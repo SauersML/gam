@@ -178,6 +178,40 @@ pub(crate) fn joint_hessian_source_curvature_is_finite(source: &JointHessianSour
     }
 }
 
+/// Loud contract-boundary variant of [`joint_hessian_source_curvature_is_finite`].
+/// Where the boolean probe answers "does the joint curvature carry a non-finite
+/// entry", this returns the canonical smooth-regularized logdet-boundary error
+/// (the same phrasing `validate_block_hessians_finite` emits for a per-block
+/// exact-Newton Hessian) locating the first offending entry. It is used at the
+/// initial-iterate (cycle 0) boundary: a non-finite entry in the family's
+/// analytic joint curvature *at the starting β* is a contract violation against
+/// the family's second derivative — the solve cannot even begin — so it is a
+/// typed hard failure, not a ρ-rejection. (A non-finite entry that only emerges
+/// *after* the coupled Newton loop has driven β to an overflowing operating
+/// point is a genuine ρ-degeneracy and stays a graceful non-converged exit;
+/// gam#1088.) The `Operator` variant probes its assembled `diagonal`, exactly
+/// as the boolean twin does, since the full operator is never materialized here.
+pub(crate) fn joint_hessian_source_finite_check(source: &JointHessianSource) -> Result<(), String> {
+    let offender = match source {
+        JointHessianSource::Dense(h_joint) => h_joint
+            .indexed_iter()
+            .find_map(|((row, col), &value)| (!value.is_finite()).then_some((row, col, value))),
+        JointHessianSource::Operator { diagonal, .. } => diagonal
+            .iter()
+            .enumerate()
+            .find_map(|(idx, &value)| (!value.is_finite()).then_some((idx, idx, value))),
+    };
+    match offender {
+        None => Ok(()),
+        Some((row, col, value)) => Err(CustomFamilyError::NumericalFailure {
+            reason: format!(
+                "smooth-regularized logdet Hessian contains non-finite entry at ({row}, {col}): {value}"
+            ),
+        }
+        .into()),
+    }
+}
+
 pub(crate) fn materialize_joint_hessian_source(
     source: &JointHessianSource,
     total: usize,

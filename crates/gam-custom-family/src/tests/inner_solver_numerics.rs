@@ -2892,8 +2892,18 @@ pub(crate) fn rank_reduce_preserves_full_rank_matrix() {
     assert_eq!(total_constraint_ids, 3);
 }
 
+/// gam#1088 fail-loudly contract, constrained arm. A `NaN` in an exact-Newton
+/// block Hessian is invalid math — the family's analytic second derivative
+/// violated its own contract — so the constrained block solve must refuse it at
+/// the same smooth-regularized logdet boundary the family-evaluation guard
+/// (`validate_block_hessians_finite`) and the coupled joint-Newton initial
+/// iterate enforce, NOT absorb it into a feasible no-op step. The former no-op
+/// contract silently masked invalid curvature behind a zero update, which reads
+/// as a converged block on poisoned math; the current contract rejects it with
+/// the offending entry named, BEFORE the constrained subsystem solve turns it
+/// into an opaque "non-finite direction" downstream.
 #[test]
-pub(crate) fn constrained_exact_newton_nan_hessian_returns_feasible_noop_instead_of_failing() {
+pub(crate) fn constrained_exact_newton_nan_hessian_refuses_loudly_at_logdet_boundary() {
     let spec = ParameterBlockSpec {
         name: "exact_block".to_string(),
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
@@ -2921,7 +2931,7 @@ pub(crate) fn constrained_exact_newton_nan_hessian_returns_feasible_noop_instead
         hessian: &hessian,
     };
     let s_lambda = Array2::zeros((1, 1));
-    let update = updater
+    let err = updater
         .compute_update_step(&BlockUpdateContext {
             family: &OneBlockConstrainedNaNHessianFamily,
             states: &states,
@@ -2932,9 +2942,12 @@ pub(crate) fn constrained_exact_newton_nan_hessian_returns_feasible_noop_instead
             linear_constraints: Some(&constraints),
             cached_active_set: None,
         })
-        .expect("constrained exact-newton NaN Hessian should produce a no-op update");
-    assert_relative_eq!(update.beta_new_raw[0], 0.0, epsilon = 1e-14);
-    assert_eq!(update.active_set, Some(vec![0]));
+        .expect_err("constrained exact-newton NaN Hessian must fail loudly, not no-op");
+    assert!(
+        err.contains("smooth-regularized logdet Hessian contains non-finite entry"),
+        "non-finite exact-Newton curvature must be rejected at the logdet boundary, \
+             before the constrained subsystem solve: {err}"
+    );
 }
 
 #[test]

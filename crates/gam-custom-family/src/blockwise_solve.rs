@@ -1308,6 +1308,16 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
             .into());
         }
 
+        // Exact-Newton Hessians are the family's analytic second derivative: a
+        // non-finite entry is invalid math, not a degenerate operating point a
+        // stabilizing ridge or a feasible no-op could rescue. Refuse loudly at
+        // the canonical smooth-regularized logdet boundary — the same boundary
+        // the family-evaluation guard and the coupled joint-Newton initial
+        // iterate enforce — BEFORE assembling `H + S` and entering the
+        // (constrained or unconstrained) solve, so the failure names the
+        // offending entry instead of surfacing later as a non-finite Newton
+        // direction (gam#1088).
+        exact_newton_hessian_finite_check(self.hessian, ctx.block_idx)?;
         let lhs = self.hessian.add_dense(ctx.s_lambda)?;
         // Solve in delta-space for both constrained and unconstrained blocks.
         // That keeps the linear system consistent even when we add a
@@ -1830,25 +1840,41 @@ pub(crate) fn validate_block_hessians_finite(eval: &FamilyEvaluation) -> Result<
         let BlockWorkingSet::ExactNewton { hessian, .. } = ws else {
             continue;
         };
-        match hessian {
-            SymmetricMatrix::Dense(matrix) => {
-                smooth_regularized_logdet_hessian_finite_check(matrix, Some(b))?;
-            }
-            SymmetricMatrix::Sparse(matrix) => {
-                let (symbolic, values) = matrix.parts();
-                let col_ptr = symbolic.col_ptr();
-                let row_idx = symbolic.row_idx();
-                for col in 0..matrix.ncols() {
-                    let start = col_ptr[col];
-                    let end = col_ptr[col + 1];
-                    for idx in start..end {
-                        let row = row_idx[idx];
-                        let value = values[idx];
-                        if !value.is_finite() {
-                            return Err(CustomFamilyError::NumericalFailure { reason: format!(
-                                "smooth-regularized logdet Hessian contains non-finite entry at ({row}, {col}): {value} for block {b}"
-                            ) }.into());
-                        }
+        exact_newton_hessian_finite_check(hessian, b)?;
+    }
+    Ok(())
+}
+
+/// Refuse a single exact-Newton block Hessian carrying a non-finite entry,
+/// using the canonical smooth-regularized logdet boundary message with the
+/// offending block index appended. Shared by the family-evaluation-boundary
+/// guard [`validate_block_hessians_finite`] and the per-block exact-Newton
+/// updater, so a `NaN`/`Inf` in the family's analytic second derivative is
+/// rejected at the same boundary with the same phrasing whether the block is
+/// constrained or unconstrained — a contract violation, not a solver
+/// contingency to be absorbed by a ridge or a no-op step (gam#1088).
+pub(crate) fn exact_newton_hessian_finite_check(
+    hessian: &SymmetricMatrix,
+    block: usize,
+) -> Result<(), String> {
+    match hessian {
+        SymmetricMatrix::Dense(matrix) => {
+            smooth_regularized_logdet_hessian_finite_check(matrix, Some(block))?;
+        }
+        SymmetricMatrix::Sparse(matrix) => {
+            let (symbolic, values) = matrix.parts();
+            let col_ptr = symbolic.col_ptr();
+            let row_idx = symbolic.row_idx();
+            for col in 0..matrix.ncols() {
+                let start = col_ptr[col];
+                let end = col_ptr[col + 1];
+                for idx in start..end {
+                    let row = row_idx[idx];
+                    let value = values[idx];
+                    if !value.is_finite() {
+                        return Err(CustomFamilyError::NumericalFailure { reason: format!(
+                            "smooth-regularized logdet Hessian contains non-finite entry at ({row}, {col}): {value} for block {block}"
+                        ) }.into());
                     }
                 }
             }

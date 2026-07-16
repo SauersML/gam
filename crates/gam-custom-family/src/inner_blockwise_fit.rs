@@ -1606,6 +1606,23 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // than grinding to the ceiling and reporting a `NaN` H_pen
             // spectrum at the refusal point.
             if !joint_hessian_source_curvature_is_finite(&joint_hessian_source) {
+                // A non-finite entry at the STARTING iterate (cycle 0) is a
+                // contract violation against the family's analytic joint second
+                // derivative — the coupled solve cannot even begin — so it is a
+                // typed hard failure at the same smooth-regularized logdet
+                // boundary that `validate_block_hessians_finite` enforces for a
+                // per-block exact-Newton Hessian (gam#1088 fail-loudly contract).
+                // A non-finite entry that only emerges at a LATER cycle, after
+                // the coupled Newton loop has driven β to an overflowing
+                // operating point during outer optimization, is a genuine
+                // ρ-degeneracy: exit non-converged with the current finite β so
+                // the outer optimizer rejects this ρ cleanly instead of grinding
+                // to inner_max_cycles (the multi-hour link-wiggle & location-
+                // scale timeouts). Both exit immediately; only the initial-iterate
+                // case aborts, because there is no finite progress to hand back.
+                if cycle == 0 {
+                    joint_hessian_source_finite_check(&joint_hessian_source)?;
+                }
                 cycles_done = cycle + 1;
                 log::warn!(
                     "[PIRLS/joint-Newton convergence] cycle {:>3} | non-finite-curvature guard (gam#1088): the joint Hessian source carries a non-finite entry, so the penalized Hessian H_pen = H + S(λ) and its spectrum (λ_max/λ_min/cond) are degenerate and the KKT certificate can never be issued; returning unconverged with finite β so the outer optimizer rejects this ρ evaluation instead of grinding to inner_max_cycles={}.",
