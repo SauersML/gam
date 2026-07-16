@@ -1079,6 +1079,73 @@ mod amortized_encoder_tests {
         );
     }
 
+    /// #2330 DIAGNOSTIC — why is the deflation-eigen twist term inert? Prints per
+    /// row: deflation direction count, whether the DK map is SPECTRAL
+    /// (`spectrum Some`) or gauge-only (`None`), and `∂H_tt/∂ρ_ard` (the row
+    /// t-block max of each ARD `∂H/∂ρ` operator). If every deflated row has
+    /// `∂H_tt/∂ρ_ard = 0`, the deflation does not move under ρ_ard (deflated rows
+    /// are ARD-inactive, majorizer 0) and the eigen term is correctly zero — so
+    /// the twist asymmetry has a DIFFERENT cause. If deflated rows are gauge-only
+    /// (`spectrum None`), the eigen route returns 0 by construction.
+    #[test]
+    fn deflation_type_and_htt_probe_2330() {
+        use ndarray::array;
+        let (mut term, target, rho, _stationary_cache) =
+            super::exact_hessian_fixture_tests::converged_state_with_residual();
+        let mut rho_eval = rho.clone();
+        rho_eval.log_lambda_sparse = 0.5;
+        for v in rho_eval.log_lambda_smooth.iter_mut() {
+            *v = -2.0;
+        }
+        rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
+        let rho = rho_eval;
+        let (_value, _loss, cache) = term
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                0,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("deflated cache");
+        let m_ops = term
+            .penalty_curvature_operators_by_flat(&rho, &cache)
+            .expect("operators");
+        let ard0 = rho.ard_flat_index(0, 0);
+        let ard1 = rho.ard_flat_index(1, 0);
+        let block_max = |op: &ndarray::Array2<f64>, base: usize, q: usize| -> f64 {
+            let mut mx = 0.0_f64;
+            for a in 0..q {
+                for b in 0..q {
+                    mx = mx.max(op[[base + a, base + b]].abs());
+                }
+            }
+            mx
+        };
+        for row in 0..term.n_obs() {
+            let dirs = cache
+                .deflated_row_directions
+                .get(row)
+                .map(|d| d.len())
+                .unwrap_or(0);
+            let spec = cache
+                .deflation_row_spectra
+                .get(row)
+                .and_then(|s| s.as_ref())
+                .is_some();
+            let base = cache.row_offsets[row];
+            let q = cache.row_dims[row];
+            let ht0 = block_max(&m_ops[&ard0], base, q);
+            let ht1 = block_max(&m_ops[&ard1], base, q);
+            eprintln!(
+                "DEFL row={row} q={q} defl_dirs={dirs} spectrum_some={spec} \
+                 dHtt_ard0_max={ht0:.3e} dHtt_ard1_max={ht1:.3e}"
+            );
+        }
+    }
+
     /// The fitted amplitudes the encoder derives are exactly the posterior gate
     /// coordinates used by reconstruction. Decoder magnitude stays in `B`, so
     /// there is no second radial-scale channel to fold into these values.
