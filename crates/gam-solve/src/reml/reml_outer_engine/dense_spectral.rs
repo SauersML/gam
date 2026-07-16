@@ -361,6 +361,79 @@ impl DenseSpectralOperator {
         fused
     }
 
+    /// General cancellation-free logdet-gradient reduction for a SINGLETON penalty
+    /// coordinate whose det derivative `det1[k] = λ_k·tr(S_λ⁺ S_k)` is FRACTIONAL —
+    /// the joint-normalizer case (`log|Σ_l λ_l S_l|₊`) that arises when penalty
+    /// blocks overlap (a full-span stabilization ridge, coalesced same-span pairs,
+    /// or any post-reparam coupling). Neither the block-indicator fusion
+    /// ([`fused_logdet_gradient_minus_rank_full_block`]) nor the range-projector
+    /// fusion ([`fused_logdet_gradient_minus_rank_deficient_block`]) applies there,
+    /// because both distribute an INTEGER `−rank`, whereas the joint det derivative
+    /// is not the integer rank of `S_k`.
+    ///
+    /// The correct per-H-eigenpair `−det1[k]` distribution uses the range chart of
+    /// the JOINT penalty `S_λ = Σ_l λ_l S_l`, supplied as its whitening factor
+    /// `W_S` (p × rank(S_λ), with `W_S W_Sᵀ = S_λ⁺`):
+    ///
+    /// ```text
+    ///   w_jk = λ_k · u_jᵀ S_λ⁺ S_k u_j = λ_k · (W_Sᵀ u_j)·(W_Sᵀ S_k u_j)
+    ///   fused_k = Σ_j [ φ'(σ_j)·(u_jᵀ λ_k S_k u_j) − w_jk ]
+    /// ```
+    ///
+    /// `Σ_j w_jk = λ_k·tr(S_λ⁺ S_k) = det1[k]` identically over the complete
+    /// eigenbasis, so `fused_k = tr(G_ε λ_k S_k) − det1[k]` — the same quantity the
+    /// naive `trace − det1` path forms, reassociated with the subtraction matched
+    /// eigenpair-by-eigenpair. At the over-smoothing rail `H → S_λ`, so
+    /// `u_jᵀ[φ'(σ_j)I − S_λ⁺] → 0` per direction and each term stays at the true
+    /// O(1/λ_k) scale — cancellation-free, exactly as the two special-case fusions
+    /// (of which this is the strict generalization: `W_S W_Sᵀ = P_{S_k}/λ_k` when
+    /// `S_λ = λ_k S_k`).
+    ///
+    /// Returns `(fused_k, Σ_j w_jk)`. The caller compares the returned weight sum
+    /// against the cost's own `det1[k]` and only trusts the fused value when they
+    /// agree — the runtime self-consistency gate that keeps this off any lane
+    /// whose `det1` is not this exact joint quantity.
+    pub(crate) fn fused_logdet_gradient_weighted_block(
+        &self,
+        s_block: &Array2<f64>,
+        start: usize,
+        end: usize,
+        scale: f64,
+        penalty_whitening: &Array2<f64>,
+    ) -> (f64, f64) {
+        let g_block = self.g_factor.slice(ndarray::s![start..end, ..]);
+        let u_block = self.eigenvectors.slice(ndarray::s![start..end, ..]);
+        // Trace-term factor: sg[:,j] = S_k g_j[block]; s_k_u[:,j] = S_k u_j[block].
+        let sg = s_block.dot(&g_block);
+        let s_k_u_block = s_block.dot(&u_block);
+        // W_Sᵀ u_j for every H-eigenvector (r × n), and W_Sᵀ (S_k u_j) using only
+        // the block rows of S_k u_j (nonzero only there).
+        let wt_u = gam_linalg::faer_ndarray::fast_atb(penalty_whitening, &self.eigenvectors);
+        let ws_block = penalty_whitening.slice(ndarray::s![start..end, ..]);
+        let wt_sk_u = gam_linalg::faer_ndarray::fast_atb(&ws_block.to_owned(), &s_k_u_block);
+
+        let mut fused = 0.0;
+        let mut weight_sum = 0.0;
+        for j in 0..self.n_dim {
+            let trace_term: f64 = scale
+                * sg.column(j)
+                    .iter()
+                    .zip(g_block.column(j).iter())
+                    .map(|(&a, &b)| a * b)
+                    .sum::<f64>();
+            let w_jk: f64 = scale
+                * wt_u
+                    .column(j)
+                    .iter()
+                    .zip(wt_sk_u.column(j).iter())
+                    .map(|(&a, &b)| a * b)
+                    .sum::<f64>();
+            fused += trace_term - w_jk;
+            weight_sum += w_jk;
+        }
+        (fused, weight_sum)
+    }
+
     #[inline]
     pub(crate) fn trace_hinv_product_cross_rotated(
         &self,

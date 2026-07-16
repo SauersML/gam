@@ -2593,7 +2593,6 @@ impl WorkingModelSurvival {
         };
         use gam_solve::estimate::reml::reml_outer_engine::{
             DenseSpectralOperator, DispersionHandling, PenaltyLogdetDerivs,
-            compute_block_penalty_logdet_derivs,
         };
 
         let p = beta.len();
@@ -2652,20 +2651,42 @@ impl WorkingModelSurvival {
         let penalty_coords =
             penalty_coords_from_blocks(&block_descs, p).map_err(EstimationError::InvalidInput)?;
 
-        // --- Penalty logdet derivatives ---
-        let per_block_rho: Vec<Array1<f64>> =
-            rho.iter().map(|&r| Array1::from_vec(vec![r])).collect();
-        let per_block_penalty_matrices: Vec<Vec<Array2<f64>>> = active_penalty_blocks
-            .iter()
-            .map(|b| vec![b.matrix.clone()])
-            .collect();
-        let per_block_penalty_refs: Vec<&[Array2<f64>]> = per_block_penalty_matrices
-            .iter()
-            .map(|v| v.as_slice())
-            .collect();
+        // --- Penalty logdet derivatives (JOINT normalizer, #2331 Inc 0) ---
+        //
+        // The LAML prior normalizer is `log|S_λ|₊` with the SINGLE combined
+        // penalty `S_λ = Σ_k λ_k S_k` (λ_k = e^{ρ_k}), NOT the per-block sum
+        // `Σ_k log|λ_k S_k|₊`. The two coincide only when the blocks are disjoint;
+        // the survival stabilization ridge (fit_orchestration/fit.rs) is a
+        // FULL-SPAN block that overlaps every smoothing block, so the per-block
+        // convention was a real objective inconsistency (#2331 Finding 3a). The
+        // joint quantity also makes `det1[k] = λ_k·tr(S_λ⁺ S_k)` fractional, which
+        // the fused ρ-gradient consumes via the joint whitening `W_S`
+        // (cancellation-free at the over-smoothing rail). A single
+        // `PenaltyPseudologdet` eigendecomposition sources value, det1, and det2
+        // consistently (no per-block/joint mismatch, #2331 R7).
         let penalty_logdet = if k_count > 0 {
-            compute_block_penalty_logdet_derivs(&per_block_rho, &per_block_penalty_refs, 0.0)
-                .map_err(EstimationError::InvalidInput)?
+            let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+            let s_k_embedded: Vec<Array2<f64>> = active_penalty_blocks
+                .iter()
+                .map(|b| {
+                    let mut s = Array2::<f64>::zeros((p, p));
+                    let (rs, re) = (b.range.start, b.range.end);
+                    s.slice_mut(ndarray::s![rs..re, rs..re]).assign(&b.matrix);
+                    s
+                })
+                .collect();
+            let pld = gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_components(
+                &s_k_embedded,
+                &lambdas,
+                0.0,
+            )
+            .map_err(EstimationError::InvalidInput)?;
+            let (first, second) = pld.rho_derivatives(&s_k_embedded, &lambdas);
+            PenaltyLogdetDerivs {
+                value: pld.value(),
+                first,
+                second: Some(second),
+            }
         } else {
             PenaltyLogdetDerivs {
                 value: 0.0,

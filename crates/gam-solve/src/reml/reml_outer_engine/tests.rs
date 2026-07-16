@@ -474,6 +474,265 @@ pub(crate) fn fused_rank_deficient_matches_full_block_on_full_rank_penalty() {
     );
 }
 
+// ─── General weighted fused kernel for FRACTIONAL det derivatives (#2331) ───
+//
+// When penalty blocks overlap (a full-span stabilization ridge, coalesced
+// same-span pairs, or any joint-normalizer coupling), the det derivative
+// `det1[k] = λ_k·tr(S_λ⁺ S_k)` is FRACTIONAL — not the integer rank of `S_k` — so
+// neither integer-`−rank` fusion applies. `fused_logdet_gradient_weighted_block`
+// distributes `−det1[k]` over the joint range chart `W_S` (`W_S W_Sᵀ = S_λ⁺`) as
+// `w_jk = λ_k·u_jᵀ S_λ⁺ S_k u_j`. This harness pins, for a railed target
+// coordinate: (1) `Σ_j w_jk = det1[k]`, (2) value identity with the naive
+// `tr(G_ε λS_k) − det1[k]`, (3) the fused value matches a compensated (Neumaier)
+// reference to roundoff, and (4) the naive form's error is ≥100× larger (it is
+// in the cancellation regime). Fixtures: rank-deficient target, full-span ridge
+// overlap (the #2298 survival shape), and a coalesced same-span pair.
+#[cfg(test)]
+fn assert_weighted_fused_kernel_gate(
+    h: &Array2<f64>,
+    s_k_full: &[Array2<f64>],
+    lambdas: &[f64],
+    target: usize,
+) {
+    let p = h.nrows();
+    let op = DenseSpectralOperator::from_symmetric(h).expect("SPD fixture");
+    assert_eq!(op.active_rank(), p, "smooth mode keeps the complete eigenbasis");
+
+    // Joint penalty S_λ = Σ λ_l S_l and its whitening W_S (W_S W_Sᵀ = S_λ⁺),
+    // sourced from the same PenaltyPseudologdet the cost path uses.
+    let mut s_lambda = Array2::<f64>::zeros((p, p));
+    for (l, s) in s_k_full.iter().enumerate() {
+        s_lambda.scaled_add(lambdas[l], s);
+    }
+    let pld = super::super::penalty_logdet::PenaltyPseudologdet::from_assembled(
+        s_lambda.clone(),
+        None,
+    )
+    .expect("joint penalty pseudologdet");
+    let ws = &pld.w_factor;
+    let (det1, _det2) = pld.rho_derivatives(s_k_full, lambdas);
+    let det1_k = det1[target];
+    // This gate is only meaningful when det1[k] is genuinely fractional.
+    assert!(
+        (det1_k - det1_k.round()).abs() > 1e-6,
+        "fixture target det1[{target}]={det1_k:.6e} is (near) integer — not a joint/fractional case"
+    );
+
+    // Production naive: full block trace, then subtract the fractional det1.
+    let naive =
+        op.trace_logdet_block_local(&s_k_full[target], lambdas[target], 0, p) - det1_k;
+    // Production weighted fused.
+    let (fused, weight_sum) =
+        op.fused_logdet_gradient_weighted_block(&s_k_full[target], 0, p, lambdas[target], ws);
+
+    // (1) The per-direction weights sum to the cost's det derivative.
+    assert!(
+        (weight_sum - det1_k).abs() <= 1e-9 * (1.0 + det1_k.abs()),
+        "Σ_j w_jk must equal det1[k]: got {weight_sum:.9e} vs {det1_k:.9e}"
+    );
+
+    // Compensated (Neumaier) reference over the SAME per-eigenpair terms the
+    // fused method sums naively — ground truth for the gradient value.
+    let g_block = op.g_factor.slice(ndarray::s![0..p, ..]);
+    let sg = s_k_full[target].dot(&g_block);
+    let s_k_u = s_k_full[target].dot(&op.eigenvectors);
+    let wt_u = gam_linalg::faer_ndarray::fast_atb(ws, &op.eigenvectors);
+    let wt_sku = gam_linalg::faer_ndarray::fast_atb(ws, &s_k_u);
+    let mut sum = 0.0_f64;
+    let mut comp = 0.0_f64;
+    for j in 0..op.n_dim {
+        let trace_j = lambdas[target]
+            * sg.column(j)
+                .iter()
+                .zip(g_block.column(j).iter())
+                .map(|(&a, &b)| a * b)
+                .sum::<f64>();
+        let w_j = lambdas[target]
+            * wt_u
+                .column(j)
+                .iter()
+                .zip(wt_sku.column(j).iter())
+                .map(|(&a, &b)| a * b)
+                .sum::<f64>();
+        let d = trace_j - w_j;
+        let t = sum + d;
+        if sum.abs() >= d.abs() {
+            comp += (sum - t) + d;
+        } else {
+            comp += (d - t) + sum;
+        }
+        sum = t;
+    }
+    let reference = sum + comp;
+
+    let err_naive = (naive - reference).abs();
+    let err_fused = (fused - reference).abs();
+    let cancellation = op
+        .trace_logdet_block_local(&s_k_full[target], lambdas[target], 0, p)
+        .abs()
+        / reference.abs().max(f64::MIN_POSITIVE);
+    eprintln!(
+        "[FUSED-WEIGHTED] det1={det1_k:.6e} reference={reference:.6e} naive={naive:.6e} \
+         fused={fused:.6e} err_naive={err_naive:.3e} err_fused={err_fused:.3e} \
+         cancellation={cancellation:.3e}"
+    );
+
+    // (2) Value identity: the reformulation must not move the derivative.
+    assert!(
+        (fused - naive).abs() <= 1.0e-6 * (1.0 + reference.abs()),
+        "weighted fused and naive disagree beyond roundoff: fused={fused:.6e} naive={naive:.6e}"
+    );
+    // (3) Fused matches the compensated reference to roundoff.
+    assert!(
+        err_fused <= 1.0e-13 * (1.0 + reference.abs()),
+        "weighted fused not accurate to roundoff: err_fused={err_fused:.3e}"
+    );
+    // Fixture is genuinely in the cancellation regime.
+    assert!(
+        cancellation >= 1.0e4,
+        "fixture is not deep enough to exercise the cancellation: ratio={cancellation:.3e}"
+    );
+    // (4) The witness: fusing the subtraction cuts the summation error ≥100×.
+    assert!(
+        err_naive >= 100.0 * err_fused.max(f64::MIN_POSITIVE),
+        "weighted fusion did not reduce the summation error: \
+         err_naive={err_naive:.3e} err_fused={err_fused:.3e}"
+    );
+}
+
+#[cfg(test)]
+fn second_difference_penalty(p: usize) -> Array2<f64> {
+    // Sᵀ = D₂ᵀD₂ with D₂ the (p-2)×p second-difference operator: rank p-2,
+    // null space = {constant, linear}.
+    let mut d2 = Array2::<f64>::zeros((p.saturating_sub(2), p));
+    for i in 0..p.saturating_sub(2) {
+        d2[[i, i]] = 1.0;
+        d2[[i, i + 1]] = -2.0;
+        d2[[i, i + 2]] = 1.0;
+    }
+    d2.t().dot(&d2)
+}
+
+#[cfg(test)]
+fn small_data_hessian(p: usize) -> Array2<f64> {
+    // Fixed well-conditioned SPD data-curvature floor.
+    Array2::from_shape_fn((p, p), |(i, j)| {
+        if i == j {
+            0.7 + 0.1 * (i as f64)
+        } else {
+            0.03 / (1.0 + (i as f64 - j as f64).abs())
+        }
+    })
+}
+
+#[test]
+pub(crate) fn weighted_fused_kernel_rank_deficient_target_beats_naive() {
+    let p = 6usize;
+    let s0 = second_difference_penalty(p); // rank-deficient target
+    let s1 = Array2::<f64>::eye(p); // small full-span coupling ⇒ det1[0] fractional
+    let lambdas = [1.0e6_f64, 1.0e-1];
+    let mut h = small_data_hessian(p);
+    h.scaled_add(lambdas[0], &s0);
+    h.scaled_add(lambdas[1], &s1);
+    assert_weighted_fused_kernel_gate(&h, &[s0, s1], &lambdas, 0);
+}
+
+#[test]
+pub(crate) fn weighted_fused_kernel_full_span_ridge_overlap_beats_naive() {
+    // The #2298 survival shape: a smoothing block on [0..4] plus a FULL-SPAN
+    // identity stabilization ridge over [0..6].
+    let p = 6usize;
+    let mut s0 = Array2::<f64>::zeros((p, p));
+    let block = second_difference_penalty(4);
+    s0.slice_mut(ndarray::s![0..4, 0..4]).assign(&block);
+    let ridge = Array2::<f64>::eye(p);
+    let lambdas = [1.0e6_f64, 1.0e-2];
+    let mut h = small_data_hessian(p);
+    h.scaled_add(lambdas[0], &s0);
+    h.scaled_add(lambdas[1], &ridge);
+    assert_weighted_fused_kernel_gate(&h, &[s0, ridge], &lambdas, 0);
+}
+
+#[test]
+pub(crate) fn weighted_fused_kernel_coalesced_same_span_pair_beats_naive() {
+    // Two DIFFERENT penalties on the SAME span [0..5] (coalesced): a curvature
+    // penalty and a first-difference penalty.
+    let p = 5usize;
+    let s0 = second_difference_penalty(p);
+    let mut d1 = Array2::<f64>::zeros((p - 1, p));
+    for i in 0..p - 1 {
+        d1[[i, i]] = 1.0;
+        d1[[i, i + 1]] = -1.0;
+    }
+    let s1 = d1.t().dot(&d1);
+    let lambdas = [1.0e6_f64, 3.0];
+    let mut h = small_data_hessian(p);
+    h.scaled_add(lambdas[0], &s0);
+    h.scaled_add(lambdas[1], &s1);
+    assert_weighted_fused_kernel_gate(&h, &[s0, s1], &lambdas, 0);
+}
+
+// ─── R1: joint normalizer value differs from the per-block sum under overlap ──
+//
+// The #2331 cutover replaces the survival per-block `Σ_k log|λ_k S_k|₊` with the
+// JOINT `log|Σ_k λ_k S_k|₊`. They coincide for disjoint blocks but DIFFER once a
+// full-span ridge overlaps the smoothing block — a real objective-value shift
+// (R1). This pins the joint value against an independent dense pseudo-logdet and
+// asserts the shift is nonzero (so the delta is measured, not assumed away).
+#[test]
+pub(crate) fn joint_penalty_logdet_differs_from_per_block_under_ridge_overlap() {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let p = 5usize;
+    let mut s0 = Array2::<f64>::zeros((p, p));
+    s0.slice_mut(ndarray::s![0..4, 0..4])
+        .assign(&second_difference_penalty(4));
+    let ridge = Array2::<f64>::eye(p);
+    let lambdas = [12.0_f64, 0.5];
+    let s_k = [s0, ridge];
+
+    // Joint value from the production machinery.
+    let mut s_lambda = Array2::<f64>::zeros((p, p));
+    for (l, s) in s_k.iter().enumerate() {
+        s_lambda.scaled_add(lambdas[l], s);
+    }
+    let pld = super::super::penalty_logdet::PenaltyPseudologdet::from_assembled(
+        s_lambda.clone(),
+        None,
+    )
+    .expect("joint pld");
+    let joint_value = pld.value();
+
+    // Independent reference: Σ log σ_i over the positive spectrum of S_λ.
+    let (evals, _) = s_lambda.eigh(faer::Side::Lower).expect("eig S_lambda");
+    let max_ev = evals.iter().copied().fold(0.0_f64, f64::max);
+    let tol = (p as f64) * f64::EPSILON * max_ev.max(1e-12);
+    let reference_value: f64 = evals.iter().filter(|&&e| e > tol).map(|&e| e.ln()).sum();
+    assert!(
+        (joint_value - reference_value).abs() <= 1e-9 * (1.0 + reference_value.abs()),
+        "joint log|S_λ|₊ must match the independent spectrum sum: {joint_value:.6e} vs {reference_value:.6e}"
+    );
+
+    // Per-block Σ_k log|λ_k S_k|₊ (each block's own positive spectrum).
+    let per_block: f64 = s_k
+        .iter()
+        .zip(lambdas.iter())
+        .map(|(s, &lam)| {
+            let scaled = lam * s;
+            let (ev, _) = scaled.eigh(faer::Side::Lower).expect("eig block");
+            let m = ev.iter().copied().fold(0.0_f64, f64::max);
+            let t = (p as f64) * f64::EPSILON * m.max(1e-12);
+            ev.iter().filter(|&&e| e > t).map(|&e| e.ln()).sum::<f64>()
+        })
+        .sum();
+
+    // The overlap makes the two conventions genuinely disagree (the R1 shift).
+    assert!(
+        (joint_value - per_block).abs() > 1e-3,
+        "ridge overlap must produce a measurable joint-vs-per-block value shift: \
+         joint={joint_value:.6e} per_block={per_block:.6e}"
+    );
+}
+
 // ─── Batched kernel-trace factor must reproduce the exact kernel ─────
 //
 // `penalty_subspace_trace_drifts_batched` evaluates `tr(K·A_i)` for the
