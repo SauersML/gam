@@ -1686,9 +1686,9 @@ impl SaeManifoldTerm {
         let g = self.materialize_joint_inverse(cache, &solver)?;
         let h_bd = self.materialize_block_diag_t_inverse(cache);
         let operators = self.penalty_curvature_operators_by_flat(rho, cache)?;
-        // `∂A/∂ρᵢ = ∂H/∂ρᵢ (operators) + ∂(ΔC)/∂ρᵢ (this delta)`. The twist uses
-        // `∂H/∂ρ` (G = H⁻¹), but the IFT `Mᵢ·a` term differentiates the EXACT
-        // stationarity Hessian A, so it adds this delta.
+        // `∂A/∂ρᵢ = ∂H/∂ρᵢ (operators) + ∂(ΔC)/∂ρᵢ (this delta)`. BOTH the twist
+        // inverse ∂G/∂ρ = −G(∂A/∂ρ)G and the IFT `Mᵢ·a` term differentiate the
+        // EXACT stationarity Hessian A, so both add this delta (#2330).
         let exact_deltas = self.exact_stationarity_penalty_derivative_delta_by_flat(rho, cache)?;
 
         // Effective adjoint Γ_eff = Γ_joint − Γ_tt + 2∇R, assembled EXACTLY as
@@ -1723,9 +1723,17 @@ impl SaeManifoldTerm {
         let mut hessian = Array2::<f64>::zeros((n_params, n_params));
         for &i in &flats {
             let m_i = &operators[&i];
-            // Twisted inverses G_i = −G M_i G and h_bd_i = −h_bd M_i h_bd.
-            let g_i = -g.dot(m_i).dot(&g);
-            let h_bd_i = -h_bd.dot(m_i).dot(&h_bd);
+            // Twisted inverses G_i = −G (∂A/∂ρ_i) G, h_bd_i = −h_bd (∂A/∂ρ_i) h_bd.
+            // The Laplace logdet is logdet(A_exact), so ∂G/∂ρ_i differentiates the
+            // EXACT stationarity Hessian ∂A/∂ρ_i = M_i + ΔC-delta_i — NOT the
+            // majorized M_i alone, which is one-sided on ARD (delta ≠ 0 only for
+            // ARD/softmax) and breaks g3 smooth↔ARD cross-conservation (#2330).
+            let twist_op = match exact_deltas.get(&i) {
+                Some(delta_i) => m_i + delta_i,
+                None => m_i.clone(),
+            };
+            let g_i = -g.dot(&twist_op).dot(&g);
+            let h_bd_i = -h_bd.dot(&twist_op).dot(&h_bd);
 
             // dΓ_joint/dρ_i and dΓ_tt/dρ_i = part(a) twist + part(b) mixed.
             let mut d_gamma_joint = self.logdet_theta_adjoint_dense(
@@ -2803,6 +2811,8 @@ mod test_support {
             let solver = DeflatedArrowSolver::plain(cache);
             let g = self.materialize_joint_inverse(cache, &solver)?;
             let operators = self.penalty_curvature_operators_by_flat(rho, cache)?;
+            // Mirror production: the twist inverse rides the EXACT ∂A/∂ρ = M_c + Δ.
+            let exact_deltas = self.exact_stationarity_penalty_derivative_delta_by_flat(rho, cache)?;
             let total_t = cache.delta_t_len();
             let dim = total_t + cache.k;
             let flatten = |v: &SaeArrowVector| -> Array1<f64> {
@@ -2818,7 +2828,11 @@ mod test_support {
             // trace-only and full (trace − DK) form, contracted against b_other.
             let leg = |c: usize, skip_dk: bool, part_a: bool| -> Result<Array1<f64>, String> {
                 if part_a {
-                    let g_c = -g.dot(&operators[&c]).dot(&g);
+                    let twist_op = match exact_deltas.get(&c) {
+                        Some(delta_c) => &operators[&c] + delta_c,
+                        None => operators[&c].clone(),
+                    };
+                    let g_c = -g.dot(&twist_op).dot(&g);
                     Ok(flatten(&self.logdet_theta_adjoint_dense(
                         rho,
                         cache,
