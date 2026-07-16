@@ -269,6 +269,98 @@ impl DenseSpectralOperator {
         fused
     }
 
+    /// Cancellation-free logdet-gradient reduction for a RANK-DEFICIENT singleton
+    /// penalty block: computes `tr(G_ε(H)·λ_k S_k) − rank(S_k)` for a block whose
+    /// penalty `S_k` has a structural null space (`rank(S_k) < end − start`, e.g.
+    /// a spline curvature / difference penalty).
+    ///
+    /// [`fused_logdet_gradient_minus_rank_full_block`] distributes the `−rank`
+    /// subtraction over the block-coordinate identity `P_block`, whose trace is
+    /// the block WIDTH.  That equals the det derivative `∂_{ρ_k} log|λ_k S_k|₊ =
+    /// rank(S_k)` ONLY when the block is full rank (`width = rank`).  For a
+    /// rank-deficient block the det derivative is still the integer `rank(S_k)`
+    /// (a proportional singleton `log|λ_k S_k|₊ = rank·ρ_k + const`) but
+    /// `tr(P_block) = width > rank`, so the full-block fusion over-subtracts.
+    ///
+    /// The correct per-eigenpair `−rank` distribution is the ORTHOGONAL
+    /// PROJECTOR `P_{S_k} = Q Qᵀ` onto `range(S_k)` (with `Q` the orthonormal
+    /// range basis, `QᵀQ = I_r`), because
+    /// `Σ_j (u_j^{blk})ᵀ P_{S_k} (u_j^{blk}) = tr(P_{S_k}·I_block) = rank(S_k)`
+    /// over the complete eigenbasis.  So per eigenpair
+    ///
+    /// ```text
+    ///   fused += λ_k·(g_jᵀ S_k g_j) − ‖Qᵀ u_j^{blk}‖²
+    /// ```
+    ///
+    /// is `tr(G_ε λ_k S_k) − rank(S_k)` reassociated with the subtraction matched
+    /// eigenpair-by-eigenpair.  At the over-smoothing rail the `+` term (mass of
+    /// `G_ε λ_k S_k` on eigendirection `j`) and the `−` term (mass of `u_j` in
+    /// `range(S_k)`) each approach the same per-pair value, so their difference
+    /// stays at the true O(1/λ_k) scale and never emerges from the last bits of a
+    /// rank-sized aggregate — exactly as in the full-rank fusion, of which this
+    /// is the strict generalization (`P_{S_k} = P_block` when `width = rank`).
+    ///
+    /// Callers gate on `active_rank() == dim()` (complete eigenbasis, so the
+    /// `Σ_j = rank` identity holds) and on the det derivative being the integer
+    /// rank (proportional singleton, so `−rank` is the exact det pairing).
+    pub(crate) fn fused_logdet_gradient_minus_rank_deficient_block(
+        &self,
+        s_block: &Array2<f64>,
+        start: usize,
+        end: usize,
+        scale: f64,
+    ) -> f64 {
+        use faer::Side;
+        let width = end - start;
+        // Orthonormal basis `Q` (width × r) of `range(S_k)` from the block
+        // eigenspectrum. The rank tolerance mirrors `penalty_matrix_root` so
+        // `r` matches the coordinate's own `rank()` (the det derivative the
+        // caller certified as the integer `−rank`).
+        let (evals, evecs) = s_block
+            .eigh(Side::Lower)
+            .expect("rank-deficient penalty block eigendecomposition");
+        let max_ev = evals.iter().copied().fold(0.0_f64, f64::max);
+        let tol = (width.max(1) as f64) * f64::EPSILON * max_ev.max(1e-12);
+        let active: Vec<usize> = evals
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v > tol)
+            .map(|(i, _)| i)
+            .collect();
+        let r = active.len();
+
+        let g_block = self.g_factor.slice(ndarray::s![start..end, ..]);
+        let u_block = self.eigenvectors.slice(ndarray::s![start..end, ..]);
+        // S_k · g_block once: (width × n), column j is S_k g_j[block].
+        let sg = s_block.dot(&g_block);
+        // Range coordinates of every eigenvector's block restriction:
+        // `qt_u[:, j] = Qᵀ u_j^{blk}` (r × n), so `‖qt_u[:, j]‖²` is the mass of
+        // `u_j^{blk}` inside `range(S_k)` — the per-eigenpair `−rank` share.
+        let mut qt_u = Array2::<f64>::zeros((r, self.n_dim));
+        for (out_row, &idx) in active.iter().enumerate() {
+            for j in 0..self.n_dim {
+                let mut acc = 0.0;
+                for local in 0..width {
+                    acc += evecs[[local, idx]] * u_block[[local, j]];
+                }
+                qt_u[[out_row, j]] = acc;
+            }
+        }
+
+        let mut fused = 0.0;
+        for j in 0..self.n_dim {
+            let s_term: f64 = sg
+                .column(j)
+                .iter()
+                .zip(g_block.column(j).iter())
+                .map(|(&a, &b)| a * b)
+                .sum();
+            let p_term: f64 = qt_u.column(j).iter().map(|&v| v * v).sum();
+            fused += scale * s_term - p_term;
+        }
+        fused
+    }
+
     #[inline]
     pub(crate) fn trace_hinv_product_cross_rotated(
         &self,

@@ -941,13 +941,18 @@ pub fn reml_laml_evaluate(
     // host-arithmetic-independent (see
     // `DenseSpectralOperator::fused_logdet_gradient_minus_rank_full_block`).
     //
-    // The fused identity holds ONLY for a square full-rank block whose det
-    // derivative equals the integer rank, and only over the complete eigenbasis.
-    // Every other coordinate (coalesced multi-penalty blocks whose `first[k]` is
-    // the fractional `λ_k·tr(S⁺S_k)`, rank-deficient roots, masked null spaces)
-    // is left `None` here and takes the unmodified trace − det path below.  The
-    // stochastic-SLQ branch is intentionally out of scope and unifies under
-    // #2331.
+    // The fused identity holds for any SINGLETON penalty block whose det
+    // derivative equals the integer rank, over the complete eigenbasis: the
+    // square full-rank case fuses `−rank` against the block-coordinate identity
+    // (`fused_logdet_gradient_minus_rank_full_block`), and the rank-deficient
+    // case (spline curvature / difference penalties, whose block width exceeds
+    // their rank) fuses `−rank` against the range projector `P_{S_k}`
+    // (`fused_logdet_gradient_minus_rank_deficient_block`, #2331). Every other
+    // coordinate (coalesced multi-penalty blocks whose `first[k]` is the
+    // fractional `λ_k·tr(S⁺S_k)`, masked numerical null spaces where
+    // `active_rank() < dim()`) is left `None` here and takes the unmodified
+    // trace − det path below. The stochastic-SLQ branch is intentionally out of
+    // scope and unifies under #2331.
     let fused_logdet_minus_rank: Vec<Option<f64>> = if incl_logdet_h
         && incl_logdet_s
         && stochastic_trace_values.is_none()
@@ -962,23 +967,38 @@ pub fn reml_laml_evaluate(
                     let coord = &solution.penalty_coords[idx];
                     let rank = coord.rank();
                     let (s_block, start, end) = coord.scaled_block_local(1.0);
-                    // Square full-rank block whose det derivative is the integer
-                    // rank: `P_k` is the block-coordinate identity, so the
-                    // fused subtraction is exact and value-identical to the
-                    // `trace − first[idx]` it replaces.
-                    let is_square_full_rank = end - start == rank;
+                    // Integer det derivative certifies a PROPORTIONAL SINGLETON
+                    // block (`log|λ_k S_k|₊ = rank·ρ_k + const`), so the ρ-grad's
+                    // det term is exactly `−rank`. Coalesced multi-penalty spans
+                    // (fractional `λ_k·tr(S⁺S_k)`) fail this and stay on the
+                    // trace − det path.
                     let det_is_integer_rank = (solution.penalty_logdet.first[idx] - rank as f64)
                         .abs()
                         <= 1e-9 * (1.0 + rank as f64);
-                    if !is_square_full_rank || !det_is_integer_rank {
+                    if !det_is_integer_rank {
                         return None;
                     }
-                    let fused = ds.fused_logdet_gradient_minus_rank_full_block(
-                        &s_block,
-                        start,
-                        end,
-                        curvature_lambdas[idx],
-                    );
+                    // Square full-rank block: `P_k` is the block-coordinate
+                    // identity. Rank-deficient block (width > rank): `−rank`
+                    // fuses against the range projector `P_{S_k}` instead. Both
+                    // are value-identical to the `trace − first[idx]` they
+                    // replace and cancellation-free at the rail.
+                    let is_square_full_rank = end - start == rank;
+                    let fused = if is_square_full_rank {
+                        ds.fused_logdet_gradient_minus_rank_full_block(
+                            &s_block,
+                            start,
+                            end,
+                            curvature_lambdas[idx],
+                        )
+                    } else {
+                        ds.fused_logdet_gradient_minus_rank_deficient_block(
+                            &s_block,
+                            start,
+                            end,
+                            curvature_lambdas[idx],
+                        )
+                    };
                     // The family curvature correction C[v_k] has no paired det
                     // term; add its logdet trace back so the fused value equals
                     // `tr(G_ε·(λ_k S_k + C)) − rank`.
