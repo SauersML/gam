@@ -5718,7 +5718,9 @@ mod tests {
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
             likelihood_family: Some(LikelihoodSpec::binomial_probit()),
-            likelihood_scale: LikelihoodScaleMetadata::Unspecified,
+            // Binomial carries a fixed unit dispersion; fit assembly now requires
+            // it to be stated explicitly (Unspecified is rejected for binomial).
+            likelihood_scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
             deviance: 0.0,
