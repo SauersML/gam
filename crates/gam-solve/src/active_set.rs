@@ -1,6 +1,6 @@
 use crate::estimate::EstimationError;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve, SolveLstsq};
-use faer::{Side, Unbind};
+use faer::Side;
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerLinalgError, FaerSvd, array1_to_col_matmut};
 use gam_linalg::utils::{StableSolver, array_is_finite, boundary_hit_step_fraction};
 use gam_problem::{ConstraintSet, LinearInequalityConstraints};
