@@ -2744,15 +2744,8 @@ mod tests {
             let mut y = Array2::<f64>::zeros((1, k));
             y[[0, obs]] = 1.0;
             let design = Arc::new(array![[1.0_f64]]);
-            MultinomialFamily::new(
-                y,
-                array![w],
-                k,
-                design,
-                Arc::new(Vec::new()),
-                Arc::new(Vec::new()),
-            )
-            .expect("single-row multinomial family")
+            MultinomialFamily::new(y, array![w], k, design, Arc::new(Vec::new()))
+                .expect("single-row multinomial family")
         }
 
         fn single_row_family_response(response: &[f64], w: f64) -> MultinomialFamily {
@@ -2763,7 +2756,6 @@ mod tests {
                 array![w],
                 response.len(),
                 Arc::new(array![[1.0_f64]]),
-                Arc::new(Vec::new()),
                 Arc::new(Vec::new()),
             )
             .expect("single-row multinomial family with simplex response")
