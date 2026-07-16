@@ -68,6 +68,38 @@ def _parse(stream) -> list[dict]:
     return list(rows.values())
 
 
+_NEXTEST = re.compile(
+    r"^\s*(?P<status>PASS|FAIL|LEAK|TIMEOUT|SIGSEGV|ABORT)\s+"
+    r"\[[^\]]*\]\s+\S*quality\S*\s+(?P<path>\S+)"
+)
+
+
+def _parse_nextest(lines: list[str]) -> dict[str, dict]:
+    """Per-category executed/failed counts from nextest PASS/FAIL lines.
+
+    The category is the first `::`-component of the test path within the
+    `quality` binary. A test that panics/refuses BEFORE its emit line shows up
+    here as FAIL with no matching [QUALITY_PAIR] — that silent attrition is
+    exactly what must stay visible so a crashing test cannot quietly drop out of
+    the significance set.
+    """
+    by_cat: dict[str, dict] = defaultdict(
+        lambda: {"executed": 0, "failed": 0, "failed_paths": []}
+    )
+    for raw in lines:
+        m = _NEXTEST.match(raw)
+        if m is None:
+            continue
+        path = m["path"]
+        category = path.split("::", 1)[0]
+        rec = by_cat[category]
+        rec["executed"] += 1
+        if m["status"] != "PASS":
+            rec["failed"] += 1
+            rec["failed_paths"].append(f"{m['status']} {path}")
+    return dict(by_cat)
+
+
 def _effect(row: dict) -> float | None:
     gam, ref = row["gam"], row["reference_value"]
     if not (math.isfinite(gam) and math.isfinite(ref)) or gam <= 0.0 or ref <= 0.0:
@@ -151,7 +183,9 @@ def main() -> None:
         raise SystemExit(__doc__)
     src = sys.stdin if sys.argv[1] == "-" else open(sys.argv[1])
     with src if src is not sys.stdin else _nullctx(src):
-        rows = _parse(src)
+        lines = src.readlines()
+    rows = _parse(lines)
+    nextest = _parse_nextest(lines)
     if not rows:
         raise SystemExit(
             "no [QUALITY_PAIR] lines found. Ensure the quality tests emit "
@@ -208,6 +242,40 @@ def main() -> None:
     )
     if overall["dropped_nonfinite"]:
         print(f"NOTE: {overall['dropped_nonfinite']} pair(s) dropped (nonfinite/nonpositive).")
+
+    # Attrition: cross-reference emitted pairs against nextest execution so a
+    # test that crashed/refused BEFORE its emit line is visible, not absorbed.
+    if nextest:
+        emitters = defaultdict(set)
+        for row in rows:
+            emitters[row["category"]].add(row["test"].split("::", 1)[0])
+        print("\n--- execution vs emission (silent-attrition guard) ---")
+        print(f"{'category':<12} {'executed':>8} {'failed':>7} {'emitting':>9}")
+        total_failed_no_pair = []
+        for c in sorted(set(nextest) | set(emitters)):
+            nx = nextest.get(c, {"executed": 0, "failed": 0, "failed_paths": []})
+            print(
+                f"{c:<12} {nx['executed']:>8} {nx['failed']:>7} {len(emitters.get(c, set())):>9}"
+            )
+            for fp in nx["failed_paths"]:
+                stem = fp.split("::", 1)[-1].split("::")[0] if "::" in fp else fp
+                if stem not in emitters.get(c, set()):
+                    total_failed_no_pair.append(fp)
+        if total_failed_no_pair:
+            print(
+                f"\nSILENT ATTRITION: {len(total_failed_no_pair)} test(s) failed BEFORE "
+                f"emitting a pair (excluded from the significance set):"
+            )
+            for fp in total_failed_no_pair:
+                print(f"  {fp}")
+        else:
+            print("\nNo silent attrition: every failed test still emitted its pair.")
+    else:
+        print(
+            "\nNOTE: no nextest PASS/FAIL lines found in input — attrition guard "
+            "inactive. Pipe the full `nextest run` output (not just filtered pairs) "
+            "so crashing tests are visible."
+        )
 
     # Worst offenders: the tests GAM loses by the most (largest positive effect).
     scored = [(r, _effect(r)) for r in rows]
