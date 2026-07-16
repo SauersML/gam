@@ -949,3 +949,187 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod parallel_transport_tests {
+    use super::*;
+    use ndarray::{Array1, Array2, array};
+
+    fn flat(m: &Array2<f64>) -> Array1<f64> {
+        let (rows, cols) = m.dim();
+        let mut v = Array1::<f64>::zeros(rows * cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                v[r * cols + c] = m[[r, c]];
+            }
+        }
+        v
+    }
+
+    fn path2(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((2, a.len()));
+        out.row_mut(0).assign(&a);
+        out.row_mut(1).assign(&b);
+        out
+    }
+
+    /// Same disjoint-rotation-plane construction as `tests::frames_with_angles`
+    /// (duplicated locally — the two `mod`s are siblings, not parent/child, so
+    /// the private helper isn't reachable via `super::*`): `Y = [e_0 … e_{k-1}]`
+    /// and `Z = [cosθ_j e_j + sinθ_j e_{k+j}]_j` have EXACT principal angles
+    /// `angles`, and both leave rows `k..n` of `Y` all zero.
+    fn frames_with_angles(n: usize, k: usize, angles: &[f64]) -> (Array2<f64>, Array2<f64>) {
+        assert!(n >= 2 * k, "disjoint rotation planes need n >= 2k");
+        assert_eq!(angles.len(), k);
+        let mut y = Array2::<f64>::zeros((n, k));
+        let mut z = Array2::<f64>::zeros((n, k));
+        for (j, &theta) in angles.iter().enumerate() {
+            y[[j, j]] = 1.0;
+            z[[j, j]] = theta.cos();
+            z[[k + j, j]] = theta.sin();
+        }
+        (y, z)
+    }
+
+    /// A horizontal tangent at `Y = [e_0 … e_{k-1}]` (`YᵀH = 0`) is exactly any
+    /// `n×k` matrix whose first `k` rows are zero; fill the rest with a fixed,
+    /// arbitrary pattern so callers get two independent, non-parallel tangents.
+    fn horizontal_tangent_at_identity_block(n: usize, k: usize, seed: f64) -> Array2<f64> {
+        let mut h = Array2::<f64>::zeros((n, k));
+        for r in k..n {
+            for c in 0..k {
+                h[[r, c]] = ((r * k + c) as f64 + seed).sin();
+            }
+        }
+        h
+    }
+
+    /// `GrassmannManifold::parallel_transport`'s `k > 1` branch (the
+    /// Edelman-Arias-Smith closed form) had no direct test anywhere in this
+    /// crate: every existing test here exercises `exp_map`/`log_map`/VJPs, not
+    /// transport. Check the two properties the doc comment on that formula
+    /// claims — canonical-metric isometry and landing back in the horizontal
+    /// tangent space at the far endpoint — on a genuine `k=2` geodesic (not the
+    /// `k=1` sphere-delegation special case).
+    #[test]
+    fn parallel_transport_k_gt_1_preserves_inner_product_and_horizontality() {
+        let gr = GrassmannManifold::new(2, 6).expect("Gr(2,6)");
+        let (y, z) = frames_with_angles(6, 2, &[0.4, 0.9]);
+        let path = path2(flat(&y).view(), flat(&z).view());
+
+        let h1 = horizontal_tangent_at_identity_block(6, 2, 0.0);
+        let h2 = horizontal_tangent_at_identity_block(6, 2, 1.7);
+
+        let t1 = gr
+            .parallel_transport(path.view(), flat(&h1).view())
+            .expect("Γ(H1)");
+        let t2 = gr
+            .parallel_transport(path.view(), flat(&h2).view())
+            .expect("Γ(H2)");
+
+        // Canonical (Frobenius) metric is the ambient identity here, so the
+        // isometry check is a plain dot product on the flattened frames.
+        let before = dot(flat(&h1).view(), flat(&h2).view());
+        let after = dot(t1.view(), t2.view());
+        assert!(
+            (before - after).abs() <= 1e-9 * before.abs().max(1.0),
+            "not an isometry: ⟨H1,H2⟩={before:.12e}, ⟨ΓH1,ΓH2⟩={after:.12e}"
+        );
+
+        // Horizontality at Z: ZᵀΓ(H) must vanish (transport lands in the
+        // horizontal tangent space at the far endpoint, not merely tangent).
+        let t1_mat = from_flat(t1.view(), 6, 2).expect("ΓH1 as n×k");
+        let zt_t1 = z.t().dot(&t1_mat);
+        for v in zt_t1.iter() {
+            assert!(v.abs() < 1e-9, "ΓH1 is not horizontal at Z: ZᵀΓH1 has entry {v:.3e}");
+        }
+    }
+
+    /// The manifold-agnostic geodesic-velocity sign identity
+    /// `Γ_{Y→Z}(log_Y Z) = −log_Z Y`, checked elsewhere for `sphere.rs` and
+    /// `spd.rs`, on the genuine `k=2` transport formula.
+    #[test]
+    fn parallel_transport_k_gt_1_matches_geodesic_velocity_identity() {
+        let gr = GrassmannManifold::new(2, 6).expect("Gr(2,6)");
+        let (y, z) = frames_with_angles(6, 2, &[0.5, 1.1]);
+        let y_flat = flat(&y);
+        let z_flat = flat(&z);
+        let forward = path2(y_flat.view(), z_flat.view());
+
+        let v_y_to_z = gr.log_map(y_flat.view(), z_flat.view()).expect("log_Y(Z)");
+        let v_z_to_y = gr.log_map(z_flat.view(), y_flat.view()).expect("log_Z(Y)");
+        let transported = gr
+            .parallel_transport(forward.view(), v_y_to_z.view())
+            .expect("Γ(log_Y Z)");
+
+        for (i, (&t, &v)) in transported.iter().zip(v_z_to_y.iter()).enumerate() {
+            assert!(
+                (t + v).abs() <= 1e-8 * v.abs().max(1.0),
+                "component {i}: Γ(log_Y Z)={t:.12e}, −log_Z Y={:.12e}",
+                -v
+            );
+        }
+    }
+
+    /// Round trip `Y→Z→Y` must recover the original horizontal tangent.
+    #[test]
+    fn parallel_transport_k_gt_1_round_trip_is_identity() {
+        let gr = GrassmannManifold::new(2, 6).expect("Gr(2,6)");
+        let (y, z) = frames_with_angles(6, 2, &[0.3, 0.8]);
+        let y_flat = flat(&y);
+        let z_flat = flat(&z);
+        let forward = path2(y_flat.view(), z_flat.view());
+        let backward = path2(z_flat.view(), y_flat.view());
+
+        let h = horizontal_tangent_at_identity_block(6, 2, 0.6);
+        let out = gr
+            .parallel_transport(forward.view(), flat(&h).view())
+            .expect("Γ_{Y→Z}(H)");
+        let back = gr
+            .parallel_transport(backward.view(), out.view())
+            .expect("Γ_{Z→Y}(Γ_{Y→Z}(H))");
+
+        let h_flat = flat(&h);
+        for (i, (&b, &orig)) in back.iter().zip(h_flat.iter()).enumerate() {
+            assert!(
+                (b - orig).abs() <= 1e-8 * orig.abs().max(1.0),
+                "component {i}: round-trip {b:.12e} vs original {orig:.12e}"
+            );
+        }
+    }
+
+    /// `Gr(1,n)`'s sphere-delegation branch flips the sign of the path's last
+    /// row when the raw representatives land in opposite hemispheres (see the
+    /// doc comment on `GrassmannManifold::parallel_transport`), because a line
+    /// is represented by ±q and the horizontal tangent space is the same for
+    /// either sign. This had no direct test: transporting the SAME tangent
+    /// along paths to the near (`dot > 0`) and far (`dot < 0`) representative
+    /// of the identical target line must give the identical result, or the
+    /// alignment branch is not doing its job.
+    #[test]
+    fn parallel_transport_gr1n_is_invariant_to_target_representative_sign() {
+        let gr = GrassmannManifold::new(1, 3).expect("Gr(1,3)");
+        let y = array![1.0_f64, 0.0, 0.0];
+        let theta = 0.3_f64;
+        let z_near = array![theta.cos(), theta.sin(), 0.0];
+        let z_far = z_near.mapv(|x| -x);
+        assert!(dot(y.view(), z_near.view()) > 0.0);
+        assert!(dot(y.view(), z_far.view()) < 0.0);
+
+        let h = array![0.0_f64, 0.5, -0.3]; // orthogonal to y: horizontal at y
+
+        let t_near = gr
+            .parallel_transport(path2(y.view(), z_near.view()).view(), h.view())
+            .expect("Γ via near representative");
+        let t_far = gr
+            .parallel_transport(path2(y.view(), z_far.view()).view(), h.view())
+            .expect("Γ via far representative");
+
+        for (i, (&a, &b)) in t_near.iter().zip(t_far.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-10,
+                "component {i}: near-rep transport {a:.12e} != far-rep transport {b:.12e}"
+            );
+        }
+    }
+}
