@@ -371,10 +371,38 @@ pub(crate) fn priority_tiered_rank_from_gram(
             rank_tol: 0.0,
         };
     }
-    // Working Schur-complement copy of the Gram and its diagonal residuals.
-    let mut g = gram.clone();
+    // WEIGHT-INVARIANT RANK. Identifiability (column rank) is invariant to a
+    // positive per-column scaling — a diagonal congruence `D^{-1/2} G D^{-1/2}`
+    // preserves rank and inertia exactly — so rank the DIAGONALLY-EQUILIBRATED
+    // Gram, not the raw one. Without this the pivot tolerance below is relative
+    // to the LARGEST column norm (`leading_diag`), so a single stiff direction
+    // inflates `tol` until genuinely independent, well-conditioned columns fall
+    // beneath it and are mislabeled rank-deficient. Concretely, the
+    // marginal-slope effective Jacobian carries the per-row chain weight
+    // `c_i = sqrt(1 + (s·g_i)²)`, which made one direction σ₁ ≈ 8.7e7 while the
+    // other eleven were σ ∈ [37, 4.8e-2] (absolutely well-conditioned): the raw
+    // relative cutoff dropped all eleven and reported range_rank 1/12, refusing a
+    // fully identified time surface. Equilibrating to unit diagonals makes the
+    // cutoff see the true column CORRELATION structure — collinear columns still
+    // collapse (correlation → 1, residual → 0), only benign scale differences are
+    // neutralized. Zero-diagonal columns stay zero (dropped) via the unit
+    // fallback.
+    let scale: Vec<f64> = (0..p)
+        .map(|j| {
+            let dj = gram[[j, j]].max(0.0);
+            if dj > 0.0 { dj.sqrt() } else { 1.0 }
+        })
+        .collect();
+    let mut g = Array2::<f64>::zeros((p, p));
+    for i in 0..p {
+        for j in 0..p {
+            g[[i, j]] = gram[[i, j]] / (scale[i] * scale[j]);
+        }
+    }
+    // Working Schur-complement Gram (equilibrated) and its diagonal residuals.
     let mut d: Vec<f64> = (0..p).map(|j| g[[j, j]].max(0.0)).collect();
-    // Leading pivot magnitude = largest initial column norm = max √diagonal.
+    // Leading pivot magnitude of the equilibrated Gram (≈ 1 for any column with a
+    // non-zero norm), so the tolerance is now scale-free.
     let leading_diag = d.iter().cloned().fold(0.0_f64, f64::max).sqrt();
     let tol = rank_alpha * f64::EPSILON * (m_rows.max(p).max(1) as f64) * leading_diag.max(1.0);
     let tol_sq = tol * tol;
