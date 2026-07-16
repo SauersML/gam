@@ -4373,6 +4373,36 @@ impl CustomFamily for OneStepReturnedSaddleFamily {
         Ok(Some(self.hessian(x, y)))
     }
 
+    /// Exact directional derivative of `hessian(x, y)` along `(dx, dy)` —
+    /// required because this fixture declares a β-dependent explicit joint
+    /// Hessian, and the β-dependent LAML value carries the gam#1395
+    /// moving-Hessian IFT log-det response, which consumes dH even for
+    /// value-only outer evaluations.
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let (x, y) = self.coordinates(states)?;
+        if d_beta_flat.len() != 2 {
+            return Err(format!(
+                "returned-saddle dH direction must have length 2, got {}",
+                d_beta_flat.len()
+            ));
+        }
+        let (dx, dy) = (d_beta_flat[0], d_beta_flat[1]);
+        let displacement = x - self.target;
+        let target_squared = self.target * self.target;
+        let off_diagonal = 4.0 * (dx * y + dy * displacement) / target_squared;
+        Ok(Some(array![
+            [4.0 * dy * y / target_squared, off_diagonal],
+            [
+                off_diagonal,
+                4.0 * dx * displacement / target_squared + 12.0 * dy * y
+            ],
+        ]))
+    }
+
     fn exact_newton_joint_hessian_workspace(
         &self,
         states: &[ParameterBlockState],
