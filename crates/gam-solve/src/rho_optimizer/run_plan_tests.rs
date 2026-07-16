@@ -6464,3 +6464,173 @@ fn exact_final_cache_hit_skips_outer_validation() {
         "exact final hit should not evaluate the outer objective"
     );
 }
+
+// ─── #2334 terminal-coefficient-mode reset for cap-less mode owners ──
+//
+// The terminal certification sequence installs the selected point twice at
+// `result.rho`: once via `finalize_outer_result` (where a mode-owning
+// objective installs its owned coefficient mode) and once via the analytic
+// re-eval in `certify_outer_optimality` (which sets `result.final_value`). On
+// a nonconvex / bimodal inner solve those two evaluations can land in
+// DIFFERENT coefficient basins unless each re-installs from the same clean
+// baseline through `reset()`. That reset was gated solely on
+// `config.outer_inner_cap.is_some()`, which the custom-family fit never sets
+// (it holds its inner cap in a different field), so the reset never fired and
+// the downstream bitwise bind `terminal_mode.objective == final_value` could
+// spuriously fail. `owns_terminal_coefficient_mode()` now forces that reset
+// independently of the cap.
+
+/// A deterministic stand-in for a warm-start-sensitive bimodal inner solve.
+///
+/// Each derivative-bearing terminal evaluation (`eval` / `eval_with_order` /
+/// `finalize`) reads a warm-parity flag: in the "bumped" parity the inner
+/// solve lands in a basin whose objective is offset by `BASIN_BUMP`; every
+/// such evaluation flips the parity, modeling an inner solve whose consecutive
+/// warm-started solves alternate basins. `reset()` re-baselines the parity to
+/// the un-bumped basin. The outer gradient is basin-independent (`= ρ`), so
+/// the fit still certifies stationarity at ρ = 0 regardless of basin — exactly
+/// the real defect's shape, where the two inner optima share the outer
+/// gradient but differ in objective value.
+///
+/// Consequence: with NO terminal reset, `finalize` and the certifying re-eval
+/// are one flip apart, so their objective values differ by `BASIN_BUMP`
+/// (whole-basin disagreement, not roundoff). With the terminal reset, both
+/// start from the un-bumped baseline and agree bitwise.
+struct BimodalTerminalObjective {
+    owns_terminal: bool,
+    warm_bumped: Arc<Mutex<bool>>,
+    finalize_installed: Arc<Mutex<Option<f64>>>,
+}
+
+const BASIN_BUMP: f64 = 2.6; // ~ the observed terminal(9.1931e2) − certified(9.1671e2) gap
+
+impl BimodalTerminalObjective {
+    fn basin_eval(&self, rho: &Array1<f64>) -> OuterEval {
+        let mut warm = self.warm_bumped.lock().unwrap();
+        let bump = if *warm { BASIN_BUMP } else { 0.0 };
+        *warm = !*warm; // consecutive warm-started solves alternate basins
+        OuterEval {
+            cost: 0.5 * rho.dot(rho) + bump,
+            gradient: rho.clone(),
+            hessian: HessianValue::Unavailable,
+            inner_beta_hint: None,
+        }
+    }
+}
+
+impl OuterObjective for BimodalTerminalObjective {
+    fn capability(&self) -> OuterCapability {
+        OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Unavailable,
+            n_params: 1,
+            psi_dim: 0,
+            fixed_point_available: false,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: true,
+        }
+    }
+    fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        // The basin-independent value: keeps the search / diagnostic FD probes
+        // clean so convergence is driven purely by the (basin-independent)
+        // gradient. Only the derivative-bearing terminal installers carry the
+        // basin offset.
+        Ok(0.5 * rho.dot(rho))
+    }
+    fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+        Ok(self.basin_eval(rho))
+    }
+    fn eval_with_order(
+        &mut self,
+        rho: &Array1<f64>,
+        _order: OuterEvalOrder,
+    ) -> Result<OuterEval, EstimationError> {
+        Ok(self.basin_eval(rho))
+    }
+    fn finalize_outer_result(
+        &mut self,
+        rho: &Array1<f64>,
+        _plan: &OuterPlan,
+    ) -> Result<(), EstimationError> {
+        // Install the owned coefficient mode: record the objective value the
+        // mode carries, exactly as the custom-family evaluator does.
+        let installed = self.basin_eval(rho).cost;
+        *self.finalize_installed.lock().unwrap() = Some(installed);
+        Ok(())
+    }
+    fn owns_terminal_coefficient_mode(&self) -> bool {
+        self.owns_terminal
+    }
+    fn reset(&mut self) {
+        *self.warm_bumped.lock().unwrap() = false;
+    }
+    fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+        // The bimodal basin is carried by `warm_bumped`, not an inner-β slot.
+        Ok(SeedOutcome::NoSlot)
+    }
+}
+
+fn run_bimodal_terminal(owns_terminal: bool) -> (f64, f64) {
+    let warm_bumped = Arc::new(Mutex::new(false));
+    let finalize_installed = Arc::new(Mutex::new(None));
+    let mut obj = BimodalTerminalObjective {
+        owns_terminal,
+        warm_bumped: Arc::clone(&warm_bumped),
+        finalize_installed: Arc::clone(&finalize_installed),
+    };
+    // Seed AT the stationary point (∇ = ρ = 0) so the outer search certifies
+    // at iteration 0 and control passes straight into the terminal sequence.
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_initial_rho(array![0.0])
+        .with_screen_initial_rho(false)
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
+    let result = problem
+        .run(&mut obj, "bimodal-terminal")
+        .expect("stationary seed must certify");
+    assert!(result.converged, "stationary seed must converge");
+    let installed = finalize_installed
+        .lock()
+        .unwrap()
+        .expect("finalize must have installed a terminal mode");
+    (installed, result.final_value)
+}
+
+#[test]
+fn terminal_reset_binds_bimodal_mode_owner_bitwise() {
+    // WITH the ownership flag: the terminal reset fires before BOTH the
+    // finalize install and the certifying re-eval, so the mode's objective and
+    // the certified value come from the same un-bumped baseline — bitwise equal.
+    let (installed, final_value) = run_bimodal_terminal(true);
+    assert_eq!(
+        installed.to_bits(),
+        final_value.to_bits(),
+        "terminal-coefficient-mode owner: finalize-installed objective ({installed:.17e}) \
+         must bitwise-match the certified final_value ({final_value:.17e})",
+    );
+}
+
+#[test]
+fn without_ownership_flag_bimodal_terminal_bind_fails() {
+    // WITHOUT the flag (and no outer_inner_cap wired, exactly the custom-family
+    // situation): no terminal reset, so finalize and the certifying re-eval are
+    // one warm-parity flip apart and settle in different basins — a whole-basin
+    // bitwise mismatch, i.e. the spurious bind failure this fix removes.
+    let (installed, final_value) = run_bimodal_terminal(false);
+    assert_ne!(
+        installed.to_bits(),
+        final_value.to_bits(),
+        "control: without the ownership flag the bimodal finalize/certify pair must disagree",
+    );
+    assert!(
+        (installed - final_value).abs() >= BASIN_BUMP - 1e-9,
+        "the disagreement must be a whole-basin gap (~{BASIN_BUMP}), not roundoff: \
+         installed={installed:.17e} final_value={final_value:.17e}",
+    );
+}

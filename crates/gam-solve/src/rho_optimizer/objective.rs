@@ -810,6 +810,13 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         self.inner.terminal_eval_order()
     }
 
+    fn owns_terminal_coefficient_mode(&self) -> bool {
+        // Forward the wrapped objective's ownership: the terminal reset must
+        // still fire for a cap-less mode owner (e.g. a custom family) when its
+        // fit routes through a cache session and is wrapped here (#2334).
+        self.inner.owns_terminal_coefficient_mode()
+    }
+
     fn reactive_domain_scalar_contract(
         &self,
     ) -> Result<Option<crate::continuation_path::ContinuationScalarContract>, EstimationError> {
@@ -1337,6 +1344,14 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
 
     fn terminal_eval_order(&self) -> Option<OuterEvalOrder> {
         self.inner.terminal_eval_order()
+    }
+
+    fn owns_terminal_coefficient_mode(&self) -> bool {
+        // Forward through the canonicalizing permutation wrapper so a cap-less
+        // mode owner (e.g. a custom family) still gets the terminal reset when
+        // its outer search runs in a non-identity canonical coordinate layout
+        // (#2334). Ownership is coordinate-order-invariant.
+        self.inner.owns_terminal_coefficient_mode()
     }
 
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
