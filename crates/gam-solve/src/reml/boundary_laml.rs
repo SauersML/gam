@@ -250,7 +250,7 @@ mod tests {
         // the criterion reduces byte-identically to today's LAML there. Every
         // case keeps s√h ≥ 9, well past where |logΦ(s√h)| drops below the 1e-6
         // limit tolerance (|logΦ(z)| ≈ φ(z)/z, ~1e-5 at z≈4.2 but ~1e-19 at z≈9).
-        for &(s, h) in &[(10.0_f64, 1.0), (30.0, 4.0), (13.0, 0.5)] {
+        for &(s, h) in &[(10.0_f64, 1.0_f64), (30.0, 4.0), (13.0, 0.5)] {
             let z = s * h.sqrt();
             assert!(z >= 9.0, "far-interior test case must keep s√h ≥ 9, got {z}");
             let got = log_interior_boundary_g(s, h);
