@@ -19,6 +19,16 @@ pub(crate) struct ExactJointModeCurvatureCertificate {
     pub(crate) workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     pub(crate) minimum_whitened_eigenvalue: f64,
     pub(crate) numerical_floor: f64,
+    /// Coefficient-space direction of the minimum-curvature mode, expressed in
+    /// the FULL joint layout (mapped through the active-face tangent when the
+    /// mode was certified on a reduced face). Populated only when the mode has
+    /// resolvable negative curvature — the direction a saddle-escape steps
+    /// along. `None` otherwise (PSD mode, fully pinned face, or no free
+    /// direction). Its exact curvature is `minimum_whitened_eigenvalue`: for the
+    /// whitened unit eigenvector `v` with eigenvalue `γ_min`, the raw
+    /// coefficient direction `δ = D^{-1/2} v` satisfies `δᵀ H_pen δ = γ_min`, so
+    /// a step `s·δ` lowers the quadratic model by `½ s² |γ_min|`.
+    pub(crate) negative_curvature_direction: Option<Array1<f64>>,
 }
 
 impl ExactJointModeCurvatureCertificate {
@@ -473,13 +483,17 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
     // CTN cycle-97 witness: KKT-certified with tangent min_eig = -7.9, which
     // then killed the downstream SPD determinant). A fully pinned mode has no
     // free directions and is trivially certified.
-    let (certificate_matrix, certificate_metric) = match active_constraints {
+    // Retain the active-face tangent `Z` so a resolved negative-curvature mode
+    // (certified in the reduced tangent space) can be mapped back into the full
+    // joint coefficient layout as a saddle-escape direction.
+    let (certificate_matrix, certificate_metric, tangent) = match active_constraints {
         Some(active) => match active_constraint_tangent_geometry(&active.a)? {
             ActiveConstraintTangentGeometry::FullyPinned => {
                 return Ok(ExactJointModeCurvatureCertificate {
                     workspace,
                     minimum_whitened_eigenvalue: f64::INFINITY,
                     numerical_floor: 0.0,
+                    negative_curvature_direction: None,
                 });
             }
             ActiveConstraintTangentGeometry::Tangent(z) => {
@@ -494,10 +508,10 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
                     }
                     reduced_metric[j] = projected;
                 }
-                (reduced, reduced_metric)
+                (reduced, reduced_metric, Some(z))
             }
         },
-        None => (hessian, metric),
+        None => (hessian, metric, None),
     };
     let zero_rhs = Array1::<f64>::zeros(certificate_matrix.nrows());
     let spectrum = whitened_spectrum::WhitenedHessianSpectrum::decompose(
@@ -507,10 +521,215 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
         KKT_REFUSAL_RANK_TOL,
     )?;
     let minimum_whitened_eigenvalue = spectrum.gamma.iter().copied().fold(f64::INFINITY, f64::min);
+    // A strict saddle exposes a resolvable negative-curvature eigenvector. Map
+    // that whitened mode back to the raw coefficient direction `δ = D^{-1/2} v`
+    // (curvature `δᵀ H_pen δ = γ_min` for the unit eigenvector `v`), then lift it
+    // through the tangent `Z` when the mode was certified on a reduced face. The
+    // resulting full-space direction is the one an inner saddle-escape steps
+    // along; a PSD mode carries no such direction.
+    let negative_curvature_direction = if minimum_whitened_eigenvalue < -spectrum.numerical_floor {
+        let mut argmin = 0usize;
+        let mut best = f64::INFINITY;
+        for (index, &value) in spectrum.gamma.iter().enumerate() {
+            if value < best {
+                best = value;
+                argmin = index;
+            }
+        }
+        let eigenvector = spectrum.evecs.column(argmin);
+        let reduced_direction = Array1::from_iter(
+            spectrum
+                .d_inv_sqrt
+                .iter()
+                .zip(eigenvector.iter())
+                .map(|(scale, component)| scale * component),
+        );
+        let full_direction = match tangent.as_ref() {
+            Some(z) => z.dot(&reduced_direction),
+            None => reduced_direction,
+        };
+        if full_direction.iter().all(|value| value.is_finite()) {
+            Some(full_direction)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     Ok(ExactJointModeCurvatureCertificate {
         workspace,
         minimum_whitened_eigenvalue,
         numerical_floor: spectrum.numerical_floor,
+        negative_curvature_direction,
+    })
+}
+
+/// Maximum number of times the constrained joint-Newton inner solve steps off a
+/// first-order KKT point that certifies as a strict saddle on the active-face
+/// tangent before it refuses the fit.
+///
+/// A first-order-stationary point with a resolvable negative face-tangent
+/// eigenvalue is NOT a Laplace mode: the penalized objective strictly decreases
+/// along that eigenvector, so the standard second-order response is to step
+/// along it and continue the solve, not to refuse. Two escapes clear any
+/// isolated saddle the fixed-penalty coefficient objective exposes on the way to
+/// a mode; a point that still certifies as a saddle after two feasible escapes
+/// is evidence of a genuinely non-modal ρ the outer optimizer must reject, so
+/// the honest typed refusal is kept on the final attempt.
+const MAX_SADDLE_ESCAPES: usize = 2;
+
+/// Verdict of second-order certification at a constrained first-order KKT point.
+enum ConstrainedModeResolution {
+    /// The active-face-tangent curvature is PSD: a genuine Laplace mode.
+    Certified {
+        workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    },
+    /// The point is a strict face-tangent saddle. Step `alpha · direction` (in
+    /// the full joint layout, `alpha` carrying the feasible sign) strictly
+    /// lowers the objective and stays feasible; the caller applies it and
+    /// resumes the inner solve.
+    Escape {
+        direction: Array1<f64>,
+        alpha: f64,
+        lambda_min: f64,
+    },
+}
+
+/// Second-order certification of a constrained first-order KKT point, with a
+/// bounded feasible saddle-escape when the active-face tangent is indefinite.
+///
+/// `saddle_escapes_used` is the number of escapes already spent this solve; once
+/// it reaches [`MAX_SADDLE_ESCAPES`] a still-indefinite point yields the honest
+/// typed refusal instead of another escape.
+fn resolve_constrained_converged_mode<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    joint_mode_diagonal_ridge: f64,
+    joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
+    total_p: usize,
+    block_constraints: &[Option<ConstraintSet>],
+    cached_active_sets: &[Option<Vec<usize>>],
+    saddle_escapes_used: usize,
+    objective_tol: f64,
+) -> Result<ConstrainedModeResolution, String> {
+    let mode_active_block =
+        assemble_active_constraint_block(block_constraints, cached_active_sets, ranges, total_p);
+    let certificate = exact_joint_mode_curvature_certificate(
+        family,
+        states,
+        specs,
+        options,
+        ranges,
+        s_lambdas,
+        joint_mode_diagonal_ridge,
+        joint_bundle,
+        total_p,
+        mode_active_block.as_ref(),
+    )?;
+    let lambda_min = certificate.minimum_whitened_eigenvalue;
+    let numerical_floor = certificate.numerical_floor;
+    if !certificate.has_resolvable_negative_curvature() {
+        log::info!(
+            "[PIRLS/joint-Newton mode certificate] constrained returned beta certified from fresh exact curvature: lambda_min={lambda_min:.6e}, floor={numerical_floor:.6e}",
+        );
+        return Ok(ConstrainedModeResolution::Certified {
+            workspace: certificate.workspace,
+        });
+    }
+    if saddle_escapes_used >= MAX_SADDLE_ESCAPES {
+        return Err(format!(
+            "joint Newton tentative convergence rejected by fresh exact returned-mode curvature: lambda_min={lambda_min:.6e} < -floor={numerical_floor:.6e}; an indefinite coefficient point cannot define a Laplace mode (after {saddle_escapes_used} negative-curvature escapes)",
+        ));
+    }
+    let Some(direction) = certificate.negative_curvature_direction else {
+        return Err(format!(
+            "joint Newton returned-mode curvature is a strict saddle (lambda_min={lambda_min:.6e} < -floor={numerical_floor:.6e}) but the certificate exposed no finite escape direction",
+        ));
+    };
+    // Along the raw coefficient direction `δ` the exact curvature is `γ_min`
+    // (`δᵀ H_pen δ = γ_min`), so a step `s·δ` lowers the quadratic model by
+    // `½ s² |γ_min|`. Pick the `s` at which that guaranteed second-order decrease
+    // clears solver noise, then cap the DISPLACEMENT at a fraction of the current
+    // coefficient scale so the escape stays local.
+    let gamma_min = lambda_min.abs();
+    if !(gamma_min.is_finite() && gamma_min > 0.0) {
+        return Err(format!(
+            "saddle-escape could not size a step: non-finite curvature magnitude lambda_min={lambda_min:.6e}",
+        ));
+    }
+    let direction_norm = direction.dot(&direction).sqrt();
+    if !(direction_norm.is_finite() && direction_norm > 0.0) {
+        return Err("saddle-escape direction is degenerate (zero or non-finite norm)".to_string());
+    }
+    let beta = flatten_state_betas(states, specs);
+    let beta_norm = beta.dot(&beta).sqrt();
+    let decrease_scaled = (2.0 * objective_tol.max(1e-8) / gamma_min).sqrt();
+    let displacement_cap = 0.1 * (1.0 + beta_norm) / direction_norm;
+    let base_magnitude = decrease_scaled.min(displacement_cap);
+    // Feasibility. The tangent-projected direction satisfies the ACTIVE rows to
+    // first order; truncate strictly inside the first INACTIVE blocker, in the
+    // scaled-slack terms the active-set solvers use (row norm cancels in the
+    // ratio). Both signs of `δ` give the same second-order decrease, so choose
+    // the sign that admits the longer feasible step.
+    let joint_active =
+        flatten_joint_active_set(cached_active_sets, block_constraints).unwrap_or_default();
+    let mut feasible_positive = f64::INFINITY;
+    let mut feasible_negative = f64::INFINITY;
+    if let Some(joint_constraints) =
+        assemble_joint_linear_constraints(block_constraints, ranges, total_p)?
+    {
+        let values_beta = joint_constraints.values(beta.view())?;
+        let values_direction = joint_constraints.values(direction.view())?;
+        for row in 0..joint_constraints.nrows() {
+            if joint_active.contains(&row) {
+                continue;
+            }
+            let norm = joint_constraints.row_norm(row)?;
+            if !(norm.is_finite() && norm > 0.0) {
+                continue;
+            }
+            let bound = joint_constraints.bound(row)?;
+            if bound == f64::NEG_INFINITY {
+                continue;
+            }
+            let scaled_slack = (values_beta[row] - bound) / norm;
+            if scaled_slack < 0.0 {
+                continue;
+            }
+            let scaled_rate = values_direction[row] / norm;
+            if scaled_rate < 0.0 {
+                feasible_positive = feasible_positive.min(scaled_slack / -scaled_rate);
+            } else if scaled_rate > 0.0 {
+                feasible_negative = feasible_negative.min(scaled_slack / scaled_rate);
+            }
+        }
+    }
+    let (sign, feasible_cap) = if feasible_positive >= feasible_negative {
+        (1.0_f64, feasible_positive)
+    } else {
+        (-1.0_f64, feasible_negative)
+    };
+    let feasible_cap = if feasible_cap.is_finite() {
+        // Land strictly inside the blocker (matching the reduced-face solver's
+        // 1e-12 inward shave), never on or past it.
+        feasible_cap * (1.0 - 1e-12)
+    } else {
+        feasible_cap
+    };
+    let magnitude = base_magnitude.min(feasible_cap);
+    if !(magnitude.is_finite() && magnitude > 0.0) {
+        return Err(format!(
+            "joint Newton returned-mode curvature is a strict saddle (lambda_min={lambda_min:.6e} < -floor={numerical_floor:.6e}) with no feasible escape length along the negative-curvature tangent",
+        ));
+    }
+    Ok(ConstrainedModeResolution::Escape {
+        direction,
+        alpha: sign * magnitude,
+        lambda_min,
     })
 }
 
@@ -1389,6 +1608,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // More-Sorensen hard case from the same beta.
         let mut returned_mode_curvature_pending = false;
         let mut returned_mode_curvature_certified = false;
+        // Constrained analogue of `returned_mode_curvature_pending`: a first-order
+        // KKT point on an active face is tentative until the next cycle head
+        // certifies its active-face-tangent curvature. On a strict face-tangent
+        // saddle that head escapes along the negative-curvature direction and
+        // resumes; `saddle_escapes_used` bounds those escapes at
+        // `MAX_SADDLE_ESCAPES` before the honest typed refusal.
+        let mut returned_constrained_mode_pending = false;
+        let mut saddle_escapes_used = 0usize;
 
         // Fit-level wall-clock budget guard at inner-solve ENTRY. The
         // per-cycle guard below only fires from `cycle > 0`, so it returns a
@@ -1404,6 +1631,89 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         'joint_newton_cycles: for cycle in 0..inner_loop_hard_ceiling {
             if cycle >= inner_max_cycles {
                 break;
+            }
+            // Constrained returned-mode second-order certification (gam#979).
+            //
+            // A constrained first-order KKT point reached last cycle is tentative
+            // until its active-face-tangent curvature is certified. Do that here,
+            // at the cycle head, before rebuilding the step: a strict face-tangent
+            // saddle (curvature the first-order certificate cannot see, the #979
+            // CTN witness) is ESCAPED along its negative-curvature direction and
+            // the solve resumes at the escaped, feasible point — the standard
+            // second-order response to an indefinite stationary point, not a
+            // refusal. Only when `MAX_SADDLE_ESCAPES` feasible escapes still land
+            // on a saddle does the honest typed refusal fire (inside the helper).
+            if returned_constrained_mode_pending {
+                returned_constrained_mode_pending = false;
+                let escape_block_constraints =
+                    collect_block_linear_constraints(family, &states, specs)?;
+                let escape_objective_tol = inner_tol * (1.0 + lastobjective.abs());
+                match resolve_constrained_converged_mode(
+                    family,
+                    &states,
+                    specs,
+                    options,
+                    &ranges,
+                    &s_lambdas,
+                    joint_mode_diagonal_ridge,
+                    joint_bundle,
+                    total_p,
+                    &escape_block_constraints,
+                    &cached_active_sets,
+                    saddle_escapes_used,
+                    escape_objective_tol,
+                )? {
+                    ConstrainedModeResolution::Certified { workspace } => {
+                        cached_joint_workspace = workspace;
+                        returned_mode_curvature_certified = true;
+                        converged = true;
+                        cycles_done = cycle;
+                        break;
+                    }
+                    ConstrainedModeResolution::Escape {
+                        direction,
+                        alpha,
+                        lambda_min,
+                    } => {
+                        for (block_idx, (start, _)) in ranges.iter().copied().enumerate() {
+                            for (coefficient_idx, coefficient) in
+                                states[block_idx].beta.iter_mut().enumerate()
+                            {
+                                *coefficient += alpha * direction[start + coefficient_idx];
+                            }
+                        }
+                        refresh_all_block_etas(family, specs, &mut states)?;
+                        saddle_escapes_used += 1;
+                        log::info!(
+                            "[PIRLS/joint-Newton saddle-escape] attempt={} lambda_min={:.6e} alpha={:.6e}",
+                            saddle_escapes_used,
+                            lambda_min,
+                            alpha,
+                        );
+                        // The escaped point is a fresh iterate; every cross-cycle
+                        // progress statistic collected at the saddle is stale.
+                        converged = false;
+                        returned_mode_curvature_certified = false;
+                        last_cycle_residual_below_tol = false;
+                        last_cycle_obj_change_below_tol = false;
+                        min_certified_residual = f64::INFINITY;
+                        best_residual_seen = f64::INFINITY;
+                        cycles_since_residual_improved = 0;
+                        residual_descent_history.clear();
+                        tr_clamped_during_stall = false;
+                        residual_rate_history.clear();
+                        merit_window.clear();
+                        prev_rejected_trust_radius = None;
+                        consecutive_held_rejected_cycles = 0;
+                        prev_rejected_first_attempt_objective = None;
+                        consecutive_identical_rejected_cycles = 0;
+                        consecutive_all_reject_at_floor_cycles = 0;
+                        last_joint_math = None;
+                        last_kkt_refusal_report = None;
+                        prev_kkt_norm = None;
+                        geometric_tail_history.clear();
+                    }
+                }
             }
             let verbose_cycle = cycle == 0
                 || cycle + 1 == inner_max_cycles
@@ -3876,6 +4186,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     returned_mode_curvature_certified = joint_constraints.is_none()
                         && joint_jeffreys_subspace.is_none()
                         && joint_spectrum.is_some();
+                    // Constrained (non-Jeffreys) acceptance is tentative until the
+                    // next cycle head certifies the active-face-tangent curvature
+                    // and escapes a strict saddle (gam#979). A trust-floor accept
+                    // is a common saddle signature (negative curvature keeps every
+                    // step rejected), so it must route through the same check.
+                    if joint_constraints.is_some() && joint_jeffreys_subspace.is_none() {
+                        returned_constrained_mode_pending = true;
+                        continue 'joint_newton_cycles;
+                    }
                     break;
                 }
                 if secondary_ok {
@@ -4059,6 +4378,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // panic on a fully resolved fit.
                 if last_cycle_residual_below_tol && last_cycle_obj_change_below_tol {
                     converged = true;
+                    // Constrained (non-Jeffreys) acceptance is tentative until the
+                    // next cycle head certifies the active-face-tangent curvature
+                    // and escapes a strict saddle (gam#979).
+                    if joint_constraints.is_some() && joint_jeffreys_subspace.is_none() {
+                        returned_constrained_mode_pending = true;
+                        returned_mode_curvature_certified = false;
+                        continue 'joint_newton_cycles;
+                    }
                     break;
                 }
                 // Fully-rejected stall guard. See the constant declaration
@@ -4327,6 +4654,17 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     converged = true;
                     if joint_constraints.is_none() && joint_jeffreys_subspace.is_none() {
                         returned_mode_curvature_pending = true;
+                        returned_mode_curvature_certified = false;
+                        continue 'joint_newton_cycles;
+                    }
+                    // Constrained (non-Jeffreys) first-order convergence is
+                    // tentative until the next cycle head certifies the
+                    // active-face-tangent curvature and, on a strict saddle,
+                    // escapes along it (gam#979). Jeffreys-augmented families keep
+                    // their first-order contract and their own augmented-objective
+                    // certificate, so they still break straight to the post-loop.
+                    if joint_jeffreys_subspace.is_none() {
+                        returned_constrained_mode_pending = true;
                         returned_mode_curvature_certified = false;
                         continue 'joint_newton_cycles;
                     }
