@@ -1607,50 +1607,6 @@ impl SaeManifoldTerm {
         })
     }
 
-    /// PATH C (#2253) CH5 test-support — the max `|dense − production|` of the
-    /// θ-adjoint reconstruction over the `(t, β)` blocks, for the joint (`inv = G`)
-    /// and coordinate-block (`inv = h_bd`) legs. A failing FD gate uses this to
-    /// separate a bug in the dense `dh` + Daleckii–Krein reproduction (this diverges
-    /// from the trusted production builder) from a bug in the twist / rank-charge
-    /// assembly (this is ~0 but the FD still reds). Both should be at solver noise.
-    /// Only the in-crate test module calls this, so it must not exist in the
-    /// non-test lib build (integration-test builds compile the lib without
-    /// `cfg(test)` and `-D warnings` turns the dead item into a hard error).
-    #[cfg(test)]
-    pub(crate) fn ch5_dense_theta_adjoint_selfcheck(
-        &self,
-        rho: &SaeManifoldRho,
-        cache: &ArrowFactorCache,
-    ) -> Result<(f64, f64), String> {
-        let solver = DeflatedArrowSolver::plain(cache);
-        let g = self.materialize_joint_inverse(cache, &solver)?;
-        let h_bd = self.materialize_block_diag_t_inverse(cache);
-        let dense_joint =
-            self.logdet_theta_adjoint_dense(rho, cache, &g, ThetaAdjointDhChannel::All)?;
-        let dense_tt =
-            self.logdet_theta_adjoint_dense(rho, cache, &h_bd, ThetaAdjointDhChannel::All)?;
-        let prod_joint = self.logdet_theta_adjoint(rho, cache, &solver)?;
-        let prod_tt = self.coordinate_block_logdet_theta_adjoint(rho, cache, &solver)?;
-        let max_diff = |a: &SaeArrowVector, b: &SaeArrowVector| -> f64 {
-            let t =
-                a.t.iter()
-                    .zip(b.t.iter())
-                    .map(|(x, y)| (x - y).abs())
-                    .fold(0.0_f64, f64::max);
-            let beta = a
-                .beta
-                .iter()
-                .zip(b.beta.iter())
-                .map(|(x, y)| (x - y).abs())
-                .fold(0.0_f64, f64::max);
-            t.max(beta)
-        };
-        Ok((
-            max_diff(&dense_joint, &prod_joint),
-            max_diff(&dense_tt, &prod_tt),
-        ))
-    }
-
     /// PATH C (#2253) CH5 — the exact fixed-stratum second derivative of the
     /// outer gradient's third-order forward-sensitivity channel
     /// `g3[j] = −½⟨a, g_ρ,j⟩`, `a = A⁺Γ_eff`.
@@ -2752,5 +2708,56 @@ impl SaeManifoldTerm {
             hessian.nrows(),
             hessian.ncols()
         ))
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::{
+        ArrowFactorCache, DeflatedArrowSolver, SaeArrowVector, SaeManifoldRho,
+        ThetaAdjointDhChannel,
+    };
+
+    impl super::SaeManifoldTerm {
+        /// PATH C (#2253) CH5 test-support — the max `|dense − production|` of the
+        /// θ-adjoint reconstruction over the `(t, β)` blocks, for the joint
+        /// (`inv = G`) and coordinate-block (`inv = h_bd`) legs. A failing FD gate
+        /// uses this to separate a bug in the dense `dh` + Daleckii–Krein
+        /// reproduction (this diverges from the trusted production builder) from a
+        /// bug in the twist / rank-charge assembly (this is ~0 but the FD still
+        /// reds). Both should be at solver noise.
+        pub(crate) fn ch5_dense_theta_adjoint_selfcheck(
+            &self,
+            rho: &SaeManifoldRho,
+            cache: &ArrowFactorCache,
+        ) -> Result<(f64, f64), String> {
+            let solver = DeflatedArrowSolver::plain(cache);
+            let g = self.materialize_joint_inverse(cache, &solver)?;
+            let h_bd = self.materialize_block_diag_t_inverse(cache);
+            let dense_joint =
+                self.logdet_theta_adjoint_dense(rho, cache, &g, ThetaAdjointDhChannel::All)?;
+            let dense_tt =
+                self.logdet_theta_adjoint_dense(rho, cache, &h_bd, ThetaAdjointDhChannel::All)?;
+            let prod_joint = self.logdet_theta_adjoint(rho, cache, &solver)?;
+            let prod_tt = self.coordinate_block_logdet_theta_adjoint(rho, cache, &solver)?;
+            let max_diff = |a: &SaeArrowVector, b: &SaeArrowVector| -> f64 {
+                let t =
+                    a.t.iter()
+                        .zip(b.t.iter())
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0.0_f64, f64::max);
+                let beta = a
+                    .beta
+                    .iter()
+                    .zip(b.beta.iter())
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0_f64, f64::max);
+                t.max(beta)
+            };
+            Ok((
+                max_diff(&dense_joint, &prod_joint),
+                max_diff(&dense_tt, &prod_tt),
+            ))
+        }
     }
 }
