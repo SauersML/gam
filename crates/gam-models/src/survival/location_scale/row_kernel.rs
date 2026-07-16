@@ -3,8 +3,7 @@ use super::*;
 use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar,
-    MappedOrder2Accumulator, OneSeedBatch, OneSeedLane, Order2AtomChannels, Order2Lane,
-    RuntimeJetScalar,
+    MappedOrder2Accumulator, OneSeedBatch, Order2AtomChannels, RuntimeJetScalar,
 };
 use gam_row_macros::row_atom;
 use wide::f64x4;
@@ -1926,33 +1925,6 @@ fn pullback_from_channel_cache(
     }
 }
 
-/// Multiply every channel of a packed batched one-seed scalar by a PER-LANE
-/// factor `s` (one weight per row in the 4-lane batch). Mirrors
-/// [`OneSeed::scale`] (`base.scale`, `eps.scale` = `v·s, g·s, h·s` per part)
-/// lane-for-lane: lane `i` is `to_bits`-identical to the scalar `OneSeed::scale`
-/// on row `i`. This is NOT `mul`-by-a-constant scalar (which would route through
-/// `Order2Lane::mul`'s leading `+0.0` terms and could flip a `-0.0` grad channel
-/// to `+0.0`); the straight per-channel multiply matches the scalar `scale`'s
-/// float ops exactly.
-#[inline]
-fn scale_onesseed_batch_lane(t: &OneSeedBatch<SLS_ROW_K>, s: f64x4) -> OneSeedBatch<SLS_ROW_K> {
-    let sc = |o: &Order2Lane<f64x4, SLS_ROW_K>| {
-        let mut r = *o;
-        r.v = o.v * s;
-        for i in 0..SLS_ROW_K {
-            r.g[i] = o.g[i] * s;
-            for j in 0..SLS_ROW_K {
-                r.h[i][j] = o.h[i][j] * s;
-            }
-        }
-        r
-    };
-    OneSeedLane {
-        base: sc(&t.base),
-        eps: sc(&t.eps),
-    }
-}
-
 /// SIMD 4-rows-per-pass evaluation of [`sls_row_nll`] at the packed one-seed
 /// directional scalar, for a group of FOUR rows that share the SAME gating
 /// signature (`cens_on` = the censored term is active for every lane,
@@ -1968,8 +1940,11 @@ fn scale_onesseed_batch_lane(t: &OneSeedBatch<SLS_ROW_K>, s: f64x4) -> OneSeedBa
 /// non-finite. Batching rows that share a gating signature lets the batch compose
 /// a term ONLY when it is active for all four lanes — where the stack is
 /// guaranteed finite — and skip it entirely otherwise (no dummy `+0.0` add, so no
-/// `-0.0`/`+0.0` skew). Per-row weights enter through
-/// [`scale_onesseed_batch_lane`], so they are exact `to_bits` per lane.
+/// `-0.0`/`+0.0` skew). Per-row/censoring/event weights are folded into each
+/// `compose_unary` coefficient stack (pre-scale) via the shared
+/// [`sls_outer_plan`], exactly as the scalar `sls_row_nll` does — NOT applied as
+/// a post-composition scale, which would round the contracted third channel
+/// differently by 1 ulp — so composition is `to_bits`-identical per lane.
 #[inline]
 fn sls_row_nll_onesseed_batch(
     vars: &[OneSeedBatch<SLS_ROW_K>; SLS_ROW_K],
@@ -1977,84 +1952,36 @@ fn sls_row_nll_onesseed_batch(
     cens_on: bool,
     event_on: bool,
 ) -> OneSeedBatch<SLS_ROW_K> {
-    let pk = |f: [f64; 4]| f64x4::new(f);
     let inv_sigma_entry = vars[7].neg().exp();
     let u0 = vars[0].sub(&vars[4].mul(&inv_sigma_entry));
     let inv_sigma_exit = vars[6].neg().exp();
     let u1 = vars[1].sub(&vars[3].mul(&inv_sigma_exit));
     let g = vars[2].add(&inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5])));
-    let wpk = pk([k[0].w, k[1].w, k[2].w, k[3].w]);
-    let mut nll = scale_onesseed_batch_lane(
-        &u0.compose_unary([
-            pk([k[0].log_s0, k[1].log_s0, k[2].log_s0, k[3].log_s0]),
-            pk([-k[0].r0, -k[1].r0, -k[2].r0, -k[3].r0]),
-            pk([-k[0].dr0, -k[1].dr0, -k[2].dr0, -k[3].dr0]),
-            pk([-k[0].ddr0, -k[1].ddr0, -k[2].ddr0, -k[3].ddr0]),
-            pk([-k[0].dddr0, -k[1].dddr0, -k[2].dddr0, -k[3].dddr0]),
-        ]),
-        wpk,
-    );
-    if cens_on {
-        let cwpk = pk([
-            -(k[0].w * (1.0 - k[0].d)),
-            -(k[1].w * (1.0 - k[1].d)),
-            -(k[2].w * (1.0 - k[2].d)),
-            -(k[3].w * (1.0 - k[3].d)),
-        ]);
-        nll = nll.add(&scale_onesseed_batch_lane(
-            &u1.compose_unary([
-                pk([k[0].log_s1, k[1].log_s1, k[2].log_s1, k[3].log_s1]),
-                pk([-k[0].r1, -k[1].r1, -k[2].r1, -k[3].r1]),
-                pk([-k[0].dr1, -k[1].dr1, -k[2].dr1, -k[3].dr1]),
-                pk([-k[0].ddr1, -k[1].ddr1, -k[2].ddr1, -k[3].ddr1]),
-                pk([-k[0].dddr1, -k[1].dddr1, -k[2].dddr1, -k[3].dddr1]),
-            ]),
-            cwpk,
-        ));
+
+    // Fold the per-row/censoring/event weights into each `compose_unary`
+    // coefficient stack (pre-scale) via the shared `sls_outer_plan`, exactly as
+    // the scalar `sls_row_nll` does, then compose ONCE per index term. The
+    // homogeneous gating signature guarantees all four lanes agree on which
+    // terms are active, so the per-lane plans share the same `Some`/`None`
+    // structure and pack lane-for-lane into the batched coefficient stacks.
+    let plans: [SlsOuterPlan; 4] = std::array::from_fn(|lane| sls_outer_plan(k[lane]));
+    let pack = |get: fn(&SlsOuterPlan) -> [f64; 5]| -> [f64x4; 5] {
+        let per_lane: [[f64; 5]; 4] = std::array::from_fn(|lane| get(&plans[lane]));
+        std::array::from_fn(|order| f64x4::new(std::array::from_fn(|lane| per_lane[lane][order])))
+    };
+
+    let mut nll = u0.compose_unary(pack(|plan| plan.u0));
+    // The scalar collapses the censored and event `u1` contributions into ONE
+    // combined stack (`plan.u1`) and composes it once; mirror that. A
+    // homogeneous group's `u1` term is active exactly when a censored or event
+    // term is active.
+    if cens_on || event_on {
+        let u1_stack = pack(|plan| plan.u1.expect("homogeneous group has an active u1 stack"));
+        nll = nll.add(&u1.compose_unary(u1_stack));
     }
     if event_on {
-        let ewpk = pk([
-            -(k[0].w * k[0].d),
-            -(k[1].w * k[1].d),
-            -(k[2].w * k[2].d),
-            -(k[3].w * k[3].d),
-        ]);
-        nll = nll
-            .add(&scale_onesseed_batch_lane(
-                &u1.compose_unary([
-                    pk([k[0].logphi1, k[1].logphi1, k[2].logphi1, k[3].logphi1]),
-                    pk([k[0].dlogphi1, k[1].dlogphi1, k[2].dlogphi1, k[3].dlogphi1]),
-                    pk([
-                        k[0].d2logphi1,
-                        k[1].d2logphi1,
-                        k[2].d2logphi1,
-                        k[3].d2logphi1,
-                    ]),
-                    pk([
-                        k[0].d3logphi1,
-                        k[1].d3logphi1,
-                        k[2].d3logphi1,
-                        k[3].d3logphi1,
-                    ]),
-                    pk([
-                        k[0].d4logphi1,
-                        k[1].d4logphi1,
-                        k[2].d4logphi1,
-                        k[3].d4logphi1,
-                    ]),
-                ]),
-                ewpk,
-            ))
-            .add(&scale_onesseed_batch_lane(
-                &g.compose_unary([
-                    pk([k[0].log_g, k[1].log_g, k[2].log_g, k[3].log_g]),
-                    pk([k[0].d_log_g, k[1].d_log_g, k[2].d_log_g, k[3].d_log_g]),
-                    pk([k[0].d2_log_g, k[1].d2_log_g, k[2].d2_log_g, k[3].d2_log_g]),
-                    pk([k[0].d3_log_g, k[1].d3_log_g, k[2].d3_log_g, k[3].d3_log_g]),
-                    pk([k[0].d4_log_g, k[1].d4_log_g, k[2].d4_log_g, k[3].d4_log_g]),
-                ]),
-                ewpk,
-            ));
+        let g_stack = pack(|plan| plan.g.expect("homogeneous group has an active g stack"));
+        nll = nll.add(&g.compose_unary(g_stack));
     }
     nll
 }
