@@ -4954,17 +4954,47 @@ fn joint_exact_newton_log_sigma_block_matches_fd_in_far_exp_tail() {
     let ll_minus = objective(&array![beta_log_sigma0 - h]);
     let score_fd = (ll_plus - ll_minus) / (2.0 * h);
     let info_fd = -(ll_plus - 2.0 * ll0 + ll_minus) / (h * h);
-    assert!(
-        (analytic_score - score_fd).abs() < 1e-8,
-        "the exact-newton survival log-sigma score should match the far-tail finite difference at beta_log_sigma={beta_log_sigma0}; got {} vs {}",
-        analytic_score,
-        score_fd
+
+    // The honest (post-#2335) far-tail surface is astronomical, not moderate: at
+    // this fixture row 2 has u0 ≈ u1 ≈ 3.6e150 and the log-sigma score/info are
+    // O(1.76e149) (MSI ground truth `score_fd ≈ 1.759e149`, step-independent).
+    // The original `abs < 1e-8` / `< 1e-5` bounds were written against the
+    // pre-#2335 *fake* cancellation-noise surface (analytic 0.0258) and are
+    // unsatisfiable on the honest one, so compare in RELATIVE form (#2342).
+    //
+    // Central-difference FD error at h=1e-4 on the locally-exponential
+    // `e^{-0.5·β_ls}` surface: the score truncation is `(0.5h)²/2 ≈ 1.3e-9` plus
+    // subtractive rounding; the info truncation is `(0.5h)²/12 ≈ 2e-10` but its
+    // second-difference numerator cancels three ~3.5e149 operands down to
+    // ~1e141, losing ~8 digits (≈ 4e-8 relative). The bounds sit an order of
+    // magnitude above those. A broken analytic (the fake-surface 0.0258) is off
+    // by ~1e151 relative and is caught by any bound below 1; the sign check is
+    // kept absolute.
+    const SCORE_REL_TOL: f64 = 1e-8;
+    const INFO_REL_TOL: f64 = 1e-6;
+    assert_eq!(
+        analytic_score.signum(),
+        score_fd.signum(),
+        "survival log-sigma score sign mismatch: analytic={analytic_score} fd={score_fd}"
     );
     assert!(
-        (analytic_info - info_fd).abs() < 1e-5,
-        "the exact-newton survival log-sigma information should match the far-tail finite difference at beta_log_sigma={beta_log_sigma0}; got {} vs {}",
+        (analytic_score - score_fd).abs() <= SCORE_REL_TOL * score_fd.abs().max(1.0),
+        "the exact-newton survival log-sigma score should match the far-tail finite difference at beta_log_sigma={beta_log_sigma0}; got {} vs {} (rel budget {})",
+        analytic_score,
+        score_fd,
+        SCORE_REL_TOL * score_fd.abs().max(1.0)
+    );
+    assert_eq!(
+        analytic_info.signum(),
+        info_fd.signum(),
+        "survival log-sigma information sign mismatch: analytic={analytic_info} fd={info_fd}"
+    );
+    assert!(
+        (analytic_info - info_fd).abs() <= INFO_REL_TOL * info_fd.abs().max(1.0),
+        "the exact-newton survival log-sigma information should match the far-tail finite difference at beta_log_sigma={beta_log_sigma0}; got {} vs {} (rel budget {})",
         analytic_info,
-        info_fd
+        info_fd,
+        INFO_REL_TOL * info_fd.abs().max(1.0)
     );
 }
 
