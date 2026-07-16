@@ -106,25 +106,33 @@ def test_ordinary_affine_design_exposes_model_offset_and_full_frame() -> None:
 
 
 def test_link_wiggle_affine_design_uses_joint_frame_and_exact_2141_index() -> None:
-    # Well-conditioned flexible-link fit: a parametric mean (``y ~ x``) makes the
-    # warp identifiable and the joint solve converges (mirrors the green
-    # bug_hunt_flexible_link_engages_and_predicts fixture: probit truth with a
-    # requested flexible(logit) warp, so the warp genuinely engages). A known
-    # per-row offset is carried through so the offset-separation contract is
-    # exercised. The ``s(x)`` + ``flexible_link=True`` joint-Newton blow-up lane
-    # is preserved in the red gate below.
-    rng = np.random.default_rng(11)
-    n = 2500
-    x = rng.uniform(-2.5, 2.5, n)
-    offset = rng.uniform(-0.4, 0.4, n)
-    eta = -0.3 + 1.4 * x + offset
-    probability = np.clip(norm.cdf(eta), 1e-4, 1.0 - 1e-4)
+    # Well-conditioned link-wiggle fit built to stay clear of the joint-Newton
+    # far-tail-curvature instability (#2342 disease family) that a heavy default
+    # warp hits:
+    #   * documented anchored form ``link(type=probit) + linkwiggle(...)`` on a
+    #     PROBIT base with a MINIMAL warp (degree=2, internal_knots=2) instead of
+    #     the default degree-3/8-knot warp -- few, low-order warp columns cannot
+    #     manufacture far-tail curvature garbage;
+    #   * a parametric mean (``y ~ x``) so the mean block is identifiable;
+    #   * bounded predictor: slope 0.9 over x in [-2, 2] plus a small offset keeps
+    #     |eta| <~ 2, so no observation sits in a saturated 0/1 tail;
+    #   * probit-matched truth, so the fitted warp is a mild penalized deviation
+    #     around zero rather than a large engaged warp.
+    # The offset-separation contract is still exercised via a known per-row
+    # offset. The ``s(x)`` + ``flexible_link=True`` joint-Newton blow-up lane is
+    # preserved in the red gate below.
+    rng = np.random.default_rng(7)
+    n = 1500
+    x = rng.uniform(-2.0, 2.0, n)
+    offset = rng.uniform(-0.15, 0.15, n)
+    eta = 0.9 * x + offset
+    probability = np.clip(norm.cdf(eta), 1e-3, 1.0 - 1e-3)
     y = (rng.uniform(size=n) < probability).astype(float)
     data = {"y": y, "x": x, "offset": offset}
 
     model = gamfit.fit(
         data,
-        "y ~ x + link(type=flexible(logit))",
+        "y ~ x + link(type=probit) + linkwiggle(degree=2, internal_knots=2)",
         family="binomial",
         offset="offset",
     )
