@@ -4850,7 +4850,7 @@ fn run_starts_solver_with_direct_startup_eval() {
     // so the run may legitimately refuse to certify — that outcome is orthogonal
     // to what is asserted here. The `calls` trace records the startup sequence
     // whether or not the run mints, so the run's Result is deliberately ignored.
-    let _ = problem.run(&mut obj, "solver should start from a direct startup eval");
+    drop(problem.run(&mut obj, "solver should start from a direct startup eval"));
     let calls = calls.lock().unwrap();
     let first_eval_idx = calls
         .iter()
@@ -5610,7 +5610,7 @@ fn run_bfgs_projects_seed_before_seed_validation_eval() {
     // optimum, so the run may legitimately refuse to certify — orthogonal to the
     // projection assertion. The `seen` trace records the first evaluated point
     // whether or not the run mints, so the run's Result is deliberately ignored.
-    let _ = problem.run(&mut obj, "bfgs seed projection");
+    drop(problem.run(&mut obj, "bfgs seed projection"));
     assert_eq!(
         seen.lock().unwrap().first().cloned(),
         Some(array![1.0]),
