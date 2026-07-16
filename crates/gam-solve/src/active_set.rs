@@ -1756,6 +1756,19 @@ fn solve_newton_direction_with_linear_constraints_impl(
             }
         }
         if feasible {
+            // Face provenance of the RETURNED point: the unconstrained optimum
+            // can land exactly on a boundary (the warm filter above may have
+            // just emptied the hint because the START was interior). Report
+            // the rows tight at the answer so the next warm start carries the
+            // face instead of an empty hint.
+            if let Some(hint) = active_hint.as_mut() {
+                hint.clear();
+                for i in 0..m {
+                    if scaled_constraint_slack(&candidate, constraints, i) <= tol_active {
+                        hint.push(i);
+                    }
+                }
+            }
             return Ok(());
         }
     }
@@ -2694,6 +2707,12 @@ fn solve_newton_direction_with_constraint_set_impl(
         let candidate_values = ops.values(&candidate)?;
         let feasible = (0..m).all(|row| ops.scaled_slack(&candidate_values, row) >= -tol_active);
         if feasible {
+            // Unlike the dense loop's fast path, the hint deliberately stays
+            // empty here: a factored cone can have thousands of duplicate
+            // geometrically-tight rows at a boundary landing, and eagerly
+            // reporting them all would poison the next warm start with the
+            // materialized face this operator path exists to avoid. The ratio
+            // test rediscovers the one blocking row when it matters.
             return Ok(());
         }
     }
