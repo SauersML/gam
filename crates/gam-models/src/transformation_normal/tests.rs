@@ -2691,6 +2691,85 @@ pub(crate) fn ctn_covariate_penalty_is_response_mass_gram_function_roughness() {
     );
 }
 
+/// SPEC-5 basis-change invariance of the covariate-direction penalty: the
+/// penalized roughness of a fixed transformation `h` is invariant to the choice
+/// of covariate design basis. Under a reparameterization `Ψ' = Ψ T` (T
+/// invertible), the same function has covariate coefficients `A' = A T⁻ᵀ` and
+/// the roughness Gram transforms covariantly to `S_x' = Tᵀ S_x T`, so the
+/// assembled `βᵀ (G_y ⊗ S_x) β` is unchanged. An identity coefficient factor
+/// would NOT be basis-covariant — this pins the penalty as a genuine
+/// function-space quantity (gam#2306).
+#[test]
+pub(crate) fn ctn_covariate_penalty_is_basis_change_invariant() {
+    let response = array![-1.0, -0.2, 0.6, 1.3];
+    let weights = Array1::from_elem(response.len(), 1.0);
+    let offset = Array1::zeros(response.len());
+
+    // Base covariate design Ψ and an invertible reparameterization T (det 1).
+    let psi_design = array![[1.0, 0.2], [1.0, -0.1], [1.0, 0.4], [1.0, -0.3]];
+    let p_cov = psi_design.ncols();
+    let t = array![[1.0, 0.5], [0.0, 1.0]];
+    // T⁻ᵀ for T = [[1, 0.5], [0, 1]] is [[1, 0], [-0.5, 1]].
+    let t_inv_t = array![[1.0, 0.0], [-0.5, 1.0]];
+    let psi_reparam = psi_design.dot(&t);
+    let s_cov = array![[2.0, -1.0], [-1.0, 2.0]];
+    let s_cov_reparam = t.t().dot(&s_cov).dot(&t);
+
+    let build = |cov: Array2<f64>, pen: Array2<f64>| -> (PenaltyMatrix, usize) {
+        let (val_basis, deriv_basis, knots, transform, p_resp) = toy_response_basis(&response);
+        let family = TransformationNormalFamily::from_prebuilt_response_basis(
+            &response,
+            val_basis,
+            deriv_basis,
+            vec![],
+            knots,
+            toy_scop_ctn_config().response_degree,
+            transform,
+            &weights,
+            &offset,
+            DesignMatrix::Dense(DenseDesignMatrix::from(cov)),
+            vec![PenaltyMatrix::Dense(pen)],
+            &toy_scop_ctn_config(),
+            None,
+        )
+        .expect("toy transformation family");
+        (family.tensor_penalties[0].clone(), p_resp)
+    };
+
+    let (penalty_base, p_resp) = build(psi_design.clone(), s_cov.clone());
+    let (penalty_reparam, p_resp_b) = build(psi_reparam, s_cov_reparam);
+    assert_eq!(p_resp, p_resp_b);
+
+    // A fixed transformation as a coefficient matrix A (p_resp × p_cov) in the
+    // base basis, and its reparameterized coefficients A' = A T⁻ᵀ.
+    let a_flat = toy_probe_vector(p_resp * p_cov, 0xB6C1_u64);
+    let a = a_flat
+        .clone()
+        .into_shape_with_order((p_resp, p_cov))
+        .expect("reshape A");
+    let a_reparam = a.dot(&t_inv_t);
+
+    let beta_base = a_flat;
+    let beta_reparam = a_reparam
+        .into_shape_with_order(p_resp * p_cov)
+        .expect("flatten A'");
+
+    let base_dense = penalty_base.to_dense();
+    let reparam_dense = penalty_reparam.to_dense();
+    let roughness_base = beta_base.dot(&base_dense.dot(&beta_base));
+    let roughness_reparam = beta_reparam.dot(&reparam_dense.dot(&beta_reparam));
+
+    assert!(
+        roughness_base > 1e-6,
+        "probe transformation must carry nontrivial covariate roughness"
+    );
+    let rel = (roughness_base - roughness_reparam).abs() / roughness_base.abs();
+    assert!(
+        rel <= 1e-10,
+        "covariate roughness must be basis-change invariant: base {roughness_base:.8e} vs reparam {roughness_reparam:.8e} (rel {rel:.3e})"
+    );
+}
+
 /// Unsupported response-direction derivative orders are hard errors, not
 /// silently skipped no-ops (the retired `if order==0 || order>=p {return Ok}`
 /// path). Order 0 is the value function; an order above the I-spline value
