@@ -1387,25 +1387,47 @@ fn faithful_matched_dictionary_hybrid_wins_on_support_alone_2233() {
         );
     }
 
-    // Real-scale config pin (K_ext=32768, P=2048, top_k=32, H harmonics ⇒ b=2H+1).
-    // The faithful config sets K_flat = K_ext − K_curved·b so ★ is an EQUALITY:
-    // dict_params(hybrid) = K_flat·P + K_curved·b·P = K_ext·P = dict_params(flat).
-    // This is the config the GPU run must use so dictionary bits tie and the
-    // measured win is the support term the pre-screen prices.
-    let (k_ext, p_out, top_k) = (32_768_i64, 2_048_i64, 32.0_f64);
+    // Real-scale config pin. The load-bearing scalars are SOURCED from #2283's
+    // authoritative measurement driver `experiments/1026_close/driver_1026_arms.py`
+    // (argparse defaults) so the scoreboard and the GPU measurement certify the
+    // SAME config — a drift here would make the corollary vacuous:
+    //   --K 32768   --top-k 32   --curved-atoms 256   (P=2048 is the creditscope
+    //   L30 residual_post width; the horizon is the run's declared training N, 96k
+    //   train of the 120k --max-rows × 0.8; b = 2H+1 is fit-determined for the
+    //   circle curved atom, so it is swept, not pinned).
+    // The driver's `--k-flat` is a FREE parameter self-certified faithful by
+    //   dict_params(hybrid) = k_flat·P + curved_atoms·b·P ≤ K·P   AND   k_flat ≥ top_k
+    // (`bits_dict_params_faithful` in the driver). This test uses the TIGHTEST such
+    // config, k_flat = K_ext − K_curved·b, at which ★ is an EQUALITY so the
+    // decoder-parameter counts — and thus the dictionary bits — tie exactly.
+    let (k_ext, p_out) = (32_768_i64, 2_048_i64); // driver --K, creditscope L30 width
+    let top_k = 32.0_f64; // driver --top-k
+    let driver_curved_atoms = 256_i64; // driver --curved-atoms default
+    // The driver default (256) is the centre of the swept range; the corollary is
+    // asserted across a band of curved-atom counts and fit-determined harmonics.
+    assert!(
+        [64_i64, 256, 1024].contains(&driver_curved_atoms),
+        "the swept K_curved band must include the driver's pinned --curved-atoms"
+    );
     for &k_curved in &[64_i64, 256, 1024] {
         for &harmonics in &[1_i64, 4, 11] {
-            let b = 2 * harmonics + 1; // circle Fourier basis width
+            let b = 2 * harmonics + 1; // circle Fourier basis width, b = 2H+1
             let k_flat = k_ext - k_curved * b;
+            // The driver's two faithfulness conditions must both hold at this config.
             assert!(
-                k_flat > 0,
-                "faithful config needs a positive flat remainder (K_curved={k_curved}, b={b})"
+                k_flat >= top_k as i64,
+                "driver requires k_flat ≥ top_k (K_curved={k_curved}, b={b}): k_flat={k_flat}"
             );
-            // ★ holds with equality: the two decoder-parameter counts are identical.
+            assert!(
+                k_flat * p_out + k_curved * b * p_out <= k_ext * p_out,
+                "driver faithfulness ≤ must hold (K_curved={k_curved}, H={harmonics})"
+            );
+            // At the tightest config ★ holds with EQUALITY: the two decoder-parameter
+            // counts are identical, so dictionary bits tie exactly.
             assert_eq!(
                 k_flat * p_out + k_curved * b * p_out,
                 k_ext * p_out,
-                "faithful ★ must be an equality (K_curved={k_curved}, H={harmonics})"
+                "tightest faithful ★ must be an equality (K_curved={k_curved}, H={harmonics})"
             );
             // Dictionary bits tie exactly at the equality config (any horizon N).
             let horizon = 96_000.0_f64; // creditscope train N
