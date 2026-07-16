@@ -869,21 +869,59 @@ fn keep_positive_eigenspace(
     if p == 0 {
         return Ok(Array2::zeros((0, 0)));
     }
+    // A block whose UNRESIDUALISED diagonal trace is zero owns no positive
+    // eigenspace (an all-zero residual Gram): rank 0.
+    if g_bb_trace <= 0.0 {
+        return Ok(Array2::zeros((p, 0)));
+    }
     let (evals, evecs) = g_tilde.eigh(Side::Lower).map_err(|err| {
         CompilerError::LinalgFailure(format!("residual Gram eigh failed: {err:?}"))
     })?;
-    let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
-    let scale = lambda_max.max(g_bb_trace);
-    let nk = (n.saturating_mul(k)).max(p).max(1) as f64;
-    let tau = scale * RANK_REVEAL_EPS_SLACK * nk * f64::EPSILON;
-    // Collect kept column indices.
-    let mut kept: Vec<usize> = (0..p).filter(|&i| evals[i] > tau).collect();
-    // Sort kept indices by descending eigenvalue for a stable column order.
+
+    // WEIGHT-INVARIANT RANK COUNT. The rank tolerance is relative to the dominant
+    // eigenvalue, so a single stiff residual direction inflates it until
+    // well-conditioned independent directions are dropped. The marginal-slope
+    // effective Jacobian carries the per-row chain weight c_i = sqrt(1+(s·g_i)²);
+    // it produced a residual Gram spectrum σ² of [7.5e15, 1.3e3, …, 2.3e-3] — one
+    // stiff direction and eleven absolutely well-conditioned ones — and the
+    // lambda_max-relative cutoff dropped all eleven, reporting range_rank 1/12 on
+    // a fully identified time surface. Identifiability is invariant to a positive
+    // per-column scaling (a diagonal congruence D^{-1/2}·G·D^{-1/2} preserves rank
+    // and inertia), so take the rank COUNT from the diagonally-equilibrated
+    // residual Gram, whose cutoff sees true residual correlation rather than
+    // scale. Return the RAW eigenvectors (top-`rank` by descending raw
+    // eigenvalue), so blocks already ranked correctly are byte-identical — only
+    // stiff-direction-mislabeled blocks gain their true rank.
+    let rank = {
+        let scale_col: Vec<f64> = (0..p)
+            .map(|j| {
+                let d = g_tilde[[j, j]].max(0.0);
+                if d > 0.0 { d.sqrt() } else { 1.0 }
+            })
+            .collect();
+        let mut g_eq = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                g_eq[[i, j]] = g_tilde[[i, j]] / (scale_col[i] * scale_col[j]);
+            }
+        }
+        let (evals_eq, _) = g_eq.eigh(Side::Lower).map_err(|err| {
+            CompilerError::LinalgFailure(format!("equilibrated residual Gram eigh failed: {err:?}"))
+        })?;
+        let lambda_max_eq = evals_eq.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
+        let nk = (n.saturating_mul(k)).max(p).max(1) as f64;
+        let tau_eq = lambda_max_eq * RANK_REVEAL_EPS_SLACK * nk * f64::EPSILON;
+        evals_eq.iter().filter(|&&e| e > tau_eq).count()
+    };
+
+    // Top-`rank` RAW eigenvectors by descending raw eigenvalue (stable order).
+    let mut kept: Vec<usize> = (0..p).collect();
     kept.sort_by(|&a, &b| {
         evals[b]
             .partial_cmp(&evals[a])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    kept.truncate(rank);
     let mut v = Array2::<f64>::zeros((p, kept.len()));
     for (out_col, &src_col) in kept.iter().enumerate() {
         for row in 0..p {
