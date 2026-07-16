@@ -19,7 +19,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -125,6 +125,18 @@ fn assert_gaussian_regime(
         "duchon-regime[{label}]: n={n} k={k} sigma={sigma} \
          gam_truth_rmse={gam_truth_rmse:.4} mgcv_truth_rmse={mgcv_truth_rmse:.4} \
          (context: rel_l2(gam,mgcv)={rel_gam_vs_mgcv:.4})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            &format!("quality_vs_mgcv_duchon_regimes::{label}"),
+            "truth_rmse",
+            gam_truth_rmse,
+            "mgcv",
+            mgcv_truth_rmse,
+        )
+        .line()
     );
 
     // (1) ABSOLUTE recovery bar tied to the regime: gam must reconstruct the
@@ -279,6 +291,18 @@ fn gam_duchon_1d_poisson_log_mean_recovery_matches_mgcv() {
         "duchon-poisson-mean-recovery-1d: n={n} grid={m} \
          gam_mu_rmse={gam_mu_rmse:.4} mgcv_mu_rmse={mgcv_mu_rmse:.4} \
          rms_mu={rms_mu:.4} (context: rel_l2(gam,mgcv)={rel_gam_vs_mgcv:.4})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_duchon_regimes::mu",
+            "mu_rmse",
+            gam_mu_rmse,
+            "mgcv",
+            mgcv_mu_rmse,
+        )
+        .line()
     );
 
     // (1) ABSOLUTE recovery bar: gam must recover the smooth count-mean curve.

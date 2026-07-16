@@ -32,7 +32,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, r2, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -152,6 +152,18 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine() {
         "cyclic cc(t): n={n} sigma=0.1 gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
          rmse(gam,sin)={gam_truth_rmse:.5} rmse(mgcv,sin)={mgcv_truth_rmse:.5} \
          rel_l2(gam,mgcv)={rel_to_mgcv:.5} wrap_gap={wrap_gap:.3e}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_cyclic_cubic",
+            "truth_rmse",
+            gam_truth_rmse,
+            "mgcv",
+            mgcv_truth_rmse,
+        )
+        .line()
     );
 
     // 1) TRUTH RECOVERY (primary): the fitted curve must land close to sin(t).
@@ -332,6 +344,18 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine_on_real_data() {
          wrap_gap={wrap_gap:.3e} (context: in-sample rel_l2 vs mgcv={insample_rel:.4})",
         train_rows.len(),
         n_test,
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_cyclic_cubic::test",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts the seasonal cycle ------

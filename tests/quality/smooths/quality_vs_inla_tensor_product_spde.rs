@@ -50,7 +50,7 @@ use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{
-    Column, pearson, r_package_available, relative_l2, rmse, run_r,
+    Column, QualityPair, pearson, r_package_available, relative_l2, rmse, run_r,
 };
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
@@ -304,6 +304,18 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
          (gam/inla={:.3}) gam_edf={gam_edf:.3} (k={gam_k}) \
          [context: rel_l2={rel:.4} pearson={corr:.5}]",
         gam_rmse / inla_rmse.max(1e-300)
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_inla_tensor_product_spde",
+            "held_out_rmse",
+            gam_rmse,
+            "inla",
+            inla_rmse,
+        )
+        .line()
     );
 
     // 1. PRIMARY: gam generalizes. Out-of-sample R² on the held-out test rows

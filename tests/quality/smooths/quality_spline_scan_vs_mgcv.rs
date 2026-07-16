@@ -14,7 +14,9 @@
 //! with an honest message — when `Rscript`/`mgcv` is genuinely absent.
 
 use csv::StringRecord;
-use gam::test_support::reference::{Column, pad_to, r_package_available, rmse, run_r};
+use gam::test_support::reference::{
+    Column, QualityPair, pad_to, r_package_available, rmse, run_r,
+};
 use gam::{
     FitConfig, encode_recordswith_inferred_schema, fit_spline_scan_from_formula, init_parallelism,
 };
@@ -153,6 +155,18 @@ fn spline_scan_matches_or_beats_mgcv_on_truth_recovery() {
     eprintln!(
         "[spline-scan vs mgcv] n={n} scan_edf={edf:.3} mgcv_edf={mgcv_edf:.3} \
          rmse_to_truth(gam)={gam_rmse:.5} rmse_to_truth(mgcv)={mgcv_rmse:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_spline_scan_vs_mgcv",
+            "rmse_to_truth",
+            gam_rmse,
+            "mgcv",
+            mgcv_rmse,
+        )
+        .line()
     );
 
     // Match-or-beat on the OBJECTIVE metric: gam's truth-recovery error must

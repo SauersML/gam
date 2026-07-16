@@ -33,7 +33,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -144,6 +144,18 @@ fn assert_duchon_1d_default_rank(n: usize, sigma: f64, seed: u64, k_mgcv: usize,
         "duchon-default-rank-1d: n={n} sigma={sigma} k_mgcv={k_mgcv} \
          gam_truth_rmse={gam_truth_rmse:.4} mgcv_truth_rmse={mgcv_truth_rmse:.4} \
          (context: rel_l2(gam,mgcv)={rel_gam_vs_mgcv:.4})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            &format!("quality_vs_mgcv_duchon_default_rank::1d_n{n}"),
+            "truth_rmse",
+            gam_truth_rmse,
+            "mgcv",
+            mgcv_truth_rmse,
+        )
+        .line()
     );
 
     // #1561 λ-selection diagnostic (pure instrumentation; no pass criterion). gam
@@ -320,6 +332,18 @@ fn assert_duchon_2d_default_rank(n: usize, sigma: f64, seed: u64, k_mgcv: usize,
         "duchon-default-rank-2d: n={n} grid={m} sigma={sigma} k_mgcv={k_mgcv} \
          gam_truth_rmse={gam_truth_rmse:.4} mgcv_truth_rmse={mgcv_truth_rmse:.4} \
          rms_truth={rms_truth:.4} (context: rel_l2(gam,mgcv)={rel_gam_vs_mgcv:.4})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            &format!("quality_vs_mgcv_duchon_default_rank::2d_n{n}"),
+            "truth_rmse",
+            gam_truth_rmse,
+            "mgcv",
+            mgcv_truth_rmse,
+        )
+        .line()
     );
 
     // #1561 λ-selection diagnostic (pure instrumentation; no pass criterion). Emit

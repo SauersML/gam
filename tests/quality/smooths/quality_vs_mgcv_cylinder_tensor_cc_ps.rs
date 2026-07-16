@@ -34,7 +34,7 @@
 use csv::{ReaderBuilder, StringRecord};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, r2, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -238,6 +238,18 @@ fn gam_cylinder_tensor_cc_ps_recovers_truth_and_mixes_boundaries() {
          theta_seam_gap={theta_seam_gap:.3e} \
          gam_z_gap={gam_z_endpoint_gap:.4} truth_z_span={truth_z_span:.4} \
          mgcv_z_gap={mgcv_z_endpoint_gap:.4} rel_to_mgcv(context)={rel_to_mgcv:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_cylinder_tensor_cc_ps",
+            "truth_rmse",
+            gam_truth_rmse,
+            "mgcv",
+            mgcv_truth_rmse,
+        )
+        .line()
     );
 
     // ---- (1) PRIMARY: truth recovery --------------------------------------
@@ -506,6 +518,18 @@ fn gam_cylinder_tensor_cc_ps_recovers_truth_and_mixes_boundaries_on_real_data() 
          mgcv_test_rmse={mgcv_test_rmse:.4} (context rel_l2 vs mgcv={rel_to_mgcv:.4})",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_cylinder_tensor_cc_ps::test",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY: gam predicts the held-out SZA surface -------------------

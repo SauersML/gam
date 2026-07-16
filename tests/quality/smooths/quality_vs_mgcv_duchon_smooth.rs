@@ -39,7 +39,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -162,6 +162,18 @@ fn gam_duchon_1d_matches_mgcv_ds() {
         "duchon-truth-recovery-1d: n={n} grid={m} sigma=0.05 \
          gam_truth_rmse={gam_truth_rmse:.4} mgcv_truth_rmse={mgcv_truth_rmse:.4} \
          (context: rel_l2(gam,mgcv)={rel_gam_vs_mgcv:.4})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_duchon_smooth",
+            "truth_rmse",
+            gam_truth_rmse,
+            "mgcv",
+            mgcv_truth_rmse,
+        )
+        .line()
     );
 
     // (1) ABSOLUTE non-degeneracy bar: gam must genuinely recover the signal,
