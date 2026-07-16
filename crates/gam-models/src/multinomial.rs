@@ -2727,52 +2727,60 @@ pub fn fit_penalized_multinomial_formula(
     // per-class EDF, and `Σ_a edf_a = tr(F) = edf_total`.
     let joint_recon = fit.artifacts.joint_log_lambdas.as_ref().and_then(|jll| {
         let n_components = penalties_arc.len();
-        if jll.len() != n_components || n_components == 0 {
+        if n_components == 0 {
             return None;
         }
+        // The coupled joint penalty family at the selected λ's, in raw stacked
+        // (class-major) coordinates — exactly the operator the inner solve and
+        // covariance path penalize with. Under the equivariant carrier this is
+        // K per-class specs per term, grouped term-major (`s = t·g + c`); the
+        // K = 2 degenerate arm returns one shared centered spec per term.
+        let joint_specs = family.equivariant_class_penalty_specs();
+        if jll.len() != joint_specs.len() || joint_specs.len() % n_components != 0 {
+            return None;
+        }
+        let specs_per_term = joint_specs.len() / n_components;
         let expected_joint = p_per_class.saturating_mul(m);
         let hinv = fit
             .covariance_conditional
             .as_ref()
             .filter(|c| c.nrows() == expected_joint && c.ncols() == expected_joint)?;
-        // The coupled joint penalty components `M ⊗ S_t` at the selected `λ_t`,
-        // in raw stacked (class-major) coordinates — exactly the operator the
-        // inner solve and the now-fixed covariance path penalize with.
-        let joint_specs = family.centered_joint_penalty_specs();
-        if joint_specs.len() != n_components {
-            return None;
-        }
         let lam: Vec<f64> = jll.iter().map(|&l| l.exp()).collect();
-        // Per-component `H⁻¹ (M ⊗ S_t)` (full mp×mp), reused for both the joint
-        // influence matrix and the per-(class, component) trace decomposition.
-        let mut hinv_st: Vec<Array2<f64>> = Vec::with_capacity(n_components);
+        // Per-spec `H⁻¹ M_s` (full mp×mp), reused for both the joint influence
+        // matrix and the per-(class, component) trace decomposition.
+        let mut hinv_st: Vec<Array2<f64>> = Vec::with_capacity(joint_specs.len());
         for spec in &joint_specs {
             if spec.matrix.nrows() != expected_joint || spec.matrix.ncols() != expected_joint {
                 return None;
             }
             hinv_st.push(hinv.dot(&spec.matrix));
         }
-        // F = I − H⁻¹ S_λ = I − Σ_t λ_t H⁻¹ (M ⊗ S_t).
+        // F = I − H⁻¹ S_λ = I − Σ_s λ_s H⁻¹ M_s.
         let mut f = Array2::<f64>::eye(expected_joint);
-        for (t, hs) in hinv_st.iter().enumerate() {
-            f.scaled_add(-lam[t], hs);
+        for (s, hs) in hinv_st.iter().enumerate() {
+            f.scaled_add(-lam[s], hs);
         }
-        // Per-class diagonal-block trace of F (the honest per-class EDF), and the
-        // per-(class, component) penalty trace `tr_{a,t} = λ_t · Σ_{i∈class a}
-        // (H⁻¹ (M⊗S_t))[i,i]` for the per-penalty EDF rollup.
+        // Per-class diagonal-block trace of F (the honest per-class EDF), and
+        // the per-(class, component) penalty trace
+        // `tr_{a,t} = Σ_{c∈term t} λ_{t,c} · Σ_{i∈class a} (H⁻¹ M_{t,c})[i,i]`
+        // for the per-penalty EDF rollup.
         let mut edf_per_class = Vec::with_capacity(m);
         // class-major per-penalty EDF (class 0's components, then class 1's, …),
-        // aligned 1:1 with the flat per-component λ replicated per class.
+        // aligned 1:1 with the flat per-(class, component) λ report below.
         let mut edf_per_penalty = Vec::with_capacity(m * n_components);
         for a in 0..m {
             let base = a * p_per_class;
             let mut class_trace = 0.0_f64;
             for t in 0..n_components {
                 let mut tr_at = 0.0_f64;
-                for i in 0..p_per_class {
-                    tr_at += hinv_st[t][[base + i, base + i]];
+                for c in 0..specs_per_term {
+                    let s = t * specs_per_term + c;
+                    let mut tr = 0.0_f64;
+                    for i in 0..p_per_class {
+                        tr += hinv_st[s][[base + i, base + i]];
+                    }
+                    tr_at += lam[s] * tr;
                 }
-                tr_at *= lam[t];
                 class_trace += tr_at;
                 // A single component's per-class trace EDF `rank(S_t) − tr_{a,t}`,
                 // bounded by its local rank (≤ p_per_class).
@@ -2782,24 +2790,35 @@ pub fn fit_penalized_multinomial_formula(
             }
             edf_per_class.push((p_per_class as f64 - class_trace).clamp(0.0, p_per_class as f64));
         }
-        Some((f, edf_per_class, edf_per_penalty, n_components, lam))
+        // Per-(class, component) λ report, class-major. Under the equivariant
+        // carrier the smoothing applied to active class `a`'s centered function
+        // for term `t` is its own `λ_{t,c=a}` (spec index `t·K + a`); under the
+        // K = 2 shared arm every class reports the one `λ_t`.
+        let mut lam_flat = Vec::with_capacity(m * n_components);
+        for a in 0..m {
+            for t in 0..n_components {
+                let s = if specs_per_term > 1 {
+                    t * specs_per_term + a
+                } else {
+                    t
+                };
+                lam_flat.push(lam[s]);
+            }
+        }
+        Some((f, edf_per_class, edf_per_penalty, n_components, lam_flat))
     });
 
     // Flatten every (class, component) smoothing parameter in class-major order.
-    // Under the joint-penalty architecture each active class carries the SAME
-    // per-component λ set (the centered metric ties `λ_t` across classes for
-    // reference-class invariance), so the flat vector is the selected `λ_t`
-    // replicated `K-1` times and `lambdas_per_block = [n_components; K-1]`. When
-    // the joint reconstruction is unavailable (legacy fixed-λ path or absent
+    // Under the equivariant joint-penalty architecture each active class `a`
+    // reports its own `λ_{t,a}` per term (the per-class centered penalties;
+    // the K = 2 degenerate arm replicates the shared `λ_t`), so the flat vector
+    // is class-major with `lambdas_per_block = [n_components; K-1]`. When the
+    // joint reconstruction is unavailable (legacy fixed-λ path or absent
     // covariance) fall back to the raw — now empty — per-block λ lists.
     let (lambdas_per_block, lambdas_flat): (Vec<usize>, Vec<f64>) = match joint_recon.as_ref() {
-        Some((_, _, _, n_components, lam)) => {
+        Some((_, _, _, n_components, lam_flat)) => {
             let per_block = vec![*n_components; m];
-            let mut flat = Vec::with_capacity(m * n_components);
-            for _ in 0..m {
-                flat.extend(lam.iter().copied());
-            }
-            (per_block, flat)
+            (per_block, lam_flat.clone())
         }
         None => {
             let per_block: Vec<usize> = fit.blocks.iter().map(|b| b.lambdas.len()).collect();

@@ -1020,26 +1020,22 @@ impl MultinomialFamily {
                 // repeated columns for aliases, and strips every block past
                 // `class_0` to width 0 — the failure in #363.
                 //
-                // Each block carries the FULL per-term physical penalty list
-                // with its own log-λ coordinates. Multinomial smooth effects are
-                // genuinely class-specific: tying one λ_t across all active
-                // logits lets an easy/near-linear class force over-smoothing of
-                // a wiggly class (the #1855 truth-recovery failure). Keeping the
-                // penalties on the active-class blocks lets REML select the
-                // heterogeneous per-(class, term) smoothness required by held-out
-                // simplex and decision-boundary recovery while the
-                // channel-aware Jacobian above preserves the coefficient-space
-                // identifiability audit.
+                // The per-class blocks attach NO smooth penalty: the sole
+                // smoothing carrier is the permutation-equivariant per-class
+                // centered joint family `λ_{t,c}·(C_cᵀC_c ⊗ S_t)` (see
+                // `equivariant_class_penalty_specs`). Penalizing the ALR
+                // contrasts β_a here would re-anchor smoothness to the
+                // arbitrary reference class (#1587) — and attaching both
+                // carriers would double-count. Heterogeneous per-class
+                // smoothness (#1855) survives as the per-class λ_{t,c} on the
+                // gauge-free centered functions.
                 let mut spec = ParameterBlockSpec {
                     name: format!("class_{a}"),
                     design: DesignMatrix::Dense(DenseDesignMatrix::from(self.design.clone())),
                     offset: Array1::<f64>::zeros(self.design.nrows()),
-                    penalties: self.penalties.iter().cloned().collect(),
-                    nullspace_dims: (*self.penalty_nullspace_dims).clone(),
-                    initial_log_lambdas: Array1::<f64>::from_elem(
-                        self.penalties.len(),
-                        self.initial_log_lambda,
-                    ),
+                    penalties: Vec::new(),
+                    nullspace_dims: Vec::new(),
+                    initial_log_lambdas: Array1::<f64>::zeros(0),
                     initial_beta: None,
                     gauge_priority: priority,
                     jacobian_callback: None,
@@ -1111,6 +1107,83 @@ impl MultinomialFamily {
                 }
             })
             .collect()
+    }
+
+    /// Build the permutation-EQUIVARIANT heterogeneous smoothing penalties:
+    /// for each smooth term `t`, `K` per-class penalties
+    /// `λ_{t,c} · γ_cᵀ S_t γ_c` on the CENTERED class functions
+    /// `γ_c = β_c − (1/K)Σ_b β_b` (with `β_ref ≡ 0`), one λ per class —
+    /// including the softmax reference class.
+    ///
+    /// This is the resolution of the #1587 (reference invariance) vs #1855
+    /// (heterogeneous per-class smoothness) tension. The reverted per-block
+    /// carrier penalized the ALR contrasts `β_a = γ_a − γ_ref`, whose
+    /// "per-class" smoothness is an artifact of which class is the baseline
+    /// (the family of diagonal ALR precisions is not closed under reference
+    /// changes). Penalizing the centered functions is reference-free by
+    /// construction: relabeling classes permutes the (γ_c, λ_{t,c}) pairs
+    /// together, so the fitted probabilities after label alignment are
+    /// identical, while REML still selects genuinely heterogeneous per-class
+    /// smoothness (a wiggly class takes a small λ_c, an easy class shrinks its
+    /// centered deviation toward the mean function).
+    ///
+    /// In stacked ALR coordinates `[β_0; …; β_{m−1}]` (`m = K−1`), class `c`'s
+    /// centering row is `C_a = e_aᵀ − 𝟙ᵀ/K` for an active class and
+    /// `C_ref = −𝟙ᵀ/K` for the reference, so spec `(t, c)` carries the PSD
+    /// rank-`rank(S_t)` matrix `(C_cᵀC_c) ⊗ S_t`. With all `λ_{t,c}` equal the
+    /// sum collapses exactly to the shared centered metric:
+    /// `Σ_c C_cᵀC_c = I − J/K = M`, so this family strictly generalizes
+    /// [`Self::centered_joint_penalty_specs`].
+    ///
+    /// `K = 2` is the degenerate case: `γ_ref = −γ_0`, both centered functions
+    /// have identical wiggliness, and the two per-class metrics are
+    /// proportional (only `λ_0 + λ_1` would be identified). The shared
+    /// centered spec is the correct model there, so this builder returns it.
+    pub fn equivariant_class_penalty_specs(&self) -> Vec<gam_problem::JointPenaltySpec> {
+        let m = self.active_classes();
+        let k = self.total_classes;
+        let p = self.design.ncols();
+        if k <= 2 {
+            return self.centered_joint_penalty_specs();
+        }
+        let raw_total = m * p;
+        let mut specs = Vec::with_capacity(self.penalties.len() * k);
+        for (t, pen) in self.penalties.iter().enumerate() {
+            let s_t = pen.to_dense();
+            let ns_t = self.penalty_nullspace_dims.get(t).copied().unwrap_or(0);
+            // rank(C_cᵀC_c ⊗ S_t) = 1 · rank(S_t) = p − ns_t.
+            let nullspace_dim = raw_total - (p - ns_t);
+            for c in 0..k {
+                // Centering row for class c over the m active coordinates.
+                let row: Vec<f64> = (0..m)
+                    .map(|b| {
+                        let indicator = if c == b { 1.0 } else { 0.0 };
+                        indicator - 1.0 / (k as f64)
+                    })
+                    .collect();
+                let mut matrix = Array2::<f64>::zeros((raw_total, raw_total));
+                for a in 0..m {
+                    for b in 0..m {
+                        let scale = row[a] * row[b];
+                        if scale == 0.0 {
+                            continue;
+                        }
+                        for i in 0..p {
+                            for j in 0..p {
+                                matrix[[a * p + i, b * p + j]] = scale * s_t[[i, j]];
+                            }
+                        }
+                    }
+                }
+                specs.push(gam_problem::JointPenaltySpec {
+                    label: Some(format!("multinomial_term_{t}_class_{c}")),
+                    matrix,
+                    initial_log_lambda: self.initial_log_lambda,
+                    nullspace_dim,
+                });
+            }
+        }
+        specs
     }
 
     fn specs_match_workspace_shape(&self, specs: &[ParameterBlockSpec]) -> bool {
@@ -2013,14 +2086,17 @@ impl CustomFamily for MultinomialFamily {
     }
 
     fn joint_penalty_specs(&self) -> Result<Vec<gam_problem::JointPenaltySpec>, String> {
-        // The formula path attaches the physical smooth penalties to each
-        // active-class block so REML can select the heterogeneous per-class
-        // smoothness required by multinomial truth-recovery/classification
-        // problems. A centered joint penalty is still available for diagnostics
-        // through `centered_joint_penalty_specs`, but it is not the production
-        // smoothing carrier because one shared λ_t over-smooths class-specific
-        // decision surfaces.
-        Ok(Vec::new())
+        // The smoothing carrier is the permutation-equivariant per-class
+        // centered penalty family: K per-term λ_{t,c} on the CENTERED class
+        // functions γ_c (see `equivariant_class_penalty_specs`). This restores
+        // the #1587 reference invariance the per-block ALR carrier broke
+        // (relabeling the arbitrary baseline changed fitted probabilities)
+        // while keeping the heterogeneous per-class smoothness #1855 requires
+        // — per-CLASS λ on gauge-free functions, not per-contrast λ in the
+        // reference-anchored frame. The per-class blocks attach NO smooth
+        // penalty (see `build_block_specs`); double-carrying both would
+        // penalize (I + Σ_c C_cᵀC_c) ⊗ S_t.
+        Ok(self.equivariant_class_penalty_specs())
     }
 
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
@@ -3583,19 +3659,23 @@ mod tests {
     }
 
     #[test]
-    fn per_term_smoothing_is_carried_by_active_class_blocks() {
+    fn per_term_smoothing_is_carried_by_equivariant_class_penalties() {
         let single = toy_family(6, 4, 3);
         for spec in &single.build_block_specs() {
-            assert_eq!(spec.penalties.len(), 1);
-            assert_eq!(spec.initial_log_lambdas.len(), 1);
-            assert_eq!(spec.nullspace_dims.len(), 1);
+            assert!(
+                spec.penalties.is_empty()
+                    && spec.initial_log_lambdas.is_empty()
+                    && spec.nullspace_dims.is_empty(),
+                "per-class blocks must attach no smooth penalty — the ALR-anchored \
+                 per-block carrier is reference-dependent (#1587); the equivariant \
+                 per-class centered joint family is the sole carrier"
+            );
         }
-        assert!(
-            single
-                .joint_penalty_specs()
-                .expect("joint specs")
-                .is_empty(),
-            "production smoothing is carried by per-class blocks so each class can select its own λ"
+        let joint = single.joint_penalty_specs().expect("joint specs");
+        assert_eq!(
+            joint.len(),
+            3, // K = 3 per-class specs for the single term
+            "one per-class centered penalty per (term, class), reference included"
         );
 
         let p = 5;
@@ -3629,11 +3709,43 @@ mod tests {
         let specs = multi.build_block_specs();
         assert_eq!(specs.len(), k - 1, "one block per active class");
         for spec in &specs {
-            assert_eq!(spec.penalties.len(), n_terms);
-            assert_eq!(spec.initial_log_lambdas.len(), n_terms);
-            assert_eq!(spec.nullspace_dims.len(), n_terms);
+            assert!(spec.penalties.is_empty());
+            assert!(spec.initial_log_lambdas.is_empty());
+            assert!(spec.nullspace_dims.is_empty());
         }
-        assert!(multi.joint_penalty_specs().expect("joint specs").is_empty());
+        let joint = multi.joint_penalty_specs().expect("joint specs");
+        assert_eq!(
+            joint.len(),
+            n_terms * k,
+            "K per-class centered penalties per term, term-major"
+        );
+        let m = k - 1;
+        let raw_total = m * p;
+        for (t_idx, term_specs) in joint.chunks(k).enumerate() {
+            // Equal λ across the K per-class specs must reproduce the shared
+            // centered metric penalty M ⊗ S_t exactly: Σ_c C_cᵀC_c = I − J/K.
+            let mut sum = Array2::<f64>::zeros((raw_total, raw_total));
+            for (c, spec) in term_specs.iter().enumerate() {
+                assert_eq!(
+                    spec.label.as_deref(),
+                    Some(format!("multinomial_term_{t_idx}_class_{c}").as_str())
+                );
+                // rank(C_cᵀC_c ⊗ S_t) = rank(S_t) = p (diagonal PD fixtures).
+                assert_eq!(spec.nullspace_dim, raw_total - p);
+                sum += &spec.matrix;
+            }
+            let centered = multi.centered_joint_penalty_specs();
+            let target = &centered[t_idx].matrix;
+            let max_err = sum
+                .iter()
+                .zip(target.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                max_err < 1e-14,
+                "Σ_c C_cᵀC_c ⊗ S_t must equal M ⊗ S_t (max err {max_err:.2e})"
+            );
+        }
     }
 
     #[test]
@@ -3668,8 +3780,21 @@ mod tests {
             .expect("multi-term MultinomialFamily must construct");
         let specs = multi.build_block_specs();
         assert_eq!(specs.len(), k - 1);
+        // Independent per-class smoothness survives as one λ_{t,c} per (term,
+        // class) on the CENTERED class functions — a gauge-free coordinate per
+        // class — never as per-block ALR penalties (reference-anchored, #1587).
+        let joint = multi.joint_penalty_specs().expect("joint specs");
+        assert_eq!(joint.len(), n_terms * k);
+        let labels: Vec<&str> = joint.iter().filter_map(|s| s.label.as_deref()).collect();
+        assert_eq!(labels.len(), n_terms * k, "every spec carries its own label");
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "distinct labels ⇒ one independent outer λ per (term, class)"
+        );
         for spec in &specs {
-            assert_eq!(spec.penalties.len(), n_terms);
+            assert!(spec.penalties.is_empty());
         }
     }
 
