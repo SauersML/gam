@@ -1971,6 +1971,26 @@ fn survival_unified_fit_result(
             })
             .collect::<Result<Vec<_>, _>>()?,
     );
+    // #2301 defect E: the `UnifiedFitResult` invariant requires
+    // `exp(log_lambdas) == lambdas` BIT-exactly (the validator round-trips
+    // `checked_exp_log_strength(log_λ)` against `λ`), but `ln` then `exp` is not
+    // bit-stable, so deriving `log_lambdas = ln(λ)` from the raw penalty-block λ
+    // fails the round-trip. log-λ (= ρ) is the canonical source — the outer
+    // optimizer works in ρ-space — so re-derive `λ = exp(log_λ)` here to make the
+    // two fields bit-consistent (a ≤1-ulp change to the stored λ). This was masked
+    // until the certificate-wiring fix (defect D) let assembly reach the invariant.
+    let lambdas = Array1::from_vec(
+        log_lambdas
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(coordinate, log_value)| {
+                gam_problem::checked_exp_log_strength(log_value).map_err(|error| {
+                    format!("survival fit log-lambda coordinate {coordinate}: {error}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     require_certified_survival_pirls(
         summary,
         "survival transformation fit assembly",
