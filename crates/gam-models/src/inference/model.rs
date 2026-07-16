@@ -3298,33 +3298,15 @@ impl FittedModel {
         if let Some(weight_column) = payload.weight_column.as_ref() {
             extras.push(weight_column.clone());
         }
-        // Survival responses are `Surv(...)` / `SurvInterval(...)` expressions,
-        // not bare columns. `prediction_required_columns` folds in the entry/exit
-        // (or L/R) TIME columns because the time basis needs them at predict, but
-        // it deliberately DROPS the event/status column — prediction never reads
-        // whether the event occurred. Diagnostics do: ALO leave-one-out resolves
-        // exactly that event column (`survival_event`) as the response, so the
-        // projected diagnostics loader must keep it or `diagnose --alo` aborts
-        // with "survival event column not found". Fold the event column in here
-        // (the time columns are already required); this is the survival analogue
-        // of re-adding a standard GAM's bare response. Guard against a degenerate
-        // schema where the event name coincides with a required covariate/time
-        // column so we never request a duplicate.
-        let required = self.prediction_required_columns()?;
-        if let Some((_entry, _exit, event)) =
-            parse_surv_response(parsed.response.as_str()).map_err(|e| e.to_string())?
+        // Survival responses are `Surv(...)` expressions, not bare columns; the
+        // underlying entry/exit columns are already prediction-required.
+        if parse_surv_response(parsed.response.as_str())
+            .map_err(|e| e.to_string())?
+            .is_some()
+            || parse_surv_interval_response(parsed.response.as_str())
+                .map_err(|e| e.to_string())?
+                .is_some()
         {
-            if !required.contains(&event) {
-                extras.push(event);
-            }
-            return Ok(extras);
-        }
-        if let Some((_left, _right, event)) =
-            parse_surv_interval_response(parsed.response.as_str()).map_err(|e| e.to_string())?
-        {
-            if !required.contains(&event) {
-                extras.push(event);
-            }
             return Ok(extras);
         }
         let response = parsed.response.trim();
@@ -3334,8 +3316,8 @@ impl FittedModel {
             return Ok(extras);
         }
         // Already prediction-required (e.g. transformation-normal re-adds it):
-        // nothing extra to fold in. Reuses the `required` set computed above.
-        if required.contains(response) {
+        // nothing extra to fold in.
+        if self.prediction_required_columns()?.contains(response) {
             return Ok(extras);
         }
         extras.push(response.to_string());

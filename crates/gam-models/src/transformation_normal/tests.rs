@@ -2843,7 +2843,7 @@ pub(crate) fn ctn_covariate_penalty_is_response_mass_gram_function_roughness() {
     let mut max_gap = 0.0_f64;
     for r in 0..p_resp {
         for c in 0..p_resp {
-            let old = if r == c && r > 0 { 1.0 } else { 0.0 };
+            let old: f64 = if r == c && r > 0 { 1.0 } else { 0.0 };
             let scale = expected_g_resp[[r, c]].abs().max(old.abs()).max(1e-9);
             max_gap = max_gap.max((expected_g_resp[[r, c]] - old).abs() / scale);
         }
