@@ -2704,7 +2704,18 @@ fn solve_newton_direction_with_constraint_set_impl(
     let mut visited_working_sets: HashSet<(Vec<usize>, Vec<u64>)> = HashSet::new();
     record_active_working_set(&mut visited_working_sets, &active, &x, 0);
 
+    // Terminal-diagnosis counters: dep-crate debug logs are filtered out by
+    // CLI consumers, so a budget-exhausted refusal must name its own churn
+    // mechanism (blocking-adds vs release cycling vs working-set repetition)
+    // in the typed error text.
+    let mut count_blocking_add = 0usize;
+    let mut count_stationary_add = 0usize;
+    let mut count_release = 0usize;
+    let mut ws_repeat_break = false;
+    let mut iterations_used = 0usize;
+
     for iteration in 0..max_iterations {
+        iterations_used = iteration + 1;
         let compressed_working = ops.compress_working(&active)?;
         let mut residualw = Array1::<f64>::zeros(compressed_working.constraints.a.nrows());
         for r in 0..compressed_working.constraints.a.nrows() {
@@ -2723,6 +2734,7 @@ fn solve_newton_direction_with_constraint_set_impl(
             if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL && !is_active[worst_row] {
                 active.push(worst_row);
                 is_active[worst_row] = true;
+                count_stationary_add += 1;
                 log_active_set_transition(
                     "stationary-infeasible-add",
                     iteration,
@@ -2730,6 +2742,7 @@ fn solve_newton_direction_with_constraint_set_impl(
                     Some(worst_row),
                 );
                 if !record_active_working_set(&mut visited_working_sets, &active, &x, iteration) {
+                    ws_repeat_break = true;
                     break;
                 }
                 continue;
@@ -2750,6 +2763,7 @@ fn solve_newton_direction_with_constraint_set_impl(
             if let Some(active_pos) = remove_pos {
                 let idx = active.remove(active_pos);
                 is_active[idx] = false;
+                count_release += 1;
                 log_active_set_transition(
                     "remove-negative-dual",
                     iteration,
@@ -2757,6 +2771,7 @@ fn solve_newton_direction_with_constraint_set_impl(
                     Some(idx),
                 );
                 if !record_active_working_set(&mut visited_working_sets, &active, &x, iteration) {
+                    ws_repeat_break = true;
                     break;
                 }
                 continue;
@@ -2808,11 +2823,13 @@ fn solve_newton_direction_with_constraint_set_impl(
             active.push(row);
             is_active[row] = true;
             added_new_active = true;
+            count_blocking_add += 1;
             log_active_set_transition("blocking-add", iteration, active.len(), Some(row));
             working_set_repeated =
                 !record_active_working_set(&mut visited_working_sets, &active, &x, iteration);
         }
         if working_set_repeated {
+            ws_repeat_break = true;
             break;
         }
 
@@ -2911,16 +2928,19 @@ fn solve_newton_direction_with_constraint_set_impl(
     // materializes.
     let strong_path_accepts =
         kkt_strong_ok && working_kkt.dual_feasibility <= ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL;
+    let mut nnls_closure: Option<(f64, usize)> = None;
     let nnls_certified = worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL && !strong_path_accepts && {
         let tight: Vec<usize> = (0..m)
             .filter(|&i| {
                 ops.norms[i] > 0.0 && (values_x[i] - ops.bounds[i]) / ops.norms[i] <= tol_active
             })
             .collect();
+        let tight_len = tight.len();
         match ops.set.gather_rows(&tight) {
             Ok(gathered) => nonnegative_cone_multipliers(&gathered.a, &g_cur)
                 .map(|(_, projected)| {
                     let closure = projected.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                    nnls_closure = Some((closure, tight_len));
                     closure <= ACTIVE_SET_KKT_STATIONARITY_TOL
                         || closure / grad_inf.max(1.0) <= ACTIVE_SET_KKT_STATIONARITY_TOL
                 })
@@ -2945,9 +2965,18 @@ fn solve_newton_direction_with_constraint_set_impl(
         direction_out.assign(&d_total);
         return Ok(());
     }
+    let nnls_diag = match nnls_closure {
+        Some((closure, tight_len)) => format!(
+            "nnls_closure={closure:.3e} (tol={ACTIVE_SET_KKT_STATIONARITY_TOL:.1e}) over {tight_len} tight rows"
+        ),
+        None => "nnls_closure=not-evaluated".to_string(),
+    };
+    let churn_diag = format!(
+        "iterations={iterations_used}/{max_iterations} transitions[blocking-add={count_blocking_add} stationary-add={count_stationary_add} release={count_release}] ws_repeat_break={ws_repeat_break}"
+    );
     if !allow_projected_gradient_fallback {
         return Err(EstimationError::ParameterConstraintViolation(format!(
-            "operator-constrained active-set did not certify the strict-convex projection QP; max scaled violation={worst:.3e} at row {row}; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]",
+            "operator-constrained active-set did not certify the strict-convex projection QP; max scaled violation={worst:.3e} at row {row}; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]; {nnls_diag}; {churn_diag}",
             working_kkt.primal_feasibility,
             working_kkt.dual_feasibility,
             working_kkt.complementarity,
@@ -2969,7 +2998,7 @@ fn solve_newton_direction_with_constraint_set_impl(
         return Ok(());
     }
     Err(EstimationError::ParameterConstraintViolation(format!(
-        "operator-constrained Newton active-set failed to converge; max scaled violation={worst:.3e} at row {row}; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]",
+        "operator-constrained Newton active-set failed to converge; max scaled violation={worst:.3e} at row {row}; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]; {nnls_diag}; {churn_diag}; projected-gradient fallback declined",
         working_kkt.primal_feasibility,
         working_kkt.dual_feasibility,
         working_kkt.complementarity,
