@@ -365,7 +365,7 @@ pub(crate) fn fused_rank_deficient_rail_gradient_beats_naive_trace_minus_rank() 
     let active: Vec<usize> = evals
         .iter()
         .enumerate()
-        .filter(|(_, &v)| v > tol)
+        .filter(|(_, v)| **v > tol)
         .map(|(i, _)| i)
         .collect();
     assert_eq!(active.len(), rank, "second-difference penalty must be rank {rank}");

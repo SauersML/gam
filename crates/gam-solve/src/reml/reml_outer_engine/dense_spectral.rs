@@ -324,7 +324,7 @@ impl DenseSpectralOperator {
         let active: Vec<usize> = evals
             .iter()
             .enumerate()
-            .filter(|(_, &v)| v > tol)
+            .filter(|(_, v)| **v > tol)
             .map(|(i, _)| i)
             .collect();
         let r = active.len();
