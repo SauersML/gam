@@ -2204,6 +2204,16 @@ fn fit_cause_specific_survival_transformation_custom(
             offset_eta_exit: prepared.eta_offset_exit.clone() + &spec.covariate_offset,
             offset_derivative_exit: prepared.derivative_offset_exit.clone(),
             derivative_floor,
+            // Non-Weibull survival uses the structural monotone I-spline time
+            // basis (`set_structural_monotonicity` above), so its leading
+            // `p_time_total` columns get the domain-wide coefficient cone
+            // `β_j ≥ 0`. The parametric Weibull `log t` baseline is not an
+            // I-spline monotone block, so it carries no structural cone here.
+            structural_time_columns: if spec.likelihood_mode == SurvivalLikelihoodMode::Weibull {
+                0
+            } else {
+                p_time_total
+            },
         });
 
         let mut penalties = Vec::with_capacity(penalty_blocks.len());

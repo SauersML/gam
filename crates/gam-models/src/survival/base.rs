@@ -229,6 +229,23 @@ pub struct CauseSpecificRoystonParmarBlock {
     pub offset_eta_exit: Array1<f64>,
     pub offset_derivative_exit: Array1<f64>,
     pub derivative_floor: f64,
+    /// Number of leading columns that are structural monotone-I-spline time
+    /// columns (`0` for a non-structural block, e.g. a parametric Weibull
+    /// `log t` baseline). When `> 0`, `block_linear_constraints` emits the
+    /// coefficient cone `β_j ≥ 0` for `j in 0..structural_time_columns` in
+    /// addition to the per-row derivative guard. Each such column is a monotone
+    /// non-decreasing I-spline basis (its M-spline derivative is non-negative
+    /// everywhere), so the cone is the exact DOMAIN-WIDE monotonicity
+    /// certificate — the per-row guard only pins `q'(t_i) ≥ floor` at the
+    /// training rows and leaves tail columns (M-spline support beyond the
+    /// largest training exit time, ≈0 at every training row) free to go
+    /// negative, producing a non-monotone `q'(t)` at prediction horizons the
+    /// Royston-Parmar predictor then refuses. Covariate columns
+    /// (`structural_time_columns..p`) are excluded — their coefficients carry
+    /// covariate effects and legitimately take any sign; the constant column is
+    /// already dropped by the I-spline `keep_cols` at construction, so every
+    /// column in `0..structural_time_columns` is a genuine shape column.
+    pub structural_time_columns: usize,
 }
 
 /// Cause-specific competing-risks survival as a blockwise custom family.
@@ -737,9 +754,36 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         let rhs = block
             .offset_derivative_exit
             .mapv(|offset| block.derivative_floor - offset);
+        let p = block.x_derivative.ncols();
+        let n_rows = block.x_derivative.nrows();
+        // Structural monotone-I-spline time columns get the coefficient cone
+        // `β_j ≥ 0` appended to the per-row derivative guard. The per-row guard
+        // only pins `q'(t_i) ≥ floor` at training rows; a tail I-spline column
+        // whose M-spline support sits beyond the largest training exit time is
+        // ≈0 at every training row and so escapes it, letting the penalized fit
+        // drive its coefficient negative and make `q'(t)` negative at a
+        // prediction horizon in that column's support (the Royston-Parmar
+        // predictor then refuses the invalid log-cumulative-hazard derivative).
+        // Because each such column is monotone non-decreasing over the whole
+        // axis, `β_j ≥ 0` is the exact domain-wide monotonicity certificate.
+        let structural_cols = block.structural_time_columns.min(p);
+        if structural_cols == 0 {
+            return Ok(Some(ConstraintSet::Dense(LinearInequalityConstraints {
+                a: block.x_derivative.clone(),
+                b: rhs,
+            })));
+        }
+        let mut a = Array2::<f64>::zeros((n_rows + structural_cols, p));
+        a.slice_mut(ndarray::s![..n_rows, ..])
+            .assign(&block.x_derivative);
+        for j in 0..structural_cols {
+            a[[n_rows + j, j]] = 1.0;
+        }
+        let mut b = Array1::<f64>::zeros(n_rows + structural_cols);
+        b.slice_mut(ndarray::s![..n_rows]).assign(&rhs);
         Ok(Some(ConstraintSet::Dense(LinearInequalityConstraints {
-            a: block.x_derivative.clone(),
-            b: rhs,
+            a,
+            b,
         })))
     }
 
@@ -3478,6 +3522,7 @@ mod tests {
                 offset_eta_exit: array![0.0],
                 offset_derivative_exit: array![0.0],
                 derivative_floor: 0.0,
+                structural_time_columns: 0,
             }
         }
 
