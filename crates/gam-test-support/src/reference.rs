@@ -388,6 +388,90 @@ pub fn rmse(a: &[f64], b: &[f64]) -> f64 {
     (s / a.len().max(1) as f64).sqrt()
 }
 
+/// A single machine-readable GAM-vs-reference quality pair for the #1561
+/// whole-suite meta-gate.
+///
+/// The quality suite's per-test human `eprintln!` lines name the two competing
+/// error metrics with wildly inconsistent tokens (`gam_rmse_truth` vs
+/// `betareg_rmse_truth`, `gam:{}` vs `sm:{}`, `gam_test_rmse` vs
+/// `mgcv_test_rmse`, ...), which makes the aggregate one-sided-Wilcoxon gate
+/// impossible to recompute by scraping. A test additionally emits ONE
+/// [`QualityPair::line`] next to its existing diagnostics; the aggregator greps
+/// the stable `[QUALITY_PAIR]` prefix and recomputes the significance test
+/// unambiguously. This is purely additive telemetry — it changes no assertion.
+#[derive(Clone, Debug)]
+pub struct QualityPair {
+    /// Suite category (`families`, `smooths`, `manifolds`, ...); by convention
+    /// the `tests/quality/<category>/` directory the test lives in.
+    pub category: String,
+    /// Stable per-test label, unique within the suite.
+    pub test: String,
+    /// The objective error/score metric both arms are scored on.
+    pub metric: String,
+    /// GAM's value of `metric`.
+    pub gam: f64,
+    /// The mature reference tool being matched-or-beaten (`mgcv`, `gamlss`, ...).
+    pub reference: String,
+    /// The reference tool's value of the SAME `metric` on the SAME data.
+    pub reference_value: f64,
+    /// Whether a smaller `metric` is better (true for RMSE/error; false for
+    /// held-out log-likelihood / ELPD / coverage-style scores).
+    pub lower_is_better: bool,
+}
+
+impl QualityPair {
+    /// A quality pair on a lower-is-better error metric (the RMSE-to-truth case
+    /// that dominates the suite).
+    pub fn error(
+        category: impl Into<String>,
+        test: impl Into<String>,
+        metric: impl Into<String>,
+        gam: f64,
+        reference: impl Into<String>,
+        reference_value: f64,
+    ) -> Self {
+        Self {
+            category: category.into(),
+            test: test.into(),
+            metric: metric.into(),
+            gam,
+            reference: reference.into(),
+            reference_value,
+            lower_is_better: true,
+        }
+    }
+
+    /// A quality pair on a higher-is-better score metric (held-out ELPD, etc.).
+    pub fn score(
+        category: impl Into<String>,
+        test: impl Into<String>,
+        metric: impl Into<String>,
+        gam: f64,
+        reference: impl Into<String>,
+        reference_value: f64,
+    ) -> Self {
+        Self {
+            lower_is_better: false,
+            ..Self::error(category, test, metric, gam, reference, reference_value)
+        }
+    }
+
+    /// The single stable line the aggregator consumes. Values use full `f64`
+    /// precision so the log-ratio the Wilcoxon test needs is exact.
+    pub fn line(&self) -> String {
+        format!(
+            "[QUALITY_PAIR] category={} test={} metric={} gam={:.12e} reference={} reference_value={:.12e} lower_is_better={}",
+            self.category,
+            self.test,
+            self.metric,
+            self.gam,
+            self.reference,
+            self.reference_value,
+            self.lower_is_better,
+        )
+    }
+}
+
 /// Coefficient of determination against the mean predictor.
 pub fn r2(pred: &[f64], truth: &[f64]) -> f64 {
     assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
