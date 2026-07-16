@@ -39,7 +39,7 @@ use gam::families::survival::predict::{
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
 use gam::test_support::cli_harness::run_or_panic;
-use gam::test_support::reference::{Column, run_python};
+use gam::test_support::reference::{Column, QualityPair, run_python};
 use ndarray::Array1;
 
 const N: usize = 600;
@@ -237,6 +237,18 @@ emit("rmst_ref", out)
     eprintln!(
         "RMST(tau={TAU}) recovery: gam={:?} truth={:?} lifelines={:?} | maxerr gam={:.4} lifelines={:.4}",
         gam_vals, truth_vals, rmst_ref, gam_abs_err, ref_abs_err
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_lifelines_rmst_truth_recovery",
+            "rmst_abs_err_to_truth",
+            gam_abs_err,
+            "lifelines",
+            ref_abs_err,
+        )
+        .line()
     );
 
     // ---- truth-recovery assertion ----------------------------------------

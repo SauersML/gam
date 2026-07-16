@@ -27,7 +27,7 @@ use gam::estimate::BlockRole;
 use gam::gamlss::DispersionFamilyKind;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, rmse, run_r};
 use gam::{
     DispersionLocationScaleFitResult, FitConfig, FitResult, encode_recordswith_inferred_schema,
     fit_from_formula, init_parallelism,
@@ -229,6 +229,30 @@ fn gam_beta_dispersion_location_scale_recovers_phi_surface_vs_gamlss() {
          RMSE_vs_truth(logit mu): gam={gam_rmse_logit_mu:.5} gamlss={gamlss_rmse_logit_mu:.5}\n  \
          RMSE_vs_truth(log phi):  gam={gam_rmse_log_phi:.5} gamlss={gamlss_rmse_log_phi:.5}\n  \
          dispersion-channel signal pearson(gam log phi, truth)={gam_disp_signal_r:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_gamlss_beta_dispersion_location_scale_1060::mu",
+            "rmse_logit_mu",
+            gam_rmse_logit_mu,
+            "gamlss",
+            gamlss_rmse_logit_mu,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_gamlss_beta_dispersion_location_scale_1060::log_phi",
+            "rmse_log_phi",
+            gam_rmse_log_phi,
+            "gamlss",
+            gamlss_rmse_log_phi,
+        )
+        .line()
     );
 
     // 1. TRUTH RECOVERY (mean).

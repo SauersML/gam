@@ -56,7 +56,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -402,6 +402,42 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
          x2 gam={gam_x2_slope:.4} vgam={vgam_x2:.4} \
          (err gam={gam_x2_err:.4} vgam={vgam_x2_err:.4}) | \
          gam_vs_vgam_rel_l2(context only)={class_rel_vs_ref:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_mass_ordinal_polr::class",
+            "class_rmse",
+            gam_class_rmse,
+            "vgam",
+            vgam_class_rmse,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_mass_ordinal_polr::cum",
+            "cum_rmse",
+            gam_cum_rmse,
+            "vgam",
+            vgam_cum_rmse,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_mass_ordinal_polr::x2_slope",
+            "x2_slope_abs_err",
+            gam_x2_err,
+            "vgam",
+            vgam_x2_err,
+        )
+        .line()
     );
 
     // PRIMARY CLAIM: gam recovers the known generative truth. The probabilities
@@ -779,6 +815,30 @@ fn gam_continuation_ratio_matches_vgam_sratio_on_real_data() {
          n_test={n_test} J={n_levels} gam_edf={gam_edf:.3} majority_acc={majority_acc:.4} \
          acc gam={gam_acc:.4} vgam={vgam_acc:.4} | logloss gam={gam_ll:.4} vgam={vgam_ll:.4} \
          (context: rel_l2 vs vgam={probs_rel_vs_ref:.4} rmse vs vgam={probs_rmse_vs_ref:.4})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::score(
+            "misc",
+            "quality_vs_mass_ordinal_polr::holdout_accuracy",
+            "accuracy",
+            gam_acc,
+            "vgam",
+            vgam_acc,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_mass_ordinal_polr::holdout_logloss",
+            "logloss",
+            gam_ll,
+            "vgam",
+            vgam_ll,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertions: gam predicts held-out quality ------

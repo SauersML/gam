@@ -41,7 +41,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -277,6 +277,18 @@ fn gam_sleepstudy_random_slope_forecasts_held_out_days_vs_lme4() {
          subjects={n_subjects} n_test={n_test} gam_edf={gam_edf:.2}\n  \
          held-out RMSE  gam={gam_rmse:.3} ms  lme4={lme4_rmse:.3} ms  \
          (marginal SD of held-out Reaction = {test_sd:.3} ms)"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_lme4_sleepstudy_random_slope_forecast",
+            "forecast_rmse",
+            gam_rmse,
+            "lme4",
+            lme4_rmse,
+        )
+        .line()
     );
 
     // (1) ABSOLUTE — a working random-slope forecaster must beat the

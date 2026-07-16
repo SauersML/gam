@@ -67,7 +67,7 @@ use csv::StringRecord;
 use gam::data::EncodedDataset;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, r2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, r2, rmse, run_r};
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
@@ -275,6 +275,18 @@ fn tweedie_log_smooth_recovers_truth_and_matches_mgcv() {
         gam_err / mgcv_err.max(1e-12),
         seeds.len()
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_validation_baseline_1471::tweedie",
+            "rmse_vs_truth",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
+    );
 
     // PRIMARY: gam recovers the mean curve well below the signal scale (seed-mean).
     assert!(
@@ -377,6 +389,18 @@ fn smooth_plus_linear_same_var_recovers_truth_and_matches_mgcv() {
          gam_rmse_vs_truth={gam_err:.5} mgcv_rmse_vs_truth={mgcv_err:.5} \
          ratio={:.3} gam_r2={gam_r2:.4}",
         gam_err / mgcv_err.max(1e-12)
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_validation_baseline_1471::smooth_plus_linear",
+            "rmse_vs_truth",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
     );
 
     // PRIMARY: near-perfect recovery of the combined truth (R² well above 0).
@@ -553,6 +577,18 @@ fn concurvity_two_smooths_corr_090_recovers_truth_and_matches_mgcv() {
          gam_rmse_vs_truth={gam_err:.5} mgcv_rmse_vs_truth={mgcv_err:.5} \
          ratio={:.3} gam_r2={gam_r2:.4}",
         gam_err / mgcv_err.max(1e-12)
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_validation_baseline_1471::concurvity_sum",
+            "rmse_vs_truth",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
     );
 
     // PRIMARY: the additive SUM is recovered despite high concurvity.
@@ -781,6 +817,18 @@ fn cyclic_tensor_periodic_clamped_wraps_and_matches_mgcv() {
          mgcv_rmse_vs_truth={mgcv_err:.5} ratio={:.3}",
         gam_err / mgcv_err.max(1e-12)
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_validation_baseline_1471::cyclic_tensor",
+            "rmse_vs_truth",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
+    );
 
     // PRIMARY (structure): the periodic seam wraps to numerical zero. The
     // documented gap is 0.0000; a broken cyclic-basis closure (sign/threshold
@@ -935,6 +983,18 @@ fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
         "poisson response-scale 95% CI coverage: reps={replicates} n={n} \
          gam_cov={gam_coverage:.4} mgcv_cov={mgcv_coverage:.4} nominal={nominal} \
          gam_err={gam_err:.4} mgcv_err={mgcv_err:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_validation_baseline_1471::poisson_ci_coverage",
+            "ci_calibration_error",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
     );
 
     // PRIMARY: gam's own response-scale Poisson intervals are calibrated. The

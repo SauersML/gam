@@ -49,7 +49,7 @@ use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, run_r};
+use gam::test_support::reference::{Column, QualityPair, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -337,6 +337,30 @@ fn gam_location_scale_predicts_gagurine_better_than_baseline() {
          | gamlss local ML: NLL={gamlss_nll:.5} CRPS={gamlss_crps:.5}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_gamlss_gagurine_location_scale",
+            "nll",
+            gam_nll,
+            "gamlss",
+            gamlss_nll,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_gamlss_gagurine_location_scale::crps",
+            "crps",
+            gam_crps,
+            "gamlss",
+            gamlss_crps,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: absolute held-out density quality ----

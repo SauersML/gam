@@ -35,7 +35,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -213,6 +213,42 @@ fn gam_random_intercept_matches_lme4() {
          (err gam={gam_e_err:.4} lme4={lme4_e_err:.4}) | \
          sigma_g2 gam={gam_sigma_g2:.4} lme4={lme4_sigma_g2:.4} truth={true_sigma_g2:.4} \
          (err gam={gam_g_err:.4} lme4={lme4_g_err:.4})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_lme4_random_intercept::deviations",
+            "dev_rmse",
+            gam_dev_rmse,
+            "lme4",
+            lme4_dev_rmse,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_lme4_random_intercept::residual_variance",
+            "abs_err_sigma_e2",
+            gam_e_err,
+            "lme4",
+            lme4_e_err,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_lme4_random_intercept::intercept_variance",
+            "abs_err_sigma_g2",
+            gam_g_err,
+            "lme4",
+            lme4_g_err,
+        )
+        .line()
     );
 
     // (1) The 8 group effects span [-1.5, 1.5] (range ≈ 3.0) and sit far above
@@ -408,6 +444,18 @@ fn gam_random_intercept_matches_lme4_on_real_data() {
         "sleepstudy random-intercept held-out: n_train={train_len} n_test={k} \
          gam_test_rmse={gam_test_rmse:.3} lme4_test_rmse={lme4_test_rmse:.3} \
          (held-out Reaction sd={resp_sd:.3})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_lme4_random_intercept::test",
+            "test_rmse",
+            gam_test_rmse,
+            "lme4",
+            lme4_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts held-out Reaction ------

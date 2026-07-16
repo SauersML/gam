@@ -41,7 +41,7 @@
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{
-    Column, held_out_r2, r_package_available, relative_l2, rmse, run_r,
+    Column, QualityPair, held_out_r2, r_package_available, relative_l2, rmse, run_r,
 };
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::{Array2, s};
@@ -243,6 +243,18 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla() {
          gam_R2={gam_r2:.4} gam_rmse={gam_rmse:.5} \
          inla_R2={inla_r2:.4} inla_rmse={inla_rmse:.5} \
          (context) rel_l2(gam_pred,inla_pred)={rel_pred:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_inla_rw2_spde_penalized_baseline::rw2_lidar",
+            "rmse",
+            gam_rmse,
+            "inla",
+            inla_rmse,
+        )
+        .line()
     );
 
     // PRIMARY: absolute out-of-sample accuracy bar. A smoother that has learned
@@ -512,6 +524,18 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla_on_real_data() {
          gam_R2={gam_r2:.4} gam_rmse={gam_rmse:.5} \
          inla_R2={inla_r2:.4} inla_rmse={inla_rmse:.5} \
          (context) rel_l2(gam_pred,inla_pred)={rel_pred:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_inla_rw2_spde_penalized_baseline::spde_quakes",
+            "rmse",
+            gam_rmse,
+            "inla",
+            inla_rmse,
+        )
+        .line()
     );
 
     // PRIMARY: tool-free out-of-sample informativeness. This quakes

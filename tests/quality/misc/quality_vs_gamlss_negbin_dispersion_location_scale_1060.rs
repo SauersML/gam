@@ -25,7 +25,7 @@ use gam::estimate::BlockRole;
 use gam::gamlss::DispersionFamilyKind;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, rmse, run_r};
 use gam::{
     DispersionLocationScaleFitResult, FitConfig, FitResult, encode_recordswith_inferred_schema,
     fit_from_formula, init_parallelism,
@@ -217,6 +217,30 @@ fn gam_negbin_dispersion_location_scale_recovers_theta_surface_vs_gamlss() {
          RMSE_vs_truth(log mu):    gam={gam_rmse_log_mu:.5} gamlss={gamlss_rmse_log_mu:.5}\n  \
          RMSE_vs_truth(log theta): gam={gam_rmse_log_theta:.5} gamlss={gamlss_rmse_log_theta:.5}\n  \
          dispersion-channel signal pearson(gam log theta, truth)={gam_disp_signal_r:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_gamlss_negbin_dispersion_location_scale_1060::mu",
+            "rmse_log_mu",
+            gam_rmse_log_mu,
+            "gamlss",
+            gamlss_rmse_log_mu,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_gamlss_negbin_dispersion_location_scale_1060::log_theta",
+            "rmse_log_theta",
+            gam_rmse_log_theta,
+            "gamlss",
+            gamlss_rmse_log_theta,
+        )
+        .line()
     );
 
     // 1. TRUTH RECOVERY (mean).

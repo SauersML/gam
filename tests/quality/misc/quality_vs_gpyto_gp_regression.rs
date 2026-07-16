@@ -47,7 +47,9 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, r2, relative_l2, rmse, run_python};
+use gam::test_support::reference::{
+    Column, QualityPair, pad_to, pearson, r2, relative_l2, rmse, run_python,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -240,6 +242,18 @@ emit("grid_std", std)
          gam_rmse_vs_truth={gam_truth_rmse:.4} gpt_rmse_vs_truth={gpt_truth_rmse:.4} \
          coverage95={coverage:.3} | context-only rel_l2_to_gpt={rel_to_ref:.4} \
          band_pearson={band_corr:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_gpyto_gp_regression",
+            "truth_rmse",
+            gam_truth_rmse,
+            "gpytorch",
+            gpt_truth_rmse,
+        )
+        .line()
     );
 
     // 1. PRIMARY — truth recovery: a good Matérn-5/2 smoother removes most of the
@@ -437,6 +451,18 @@ emit("test_pred", pred)
          gpt_test_rmse={gpt_test_rmse:.4} | context-only rel_l2_to_gpt={rel_to_ref:.4}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_gpyto_gp_regression::test",
+            "test_rmse",
+            gam_test_rmse,
+            "gpytorch",
+            gpt_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts the held-out signal -------
