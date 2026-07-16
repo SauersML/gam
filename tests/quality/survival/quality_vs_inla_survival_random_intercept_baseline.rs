@@ -279,7 +279,7 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
     let group_idx = col["group"];
 
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         ..FitConfig::default()
     };
@@ -716,7 +716,7 @@ fn gam_survival_frailty_random_intercept_matches_inla_on_real_data() {
     let group_idx = dcol["group"];
 
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         ..FitConfig::default()
     };

@@ -129,7 +129,7 @@ fn survival_location_scale_constant_scale_fit_terminates_1389() {
     // gauge-degenerate cold-start time block small (the estimand is a parametric
     // AFT), matching the lognormal-LS quality fixture.
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         survival_distribution: "gaussian".to_string(),
         time_num_internal_knots: 2,
         outer_max_iter: Some(80),

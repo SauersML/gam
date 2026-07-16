@@ -158,7 +158,7 @@ fn fit_and_cause_cumulative_hazards(
         encode_recordswith_inferred_schema(headers, rows).expect("encode competing-risks data");
 
     let cfg = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula("Surv(time, event) ~ s(x, bs='tp')", &data, &cfg)

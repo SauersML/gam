@@ -71,7 +71,7 @@ fn competing_risks_baseline_seed_replicates_to_match_cause_specific_beta_length(
 fn survival_marginal_slope_materialize_rejects_z_column_in_main_formula() {
     let data = load_survival_dataset();
     let mut config = FitConfig::default();
-    config.survival_likelihood = "marginal-slope".to_string();
+    config.survival_likelihood = Some("marginal-slope".to_string());
     config.logslope_formula = Some("1".to_string());
     config.z_column = Some("z".to_string());
 
@@ -90,7 +90,7 @@ fn survival_marginal_slope_materialize_rejects_z_column_in_main_formula() {
 fn survival_marginal_slope_materialize_rejects_z_column_in_logslope_formula() {
     let data = load_survival_dataset();
     let mut config = FitConfig::default();
-    config.survival_likelihood = "marginal-slope".to_string();
+    config.survival_likelihood = Some("marginal-slope".to_string());
     config.logslope_formula = Some("1 + z".to_string());
     config.z_column = Some("z".to_string());
 
@@ -109,7 +109,7 @@ fn survival_marginal_slope_materialize_rejects_z_column_in_logslope_formula() {
 fn survival_marginal_slope_materialize_rejects_z_column_when_logslope_defaults_to_main_spec() {
     let data = load_survival_dataset();
     let mut config = FitConfig::default();
-    config.survival_likelihood = "marginal-slope".to_string();
+    config.survival_likelihood = Some("marginal-slope".to_string());
     config.z_column = Some("z".to_string());
 
     let err = materialize("Surv(entry, exit, event) ~ x + z", &data, &config)
@@ -173,7 +173,7 @@ fn survival_transformation_left_truncated_uses_median_exit_anchor() {
     // (Royston-Parmar) likelihood; the direct Rust `FitConfig::default()` stays
     // lognormal location-scale for backwards-compatible formula fits.
     let mut config = FitConfig::default();
-    config.survival_likelihood = "transformation".to_string();
+    config.survival_likelihood = Some("transformation".to_string());
 
     let materialized = materialize("Surv(entry, exit, event) ~ x", &data, &config)
         .expect("left-truncated transformation survival should materialize");
@@ -290,7 +290,7 @@ fn survival_marginal_slope_matern_logslope_penalties_keep_surface_width() {
         ),
     ] {
         let config = FitConfig {
-            survival_likelihood: "marginal-slope".to_string(),
+            survival_likelihood: Some("marginal-slope".to_string()),
             logslope_formula: Some("matern(PC1, PC2, PC3, centers=6)".to_string()),
             z_column: Some("z".to_string()),
             ..FitConfig::default()
@@ -494,7 +494,7 @@ fn competing_risks_weibull_fit_is_reachable_1590() {
         ],
     };
     let config = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
 
@@ -818,7 +818,7 @@ fn survival_marginal_slope_rejects_zero_event_data_before_fit() {
     let mut data = workflow_test_dataset();
     data.values.column_mut(2).fill(0.0);
     let config = FitConfig {
-        survival_likelihood: "marginal-slope".to_string(),
+        survival_likelihood: Some("marginal-slope".to_string()),
         logslope_formula: Some("1".to_string()),
         z_column: Some("z".to_string()),
         ..FitConfig::default()
@@ -882,7 +882,7 @@ fn survival_one_positive_weight_event_passes_fittability_gate_issue_2276() {
 fn competing_risks_zero_weight_cause_rejected_before_fit_issue_2276() {
     let data = competing_risks_weighted_dataset([1.0, 2.0, 1.0, 0.0], [1.0, 0.0, 1.0, 1.0]);
     let config = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         weight_column: Some("w".to_string()),
         ..FitConfig::default()
     };
@@ -904,7 +904,7 @@ fn competing_risks_zero_weight_cause_rejected_before_fit_issue_2276() {
 fn competing_risks_all_causes_weighted_passes_per_cause_gate_issue_2276() {
     let data = competing_risks_weighted_dataset([1.0, 2.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]);
     let config = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         weight_column: Some("w".to_string()),
         ..FitConfig::default()
     };
@@ -966,7 +966,7 @@ fn competing_risks_weighted_dataset(codes: [f64; 4], weights: [f64; 4]) -> Datas
 fn surv_interval_rejects_degenerate_zero_width_bracket_issue_2277() {
     let data = surv_interval_degenerate_bracket_dataset();
     let config = FitConfig {
-        survival_likelihood: "latent".to_string(),
+        survival_likelihood: Some("latent".to_string()),
         ..FitConfig::default()
     };
 
@@ -1443,7 +1443,7 @@ fn workflow_survival_marginal_slope_routes_logslope_linkwiggle_into_score_warp_o
     // two blocks are distinguished here by `internal_knots` (9 vs 7) and
     // `penalty_order` (1 vs 2,3), not by an unrealizable degree.
     let config = FitConfig {
-        survival_likelihood: "marginal-slope".to_string(),
+        survival_likelihood: Some("marginal-slope".to_string()),
         logslope_formula: Some(
             "1 + linkwiggle(degree=3, internal_knots=7, penalty_order=\"2,3\")".to_string(),
         ),
@@ -2037,7 +2037,7 @@ fn linkwiggle_defaults_are_consistent_across_formula_and_runtime() {
 fn survival_marginal_slope_accepts_explicit_probit_link() {
     let data = workflow_test_dataset();
     let config = FitConfig {
-        survival_likelihood: "marginal-slope".to_string(),
+        survival_likelihood: Some("marginal-slope".to_string()),
         logslope_formula: Some("1".to_string()),
         z_column: Some("z".to_string()),
         ..FitConfig::default()
@@ -2928,7 +2928,7 @@ fn survival_likelihood_rejected_on_nonsurvival_response() {
     let data = nonsurvival_gaussian_dataset();
     let mut config = FitConfig::default();
     // Explicitly request a survival likelihood mode *without* a Surv(...) LHS.
-    config.survival_likelihood = "weibull".to_string();
+    config.survival_likelihood = Some("weibull".to_string());
 
     let err = materialize("time ~ s(x)", &data, &config)
         .err()
@@ -2947,12 +2947,15 @@ fn survival_likelihood_rejected_on_nonsurvival_response() {
 
 #[test]
 fn default_survival_likelihood_allowed_on_nonsurvival_response() {
-    // Positive control: the Rust default (lognormal location-scale) mode is
-    // indistinguishable from "unset" and must NOT be rejected, so the guard
-    // isn't over-broad.
+    // Positive control: the default survival_likelihood is now `None` (unset) —
+    // there is no library-side string default (#2301). `None` is unambiguously
+    // "unset" and must NOT be rejected on a non-survival response, so the guard
+    // isn't over-broad. The single canonical default (`"transformation"`) is
+    // resolved only at the `Surv(...)` seam, which a non-survival fit never hits.
     let data = nonsurvival_gaussian_dataset();
     let config = FitConfig::default();
-    assert_eq!(config.survival_likelihood, "location-scale");
+    assert_eq!(config.survival_likelihood, None);
+    assert_eq!(config.resolved_survival_likelihood(), "transformation");
 
     materialize("time ~ s(x)", &data, &config)
         .expect("default survival_likelihood must still materialize an ordinary GAM (#1767)");

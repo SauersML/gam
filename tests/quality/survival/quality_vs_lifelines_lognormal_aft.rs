@@ -160,7 +160,7 @@ fn gam_lognormal_aft_interaction_recovers_truth() {
     // family. No noise_formula => a single constant log-scale (sigma) channel,
     // matching lifelines' constant `sigma_`.
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         survival_distribution: "gaussian".to_string(),
         // Default flexible time warp (8 internal knots). An earlier commit scoped
         // this to 2 knots claiming it let gam "recover the affine surface and beat

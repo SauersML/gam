@@ -127,7 +127,7 @@ fn transformation_survival_library_path_does_not_abort_on_outer_trial() {
     // that builds REML-selected time-smoothing blocks and therefore runs the
     // outer λ-selection loop the bug lives in.
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         ..FitConfig::default()
     };
 

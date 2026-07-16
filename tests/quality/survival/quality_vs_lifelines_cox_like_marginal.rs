@@ -246,7 +246,7 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
     // degeneracy of gam#979). baseline_target="linear" is the marginal-slope
     // baseline; frailty=None ⇒ probit_scale = 1.
     let cfg = FitConfig {
-        survival_likelihood: "marginal-slope".to_string(),
+        survival_likelihood: Some("marginal-slope".to_string()),
         z_column: Some("ejection_fraction".to_string()),
         logslope_formula: Some("s(age, bs='tp', k=4)".to_string()),
         baseline_target: "linear".to_string(),

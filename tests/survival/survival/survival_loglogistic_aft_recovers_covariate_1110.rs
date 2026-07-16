@@ -108,7 +108,7 @@ fn loglogistic_aft_recovers_location_slope_not_pinned_to_zero() {
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode survival data");
 
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         survival_distribution: "logistic".to_string(),
         noise_formula: Some("1".to_string()),
         // The load-bearing setting for gam#1110: 2 internal knots makes the

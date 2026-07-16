@@ -84,7 +84,7 @@ fn build_survival_frame() -> gam::data::EncodedDataset {
 fn survival_fit_existence_is_the_certified_convergence_verdict() {
     let ds = build_survival_frame();
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: 3,
         time_num_internal_knots: 2,

@@ -171,7 +171,7 @@ fn gam_penalized_baseline_is_monotone_and_concordant_on_cirrhosis() {
     // enters linearly as a proportional log-Λ shift — exactly pstpm2's
     // `Surv(t,event) ~ age`, with the baseline smoothed/penalized automatically.
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: TIME_DEGREE,
         time_num_internal_knots: N_INTERNAL_KNOTS,
@@ -588,7 +588,7 @@ fn synthetic_gompertz_monotone_recovery() {
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode Gompertz frame");
 
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: TIME_DEGREE,
         time_num_internal_knots: N_INTERNAL_KNOTS,

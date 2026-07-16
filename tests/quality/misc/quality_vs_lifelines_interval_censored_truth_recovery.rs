@@ -161,7 +161,7 @@ fn gam_recovers_interval_censored_latent_truth_match_or_beat_lifelines() {
         .expect("encode interval-censored survival data");
 
     let cfg = FitConfig {
-        survival_likelihood: "latent".to_string(),
+        survival_likelihood: Some("latent".to_string()),
         baseline_target: "weibull".to_string(),
         time_basis: "ispline".to_string(),
         frailty: FrailtySpec::HazardMultiplier {

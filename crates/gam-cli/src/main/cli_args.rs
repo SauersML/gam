@@ -288,9 +288,10 @@ pub(crate) struct FitArgs {
     /// one — the smooth analogue of a quantile.
     #[arg(long = "expectile-tau", value_parser = parse_probability_open_cli)]
     pub(crate) expectile_tau: Option<f64>,
-    /// Survival likelihood mode for Surv(...) formulas.
-    #[arg(long = "survival-likelihood", default_value = "transformation", value_parser = crate::config_resolve::parse_survival_likelihood_cli)]
-    pub(crate) survival_likelihood: String,
+    /// Survival likelihood mode for Surv(...) formulas; defaults to
+    /// transformation for Surv() formulas.
+    #[arg(long = "survival-likelihood", value_parser = crate::config_resolve::parse_survival_likelihood_cli)]
+    pub(crate) survival_likelihood: Option<String>,
     /// Optional anchor time for survival location-scale mode.
     #[arg(long = "survival-time-anchor", value_parser = parse_nonnegative_f64_cli)]
     pub(crate) survival_time_anchor: Option<f64>,

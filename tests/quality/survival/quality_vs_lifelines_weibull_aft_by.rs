@@ -199,7 +199,7 @@ fn gam_weibull_aft_by_factor_recovers_true_survival() {
     let g_idx = col["group"];
 
     let cfg = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(
@@ -561,7 +561,7 @@ fn gam_weibull_aft_by_factor_recovers_true_survival_on_real_data() {
 
     // ---- fit gam on TRAIN: Weibull AFT + by-factor smooth on karno --------
     let cfg = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(

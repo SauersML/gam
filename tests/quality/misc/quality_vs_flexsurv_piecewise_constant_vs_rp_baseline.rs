@@ -324,7 +324,7 @@ fn gam_smooth_ispline_baseline_predicts_icu_survival() {
         .expect("encode ICU survival train frame");
 
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: TIME_DEGREE,
         time_num_internal_knots: N_INTERNAL_KNOTS,
@@ -657,7 +657,7 @@ fn gam_smooth_ispline_baseline_predicts_icu_survival_on_real_data() {
     // fits). Degree-3 monotone I-spline on log t with k interior knots is the
     // flexible baseline; `karno` enters as a proportional linear covariate.
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: TIME_DEGREE,
         time_num_internal_knots: N_INTERNAL_KNOTS,

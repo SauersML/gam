@@ -81,7 +81,7 @@ fn fit_surv_two_arg_shorthand_lowers_to_location_scale_with_zero_entry() {
 
     let data = synth_right_censored_dataset(200, 0);
     let config = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         noise_formula: Some("1".to_string()),
         ..FitConfig::default()
     };

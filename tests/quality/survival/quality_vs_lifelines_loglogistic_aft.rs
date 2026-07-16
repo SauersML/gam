@@ -169,7 +169,7 @@ fn gam_loglogistic_aft_matches_lifelines_on_haberman_ages() {
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode survival data");
 
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         // Logistic residual distribution => log-logistic AFT (vs Gaussian =
         // log-normal, Gumbel = Weibull). This is the load-bearing choice.
         survival_distribution: "logistic".to_string(),

@@ -168,7 +168,7 @@ fn survival_marginal_slope_auto_matern_logslope_centers12_converges() {
     let matern = format!("matern(PC1, PC2, centers={CENTERS})");
     let formula = format!("Surv(time, event) ~ {matern}");
     let cfg = FitConfig {
-        survival_likelihood: "marginal-slope".to_string(),
+        survival_likelihood: Some("marginal-slope".to_string()),
         z_column: Some("z".to_string()),
         logslope_formula: Some(matern.clone()),
         baseline_target: "linear".to_string(),

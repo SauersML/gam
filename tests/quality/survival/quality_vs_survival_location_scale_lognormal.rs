@@ -147,7 +147,7 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg() {
     // No noise_formula => a single constant log-scale (sigma) channel, matching
     // survreg's constant `sr$scale`.
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         survival_distribution: "gaussian".to_string(),
         // #721: this estimand is a parametric lognormal AFT. The default
         // cold-started 8-internal-knot monotone time block adds a large
@@ -493,7 +493,7 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg_on_real_data() {
 
     // ---- fit gam on TRAIN: lognormal location-scale AFT with s(karno) --------
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         survival_distribution: "gaussian".to_string(),
         ..FitConfig::default()
     };

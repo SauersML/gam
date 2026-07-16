@@ -15,7 +15,7 @@ fn tiny_dataset(rows: &[[f64; 4]]) -> gam::inference::data::EncodedDataset {
 
 fn fit_theta(data: &gam::inference::data::EncodedDataset) -> Vec<f64> {
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         noise_formula: Some("1".to_string()),
         ..FitConfig::default()
     };

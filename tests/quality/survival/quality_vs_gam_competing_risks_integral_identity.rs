@@ -451,7 +451,7 @@ fn cause_cumulative_hazard_real(
         .expect("encode cause-specific veteran training data");
 
     let cfg = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
     // bs='cr' (cubic regression spline) is much faster than 'tp' for a single

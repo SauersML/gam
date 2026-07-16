@@ -212,7 +212,7 @@ fn gam_smooth_covariate_recovers_flat_noise_effect_and_valid_survival_on_bone() 
     // I-spline carries 10 interior knots (spec). gam tunes all smoothing
     // parameters by REML.
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: TIME_DEGREE,
         time_num_internal_knots: TIME_INTERNAL_KNOTS,

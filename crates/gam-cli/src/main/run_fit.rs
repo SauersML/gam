@@ -120,7 +120,9 @@ fn fit_request_document_from_fit_args(
         sigma_time_degree: Some(args.sigma_time_degree),
         sigma_time_k: args.sigma_time_k,
         smooth_descriptors,
-        survival_likelihood: Some(args.survival_likelihood.clone()),
+        // `None` (flag unset) flows through so the Surv() seam resolves the one
+        // canonical default; `Some(mode)` is the explicit request (#2301).
+        survival_likelihood: args.survival_likelihood.clone(),
         threshold_time_degree: Some(args.threshold_time_degree),
         threshold_time_k: args.threshold_time_k,
         time_basis: Some(args.time_basis.clone()),
@@ -169,7 +171,9 @@ pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitCo
         time_degree: args.time_degree,
         time_num_internal_knots: args.time_num_internal_knots,
         time_smooth_lambda: args.time_smooth_lambda,
-        survival_likelihood: args.survival_likelihood.clone(),
+        // `SurvivalArgs` already carries a resolved concrete mode; this is a
+        // survival fit, so the explicit `Some` is correct.
+        survival_likelihood: Some(args.survival_likelihood.clone()),
         survival_distribution: args.survival_distribution.clone(),
         threshold_time_k: args.threshold_time_k,
         threshold_time_degree: args.threshold_time_degree,
@@ -285,7 +289,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             // entry times are synthesized as zero at materialization time.
             formula: rhs,
             predict_noise: fit_config.noise_formula.clone(),
-            survival_likelihood: fit_config.survival_likelihood.clone(),
+            survival_likelihood: fit_config.resolved_survival_likelihood().to_string(),
             survival_distribution: formula_surv
                 .as_ref()
                 .and_then(|s| s.survival_distribution.clone())
@@ -1688,7 +1692,7 @@ pub(crate) fn validate_fit_args_preflight(
     if args.request.is_some() {
         let is_survival = parse_surv_response(&parsed.response)?.is_some();
         if is_survival {
-            let likelihood = parse_survival_likelihood_mode(&fit_config.survival_likelihood)?;
+            let likelihood = parse_survival_likelihood_mode(fit_config.resolved_survival_likelihood())?;
             gam::families::fit_orchestration::validate_survival_baseline_config(
                 likelihood,
                 &fit_config.baseline_target,
@@ -1796,8 +1800,8 @@ pub(crate) fn validate_fit_args_preflight(
         return Err("--negative-binomial-theta requires --family negative-binomial".to_string());
     }
     let is_survival = parse_surv_response(&parsed.response)?.is_some();
-    let survival_likelihood = parse_survival_likelihood_mode(&fit_config.survival_likelihood)?;
-    let survival_likelihood_raw = fit_config.survival_likelihood.trim().to_ascii_lowercase();
+    let survival_likelihood = parse_survival_likelihood_mode(fit_config.resolved_survival_likelihood())?;
+    let survival_likelihood_raw = fit_config.resolved_survival_likelihood().to_ascii_lowercase();
     let baseline_target_raw = fit_config.baseline_target.trim().to_ascii_lowercase();
     let time_basis_raw = fit_config.time_basis.trim().to_ascii_lowercase();
     if is_survival {

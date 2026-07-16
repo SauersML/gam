@@ -150,7 +150,7 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
     // ---- fit with gam: location ~ s(x, k=6), log-sigma ~ s(x, k=4) ---------
     // Gaussian-residual survival location-scale via the in-Rust workflow.
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         survival_distribution: "gaussian".to_string(),
         noise_formula: Some("s(x, k=4)".to_string()),
         ..FitConfig::default()
@@ -471,7 +471,7 @@ fn gam_gaussian_survival_location_scale_matches_gamlss_on_real_data() {
     // Log-scale eta_ls  ~ smooth ejection_fraction (dispersion most plausibly
     //                     varies with cardiac output).
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         survival_distribution: "gaussian".to_string(),
         noise_formula: Some("s(ejection_fraction, k=4)".to_string()),
         ..FitConfig::default()

@@ -538,9 +538,13 @@ pub struct FitConfig {
     pub time_degree: usize,
     pub time_num_internal_knots: usize,
     pub time_smooth_lambda: f64,
-    /// Survival likelihood mode: "location-scale", "transformation", "weibull",
-    /// "marginal-slope", "latent", or "latent-binary".
-    pub survival_likelihood: String,
+    /// Survival likelihood mode: `Some("transformation" | "location-scale" |
+    /// "weibull" | "marginal-slope" | "latent" | "latent-binary")`, or `None`
+    /// (the default), which resolves to `"transformation"` at the `Surv(...)`
+    /// materialization seam via [`FitConfig::resolved_survival_likelihood`]
+    /// (#2301 — no library-side string default). `Some(_)` on a non-survival
+    /// response is a typed configuration error.
+    pub survival_likelihood: Option<String>,
     /// Residual distribution: "gaussian", "logistic", "gumbel".
     pub survival_distribution: String,
     pub threshold_time_k: Option<usize>,
@@ -702,7 +706,7 @@ impl Default for FitConfig {
             time_degree: 3,
             time_num_internal_knots: 8,
             time_smooth_lambda: 1e-2,
-            survival_likelihood: "location-scale".into(),
+            survival_likelihood: None,
             survival_distribution: "gaussian".into(),
             threshold_time_k: None,
             threshold_time_degree: 3,

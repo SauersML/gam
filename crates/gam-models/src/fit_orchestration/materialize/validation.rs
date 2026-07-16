@@ -58,35 +58,41 @@ pub(crate) fn reject_survival_only_terms_for_nonsurvival(
     Ok(())
 }
 
-/// Reject a non-default `config.survival_likelihood` when the response is not
-/// `Surv(...)`.
+/// Reject an explicitly-requested `config.survival_likelihood` when the response
+/// is not `Surv(...)`.
 ///
 /// `survival_likelihood` selects the survival likelihood mode
-/// (`"location-scale"`, `"weibull"`, `"marginal-slope"`, `"latent"`,
-/// `"latent-binary"`, …) and is read *exclusively* inside `materialize_survival`.
-/// When the main formula has no `Surv(...)` response the survival materializer is
-/// never reached, so a survival-only knob like
+/// (`"transformation"`, `"location-scale"`, `"weibull"`, `"marginal-slope"`,
+/// `"latent"`, `"latent-binary"`, …) and is read *exclusively* inside
+/// `materialize_survival`. When the main formula has no `Surv(...)` response the
+/// survival materializer is never reached, so a survival-only knob like
 /// `survival_likelihood="weibull"` is parsed, validated, and then dropped on the
 /// floor — the request silently degrades to an ordinary Gaussian GAM (#1767),
 /// the same silent-no-op contract violation as the survival-only *terms* guarded
 /// by [`reject_survival_only_terms_for_nonsurvival`].
 ///
-/// The direct Rust API default is `"location-scale"` (lognormal AFT), while
-/// CLI/config-layer callers may still pass their documented `"transformation"`
-/// default explicitly. Both defaults are indistinguishable from "unset" at this
-/// validation seam, so they are allowed through here; every other,
-/// explicitly-requested mode is a configuration error and is rejected with the
-/// same phrasing the survival-only-term path uses.
+/// `survival_likelihood` is now `Option<String>` defaulting to `None` at every
+/// entrance (#2301): the single canonical default (`"transformation"`) is
+/// resolved at the `Surv(...)` seam, not stored. So `None` is unambiguously
+/// "unset" (allowed through), and ANY `Some(mode)` is an explicit request that
+/// must be rejected on a non-survival response — the type carries the intent, so
+/// this seam no longer has to guess default-vs-explicit from a string value.
 pub(crate) fn reject_survival_likelihood_for_nonsurvival(
     config: &FitConfig,
 ) -> Result<(), WorkflowError> {
-    let mode = config.survival_likelihood.trim();
-    // The library and CLI/config layers have different survival defaults; both are
-    // indistinguishable from "unset" by the time a non-survival formula reaches
-    // this seam, so neither should poison ordinary GAM materialization.
-    if mode.eq_ignore_ascii_case("transformation") || mode.eq_ignore_ascii_case("location-scale") {
+    // `survival_likelihood` is `None` by default across every entrance (#2301):
+    // the sole canonical default is resolved to `"transformation"` at the
+    // `Surv(...)` seam, not stored here. So `None` is genuinely "unset" and must
+    // not poison ordinary GAM materialization, while ANY explicit `Some(mode)`
+    // on a non-survival response is a survival knob that only
+    // `materialize_survival` reads — it would be silently dropped, degrading the
+    // fit to an ordinary GAM (#1767). Reject it, exactly as the survival-only
+    // formula terms are rejected. Carrying intent in the `Option` is what lets
+    // this seam distinguish default from explicit without guessing.
+    let Some(mode) = config.survival_likelihood.as_deref() else {
         return Ok(());
-    }
+    };
+    let mode = mode.trim();
     Err(WorkflowError::InvalidConfig {
         reason: format!(
             "survival_likelihood=\"{mode}\" is only supported in the main survival formula \

@@ -107,7 +107,7 @@ fn fit_location_scale_survival_with_constant_noise_on_small_right_censored_data(
     init_parallelism();
     let data = small_right_censored_location_scale_dataset();
     let config = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         noise_formula: Some("1".to_string()),
         ..FitConfig::default()
     };

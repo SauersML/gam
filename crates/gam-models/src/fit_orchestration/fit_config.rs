@@ -91,7 +91,9 @@ impl FitConfig {
             let value = value.trim();
             (!value.eq_ignore_ascii_case("auto")).then(|| value.to_string())
         });
-        self.survival_likelihood = self.survival_likelihood.trim().to_ascii_lowercase();
+        self.survival_likelihood = self
+            .survival_likelihood
+            .map(|value| value.trim().to_ascii_lowercase());
         self.baseline_target = self.baseline_target.trim().to_ascii_lowercase();
         self.link = self.link.and_then(|value| {
             let value = value.trim();
@@ -111,7 +113,7 @@ impl FitConfig {
         }
         self.frailty.validate().map_err(|error| error.to_string())?;
         self.spatial_optimization.validate()?;
-        let likelihood_mode = parse_survival_likelihood_mode(&self.survival_likelihood)?;
+        let likelihood_mode = parse_survival_likelihood_mode(self.resolved_survival_likelihood())?;
         validate_survival_baseline_config(
             likelihood_mode,
             &self.baseline_target,
@@ -121,6 +123,24 @@ impl FitConfig {
             self.baseline_makeham,
         )?;
         Ok(self)
+    }
+
+    /// The survival likelihood mode this config resolves to for a `Surv(...)`
+    /// fit.
+    ///
+    /// `survival_likelihood` is `None` by default — there is no library-side
+    /// string default (#2301). An explicit `Some(mode)` selects that mode; an
+    /// unset `None` resolves to the single canonical default `"transformation"`
+    /// (Royston-Parmar), the same default the CLI documents. This is the ONE
+    /// resolution point: the `Surv(...)` materialization seam, the CLI survival
+    /// path, and the pyffi survival path all consult it, so the default lives in
+    /// exactly one place. A non-`Surv()` formula never calls this — `Some(_)` on
+    /// a non-survival response is a typed configuration error rejected by
+    /// [`reject_survival_likelihood_for_nonsurvival`], and `None` is unset.
+    pub fn resolved_survival_likelihood(&self) -> &str {
+        self.survival_likelihood
+            .as_deref()
+            .unwrap_or("transformation")
     }
 }
 
@@ -132,14 +152,14 @@ mod tests {
     fn resolve_normalizes_front_end_spellings() {
         let resolved = FitConfig {
             family: Some(" AUTO ".to_string()),
-            survival_likelihood: " Transformation ".to_string(),
+            survival_likelihood: Some(" Transformation ".to_string()),
             baseline_target: " Linear ".to_string(),
             ..FitConfig::default()
         }
         .resolve()
         .unwrap();
         assert_eq!(resolved.family, None);
-        assert_eq!(resolved.survival_likelihood, "transformation");
+        assert_eq!(resolved.survival_likelihood.as_deref(), Some("transformation"));
         assert_eq!(resolved.baseline_target, "linear");
     }
 

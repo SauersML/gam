@@ -171,7 +171,7 @@ fn gam_monotone_baseline_recovers_log_cumhaz_truth() {
     // baseline × smooth covariate). Cubic (degree-3) I-spline with several
     // interior knots gives a flexible-but-monotone baseline.
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: 3,
         time_num_internal_knots: 6,

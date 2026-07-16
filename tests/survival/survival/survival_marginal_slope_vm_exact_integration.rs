@@ -147,7 +147,7 @@ fn survival_marginal_slope_v_plus_m_exact_engages_and_lifts_beta_to_raw_width() 
     let formula = format!("Surv(entry_age, exit_age, event) ~ {} + 1", duchon);
 
     let config = FitConfig {
-        survival_likelihood: "marginal-slope".to_string(),
+        survival_likelihood: Some("marginal-slope".to_string()),
         z_column: Some("prs_z".to_string()),
         logslope_formula: Some(duchon.clone()),
         baseline_target: "linear".to_string(),

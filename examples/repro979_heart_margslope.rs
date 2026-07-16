@@ -67,7 +67,7 @@ fn main() {
     ds_train.values = train_values;
 
     let cfg = FitConfig {
-        survival_likelihood: "marginal-slope".to_string(),
+        survival_likelihood: Some("marginal-slope".to_string()),
         z_column: Some("ejection_fraction".to_string()),
         logslope_formula: Some("s(age, bs='tp', k=4)".to_string()),
         baseline_target: "linear".to_string(),

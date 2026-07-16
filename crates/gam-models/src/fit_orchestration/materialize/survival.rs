@@ -115,7 +115,11 @@ pub(crate) fn materialize_survival<'a>(
         None
     };
 
-    let mut survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
+    // Resolve the survival likelihood at THE seam: an explicit `Some(mode)` is
+    // used as-is; an unset `None` becomes the one canonical default
+    // `"transformation"` here (#2301). This is the only place the survival
+    // default is materialized.
+    let mut survival_mode = parse_survival_likelihood_mode(config.resolved_survival_likelihood())?;
     // `linkwiggle(...)` is a flexible-link feature defined only for the
     // location-scale and marginal-slope survival models; it is meaningless under
     // the default `transformation` (Royston-Parmar) likelihood. When the user
@@ -133,7 +137,7 @@ pub(crate) fn materialize_survival<'a>(
                 "interval-censored SurvInterval(L, R, event) is only defined for the latent \
                  hazard-window survival likelihood (its kernel carries the log[S(L) − S(R)] \
                  interval contribution); got survival_likelihood='{}'",
-                config.survival_likelihood
+                config.resolved_survival_likelihood()
             ),
         });
     }
@@ -185,7 +189,7 @@ pub(crate) fn materialize_survival<'a>(
         return Err(WorkflowError::InvalidConfig {
             reason: format!(
                 "cause-specific competing risks with {cause_count} causes are currently supported for survival_likelihood='transformation' and 'weibull'; got '{}'",
-                config.survival_likelihood
+                config.resolved_survival_likelihood()
             ),
         }
         .into());
@@ -227,7 +231,7 @@ pub(crate) fn materialize_survival<'a>(
         return Err(WorkflowError::InvalidConfig {
             reason: format!(
                 "linkwiggle(...) is not defined for survival_likelihood='{}'",
-                config.survival_likelihood
+                config.resolved_survival_likelihood()
             ),
         }
         .into());
@@ -244,7 +248,7 @@ pub(crate) fn materialize_survival<'a>(
         return Err(WorkflowError::InvalidConfig {
             reason: format!(
                 "link(...) is not implemented for survival_likelihood='{}'",
-                config.survival_likelihood
+                config.resolved_survival_likelihood()
             ),
         }
         .into());

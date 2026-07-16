@@ -163,7 +163,7 @@ fn gam_lognormal_aft_crps_calibration_matches_lifelines() {
     // No noise_formula => a single constant log-scale (sigma) channel, matching
     // lifelines' constant `sigma_`.
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         survival_distribution: "gaussian".to_string(),
         ..FitConfig::default()
     };
@@ -545,7 +545,7 @@ fn gam_lognormal_aft_crps_calibration_matches_lifelines_on_real_data() {
 
     // ---- fit gam on TRAIN: lognormal location-scale AFT with s(age) --------
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         survival_distribution: "gaussian".to_string(),
         ..FitConfig::default()
     };

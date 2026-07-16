@@ -111,7 +111,7 @@ struct FitSummary {
 fn fitted_summary(entry: f64) -> FitSummary {
     let ds = build_frame(entry);
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: 3,
         time_num_internal_knots: 2,

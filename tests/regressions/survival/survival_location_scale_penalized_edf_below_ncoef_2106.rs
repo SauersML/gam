@@ -88,7 +88,7 @@ fn survival_location_scale_penalized_edf_below_ncoef_2106() {
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode edf data");
 
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         survival_distribution: "gaussian".to_string(),
         noise_formula: Some(format!("s(x, k={k_scale})")),
         ..FitConfig::default()

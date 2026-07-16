@@ -234,7 +234,7 @@ fn large_scale_survival_marginal_slope_canonical_gauge_fix() {
     let logslope = format!("{duchon} + linkwiggle()");
 
     let config = FitConfig {
-        survival_likelihood: "marginal-slope".to_string(),
+        survival_likelihood: Some("marginal-slope".to_string()),
         z_column: Some("prs_z".to_string()),
         logslope_formula: Some(logslope),
         baseline_target: "linear".to_string(),

@@ -200,7 +200,7 @@ fn cause_cumulative_hazard(
         .expect("encode cause-specific cirrhosis data");
 
     let cfg = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula("Surv(N_Days, event) ~ s(Age, bs='tp')", &data, &cfg)

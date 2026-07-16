@@ -145,7 +145,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         }
     };
     let requested_likelihood_mode =
-        parse_survival_likelihood_mode(&effective_config.survival_likelihood)?;
+        parse_survival_likelihood_mode(effective_config.resolved_survival_likelihood())?;
     let likelihood_mode = if predict_noise_formula.is_some() {
         match requested_likelihood_mode {
             SurvivalLikelihoodMode::Weibull => {

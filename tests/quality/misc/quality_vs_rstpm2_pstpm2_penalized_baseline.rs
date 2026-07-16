@@ -222,7 +222,7 @@ fn gam_penalized_baseline_predicts_heldout_survival_on_cirrhosis() {
         .expect("encode cirrhosis train frame");
 
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: 3,
         time_num_internal_knots: N_INTERNAL_KNOTS,

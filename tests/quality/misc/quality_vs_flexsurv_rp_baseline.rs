@@ -247,7 +247,7 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_heart_
 
     // ---- fit gam on TRAIN: Royston-Parmar net-survival baseline + linear cov -
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: TIME_DEGREE,
         time_num_internal_knots: N_INTERNAL_KNOTS,
@@ -510,7 +510,7 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_vetera
 
     // ---- fit gam on TRAIN: Royston-Parmar net-survival baseline + linear cov -
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: TIME_DEGREE,
         time_num_internal_knots: N_INTERNAL_KNOTS,

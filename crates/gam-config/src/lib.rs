@@ -174,9 +174,12 @@ pub fn resolve_fit_request_config(
     if let Some(flag) = json_config.transformation_normal {
         fit_config.transformation_normal = flag;
     }
-    if let Some(mode) = json_config.survival_likelihood {
-        fit_config.survival_likelihood = mode;
-    }
+    // `survival_likelihood` is `Option<String>` end to end (#2301): pass the
+    // caller's choice straight through — `None` (unset) stays unset so the
+    // `Surv(...)` seam resolves the one canonical default, and `Some(mode)`
+    // carries the explicit request (including onto a non-survival response,
+    // where it is a typed rejection).
+    fit_config.survival_likelihood = json_config.survival_likelihood;
     if let Some(distribution) = json_config.survival_distribution {
         fit_config.survival_distribution = distribution;
     }
@@ -860,7 +863,7 @@ mod tests {
                 name: "weibull survival likelihood and baseline scale shape",
                 cli: {
                     let mut input = base_cli();
-                    input.survival_likelihood = "weibull".to_string();
+                    input.survival_likelihood = Some("weibull".to_string());
                     input.baseline_target = "weibull".to_string();
                     input.baseline_scale = Some(2.5);
                     input.baseline_shape = Some(1.75);
@@ -877,7 +880,7 @@ mod tests {
                 name: "transformation survival gompertz makeham baseline",
                 cli: {
                     let mut input = base_cli();
-                    input.survival_likelihood = "transformation".to_string();
+                    input.survival_likelihood = Some("transformation".to_string());
                     input.baseline_target = "gompertz-makeham".to_string();
                     input.baseline_shape = Some(1.2);
                     input.baseline_rate = Some(0.04);
@@ -896,7 +899,7 @@ mod tests {
                 name: "survival likelihood values are canonicalized",
                 cli: {
                     let mut input = base_cli();
-                    input.survival_likelihood = "TRANSFORMATION".to_string();
+                    input.survival_likelihood = Some("TRANSFORMATION".to_string());
                     input
                 },
                 json: json!({
@@ -1023,7 +1026,7 @@ mod tests {
                 name: "weibull likelihood rejects gompertz target",
                 cli: {
                     let mut input = base_cli();
-                    input.survival_likelihood = "weibull".to_string();
+                    input.survival_likelihood = Some("weibull".to_string());
                     input.baseline_target = "gompertz".to_string();
                     input
                 },

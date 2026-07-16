@@ -255,7 +255,7 @@ fn gam_tensor_baseline_stratified_heldout_concordance() {
     let sex_idx = col["sex"];
 
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: 3,
         time_num_internal_knots: N_INTERNAL_KNOTS,

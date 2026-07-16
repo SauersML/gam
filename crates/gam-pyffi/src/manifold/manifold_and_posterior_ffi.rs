@@ -4890,7 +4890,7 @@ fn build_survival_marginal_slope_ffi_payload(
         fit_config.baseline_rate,
         fit_config.baseline_makeham,
     )?;
-    let likelihood_mode = parse_survival_likelihood_mode(&fit_config.survival_likelihood)?;
+    let likelihood_mode = parse_survival_likelihood_mode(fit_config.resolved_survival_likelihood())?;
     let time_cfg = if parsed.timewiggle.is_some() {
         gam::families::survival::construction::SurvivalTimeBasisConfig::None
     } else {
@@ -5369,7 +5369,7 @@ fn build_survival_location_scale_ffi_payload(
         fit_config.baseline_rate,
         fit_config.baseline_makeham,
     )?;
-    let likelihood_mode = parse_survival_likelihood_mode(&fit_config.survival_likelihood)?;
+    let likelihood_mode = parse_survival_likelihood_mode(fit_config.resolved_survival_likelihood())?;
     let time_cfg = if parsed.timewiggle.is_some() {
         gam::families::survival::construction::SurvivalTimeBasisConfig::None
     } else {

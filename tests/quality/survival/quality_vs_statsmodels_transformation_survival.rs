@@ -174,7 +174,7 @@ fn gam_transformation_survival_prediction_grid_matches_scipy() {
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode survival data");
 
     let cfg = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(
@@ -635,7 +635,7 @@ fn gam_transformation_survival_prediction_grid_matches_scipy_on_real_data() {
     // model, linear covariate block over a shared log-cumulative-hazard); only
     // the covariate set changes to the real prognostic factors.
     let cfg = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(

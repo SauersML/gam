@@ -160,7 +160,7 @@ fn gam_weibull_survival_objective_quality_on_bone() {
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode bone data");
 
     let cfg = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula("Surv(t, d) ~ trt", &data, &cfg).expect("gam Weibull fit");
@@ -433,7 +433,7 @@ fn gam_weibull_survival_objective_quality_on_bone_on_real_data() {
         encode_recordswith_inferred_schema(headers, rows).expect("encode veteran train data");
 
     let cfg = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula("Surv(time, status) ~ karno + age", &train_data, &cfg)

@@ -224,7 +224,7 @@ fn gam_weibull_survival_out_of_sample_quality_on_veteran_lung() {
         encode_recordswith_inferred_schema(headers, rows).expect("encode veteran train data");
 
     let cfg = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula("Surv(time, event) ~ karno + age + trt", &data, &cfg)
@@ -545,7 +545,7 @@ fn gam_weibull_survival_out_of_sample_quality_on_veteran_lung_on_real_data() {
         encode_recordswith_inferred_schema(headers, rows).expect("encode veteran train data");
 
     let cfg = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula("Surv(time, event) ~ karno + age + trt", &data, &cfg)

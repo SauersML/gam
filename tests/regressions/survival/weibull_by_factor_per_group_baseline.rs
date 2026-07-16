@@ -143,7 +143,7 @@ fn gam_weibull_by_factor_recovers_per_group_baseline_level() {
     let g_idx = col["group"];
 
     let cfg = FitConfig {
-        survival_likelihood: "weibull".to_string(),
+        survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(

@@ -102,7 +102,7 @@ fn fit_heteroscedastic(
     let ncols = ds.headers.len();
 
     let cfg = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
+        survival_likelihood: Some("location-scale".to_string()),
         survival_distribution: "gaussian".to_string(),
         noise_formula: Some(format!("s(x, k={k_scale})")),
         ..FitConfig::default()

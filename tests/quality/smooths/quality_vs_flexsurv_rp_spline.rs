@@ -223,7 +223,7 @@ fn gam_rp_spline_holdout_concordance_matches_or_beats_flexsurvspline_on_cirrhosi
 
     // ---- fit gam on TRAIN: Royston-Parmar flexible parametric baseline ----
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: 3,
         time_num_internal_knots: N_INTERNAL_KNOTS,
@@ -516,7 +516,7 @@ fn gam_rp_spline_holdout_concordance_matches_or_beats_flexsurvspline_on_cirrhosi
     // plus a proportional karno effect — exactly the capability the synthetic
     // arm proves, now exercised on real censored data.
     let cfg = FitConfig {
-        survival_likelihood: "transformation".to_string(),
+        survival_likelihood: Some("transformation".to_string()),
         time_basis: "ispline".to_string(),
         time_degree: 3,
         time_num_internal_knots: N_INTERNAL_KNOTS,

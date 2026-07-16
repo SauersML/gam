@@ -154,7 +154,7 @@ fn stage1_config() -> TransformationNormalConfig {
 /// naive arm sets `z_column` and leaves `ctn_stage1` `None`.
 fn stage2_config() -> FitConfig {
     FitConfig {
-        survival_likelihood: "marginal-slope".to_string(),
+        survival_likelihood: Some("marginal-slope".to_string()),
         logslope_formula: Some(LOGSLOPE_FORMULA.to_string()),
         baseline_target: "linear".to_string(),
         ..FitConfig::default()

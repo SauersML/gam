@@ -104,7 +104,7 @@ fn fit_result_kind(fit: &FitResult) -> &'static str {
 fn fit_survival_smooth(label: &str, survival_likelihood: &str) -> FitResult {
     let data = build_dataset(600);
     let config = FitConfig {
-        survival_likelihood: survival_likelihood.to_string(),
+        survival_likelihood: Some(survival_likelihood.to_string()),
         ..FitConfig::default()
     };
     fit_from_formula("Surv(entry, exit, event) ~ s(x, k=10)", &data, &config)

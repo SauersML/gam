@@ -218,7 +218,7 @@ fn gam_hazard_multiplier_frailty_matches_coxph_frailty() {
         // exactly via the K_{k,m} kernels; it requires a non-linear scalar
         // baseline, so we use the Weibull scaffold with the flexible monotone
         // I-spline time basis (gam's smooth analogue of the Breslow baseline).
-        survival_likelihood: "latent".to_string(),
+        survival_likelihood: Some("latent".to_string()),
         baseline_target: "weibull".to_string(),
         time_basis: "ispline".to_string(),
         frailty: FrailtySpec::HazardMultiplier {
@@ -515,7 +515,7 @@ fn gam_hazard_multiplier_frailty_matches_coxph_frailty_on_real_data() {
 
     // ---- fit gam on TRAIN: latent hazard-multiplier shared frailty ---------
     let cfg = FitConfig {
-        survival_likelihood: "latent".to_string(),
+        survival_likelihood: Some("latent".to_string()),
         baseline_target: "weibull".to_string(),
         time_basis: "ispline".to_string(),
         frailty: FrailtySpec::HazardMultiplier {

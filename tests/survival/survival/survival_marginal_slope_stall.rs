@@ -248,7 +248,7 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
     let formula = format!("Surv(entry_age, exit_age, event) ~ {} + sex", duchon_term);
 
     let config = FitConfig {
-        survival_likelihood: "marginal-slope".to_string(),
+        survival_likelihood: Some("marginal-slope".to_string()),
         z_column: Some("prs_z".to_string()),
         logslope_formula: Some(duchon_term),
         baseline_target: "linear".to_string(),

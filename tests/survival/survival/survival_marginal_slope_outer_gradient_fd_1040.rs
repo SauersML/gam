@@ -206,7 +206,7 @@ fn run_basis(basis_term: &str) {
     let data = build_dataset();
     let formula = format!("Surv(entry_age, exit_age, event) ~ {basis_term} + sex");
     let config = FitConfig {
-        survival_likelihood: "marginal-slope".to_string(),
+        survival_likelihood: Some("marginal-slope".to_string()),
         z_column: Some("prs_z".to_string()),
         logslope_formula: Some(basis_term.to_string()),
         baseline_target: "linear".to_string(),

@@ -406,7 +406,7 @@ fn clean_fit_invariance_survival_lognormal() {
         // to exercise the lognormal fit this test is named for (#1847) rather than
         // relying on a wrong assumption that the default is location-scale.
         let mut cfg = FitConfig::default();
-        cfg.survival_likelihood = "location-scale".to_string();
+        cfg.survival_likelihood = Some("location-scale".to_string());
         let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tp", k=6)"#, &data, &cfg)
             .unwrap_or_else(|e| panic!("clean survival fit returned Err: {e}"));
         let variant_dbg = match &result {

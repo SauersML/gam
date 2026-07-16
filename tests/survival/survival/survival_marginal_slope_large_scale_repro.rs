@@ -159,7 +159,7 @@ fn survival_marginal_slope_large_scale_repro_vm_exact_engages_and_converges() {
     let logslope = format!("{} + linkwiggle()", duchon);
 
     let config = FitConfig {
-        survival_likelihood: "marginal-slope".to_string(),
+        survival_likelihood: Some("marginal-slope".to_string()),
         z_column: Some("prs".to_string()),
         logslope_formula: Some(logslope),
         baseline_target: "linear".to_string(),
