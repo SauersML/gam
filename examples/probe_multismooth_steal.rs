@@ -78,7 +78,7 @@ fn term_edf(fit: &gam::StandardFitResult, needle: &str) -> f64 {
         penalty_cursor += 1;
     }
     for term in &design.smooth.terms {
-        let k = term.penalties_local.len();
+        let k = term.penalties.len();
         if term.name.contains(needle) {
             return unified.per_term_edf(term.coeff_range.clone(), penalty_cursor, k);
         }
