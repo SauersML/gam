@@ -130,20 +130,28 @@ impl std::fmt::Display for VanishedAtoms {
 pub enum SaeCriterionError {
     VanishedAtoms(VanishedAtoms),
     Numerical(String),
+    /// #2330 — the exact observed-information Hessian `A = ∇²_θθ L` is not
+    /// positive definite at the converged inner mode, so the dense-route Laplace
+    /// term `½log|A|` is undefined: the point is a saddle, not a maximum. The
+    /// dense capability route refuses typed rather than ranking a non-maximum
+    /// (the majorized surrogate `B` stays PD by construction; this is the exact
+    /// observed information declining to certify a non-max). `block` names the
+    /// factorized block that failed (`"joint"` or `"coordinate"`).
+    IndefiniteObservedInformation { block: &'static str },
 }
 
 impl SaeCriterionError {
     pub fn vanished_atoms(&self) -> Option<&VanishedAtoms> {
         match self {
             Self::VanishedAtoms(atoms) => Some(atoms),
-            Self::Numerical(_) => None,
+            Self::Numerical(_) | Self::IndefiniteObservedInformation { .. } => None,
         }
     }
 
     pub fn numerical_message(&self) -> Option<&str> {
         match self {
             Self::Numerical(message) => Some(message),
-            Self::VanishedAtoms(_) => None,
+            Self::VanishedAtoms(_) | Self::IndefiniteObservedInformation { .. } => None,
         }
     }
 }
@@ -165,6 +173,11 @@ impl std::fmt::Display for SaeCriterionError {
         match self {
             Self::VanishedAtoms(atoms) => atoms.fmt(f),
             Self::Numerical(message) => f.write_str(message),
+            Self::IndefiniteObservedInformation { block } => write!(
+                f,
+                "exact observed-information Hessian is indefinite at the converged mode \
+                 ({block} block): ½log|A| is undefined (the inner point is not a maximum)"
+            ),
         }
     }
 }

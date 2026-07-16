@@ -1190,6 +1190,93 @@ mod amortized_encoder_tests {
         }
     }
 
+    /// #2330 — the EXACT observed-information Laplace log-dets `(log|A|, log|A_tt|)`
+    /// from the strict-Cholesky production path (`exact_observed_information_log_dets`)
+    /// equal the independent dense eigendecomposition oracle `Σ ln λ_i(A)`, and `A`
+    /// is certified positive definite (min eigenvalue > 0) at the converged mode.
+    /// This pins the `log|A|` VALUE the dense capability route ranks against the
+    /// exact observed information `A = ∇²_θθ L`, NOT the majorized surrogate `B`.
+    #[test]
+    fn exact_observed_information_log_det_matches_eigendecomposition_2330() {
+        use ndarray::{Array1, Array2, array, s};
+        let (mut term, target, rho, _stationary_cache) =
+            super::exact_hessian_fixture_tests::converged_state_with_residual();
+        let mut rho_eval = rho.clone();
+        rho_eval.log_lambda_sparse = 0.5;
+        for v in rho_eval.log_lambda_smooth.iter_mut() {
+            *v = -2.0;
+        }
+        rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
+        let rho = rho_eval;
+        let (_value, _loss, cache) = term
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                0,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("fixed-theta cache");
+        let (log_a, log_a_tt) = term
+            .exact_observed_information_log_dets(&rho, target.view(), &cache)
+            .expect("exact observed-information log-dets");
+
+        // Independent oracle: materialize A densely via the exact-Hessian apply,
+        // then eigendecompose. The strict-Cholesky logdet (production) must equal
+        // Σ ln λ (oracle), and every eigenvalue must be positive — A is PD at a
+        // true maximum, so the typed refusal must NOT fire on this converged mode.
+        let total_t = cache.delta_t_len();
+        let k = cache.k;
+        let dim = total_t + k;
+        let mut a = Array2::<f64>::zeros((dim, dim));
+        let mut unit = SaeArrowVector {
+            t: Array1::<f64>::zeros(total_t),
+            beta: Array1::<f64>::zeros(k),
+        };
+        for col in 0..dim {
+            if col < total_t {
+                unit.t[col] = 1.0;
+            } else {
+                unit.beta[col - total_t] = 1.0;
+            }
+            let av = term
+                .apply_exact_hessian(&rho, target.view(), &cache, &unit)
+                .expect("exact-Hessian apply");
+            if col < total_t {
+                unit.t[col] = 0.0;
+            } else {
+                unit.beta[col - total_t] = 0.0;
+            }
+            for r in 0..total_t {
+                a[[r, col]] = av.t[r];
+            }
+            for r in 0..k {
+                a[[total_t + r, col]] = av.beta[r];
+            }
+        }
+        let sym = (&a + &a.t()) * 0.5;
+        let (eigs, _vecs) = sym.eigh(Side::Lower).expect("A eigendecomposition");
+        let min_eig = eigs.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(
+            min_eig > 0.0,
+            "A must be positive definite at the converged mode; min eigenvalue {min_eig}"
+        );
+        let eig_log_det: f64 = eigs.iter().map(|l| l.ln()).sum();
+        assert!(
+            (log_a - eig_log_det).abs() <= 1.0e-9 * (1.0 + eig_log_det.abs()),
+            "log|A| strict-Cholesky path {log_a} != eigendecomposition oracle {eig_log_det}"
+        );
+        let a_tt = sym.slice(s![..total_t, ..total_t]).to_owned();
+        let (eigs_tt, _) = a_tt.eigh(Side::Lower).expect("A_tt eigendecomposition");
+        let eig_log_det_tt: f64 = eigs_tt.iter().map(|l| l.ln()).sum();
+        assert!(
+            (log_a_tt - eig_log_det_tt).abs() <= 1.0e-9 * (1.0 + eig_log_det_tt.abs()),
+            "log|A_tt| strict-Cholesky path {log_a_tt} != eigendecomposition oracle {eig_log_det_tt}"
+        );
+    }
+
     /// The fitted amplitudes the encoder derives are exactly the posterior gate
     /// coordinates used by reconstruction. Decoder magnitude stays in `B`, so
     /// there is no second radial-scale channel to fold into these values.
