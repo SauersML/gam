@@ -1805,6 +1805,120 @@ extern "C" __global__ void sae_rowjet_contract_bilinear_beta(
   }
   beta_out[index]=acc;
 }
+
+// ---- resident Trace (θ-adjoint) reduction kernels (#2304) ----
+//
+// The Trace shape reduces jet-against-jet inner products (no single probe), so
+// it materializes the same first/second/beta/mixed tower the elementwise path
+// builds and contracts it in place against the small per-row selected-inverse
+// weights `E_tt` (q×q, deflation-folded), `inv_vbeta` (q×nb) and the shared
+// `beta_inv` (nb×nb). Only the reduced `n·q` t-outputs and `n·nb` β-outputs
+// leave the device; the packed tower never touches the host. The scalar formula
+// mirrors `cpu_contracted_tile`'s Trace arm term for term, including the softmax
+// data-weight substitution for a logit direction over a coordinate pair. The
+// `sqrt_row_weight` is already folded into every materialized channel, so a jet
+// dot carries it squared exactly as the CPU oracle's does.
+__device__ double sae_rj_dot(const double* x, const double* y, int p){
+  double acc=0.0;
+  for(int c=0;c<p;++c) acc += x[c]*y[c];
+  return acc;
+}
+
+// t[row*q + w] = tr(E · dh_w) over the t–t block + 2·inv_vβ t–β block + beta_inv β–β block.
+extern "C" __global__ void sae_rowjet_trace_t(
+    const double* z, const int* kind, const int* atom,
+    const double* first, const double* second, const double* beta, const double* mixed,
+    const double* e_tt, const double* inv_vbeta, const double* beta_inv,
+    double inv_tau, int k, int q, int p, int nb,
+    unsigned long long total, double* t_out)
+{
+  unsigned long long index=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  if(index>=total) return;
+  int w=(int)(index%(unsigned long long)q);
+  int row=(int)(index/(unsigned long long)q);
+  int kw=kind[row*q+w];
+  int atom_w=atom[row*q+w];
+  const double* first_row=first+(unsigned long long)row*(unsigned long long)q*p;
+  const double* second_row=second+(unsigned long long)row*(unsigned long long)q*q*p;
+  const double* beta_row=beta+(unsigned long long)row*(unsigned long long)nb*p;
+  const double* mixed_row=mixed+(unsigned long long)row*(unsigned long long)q*nb*p;
+  const double* e_row=e_tt+(unsigned long long)row*(unsigned long long)q*q;
+  const double* vbeta_row=inv_vbeta+(unsigned long long)row*(unsigned long long)q*nb;
+  double gamma=0.0;
+  for(int a=0;a<q;++a){
+    int ka=kind[row*q+a];
+    int atom_a=atom[row*q+a];
+    const double* fa=first_row+(unsigned long long)a*p;
+    const double* s_aw=second_row+((unsigned long long)a*q+w)*p;
+    for(int b=0;b<q;++b){
+      int kb=kind[row*q+b];
+      int atom_b=atom[row*q+b];
+      const double* fb=first_row+(unsigned long long)b*p;
+      const double* s_bw=second_row+((unsigned long long)b*q+w)*p;
+      double dh;
+      if(kw==0 && ka!=0 && kb!=0){
+        double aw=z[row*k+atom_w];
+        double left=(atom_w==atom_a ? 1.0 : 0.0)-aw;
+        double right=(atom_w==atom_b ? 1.0 : 0.0)-aw;
+        dh=sae_rj_dot(fa,fb,p)*((left+right)*inv_tau);
+      }else{
+        dh=sae_rj_dot(s_aw,fb,p)+sae_rj_dot(fa,s_bw,p);
+      }
+      gamma+=e_row[a*q+b]*dh;
+    }
+    for(int border=0;border<nb;++border){
+      const double* bbeta=beta_row+(unsigned long long)border*p;
+      const double* m_w=mixed_row+((unsigned long long)w*nb+border)*p;
+      double dh=sae_rj_dot(s_aw,bbeta,p)+sae_rj_dot(fa,m_w,p);
+      gamma+=2.0*vbeta_row[a*nb+border]*dh;
+    }
+  }
+  for(int i=0;i<nb;++i){
+    const double* m_wi=mixed_row+((unsigned long long)w*nb+i)*p;
+    const double* beta_i=beta_row+(unsigned long long)i*p;
+    for(int j=0;j<nb;++j){
+      const double* m_wj=mixed_row+((unsigned long long)w*nb+j)*p;
+      const double* beta_j=beta_row+(unsigned long long)j*p;
+      double dh=sae_rj_dot(m_wi,beta_j,p)+sae_rj_dot(beta_i,m_wj,p);
+      gamma+=beta_inv[i*nb+j]*dh;
+    }
+  }
+  t_out[index]=gamma;
+}
+
+// beta[row*nb + w_beta] = tr(E · dh_wβ) over t–t + 2·inv_vβ t–β block.
+extern "C" __global__ void sae_rowjet_trace_beta(
+    const double* first, const double* beta, const double* mixed,
+    const double* e_tt, const double* inv_vbeta,
+    int q, int p, int nb, unsigned long long total, double* beta_out)
+{
+  unsigned long long index=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  if(index>=total) return;
+  int wb=(int)(index%(unsigned long long)nb);
+  int row=(int)(index/(unsigned long long)nb);
+  const double* first_row=first+(unsigned long long)row*(unsigned long long)q*p;
+  const double* beta_row=beta+(unsigned long long)row*(unsigned long long)nb*p;
+  const double* mixed_row=mixed+(unsigned long long)row*(unsigned long long)q*nb*p;
+  const double* e_row=e_tt+(unsigned long long)row*(unsigned long long)q*q;
+  const double* vbeta_row=inv_vbeta+(unsigned long long)row*(unsigned long long)q*nb;
+  double gamma=0.0;
+  for(int a=0;a<q;++a){
+    const double* fa=first_row+(unsigned long long)a*p;
+    const double* m_a=mixed_row+((unsigned long long)a*nb+wb)*p;
+    for(int b=0;b<q;++b){
+      const double* fb=first_row+(unsigned long long)b*p;
+      const double* m_b=mixed_row+((unsigned long long)b*nb+wb)*p;
+      double dh=sae_rj_dot(m_a,fb,p)+sae_rj_dot(fa,m_b,p);
+      gamma+=e_row[a*q+b]*dh;
+    }
+    for(int border=0;border<nb;++border){
+      const double* bbeta=beta_row+(unsigned long long)border*p;
+      double dh=sae_rj_dot(m_a,bbeta,p);
+      gamma+=2.0*vbeta_row[a*nb+border]*dh;
+    }
+  }
+  beta_out[index]=gamma;
+}
 "#;
 
 #[cfg(target_os = "linux")]
@@ -2018,36 +2132,32 @@ mod device {
         })
     }
 
-    pub(super) fn device_tile(
-        rows: &[SaeSoftmaxRowJetInput],
+    /// Materialized first/second/beta/mixed tower channels resident on device.
+    struct TowerChannels {
+        first_dev: CudaSlice<f64>,
+        second_dev: CudaSlice<f64>,
+        beta_dev: CudaSlice<f64>,
+        mixed_dev: CudaSlice<f64>,
+        first_len: usize,
+        second_len: usize,
+        beta_len: usize,
+        mixed_len: usize,
+    }
+
+    /// Build the packed first/second/beta/mixed channels on device from staged
+    /// inputs, launching the four elementwise tower kernels. Shared by the
+    /// elementwise `device_tile` (which downloads them) and the Trace contracted
+    /// tile (which reduces them in place and downloads only the coefficients).
+    fn materialize_tower_channels(
+        stream: &Arc<CudaStream>,
+        b: &Backend,
+        staged: &Staged,
         inv_tau: f64,
-        k: usize,
+        n: usize,
         q: usize,
         p: usize,
         n_beta: usize,
-    ) -> Result<SaeRowJetChannels, GpuError> {
-        let n = rows.len();
-        let b = backend()?;
-        let stream = b.stream.clone();
-        let Staged {
-            z_dev,
-            active_dev,
-            kind_dev,
-            atom_dev,
-            decoded_dev,
-            d1_dev,
-            d2_dev,
-            sqrt_w_dev,
-            beta_atom_dev,
-            beta_phi_dev,
-            beta_first_dev,
-            beta_output_dev,
-            k_i32,
-            q_i32,
-            p_i32,
-            nb_i32,
-        } = stage_inputs(&stream, rows, k, q, p, n_beta)?;
-
+    ) -> Result<TowerChannels, GpuError> {
         let first_len = device_length(&[n, q, p])?;
         let second_len = device_length(&[n, q, q, p])?;
         let beta_len = device_length(&[n, n_beta, p])?;
@@ -2074,17 +2184,17 @@ mod device {
                 .map_err(|_| gam_gpu::gpu_err!("SAE row-jet first length overflows u64"))?;
             let mut launch = stream.launch_builder(&function);
             launch
-                .arg(&z_dev)
-                .arg(&active_dev)
-                .arg(&kind_dev)
-                .arg(&atom_dev)
-                .arg(&decoded_dev)
-                .arg(&d1_dev)
-                .arg(&sqrt_w_dev)
+                .arg(&staged.z_dev)
+                .arg(&staged.active_dev)
+                .arg(&staged.kind_dev)
+                .arg(&staged.atom_dev)
+                .arg(&staged.decoded_dev)
+                .arg(&staged.d1_dev)
+                .arg(&staged.sqrt_w_dev)
                 .arg(&inv_tau)
-                .arg(&k_i32)
-                .arg(&q_i32)
-                .arg(&p_i32)
+                .arg(&staged.k_i32)
+                .arg(&staged.q_i32)
+                .arg(&staged.p_i32)
                 .arg(&total)
                 .arg(&mut first_dev);
             // SAFETY: the loaded kernel's argument ABI matches this builder, and
@@ -2100,18 +2210,18 @@ mod device {
                 .map_err(|_| gam_gpu::gpu_err!("SAE row-jet second length overflows u64"))?;
             let mut launch = stream.launch_builder(&function);
             launch
-                .arg(&z_dev)
-                .arg(&active_dev)
-                .arg(&kind_dev)
-                .arg(&atom_dev)
-                .arg(&decoded_dev)
-                .arg(&d1_dev)
-                .arg(&d2_dev)
-                .arg(&sqrt_w_dev)
+                .arg(&staged.z_dev)
+                .arg(&staged.active_dev)
+                .arg(&staged.kind_dev)
+                .arg(&staged.atom_dev)
+                .arg(&staged.decoded_dev)
+                .arg(&staged.d1_dev)
+                .arg(&staged.d2_dev)
+                .arg(&staged.sqrt_w_dev)
                 .arg(&inv_tau)
-                .arg(&k_i32)
-                .arg(&q_i32)
-                .arg(&p_i32)
+                .arg(&staged.k_i32)
+                .arg(&staged.q_i32)
+                .arg(&staged.p_i32)
                 .arg(&total)
                 .arg(&mut second_dev);
             // SAFETY: the loaded kernel's argument ABI matches this builder, and
@@ -2127,15 +2237,15 @@ mod device {
                 .map_err(|_| gam_gpu::gpu_err!("SAE row-jet beta length overflows u64"))?;
             let mut launch = stream.launch_builder(&function);
             launch
-                .arg(&z_dev)
-                .arg(&active_dev)
-                .arg(&beta_atom_dev)
-                .arg(&beta_phi_dev)
-                .arg(&beta_output_dev)
-                .arg(&sqrt_w_dev)
-                .arg(&k_i32)
-                .arg(&p_i32)
-                .arg(&nb_i32)
+                .arg(&staged.z_dev)
+                .arg(&staged.active_dev)
+                .arg(&staged.beta_atom_dev)
+                .arg(&staged.beta_phi_dev)
+                .arg(&staged.beta_output_dev)
+                .arg(&staged.sqrt_w_dev)
+                .arg(&staged.k_i32)
+                .arg(&staged.p_i32)
+                .arg(&staged.nb_i32)
                 .arg(&total)
                 .arg(&mut beta_dev);
             // SAFETY: the loaded kernel's argument ABI matches this builder, and
@@ -2151,26 +2261,60 @@ mod device {
                 .map_err(|_| gam_gpu::gpu_err!("SAE row-jet mixed length overflows u64"))?;
             let mut launch = stream.launch_builder(&function);
             launch
-                .arg(&z_dev)
-                .arg(&active_dev)
-                .arg(&kind_dev)
-                .arg(&atom_dev)
-                .arg(&beta_atom_dev)
-                .arg(&beta_phi_dev)
-                .arg(&beta_first_dev)
-                .arg(&beta_output_dev)
-                .arg(&sqrt_w_dev)
+                .arg(&staged.z_dev)
+                .arg(&staged.active_dev)
+                .arg(&staged.kind_dev)
+                .arg(&staged.atom_dev)
+                .arg(&staged.beta_atom_dev)
+                .arg(&staged.beta_phi_dev)
+                .arg(&staged.beta_first_dev)
+                .arg(&staged.beta_output_dev)
+                .arg(&staged.sqrt_w_dev)
                 .arg(&inv_tau)
-                .arg(&k_i32)
-                .arg(&q_i32)
-                .arg(&p_i32)
-                .arg(&nb_i32)
+                .arg(&staged.k_i32)
+                .arg(&staged.q_i32)
+                .arg(&staged.p_i32)
+                .arg(&staged.nb_i32)
                 .arg(&total)
                 .arg(&mut mixed_dev);
             // SAFETY: the loaded kernel's argument ABI matches this builder, and
             // `grid(mixed_len)` covers only the `mixed_len` allocated outputs.
             unsafe { launch.launch(grid(mixed_len)?) }.gpu_ctx("SAE row-jet beta mixed launch")?;
         }
+        Ok(TowerChannels {
+            first_dev,
+            second_dev,
+            beta_dev,
+            mixed_dev,
+            first_len,
+            second_len,
+            beta_len,
+            mixed_len,
+        })
+    }
+
+    pub(super) fn device_tile(
+        rows: &[SaeSoftmaxRowJetInput],
+        inv_tau: f64,
+        k: usize,
+        q: usize,
+        p: usize,
+        n_beta: usize,
+    ) -> Result<SaeRowJetChannels, GpuError> {
+        let n = rows.len();
+        let b = backend()?;
+        let stream = b.stream.clone();
+        let staged = stage_inputs(&stream, rows, k, q, p, n_beta)?;
+        let TowerChannels {
+            first_dev,
+            second_dev,
+            beta_dev,
+            mixed_dev,
+            first_len,
+            second_len,
+            beta_len,
+            mixed_len,
+        } = materialize_tower_channels(&stream, b, &staged, inv_tau, n, q, p, n_beta)?;
 
         let mut out = SaeRowJetChannels::zeros(n, k, q, p, n_beta)
             .map_err(|reason| gam_gpu::gpu_err!("{reason}"))?;
@@ -2198,6 +2342,124 @@ mod device {
         Ok(out)
     }
 
+    /// Resident Trace (θ-adjoint) contracted tile (#2304): materialize the
+    /// first/second/beta/mixed tower on device, reduce it in place against the
+    /// per-row deflation-folded `E_tt` (q×q), `inv_vbeta` (q×nb) and the shared
+    /// `beta_inv` (nb×nb) selected-inverse weights, and download only the
+    /// `n·q` t and `n·nb` β coefficients. The packed tower never touches the
+    /// host. Gated bit-comparably (≤1e-12) against `cpu_contracted_tile`'s Trace
+    /// arm, whose scalar formulas these kernels transcribe.
+    fn device_trace_tile(
+        stream: &Arc<CudaStream>,
+        b: &Backend,
+        staged: &Staged,
+        inv_tau: f64,
+        e_tt: &[f64],
+        inv_vbeta: &[f64],
+        beta_inv: &[f64],
+        n: usize,
+        q: usize,
+        p: usize,
+        n_beta: usize,
+    ) -> Result<SaeRowJetContractedTile, GpuError> {
+        let tower = materialize_tower_channels(stream, b, staged, inv_tau, n, q, p, n_beta)?;
+        let e_tt_dev = stream
+            .clone_htod(nonempty_f64(e_tt).as_ref())
+            .gpu_ctx("SAE row-jet htod trace e_tt")?;
+        let inv_vbeta_dev = stream
+            .clone_htod(nonempty_f64(inv_vbeta).as_ref())
+            .gpu_ctx("SAE row-jet htod trace inv_vbeta")?;
+        let beta_inv_dev = stream
+            .clone_htod(nonempty_f64(beta_inv).as_ref())
+            .gpu_ctx("SAE row-jet htod trace beta_inv")?;
+
+        let t_len = device_length(&[n, q])?;
+        let beta_len = device_length(&[n, n_beta])?;
+        let mut t_dev = stream
+            .alloc_zeros::<f64>(t_len.max(1))
+            .gpu_ctx("SAE row-jet alloc trace t")?;
+        let mut beta_dev = stream
+            .alloc_zeros::<f64>(beta_len.max(1))
+            .gpu_ctx("SAE row-jet alloc trace beta")?;
+
+        if t_len != 0 {
+            let function = b
+                .module
+                .load_function("sae_rowjet_trace_t")
+                .gpu_ctx("SAE row-jet trace t load")?;
+            let total = u64::try_from(t_len)
+                .map_err(|_| gam_gpu::gpu_err!("SAE row-jet trace t length overflows u64"))?;
+            let mut launch = stream.launch_builder(&function);
+            launch
+                .arg(&staged.z_dev)
+                .arg(&staged.kind_dev)
+                .arg(&staged.atom_dev)
+                .arg(&tower.first_dev)
+                .arg(&tower.second_dev)
+                .arg(&tower.beta_dev)
+                .arg(&tower.mixed_dev)
+                .arg(&e_tt_dev)
+                .arg(&inv_vbeta_dev)
+                .arg(&beta_inv_dev)
+                .arg(&inv_tau)
+                .arg(&staged.k_i32)
+                .arg(&staged.q_i32)
+                .arg(&staged.p_i32)
+                .arg(&staged.nb_i32)
+                .arg(&total)
+                .arg(&mut t_dev);
+            // SAFETY: the loaded kernel's argument ABI matches this builder, and
+            // `grid(t_len)` covers only the `t_len` allocated outputs.
+            unsafe { launch.launch(grid(t_len)?) }.gpu_ctx("SAE row-jet trace t launch")?;
+        }
+        if beta_len != 0 {
+            let function = b
+                .module
+                .load_function("sae_rowjet_trace_beta")
+                .gpu_ctx("SAE row-jet trace beta load")?;
+            let total = u64::try_from(beta_len)
+                .map_err(|_| gam_gpu::gpu_err!("SAE row-jet trace beta length overflows u64"))?;
+            let mut launch = stream.launch_builder(&function);
+            launch
+                .arg(&tower.first_dev)
+                .arg(&tower.beta_dev)
+                .arg(&tower.mixed_dev)
+                .arg(&e_tt_dev)
+                .arg(&inv_vbeta_dev)
+                .arg(&staged.q_i32)
+                .arg(&staged.p_i32)
+                .arg(&staged.nb_i32)
+                .arg(&total)
+                .arg(&mut beta_dev);
+            // SAFETY: the loaded kernel's argument ABI matches this builder, and
+            // `grid(beta_len)` covers only the `beta_len` allocated outputs.
+            unsafe { launch.launch(grid(beta_len)?) }.gpu_ctx("SAE row-jet trace beta launch")?;
+        }
+
+        let mut t = vec![0.0_f64; t_len];
+        let mut beta = vec![0.0_f64; beta_len];
+        if t_len != 0 {
+            stream
+                .memcpy_dtoh(&t_dev, &mut t)
+                .gpu_ctx("SAE row-jet dtoh trace t")?;
+        }
+        if beta_len != 0 {
+            stream
+                .memcpy_dtoh(&beta_dev, &mut beta)
+                .gpu_ctx("SAE row-jet dtoh trace beta")?;
+        }
+        stream
+            .synchronize()
+            .gpu_ctx("SAE row-jet trace synchronize")?;
+        Ok(SaeRowJetContractedTile {
+            n_rows: n,
+            q,
+            n_beta,
+            t,
+            beta,
+        })
+    }
+
     /// Resident contracted tile (#2304): the tower is reduced on device and
     /// only the `n·q` / `n·n_beta` coefficients come back to the host. The
     /// packed `q²p`-class channel tensors are never allocated on either side.
@@ -2218,14 +2480,12 @@ mod device {
         let stream = b.stream.clone();
         let staged = stage_inputs(&stream, rows, k, q, p, n_beta)?;
 
-        // Narrow the public contraction to the two shapes that have a device
-        // kernel. The θ-adjoint trace reduction has no single-probe device
-        // kernel yet; its resident form (per-row `E_tt`/`inv_vβ` weighted
-        // second-jet reduction) is the hardware-gated follow-on, and the CPU
-        // arm is the authoritative oracle. Refusing it here — and dropping it
-        // from the type the assembly match below consumes — keeps that
-        // impossible branch unexpressible rather than relying on a later
-        // panic/`unreachable!` arm.
+        // The θ-adjoint Trace reduction has a distinct resident form (materialize
+        // the tower, reduce in place against the per-row `E_tt`/`inv_vβ`/`beta_inv`
+        // selected-inverse weights) with no single probe, so it delegates to
+        // `device_trace_tile` and returns before the probe machinery. The
+        // remaining two shapes share the probe dot-table path; narrowing to them
+        // here keeps the probe-free Trace branch out of the assembly match below.
         enum DeviceContraction<'a> {
             Linear,
             Bilinear { v_t: &'a [f64], v_beta: &'a [f64] },
@@ -2235,10 +2495,14 @@ mod device {
             SaeRowJetContraction::Bilinear { probe, v_t, v_beta } => {
                 (probe, DeviceContraction::Bilinear { v_t, v_beta })
             }
-            SaeRowJetContraction::Trace { .. } => {
-                return Err(gam_gpu::gpu_err!(
-                    "SAE row-jet Trace contraction has no device kernel yet; plan the CPU path"
-                ));
+            SaeRowJetContraction::Trace {
+                e_tt,
+                inv_vbeta,
+                beta_inv,
+            } => {
+                return device_trace_tile(
+                    &stream, b, &staged, inv_tau, e_tt, inv_vbeta, beta_inv, n, q, p, n_beta,
+                );
             }
         };
         let probe_dev = stream
@@ -2992,23 +3256,11 @@ mod tests {
         }
     }
 
-    /// The `Trace` seam must equal the dense θ-adjoint reduction of the
-    /// materialized channels against a per-row selected inverse — bit for bit,
-    /// because both run the identical row program and identical f64 reduction.
-    /// Uses a symmetric `E_tt` / `beta_inv` (as the true deflation-folded
-    /// selected inverse is), an arbitrary `inv_vbeta`, and guards that every
-    /// output block engages so an all-zeros bug cannot pass.
-    #[test]
-    fn contracted_trace_matches_manual_selected_inverse_reduction_2304() {
-        let rows = complete_fixture(4);
-        let inv_tau = 1.0;
-        let channels =
-            execute_softmax_row_jet_tile(&rows, inv_tau, SaeRowJetPath::Cpu).expect("CPU row jet");
-        let (n, q, n_beta) = (channels.n_rows, channels.q, channels.n_beta);
-        let scheduled = channels.into_scheduled_rows();
-        let dot =
-            |a: &[f64], b: &[f64]| -> f64 { a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum() };
-
+    /// Representative per-row selected-inverse weights for the Trace shape: a
+    /// symmetric `E_tt` and `beta_inv` (as the true deflation-folded selected
+    /// inverse is) and an arbitrary `inv_vbeta`. Shared by the manual-reduction
+    /// oracle and the device parity gate so both drive the identical operands.
+    fn trace_weights(n: usize, q: usize, n_beta: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let mut e_tt = vec![0.0_f64; n * q * q];
         for row in 0..n {
             for a in 0..q {
@@ -3030,6 +3282,89 @@ mod tests {
                 beta_inv[j * n_beta + i] = value;
             }
         }
+        (e_tt, inv_vbeta, beta_inv)
+    }
+
+    /// Device parity for the θ-adjoint Trace reduction at the same 131072-row
+    /// scale as the elementwise/linear/bilinear gate. The materialize-then-reduce
+    /// device path must reproduce the authoritative CPU Trace oracle to ≤1e-12,
+    /// transferring only the `n·q` / `n·n_beta` reduced coefficients. Skips
+    /// cleanly when no device admits (a runtime-absent skip does not count as
+    /// proof; the exact-SHA GPU gate is what closes the device claim).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn contracted_trace_device_matches_cpu_reduction_when_admitted_2304() {
+        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(error) => panic!("Trace row-jet CUDA admission failed: {error}"),
+        }
+        const ROW_COUNT: usize = 1 << 17;
+        const MEASURED_PASSES: usize = 4;
+        let inv_tau = 1.0;
+        let rows = complete_fixture(ROW_COUNT);
+        let (q, n_beta) = (rows[0].n_primaries(), rows[0].n_beta_borders());
+        let (e_tt, inv_vbeta, beta_inv) = trace_weights(ROW_COUNT, q, n_beta);
+        let contraction = SaeRowJetContraction::Trace {
+            e_tt: &e_tt,
+            inv_vbeta: &inv_vbeta,
+            beta_inv: &beta_inv,
+        };
+        let cpu =
+            execute_softmax_row_jet_tile_contracted(&rows, inv_tau, SaeRowJetPath::Cpu, contraction)
+                .expect("CPU trace oracle");
+        execute_softmax_row_jet_tile_contracted(&rows, inv_tau, SaeRowJetPath::Device, contraction)
+            .expect("admitted trace device warm-up must execute without a host retry");
+        let mut max_error = 0.0_f64;
+        for pass in 0..MEASURED_PASSES {
+            let device = execute_softmax_row_jet_tile_contracted(
+                &rows,
+                inv_tau,
+                SaeRowJetPath::Device,
+                contraction,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "admitted trace device pass {pass} must execute without a host retry: {error}"
+                )
+            });
+            max_error = cpu
+                .t
+                .iter()
+                .chain(&cpu.beta)
+                .zip(device.t.iter().chain(&device.beta))
+                .fold(max_error, |maximum, (left, right)| {
+                    maximum.max((left - right).abs())
+                });
+        }
+        let outputs_per_pass = cpu.t.len() + cpu.beta.len();
+        eprintln!(
+            "SAE_ROWJET_TRACE_GPU_ACCEPT rows={ROW_COUNT} measured_passes={MEASURED_PASSES} outputs_per_pass={outputs_per_pass} max_abs_error={max_error:.17e}"
+        );
+        assert!(
+            max_error <= 1.0e-12,
+            "Trace SAE device/CPU reduction error {max_error:e} exceeds 1e-12"
+        );
+    }
+
+    /// The `Trace` seam must equal the dense θ-adjoint reduction of the
+    /// materialized channels against a per-row selected inverse — bit for bit,
+    /// because both run the identical row program and identical f64 reduction.
+    /// Uses a symmetric `E_tt` / `beta_inv` (as the true deflation-folded
+    /// selected inverse is), an arbitrary `inv_vbeta`, and guards that every
+    /// output block engages so an all-zeros bug cannot pass.
+    #[test]
+    fn contracted_trace_matches_manual_selected_inverse_reduction_2304() {
+        let rows = complete_fixture(4);
+        let inv_tau = 1.0;
+        let channels =
+            execute_softmax_row_jet_tile(&rows, inv_tau, SaeRowJetPath::Cpu).expect("CPU row jet");
+        let (n, q, n_beta) = (channels.n_rows, channels.q, channels.n_beta);
+        let scheduled = channels.into_scheduled_rows();
+        let dot =
+            |a: &[f64], b: &[f64]| -> f64 { a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum() };
+
+        let (e_tt, inv_vbeta, beta_inv) = trace_weights(n, q, n_beta);
 
         let trace = execute_softmax_row_jet_tile_contracted(
             &rows,
