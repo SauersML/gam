@@ -2853,6 +2853,7 @@ fn fallback_projected_gradient_direction_with_constraint_set(
         let (worst, _) = ops.max_violation(&values_x);
         if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
             let Some(projected) = project_point_strictly_into_feasible_constraint_set(x, ops.set)
+                .ok()
                 .filter(|candidate| {
                     ops.values(candidate)
                         .map(|candidate_values| {
@@ -3338,19 +3339,42 @@ fn solve_newton_direction_with_constraint_set_impl(
 /// delegate to the dense projection (including its anti-parallel equality
 /// lift); the factored cone is homogeneous and one-sided, so the projection
 /// is a single identity-Hessian QP against the margin-shifted rows.
+///
+/// A refusal is a typed [`EstimationError::ParameterConstraintViolation`]
+/// naming the failing condition (dimension mismatch, non-finite iterate, or
+/// the specific row whose half-margin the projection could not clear), never a
+/// bare `None`: the caller decides whether that refusal is fatal or a soft
+/// fallback, but it is never a silent one.
 pub fn project_point_strictly_into_feasible_constraint_set(
     point: &Array1<f64>,
     set: &ConstraintSet,
-) -> Option<Array1<f64>> {
+) -> Result<Array1<f64>, EstimationError> {
     match set {
-        ConstraintSet::Dense(dense) => project_point_strictly_into_feasible_cone(point, dense),
+        ConstraintSet::Dense(dense) => {
+            // The dense arm keeps its `Option` contract (it has other callers);
+            // its refusal is retyped here so this seam carries a diagnostic
+            // rather than a bare `None`.
+            project_point_strictly_into_feasible_cone(point, dense).ok_or_else(|| {
+                EstimationError::ParameterConstraintViolation(
+                    "dense strict-interior projection could not certify a feasible point"
+                        .to_string(),
+                )
+            })
+        }
         _ => {
-            let repair_guard = FeasibilityRepairGuard::enter()?;
+            let repair_guard = FeasibilityRepairGuard::enter().ok_or_else(|| {
+                EstimationError::ParameterConstraintViolation(format!(
+                    "strict-interior projection exceeded feasibility-repair depth {MAX_FEASIBILITY_REPAIR_DEPTH}"
+                ))
+            })?;
             let p = point.len();
             if set.ncols() != p {
-                return None;
+                return Err(EstimationError::ParameterConstraintViolation(format!(
+                    "strict-interior projection dimension mismatch: point length {p} != constraint columns {}",
+                    set.ncols()
+                )));
             }
-            let ops = ConstraintSetOps::new(set, ACTIVE_SET_INTERIOR_SEED_MARGIN).ok()?;
+            let ops = ConstraintSetOps::new(set, ACTIVE_SET_INTERIOR_SEED_MARGIN)?;
             let identity = Array2::<f64>::eye(p);
             // min ½‖β − point‖² ⇒ Hessian = I, gradient at `point` = 0;
             // the margin-shifted rows carry the strict-interior shift.
@@ -3366,29 +3390,33 @@ pub fn project_point_strictly_into_feasible_constraint_set(
                 None,
                 max_iterations,
                 true,
-            )
-            .ok()?;
+            )?;
             let beta = point + &direction;
             if beta.iter().any(|v| !v.is_finite()) {
-                return None;
+                return Err(EstimationError::ParameterConstraintViolation(
+                    "strict-interior projection produced a non-finite iterate".to_string(),
+                ));
             }
             // Certify against the ORIGINAL (unshifted) rows with half-margin
             // clearance, mirroring the dense projection's exit contract.
             const SEED_FEASIBILITY_TOL: f64 = 1e-9;
-            let unshifted = ConstraintSetOps::new(set, 0.0).ok()?;
-            let values = unshifted.values(&beta).ok()?;
+            let unshifted = ConstraintSetOps::new(set, 0.0)?;
+            let values = unshifted.values(&beta)?;
+            let half_margin = 0.5 * ACTIVE_SET_INTERIOR_SEED_MARGIN - SEED_FEASIBILITY_TOL;
             for row in 0..unshifted.nrows() {
                 if unshifted.norms[row] <= 0.0 {
                     continue;
                 }
-                if unshifted.scaled_slack(&values, row)
-                    < 0.5 * ACTIVE_SET_INTERIOR_SEED_MARGIN - SEED_FEASIBILITY_TOL
-                {
-                    return None;
+                let slack = unshifted.scaled_slack(&values, row);
+                if slack < half_margin {
+                    return Err(EstimationError::ParameterConstraintViolation(format!(
+                        "strict-interior projection could not clear the half-margin at row {row}: \
+                         scaled slack {slack:.3e} < {half_margin:.3e}"
+                    )));
                 }
             }
             drop(repair_guard);
-            Some(beta)
+            Ok(beta)
         }
     }
 }
@@ -3446,6 +3474,7 @@ pub fn solve_quadratic_with_constraint_set(
                 return Ok((candidate, active_hint));
             }
             let repaired = project_point_strictly_into_feasible_constraint_set(&candidate, set)
+                .ok()
                 .filter(|repaired_point| {
                     ops.values(repaired_point)
                         .map(|values| ops.max_violation(&values).0)

@@ -1569,14 +1569,14 @@ pub(crate) fn check_linear_feasibility(
                 beta,
                 constraints,
             ) {
-                Some(p) => {
+                Ok(p) => {
                     let w = constraints
                         .max_scaled_violation(p.view())
                         .map(|(w, _)| w)
                         .unwrap_or(f64::NAN);
                     format!("strict-interior→scaled_worst={w:.3e}")
                 }
-                None => "strict-interior→None".to_string(),
+                Err(e) => format!("strict-interior→refused: {e}"),
             };
         let simple_bounds_path = match extract_simple_lower_bounds(constraints, beta.len()) {
             Ok(Some(_)) => "extract_simple_lower_bounds→Some(SIMPLE-BOUNDS PATH)",

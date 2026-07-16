@@ -3615,10 +3615,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             &trial_beta,
                             constraints,
                         ) {
-                            Some(projected) => {
+                            Ok(projected) => {
                                 trial_delta = &projected - &beta_joint;
                             }
-                            None => {
+                            Err(_) => {
                                 // Projection failed to find a strictly-interior
                                 // point (degenerate / empty-interior cone at this
                                 // trial). Since the global α-crush is gated off on
