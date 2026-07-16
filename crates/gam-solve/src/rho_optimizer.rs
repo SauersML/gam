@@ -44,6 +44,7 @@ use std::sync::Mutex;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+pub mod asymptote_certificate;
 mod bridges;
 mod capability;
 mod hessian_operator;
