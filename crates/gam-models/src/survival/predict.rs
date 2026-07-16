@@ -3021,12 +3021,16 @@ fn evaluate_rp_row_with_beta(
             .slice_mut(s![.., ..p_time])
             .assign(&row_time.x_exit_time.to_dense());
     }
-    let mut eta_derivative = derivative_time_offset_row;
+    let offset_derivative_component = derivative_time_offset_row;
+    let mut eta_derivative = offset_derivative_component;
+    let mut time_derivative_component = 0.0_f64;
     if p_time > 0 {
-        eta_derivative += row_time
+        time_derivative_component = row_time
             .x_derivative_time
             .dot(&beta.slice(s![..p_time]).to_owned())[0];
+        eta_derivative += time_derivative_component;
     }
+    let mut wiggle_derivative_component = 0.0_f64;
     if let Some(runtime) = saved_timewiggle {
         let knots = Array1::from_vec(runtime.knots.clone());
         let beta_w = beta.slice(s![p_time..p_time + p_timewiggle]).to_owned();
@@ -3066,7 +3070,25 @@ fn evaluate_rp_row_with_beta(
             &knots,
             runtime.degree,
         )?;
-        eta_derivative += derivative_design.dot(&beta_w)[0];
+        wiggle_derivative_component = derivative_design.dot(&beta_w)[0];
+        eta_derivative += wiggle_derivative_component;
+    }
+    // Cold-path diagnostic (fires only when the assembled log-cumulative-hazard
+    // derivative is about to be refused): decompose `eta_t` into its additive
+    // components and report the time-coefficient / derivative-basis extrema so a
+    // refused prediction is traceable to the specific negative term instead of
+    // only surfacing the aggregate. Never fires on the accepted path.
+    if !(eta_derivative.is_finite() && eta_derivative >= 0.0) {
+        let time_beta = beta.slice(s![..p_time]);
+        let beta_min = time_beta.iter().copied().fold(f64::INFINITY, f64::min);
+        let beta_max = time_beta.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let dtime = row_time.x_derivative_time.to_dense();
+        let dmin = dtime.iter().copied().fold(f64::INFINITY, f64::min);
+        let dmax = dtime.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        log::info!(
+            "[rp-predict/eta_t-refusal] eta_t={eta_derivative:.12e} = offset({offset_derivative_component:.12e}) + time({time_derivative_component:.12e}) + wiggle({wiggle_derivative_component:.12e}); p_time={p_time} p_timewiggle={p_timewiggle} p_cov={p_cov} time_beta=[{beta_min:.6e},{beta_max:.6e}] x_derivative_time=[{dmin:.6e},{dmax:.6e}] has_wiggle={}",
+            saved_timewiggle.is_some(),
+        );
     }
     if p_cov > 0 {
         x_exit
