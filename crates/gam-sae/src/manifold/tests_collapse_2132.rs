@@ -34,6 +34,10 @@ use super::tests_startup_validation_1782::{Topo, objective_and_seed};
 use super::{SaeManifoldRho, SaeManifoldTerm};
 use crate::assignment::{AssignmentMode, SaeAssignment};
 use gam_linalg::faer_ndarray::FaerSvd;
+// `eval_efs` is a method of the `OuterObjective` trait (impl for
+// SaeManifoldOuterObjective); the trait must be in scope to call it on the
+// production objective, the same import the sibling #1782 seed-eval test uses.
+use gam_solve::rho_optimizer::OuterObjective;
 use ndarray::{Array2, ArrayView2};
 
 /// splitmix64 mixer — deterministic, reproducible across threads / devices; no
