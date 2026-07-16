@@ -1415,6 +1415,133 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
     }
 }
 
+/// PATH C (#2253) — the DEFLATED-fixture arbiter for the #1006 envelope adjoint.
+///
+/// The tiny-fixture test above converges to a well-conditioned PD state with NO
+/// per-row deflation, so it never exercises the Daleckii–Krein
+/// [`SaeManifoldTerm::deflation_block_correction`] path. This fixture (the
+/// residual-excited two-atom circle, lifted ρ) carries genuine per-row gauge
+/// deflation on the over-parametrized chart, so `logdet_theta_adjoint` here goes
+/// through the DK correction. `Γ_joint = tr(H⁻¹ ∂H/∂θ)` must equal the fixed-θ̂
+/// central difference of the criterion's authoritative `arrow_log_det()` — the
+/// SAME operator the DK comment claims to differentiate. The #2253 full-set
+/// Hessian gate proved the assembled outer gradient is non-conservative in the
+/// smooth↔ARD cross with the deflated `Γ_joint` as the dominant carrier; this
+/// test isolates whether that is a defect in the deflated θ-adjoint itself
+/// (independent of ρ and of the CH5 builder). FD is skipped on the ARD majorizer
+/// kink (`|cos κt| < 0.2`), where `max(α cos κt, 0)` is non-smooth.
+#[test]
+pub(crate) fn sae_logdet_theta_adjoint_matches_fd_on_deflated_fixture_2253() {
+    let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
+    let (n, p) = (target.nrows(), target.ncols());
+    for row in 0..n {
+        for col in 0..p {
+            let phase = (row as f64 + 0.35) / n as f64;
+            let theta = std::f64::consts::TAU * phase;
+            target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
+        }
+    }
+    rho.log_lambda_sparse = -0.5;
+    for value in rho.log_lambda_smooth.iter_mut() {
+        *value = -1.0;
+    }
+    for axis in rho.log_ard.iter_mut() {
+        for value in axis.iter_mut() {
+            *value = -0.5;
+        }
+    }
+    term.penalized_quasi_laplace_criterion_with_cache(
+        target.view(),
+        &rho,
+        None,
+        40,
+        0.4,
+        1.0e-6,
+        1.0e-6,
+    )
+    .expect("off-manifold fixture converges with both atoms alive");
+
+    // Evaluation ρ (lifted off the floor so the deflated legs are well above FD
+    // noise), θ̂ frozen.
+    rho.log_lambda_sparse = 0.5;
+    for value in rho.log_lambda_smooth.iter_mut() {
+        *value = -2.0;
+    }
+    rho.log_ard = vec![ndarray::array![-1.2_f64], ndarray::array![-1.0_f64]];
+    let (_value, _loss, cache) = term
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            0,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
+        .expect("deflated fixed-state cache");
+    // PRECONDITION: this test only has teeth if the DK path actually fires.
+    assert!(
+        cache
+            .deflated_row_directions
+            .iter()
+            .any(|dirs| !dirs.is_empty()),
+        "deflated-fixture adjoint test requires per-row deflation to be present"
+    );
+    let solver = DeflatedArrowSolver::plain(&cache);
+    let gamma = term
+        .logdet_theta_adjoint(&rho, &cache, &solver)
+        .expect("Gamma_joint");
+
+    let h = 1.0e-5;
+    let mut checked = 0usize;
+    let mut worst = 0.0_f64;
+    for row in 0..term.n_obs() {
+        let vars = term
+            .row_vars_for_cache_row(row, &cache)
+            .expect("row vars for deflated fixture");
+        for (local_pos, var) in vars.iter().enumerate() {
+            // Probe the ARD coordinate slots (the deflated t-block); skip the
+            // majorizer kink where the fixed-θ̂ central difference is invalid.
+            let SaeLocalRowVar::Coord { atom, axis } = *var else {
+                continue;
+            };
+            let t_val = term.assignment.coords[atom].row(row)[axis];
+            let cos_kt = (std::f64::consts::TAU * t_val).cos();
+            if cos_kt.abs() < 0.2 {
+                continue;
+            }
+            let at = |dt: f64| -> f64 {
+                let mut t = term.clone();
+                let mut flat = t.assignment.coords[atom].as_flat().clone();
+                let idx = row * t.assignment.coords[atom].latent_dim() + axis;
+                flat[idx] += dt;
+                t.assignment.coords[atom].set_flat(flat.view());
+                fixed_state_logdet(t, &target, &rho)
+            };
+            let fd = (at(h) - at(-h)) / (2.0 * h);
+            let analytic = gamma.t[cache.row_offsets[row] + local_pos];
+            let err = (fd - analytic).abs();
+            worst = worst.max(err);
+            eprintln!(
+                "deflated Gamma_joint row={row} pos={local_pos} atom={atom} axis={axis} \
+                 cos_kt={cos_kt:.3} fd={fd:.8e} analytic={analytic:.8e} err={err:.3e}"
+            );
+            let tol = 2.0e-3 * (1.0 + fd.abs().max(analytic.abs()));
+            assert!(
+                err <= tol,
+                "deflated Gamma_joint mismatch row={row} pos={local_pos}: \
+                 fd={fd:.8e}, analytic={analytic:.8e} (the deflated log-det θ-adjoint \
+                 does not match ∂arrow_log_det/∂θ — DK correction defect)"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 0,
+        "deflated-fixture adjoint test probed no interior ARD coordinate (worst so far {worst:.3e})"
+    );
+}
+
 #[test]
 pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli() {
     // The integrated marginal's empirical-mass channel couples every row of
