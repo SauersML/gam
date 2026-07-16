@@ -63,7 +63,7 @@ use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -298,6 +298,30 @@ fn gam_gaulss_tensor_product_matches_mgcv() {
          gam   RMSE(mu vs truth)={gam_rmse_mu:.5}  RMSE(log sigma vs truth)={gam_rmse_log_sigma:.5}\n  \
          mgcv  RMSE(mu vs truth)={mgcv_rmse_mu:.5}  RMSE(log sigma vs truth)={mgcv_rmse_log_sigma:.5}\n  \
          (context) rel_l2(gam vs mgcv): mu={rel_mu:.5} log sigma={rel_log_sigma:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_gaulss_tensor::mu",
+            "rmse_mu",
+            gam_rmse_mu,
+            "mgcv",
+            mgcv_rmse_mu,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_gaulss_tensor::log_sigma",
+            "rmse_log_sigma",
+            gam_rmse_log_sigma,
+            "mgcv",
+            mgcv_rmse_log_sigma,
+        )
+        .line()
     );
 
     // PRIMARY CLAIM (match-or-beat the mature reference on truth recovery).

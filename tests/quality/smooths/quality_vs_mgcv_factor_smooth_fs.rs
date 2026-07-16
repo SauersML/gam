@@ -28,7 +28,9 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, held_out_r2, pad_to, relative_l2, rmse, run_r};
+use gam::test_support::reference::{
+    Column, QualityPair, held_out_r2, pad_to, relative_l2, rmse, run_r,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -225,6 +227,18 @@ fn gam_factor_smooth_fs_recovers_truth() {
          (gam/mgcv={:.3}) min_group_std={min_group_std:.4} \
          gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} rel_l2_to_mgcv={rel_to_mgcv:.4} (context only)",
         gam_truth_rmse / mgcv_truth_rmse.max(1e-12)
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_factor_smooth_fs",
+            "truth_rmse",
+            gam_truth_rmse,
+            "mgcv",
+            mgcv_truth_rmse,
+        )
+        .line()
     );
 
     // PRIMARY CLAIM: gam recovers the noiseless generating function. Averaging
@@ -456,6 +470,18 @@ fn gam_factor_smooth_fs_recovers_truth_on_real_data() {
          mgcv_test_rmse={mgcv_test_rmse:.4} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
          (context: rel_l2 vs mgcv={rel_to_mgcv:.4})",
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_factor_smooth_fs::test",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts the held-out signal -----

@@ -47,7 +47,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -193,6 +193,18 @@ fn gam_negbin_estimated_theta_smooth_matches_mgcv_nb() {
          theta_rel(gam,mgcv)={theta_rel_to_mgcv:.4}",
         gam_elapsed.as_secs_f64(),
         r_elapsed.as_secs_f64(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_negbin_estimated_theta_smooth",
+            "err",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
     );
 
     // (1) PRIMARY smooth truth-recovery: gam recovers the true log-mean curve.

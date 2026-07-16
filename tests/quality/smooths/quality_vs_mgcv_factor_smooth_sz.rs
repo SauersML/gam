@@ -27,7 +27,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -228,6 +228,18 @@ fn gam_factor_smooth_sz_matches_mgcv() {
          gam_rmse_vs_truth={gam_rmse:.5} mgcv_rmse_vs_truth={mgcv_rmse:.5} \
          gam_constraint_max={constraint_max:.5} gam_constraint_rms={constraint_rms:.5} \
          mgcv_constraint_max={mgcv_constraint_max:.5} rel_l2={rel:.4} gam_edf={gam_edf:.3}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_factor_smooth_sz",
+            "rmse_vs_truth",
+            gam_rmse,
+            "mgcv",
+            mgcv_rmse,
+        )
+        .line()
     );
 
     // (1) TRUTH RECOVERY (PRIMARY). gam must recover the generating per-group

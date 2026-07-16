@@ -25,7 +25,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -178,6 +178,18 @@ fn gam_matern_family_recovers_truth_across_nu() {
             fit.fit.log_lambdas.to_vec(),
             fit.fit.edf_by_block().to_vec(),
             fit.fit.penalty_block_trace().to_vec(),
+        );
+        eprintln!(
+            "{}",
+            QualityPair::error(
+                "smooths",
+                "quality_vs_mgcv_matern_varying_nu",
+                "rmse_vs_truth",
+                gam_rmse,
+                "mgcv",
+                mgcv_rmse,
+            )
+            .line()
         );
 
         // PRIMARY claim: gam RECOVERS the known truth at every Matérn order.

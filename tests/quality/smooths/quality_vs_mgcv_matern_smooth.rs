@@ -28,7 +28,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, r2, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -312,6 +312,18 @@ fn gam_matern_smooth_recovers_truth_on_real_data() {
          (context: held-out rel_l2 vs mgcv={rel_to_mgcv:.4})",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_matern_smooth::test",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts the held-out surface ----

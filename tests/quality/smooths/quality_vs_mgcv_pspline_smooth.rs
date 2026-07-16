@@ -30,7 +30,7 @@
 use gam::data::EncodedDataset;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, r2, relative_l2, run_r};
+use gam::test_support::reference::{Column, QualityPair, r2, relative_l2, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -188,6 +188,18 @@ fn gam_pspline_generalizes_on_lidar() {
          gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
          gam_test_R2={gam_test_r2:.4} gam_test_rmse={gam_test_rmse:.4} \
          mgcv_test_rmse={mgcv_test_rmse:.4} train_rel_l2={train_rel:.4} test_rel_l2={test_rel:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_pspline_smooth",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- assertions: OBJECTIVE predictive quality -------------------------
@@ -361,6 +373,18 @@ fn gam_pspline_generalizes_on_lidar_on_real_data() {
          gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
          gam_test_R2={gam_test_r2:.4} gam_test_rmse={gam_test_rmse:.4} \
          mgcv_test_rmse={mgcv_test_rmse:.4} train_rel_l2={train_rel:.4} test_rel_l2={test_rel:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_pspline_smooth::real_data_alt",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- assertions: OBJECTIVE predictive quality -------------------------
