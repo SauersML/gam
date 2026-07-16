@@ -1613,6 +1613,10 @@ impl SaeManifoldTerm {
     /// separate a bug in the dense `dh` + Daleckii–Krein reproduction (this diverges
     /// from the trusted production builder) from a bug in the twist / rank-charge
     /// assembly (this is ~0 but the FD still reds). Both should be at solver noise.
+    /// Only the in-crate test module calls this, so it must not exist in the
+    /// non-test lib build (integration-test builds compile the lib without
+    /// `cfg(test)` and `-D warnings` turns the dead item into a hard error).
+    #[cfg(test)]
     pub(crate) fn ch5_dense_theta_adjoint_selfcheck(
         &self,
         rho: &SaeManifoldRho,

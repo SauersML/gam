@@ -4388,7 +4388,7 @@ pub fn build_saved_survival_marginal_slope_predictor(
         .map_or(0, |runtime| runtime.beta.len());
     if beta_time.len() != p_time_base + p_timewiggle {
         let hint = stale_weibull_time_basis_hint(
-            &row_time.basisname,
+            &time_build.basisname,
             beta_time.len() == p_time_base + p_timewiggle + 1,
         );
         return Err(SurvivalPredictError::IncompatibleSchema {
