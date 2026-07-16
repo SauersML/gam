@@ -1199,6 +1199,9 @@ mod amortized_encoder_tests {
     #[test]
     fn exact_observed_information_log_det_matches_eigendecomposition_2330() {
         use ndarray::{Array1, Array2, array, s};
+        // This module does not `use super::*`; the arbiter is the first test here
+        // to build a `SaeArrowVector`, call `.eigh` (FaerEigh), and name `Side`.
+        use super::{FaerEigh, SaeArrowVector, Side};
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
         let mut rho_eval = rho.clone();
