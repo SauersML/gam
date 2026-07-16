@@ -721,9 +721,10 @@ fn softmax_fisher_perturbation<S: FisherPerturbation>(
 /// zero classification as [`gam_problem::JointPenaltySpec::validate`]
 /// (`tol = 100·p·ε·max|eig|`), so the `nullspace_dim` a joint-spec builder
 /// declares from this rank always agrees with the spectrum the validator
-/// measures. The declared structural `penalty_nullspace_dims` cannot be used
-/// for that purpose: identifiability-absorbed smooth penalties carry more
-/// numerical-zero directions than their structural claim.
+/// measures. A caller-declared structural nullity cannot be used for that
+/// purpose: identifiability-absorbed smooth penalties carry more
+/// numerical-zero directions than their structural claim (which is why the
+/// family no longer carries one).
 pub(crate) fn measured_penalty_rank(s: &Array2<f64>) -> Result<usize, String> {
     let p = s.nrows();
     if p == 0 {
@@ -764,10 +765,9 @@ pub(crate) fn centered_class_metric(m: usize, k: usize) -> Array2<f64> {
 /// * `y_one_hot.dim() == (N, K)`, with `K = total_classes ≥ 2`.
 /// * `weights.len() == N`, finite and non-negative.
 /// * `design.nrows() == N`, `design.ncols() == P`.
-/// * every penalty in `penalties` has shape `(P, P)` (symmetric, PSD), and
-///   `penalty_nullspace_dims.len() == penalties.len()`.
+/// * every penalty in `penalties` has shape `(P, P)` (symmetric, PSD).
 ///
-/// All four are validated by [`MultinomialFamily::new`].
+/// All are validated by [`MultinomialFamily::new`].
 #[derive(Clone, Debug)]
 pub struct MultinomialFamily {
     /// Categorical response matrix `Y ∈ ℝ^{N × K}`. Each row must be a point on
@@ -797,12 +797,6 @@ pub struct MultinomialFamily {
     /// over-smooths one term while under-smoothing another (#561). Carried as
     /// `Arc<Vec<…>>` so per-block specs share storage with zero copies.
     pub penalties: Arc<Vec<PenaltyMatrix>>,
-    /// Structural nullspace dimension of each penalty component in `penalties`,
-    /// parallel to it (one entry per term). Passed through to each block's
-    /// `nullspace_dims` so the exact penalized log-determinant partitions every
-    /// term's eigenspace correctly. Entries default to `0` when the caller has
-    /// no analytic rank information for a term.
-    pub penalty_nullspace_dims: Arc<Vec<usize>>,
     /// Cached likelihood evaluator. Constructed once with the same row
     /// weights as `weights` and reused across every `evaluate` call.
     likelihood: MultinomialLogitLikelihood,
@@ -905,7 +899,6 @@ impl MultinomialFamily {
         total_classes: usize,
         design: Arc<Array2<f64>>,
         penalties: Arc<Vec<PenaltyMatrix>>,
-        penalty_nullspace_dims: Arc<Vec<usize>>,
     ) -> Result<Self, String> {
         if total_classes < 2 {
             return Err(format!(
@@ -938,13 +931,6 @@ impl MultinomialFamily {
             ));
         }
         let p = design.ncols();
-        if penalty_nullspace_dims.len() != penalties.len() {
-            return Err(format!(
-                "MultinomialFamily: penalty_nullspace_dims length {} != penalties length {}",
-                penalty_nullspace_dims.len(),
-                penalties.len()
-            ));
-        }
         for (t, penalty) in penalties.iter().enumerate() {
             if penalty.shape() != (p, p) {
                 return Err(format!(
@@ -983,7 +969,6 @@ impl MultinomialFamily {
             total_classes,
             design,
             penalties,
-            penalty_nullspace_dims,
             likelihood,
             axis_derivative_cache: Arc::new(Mutex::new(None)),
             use_joint_jeffreys_term: true,
@@ -1121,9 +1106,9 @@ impl MultinomialFamily {
                     }
                 }
                 // rank(M ⊗ S_t) = m · rank(S_t); measure rank(S_t) with the
-                // validator's own zero classification (structural
-                // `penalty_nullspace_dims` understate the numerical nullity
-                // for identifiability-absorbed smooths).
+                // validator's own zero classification (a structural nullity
+                // claim understates the numerical nullity for
+                // identifiability-absorbed smooths).
                 let rank_s = measured_penalty_rank(&s_t)
                     .map_err(|e| format!("multinomial centered penalty term {t}: {e}"))?;
                 Ok(gam_problem::JointPenaltySpec {
@@ -1180,10 +1165,10 @@ impl MultinomialFamily {
         for (t, pen) in self.penalties.iter().enumerate() {
             let s_t = pen.to_dense();
             // rank(C_cᵀC_c ⊗ S_t) = 1 · rank(S_t). The rank must agree with
-            // the spectrum the joint-penalty validator measures (the declared
-            // `penalty_nullspace_dims` are a structural claim that understates
-            // the numerical nullity for identifiability-absorbed smooths), so
-            // measure it with the validator's own relative classification.
+            // the spectrum the joint-penalty validator measures (a structural
+            // nullity claim understates the numerical nullity for
+            // identifiability-absorbed smooths), so measure it with the
+            // validator's own relative classification.
             let rank_s = measured_penalty_rank(&s_t)
                 .map_err(|e| format!("multinomial equivariant penalty term {t}: {e}"))?;
             let nullspace_dim = raw_total - rank_s;
@@ -3650,8 +3635,7 @@ mod tests {
         let penalties = Arc::new(vec![crate::custom_family::PenaltyMatrix::Dense(
             Array2::<f64>::from_shape_fn((p, p), |(i, j)| if i == j { 1.0 } else { 0.0 }),
         )]);
-        let nullspace_dims = Arc::new(vec![0usize]);
-        MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
+        MultinomialFamily::new(y, weights, k, design, penalties)
             .expect("toy MultinomialFamily must construct")
     }
 
@@ -3737,8 +3721,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
         );
-        let nullspace_dims = Arc::new(vec![0usize; n_terms]);
-        let multi = MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
+        let multi = MultinomialFamily::new(y, weights, k, design, penalties)
             .expect("multi-term MultinomialFamily must construct");
         let specs = multi.build_block_specs();
         assert_eq!(specs.len(), k - 1, "one block per active class");
@@ -3811,8 +3794,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
         );
-        let nullspace_dims = Arc::new(vec![0usize; n_terms]);
-        let multi = MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
+        let multi = MultinomialFamily::new(y, weights, k, design, penalties)
             .expect("multi-term MultinomialFamily must construct");
         let specs = multi.build_block_specs();
         assert_eq!(specs.len(), k - 1);
@@ -4344,8 +4326,7 @@ mod tests {
         let x = Arc::new(Array2::<f64>::ones((n, 1)));
         let zero = Array2::<f64>::zeros((1, 1));
         let s = Arc::new(vec![crate::custom_family::PenaltyMatrix::Dense(zero)]);
-        let nd = Arc::new(vec![0usize]);
-        let err = MultinomialFamily::new(y, w, 1, x, s, nd).expect_err("K = 1 must be rejected");
+        let err = MultinomialFamily::new(y, w, 1, x, s).expect_err("K = 1 must be rejected");
         assert!(err.contains("K"));
     }
 
@@ -4384,8 +4365,7 @@ mod tests {
         let penalties = Arc::new(vec![crate::custom_family::PenaltyMatrix::Dense(
             Array2::<f64>::from_shape_fn((p, p), |(i, j)| if i == j { 1.0 } else { 0.0 }),
         )]);
-        let nullspace_dims = Arc::new(vec![0usize]);
-        MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
+        MultinomialFamily::new(y, weights, k, design, penalties)
             .expect("family_with_weights must construct")
     }
 
@@ -4999,9 +4979,8 @@ mod tests {
             p, p,
         )
         ))]);
-        let nullspace_dims = Arc::new(vec![p]); // fully unpenalized block
         let weights = Array1::<f64>::ones(n);
-        let family = MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
+        let family = MultinomialFamily::new(y, weights, k, design, penalties)
             .expect("separated multinomial family must construct");
 
         let m = family.active_classes();

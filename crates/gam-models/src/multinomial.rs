@@ -2376,7 +2376,6 @@ pub fn fit_penalized_multinomial_formula(
         .into_iter()
         .map(|penalty| scale_multinomial_formula_penalty(penalty, penalty_scale))
         .collect();
-    let per_term_nullspace_dims = design.nullspace_dims.clone();
 
     // ── Custom-family driven REML/LAML path ───────────────────────────────
     // Each active class becomes one ParameterBlockSpec, all sharing X and the
@@ -2384,7 +2383,6 @@ pub fn fit_penalized_multinomial_formula(
     // `init_lambda` (one entry per term).
     let design_arc = Arc::new(x_dense);
     let penalties_arc = Arc::new(per_term_penalties);
-    let nullspace_dims_arc = Arc::new(per_term_nullspace_dims);
     let weights = resolve_multinomial_row_weights(data, config)?;
     if weights.len() != n_obs {
         crate::bail_invalid_estim!(
@@ -2403,7 +2401,6 @@ pub fn fit_penalized_multinomial_formula(
         k,
         design_arc.clone(),
         penalties_arc.clone(),
-        nullspace_dims_arc.clone(),
     )
     .map_err(EstimationError::InvalidInput)?
     .with_joint_jeffreys_term(false)
@@ -2783,9 +2780,17 @@ pub fn fit_penalized_multinomial_formula(
                 }
                 class_trace += tr_at;
                 // A single component's per-class trace EDF `rank(S_t) − tr_{a,t}`,
-                // bounded by its local rank (≤ p_per_class).
-                let ns_t = nullspace_dims_arc.get(t).copied().unwrap_or(0);
-                let rank_t = (p_per_class as f64 - ns_t as f64).max(0.0);
+                // bounded by its local rank (≤ p_per_class). Derive rank(S_t)
+                // from the spec's MEASURED nullity (per-class spec: rank =
+                // m·p − nullspace_dim; shared centered spec: m·rank), so the
+                // reporting rank matches the pseudo-logdet rank exactly.
+                let spec0 = &joint_specs[t * specs_per_term];
+                let joint_rank = expected_joint - spec0.nullspace_dim;
+                let rank_t = if specs_per_term > 1 {
+                    joint_rank as f64
+                } else {
+                    (joint_rank as f64) / (m as f64)
+                };
                 edf_per_penalty.push((rank_t - tr_at).clamp(0.0, p_per_class as f64));
             }
             edf_per_class.push((p_per_class as f64 - class_trace).clamp(0.0, p_per_class as f64));
