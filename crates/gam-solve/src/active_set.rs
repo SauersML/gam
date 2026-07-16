@@ -3775,9 +3775,10 @@ pub fn solve_quadratic_with_linear_constraints(
 mod tests {
     use super::{
         ACTIVE_SET_INTERIOR_SEED_MARGIN, ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintSet,
-        ConstraintSetOps, LinearInequalityConstraints, active_set_boundary_hit_step_fraction,
-        compute_constraint_kkt_diagnostics, constraint_set_rows_tight_at_point,
-        fallback_projected_gradient_direction,
+        ConstraintSetOps, ConstraintSetReducedFace, LinearInequalityConstraints,
+        active_set_boundary_hit_step_fraction, compute_constraint_kkt_diagnostics,
+        constraint_set_rows_tight_at_point, fallback_projected_gradient_direction,
+        khatri_rao_cone_reduced_face,
         fallback_projected_gradient_direction_with_constraint_set, moreau_projection_via_primal_qp,
         nnls_tangent_cone_projection_fallback, nonnegative_cone_multipliers,
         project_point_strictly_into_feasible_cone,
