@@ -41,7 +41,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, r2, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -251,6 +251,18 @@ fn gam_torus_tensor_cc_cc_recovers_truth_and_wraps_at_both_seams() {
          (sigma={sigma:.3}) rel_l2_gam_vs_mgcv={rel_gam_vs_mgcv:.5} \
          theta_seam_gap={theta_seam_gap:.3e} phi_seam_gap={phi_seam_gap:.3e}"
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_torus_tensor_cc_cc",
+            "rmse_to_truth",
+            gam_rmse,
+            "mgcv",
+            mgcv_rmse,
+        )
+        .line()
+    );
 
     // (1) TRUTH RECOVERY — the primary objective claim. The surface is sampled
     // from the exact analytic f(θ,φ) with noise σ; a correct doubly-periodic
@@ -438,6 +450,18 @@ fn gam_torus_tensor_cc_cc_recovers_truth_and_wraps_at_both_seams_on_real_data() 
          mgcv_test_rmse={mgcv_test_rmse:.4} (context: rel_l2 vs mgcv={rel_gam_vs_mgcv:.4})",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_torus_tensor_cc_cc::test",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts the held-out signal -----

@@ -25,7 +25,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -184,6 +184,18 @@ fn gam_tensor_te_2d_negbin_matches_mgcv() {
          [context] rel_l2(gam,mgcv)={rel_to_mgcv:.4} pearson(gam,mgcv)={corr_to_mgcv:.5}",
         gam_elapsed.as_secs_f64(),
         r_elapsed.as_secs_f64(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_tensor_te_2d_negbin",
+            "err",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
     );
 
     // PRIMARY: gam recovers the true log-mean interaction surface. The wiggly part
@@ -365,6 +377,18 @@ fn gam_tensor_te_2d_negbin_matches_mgcv_on_real_data() {
         test_rows.len(),
         gam_elapsed.as_secs_f64(),
         r_elapsed.as_secs_f64(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_mgcv_tensor_te_2d_negbin::dev",
+            "dev",
+            gam_dev,
+            "mgcv",
+            mgcv_dev,
+        )
+        .line()
     );
 
     // PRIMARY accuracy: the te(age,badh) structure must explain held-out visits

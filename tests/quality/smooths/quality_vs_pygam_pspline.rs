@@ -26,7 +26,7 @@ use csv::StringRecord;
 use gam::data::EncodedDataset;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -171,6 +171,18 @@ emit("test_pred", gam.predict(Xte))
         "lidar s(range,bs=ps,k=15) HELD-OUT: n_test={n_test} \
          gam_r2={gam_r2:.4} gam_rmse={gam_rmse:.4} pygam_rmse={pygam_rmse:.4} \
          rel_l2_vs_pygam={rel_vs_pygam:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_pygam_pspline",
+            "rmse",
+            gam_rmse,
+            "pygam",
+            pygam_rmse,
+        )
+        .line()
     );
 
     // PRIMARY claim: the p-spline smoother generalizes — it explains the bulk of

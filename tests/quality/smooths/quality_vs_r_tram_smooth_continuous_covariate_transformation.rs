@@ -41,7 +41,7 @@ use gam::smooth::TermCollectionDesign;
 use gam::terms::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
 };
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, rmse, run_r};
 use gam::transformation_normal::{TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalFitResult};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
@@ -432,6 +432,18 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
          gam_edf={gam_edf:.3} (df_ns={tram_spline_df}) \
          gam_recovery_rmse={gam_recovery_rmse:.4} tram_recovery_rmse={tram_recovery_rmse:.4} \
          [context only] rel_l2(E[Y|age])={rel:.4} pearson(gamma)={corr:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_r_tram_smooth_continuous_covariate_transformation",
+            "recovery_rmse",
+            gam_recovery_rmse,
+            "tram",
+            tram_recovery_rmse,
+        )
+        .line()
     );
 
     // PRIMARY CLAIM: gam recovers the true 0.9-amplitude sinusoidal age effect to

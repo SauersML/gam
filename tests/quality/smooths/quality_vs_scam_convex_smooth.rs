@@ -34,7 +34,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -153,6 +153,18 @@ fn gam_convex_smooth_recovers_truth_is_convex_and_matches_scam() {
          (sigma={sigma:.4} signal={signal_range:.4} scam_edf={scam_edf:.3} \
           ratio={:.3})",
         gam_err / scam_err.max(1e-12)
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_scam_convex_smooth",
+            "rmse",
+            gam_err,
+            "scam",
+            scam_err,
+        )
+        .line()
     );
 
     // PRIMARY: gam recovers the convex truth to better than the observation noise.
