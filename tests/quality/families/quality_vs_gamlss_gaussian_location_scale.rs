@@ -37,7 +37,9 @@ use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, r2, relative_l2, rmse, run_r};
+use gam::test_support::reference::{
+    Column, QualityPair, pearson, r2, relative_l2, rmse, run_r,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -236,6 +238,31 @@ fn gam_gaussian_location_scale_matches_gamlss() {
          pearson(log sigma,truth)={gam_corr_log_sigma:.5} \
          | gamlss: rmse(mu->truth)={gamlss_rmse_mu:.5} rmse(log sigma->truth)={gamlss_rmse_log_sigma:.5} \
          | (context) rel_l2(gam mu, gamlss mu)={rel_mu_vs_gamlss:.5}"
+    );
+    // Location-scale emits one QualityPair per fitted parameter block.
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_gaussian_location_scale::mu",
+            "mu_rmse_to_truth",
+            gam_rmse_mu,
+            "gamlss",
+            gamlss_rmse_mu,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_gaussian_location_scale::log_sigma",
+            "log_sigma_rmse_to_truth",
+            gam_rmse_log_sigma,
+            "gamlss",
+            gamlss_rmse_log_sigma,
+        )
+        .line()
     );
 
     // PRIMARY claim #1: gam recovers the TRUE mean. The mean is variance-

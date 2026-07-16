@@ -30,7 +30,9 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
+use gam::test_support::reference::{
+    Column, QualityPair, pearson, relative_l2, rmse, run_python,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -192,6 +194,18 @@ emit("scale", [res.scale])
          working_noise_sd={working_noise_sd:.3} \
          rmse(eta_hat,eta_true)=gam:{gam_rmse_truth:.5} sm:{ref_rmse_truth:.5} \
          [context only] rel_l2(mu)={rel:.5} pearson(eta)={corr:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_statsmodels_gamma_log",
+            "eta_rmse_to_truth",
+            gam_rmse_truth,
+            "statsmodels",
+            ref_rmse_truth,
+        )
+        .line()
     );
 
     // PRIMARY claim: gam recovers the true log-mean surface.
