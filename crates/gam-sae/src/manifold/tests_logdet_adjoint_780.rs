@@ -1415,7 +1415,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
     }
 }
 
-/// PATH C (#2253) — the DEFLATED-fixture arbiter for the #1006 envelope adjoint.
+/// #2330 — the DEFLATED-fixture arbiter for the #1006 envelope adjoint.
 ///
 /// The tiny-fixture test above converges to a well-conditioned PD state with NO
 /// per-row deflation, so it never exercises the Daleckii–Krein
@@ -1426,12 +1426,14 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
 /// central difference of the criterion's authoritative `arrow_log_det()` — the
 /// SAME operator the DK comment claims to differentiate. The #2253 full-set
 /// Hessian gate proved the assembled outer gradient is non-conservative in the
-/// smooth↔ARD cross with the deflated `Γ_joint` as the dominant carrier; this
-/// test isolates whether that is a defect in the deflated θ-adjoint itself
-/// (independent of ρ and of the CH5 builder). FD is skipped on the ARD majorizer
-/// kink (`|cos κt| < 0.2`), where `max(α cos κt, 0)` is non-smooth.
+/// smooth↔ARD cross with the deflated `Γ_joint` as the dominant carrier (bisected
+/// to `asym=1.97e-2`); #2330 tracks that as a defect in the deflated θ-adjoint
+/// itself, which this test isolates independently of ρ and of the CH5 builder.
+/// Its green unblocks the #2253 full-set gate and the capability→Dense flip. FD
+/// is skipped on the ARD majorizer kink (`|cos κt| < 0.2`), where
+/// `max(α cos κt, 0)` is non-smooth.
 #[test]
-pub(crate) fn sae_logdet_theta_adjoint_matches_fd_on_deflated_fixture_2253() {
+pub(crate) fn sae_logdet_theta_adjoint_matches_fd_on_deflated_fixture_2330() {
     let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
     let (n, p) = (target.nrows(), target.ncols());
     for row in 0..n {
