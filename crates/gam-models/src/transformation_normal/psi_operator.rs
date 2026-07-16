@@ -1588,15 +1588,20 @@ pub fn build_tensor_psi_derivatives(
         p_resp,
         "response",
     )?;
-    let shared_operator: Arc<dyn CustomFamilyPsiDerivativeOperator> =
-        Arc::new(TensorKroneckerPsiOperator {
-            response_val_basis: Arc::new(family.response_val_basis.clone()),
-            covariate_design: family.covariate_design.clone(),
-            covariate_derivs: covariate_psi_derivs.to_vec(),
-            covariate_first_cache: Arc::new(
-                (0..n_axes).map(|_| Mutex::new(None)).collect::<Vec<_>>(),
-            ),
-        });
+    // Keep a concrete handle so the κ-derivative assembly below can source the
+    // covariate ψ-derivatives (`∂Ψ/∂κ`, `∂²Ψ/∂κ²`) through the operator's own
+    // guarded accessors, which materialize from the implicit operator when the
+    // dense `x_psi` is the deliberate 0×0 placeholder (Duchon / matrix-free
+    // path) and fall back to the dense block otherwise. This completes the
+    // `x_psi`-placeholder guard pattern the other consumers already honor
+    // (gam#979 / gam#2306).
+    let shared_concrete = Arc::new(TensorKroneckerPsiOperator {
+        response_val_basis: Arc::new(family.response_val_basis.clone()),
+        covariate_design: family.covariate_design.clone(),
+        covariate_derivs: covariate_psi_derivs.to_vec(),
+        covariate_first_cache: Arc::new((0..n_axes).map(|_| Mutex::new(None)).collect::<Vec<_>>()),
+    });
+    let shared_operator: Arc<dyn CustomFamilyPsiDerivativeOperator> = shared_concrete.clone();
 
     // Only the response-roughness penalties (`S_{y,m} ⊗ G_x`) carry the κ-moving
     // covariate mass Gram `G_x = Ψ(κ)ᵀWΨ(κ)`. Collect their κ-independent left
@@ -1617,6 +1622,27 @@ pub fn build_tensor_psi_derivatives(
     };
     let weights = family.weights.view();
 
+    // Covariate ψ first-derivatives `∂Ψ/∂κ_a` for every axis, materialized once
+    // per evaluation (n × p_cov) through the guarded accessor. It returns the
+    // dense `x_psi` when present and materializes from the implicit operator
+    // when `x_psi` is the 0×0 placeholder, so the dense and matrix-free paths
+    // feed the same `G_x` derivative contraction. Only the response-roughness
+    // penalties carry the κ-moving `G_x`, so this is skipped otherwise.
+    let n_data = shared_concrete.n_data();
+    let cov_first_mats: Option<Vec<Array2<f64>>> = if gx_penalty_lefts.is_empty() {
+        None
+    } else {
+        let mut mats = Vec::with_capacity(n_axes);
+        for ax in 0..n_axes {
+            mats.push(
+                shared_concrete
+                    .cov_first_axis_row_chunk(ax, 0..n_data)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        Some(mats)
+    };
+
     let mut derivs = Vec::with_capacity(n_axes);
     for a in 0..n_axes {
         let cov_deriv = &covariate_psi_derivs[a];
@@ -1635,9 +1661,17 @@ pub fn build_tensor_psi_derivatives(
             covariate_first
         } else {
             let psi: &Array2<f64> = covariate_dense.as_ref().expect("gx penalties imply dense");
-            // dG_x/dκ_a = (∂Ψ/∂κ_a)ᵀWΨ + ΨᵀW(∂Ψ/∂κ_a).
-            let dgx_a =
-                symmetrize_sum(&weighted_cross_gram(cov_deriv.x_psi.view(), psi.view(), weights));
+            let cov_first = cov_first_mats
+                .as_ref()
+                .expect("gx penalties imply covariate first derivatives");
+            // dG_x/dκ_a = (∂Ψ/∂κ_a)ᵀWΨ + ΨᵀW(∂Ψ/∂κ_a). `∂Ψ/∂κ_a` is sourced
+            // through the guarded accessor, so a 0×0 `x_psi` placeholder is
+            // materialized from the implicit operator rather than contracted raw.
+            let dgx_a = symmetrize_sum(&weighted_cross_gram(
+                cov_first[a].view(),
+                psi.view(),
+                weights,
+            )?);
             let mut components = covariate_first.unwrap_or_default();
             for (idx, left) in &gx_penalty_lefts {
                 components.push((
@@ -1684,6 +1718,9 @@ pub fn build_tensor_psi_derivatives(
             // is linear in κ (G_x is quadratic in Ψ) — merged with any covariate
             // second-order component for that pair.
             let psi: &Array2<f64> = covariate_dense.as_ref().expect("gx penalties imply dense");
+            let cov_first = cov_first_mats
+                .as_ref()
+                .expect("gx penalties imply covariate first derivatives");
             let mut per_j: Vec<Vec<(usize, PenaltyMatrix)>> = Vec::with_capacity(n_axes);
             for j in 0..n_axes {
                 let mut comp_ij: Vec<(usize, PenaltyMatrix)> = Vec::new();
@@ -1702,21 +1739,28 @@ pub fn build_tensor_psi_derivatives(
                         ));
                     }
                 }
+                // d²G_x/dκ_a∂κ_j = (∂²Ψ/∂κ_a∂κ_j)ᵀWΨ + (∂Ψ/∂κ_a)ᵀW(∂Ψ/∂κ_j),
+                // each symmetrized. Both ψ-derivative factors are sourced through
+                // the guarded accessors: `cov_first` holds the materialized
+                // `∂Ψ/∂κ`, and `cov_second_axis_row_chunk` returns the dense
+                // `x_psi_psi` block when present and otherwise materializes the
+                // second κ-derivative from the implicit operator (diag/cross axis
+                // dispatch included) — so the matrix-free path carries the same
+                // `∂²Ψ` term the dense path does instead of silently dropping it.
                 let mut d2gx = symmetrize_sum(&weighted_cross_gram(
-                    cov_deriv.x_psi.view(),
-                    covariate_psi_derivs[j].x_psi.view(),
+                    cov_first[a].view(),
+                    cov_first[j].view(),
                     weights,
-                ));
-                if let Some(second) = cov_deriv.x_psi_psi.as_ref() {
-                    if let Some(x_psi_psi_aj) = second.get(j) {
-                        d2gx = d2gx
-                            + symmetrize_sum(&weighted_cross_gram(
-                                x_psi_psi_aj.view(),
-                                psi.view(),
-                                weights,
-                            ));
-                    }
-                }
+                )?);
+                let x_psi_psi_aj = shared_concrete
+                    .cov_second_axis_row_chunk(a, j, 0..n_data)
+                    .map_err(|e| e.to_string())?;
+                d2gx = d2gx
+                    + symmetrize_sum(&weighted_cross_gram(
+                        x_psi_psi_aj.view(),
+                        psi.view(),
+                        weights,
+                    )?);
                 for (idx, left) in &gx_penalty_lefts {
                     comp_ij.push((
                         *idx,

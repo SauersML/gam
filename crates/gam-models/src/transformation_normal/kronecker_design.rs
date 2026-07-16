@@ -551,9 +551,22 @@ pub(crate) fn weighted_cross_gram(
     a: ArrayView2<'_, f64>,
     b: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, String> {
+    if a.nrows() != weights.len() || b.nrows() != weights.len() {
+        return Err(format!(
+            "weighted_cross_gram row/weight mismatch: left {}x{}, right {}x{}, {} weights \
+             (both factors must have one row per observation; an unconformable factor here is \
+             usually an unmaterialized 0x0 x_psi placeholder — materialize it from the implicit \
+             operator before contracting)",
+            a.nrows(),
+            a.ncols(),
+            b.nrows(),
+            b.ncols(),
+            weights.len()
+        ));
+    }
     let weighted = weight_rows(&b.to_owned(), &weights.to_owned());
-    a.t().dot(&weighted)
+    Ok(a.t().dot(&weighted))
 }
 
 /// Symmetrize a cross-Gram contribution: `M + Mᵀ`. Used to assemble the exact
