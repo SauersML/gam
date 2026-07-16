@@ -1781,6 +1781,7 @@ impl SaeManifoldTerm {
     ) -> Result<bool, String> {
         let mut made_progress = false;
         let mut prev_grad_norm = f64::INFINITY;
+        let mut prev_decrement_sq = f64::INFINITY;
         for _ in 0..max_steps {
             let mut sys = self
                 .assemble_arrow_schur(target, rho_fixed, registry)
@@ -1798,13 +1799,6 @@ impl SaeManifoldTerm {
                 // idempotence certificate decide acceptance.
                 return Ok(true);
             }
-            if !(grad_norm < prev_grad_norm) {
-                log::debug!(
-                    "terminal Newton bail: no contraction (‖g‖={grad_norm:.6e} ≥ prev={prev_grad_norm:.6e})"
-                );
-                break;
-            }
-            prev_grad_norm = grad_norm;
             // Ridge-0 deflated criterion factor = the B-preconditioner for the
             // exact-pencil GMRES (identical to the outer IFT's preconditioner).
             let factor = match self.factor_deflated_evidence_with_grad_norms(
@@ -1820,6 +1814,34 @@ impl SaeManifoldTerm {
                     break;
                 }
             };
+            // DUAL-CURRENCY no-contraction bail (#2132/#2228/#2267 — the same
+            // ε/raw-‖g‖ currency inconsistency the backtrack merit fixed, one loop
+            // out). Near an indefinite mode the raw ‖g‖ is NON-monotone ACROSS
+            // polish iterations (measured: ‖g‖ 1.78e-3 → 4.59e-3 while the fit is
+            // still converging), so a strict raw-‖g‖-contraction bail kills a
+            // polish that is still driving the affine Newton decrement λ²=gᵀH⁻¹g
+            // down — and the refine loop then re-arms and re-enters, grinding
+            // (measured: 25 bail→retry cycles to walltime after the merit patch).
+            // Bail only when NEITHER currency improves on its BEST-seen value; λ²
+            // is the curvature-aware quantity that certifies real progress at the
+            // saddle, and best-seen (not last-step) prevents pure oscillation from
+            // earning windows forever. The max_steps cap remains the hard backstop.
+            let decrement_sq = sae_manifold_newton_directional_decrease(
+                &sys,
+                factor.delta_t.view(),
+                factor.delta_beta.view(),
+            )
+            .max(0.0);
+            if !(grad_norm < prev_grad_norm) && !(decrement_sq < prev_decrement_sq) {
+                log::debug!(
+                    "terminal Newton bail: no contraction in either currency \
+                     (‖g‖={grad_norm:.6e} ≥ best {prev_grad_norm:.6e}, \
+                     λ²={decrement_sq:.6e} ≥ best {prev_decrement_sq:.6e})"
+                );
+                break;
+            }
+            prev_grad_norm = grad_norm.min(prev_grad_norm);
+            prev_decrement_sq = decrement_sq.min(prev_decrement_sq);
             let cache = factor.cache;
             let solver = match self.outer_gradient_arrow_solver(&cache, lambda_smooth) {
                 Ok(solver) => solver,
