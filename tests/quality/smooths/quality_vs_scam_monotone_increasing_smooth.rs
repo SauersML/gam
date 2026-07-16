@@ -33,7 +33,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -154,6 +154,18 @@ fn gam_monotone_increasing_smooth_recovers_truth_and_matches_scam() {
          gam_rmse={gam_err:.5} scam_rmse={scam_err:.5} \
          max_monotone_violation={max_violation:.3e} ratio={:.3}",
         gam_err / scam_err.max(1e-12)
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_scam_monotone_increasing_smooth",
+            "rmse",
+            gam_err,
+            "scam",
+            scam_err,
+        )
+        .line()
     );
 
     // PRIMARY: gam recovers the monotone truth to better than the noise floor.

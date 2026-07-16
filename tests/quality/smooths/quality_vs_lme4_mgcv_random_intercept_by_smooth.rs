@@ -43,7 +43,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, held_out_r2, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, held_out_r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -290,6 +290,18 @@ fn gam_random_intercept_by_smooth_recovers_truth() {
          [context only] gam-vs-mgcv mean rel-L2={gam_vs_mgcv_rel_l2:.4}  gam-vs-lme4-BLUP rel-L2={gam_vs_lme4_blup_rel_l2:.4}",
         0.5 * RESID_SD
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_lme4_mgcv_random_intercept_by_smooth::mean",
+            "mean_rmse",
+            gam_mean_rmse,
+            "mgcv",
+            mgcv_mean_rmse,
+        )
+        .line()
+    );
 
     // (1) MEAN RECOVERY. A fit cannot beat the noise it cannot observe; landing
     // well under σ_ε proves the structured signal was recovered rather than the
@@ -530,6 +542,18 @@ fn gam_random_intercept_by_smooth_recovers_truth_on_real_data() {
          lme4_test_rmse={lme4_test_rmse:.4}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_lme4_mgcv_random_intercept_by_smooth",
+            "test_rmse",
+            gam_test_rmse,
+            "lme4",
+            lme4_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts held-out reaction times --

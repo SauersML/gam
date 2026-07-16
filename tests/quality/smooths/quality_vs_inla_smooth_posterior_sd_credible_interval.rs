@@ -36,7 +36,9 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, r_package_available, relative_l2, rmse, run_r};
+use gam::test_support::reference::{
+    Column, QualityPair, r_package_available, relative_l2, rmse, run_r,
+};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::io::Write;
@@ -402,6 +404,18 @@ fn gam_credible_intervals_are_calibrated_against_truth() {
     eprintln!(
         "inla baseline: inla_cover={inla_cover:.3} (err={inla_cover_err:.3}) \
          gam_cover_err={gam_cover_err:.3} sd_rel_l2(context)={sd_rel_l2:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_inla_smooth_posterior_sd_credible_interval",
+            "coverage_error_vs_nominal95",
+            gam_cover_err,
+            "INLA",
+            inla_cover_err,
+        )
+        .line()
     );
 
     std::fs::remove_dir_all(&dir).ok();

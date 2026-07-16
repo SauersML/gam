@@ -32,7 +32,9 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, r2, relative_l2, rmse, run_python};
+use gam::test_support::reference::{
+    Column, QualityPair, pad_to, pearson, r2, relative_l2, rmse, run_python,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -186,6 +188,18 @@ emit("edf", np.trace(S))
          gam_rmse_truth={gam_rmse_truth:.4} sklearn_rmse_truth={sk_rmse_truth:.4} \
          (context: gam_edf={gam_edf:.3} sk_edf={sk_edf:.3} edf_rel={edf_rel:.3} \
          gam_vs_sklearn_rel_l2={rel:.4} pearson={corr:.5})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_sklearn_gp_matern_regression",
+            "rmse_truth",
+            gam_rmse_truth,
+            "sklearn",
+            sk_rmse_truth,
+        )
+        .line()
     );
 
     // PRIMARY claim — gam recovers the deterministic truth to within one noise
@@ -341,6 +355,18 @@ emit("test_pred", gp.predict(xg))
          sklearn_test_rmse={sk_test_rmse:.4}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "smooths",
+            "quality_vs_sklearn_gp_matern_regression::test",
+            "test_rmse",
+            gam_test_rmse,
+            "sklearn",
+            sk_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts the held-out signal -----
