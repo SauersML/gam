@@ -1598,14 +1598,16 @@ pub fn build_tensor_psi_derivatives(
             ),
         });
 
-    // Response-roughness (`S_{y,m} ⊗ G_x`) and double (`shape_resp ⊗ G_x`)
-    // penalties carry the κ-moving covariate mass Gram `G_x = Ψ(κ)ᵀWΨ(κ)`.
-    // Collect their κ-independent left factors so we can emit the matching
-    // `S_left ⊗ dG_x/dκ` derivative components at the right penalty indices; the
-    // outer κ-gradient/Hessian would otherwise desync from the penalty value.
+    // Only the response-roughness penalties (`S_{y,m} ⊗ G_x`) carry the κ-moving
+    // covariate mass Gram `G_x = Ψ(κ)ᵀWΨ(κ)`. Collect their κ-independent left
+    // factors so we can emit the matching `S_{y,m} ⊗ dG_x/dκ` derivative
+    // components at the right penalty indices; the outer κ-gradient/Hessian would
+    // otherwise desync from the penalty value. The double (null-shrinkage) ridge
+    // is `shape_resp ⊗ I_cov` — full-rank and κ-independent — so it carries no
+    // G_x derivative.
     let layout = family.tensor_penalty_layout;
     let mut gx_penalty_lefts: Vec<(usize, Array2<f64>)> = Vec::new();
-    for idx in layout.response_indices().chain(layout.double_index()) {
+    for idx in layout.response_indices() {
         gx_penalty_lefts.push((idx, extract_kron_left(&family.tensor_penalties[idx], idx)?));
     }
     let covariate_dense = if gx_penalty_lefts.is_empty() {

@@ -279,7 +279,7 @@ pub(crate) fn ctn_tensor_penalty_layout_orders_covariate_response_double() {
     assert!(layout.has_double);
     assert_eq!(layout.total(), family.tensor_penalties.len());
     assert_eq!(layout.response_indices(), 1..1 + n_response);
-    assert_eq!(layout.double_index(), Some(1 + n_response));
+    let double_index = 1 + n_response;
 
     // Covariate penalty (index 0) carries S_x on the right.
     let PenaltyMatrix::KroneckerFactored { right, .. } = &family.tensor_penalties[0] else {
@@ -300,18 +300,20 @@ pub(crate) fn ctn_tensor_penalty_layout_orders_covariate_response_double() {
         }
     }
 
-    // The double penalty is the shape-row ridge (location row zeroed) in the
-    // covariate function measure.
+    // The double penalty is the full-rank shape-row ridge shape_resp ⊗ I_cov:
+    // its covariate factor MUST be the identity (not the rank-deficient G_x), so
+    // it pins weakly-identified shape×covariate directions (no rank_deficient_H_pen).
     let PenaltyMatrix::KroneckerFactored { left, right } =
-        &family.tensor_penalties[layout.double_index().unwrap()]
+        &family.tensor_penalties[double_index]
     else {
         panic!("double penalty must be Kronecker-factored");
     };
     for ((i, j), &value) in right.indexed_iter() {
-        assert!((value - g_cov[[i, j]]).abs() <= 1e-12 * (1.0 + g_cov[[i, j]].abs()));
+        let want: f64 = if i == j { 1.0 } else { 0.0 };
+        assert_eq!(value, want, "double penalty covariate factor must be identity");
     }
     for ((i, j), &value) in left.indexed_iter() {
-        let want = if i == j && i > 0 { 1.0 } else { 0.0 };
+        let want: f64 = if i == j && i > 0 { 1.0 } else { 0.0 };
         assert_eq!(value, want, "double penalty left factor is the shape-row ridge");
     }
 }

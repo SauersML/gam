@@ -409,6 +409,8 @@ pub(crate) fn build_tensor_penalties_kronecker(
     // `G_y` (response) is κ-independent; `G_x` (covariate) moves with κ.
     let g_resp = weighted_function_gram(response_val, weights, p_resp, "response")?;
     let g_cov = weighted_function_gram(covariate_dense, weights, p_cov, "covariate")?;
+    // Full-rank coefficient-space ridge for the double (null-shrinkage) penalty.
+    let eye_cov = Array2::<f64>::eye(p_cov);
 
     // Shape-only response ridge (double-penalty null shrinkage). The location
     // row is the conditional centering field, identified by the likelihood; keep
@@ -454,11 +456,18 @@ pub(crate) fn build_tensor_penalties_kronecker(
         });
     }
 
-    // Double penalty: shape-row ridge in the covariate function measure.
+    // Double penalty: full-rank shape-row ridge `shape_resp ⊗ I_cov`. This is
+    // the null-shrinkage that makes the penalized Hessian positive-definite on
+    // weakly-identified shape×covariate directions, so its covariate factor MUST
+    // be full rank — NOT the function-measure Gram `G_x = Ψᵀ W Ψ`, which is
+    // itself rank-deficient at ill-conditioned covariate designs and would leave
+    // exactly those directions unpinned (`rank_deficient_H_pen`). The primary
+    // roughness penalties above carry the function measure; the null-shrinkage
+    // ridge is a coefficient-space operation and stays κ-independent.
     if config.double_penalty {
         penalties.push(PenaltyMatrix::KroneckerFactored {
             left: shape_resp,
-            right: g_cov,
+            right: eye_cov,
         });
     }
 
@@ -497,15 +506,10 @@ impl CtnTensorPenaltyLayout {
         self.n_covariate + self.n_response + usize::from(self.has_double)
     }
 
-    /// Indices of the response-roughness penalties (`S_{y,m} ⊗ G_x`).
+    /// Indices of the response-roughness penalties (`S_{y,m} ⊗ G_x`) — the only
+    /// penalties carrying the κ-moving covariate mass Gram.
     pub fn response_indices(&self) -> std::ops::Range<usize> {
         self.n_covariate..self.n_covariate + self.n_response
-    }
-
-    /// Index of the double (null-shrinkage) penalty (`shape_resp ⊗ G_x`), if any.
-    pub fn double_index(&self) -> Option<usize> {
-        self.has_double
-            .then_some(self.n_covariate + self.n_response)
     }
 }
 
