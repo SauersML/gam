@@ -937,15 +937,26 @@ impl CostStallGuard {
         if !self.best_value.is_finite() {
             return;
         }
-        let converged =
-            self.best_grad_norm.is_finite() && self.best_grad_norm <= self.grad_threshold;
+        // A running best-so-far snapshot is NEVER a convergence certificate: only
+        // a genuine cost stall (`publish_stall`, whose window has proven the
+        // surface flattened) or the second-order-deferred ARC gate may stamp
+        // `converged = true`. Stamping it here on a merely-small projected
+        // gradient certified a STILL-DESCENDING iterate — e.g. a bound-pinned
+        // KKT-stationary point whose projected residual is transiently ≤ the
+        // threshold mid-descent — and, because this publish returns
+        // `CostStallVerdict::Continue`, the outer `observe_cost_stall` match never
+        // runs `defer_finite_second_order_stall` to revoke it, so the false
+        // convergence label survived to the exit cell (#2299 arc_bridge). The
+        // snapshot exists ONLY so the budget-exhaustion path always has a feasible
+        // best to halt back to (#1371/#2241); its convergence verdict is deferred
+        // to ARC / the genuine-stall paths, so it is published `converged = false`.
         if let Ok(mut slot) = self.exit.lock() {
             *slot = Some(CostStallExit {
                 rho: best_rho,
                 value: self.best_value,
                 grad_norm: self.best_grad_norm,
                 iterations: self.accepted_iters,
-                converged,
+                converged: false,
                 // Not a halted stall: no noise-floor measurement is claimed
                 // for a running best-so-far snapshot (#2241).
                 noise_grad_bound: None,
