@@ -1230,3 +1230,223 @@ fn per_kind_crossover_table_splits_code_vs_support_classes_2233() {
         }
     }
 }
+
+/// The faithful whole-dictionary crossover: for a hybrid dictionary that REPLACES
+/// flat atoms with curved ones so the total decoder-parameter count is matched to
+/// the flat bar (`K_flat + K_curved·b = K_ext`, the issue's inequality ★ at
+/// equality), the Eq-4 bits advantage of the curved single-atom featurizer over
+/// the `s`-latent flat alternative on one planted `s=d+1` factor — scored through
+/// the production Eq-4 scorer with the SAME declared `dictionary_params` on both
+/// arms.
+///
+/// The per-factor test [`eq4_curved_advantage_and_prescreen`] charges the curved
+/// atom its full `basis_m·P` decoder against removing only the `s` flat columns it
+/// covers, i.e. a stand-alone `(basis_m−s)·P` SURCHARGE — the "stacked on top"
+/// config that cannot win the ~95%-dictionary Eq-4 scoreboard for a rich basis.
+/// The FAITHFUL config instead funds the curved atom's `b·P` columns by dropping
+/// `b` flat filler atoms elsewhere in the `K_ext` budget, so `dict_params(hybrid)
+/// = dict_params(flat)` exactly. The decoder-storage term is then bitwise
+/// identical on both arms and CANCELS: the contest is decided by support + code +
+/// residual alone. Passing the matched `dictionary_params` (equality is what the
+/// whole-dictionary tie guarantees; the magnitude is immaterial since it cancels)
+/// isolates that pure support win — the corollary the 32K creditscope run must
+/// confirm, which EV-at-matched-actives under-credits.
+fn eq4_matched_dictionary_advantage(d: usize, n: usize, p: usize, g_dict: usize) -> f64 {
+    use crate::eq4_description_length::eq4_fixed_distortion_description_length;
+    use ndarray::Array2;
+
+    let s = d + 1;
+    let radius = 2.0_f64;
+    let target = 0.9_f64;
+    let (noisy, signal) = planted_sd1_signal(n, p, d, radius);
+    let test_x = Array2::from_shape_fn((n, p), |(i, j)| noisy[i][j]);
+    let recon = Array2::from_shape_fn((n, p), |(i, j)| signal[i][j]);
+    let signal_mat = Array2::from_shape_fn((n, p), |(i, j)| signal[i][j]);
+
+    // The matched decoder-storage charge shared by BOTH arms. In the faithful
+    // whole-dictionary config the curved atom's `basis_m·P` columns are funded by
+    // removing `basis_m` flat filler atoms, so the total decoder count ties the
+    // flat bar; the per-factor scorer therefore sees the SAME `dictionary_params`
+    // on both arms and the term cancels. Its magnitude is immaterial (any equal
+    // value cancels); the flat bar's `s·P` per-factor share is used.
+    let matched_dictionary_params = (s * p) as i64;
+
+    // FLAT: s atoms, each firing every row, one coded coordinate.
+    let mut flat_gate = Array2::zeros((n, g_dict));
+    let mut flat_dims = vec![0_i64; g_dict];
+    for atom in 0..s {
+        for row in 0..n {
+            flat_gate[[row, atom]] = 1.0;
+        }
+        flat_dims[atom] = 1;
+    }
+    let flat = {
+        let signal_mat = signal_mat.clone();
+        eq4_fixed_distortion_description_length(
+            test_x.view(),
+            recon.view(),
+            flat_gate.view(),
+            &flat_dims,
+            matched_dictionary_params,
+            n as i64,
+            &[target],
+            None,
+            move |atom, take| {
+                let mut out = Array2::zeros((take.len(), p));
+                for (out_row, &src) in take.iter().enumerate() {
+                    out[[out_row, atom]] = signal_mat[[src, atom]];
+                }
+                Ok(out)
+            },
+        )
+        .expect("flat Eq-4 scoring succeeds")
+    };
+
+    // CURVED: one atom firing every row with d+1 coded coordinates. The basis
+    // width `basis_m` sets the flat atoms it displaces (`K_flat = K_ext − b`), NOT
+    // this arm's declared decoder charge, which is matched to the flat bar.
+    let mut curved_gate = Array2::zeros((n, g_dict));
+    for row in 0..n {
+        curved_gate[[row, 0]] = 1.0;
+    }
+    let mut curved_dims = vec![0_i64; g_dict];
+    curved_dims[0] = s as i64;
+    let curved = {
+        let signal_mat = signal_mat.clone();
+        eq4_fixed_distortion_description_length(
+            test_x.view(),
+            recon.view(),
+            curved_gate.view(),
+            &curved_dims,
+            matched_dictionary_params,
+            n as i64,
+            &[target],
+            None,
+            move |_atom, take| {
+                let mut out = Array2::zeros((take.len(), p));
+                for (out_row, &src) in take.iter().enumerate() {
+                    for col in 0..s {
+                        out[[out_row, col]] = signal_mat[[src, col]];
+                    }
+                }
+                Ok(out)
+            },
+        )
+        .expect("curved Eq-4 scoring succeeds")
+    };
+
+    // Dictionary bits tie exactly (matched params), so the advantage is pure
+    // support + code + residual.
+    assert_eq!(
+        flat.dictionary_bits, curved.dictionary_bits,
+        "matched-config dictionary bits must tie exactly (flat {} vs curved {})",
+        flat.dictionary_bits, curved.dictionary_bits
+    );
+    flat.per_target[0].bits - curved.per_target[0].bits
+}
+
+/// #2233 corollary — the faithful matched-dictionary crossover the 32K creditscope
+/// run must confirm. At the whole-dictionary config where the hybrid REPLACES flat
+/// atoms (so total decoder params tie the flat bar, ★ at equality), the curved
+/// atom wins on SUPPORT alone with no dictionary penalty — a strictly larger and
+/// robustly positive margin than the per-factor "stacked" config, and positive
+/// EVEN for a basis so rich that the stand-alone surcharge sinks it in
+/// [`birth_prescreen_verdict_agrees_with_full_eq4_bits`]. Also pins the exact
+/// real-scale config (`K_ext=32768, P=2048, top_k=32`) for the GPU measurement:
+/// the ★ inequality is an equality and the support term is large and positive.
+#[test]
+fn faithful_matched_dictionary_hybrid_wins_on_support_alone_2233() {
+    for &(d, n, p, g_dict) in &[(1usize, 300usize, 6usize, 2048usize), (2, 320, 8, 2048)] {
+        // The matched-config advantage is basis-INDEPENDENT: the decoder-storage
+        // term cancels between the arms, so only support + code + residual remain.
+        let matched = eq4_matched_dictionary_advantage(d, n, p, g_dict);
+
+        // Lean basis: the stacked per-factor config already wins, but by LESS — the
+        // matched config beats it by exactly the refunded dictionary surcharge.
+        let lean_m = 2 * d + 1;
+        let (surcharged_lean, _) = eq4_curved_advantage_and_prescreen(d, n, p, g_dict, lean_m);
+        assert!(
+            surcharged_lean > 0.0 && matched > surcharged_lean,
+            "d={d}: matched-config advantage {matched} must beat the lean stacked \
+             advantage {surcharged_lean} (the refunded dictionary surcharge)"
+        );
+
+        // Rich basis: the stacked per-factor config LOSES (its surcharge sinks it),
+        // but the faithful matched config still WINS on support alone — the
+        // corollary's whole point, and the margin EV-at-matched-actives misses.
+        let rich_m = 400;
+        let (surcharged_rich, _) = eq4_curved_advantage_and_prescreen(d, n, p, g_dict, rich_m);
+        assert!(
+            surcharged_rich < 0.0,
+            "d={d}: the stacked rich-basis config must lose (surcharge), got {surcharged_rich}"
+        );
+        assert!(
+            matched > 0.0,
+            "d={d}: the faithful matched-config hybrid must WIN on support even where \
+             a rich stacked basis loses, got {matched}"
+        );
+    }
+
+    // Real-scale config pin (K_ext=32768, P=2048, top_k=32, H harmonics ⇒ b=2H+1).
+    // The faithful config sets K_flat = K_ext − K_curved·b so ★ is an EQUALITY:
+    // dict_params(hybrid) = K_flat·P + K_curved·b·P = K_ext·P = dict_params(flat).
+    // This is the config the GPU run must use so dictionary bits tie and the
+    // measured win is the support term the pre-screen prices.
+    let (k_ext, p_out, top_k) = (32_768_i64, 2_048_i64, 32.0_f64);
+    for &k_curved in &[64_i64, 256, 1024] {
+        for &harmonics in &[1_i64, 4, 11] {
+            let b = 2 * harmonics + 1; // circle Fourier basis width
+            let k_flat = k_ext - k_curved * b;
+            assert!(
+                k_flat > 0,
+                "faithful config needs a positive flat remainder (K_curved={k_curved}, b={b})"
+            );
+            // ★ holds with equality: the two decoder-parameter counts are identical.
+            assert_eq!(
+                k_flat * p_out + k_curved * b * p_out,
+                k_ext * p_out,
+                "faithful ★ must be an equality (K_curved={k_curved}, H={harmonics})"
+            );
+            // Dictionary bits tie exactly at the equality config (any horizon N).
+            let horizon = 96_000.0_f64; // creditscope train N
+            let dict = |params: i64| 0.5 * params as f64 / horizon * horizon.log2();
+            assert_eq!(
+                dict(k_flat * p_out + k_curved * b * p_out),
+                dict(k_ext * p_out),
+                "matched-config dictionary bits must tie at real scale"
+            );
+            // The support term the win rides on: each circle (s=2) frees s−1=1 of
+            // the top_k=32 active slots per active token, worth log₂(G/L0) bits —
+            // large and positive at 32K overcompleteness.
+            let support_per_freed_slot = (k_ext as f64 / top_k).log2();
+            assert!(
+                support_per_freed_slot > 9.0,
+                "32K support credit per freed slot must be large, got \
+                 {support_per_freed_slot}"
+            );
+            let predicted = predicted_birth_dl_bits(&BirthMdlPrescreen {
+                rho: 0.1,
+                span: 2.0,
+                intrinsic_dim: 1,
+                basis_size: b as usize,
+                signal_var: 2.0,
+                noise_floor: 0.05,
+                n_tokens: horizon,
+                p_out: p_out as usize,
+                g_dict: k_ext as usize,
+                l0: top_k,
+            });
+            // The stand-alone pre-screen carries the −(b−s)·P·½log₂N surcharge; the
+            // faithful config refunds it, so the matched-config saving is even
+            // larger. Confirm the support-only saving (surcharge added back) is
+            // strictly positive — the corollary's "wide margin".
+            let refunded_surcharge = (b as f64 - 2.0) * p_out as f64 * 0.5 * horizon.log2();
+            let matched_saving = predicted + refunded_surcharge;
+            assert!(
+                matched_saving > 0.0,
+                "faithful matched saving must be a strict win at real scale \
+                 (K_curved={k_curved}, H={harmonics}): {matched_saving}"
+            );
+        }
+    }
+}
