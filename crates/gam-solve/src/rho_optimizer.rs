@@ -47,6 +47,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 mod bridges;
 mod capability;
 mod hessian_operator;
+pub mod kl_certificate;
 mod objective;
 mod run;
 mod run_plan;
