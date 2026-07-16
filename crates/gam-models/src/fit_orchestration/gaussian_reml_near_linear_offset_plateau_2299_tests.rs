@@ -104,17 +104,28 @@ fn near_linear_offset_fit_currently_stalls_on_the_infinite_smoothing_plateau_229
     const STALL_WITNESS_ITERS: usize = 100;
     match fit_near_linear_with_offset(160, 2299) {
         // The stall surfaces as a typed non-convergence refusal (the sealed
-        // FitConvergenceEvidence contract refuses to mint a stalled fit)...
-        Err(_) => {}
-        // ...or as a fit minted only after grinding the outer loop up the plateau.
-        Ok(result) => assert!(
-            result.fit.outer_iterations >= STALL_WITNESS_ITERS,
-            "#2299: expected the near-linear+offset fit to STALL on the \
-             infinite-smoothing plateau (typed refusal, or an outer loop grinding to \
-             the cap), but it converged in {} outer iterations. If the \
-             gaussian_reml.rs plateau-rail fix has landed, flip this characterization \
-             to the convergence assertion in the doc comment.",
-            result.fit.outer_iterations,
-        ),
+        // FitConvergenceEvidence contract refuses to mint a stalled fit). The
+        // refusal's Display text names the EstimationError variant — and thus the
+        // stalling engine — so `--nocapture` pins the fix locus: "block-orthogonal
+        // ... did not converge" ⇒ gaussian_reml block-orthogonal; "REML did not
+        // converge" + rho checkpoint ⇒ gaussian_reml optimize_rho/multi_closed_form;
+        // "REML optimization failed"/projected-KKT ⇒ reml_outer_engine.
+        Err(reason) => eprintln!("[#2299-LOCUS] near-linear+offset fit refused: {reason}"),
+        // ...or a fit minted only after grinding the outer loop up the plateau.
+        Ok(result) => {
+            eprintln!(
+                "[#2299-LOCUS] near-linear+offset fit minted at outer_iterations={}",
+                result.fit.outer_iterations,
+            );
+            assert!(
+                result.fit.outer_iterations >= STALL_WITNESS_ITERS,
+                "#2299: expected the near-linear+offset fit to STALL on the \
+                 infinite-smoothing plateau (typed refusal, or an outer loop grinding to \
+                 the cap), but it converged in {} outer iterations. If the plateau-rail \
+                 fix has landed, flip this characterization to the convergence assertion \
+                 in the doc comment.",
+                result.fit.outer_iterations,
+            );
+        }
     }
 }
