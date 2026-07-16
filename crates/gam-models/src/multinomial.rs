@@ -2735,7 +2735,7 @@ pub fn fit_penalized_multinomial_formula(
         // covariance path penalize with. Under the equivariant carrier this is
         // K per-class specs per term, grouped term-major (`s = t·g + c`); the
         // K = 2 degenerate arm returns one shared centered spec per term.
-        let joint_specs = family.equivariant_class_penalty_specs();
+        let joint_specs = family.equivariant_class_penalty_specs().ok()?;
         if jll.len() != joint_specs.len() || joint_specs.len() % n_components != 0 {
             return None;
         }

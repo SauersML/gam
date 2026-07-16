@@ -717,6 +717,26 @@ fn softmax_fisher_perturbation<S: FisherPerturbation>(
     }
 }
 
+/// Numerical rank of a symmetric PSD penalty matrix, using the SAME relative
+/// zero classification as [`gam_problem::JointPenaltySpec::validate`]
+/// (`tol = 100·p·ε·max|eig|`), so the `nullspace_dim` a joint-spec builder
+/// declares from this rank always agrees with the spectrum the validator
+/// measures. The declared structural `penalty_nullspace_dims` cannot be used
+/// for that purpose: identifiability-absorbed smooth penalties carry more
+/// numerical-zero directions than their structural claim.
+pub(crate) fn measured_penalty_rank(s: &Array2<f64>) -> Result<usize, String> {
+    let p = s.nrows();
+    if p == 0 {
+        return Ok(0);
+    }
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let (eigenvalues, _) = FaerEigh::eigh(s, faer::Side::Lower)
+        .map_err(|e| format!("penalty rank eigendecomposition failed: {e}"))?;
+    let max_abs = eigenvalues.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+    let tol = 100.0 * (p as f64) * f64::EPSILON * max_abs;
+    Ok(eigenvalues.iter().filter(|&&ev| ev > tol).count())
+}
+
 /// The reference-symmetric class-space metric `M = I_m − J_m/K` (`m = K−1`
 /// active classes, `J` = all-ones), the closed-form CLR whitening factor of
 /// the softmax gauge (gam#1587). Symmetric positive-definite with eigenvalues
@@ -1076,7 +1096,9 @@ impl MultinomialFamily {
     /// so the outer loop ties one shared `λ_t` across all classes (the gauge
     /// the centered metric requires; an untied per-(class,term) `λ` is itself a
     /// second source of reference dependence).
-    pub fn centered_joint_penalty_specs(&self) -> Vec<gam_problem::JointPenaltySpec> {
+    pub fn centered_joint_penalty_specs(
+        &self,
+    ) -> Result<Vec<gam_problem::JointPenaltySpec>, String> {
         let m = self.active_classes();
         let k = self.total_classes;
         let p = self.design.ncols();
@@ -1098,13 +1120,18 @@ impl MultinomialFamily {
                         }
                     }
                 }
-                let ns_t = self.penalty_nullspace_dims.get(t).copied().unwrap_or(0);
-                gam_problem::JointPenaltySpec {
+                // rank(M ⊗ S_t) = m · rank(S_t); measure rank(S_t) with the
+                // validator's own zero classification (structural
+                // `penalty_nullspace_dims` understate the numerical nullity
+                // for identifiability-absorbed smooths).
+                let rank_s = measured_penalty_rank(&s_t)
+                    .map_err(|e| format!("multinomial centered penalty term {t}: {e}"))?;
+                Ok(gam_problem::JointPenaltySpec {
                     label: Some(format!("multinomial_term_{t}")),
                     matrix,
                     initial_log_lambda: self.initial_log_lambda,
-                    nullspace_dim: m * ns_t,
-                }
+                    nullspace_dim: raw_total - m * rank_s,
+                })
             })
             .collect()
     }
@@ -1139,7 +1166,9 @@ impl MultinomialFamily {
     /// have identical wiggliness, and the two per-class metrics are
     /// proportional (only `λ_0 + λ_1` would be identified). The shared
     /// centered spec is the correct model there, so this builder returns it.
-    pub fn equivariant_class_penalty_specs(&self) -> Vec<gam_problem::JointPenaltySpec> {
+    pub fn equivariant_class_penalty_specs(
+        &self,
+    ) -> Result<Vec<gam_problem::JointPenaltySpec>, String> {
         let m = self.active_classes();
         let k = self.total_classes;
         let p = self.design.ncols();
@@ -1150,9 +1179,14 @@ impl MultinomialFamily {
         let mut specs = Vec::with_capacity(self.penalties.len() * k);
         for (t, pen) in self.penalties.iter().enumerate() {
             let s_t = pen.to_dense();
-            let ns_t = self.penalty_nullspace_dims.get(t).copied().unwrap_or(0);
-            // rank(C_cᵀC_c ⊗ S_t) = 1 · rank(S_t) = p − ns_t.
-            let nullspace_dim = raw_total - (p - ns_t);
+            // rank(C_cᵀC_c ⊗ S_t) = 1 · rank(S_t). The rank must agree with
+            // the spectrum the joint-penalty validator measures (the declared
+            // `penalty_nullspace_dims` are a structural claim that understates
+            // the numerical nullity for identifiability-absorbed smooths), so
+            // measure it with the validator's own relative classification.
+            let rank_s = measured_penalty_rank(&s_t)
+                .map_err(|e| format!("multinomial equivariant penalty term {t}: {e}"))?;
+            let nullspace_dim = raw_total - rank_s;
             for c in 0..k {
                 // Centering row for class c over the m active coordinates.
                 let row: Vec<f64> = (0..m)
@@ -1183,7 +1217,7 @@ impl MultinomialFamily {
                 });
             }
         }
-        specs
+        Ok(specs)
     }
 
     fn specs_match_workspace_shape(&self, specs: &[ParameterBlockSpec]) -> bool {
@@ -2096,7 +2130,7 @@ impl CustomFamily for MultinomialFamily {
         // reference-anchored frame. The per-class blocks attach NO smooth
         // penalty (see `build_block_specs`); double-carrying both would
         // penalize (I + Σ_c C_cᵀC_c) ⊗ S_t.
-        Ok(self.equivariant_class_penalty_specs())
+        self.equivariant_class_penalty_specs()
     }
 
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
@@ -3734,7 +3768,9 @@ mod tests {
                 assert_eq!(spec.nullspace_dim, raw_total - p);
                 sum += &spec.matrix;
             }
-            let centered = multi.centered_joint_penalty_specs();
+            let centered = multi
+                .centered_joint_penalty_specs()
+                .expect("centered specs");
             let target = &centered[t_idx].matrix;
             let max_err = sum
                 .iter()
