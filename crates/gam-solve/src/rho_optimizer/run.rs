@@ -2239,6 +2239,20 @@ fn compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
             0,
         );
     }
+    // The ρ-uncertainty diagnostic needs the EXACT outer Hessian. A non-analytic
+    // (BFGS / quasi-Newton) capability cannot supply one, so requesting
+    // `ValueGradientHessian` below would (a) waste an eval that materializes to
+    // `None` and skips two lines later anyway, and (b) VIOLATE the mode-aware eval
+    // contract — a BFGS run must never request Hessian work
+    // (`run_bfgs_mode_aware_eval_skips_hessian_work`). Gate on the SAME
+    // `capability.hessian.is_analytic()` the terminal certificate uses so a BFGS
+    // fit skips the diagnostic up front instead of leaking a Hessian request.
+    if !cap.hessian.is_analytic() {
+        return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
+            "outer Hessian is not analytic; rho-uncertainty diagnostic needs exact curvature",
+            0,
+        );
+    }
 
     let final_eval = match obj.eval_with_order(&result.rho, OuterEvalOrder::ValueGradientHessian) {
         Ok(eval) => eval,
