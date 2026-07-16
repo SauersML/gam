@@ -919,6 +919,166 @@ mod amortized_encoder_tests {
         }
     }
 
+    /// #2330 — twist-vs-∂A split of the g3 cross non-conservation. The off-diagonal
+    /// `H3[i,j] = −½⟨∂_iΓ_eff − (∂_iA)·a, b_j⟩` has two pieces; conservation needs
+    /// EACH to be cross-symmetric between the (i,j) and (j,i) orientations. This
+    /// prints both:
+    /// * `twist[i,j] = ⟨∂_iΓ_eff, b_j⟩`, with `∂_iΓ_eff` a central difference of the
+    ///   ASSEMBLED `Γ_eff` at ρ±h with the cache REBUILT per leg (so the deflation
+    ///   is re-discovered — this is the deflated adjoint's actual ρ-dependence,
+    ///   membership shifts included, which the frozen `−G Mᵢ G` twist may miss).
+    /// * `dA[i,j] = ⟨(∂_iA)·a, b_j⟩`, using the exact `∂A/∂ρ` operators.
+    ///
+    /// The guilty piece should reproduce the round-6b transpose fingerprint
+    /// (`piece[i,j] ≈ piece_fd[j,i]`), not just an asymmetric magnitude. Diagnostic
+    /// (prints; asserts finiteness). Pairs (smooth0,ard0) and (smooth1,ard1).
+    #[test]
+    fn third_order_cross_symmetry_split_2330() {
+        use crate::manifold::arrow_solver::{DeflatedArrowSolver, SaeArrowVector};
+        use ndarray::{Array1, array};
+        let (mut term, target, rho, _stationary_cache) =
+            super::exact_hessian_fixture_tests::converged_state_with_residual();
+        let mut rho_eval = rho.clone();
+        rho_eval.log_lambda_sparse = 0.5;
+        for v in rho_eval.log_lambda_smooth.iter_mut() {
+            *v = -2.0;
+        }
+        rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
+        let rho = rho_eval;
+        let base = rho.to_flat();
+        let h = 1.0e-5;
+        let (_value, loss, cache) = term
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                0,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("deflated base cache");
+        let total_t = cache.delta_t_len();
+        let dim = total_t + cache.k;
+        let flatten = |v: &SaeArrowVector| -> Array1<f64> {
+            let mut out = Array1::<f64>::zeros(dim);
+            for (k, &x) in v.t.iter().enumerate() {
+                out[k] = x;
+            }
+            for (k, &x) in v.beta.iter().enumerate() {
+                out[total_t + k] = x;
+            }
+            out
+        };
+        let solver = DeflatedArrowSolver::plain(&cache);
+
+        // Γ_eff = Γ_joint − Γ_tt + 2∇R, the gradient's effective adjoint.
+        let mut gamma_eff = term
+            .logdet_theta_adjoint(&rho, &cache, &solver)
+            .expect("gamma_joint");
+        {
+            let gtt = term
+                .coordinate_block_logdet_theta_adjoint(&rho, &cache, &solver)
+                .expect("gamma_tt");
+            gamma_eff.t -= &gtt.t;
+            gamma_eff.beta -= &gtt.beta;
+            let rc = term
+                .production_rank_charge_derivative(target.view(), &rho, &loss, &cache)
+                .expect("rank charge");
+            gamma_eff.t.scaled_add(2.0, &rc.theta.t);
+            gamma_eff.beta.scaled_add(2.0, &rc.theta.beta);
+        }
+        let a = term
+            .solve_exact_stationarity(&rho, target.view(), &cache, &solver, &gamma_eff)
+            .expect("a = A+ Gamma");
+        let a_flat = flatten(&a);
+        let m_ops = term
+            .penalty_curvature_operators_by_flat(&rho, &cache)
+            .expect("dH/drho operators");
+        let deltas = term
+            .exact_stationarity_penalty_derivative_delta_by_flat(&rho, &cache)
+            .expect("dC/drho deltas");
+
+        let coords = [
+            ("smooth0", rho.smooth_flat_index(0)),
+            ("smooth1", rho.smooth_flat_index(1)),
+            ("ard0", rho.ard_flat_index(0, 0)),
+            ("ard1", rho.ard_flat_index(1, 0)),
+        ];
+        // Per-coordinate: b_j = A+ g_ρ,j ; (∂_iA)a ; ∂_iΓ_eff (FD, cache rebuilt).
+        let mut b_flat = Vec::new();
+        let mut da_a = Vec::new();
+        let mut d_gamma = Vec::new();
+        for &(_name, i) in &coords {
+            let g_rho = term
+                .outer_rho_gradient_ift_rhs(&rho, i, &cache)
+                .expect("ift rhs");
+            let b = term
+                .solve_exact_stationarity(&rho, target.view(), &cache, &solver, &g_rho)
+                .expect("b_j");
+            b_flat.push(flatten(&b));
+            let mut da = m_ops[&i].dot(&a_flat);
+            if let Some(delta) = deltas.get(&i) {
+                da += &delta.dot(&a_flat);
+            }
+            da_a.push(da);
+            let gamma_at = |sign: f64| -> Array1<f64> {
+                let mut flat = base.clone();
+                flat[i] += sign * h;
+                let r = rho.from_flat(flat.view()).unwrap();
+                let mut t = term.clone();
+                let (_v, loss, cache) = t
+                    .penalized_quasi_laplace_criterion_with_cache(
+                        target.view(),
+                        &r,
+                        None,
+                        0,
+                        0.4,
+                        1.0e-6,
+                        1.0e-6,
+                    )
+                    .expect("perturbed cache");
+                let solver = DeflatedArrowSolver::plain(&cache);
+                let mut g = t
+                    .logdet_theta_adjoint(&r, &cache, &solver)
+                    .expect("gamma_joint");
+                let gtt = t
+                    .coordinate_block_logdet_theta_adjoint(&r, &cache, &solver)
+                    .expect("gamma_tt");
+                g.t -= &gtt.t;
+                g.beta -= &gtt.beta;
+                let rc = t
+                    .production_rank_charge_derivative(target.view(), &r, &loss, &cache)
+                    .expect("rank charge");
+                g.t.scaled_add(2.0, &rc.theta.t);
+                g.beta.scaled_add(2.0, &rc.theta.beta);
+                flatten(&g)
+            };
+            d_gamma.push((gamma_at(1.0) - gamma_at(-1.0)) / (2.0 * h));
+        }
+
+        let twist = |i: usize, j: usize| -> f64 { d_gamma[i].dot(&b_flat[j]) };
+        let d_a = |i: usize, j: usize| -> f64 { da_a[i].dot(&b_flat[j]) };
+        for (ia, ib) in [(0usize, 2usize), (1usize, 3usize)] {
+            eprintln!(
+                "SPLIT pair ({},{}): twist[i,j]={:.6e} twist[j,i]={:.6e} (asym {:.3e}) | \
+                 dA[i,j]={:.6e} dA[j,i]={:.6e} (asym {:.3e})",
+                coords[ia].0,
+                coords[ib].0,
+                twist(ia, ib),
+                twist(ib, ia),
+                (twist(ia, ib) - twist(ib, ia)).abs(),
+                d_a(ia, ib),
+                d_a(ib, ia),
+                (d_a(ia, ib) - d_a(ib, ia)).abs()
+            );
+        }
+        assert!(
+            twist(0, 2).is_finite() && d_a(0, 2).is_finite(),
+            "cross-symmetry split produced non-finite terms"
+        );
+    }
+
     /// The fitted amplitudes the encoder derives are exactly the posterior gate
     /// coordinates used by reconstruction. Decoder magnitude stays in `B`, so
     /// there is no second radial-scale channel to fold into these values.
