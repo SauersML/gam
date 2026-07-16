@@ -1146,12 +1146,14 @@ mod amortized_encoder_tests {
         }
     }
 
-    /// #2330 — is the eigen-twist term actually DELIVERED? Prints, per coordinate,
-    /// `|eigen_joint|`, `|eigen_tt|`, and `|eigen_joint − eigen_tt|` (the piece that
-    /// enters `dΓ_eff`). Distinguishes builder-returns-0 vs joint/tt-cancel vs
-    /// delivered-but-fullset-was-stale.
+    /// #2330 — attribute the g3 cross non-conservation to the trace vs frozen-DK
+    /// piece of the twist. Splits `dΓ_joint/dρ` into 4 legs (part-a/part-b ×
+    /// trace-only/DK) and prints each leg's cross pair `⟨leg_smooth, b_ard⟩` vs
+    /// `⟨leg_ard, b_smooth⟩` with the asymmetry. The asymmetric leg is the leak;
+    /// the strong suspect is `part_a_dk` (frozen `deflation_block_correction` fed
+    /// the twisted inverse `−G Mᵢ G`, which is not a valid selected inverse).
     #[test]
-    fn eigen_twist_delivery_probe_2330() {
+    fn twist_leg_cross_split_2330() {
         use ndarray::array;
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
@@ -1173,21 +1175,17 @@ mod amortized_encoder_tests {
                 1.0e-6,
             )
             .expect("deflated cache");
-        let mut coords = vec![
-            ("smooth0", rho.smooth_flat_index(0)),
-            ("ard0", rho.ard_flat_index(0, 0)),
-            ("ard1", rho.ard_flat_index(1, 0)),
-        ];
-        if let Some(s) = rho.sparse_flat_index() {
-            coords.push(("sparse", s));
-        }
-        for (name, i) in coords {
-            let (ej, et, diff) = term
-                .ch5_eigen_twist_delivery_check(&rho, &cache, i)
-                .expect("eigen delivery check");
+        let smooth0 = rho.smooth_flat_index(0);
+        let ard0 = rho.ard_flat_index(0, 0);
+        let legs = term
+            .ch5_twist_leg_cross(&rho, target.view(), &cache, smooth0, ard0)
+            .expect("twist leg cross");
+        let names = ["part_a_tr", "part_a_dk", "part_b_tr", "part_b_dk"];
+        for (name, (ij, ji)) in names.iter().zip(legs.iter()) {
             eprintln!(
-                "EIGEN-DELIVER {name}(flat={i}): |eigen_joint|={ej:.6e} |eigen_tt|={et:.6e} \
-                 |joint-tt|={diff:.6e}"
+                "LEG {name}: <leg_smooth,b_ard>={ij:.6e} <leg_ard,b_smooth>={ji:.6e} \
+                 asym={:.3e}",
+                (ij - ji).abs()
             );
         }
     }
