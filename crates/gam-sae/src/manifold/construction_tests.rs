@@ -746,6 +746,92 @@ mod amortized_encoder_tests {
         );
     }
 
+    /// PATH C (#2253) DIAGNOSTIC — localize the smooth↔ARD non-conservation of the
+    /// production third-order gradient `g3[j] = −½⟨A⁺Γ_eff, g_ρ,j⟩`. `g3` is
+    /// `∂Φ/∂ρ − ∂L/∂ρ` for a scalar `Φ`, so it MUST be conservative
+    /// (`∂g3[ard]/∂ρ_smooth == ∂g3[smooth]/∂ρ_ard`); the full-set gate shows it is
+    /// not. This splits `g3` by `Γ_eff = Γ_joint − Γ_tt + 2∇R` and prints each
+    /// part's cross asymmetry so ONE run names the offending adjoint. Pure
+    /// diagnostic — asserts only finiteness so it never masks the defect.
+    #[test]
+    fn third_order_conservation_bisection_2253() {
+        use crate::manifold::arrow_solver::DeflatedArrowSolver;
+        use ndarray::array;
+        let (term, target, rho, _stationary_cache) =
+            super::exact_hessian_fixture_tests::converged_state_with_residual();
+        let mut rho_eval = rho.clone();
+        rho_eval.log_lambda_sparse = 0.5;
+        for v in rho_eval.log_lambda_smooth.iter_mut() {
+            *v = -2.0;
+        }
+        rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
+        let rho = rho_eval;
+        let base = rho.to_flat();
+        let h = 1.0e-5;
+        let smooth0 = rho.smooth_flat_index(0);
+        let ard0 = rho.ard_flat_index(0, 0);
+
+        // g3 restricted to ONE Γ_eff part (0 = Γ_joint, 1 = Γ_tt, 2 = 2∇R),
+        // component `j`, at a REBUILT fixed-θ̂ cache at ρ + sign·h·e_perturb.
+        let g3_part = |sign: f64, perturb: usize, j: usize, part: usize| -> f64 {
+            let mut flat = base.clone();
+            flat[perturb] += sign * h;
+            let r = rho.from_flat(flat.view()).unwrap();
+            let mut t = term.clone();
+            let (_v, loss, cache) = t
+                .penalized_quasi_laplace_criterion_with_cache(
+                    target.view(),
+                    &r,
+                    None,
+                    0,
+                    0.4,
+                    1.0e-6,
+                    1.0e-6,
+                )
+                .expect("perturbed fixed-theta cache");
+            let solver = DeflatedArrowSolver::plain(&cache);
+            let gamma = match part {
+                0 => t.logdet_theta_adjoint(&r, &cache, &solver).unwrap(),
+                1 => t
+                    .coordinate_block_logdet_theta_adjoint(&r, &cache, &solver)
+                    .unwrap(),
+                _ => {
+                    let rc = t
+                        .production_rank_charge_derivative(target.view(), &r, &loss, &cache)
+                        .unwrap();
+                    crate::manifold::arrow_solver::SaeArrowVector {
+                        t: &rc.theta.t * 2.0,
+                        beta: &rc.theta.beta * 2.0,
+                    }
+                }
+            };
+            let a = t
+                .solve_exact_stationarity(&r, target.view(), &cache, &solver, &gamma)
+                .unwrap();
+            let g_rho = t.outer_rho_gradient_ift_rhs(&r, j, &cache).unwrap();
+            let dot: f64 = a.t.dot(&g_rho.t) + a.beta.dot(&g_rho.beta);
+            -0.5 * dot
+        };
+
+        for (name, part) in [("Gamma_joint", 0usize), ("Gamma_tt", 1), ("2_grad_R", 2)] {
+            let d_ard_by_smooth = (g3_part(1.0, smooth0, ard0, part)
+                - g3_part(-1.0, smooth0, ard0, part))
+                / (2.0 * h);
+            let d_smooth_by_ard = (g3_part(1.0, ard0, smooth0, part)
+                - g3_part(-1.0, ard0, smooth0, part))
+                / (2.0 * h);
+            eprintln!(
+                "CH5 conservation bisect [{name}]: d g3[ard0]/d rho_smooth0={d_ard_by_smooth:.9e} \
+                 d g3[smooth0]/d rho_ard0={d_smooth_by_ard:.9e} asym={:.3e}",
+                (d_ard_by_smooth - d_smooth_by_ard).abs()
+            );
+            assert!(
+                d_ard_by_smooth.is_finite() && d_smooth_by_ard.is_finite(),
+                "conservation bisection [{name}] produced non-finite cross derivatives"
+            );
+        }
+    }
+
     /// The fitted amplitudes the encoder derives are exactly the posterior gate
     /// coordinates used by reconstruction. Decoder magnitude stays in `B`, so
     /// there is no second radial-scale channel to fold into these values.
