@@ -4155,9 +4155,13 @@ pub(crate) fn projected_stationarity_inf_norm_projects_coupled_linear_kkt_multip
 #[test]
 pub(crate) fn projected_stationarity_uses_the_qp_face_without_expanding_tight_rows() {
     // A cone vertex can make every observation inequality tight while the QP's
-    // authoritative normal face contains one row. Reconstructing from slack
-    // would materialize all 4,096 duplicates and feed them to the NNLS
-    // projection; face provenance must keep the residual calculation sparse.
+    // face names one (or zero) of the 4,096 duplicate rows. The QP face is a
+    // WARM SEED, not the complete normal cone: the projection certifies
+    // against ONE cone geometry (the tangent cone at beta) regardless of which
+    // redundant rows the QP happened to report. Treating a sparse/empty seed
+    // as an authoritative "no projection" verdict reports resolvable
+    // multiplier mass as residual — the #979 eternal-plateau class — so the
+    // resolvable +2 component must project out under EVERY seed.
     let mut a = Array2::<f64>::zeros((4096, 2));
     a.column_mut(0).fill(1.0);
     let constraints = ConstraintSet::Dense(
@@ -4169,15 +4173,15 @@ pub(crate) fn projected_stationarity_uses_the_qp_face_without_expanding_tight_ro
 
     let projected =
         projected_linear_constraint_stationarity_vector(&residual, &beta, &constraints, Some(&[0]))
-            .expect("authoritative face projection");
+            .expect("seeded face projection");
     assert_relative_eq!(projected[0], 0.0_f64, epsilon = 1e-10);
-    assert_relative_eq!(projected[1], -3.0_f64, epsilon = 1e-12);
+    assert_relative_eq!(projected[1], -3.0_f64, epsilon = 1e-10);
 
-    let explicitly_free =
+    let empty_seed =
         projected_linear_constraint_stationarity_vector(&residual, &beta, &constraints, Some(&[]))
-            .expect("authoritative empty face");
-    assert_relative_eq!(explicitly_free[0], 2.0_f64, epsilon = 1e-12);
-    assert_relative_eq!(explicitly_free[1], -3.0_f64, epsilon = 1e-12);
+            .expect("empty-seed projection against the same cone geometry");
+    assert_relative_eq!(empty_seed[0], 0.0_f64, epsilon = 1e-10);
+    assert_relative_eq!(empty_seed[1], -3.0_f64, epsilon = 1e-10);
 }
 
 #[test]
