@@ -888,18 +888,22 @@ mod amortized_encoder_tests {
             let x = term
                 .solve_exact_stationarity(&rho, target.view(), &cache, &solver, &g_rho)
                 .expect("A+ g_rho");
-            let ax = term
-                .apply_exact_hessian(&rho, target.view(), &cache, &x)
-                .expect("A x");
-            let (hxt, hxb) =
-                apply_cached_arrow_hessian(&cache, x.t.view(), x.beta.view()).expect("H x");
+            let hx = apply_cached_arrow_hessian(&cache, x.t.view(), x.beta.view()).expect("H x");
+            let dc = term
+                .apply_exact_hessian_minus_b(&rho, target.view(), &cache, &x)
+                .expect("dC x");
+            // A·x = H·x + ΔC·x (the exact stationarity operator A = B + ΔC, B = H).
+            let ax = SaeArrowVector {
+                t: &hx.t + &dc.t,
+                beta: &hx.beta + &dc.beta,
+            };
             let r_exact = SaeArrowVector {
                 t: &ax.t - &g_rho.t,
                 beta: &ax.beta - &g_rho.beta,
             };
             let r_maj = SaeArrowVector {
-                t: &hxt - &g_rho.t,
-                beta: &hxb - &g_rho.beta,
+                t: &hx.t - &g_rho.t,
+                beta: &hx.beta - &g_rho.beta,
             };
             eprintln!(
                 "IFT[{name}] |g_rho|={:.6e} |x|={:.6e} |A.x-g|={:.6e} |H.x-g|={:.6e}",
