@@ -70,7 +70,7 @@ use csv::StringRecord;
 use gam::families::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, run_r};
+use gam::test_support::reference::{Column, QualityPair, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -320,6 +320,30 @@ fn gam_hazard_multiplier_frailty_matches_coxph_frailty() {
          | beta_x: gam={gam_beta_x:.4} (err={gam_beta_err:.4}) R={r_coef_x:.4} (err={r_beta_err:.4}) true={TRUE_BETA} \
          | mult_var: gam={gam_frailty_var:.4} (sd={gam_latent_sd:.4}, rel_err={gam_var_rel_err:.4}) \
          R={r_frailty_var:.4} (rel_err={r_var_rel_err:.4}) true={true_mult_var:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_survival_coxph_frailty_hazard_multiplier::beta",
+            "log_hr_abs_err_to_truth",
+            gam_beta_err,
+            "coxph",
+            r_beta_err,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_survival_coxph_frailty_hazard_multiplier::frailty_var",
+            "frailty_mult_var_rel_err_to_truth",
+            gam_var_rel_err,
+            "coxph",
+            r_var_rel_err,
+        )
+        .line()
     );
 
     // PRIMARY bound 1: gam recovers the true PH log-HR.
@@ -587,6 +611,18 @@ fn gam_hazard_multiplier_frailty_matches_coxph_frailty_on_real_data() {
         train_rows.len(),
         test_rows.len(),
         fit.latent_sd,
+    );
+    eprintln!(
+        "{}",
+        QualityPair::score(
+            "survival",
+            "quality_vs_survival_coxph_frailty_hazard_multiplier::holdout_cindex",
+            "cindex_holdout",
+            gam_concordance,
+            "coxph",
+            coxph_concordance,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam discriminates on held-out data ----

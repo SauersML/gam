@@ -54,7 +54,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -273,6 +273,30 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg() {
          ref_log_sigma={ref_log_sigma:.4} \
          gam_log_sigma_err={gam_log_sigma_err:.4} ref_log_sigma_err={ref_log_sigma_err:.4} \
          mu_rel_l2_vs_survreg={mu_rel_vs_ref:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_survival_location_scale_lognormal::mu",
+            "mu_rmse_to_truth",
+            gam_truth_rmse,
+            "survreg",
+            ref_truth_rmse,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_survival_location_scale_lognormal::log_sigma",
+            "log_sigma_abs_err",
+            gam_log_sigma_err,
+            "survreg",
+            ref_log_sigma_err,
+        )
+        .line()
     );
 
     // PRIMARY (truth recovery, absolute). With n=300, ~40% right-censoring and a

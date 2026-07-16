@@ -65,7 +65,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, run_python};
+use gam::test_support::reference::{Column, QualityPair, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -353,6 +353,42 @@ emit("sigma", [float(np.exp(sigma_params["Intercept"]))])
          gam_loc_rmse={gam_loc_rmse:.4} ref_loc_rmse={ref_loc_rmse:.4} \
          gam_sigma={gam_sigma:.4} (err {gam_sigma_err:.4}) ref_sigma={ref_sigma:.4} (err {ref_sigma_err:.4}) \
          gam_crps={gam_crps:.5} truth_crps={truth_crps:.5} ref_crps={ref_crps:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_lifelines_crps_lognormal_aft::loc",
+            "loc_rmse_centered_to_truth",
+            gam_loc_rmse,
+            "lifelines",
+            ref_loc_rmse,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_lifelines_crps_lognormal_aft::sigma",
+            "sigma_rel_err_to_truth",
+            gam_sigma_err,
+            "lifelines",
+            ref_sigma_err,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_lifelines_crps_lognormal_aft::crps",
+            "crps",
+            gam_crps,
+            "lifelines",
+            ref_crps,
+        )
+        .line()
     );
 
     // ---- OBJECTIVE BOUNDS (truth recovery + proper-score calibration) -------
@@ -706,6 +742,18 @@ emit("sigma", [float(np.exp(sigma_params["Intercept"]))])
          gam_crps={gam_crps:.4} ref_crps={ref_crps:.4} base_crps={base_crps:.4}",
         test_rows.len(),
         test_observed.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_lifelines_crps_lognormal_aft::crps_holdout",
+            "crps_holdout",
+            gam_crps,
+            "lifelines",
+            ref_crps,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective: beat the no-covariate lognormal baseline -------

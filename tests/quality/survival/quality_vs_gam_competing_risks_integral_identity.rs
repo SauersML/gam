@@ -57,7 +57,7 @@
 use gam::families::survival::assemble_competing_risks_cif;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -274,6 +274,18 @@ emit("cif_d", out)
     eprintln!(
         "accuracy-to-truth: rmse(gam,closed)={gam_err:.3e} rmse(AJ,closed)={aj_err:.3e} \
          (for context rel_l2(gam,AJ)={rel_aj:.4})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_gam_competing_risks_integral_identity",
+            "cif_rmse_to_closed_form",
+            gam_err,
+            "aalen_johansen",
+            aj_err,
+        )
+        .line()
     );
     // gam telescopes onto the exact integral (err ~1e-14) while AJ carries the
     // Monte-Carlo spread of a non-parametric fit (err ~1e-2 at n=500), so gam is

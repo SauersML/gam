@@ -69,7 +69,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -283,6 +283,30 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
          rmse_logsig(gam)={gam_err_lsig:.4} rmse_logsig(gamlss)={ref_err_lsig:.4} \
          [context rel_l2(loc vs gamlss)={rel_loc_vs_ref:.4} \
          rel_l2(log sigma vs gamlss)={rel_lsig_vs_ref:.4}]"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_gamlss_gaussian_survival_ls::loc",
+            "rmse_to_truth",
+            gam_err_loc,
+            "gamlss",
+            ref_err_loc,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_gamlss_gaussian_survival_ls::log_sigma",
+            "rmse_to_truth",
+            gam_err_lsig,
+            "gamlss",
+            ref_err_lsig,
+        )
+        .line()
     );
 
     // ---- PRIMARY assertion: gam recovers the true x-dependence -------------

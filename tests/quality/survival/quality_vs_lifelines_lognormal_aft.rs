@@ -62,7 +62,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -360,6 +360,18 @@ emit("sigma", [float(np.exp(sigma_params["Intercept"]))])
          gam_slope_rmse_vs_truth={gam_slope_rmse:.4} (baseline lifelines={ref_slope_rmse:.4}) \
          gam_sigma_rel_vs_truth={gam_sigma_rel:.4} (baseline lifelines={ref_sigma_rel:.4}) \
          gam_intercept={gam_intercept:.4} S_rel_l2_vs_truth={surv_rel_vs_truth:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_lifelines_lognormal_aft",
+            "slope_rmse_to_truth",
+            gam_slope_rmse,
+            "lifelines",
+            ref_slope_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY: gam recovers the true generating slopes ------------------
