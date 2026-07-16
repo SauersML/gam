@@ -93,6 +93,98 @@ fn fit_model(train_path: &Path, model_path: &Path) {
     assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
 }
 
+/// Survival analogue of the response-drop bug (#2301): a `Surv(time, event)`
+/// fit's EVENT column is not prediction-required (prediction never reads whether
+/// the event occurred), so the projected diagnostics loader dropped it and
+/// `gam diagnose --alo` aborted with "survival event column 'event' not found".
+///
+/// This exercises the *2-argument* right-censored `Surv(time, event)` form —
+/// deliberately different from the committed `bug_hunt_2301` 3-argument
+/// `Surv(entry, exit, event)` arm — so a regression that only re-added the event
+/// column for one Surv arity would still be caught here. The `event` column must
+/// survive the projection and ALO must print its typed survival coordinate frame.
+fn write_survival_csv(path: &Path) {
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand_distr::{Distribution, Uniform};
+    let mut rng = StdRng::seed_from_u64(2301);
+    let unit = Uniform::new(0.0_f64, 1.0_f64).expect("uniform");
+    let mut writer = csv::Writer::from_path(path).expect("create survival csv");
+    writer
+        .write_record(["time", "event", "x"])
+        .expect("write header");
+    let n = 200usize;
+    for _ in 0..n {
+        let x = -1.5 + 3.0 * unit.sample(&mut rng);
+        let u = unit.sample(&mut rng).clamp(1e-9, 1.0 - 1e-12);
+        let scale = (0.5 + 0.4 * x).exp();
+        let t_latent = scale * (-u.ln());
+        let censor = 4.0_f64;
+        let exit = t_latent.min(censor);
+        let event = if t_latent <= censor { 1.0 } else { 0.0 };
+        writer
+            .write_record([format!("{exit:.10}"), format!("{event:.1}"), format!("{x:.10}")])
+            .expect("write survival row");
+    }
+    writer.flush().expect("flush survival csv");
+}
+
+#[test]
+fn diagnose_alo_keeps_survival_event_column() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let train_path = dir.path().join("surv_train.csv");
+    let model_path = dir.path().join("surv_model.gam");
+
+    write_survival_csv(&train_path);
+
+    let fit = Command::new(gam::gam_binary!())
+        .arg("fit")
+        .arg(&train_path)
+        .arg("Surv(time, event) ~ x")
+        .args(["--survival-likelihood", "weibull"])
+        .arg("--out")
+        .arg(&model_path)
+        .output()
+        .expect("spawn gam fit (survival)");
+    assert!(
+        fit.status.success(),
+        "`gam fit 'Surv(time, event) ~ x'` failed.\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&fit.stderr),
+    );
+    assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
+
+    let out = Command::new(gam::gam_binary!())
+        .arg("diagnose")
+        .arg("--alo")
+        .arg(&model_path)
+        .arg(&train_path)
+        .output()
+        .expect("spawn gam diagnose --alo (survival)");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !stderr.contains("survival event column") && !stdout.contains("survival event column"),
+        "`gam diagnose --alo` dropped the survival event column from its own \
+         training data:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "`gam diagnose --alo` failed on a survival fit's training data.\n\
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("ALO diagnostics"),
+        "survival `gam diagnose --alo` produced no ALO diagnostics table.\n\
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("ALO coordinates (survival)"),
+        "survival `gam diagnose --alo` did not print its typed survival ALO frame.\n\
+         --- stdout ---\n{stdout}"
+    );
+}
+
 #[test]
 fn diagnose_runs_on_the_training_data() {
     let dir = tempfile::tempdir().expect("create tempdir");
