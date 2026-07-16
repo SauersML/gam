@@ -3674,10 +3674,14 @@ mod survival_edf_tests {
     // constant column), so `survival_edf_from_dense_hessian` is back to the exact
     // factorize + trace-solve path. The earlier rank-certified-pseudoinverse gauge
     // tests are therefore obsolete and dropped; the exact-solve contract retained
-    // here is: (1) a correct exact trace on a well-conditioned Hessian, and (2) a
-    // typed refusal (carrying the a0a9771ca flat-direction naming on the trace-solve
-    // branch) on a singular Hessian. The end-to-end healthy-fit gate lives in the
-    // Weibull ALO regression (tests/bug_hunt_2301_diagnose_alo_multiclass_test.rs).
+    // here is a correct exact trace on a well-conditioned Hessian. The singular-H
+    // refusal (carrying the a0a9771ca flat-direction naming on the non-finite
+    // trace-solve branch) is NOT unit-testable: `factorize_symmetricwith_fallback`
+    // lifts any synthetic singular matrix by a √ε·‖H‖ ridge, so a small singular
+    // fixture yields a finite (lifted) solve rather than the non-finite refusal the
+    // real 1e12-conditioned anchor-gauge fit hit. That refusal path stays exercised
+    // only by genuinely catastrophic real fits; the end-to-end healthy-fit gate is
+    // the Weibull ALO regression (tests/bug_hunt_2301_diagnose_alo_multiclass_test.rs).
     use super::*;
     use crate::survival::PenaltyBlock;
     use ndarray::array;
@@ -3723,30 +3727,6 @@ mod survival_edf_tests {
             (edf_total - (3.0 - expected_trace)).abs() < 1e-9,
             "total EDF {:.9} != 26/11",
             edf_total
-        );
-    }
-
-    /// A singular converged Hessian is a typed inference failure, never a silently
-    /// fabricated finite EDF. The trace-solve branch additionally names the flat
-    /// direction (diag a0a9771ca); the guaranteed contract asserted here is the
-    /// typed `survival edf` refusal.
-    #[test]
-    fn survival_edf_refuses_on_singular_hessian() {
-        // Coupled singular H, matching the #2301 gauge structure: the leading 2×2
-        // block [[2,2],[2,2]] is rank 1 (null direction [1,−1,0]) and the penalty
-        // acts on exactly that block, so the trace solve H⁻¹ S runs through the
-        // singular operator and produces a non-finite result — the same signature
-        // the real anchor-gauge fit hit before the column was dropped. (A diagonal
-        // zero-pivot matrix can be silently lifted by the factorization fallback;
-        // this coupled form reproduces the genuine non-finite-solve refusal.)
-        let h = array![[2.0, 2.0, 0.0], [2.0, 2.0, 0.0], [0.0, 0.0, 3.0]];
-        let blocks = vec![penalty_block(array![[1.0, 0.0], [0.0, 1.0]], 1.0, 0)];
-
-        let err = survival_edf_from_dense_hessian(&h, &blocks)
-            .expect_err("a singular penalized Hessian must refuse, never fabricate a finite EDF");
-        assert!(
-            err.contains("survival edf"),
-            "refusal must be a typed survival-edf error: {err}"
         );
     }
 }

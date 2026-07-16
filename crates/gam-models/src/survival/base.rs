@@ -2246,7 +2246,17 @@ impl WorkingModelSurvival {
         let score_norm = array1_l2_norm(&grad);
 
         let penaltygrad = self.penalties.gradient(beta);
-        let penalty_dev = self.penalties.deviance(beta);
+        // The WorkingState contract (`gam_solve::pirls::WorkingState`) defines
+        // `penalty_term` as the FULL quadratic form βᵀSβ: the shared LM objective
+        // is `½(deviance + penalty_term)` (reweight.rs), so the penalty ENERGY is
+        // `½·penalty_term`. `PenaltyBlocks::deviance` returns the energy `½βᵀSβ`, so
+        // the full quadratic is twice it. Storing the energy directly here (as this
+        // path historically did) made the LM's accept/reject objective read
+        // `½·deviance + ¼βᵀSβ` — under-penalized by 2× against the `Sβ` step gradient
+        // in `gradient` below — desyncing objective and step into a non-convergent
+        // Levenberg–Marquardt crawl at large λ (#2301 defect B). Downstream survival
+        // consumers that want the energy read `½·penalty_term`.
+        let penalty_quadratic_form = 2.0 * self.penalties.deviance(beta);
         let penaltygrad_norm = array1_l2_norm(&penaltygrad);
 
         let mut totalgrad = grad;
@@ -2268,7 +2278,7 @@ impl WorkingModelSurvival {
             hessian: gam_linalg::matrix::SymmetricMatrix::Dense(h),
             log_likelihood,
             deviance,
-            penalty_term: penalty_dev,
+            penalty_term: penalty_quadratic_form,
             firth: gam_solve::pirls::FirthDiagnostics::Inactive,
             ridge_used: 0.0,
             hessian_curvature: gam_solve::pirls::HessianCurvatureKind::Observed,
@@ -2637,8 +2647,10 @@ impl WorkingModelSurvival {
             }
         };
 
-        // penalty_quadratic = 2 * penalty_term (matching unified evaluator convention).
-        let penalty_quadratic = 2.0 * state.penalty_term;
+        // `penalty_term` is now the full quadratic βᵀSβ (WorkingState contract),
+        // which IS the unified evaluator's `penalty_quadratic` (#2301 defect B: it
+        // previously held the ½βᵀSβ energy and was doubled here).
+        let penalty_quadratic = state.penalty_term;
         let provider = SurvivalDerivProvider::new(self.clone(), beta.clone());
 
         // #931 survival-LAML IFT envelope: attach the one-step Newton correction
@@ -2872,8 +2884,10 @@ impl WorkingModelSurvival {
             // exactly `state.gradient` and whose UNDAMPED Hessian is exactly
             // `state.hessian`. `update_state` exposes the pieces directly; the
             // Levenberg–Marquardt shift below exists only while solving a step.
+            // `penalty_term` is the full quadratic βᵀSβ (WorkingState contract), so
+            // the ½β'Sβ energy is `0.5 * penalty_term` (#2301 defect B).
             let penalized_objective =
-                |st: &WorkingState| -> f64 { -st.log_likelihood + st.penalty_term };
+                |st: &WorkingState| -> f64 { -st.log_likelihood + 0.5 * st.penalty_term };
             for _ in 0..POLISH_MAX_ITERS {
                 let st = match candidate.update_state(&beta) {
                     Ok(st) => st,
@@ -4589,7 +4603,8 @@ mod tests {
             state.ridge_used, 0.0,
             "survival objective must not fuse a coefficient ridge"
         );
-        let expected_penalty = penalties.deviance(&beta);
+        // `penalty_term` is the full quadratic βᵀSβ = 2·(½βᵀSβ energy) (#2301 defect B).
+        let expected_penalty = 2.0 * penalties.deviance(&beta);
         assert!(
             (state.penalty_term - expected_penalty).abs() < 1e-12,
             "penalty_term mismatch: state={} expected={}",
@@ -4724,8 +4739,8 @@ mod tests {
             minus[j] -= eps;
             let state_plus = model.update_state(&plus).expect("state at beta + eps");
             let state_minus = model.update_state(&minus).expect("state at beta - eps");
-            let obj_plus = 0.5 * state_plus.deviance + state_plus.penalty_term;
-            let obj_minus = 0.5 * state_minus.deviance + state_minus.penalty_term;
+            let obj_plus = 0.5 * (state_plus.deviance + state_plus.penalty_term);
+            let obj_minus = 0.5 * (state_minus.deviance + state_minus.penalty_term);
             let fd = (obj_plus - obj_minus) / (2.0 * eps);
             assert_eq!(
                 state.gradient[j].signum(),
@@ -4896,7 +4911,7 @@ mod tests {
             .unified_lamlobjective_and_rhogradient(&beta, &state, &rho)
             .expect("survival LAML objective and gradient");
 
-        let expected = 0.5 * state.deviance + state.penalty_term + 0.5 * laml_test_logdet_h(&state)
+        let expected = 0.5 * (state.deviance + state.penalty_term) + 0.5 * laml_test_logdet_h(&state)
             - 0.5 * (rho0 + 2.5_f64.ln());
         assert_eq!(
             grad.len(),
@@ -4979,8 +4994,8 @@ mod tests {
             minus[j] -= eps;
             let state_plus = model.update_state(&plus).expect("state at beta + eps");
             let state_minus = model.update_state(&minus).expect("state at beta - eps");
-            let obj_plus = 0.5 * state_plus.deviance + state_plus.penalty_term;
-            let obj_minus = 0.5 * state_minus.deviance + state_minus.penalty_term;
+            let obj_plus = 0.5 * (state_plus.deviance + state_plus.penalty_term);
+            let obj_minus = 0.5 * (state_minus.deviance + state_minus.penalty_term);
             let fd = (obj_plus - obj_minus) / (2.0 * eps);
             assert_eq!(
                 state.gradient[j].signum(),
@@ -5518,7 +5533,7 @@ mod tests {
                 .expect("survival LAML Hessian operator")
                 .logdet()
         };
-        let expected = 0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h;
+        let expected = 0.5 * (state.deviance + state.penalty_term) + 0.5 * logdet_h;
 
         assert_eq!(grad.len(), 0);
         assert!(
