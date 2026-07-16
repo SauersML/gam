@@ -118,6 +118,21 @@ fn end_row_jet_allocation_measurement() -> (u64, u64) {
 pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache() {
     use crate::row_jet_program::{AtomRowBasisJet, RowGate, SaeReconstructionRowProgram};
 
+    // Production packs each reconstruction channel through the compiled schedule
+    // while the independent tower recomputes it via `Tower4`; the two evaluate
+    // the SAME quantity in different summation orders, so a near-zero entry
+    // differs only by f64 rounding (~1e-16·|intermediate|). A per-element
+    // RELATIVE bound collapses below that floor on near-zero entries (a 7e-9
+    // channel demands sub-1e-17 agreement, unmeetable in f64), so pin a mixed
+    // absolute+relative tolerance: `RTOL·|want|` keeps the full 1e-9 relative
+    // check on live entries; `ATOL` (four orders above rounding, far below any
+    // meaningful reconstruction signal) absorbs summation-order noise where the
+    // channel value is itself near zero. This tightens, not weakens: a real
+    // desync of even a near-zero channel exceeds ATOL, while pure reassociation
+    // does not.
+    const RECON_RTOL: f64 = 1e-9;
+    const RECON_ATOL: f64 = 1e-12;
+
     // Tiny-fixture row arity: softmax gauges the last logit as the fixed
     // reference (assignment_coord_dim = k_atoms − 1 = 1 free logit), plus
     // 2 atoms × 1 latent coord.
@@ -260,17 +275,11 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
 
             for out_col in 0..p {
                 let tower = prog.reconstruction_column::<K>(out_col);
-                let g_floor = (0..K)
-                    .map(|a| jets.first(a)[out_col].abs())
-                    .fold(1e-12_f64, f64::max);
-                let h_floor = (0..K)
-                    .flat_map(|a| (0..K).map(move |b| (a, b)))
-                    .map(|(a, b)| jets.second(a, b)[out_col].abs())
-                    .fold(1e-12_f64, f64::max);
                 for a in 0..K {
                     let want = sqrt_row_w * tower.g[a];
                     assert!(
-                        (jets.first(a)[out_col] - want).abs() <= 1e-9 * g_floor,
+                        (jets.first(a)[out_col] - want).abs()
+                            <= RECON_RTOL * want.abs() + RECON_ATOL,
                         "weighted={weighted} row {row} col {out_col} first[{a}]: \
                              production {} vs tower {}",
                         jets.first(a)[out_col],
@@ -279,7 +288,8 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                     for b in 0..K {
                         let want2 = sqrt_row_w * tower.h[a][b];
                         assert!(
-                            (jets.second(a, b)[out_col] - want2).abs() <= 1e-9 * h_floor,
+                            (jets.second(a, b)[out_col] - want2).abs()
+                                <= RECON_RTOL * want2.abs() + RECON_ATOL,
                             "weighted={weighted} row {row} col {out_col} \
                                  second[{a}][{b}]: production {} vs tower {}",
                             jets.second(a, b)[out_col],
@@ -310,9 +320,9 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                 for out_col in 0..p {
                     let out_c = channel.output[out_col];
                     let want_v = sqrt_row_w * s.v * out_c;
-                    let v_floor = want_v.abs().max(1e-12);
                     assert!(
-                        (jets.beta(beta_pos)[out_col] - want_v).abs() <= 1e-9 * v_floor,
+                        (jets.beta(beta_pos)[out_col] - want_v).abs()
+                            <= RECON_RTOL * want_v.abs() + RECON_ATOL,
                         "weighted={weighted} row {row} col {out_col} \
                          beta[{beta_pos}] (atom {} basis {}): production {} vs tower {}",
                         channel.atom,
@@ -322,14 +332,13 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                     );
                     for a in 0..K {
                         let want_d = sqrt_row_w * s.g[a] * out_c;
-                        let d_floor = want_d.abs().max(1e-12);
                         // `beta_deriv` and `beta_l_deriv` are the SAME mixed
                         // ∂²ẑ_c/∂β∂p_a derivative the linear-in-β reconstruction
                         // produces (the schedule fills both identically); both
                         // must equal the tower's first-derivative channel × out_c.
                         assert!(
                             (jets.beta_deriv(a, beta_pos)[out_col] - want_d).abs()
-                                <= 1e-9 * d_floor,
+                                <= RECON_RTOL * want_d.abs() + RECON_ATOL,
                             "weighted={weighted} row {row} col {out_col} \
                              beta_deriv[{a}][{beta_pos}]: production {} vs tower {}",
                             jets.beta_deriv(a, beta_pos)[out_col],
@@ -337,7 +346,7 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                         );
                         assert!(
                             (jets.beta_l_deriv(a, beta_pos)[out_col] - want_d).abs()
-                                <= 1e-9 * d_floor,
+                                <= RECON_RTOL * want_d.abs() + RECON_ATOL,
                             "weighted={weighted} row {row} col {out_col} \
                              beta_l_deriv[{a}][{beta_pos}]: production {} vs tower {}",
                             jets.beta_l_deriv(a, beta_pos)[out_col],
