@@ -4624,8 +4624,11 @@ pub(crate) fn mismatched_implicit_x_psi_operator_cannot_be_reinterpreted_as_zero
         implicit_group_id: None,
     };
     let policy = gam_runtime::resource::ResourcePolicy::permissive_small_data();
-    let error = resolve_custom_family_x_psi_map(&deriv, n, p, 0..n, "reduced-frame", &policy)
-        .expect_err("a raw-width implicit operator must not disappear in a reduced frame");
+    let error = match resolve_custom_family_x_psi_map(&deriv, n, p, 0..n, "reduced-frame", &policy)
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a raw-width implicit operator must not disappear in a reduced frame"),
+    };
     assert!(
         error.contains("implicit x_psi operator shape (5, 4) does not match (5, 3)"),
         "unexpected error: {error}",
@@ -5351,7 +5354,7 @@ pub(crate) fn kkt_refusal_report_classifies_rank_deficient_hpen_third_block() {
     joint_grad[0] = 1.0e-6;
 
     let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
-    let block_constraints: Vec<Option<LinearInequalityConstraints>> = vec![None; block_count];
+    let block_constraints: Vec<Option<ConstraintSet>> = vec![None; block_count];
 
     let math = JointNewtonMathDiagnostic {
         old_kkt_inf: 5.0,
@@ -5552,7 +5555,7 @@ pub(crate) fn rank_deficient_hpen_canary_fires_on_large_scale_shaped_failure() {
     joint_grad[11] = 0.9;
 
     let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
-    let block_constraints: Vec<Option<LinearInequalityConstraints>> = vec![None; block_count];
+    let block_constraints: Vec<Option<ConstraintSet>> = vec![None; block_count];
     let math = JointNewtonMathDiagnostic {
         old_kkt_inf: 4.2,
         linearized_next_kkt_inf: 4.2,
@@ -5669,7 +5672,7 @@ pub(crate) fn rank_deficient_hpen_canary_disappears_after_nullspace_absorption()
     let source = JointHessianSource::Dense(h);
     let joint_grad = Array1::<f64>::zeros(total_p);
     let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
-    let block_constraints: Vec<Option<LinearInequalityConstraints>> = vec![None; block_count];
+    let block_constraints: Vec<Option<ConstraintSet>> = vec![None; block_count];
     let math = JointNewtonMathDiagnostic {
         old_kkt_inf: 0.0,
         linearized_next_kkt_inf: 0.0,

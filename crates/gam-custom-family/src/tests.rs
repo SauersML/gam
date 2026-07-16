@@ -2556,16 +2556,17 @@ pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
         .expect("workspace-backed psi drift derivative should be returned");
 
     match result {
-        DriftDerivResult::Dense(_) => {
+        Some(DriftDerivResult::Dense(_)) => {
             panic!("workspace-backed block-local psi drift derivative was densified")
         }
-        DriftDerivResult::Operator(op) => {
+        Some(DriftDerivResult::Operator(op)) => {
             let (local, start, end) = op
                 .block_local_data()
                 .expect("block-local operator metadata should be preserved");
             assert_eq!((start, end), (1, 3));
             assert_eq!(local, &array![[3.0, 1.0], [1.0, 2.0]]);
         }
+        None => panic!("workspace-backed psi drift derivative must not be absent"),
     }
 }
 
@@ -4905,7 +4906,7 @@ pub(crate) fn owned_joint_penalty_geometry_uses_terminal_workspace_without_famil
     );
     assert_eq!(
         geometry.penalized_hessian.as_array(),
-        &(Array2::eye(2) * 3.0),
+        &(Array2::<f64>::eye(2) * 3.0),
         "Exact-Newton terminal geometry must retain the joint penalized precision",
     );
     assert!(
