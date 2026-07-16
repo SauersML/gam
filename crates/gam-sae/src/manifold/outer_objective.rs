@@ -837,6 +837,9 @@ impl SaeManifoldOuterObjective {
         };
         let atoms = match evaluated {
             Ok(_) => return Ok(None),
+            Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
+                return Err(err.to_string());
+            }
             Err(SaeCriterionError::Numerical(message)) => return Err(message),
             Err(SaeCriterionError::VanishedAtoms(atoms)) => atoms,
         };
@@ -2573,6 +2576,10 @@ impl SaeManifoldOuterObjective {
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 return Ok((f64::INFINITY, beta_hat));
             }
+            Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
+                let message = err.to_string();
+                return Err(message);
+            }
             Err(SaeCriterionError::Numerical(message)) => return Err(message),
         };
         let beta_hat = self.term.flatten_beta();
@@ -3048,6 +3055,10 @@ impl SaeManifoldOuterObjective {
                 return Ok(infeasible_evaluation(
                     "infeasible penalized quasi-Laplace score",
                 ));
+            }
+            Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
+                let err = err.to_string();
+                return Err(err);
             }
             Err(SaeCriterionError::Numerical(err)) => return Err(err),
         };
