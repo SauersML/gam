@@ -2806,16 +2806,27 @@ fn channel_aware_penalty_aware_joint_rank(
         }
     }
 
-    // Equilibrate the penalty-augmented Gram (diagonal congruence, exactly rank-
-    // preserving) before the numerical rank count. `count_rank`'s tolerance is
-    // relative to the LARGEST singular value, so a small penalty-covered σ on a
-    // weakly-distinguished direction — the pilot-effective marginal-slope shared-
-    // affine modes, where the c−f channel weighting is weak — is stranded below
-    // the cutoff by a stiff direction (the c_i-scale anisotropy), mislabeling an
-    // identified model as rank-deficient and blocking the penalty-coverage
-    // suppression. This is the keep_positive_eigenspace equilibration (b58bd1909)
-    // one layer down; it shares `gam_linalg::decision::equilibrate_gram`, whose
-    // own test certifies exactly this strand-vs-equilibrate case.
+    // Equilibrate the penalty-augmented Gram before the numerical rank count.
+    //
+    // WHY rank is preserved EXACTLY: `equilibrate_gram` forms `Ĝ = D^{-1/2} G
+    // D^{-1/2}` with `D = diag(G)` (positive diagonal; a zero-diagonal column is
+    // already a genuine null direction and stays null). This is a congruence by
+    // the invertible diagonal `D^{-1/2}`, and congruence preserves inertia
+    // (Sylvester), so `rank(Ĝ) = rank(G)` and the null space — the genuinely
+    // unidentified directions `ker(J_eff) ∩ ker(S)` we DO refuse on — is untouched.
+    //
+    // WHY the COUNTING is scale-robust after it: `count_rank`'s tolerance is
+    // `τ = α·ε·max(n,p)·σ_max`, relative to the LARGEST singular value. On the raw
+    // `G` a stiff direction (the marginal-slope chain weight `c_i`, whose spectrum
+    // reached ~8.66e7 here) sets `σ_max` huge, so a small-but-nonzero penalty-
+    // covered σ on a weakly-distinguished direction (the pilot-effective shared-
+    // affine modes, where the `c−f` weighting is weak) falls below `τ` and is
+    // stranded — an anisotropy artifact, not non-identification. On `Ĝ` the
+    // diagonal is unit, `σ_max = O(1)`, and each σ is judged against its own scale,
+    // so the identified small direction is counted. Identical fix to
+    // keep_positive_eigenspace (b58bd1909), one layer down at the penalty-coverage
+    // check; reuses `gam_linalg::decision::equilibrate_gram`, whose own test
+    // certifies exactly this strand-vs-equilibrate case (#2337 §3.2).
     let (equilibrated, _) = gam_linalg::decision::equilibrate_gram(&aug_gram);
     rank_of_gram(&equilibrated, n_design_rows + n_penalty_rows)
 }
