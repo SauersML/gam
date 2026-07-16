@@ -404,6 +404,7 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
     joint_mode_diagonal_ridge: f64,
     joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
     total_p: usize,
+    active_constraints: Option<&ActiveLinearConstraintBlock>,
 ) -> Result<ExactJointModeCurvatureCertificate, String> {
     let workspace =
         family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?;
@@ -462,11 +463,47 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
                 .to_string(),
         );
     }
-    let zero_rhs = Array1::<f64>::zeros(total_p);
+    // Constrained modes are certified on the active-face TANGENT null(A_act) —
+    // the same geometry the terminal determinant integrates over
+    // (`active_face_logdet_with_ridge_policy`). Curvature normal to the face
+    // is neither integrated by the Laplace approximation nor differentiated by
+    // the constrained outer kernel, so full-space indefiniteness there is not
+    // evidence against the mode; conversely a saddle WITHIN the face is
+    // exactly the point a first-order KKT certificate cannot see (the #979
+    // CTN cycle-97 witness: KKT-certified with tangent min_eig = -7.9, which
+    // then killed the downstream SPD determinant). A fully pinned mode has no
+    // free directions and is trivially certified.
+    let (certificate_matrix, certificate_metric) = match active_constraints {
+        Some(active) => match active_constraint_tangent_geometry(&active.a)? {
+            ActiveConstraintTangentGeometry::FullyPinned => {
+                return Ok(ExactJointModeCurvatureCertificate {
+                    workspace,
+                    minimum_whitened_eigenvalue: f64::INFINITY,
+                    numerical_floor: 0.0,
+                });
+            }
+            ActiveConstraintTangentGeometry::Tangent(z) => {
+                let reduced = z.t().dot(&hessian).dot(&z);
+                // Diagonal of Zᵀ·diag(metric)·Z: the exact positive scaling of
+                // the whitening metric expressed on the tangent basis.
+                let mut reduced_metric = Array1::<f64>::zeros(z.ncols());
+                for j in 0..z.ncols() {
+                    let mut projected = 0.0;
+                    for k in 0..z.nrows() {
+                        projected += metric[k] * z[[k, j]] * z[[k, j]];
+                    }
+                    reduced_metric[j] = projected;
+                }
+                (reduced, reduced_metric)
+            }
+        },
+        None => (hessian, metric),
+    };
+    let zero_rhs = Array1::<f64>::zeros(certificate_matrix.nrows());
     let spectrum = whitened_spectrum::WhitenedHessianSpectrum::decompose(
-        &hessian,
+        &certificate_matrix,
         &zero_rhs,
-        &metric,
+        &certificate_metric,
         KKT_REFUSAL_RANK_TOL,
     )?;
     let minimum_whitened_eigenvalue = spectrum.gamma.iter().copied().fold(f64::INFINITY, f64::min);
@@ -743,6 +780,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     local_joint_mode_diagonal_ridge,
                     joint_bundle,
                     total_joint_p,
+                    None,
                 ) {
                     Ok(certificate) => {
                         cached_mode_acceptable = !certificate.has_resolvable_negative_curvature();
@@ -5671,13 +5709,24 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let joint_constraints =
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
             // A full-space PSD test is exact for the unconstrained CTN mode.
-            // Constrained and Jeffreys-augmented families require their own
-            // critical-cone / augmented-objective certificate and retain the
-            // existing first-order contract here.
-            if !returned_mode_curvature_certified
-                && joint_constraints.is_none()
-                && joint_jeffreys_subspace.is_none()
-            {
+            // Constrained modes certify on the active-face tangent (the
+            // critical-cone surrogate under strict complementarity) — the same
+            // Z the terminal determinant uses, so a mode this certificate
+            // accepts can never fail the downstream SPD logdet on curvature
+            // grounds. Jeffreys-augmented families still require their own
+            // augmented-objective certificate and retain the first-order
+            // contract here.
+            if !returned_mode_curvature_certified && joint_jeffreys_subspace.is_none() {
+                let mode_active_block = if joint_constraints.is_some() {
+                    crate::blockwise_solve::assemble_active_constraint_block(
+                        &block_constraints,
+                        &cached_active_sets,
+                        &ranges,
+                        total_p,
+                    )
+                } else {
+                    None
+                };
                 let certificate = exact_joint_mode_curvature_certificate(
                     family,
                     &states,
@@ -5688,6 +5737,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     joint_mode_diagonal_ridge,
                     joint_bundle,
                     total_p,
+                    mode_active_block.as_ref(),
                 )?;
                 let has_negative_curvature = certificate.has_resolvable_negative_curvature();
                 let minimum_whitened_eigenvalue = certificate.minimum_whitened_eigenvalue;
@@ -7133,6 +7183,7 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
             joint_mode_diagonal_ridge,
             joint_bundle,
             local_total_p,
+            None,
         )?;
         let has_negative_curvature = certificate.has_resolvable_negative_curvature();
         let minimum_whitened_eigenvalue = certificate.minimum_whitened_eigenvalue;

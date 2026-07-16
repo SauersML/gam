@@ -4460,7 +4460,7 @@ pub(crate) fn fresh_exact_mode_curvature_certificate_detects_returned_strict_sad
         },
     ];
     let start_certificate = exact_joint_mode_curvature_certificate(
-        &family, &at_start, &specs, &options, &ranges, &s_lambdas, 0.0, None, 2,
+        &family, &at_start, &specs, &options, &ranges, &s_lambdas, 0.0, None, 2, None,
     )
     .expect("positive-curvature start should be certifiable");
     assert!(start_certificate.workspace.is_some());
@@ -4486,6 +4486,7 @@ pub(crate) fn fresh_exact_mode_curvature_certificate_detects_returned_strict_sad
         0.0,
         None,
         2,
+        None,
     )
     .expect("returned strict saddle should produce an honest certificate");
     assert!(returned_certificate.workspace.is_some());
@@ -4556,6 +4557,7 @@ pub(crate) fn joint_newton_recovers_from_returned_strict_saddle_with_remaining_c
         0.0,
         None,
         2,
+        None,
     )
     .expect("recovered local minimum should have certifiable exact curvature");
     assert!(!certificate.has_resolvable_negative_curvature());
