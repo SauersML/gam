@@ -44,15 +44,17 @@ Pass one of the following via `survival_likelihood=`:
 
 | Mode | Description |
 | --- | --- |
-| `"transformation"` | I-spline monotone log-cumulative-hazard baseline with linear or smooth covariate effects. CLI default. |
+| `"transformation"` | I-spline monotone log-cumulative-hazard baseline with linear or smooth covariate effects. Default in every frontend. |
 | `"weibull"` | Weibull parametric baseline with linear covariate effects on the log hazard. |
 | `"location-scale"` | Joint location and log-scale survival model; `noise_formula` can override the log-scale terms. See [location-scale.md](location-scale.md). |
 | `"marginal-slope"` | Separates a calibrated risk-score effect from the baseline. See [marginal-slope.md](marginal-slope.md). |
 | `"latent"` | Parametric baseline with latent-Gaussian frailty integration. |
 | `"latent-binary"` | Binary response under the same latent-Gaussian framework as `"latent"`. |
 
-When omitted in `gamfit.fit(...)`, the Rust/Python fit path uses
-`"location-scale"`; the `gam fit` CLI default is `"transformation"`.
+When omitted, every frontend (Python, Rust, CLI) resolves the same
+canonical default, `"transformation"` — the default lives in exactly
+one place (`FitConfig::resolved_survival_likelihood`), so identical
+requests select the identical likelihood regardless of entrance.
 `--predict-noise` requires `survival_likelihood="location-scale"`; it
 is rejected for every other survival mode.
 

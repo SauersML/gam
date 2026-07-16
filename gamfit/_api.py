@@ -864,8 +864,9 @@ def fit(
     survival_likelihood:
         Survival likelihood formulation. One of ``"transformation"``,
         ``"weibull"``, ``"location-scale"``, ``"marginal-slope"``,
-        ``"latent"``, or ``"latent-binary"``. Corresponds to
-        ``--survival-likelihood``.
+        ``"latent"``, or ``"latent-binary"``. When omitted, every frontend
+        resolves the same canonical default, ``"transformation"``.
+        Corresponds to ``--survival-likelihood``.
     baseline_target:
         Parametric baseline target for survival models. One of ``"linear"``,
         ``"weibull"``, ``"gompertz"``, ``"gompertz-makeham"``. Corresponds to

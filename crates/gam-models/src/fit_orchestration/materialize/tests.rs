@@ -169,9 +169,11 @@ fn survival_transformation_left_truncated_uses_median_exit_anchor() {
     )
     .expect("load left-truncated dataset");
 
-    // The config-layer/Python default explicitly selects the `transformation`
-    // (Royston-Parmar) likelihood; the direct Rust `FitConfig::default()` stays
-    // lognormal location-scale for backwards-compatible formula fits.
+    // `FitConfig::default()` leaves `survival_likelihood` unset (`None`), and
+    // every frontend resolves the one canonical default `"transformation"`
+    // (Royston-Parmar) at the `resolved_survival_likelihood` seam (#2301).
+    // Request it explicitly here so the test pins the mode independently of
+    // that seam.
     let mut config = FitConfig::default();
     config.survival_likelihood = Some("transformation".to_string());
 
