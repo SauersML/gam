@@ -140,6 +140,7 @@ mod family;
 mod family_solver;
 mod fit;
 mod moments;
+mod paired_stacks;
 mod predict;
 mod prepare;
 mod residual_dist;
