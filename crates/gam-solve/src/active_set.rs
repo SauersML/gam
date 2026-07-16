@@ -3,7 +3,7 @@ use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve, SolveLstsq};
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerLinalgError, FaerSvd, array1_to_col_matmut};
 use gam_linalg::utils::{StableSolver, array_is_finite, boundary_hit_step_fraction};
-use gam_problem::{ConstraintSet, LinearInequalityConstraints};
+use gam_problem::{ConstraintSet, KhatriRaoConeConstraints, LinearInequalityConstraints};
 use ndarray::{Array1, Array2, s};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -1219,6 +1219,140 @@ pub struct ReducedFace {
     pub dependence: Vec<Vec<ActiveRowDependence>>,
     /// The full tight set that was reduced, ascending flat ids.
     pub tight_rows: Vec<usize>,
+}
+
+/// Reduce the tight active face of a Khatri–Rao monotonicity cone to its minimal
+/// independent set — the `KhatriRaoCone` arm of the `ConstraintSet` reduced-face
+/// op (gam#2306; the Dense arm is [`rank_reduce_rows_pivoted_qr_with_dependence`]).
+///
+/// A cone row `(slot, i)` has normal `e_{k} ⊗ ψ_i` (`k = coupled_rows[slot]`),
+/// so two normals' inner product is `δ_{slot,slot'}·(ψ_iᵀ ψ_{i'})`: cross-block
+/// normals are ALWAYS orthogonal and never redundant, and redundancy occurs only
+/// WITHIN a shape block among linearly dependent covariate rows `ψ_i`. The
+/// reduction therefore decomposes into independent per-block Gram–Schmidt scans
+/// over the block's tight `ψ_i` rows — never forming the `n·|coupled|` system.
+///
+/// Contract (matches the Dense arm): FULL rank cut (every dependent row is
+/// dropped from `representatives`, parallel OR general-position); the dependence
+/// map records `(A)`-strict — ONLY exactly-parallel dependents
+/// (`|cos(ψ_dep, ψ_rep)| ≥ 1 − 1e-9`) get an [`ActiveRowDependence`] against their
+/// single representative (`coeff = ψ_depᵀψ_rep / ‖ψ_rep‖²`, so `a_dep ≈ coeff·a_rep`);
+/// general-position drops get no entry and re-enter via the next feasibility
+/// scan. Representatives are the lowest-flat-index row per direction (ascending
+/// obs within a block), host-deterministic with no float tie-break. The rank
+/// tolerance mirrors the Dense scan (`100·ε·max(n_tight, p_cov)·max‖ψ‖`), so the
+/// two arms cut to the same numerical rank. Flat id is `slot*n + obs`, matching
+/// [`KhatriRaoConeConstraints::values`].
+pub(crate) fn khatri_rao_cone_reduced_face(
+    cone: &KhatriRaoConeConstraints,
+    beta: ndarray::ArrayView1<'_, f64>,
+    membership_tol: f64,
+) -> Result<ReducedFace, EstimationError> {
+    let psi = cone.factor();
+    let n = psi.nrows();
+    let p_cov = psi.ncols();
+    let coupled = cone.coupled_rows();
+    let values = cone.values(beta).map_err(|error| {
+        EstimationError::ParameterConstraintViolation(format!(
+            "Khatri-Rao cone reduced-face values: {error}"
+        ))
+    })?;
+
+    // ‖ψ_i‖ is shared across coupled slots (the same covariate factor).
+    let row_norms: Vec<f64> = (0..n)
+        .map(|i| {
+            let row = psi.row(i);
+            row.dot(&row).sqrt()
+        })
+        .collect();
+
+    const RANK_ALPHA: f64 = 100.0;
+    // Exactly-parallel threshold, matching the Dense scan's ±1e-9 cosine band.
+    const PARALLEL_COS_TOL: f64 = 1.0 - 1e-9;
+
+    let mut representatives: Vec<usize> = Vec::new();
+    let mut dependence: Vec<Vec<ActiveRowDependence>> = Vec::new();
+    let mut tight_rows: Vec<usize> = Vec::new();
+
+    for slot in 0..coupled.len() {
+        // Tight obs in this block, ascending. A zero-norm ψ_i is a vacuous row
+        // (0ᵀβ ≥ 0 always holds) — never a constraint direction, never a rep.
+        let mut tight_obs: Vec<usize> = Vec::new();
+        for i in 0..n {
+            let norm_i = row_norms[i];
+            if norm_i <= 0.0 {
+                continue;
+            }
+            let scaled_slack = values[slot * n + i] / norm_i;
+            if scaled_slack <= membership_tol {
+                tight_rows.push(slot * n + i);
+                tight_obs.push(i);
+            }
+        }
+        if tight_obs.is_empty() {
+            continue;
+        }
+
+        let max_norm = tight_obs
+            .iter()
+            .map(|&i| row_norms[i])
+            .fold(0.0_f64, f64::max);
+        let rank_tol =
+            RANK_ALPHA * f64::EPSILON * (tight_obs.len().max(p_cov).max(1) as f64) * max_norm;
+
+        let mut ortho_basis: Vec<Array1<f64>> = Vec::new();
+        // Kept representatives in THIS block: (obs, ψ_obs, index into representatives).
+        let mut kept: Vec<(usize, Array1<f64>, usize)> = Vec::new();
+        for &i in &tight_obs {
+            let psi_i = psi.row(i).to_owned();
+            let mut resid = psi_i.clone();
+            for q in &ortho_basis {
+                let proj = resid.dot(q);
+                resid.scaled_add(-proj, q);
+            }
+            let resid_norm = resid.dot(&resid).sqrt();
+            let flat = slot * n + i;
+            if resid_norm > rank_tol {
+                ortho_basis.push(&resid / resid_norm);
+                let out_idx = representatives.len();
+                representatives.push(flat);
+                dependence.push(Vec::new());
+                kept.push((i, psi_i, out_idx));
+            } else {
+                // (A)-strict: record ONLY an exactly-parallel single-representative
+                // dependence; general-position drops carry no multiplier.
+                let mut best_abs_cos = 0.0_f64;
+                let mut best: Option<(usize, f64)> = None;
+                for (rep_obs, rep_psi, rep_out_idx) in &kept {
+                    let rep_norm = row_norms[*rep_obs];
+                    let dot = psi_i.dot(rep_psi);
+                    let cos = if rep_norm > 0.0 {
+                        dot / (row_norms[i] * rep_norm)
+                    } else {
+                        0.0
+                    };
+                    if cos.abs() > best_abs_cos {
+                        best_abs_cos = cos.abs();
+                        best = Some((*rep_out_idx, dot / (rep_norm * rep_norm)));
+                    }
+                }
+                if best_abs_cos >= PARALLEL_COS_TOL {
+                    if let Some((out_idx, coeff)) = best {
+                        dependence[out_idx].push(ActiveRowDependence {
+                            active_pos: flat,
+                            coeff,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(ReducedFace {
+        representatives,
+        dependence,
+        tight_rows,
+    })
 }
 
 impl CompressedActiveWorkingSet {
@@ -4183,6 +4317,76 @@ mod tests {
     fn small_cone() -> KhatriRaoConeConstraints {
         let psi = array![[1.0_f64, 0.2], [1.0, -0.4], [1.0, 1.3], [1.0, 0.8],];
         KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1, 2], 3).expect("small cone")
+    }
+
+    /// Parallel tight rows collapse to the lowest-index representative, and the
+    /// duplicate is recorded in the dependence map with its scalar ratio.
+    #[test]
+    fn cone_reduced_face_collapses_parallel_rows_to_lowest_index() {
+        // ψ_2 = 2·ψ_0 (parallel); ψ_1 independent. p_cov=2, one coupled row.
+        let psi = array![[1.0_f64, 0.0], [0.0, 1.0], [2.0, 0.0]];
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1], 2)
+            .expect("parallel cone");
+        // β = 0 ⇒ every Γ = 0 ⇒ every row tight.
+        let beta = Array1::<f64>::zeros(2 * 2);
+        let face = khatri_rao_cone_reduced_face(&cone, beta.view(), 1e-8).expect("reduce");
+        assert_eq!(face.tight_rows, vec![0, 1, 2]);
+        // Rank 2: reps are the two independent directions at their lowest obs.
+        assert_eq!(face.representatives, vec![0, 1]);
+        assert_eq!(face.dependence.len(), 2);
+        // ψ_2 (flat id 2) is parallel to representative ψ_0 (rep index 0), coeff 2.
+        assert_eq!(face.dependence[0].len(), 1);
+        assert_eq!(face.dependence[0][0].active_pos, 2);
+        assert!((face.dependence[0][0].coeff - 2.0).abs() < 1e-12);
+        assert!(face.dependence[1].is_empty());
+    }
+
+    /// A full-rank tight face keeps every row and records no dependence.
+    #[test]
+    fn cone_reduced_face_full_rank_has_no_dependence() {
+        let psi = array![[1.0_f64, 0.0], [0.0, 1.0]];
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1], 2)
+            .expect("full-rank cone");
+        let beta = Array1::<f64>::zeros(2 * 2);
+        let face = khatri_rao_cone_reduced_face(&cone, beta.view(), 1e-8).expect("reduce");
+        assert_eq!(face.representatives, vec![0, 1]);
+        assert!(face.dependence.iter().all(|d| d.is_empty()));
+        assert_eq!(face.tight_rows, vec![0, 1]);
+    }
+
+    /// A general-position dependent (in the span but parallel to no single rep)
+    /// is dropped from the working set (full rank cut) but gets NO dependence
+    /// entry — the (A)-strict contract that avoids a phantom distributed dual.
+    #[test]
+    fn cone_reduced_face_general_combination_gets_no_dependence_entry() {
+        // ψ_2 = ψ_0 + ψ_1: in the span, but cos with each rep is 1/√2 < 1.
+        let psi = array![[1.0_f64, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1], 2)
+            .expect("general-combo cone");
+        let beta = Array1::<f64>::zeros(2 * 2);
+        let face = khatri_rao_cone_reduced_face(&cone, beta.view(), 1e-8).expect("reduce");
+        assert_eq!(face.representatives, vec![0, 1]); // ψ_2 dropped
+        assert_eq!(face.tight_rows, vec![0, 1, 2]); // but still in the tight set
+        assert!(
+            face.dependence.iter().all(|d| d.is_empty()),
+            "a general-position drop must carry no distributed multiplier"
+        );
+    }
+
+    /// Cross-block cone rows are automatically orthogonal (e_k ⊥ e_{k'}), so each
+    /// shape block reduces independently — no cross-block dependence, and flat
+    /// ids stay in the slot*n+obs space.
+    #[test]
+    fn cone_reduced_face_reduces_each_shape_block_independently() {
+        let psi = array![[1.0_f64, 0.0], [0.0, 1.0]];
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1, 2], 3)
+            .expect("two-block cone");
+        let beta = Array1::<f64>::zeros(3 * 2);
+        let face = khatri_rao_cone_reduced_face(&cone, beta.view(), 1e-8).expect("reduce");
+        // Block 0 → flat 0,1; block 1 → flat 2,3 (slot*n+obs, n=2). All independent.
+        assert_eq!(face.representatives, vec![0, 1, 2, 3]);
+        assert!(face.dependence.iter().all(|d| d.is_empty()));
+        assert_eq!(face.tight_rows, vec![0, 1, 2, 3]);
     }
 
     /// Deterministic PD Hessian with off-diagonal coupling so active-set
