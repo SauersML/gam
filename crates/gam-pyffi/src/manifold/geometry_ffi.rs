@@ -7762,7 +7762,12 @@ fn validate_formula_dataset_json_impl(
         });
         fit_config.z_column = Some(VALIDATION_PLACEHOLDER_Z.to_string());
     }
-    let materialized = materialize(&formula, &dataset, &fit_config)?;
+    // Structural-only: validate must NOT fit. The survival baseline-θ resolution
+    // (a real BFGS-over-`fit_model` inner fit for location-scale / latent modes)
+    // is skipped, so a non-converging baseline fit can no longer surface as a
+    // validation error. Metadata (family / model_class / support / schema) is
+    // unchanged by the baseline-θ optimization, so the payload is identical.
+    let materialized = materialize_structural(&formula, &dataset, &fit_config)?;
     let (family_name, model_class, supported_by_python) = request_metadata(&materialized.request);
     let response_column = response_column_name(&formula);
     let payload = ValidationPayload {

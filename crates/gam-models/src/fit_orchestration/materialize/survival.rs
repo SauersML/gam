@@ -34,6 +34,7 @@ pub(crate) fn materialize_survival<'a>(
     exit_col: &str,
     event_col: &str,
     interval_right_col: Option<&str>,
+    structural_only: bool,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
     let mut inference_notes = Vec::new();
 
@@ -1224,7 +1225,19 @@ pub(crate) fn materialize_survival<'a>(
             })
         };
 
-    let baseline_cfg = if matches!(
+    let baseline_cfg = if structural_only {
+        // Structural formula validation must NOT fit. The baseline-θ resolution
+        // for the location-scale and latent modes below is a real inner fit
+        // (BFGS over `fit_model` evaluations); it only refines scale/shape, which
+        // do not affect the request METADATA that validation reports
+        // (family / model_class / schema / support). Running it here made
+        // `validate_formula` — contractually "validate a formula against a
+        // dataset WITHOUT fitting" — execute the full survival baseline workflow,
+        // so a non-converging baseline fit surfaced as a *validation* error. Carry
+        // the seed baseline config unchanged; the real fit path (this flag false)
+        // still optimizes it below.
+        baseline_cfg
+    } else if matches!(
         survival_mode,
         SurvivalLikelihoodMode::Transformation
             | SurvivalLikelihoodMode::Weibull

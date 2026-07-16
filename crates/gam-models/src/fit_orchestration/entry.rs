@@ -1950,10 +1950,34 @@ fn family_requests_transformation_normal(family: Option<&str>) -> bool {
         == Some("transformation-normal")
 }
 
+/// Build the design/request geometry for a formula against a dataset. This is the
+/// FIT path: for survival location-scale / latent modes it resolves the baseline
+/// θ via a real inner fit. Use [`materialize_structural`] for formula validation,
+/// which must not fit.
 pub fn materialize<'a>(
     formula: &str,
     data: &'a Dataset,
     config: &FitConfig,
+) -> Result<MaterializedModel<'a>, WorkflowError> {
+    materialize_impl(formula, data, config, false)
+}
+
+/// Structural-only materialization for `validate_formula`: builds the same
+/// request geometry/metadata but skips every inner fit (notably the survival
+/// baseline-θ resolution), honoring validation's "without fitting" contract.
+pub fn materialize_structural<'a>(
+    formula: &str,
+    data: &'a Dataset,
+    config: &FitConfig,
+) -> Result<MaterializedModel<'a>, WorkflowError> {
+    materialize_impl(formula, data, config, true)
+}
+
+fn materialize_impl<'a>(
+    formula: &str,
+    data: &'a Dataset,
+    config: &FitConfig,
+    structural_only: bool,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
     let config = config
         .clone()
@@ -2005,6 +2029,7 @@ pub fn materialize<'a>(
             &left_col,
             &event_col,
             Some(&right_col),
+            structural_only,
         )
     } else if let Some((entry_col, exit_col, event_col)) = parse_surv_response(&parsed.response)? {
         if effective_config.transformation_normal {
@@ -2026,6 +2051,7 @@ pub fn materialize<'a>(
             &exit_col,
             &event_col,
             None,
+            structural_only,
         )
     } else {
         // Non-survival response: `timewiggle(...)` and `survmodel(...)` are

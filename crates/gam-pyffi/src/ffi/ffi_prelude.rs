@@ -209,8 +209,8 @@ pub(crate) use gam::families::transformation_normal::TransformationNormalFitResu
 pub(crate) use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink};
 
 pub(crate) use gam::families::fit_orchestration::{
-    FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize, resolve_offset_column,
-    resolve_weight_column,
+    FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize,
+    materialize_structural, resolve_offset_column, resolve_weight_column,
 };
 
 pub(crate) use ndarray::{
