@@ -1578,8 +1578,16 @@ pub fn build_tensor_psi_derivatives(
 ) -> Result<Vec<CustomFamilyBlockPsiDerivative>, String> {
     let p_resp = family.response_val_basis.ncols();
     let n_axes = covariate_psi_derivs.len();
-    let mut shape_resp = Array2::<f64>::eye(p_resp);
-    shape_resp[[0, 0]] = 0.0;
+    // Left factor of the covariate-direction penalty `G_y ⊗ S_{x,j}(κ)`. The
+    // response value-basis mass Gram `G_y` is κ-independent, so the ψ/κ
+    // derivative is `G_y ⊗ dS_cov/dκ`; using the same `G_y` the penalty value
+    // uses keeps the outer criterion and its gradient in sync (gam#2306).
+    let response_left = weighted_function_gram(
+        family.response_val_basis.view(),
+        family.weights.view(),
+        p_resp,
+        "response",
+    )?;
     let shared_operator: Arc<dyn CustomFamilyPsiDerivativeOperator> =
         Arc::new(TensorKroneckerPsiOperator {
             response_val_basis: Arc::new(family.response_val_basis.clone()),
@@ -1596,11 +1604,11 @@ pub fn build_tensor_psi_derivatives(
         let s_psi_penalty_components = cov_deriv
             .s_psi_penalty_components
             .as_ref()
-            .map(|components| lift_covariate_penalty_derivative_components(components, &shape_resp))
+            .map(|components| lift_covariate_penalty_derivative_components(components, &response_left))
             .transpose()?
             .or_else(|| {
                 cov_deriv.s_psi_components.as_ref().map(|components| {
-                    lift_dense_covariate_penalty_derivative_components(components, &shape_resp)
+                    lift_dense_covariate_penalty_derivative_components(components, &response_left)
                 })
             });
         let s_psi_psi_penalty_components = cov_deriv
@@ -1609,7 +1617,7 @@ pub fn build_tensor_psi_derivatives(
             .map(|rows| {
                 rows.iter()
                     .map(|cov_pen_pairs| -> Result<_, String> {
-                        lift_covariate_penalty_derivative_components(cov_pen_pairs, &shape_resp)
+                        lift_covariate_penalty_derivative_components(cov_pen_pairs, &response_left)
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
@@ -1620,7 +1628,7 @@ pub fn build_tensor_psi_derivatives(
                         .map(|cov_pen_pairs| {
                             lift_dense_covariate_penalty_derivative_components(
                                 cov_pen_pairs,
-                                &shape_resp,
+                                &response_left,
                             )
                         })
                         .collect::<Vec<_>>()
@@ -1649,18 +1657,18 @@ pub fn build_tensor_psi_derivatives(
 
 pub(crate) fn lift_dense_covariate_penalty_derivative_components(
     components: &[(usize, Array2<f64>)],
-    shape_resp: &Array2<f64>,
+    response_left: &Array2<f64>,
 ) -> Vec<(usize, PenaltyMatrix)> {
     let mut out = Vec::with_capacity(components.len());
     for &(idx, ref ds_cov) in components {
-        push_lifted_covariate_penalty_component(&mut out, idx, ds_cov.clone(), shape_resp);
+        push_lifted_covariate_penalty_component(&mut out, idx, ds_cov.clone(), response_left);
     }
     out
 }
 
 pub(crate) fn lift_covariate_penalty_derivative_components(
     components: &[(usize, PenaltyMatrix)],
-    shape_resp: &Array2<f64>,
+    response_left: &Array2<f64>,
 ) -> Result<Vec<(usize, PenaltyMatrix)>, String> {
     let mut out = Vec::with_capacity(components.len());
     for (idx, ds_cov) in components {
@@ -1668,7 +1676,7 @@ pub(crate) fn lift_covariate_penalty_derivative_components(
             &mut out,
             *idx,
             extract_covariate_penalty_factor(ds_cov)?,
-            shape_resp,
+            response_left,
         );
     }
     Ok(out)
@@ -1678,12 +1686,12 @@ pub(crate) fn push_lifted_covariate_penalty_component(
     out: &mut Vec<(usize, PenaltyMatrix)>,
     cov_penalty_idx: usize,
     ds_cov: Array2<f64>,
-    shape_resp: &Array2<f64>,
+    response_left: &Array2<f64>,
 ) {
     out.push((
         cov_penalty_idx,
         PenaltyMatrix::KroneckerFactored {
-            left: shape_resp.clone(),
+            left: response_left.clone(),
             right: ds_cov,
         },
     ));

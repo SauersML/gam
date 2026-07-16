@@ -366,25 +366,58 @@ impl DenseDesignOperator for KroneckerDesign {
 
 /// A penalty matrix in separable Kronecker form: `S_left ⊗ S_right`.
 ///
-/// Build tensor product penalties in Kronecker-separable form.
+/// Build the direct-α (gam#2306) tensor product penalties in Kronecker-separable
+/// form.
+///
+/// In the direct-α chart the transformation `h(y, x) = Σ_k α_k(x) v_k(y)` is
+/// linear in the tensor coefficients `A ∈ R^{p_resp × p_cov}` (`β = vec(A)`,
+/// row-major so `β[k·p_cov + a] = A[k, a]`), so the SPEC-5 function-space
+/// roughness of `h` is exactly quadratic in `β`.
+///
+/// - Covariate roughness `∫∫ (L_x h)² dμ_y(y) dx = ½ βᵀ (G_y ⊗ S_{x,j}) β` with
+///   `S_{x,j}` the covariate roughness Gram and `G_y = Vᵀ W V` the response
+///   value-basis mass Gram under the empirical (weighted) data measure — never
+///   an identity coefficient matrix, which equals the function integral only for
+///   an orthonormal response basis. The location row `v_0 ≡ 1` participates:
+///   this is the main-effect-of-`x` smoothing of the conditional centering
+///   field, and a constant centering field lies in `null(S_{x,j})`, so the free
+///   intercept is left unpenalized exactly. `G_y` is independent of the covariate
+///   spatial hyper `κ` (the response basis is reused across `κ` iterations), so
+///   the existing `dS_{x,j}/dκ` psi-derivative path — lifted through the same
+///   `G_y` — keeps the outer criterion and its gradient in sync.
+/// - Response roughness `½ βᵀ (S_{y,m} ⊗ G_x) β`: the covariate value-basis mass
+///   Gram `G_x = Ψ(κ)ᵀ W Ψ(κ)` moves with `κ`, so replacing the identity right
+///   factor requires a matching `dG_x/dκ` psi-derivative channel to stay
+///   gradient-consistent; that is deferred to the moving-Ψ LAML work and the
+///   response factor stays the (κ-independent) identity here.
 pub(crate) fn build_tensor_penalties_kronecker(
     response_penalties: &[Array2<f64>],
     covariate_penalties: Vec<PenaltyMatrix>,
+    response_val: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
     p_resp: usize,
     p_cov: usize,
     config: &TransformationNormalConfig,
 ) -> Result<Vec<PenaltyMatrix>, String> {
     let eye_cov = Array2::<f64>::eye(p_cov);
-    let mut penalties = Vec::new();
 
+    // Response function-space mass Gram `G_y = Vᵀ W V` under the empirical
+    // (weighted) data measure: the covariate-direction penalty's left factor,
+    // making it the exact roughness of the represented function `h` rather than
+    // a coefficient-geometry surrogate. κ-independent, so its psi-derivatives
+    // reuse this same matrix.
+    let g_resp = weighted_function_gram(response_val, weights, p_resp, "response")?;
+
+    // Shape-only response ridge (double-penalty null shrinkage). The location
+    // row is the conditional centering field, identified by the likelihood; keep
+    // it outside every SCOP shrinkage penalty so population shifts stay freely
+    // calibrated in the selected covariate span.
     let mut shape_resp = Array2::<f64>::eye(p_resp);
     shape_resp[[0, 0]] = 0.0;
 
-    // Covariate roughness is the exact quadratic function-space penalty on the
-    // direct monotone shape rows. The derivative-free location row is the
-    // conditional centering field itself; penalizing it by REML under-corrects
-    // broad population shifts and leaves h(Y|x) calibrated only marginally
-    // instead of conditionally.
+    let mut penalties = Vec::new();
+
+    // Covariate roughness: G_y ⊗ S_{x,j}.
     for s_cov in covariate_penalties {
         let fixed_log_lambda = s_cov.fixed_log_lambda();
         let right = match s_cov {
@@ -400,7 +433,7 @@ pub(crate) fn build_tensor_penalties_kronecker(
             }
         };
         let penalty = PenaltyMatrix::KroneckerFactored {
-            left: shape_resp.clone(),
+            left: g_resp.clone(),
             right,
         };
         penalties.push(match fixed_log_lambda {
@@ -409,7 +442,8 @@ pub(crate) fn build_tensor_penalties_kronecker(
         });
     }
 
-    // Response penalties: S_resp_m ⊗ I_cov
+    // Response roughness: S_{y,m} ⊗ I_cov (κ-independent right factor; see the
+    // moving-Ψ G_x note above).
     for s_resp in response_penalties {
         penalties.push(PenaltyMatrix::KroneckerFactored {
             left: s_resp.clone(),
@@ -417,10 +451,7 @@ pub(crate) fn build_tensor_penalties_kronecker(
         });
     }
 
-    // Double penalty: shape-row ridge only. The location row is identified by
-    // the likelihood as the conditional centering field; keep it outside every
-    // SCOP roughness/shrinkage penalty so population shifts can be calibrated
-    // in the selected covariate span.
+    // Double penalty: shape-row ridge only.
     if config.double_penalty {
         penalties.push(PenaltyMatrix::KroneckerFactored {
             left: shape_resp,
@@ -429,6 +460,35 @@ pub(crate) fn build_tensor_penalties_kronecker(
     }
 
     Ok(penalties)
+}
+
+/// Weighted function-space mass Gram `Bᵀ diag(w) B` of a value basis `B`
+/// (`n × p`) under the empirical measure `w`.
+pub(crate) fn weighted_function_gram(
+    basis: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    p: usize,
+    label: &str,
+) -> Result<Array2<f64>, String> {
+    if basis.ncols() != p {
+        return Err(format!(
+            "{label} value basis has {} columns, expected {p}",
+            basis.ncols()
+        ));
+    }
+    if basis.nrows() != weights.len() {
+        return Err(format!(
+            "{label} value basis has {} rows but {} weights",
+            basis.nrows(),
+            weights.len()
+        ));
+    }
+    let weighted = weight_rows(&basis.to_owned(), &weights.to_owned());
+    let gram = basis.t().dot(&weighted);
+    // Symmetrize against round-off so the factor is exactly symmetric PSD.
+    let mut sym = &gram + &gram.t();
+    sym.mapv_inplace(|v| 0.5 * v);
+    Ok(sym)
 }
 
 // ---------------------------------------------------------------------------

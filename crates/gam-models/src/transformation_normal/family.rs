@@ -379,6 +379,8 @@ impl TransformationNormalFamily {
         let tensor_penalties = build_tensor_penalties_kronecker(
             &resp_penalties,
             covariate_penalties,
+            resp_val.view(),
+            weights.view(),
             p_resp,
             p_cov,
             config,
@@ -566,6 +568,8 @@ impl TransformationNormalFamily {
         let tensor_penalties = build_tensor_penalties_kronecker(
             &response_penalties,
             covariate_penalties,
+            response_val_basis.view(),
+            weights.view(),
             p_resp,
             p_cov,
             config,

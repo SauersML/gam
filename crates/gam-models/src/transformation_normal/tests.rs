@@ -160,11 +160,18 @@ pub(crate) fn prebuilt_ctn_family_uses_explicit_rho_without_reseeding() {
 }
 
 #[test]
-pub(crate) fn tensor_psi_penalty_derivatives_follow_shape_only_scop_layout() {
+pub(crate) fn tensor_psi_penalty_derivatives_carry_response_mass_gram_layout() {
     let response = array![-1.0, -0.2, 0.6, 1.3];
     let (val_basis, deriv_basis, knots, transform, p_resp) = toy_response_basis(&response);
     let weights = Array1::from_elem(response.len(), 1.0);
     let offset = Array1::zeros(response.len());
+    // The covariate-direction penalty is `G_y ⊗ S_{x,j}(κ)`, so every ψ/κ
+    // derivative component lifts through the κ-independent response value-basis
+    // mass Gram `G_y = Vᵀ W V` (gam#2306). Compute it from the same basis and
+    // weights the family sees.
+    let expected_g_resp =
+        weighted_function_gram(val_basis.view(), weights.view(), p_resp, "response")
+            .expect("response mass gram");
     let cov_design = array![[1.0, 0.2], [1.0, -0.1], [1.0, 0.4], [1.0, -0.3]];
     let family = TransformationNormalFamily::from_prebuilt_response_basis(
         &response,
@@ -210,8 +217,8 @@ pub(crate) fn tensor_psi_penalty_derivatives_follow_shape_only_scop_layout() {
         .expect("first derivatives");
     let got_indices: Vec<usize> = first.iter().map(|(idx, _)| *idx).collect();
     assert_eq!(got_indices, vec![0, 1]);
-    assert_shape_penalty_component(&first[0].1, p_resp, &ds0);
-    assert_shape_penalty_component(&first[1].1, p_resp, &ds1);
+    assert_covariate_penalty_component(&first[0].1, &expected_g_resp, &ds0);
+    assert_covariate_penalty_component(&first[1].1, &expected_g_resp, &ds1);
 
     let second = tensor_derivs[0]
         .s_psi_psi_penalty_components
@@ -220,7 +227,7 @@ pub(crate) fn tensor_psi_penalty_derivatives_follow_shape_only_scop_layout() {
     assert_eq!(second.len(), 1);
     let got_second_indices: Vec<usize> = second[0].iter().map(|(idx, _)| *idx).collect();
     assert_eq!(got_second_indices, vec![1]);
-    assert_shape_penalty_component(&second[0][0].1, p_resp, &ds1_second);
+    assert_covariate_penalty_component(&second[0][0].1, &expected_g_resp, &ds1_second);
 }
 
 #[test]
@@ -293,22 +300,22 @@ pub(crate) fn tensor_psi_row_chunks_are_window_consistent() {
     );
 }
 
-pub(crate) fn assert_shape_penalty_component(
+pub(crate) fn assert_covariate_penalty_component(
     penalty: &PenaltyMatrix,
-    p_resp: usize,
+    expected_left: &Array2<f64>,
     expected_right: &Array2<f64>,
 ) {
     let PenaltyMatrix::KroneckerFactored { left, right } = penalty else {
         panic!("expected KroneckerFactored penalty component");
     };
     assert_eq!(right, expected_right);
-    assert_eq!(left.nrows(), p_resp);
-    assert_eq!(left.ncols(), p_resp);
-    for r in 0..p_resp {
-        for c in 0..p_resp {
-            let expected = if r == c && r > 0 { 1.0 } else { 0.0 };
-            assert_eq!(left[[r, c]], expected);
-        }
+    assert_eq!(left.dim(), expected_left.dim());
+    for ((r, c), &value) in left.indexed_iter() {
+        let want = expected_left[[r, c]];
+        assert!(
+            (value - want).abs() <= 1e-12 * (1.0 + want.abs()),
+            "covariate penalty left factor [{r},{c}] = {value} != expected G_y {want}"
+        );
     }
 }
 
