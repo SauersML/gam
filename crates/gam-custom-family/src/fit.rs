@@ -34,6 +34,44 @@ pub(crate) fn lift_block_states_to_raw(
         .collect()
 }
 
+/// Operating-point `family_scalars` for the PRE-fit identifiability audit, built
+/// from each block spec's warm-start `initial_beta` (the pilot β the family
+/// seeded; zeros where it seeded none).
+///
+/// A family whose effective channel weights depend on β — survival marginal-slope,
+/// `c_i = √(1+(s·g_i)²)` — collapses to its raw design when linearized at β = 0,
+/// aliasing structurally-identical blocks that are only distinguished by that
+/// weighting and producing a FALSE identifiability refusal before the fit even
+/// starts. Linearizing the pre-fit audit at the pilot operating point (the same
+/// geometry `audit_converged_identifiability` uses post-convergence) ranks the
+/// design the fit actually sees. Static families return `None` (the trait
+/// default) and the audit linearizes at the zero/init point exactly as before.
+///
+/// `eta` is unused by `current_identifiability_family_scalars` (it reads β only),
+/// so a zero placeholder keeps each synthetic state well-formed.
+fn pre_fit_operating_scalars<F: CustomFamily + ?Sized>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, CustomFamilyError> {
+    let states: Vec<ParameterBlockState> = specs
+        .iter()
+        .map(|spec| {
+            let beta = spec
+                .initial_beta
+                .clone()
+                .unwrap_or_else(|| Array1::zeros(spec.design.ncols()));
+            let eta = Array1::zeros(spec.design.nrows());
+            ParameterBlockState { beta, eta }
+        })
+        .collect();
+    family
+        .current_identifiability_family_scalars(&states)
+        .map_err(|reason| CustomFamilyError::Optimization {
+            context: "pre-fit identifiability operating scalars",
+            reason,
+        })
+}
+
 /// Re-run the unified identifiability audit at the converged raw-coordinate
 /// state when a family exposes dynamic primary scalars. Any change from the
 /// pilot verdict invalidates the gauge used by the solve, so result assembly
@@ -756,7 +794,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         canonical_n_rows,
         canonical_n_cols_raw,
     );
-    let canonical = gam_identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
+    let canonical =
+        gam_identifiability::canonical::canonicalize_for_identifiability_with_operating_scalars(
+            raw_specs,
+            pre_fit_operating_scalars(family, raw_specs)?,
+        )?;
     let canonical_n_cols_red: usize = canonical
         .reduced_specs
         .iter()
@@ -1874,7 +1916,11 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
     options: &BlockwiseFitOptions,
     warm_start: Option<&CustomFamilyWarmStart>,
 ) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
-    let canonical = gam_identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
+    let canonical =
+        gam_identifiability::canonical::canonicalize_for_identifiability_with_operating_scalars(
+            raw_specs,
+            pre_fit_operating_scalars(family, raw_specs)?,
+        )?;
     let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
     let penalty_counts = validate_blockspecs(specs)?;
     let rho = flatten_log_lambdas(specs);
@@ -2097,7 +2143,11 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
     }
     let penalty_counts = validate_blockspecs(specs)?;
     let per_block = split_log_lambdas(&rho, &penalty_counts)?;
-    let canonical = gam_identifiability::canonical::canonicalize_for_identifiability(specs)?;
+    let canonical =
+        gam_identifiability::canonical::canonicalize_for_identifiability_with_operating_scalars(
+            specs,
+            pre_fit_operating_scalars(family, specs)?,
+        )?;
     if !canonical.gauge.is_identity()
         || canonical.reduced_specs.len() != specs.len()
         || canonical
@@ -2321,7 +2371,11 @@ pub fn fit_custom_family_fixed_log_lambda_warm_start<
     raw_specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Result<(Vec<Array1<f64>>, bool, usize), CustomFamilyError> {
-    let canonical = gam_identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
+    let canonical =
+        gam_identifiability::canonical::canonicalize_for_identifiability_with_operating_scalars(
+            raw_specs,
+            pre_fit_operating_scalars(family, raw_specs)?,
+        )?;
     let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
     let penalty_counts = validate_blockspecs(specs)?;
     let rho = flatten_log_lambdas(specs);

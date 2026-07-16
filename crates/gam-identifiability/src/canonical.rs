@@ -80,6 +80,15 @@ struct BlockJacobianAsRowOp {
     k_block: usize,
     k_target: usize,
     block_name: String,
+    /// Operating-point `family_scalars` at which a `Callback` block's effective
+    /// Jacobian is linearized. `None` = the pre-fit zero/init operating point
+    /// (β = 0), where a family whose channel weights depend on the operating
+    /// point (e.g. survival marginal-slope: `c_i = √(1+(s·g_i)²)` at `g = 0` is
+    /// `1`) collapses to its raw design — so two structurally-identical blocks
+    /// distinguished only by that weighting alias. `Some(scalars)` linearizes at
+    /// the pilot operating point so the effective Jacobians (and thus the joint
+    /// gram's rank/overlap verdict) reflect the geometry the fit actually sees.
+    operating_scalars: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl BlockJacobianAsRowOp {
@@ -99,6 +108,7 @@ impl BlockJacobianAsRowOp {
         p_block: usize,
         k_target: usize,
         block_name: &str,
+        operating_scalars: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<Self, String> {
         let k = cb.n_outputs();
         if k == 0 {
@@ -119,6 +129,7 @@ impl BlockJacobianAsRowOp {
             k_block: k,
             k_target,
             block_name: block_name.to_string(),
+            operating_scalars,
         })
     }
 
@@ -136,22 +147,27 @@ impl BlockJacobianAsRowOp {
             k_block: 1,
             k_target,
             block_name: block_name.to_string(),
-        }
-    }
-
-    fn zero_state() -> FamilyLinearizationState<'static> {
-        FamilyLinearizationState {
-            beta: &[],
-            family_scalars: None,
-            channel_hessian: None,
-            probit_frailty_scale: 1.0,
+            operating_scalars: None,
         }
     }
 
     fn stacked_rows(&self, start: usize, end: usize) -> Result<Array2<f64>, String> {
         match &self.source {
             BlockJacobianSource::Callback(cb) => {
-                let state = Self::zero_state();
+                // Linearize at the operating point carried by `operating_scalars`
+                // (the pilot β geometry) rather than the zero/init point, so a
+                // family whose effective channel weights depend on β does not
+                // collapse to its raw design and alias structurally-identical
+                // blocks. `beta` stays empty: the operating point is supplied
+                // entirely through `family_scalars`, which every operating-point
+                // callback reads (a non-empty β with no scalars is the error the
+                // callbacks reject). `None` reproduces the old zero-state.
+                let state = FamilyLinearizationState {
+                    beta: &[],
+                    family_scalars: self.operating_scalars.clone(),
+                    channel_hessian: None,
+                    probit_frailty_scale: 1.0,
+                };
                 let stacked = cb
                     .effective_jacobian_rows(&state, start..end)
                     .map_err(|e| {
@@ -393,7 +409,36 @@ pub fn canonicalize_for_identifiability(
     // any multi-channel `stacked_design` block, and on clean designs), so this is
     // byte-identical wherever there is nothing
     // to orthogonalise.
-    canonicalize_for_identifiability_inner(specs, true)
+    canonicalize_for_identifiability_inner(specs, true, None)
+}
+
+/// Like [`canonicalize_for_identifiability`], but linearizes every family-owned
+/// (`jacobian_callback`) block's effective Jacobian at the supplied pilot
+/// operating point (`operating_scalars`, the family's `family_scalars` at the
+/// pilot β) instead of the zero/init point.
+///
+/// Families whose effective channel weights depend on the operating point (e.g.
+/// survival marginal-slope's `c_i = √(1+(s·g_i)²)`) collapse to their raw design
+/// at `β = 0`, which aliases structurally-identical blocks that are only
+/// distinguished by that weighting and yields a FALSE rank/overlap refusal. The
+/// caller passes the pilot scalars (built from the block specs' `initial_beta`
+/// warm start via `CustomFamily::current_identifiability_family_scalars`) so the
+/// pre-fit audit ranks the geometry the fit actually sees. `None` scalars, or
+/// families without operating-point callbacks, reproduce the zero-state verdict
+/// exactly.
+///
+/// Determinism: the audit verdict now depends on the pilot operating point, so
+/// that point must be bit-deterministic (it is — the survival pilot is a
+/// fixed one-step IRLS linearization). A degenerate all-zero pilot (e.g. flat
+/// early-data logslope with `g ≈ 0`) legitimately cannot distinguish the
+/// surfaces — `c` and `f` coincide there — so it reproduces the zero-state
+/// refusal; that is correct, an uninformative pilot genuinely carries no
+/// identifying curvature.
+pub fn canonicalize_for_identifiability_with_operating_scalars(
+    specs: &[ParameterBlockSpec],
+    operating_scalars: Option<Arc<dyn std::any::Any + Send + Sync>>,
+) -> Result<CanonicalSpecs, CustomFamilyError> {
+    canonicalize_for_identifiability_inner(specs, true, operating_scalars)
 }
 
 /// Core canonicalisation worker.
@@ -595,6 +640,7 @@ fn flat_audit_convention_rank(j: &Array2<f64>, blocks: &[FlatRankBlock]) -> usiz
 fn canonicalize_for_identifiability_inner(
     specs: &[ParameterBlockSpec],
     orthogonalize: bool,
+    operating_scalars: Option<Arc<dyn std::any::Any + Send + Sync>>,
 ) -> Result<CanonicalSpecs, CustomFamilyError> {
     // Exact orthogonalisation of structural confounds. Runs only on the top-
     // level entry AND only where the design is single-channel dense (the general
@@ -750,6 +796,7 @@ fn canonicalize_for_identifiability_inner(
                         spec.design.ncols(),
                         k,
                         &spec.name,
+                        operating_scalars.clone(),
                     )
                     .map_err(|e| CustomFamilyError::DimensionMismatch {
                         reason: format!(
@@ -776,7 +823,8 @@ fn canonicalize_for_identifiability_inner(
             })?;
 
         log::info!(
-            "[CANON] channel-aware audit: {} blocks, joint_rank={}/{} (flat audit NOT used)",
+            "[CANON] channel-aware audit: {} blocks, joint_rank={}/{} \
+             (flat audit NOT used; effective Jacobians linearized at {})",
             specs.len(),
             audit_result
                 .blocks
@@ -784,6 +832,14 @@ fn canonicalize_for_identifiability_inner(
                 .map(|b| b.effective_dim)
                 .sum::<usize>(),
             specs.iter().map(|s| s.design.ncols()).sum::<usize>(),
+            // Which operating point the rank/overlap verdict was measured at — the
+            // decisive fact when a refusal is a false-positive from linearizing a
+            // family whose channel weights depend on β at the collapsed zero point.
+            if operating_scalars.is_some() {
+                "the pilot operating point (family_scalars supplied)"
+            } else {
+                "the zero/init point (beta = 0, no family_scalars)"
+            },
         );
 
         // NOTE: the flat audit (`audit_identifiability`) must NOT be run on
@@ -1835,7 +1891,11 @@ fn try_orthogonalize_blocks(
     // this should produce a clean (identity-T) verdict; if a *residual* rank
     // deficiency survives orthogonalisation, the fail-closed gate still
     // refuses with an actionable diagnostic.
-    let inner = canonicalize_for_identifiability_inner(&ortho_specs, false)?;
+    // The orthogonalisation pass runs only on plain single-channel dense blocks
+    // and defers on any family-owned-geometry (`jacobian_callback`) block, so the
+    // reparameterised specs re-audited here carry no operating-point callbacks;
+    // linearize at the zero/init point (`None`).
+    let inner = canonicalize_for_identifiability_inner(&ortho_specs, false, None)?;
 
     // Compose the round-trip transform: β_raw = V_b · (T_inner · θ).
     // `inner.gauge.block_transform(b)` is T_inner (selection/identity from
