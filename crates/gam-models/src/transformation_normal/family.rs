@@ -62,6 +62,11 @@ pub struct TransformationNormalFamily {
     pub(crate) offset: Arc<Array1<f64>>,
     // --- Tensor penalties ---
     pub(crate) tensor_penalties: Vec<PenaltyMatrix>,
+    /// Assembled order/counts of `tensor_penalties`
+    /// (`[covariate.., response.., double?]`). The response and double penalties
+    /// carry the κ-moving `G_x` factor; the psi-derivative channel uses this to
+    /// address them by index.
+    pub(crate) tensor_penalty_layout: CtnTensorPenaltyLayout,
 
     // --- Initial values ---
     pub(crate) initial_beta: Array1<f64>,
@@ -376,10 +381,14 @@ impl TransformationNormalFamily {
         )?;
 
         // ----- 4. Tensor penalties (Kronecker-separable) -----
-        let tensor_penalties = build_tensor_penalties_kronecker(
+        let covariate_dense = covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP covariate dense materialization failed: {e}"))?;
+        let (tensor_penalties, tensor_penalty_layout) = build_tensor_penalties_kronecker(
             &resp_penalties,
             covariate_penalties,
             resp_val.view(),
+            covariate_dense.view(),
             weights.view(),
             p_resp,
             p_cov,
@@ -407,6 +416,7 @@ impl TransformationNormalFamily {
             weights: Arc::new(weights.clone()),
             offset: Arc::new(offset.clone()),
             tensor_penalties,
+            tensor_penalty_layout,
             initial_beta,
             block_name: "transformation".to_string(),
             response_knots: resp_knots,
@@ -565,10 +575,14 @@ impl TransformationNormalFamily {
         )?;
 
         // Tensor penalties (Kronecker-separable).
-        let tensor_penalties = build_tensor_penalties_kronecker(
+        let covariate_dense = covariate_design
+            .try_row_chunk(0..n)
+            .map_err(|e| format!("SCOP covariate dense materialization failed: {e}"))?;
+        let (tensor_penalties, tensor_penalty_layout) = build_tensor_penalties_kronecker(
             &response_penalties,
             covariate_penalties,
             response_val_basis.view(),
+            covariate_dense.view(),
             weights.view(),
             p_resp,
             p_cov,
@@ -596,6 +610,7 @@ impl TransformationNormalFamily {
             weights: Arc::new(weights.clone()),
             offset: Arc::new(offset.clone()),
             tensor_penalties,
+            tensor_penalty_layout,
             initial_beta,
             block_name: "transformation".to_string(),
             response_knots: response_knots.clone(),
@@ -832,6 +847,7 @@ impl TransformationNormalFamily {
             weights: Arc::clone(&self.weights),
             offset: Arc::clone(&self.offset),
             tensor_penalties: self.tensor_penalties.clone(),
+            tensor_penalty_layout: self.tensor_penalty_layout,
             initial_beta: self.initial_beta.clone(),
             block_name: self.block_name.clone(),
             response_knots: self.response_knots.clone(),

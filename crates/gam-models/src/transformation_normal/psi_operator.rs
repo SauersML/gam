@@ -1598,10 +1598,28 @@ pub fn build_tensor_psi_derivatives(
             ),
         });
 
+    // Response-roughness (`S_{y,m} ⊗ G_x`) and double (`shape_resp ⊗ G_x`)
+    // penalties carry the κ-moving covariate mass Gram `G_x = Ψ(κ)ᵀWΨ(κ)`.
+    // Collect their κ-independent left factors so we can emit the matching
+    // `S_left ⊗ dG_x/dκ` derivative components at the right penalty indices; the
+    // outer κ-gradient/Hessian would otherwise desync from the penalty value.
+    let layout = family.tensor_penalty_layout;
+    let mut gx_penalty_lefts: Vec<(usize, Array2<f64>)> = Vec::new();
+    for idx in layout.response_indices().chain(layout.double_index()) {
+        gx_penalty_lefts.push((idx, extract_kron_left(&family.tensor_penalties[idx], idx)?));
+    }
+    let covariate_dense = if gx_penalty_lefts.is_empty() {
+        None
+    } else {
+        Some(family.covariate_dense_arc()?)
+    };
+    let weights = family.weights.view();
+
     let mut derivs = Vec::with_capacity(n_axes);
     for a in 0..n_axes {
         let cov_deriv = &covariate_psi_derivs[a];
-        let s_psi_penalty_components = cov_deriv
+        // Covariate-direction first-order components `G_y ⊗ dS_cov/dκ_a`.
+        let covariate_first = cov_deriv
             .s_psi_penalty_components
             .as_ref()
             .map(|components| lift_covariate_penalty_derivative_components(components, &response_left))
@@ -1611,29 +1629,105 @@ pub fn build_tensor_psi_derivatives(
                     lift_dense_covariate_penalty_derivative_components(components, &response_left)
                 })
             });
-        let s_psi_psi_penalty_components = cov_deriv
-            .s_psi_psi_penalty_components
-            .as_ref()
-            .map(|rows| {
-                rows.iter()
-                    .map(|cov_pen_pairs| -> Result<_, String> {
-                        lift_covariate_penalty_derivative_components(cov_pen_pairs, &response_left)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?
-            .or_else(|| {
-                cov_deriv.s_psi_psi_components.as_ref().map(|rows| {
+        let s_psi_penalty_components = if gx_penalty_lefts.is_empty() {
+            covariate_first
+        } else {
+            let psi: &Array2<f64> = covariate_dense.as_ref().expect("gx penalties imply dense");
+            // dG_x/dκ_a = (∂Ψ/∂κ_a)ᵀWΨ + ΨᵀW(∂Ψ/∂κ_a).
+            let dgx_a =
+                symmetrize_sum(&weighted_cross_gram(cov_deriv.x_psi.view(), psi.view(), weights));
+            let mut components = covariate_first.unwrap_or_default();
+            for (idx, left) in &gx_penalty_lefts {
+                components.push((
+                    *idx,
+                    PenaltyMatrix::KroneckerFactored {
+                        left: left.clone(),
+                        right: dgx_a.clone(),
+                    },
+                ));
+            }
+            Some(components)
+        };
+
+        let s_psi_psi_penalty_components = if gx_penalty_lefts.is_empty() {
+            cov_deriv
+                .s_psi_psi_penalty_components
+                .as_ref()
+                .map(|rows| {
                     rows.iter()
-                        .map(|cov_pen_pairs| {
-                            lift_dense_covariate_penalty_derivative_components(
+                        .map(|cov_pen_pairs| -> Result<_, String> {
+                            lift_covariate_penalty_derivative_components(
                                 cov_pen_pairs,
                                 &response_left,
                             )
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Result<Vec<_>, _>>()
                 })
-            });
+                .transpose()?
+                .or_else(|| {
+                    cov_deriv.s_psi_psi_components.as_ref().map(|rows| {
+                        rows.iter()
+                            .map(|cov_pen_pairs| {
+                                lift_dense_covariate_penalty_derivative_components(
+                                    cov_pen_pairs,
+                                    &response_left,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+        } else {
+            // Every partner axis `j` gets a `d²G_x/dκ_a∂κ_j` component — the
+            // `(∂Ψ/∂κ_a)ᵀW(∂Ψ/∂κ_j)` cross term is nonzero even when the design
+            // is linear in κ (G_x is quadratic in Ψ) — merged with any covariate
+            // second-order component for that pair.
+            let psi: &Array2<f64> = covariate_dense.as_ref().expect("gx penalties imply dense");
+            let mut per_j: Vec<Vec<(usize, PenaltyMatrix)>> = Vec::with_capacity(n_axes);
+            for j in 0..n_axes {
+                let mut comp_ij: Vec<(usize, PenaltyMatrix)> = Vec::new();
+                if let Some(rows) = cov_deriv.s_psi_psi_penalty_components.as_ref() {
+                    if let Some(cov_pen_pairs) = rows.get(j) {
+                        comp_ij.extend(lift_covariate_penalty_derivative_components(
+                            cov_pen_pairs,
+                            &response_left,
+                        )?);
+                    }
+                } else if let Some(rows) = cov_deriv.s_psi_psi_components.as_ref() {
+                    if let Some(cov_pen_pairs) = rows.get(j) {
+                        comp_ij.extend(lift_dense_covariate_penalty_derivative_components(
+                            cov_pen_pairs,
+                            &response_left,
+                        ));
+                    }
+                }
+                let mut d2gx = symmetrize_sum(&weighted_cross_gram(
+                    cov_deriv.x_psi.view(),
+                    covariate_psi_derivs[j].x_psi.view(),
+                    weights,
+                ));
+                if let Some(second) = cov_deriv.x_psi_psi.as_ref() {
+                    if let Some(x_psi_psi_aj) = second.get(j) {
+                        d2gx = d2gx
+                            + symmetrize_sum(&weighted_cross_gram(
+                                x_psi_psi_aj.view(),
+                                psi.view(),
+                                weights,
+                            ));
+                    }
+                }
+                for (idx, left) in &gx_penalty_lefts {
+                    comp_ij.push((
+                        *idx,
+                        PenaltyMatrix::KroneckerFactored {
+                            left: left.clone(),
+                            right: d2gx.clone(),
+                        },
+                    ));
+                }
+                per_j.push(comp_ij);
+            }
+            Some(per_j)
+        };
 
         let mut deriv = CustomFamilyBlockPsiDerivative::new(
             None,
@@ -1653,6 +1747,18 @@ pub fn build_tensor_psi_derivatives(
     }
 
     Ok(derivs)
+}
+
+/// Extract the κ-independent left factor of a Kronecker-factored tensor penalty
+/// (`S_left` in `S_left ⊗ G_x`), used to build its `S_left ⊗ dG_x/dκ`
+/// derivative component.
+fn extract_kron_left(penalty: &PenaltyMatrix, idx: usize) -> Result<Array2<f64>, String> {
+    match penalty {
+        PenaltyMatrix::KroneckerFactored { left, .. } => Ok(left.clone()),
+        _ => Err(format!(
+            "CTN tensor penalty {idx} must be Kronecker-factored to carry a G_x derivative"
+        )),
+    }
 }
 
 pub(crate) fn lift_dense_covariate_penalty_derivative_components(

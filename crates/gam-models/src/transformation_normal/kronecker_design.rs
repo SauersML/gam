@@ -385,28 +385,30 @@ impl DenseDesignOperator for KroneckerDesign {
 ///   spatial hyper `κ` (the response basis is reused across `κ` iterations), so
 ///   the existing `dS_{x,j}/dκ` psi-derivative path — lifted through the same
 ///   `G_y` — keeps the outer criterion and its gradient in sync.
-/// - Response roughness `½ βᵀ (S_{y,m} ⊗ G_x) β`: the covariate value-basis mass
-///   Gram `G_x = Ψ(κ)ᵀ W Ψ(κ)` moves with `κ`, so replacing the identity right
-///   factor requires a matching `dG_x/dκ` psi-derivative channel to stay
-///   gradient-consistent; that is deferred to the moving-Ψ LAML work and the
-///   response factor stays the (κ-independent) identity here.
+/// - Response roughness `½ βᵀ (S_{y,m} ⊗ G_x) β` with `G_x = Ψ(κ)ᵀ W Ψ(κ)` the
+///   covariate value-basis mass Gram. `G_x` MOVES with the covariate spatial
+///   hyper `κ`, so the response and double penalties carry a matching
+///   `dG_x/dκ` / `d²G_x/dκ²` psi-derivative channel (emitted in
+///   [`build_tensor_psi_derivatives`]) to keep the outer criterion and its
+///   κ-gradient/Hessian in sync.
+///
+/// The returned [`CtnTensorPenaltyLayout`] pins the assembled order
+/// `[covariate.., response.., double?]`, which the psi-derivative channel relies
+/// on to address the `G_x`-bearing penalties by index.
 pub(crate) fn build_tensor_penalties_kronecker(
     response_penalties: &[Array2<f64>],
     covariate_penalties: Vec<PenaltyMatrix>,
     response_val: ArrayView2<'_, f64>,
+    covariate_dense: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
     p_resp: usize,
     p_cov: usize,
     config: &TransformationNormalConfig,
-) -> Result<Vec<PenaltyMatrix>, String> {
-    let eye_cov = Array2::<f64>::eye(p_cov);
-
-    // Response function-space mass Gram `G_y = Vᵀ W V` under the empirical
-    // (weighted) data measure: the covariate-direction penalty's left factor,
-    // making it the exact roughness of the represented function `h` rather than
-    // a coefficient-geometry surrogate. κ-independent, so its psi-derivatives
-    // reuse this same matrix.
+) -> Result<(Vec<PenaltyMatrix>, CtnTensorPenaltyLayout), String> {
+    // Function-space mass Grams under the empirical (weighted) data measure.
+    // `G_y` (response) is κ-independent; `G_x` (covariate) moves with κ.
     let g_resp = weighted_function_gram(response_val, weights, p_resp, "response")?;
+    let g_cov = weighted_function_gram(covariate_dense, weights, p_cov, "covariate")?;
 
     // Shape-only response ridge (double-penalty null shrinkage). The location
     // row is the conditional centering field, identified by the likelihood; keep
@@ -418,6 +420,7 @@ pub(crate) fn build_tensor_penalties_kronecker(
     let mut penalties = Vec::new();
 
     // Covariate roughness: G_y ⊗ S_{x,j}.
+    let n_covariate = covariate_penalties.len();
     for s_cov in covariate_penalties {
         let fixed_log_lambda = s_cov.fixed_log_lambda();
         let right = match s_cov {
@@ -442,24 +445,68 @@ pub(crate) fn build_tensor_penalties_kronecker(
         });
     }
 
-    // Response roughness: S_{y,m} ⊗ I_cov (κ-independent right factor; see the
-    // moving-Ψ G_x note above).
+    // Response roughness: S_{y,m} ⊗ G_x.
+    let n_response = response_penalties.len();
     for s_resp in response_penalties {
         penalties.push(PenaltyMatrix::KroneckerFactored {
             left: s_resp.clone(),
-            right: eye_cov.clone(),
+            right: g_cov.clone(),
         });
     }
 
-    // Double penalty: shape-row ridge only.
+    // Double penalty: shape-row ridge in the covariate function measure.
     if config.double_penalty {
         penalties.push(PenaltyMatrix::KroneckerFactored {
             left: shape_resp,
-            right: eye_cov,
+            right: g_cov,
         });
     }
 
-    Ok(penalties)
+    let layout = CtnTensorPenaltyLayout {
+        n_covariate,
+        n_response,
+        has_double: config.double_penalty,
+    };
+    // The psi-derivative channel addresses the G_x-bearing penalties by the
+    // index arithmetic this layout defines; an inconsistent assembly order would
+    // silently desync the κ-derivatives.
+    if penalties.len() != layout.total() {
+        return Err(format!(
+            "CTN tensor penalty count {} disagrees with layout total {}",
+            penalties.len(),
+            layout.total()
+        ));
+    }
+    Ok((penalties, layout))
+}
+
+/// Assembled order and counts of the CTN tensor penalty list. The list is laid
+/// out as `[covariate.., response.., double?]`; the response and double
+/// penalties carry the κ-moving `G_x` factor, so [`build_tensor_psi_derivatives`]
+/// uses these ranges to emit their `dG_x/dκ` derivative components at the right
+/// indices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CtnTensorPenaltyLayout {
+    pub n_covariate: usize,
+    pub n_response: usize,
+    pub has_double: bool,
+}
+
+impl CtnTensorPenaltyLayout {
+    pub fn total(&self) -> usize {
+        self.n_covariate + self.n_response + usize::from(self.has_double)
+    }
+
+    /// Indices of the response-roughness penalties (`S_{y,m} ⊗ G_x`).
+    pub fn response_indices(&self) -> std::ops::Range<usize> {
+        self.n_covariate..self.n_covariate + self.n_response
+    }
+
+    /// Index of the double (null-shrinkage) penalty (`shape_resp ⊗ G_x`), if any.
+    pub fn double_index(&self) -> Option<usize> {
+        self.has_double
+            .then_some(self.n_covariate + self.n_response)
+    }
 }
 
 /// Weighted function-space mass Gram `Bᵀ diag(w) B` of a value basis `B`
@@ -489,6 +536,26 @@ pub(crate) fn weighted_function_gram(
     let mut sym = &gram + &gram.t();
     sym.mapv_inplace(|v| 0.5 * v);
     Ok(sym)
+}
+
+/// Weighted cross Gram `Aᵀ diag(w) B` of two row-aligned bases `A` (`n × p`) and
+/// `B` (`n × q`) under the empirical measure `w`. Used to differentiate the
+/// covariate mass Gram `G_x = Ψᵀ W Ψ`: `dG_x/dκ_a = M + Mᵀ` with
+/// `M = (∂Ψ/∂κ_a)ᵀ W Ψ`, and the second derivative adds the analogous
+/// `(∂²Ψ/∂κ_a∂κ_b)ᵀ W Ψ` and `(∂Ψ/∂κ_a)ᵀ W (∂Ψ/∂κ_b)` cross terms.
+pub(crate) fn weighted_cross_gram(
+    a: ArrayView2<'_, f64>,
+    b: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> Array2<f64> {
+    let weighted = weight_rows(&b.to_owned(), &weights.to_owned());
+    a.t().dot(&weighted)
+}
+
+/// Symmetrize a cross-Gram contribution: `M + Mᵀ`. Used to assemble the exact
+/// symmetric derivative matrices `dG_x/dκ` and `d²G_x/dκ²`.
+pub(crate) fn symmetrize_sum(m: &Array2<f64>) -> Array2<f64> {
+    m + &m.t()
 }
 
 // ---------------------------------------------------------------------------

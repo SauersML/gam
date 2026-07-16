@@ -230,6 +230,204 @@ pub(crate) fn tensor_psi_penalty_derivatives_carry_response_mass_gram_layout() {
     assert_covariate_penalty_component(&second[0][0].1, &expected_g_resp, &ds1_second);
 }
 
+/// The CTN tensor penalty list is assembled as `[covariate.., response.., double]`
+/// and the layout records that order load-bearingly (the psi-derivative channel
+/// addresses the G_x-bearing response/double penalties by `n_cov+i`). This pins
+/// the order so an innocent future reorder cannot silently desync the
+/// κ-derivatives (gam#2306).
+#[test]
+pub(crate) fn ctn_tensor_penalty_layout_orders_covariate_response_double() {
+    let response = array![-1.0, -0.2, 0.6, 1.3];
+    let config = TransformationNormalConfig {
+        double_penalty: true,
+        response_degree: 1,
+        response_num_internal_knots: 2,
+        ..TransformationNormalConfig::default()
+    };
+    let (val_basis, deriv_basis, response_penalties, knots, transform) =
+        build_response_basis(&response, &config).expect("response basis builds");
+    let n_response = response_penalties.len();
+    assert!(n_response >= 1, "toy config must carry a response roughness penalty");
+    let weights = Array1::from_elem(response.len(), 1.0);
+    let offset = Array1::zeros(response.len());
+    let cov_design = array![[1.0, 0.2], [1.0, -0.1], [1.0, 0.4], [1.0, -0.3]];
+    let p_cov = cov_design.ncols();
+    let s_cov = array![[2.0, -1.0], [-1.0, 2.0]];
+    let g_cov = weighted_function_gram(cov_design.view(), weights.view(), p_cov, "covariate")
+        .expect("covariate mass gram");
+
+    let family = TransformationNormalFamily::from_prebuilt_response_basis(
+        &response,
+        val_basis,
+        deriv_basis,
+        response_penalties,
+        knots,
+        config.response_degree,
+        transform,
+        &weights,
+        &offset,
+        DesignMatrix::Dense(DenseDesignMatrix::from(cov_design)),
+        vec![PenaltyMatrix::Dense(s_cov.clone())],
+        &config,
+        None,
+    )
+    .expect("toy transformation family");
+
+    let layout = family.tensor_penalty_layout;
+    assert_eq!(layout.n_covariate, 1);
+    assert_eq!(layout.n_response, n_response);
+    assert!(layout.has_double);
+    assert_eq!(layout.total(), family.tensor_penalties.len());
+    assert_eq!(layout.response_indices(), 1..1 + n_response);
+    assert_eq!(layout.double_index(), Some(1 + n_response));
+
+    // Covariate penalty (index 0) carries S_x on the right.
+    let PenaltyMatrix::KroneckerFactored { right, .. } = &family.tensor_penalties[0] else {
+        panic!("covariate penalty must be Kronecker-factored");
+    };
+    assert_eq!(right, &s_cov);
+
+    // Every response penalty carries the covariate mass Gram G_x on the right.
+    for r in layout.response_indices() {
+        let PenaltyMatrix::KroneckerFactored { right, .. } = &family.tensor_penalties[r] else {
+            panic!("response penalty must be Kronecker-factored");
+        };
+        for ((i, j), &value) in right.indexed_iter() {
+            assert!(
+                (value - g_cov[[i, j]]).abs() <= 1e-12 * (1.0 + g_cov[[i, j]].abs()),
+                "response penalty {r} right factor must be G_x"
+            );
+        }
+    }
+
+    // The double penalty is the shape-row ridge (location row zeroed) in the
+    // covariate function measure.
+    let PenaltyMatrix::KroneckerFactored { left, right } =
+        &family.tensor_penalties[layout.double_index().unwrap()]
+    else {
+        panic!("double penalty must be Kronecker-factored");
+    };
+    for ((i, j), &value) in right.indexed_iter() {
+        assert!((value - g_cov[[i, j]]).abs() <= 1e-12 * (1.0 + g_cov[[i, j]].abs()));
+    }
+    for ((i, j), &value) in left.indexed_iter() {
+        let want = if i == j && i > 0 { 1.0 } else { 0.0 };
+        assert_eq!(value, want, "double penalty left factor is the shape-row ridge");
+    }
+}
+
+/// First-order κ-derivative of the response-roughness penalty `S_y ⊗ G_x(κ)`
+/// (assembled from the emitted `s_psi_penalty_components`) matches a central
+/// finite difference of the assembled penalty, rebuilding Ψ(κ±h) per leg so the
+/// covariate mass Gram `G_x` is re-evaluated each side (no frozen cache). This
+/// is the desync guard for the moving-Ψ penalty channel (gam#2306).
+#[test]
+pub(crate) fn ctn_response_penalty_gx_first_order_kappa_derivative_matches_fd() {
+    let psi = array![0.15, -0.10];
+    let h = 1e-6;
+    let (family, blocks, _state, _spec) =
+        toy_family_and_derivatives_with_penalty_mode(&psi, true);
+    let p_total = family.p_total();
+    let n_pen = family.tensor_penalties.len();
+    assert!(
+        family.tensor_penalty_layout.n_response >= 1,
+        "penalty-mode family must carry the G_x-bearing response penalty"
+    );
+    // Unit smoothing strengths: the penalty-derivative assembly scales each
+    // component by lambda[idx]; matching lambdas on both sides isolates dG_x/dκ.
+    let lambdas = Array1::<f64>::ones(n_pen);
+
+    let analytic_first = |derivs: &[CustomFamilyBlockPsiDerivative], a: usize| -> Array2<f64> {
+        let mut s = Array2::<f64>::zeros((p_total, p_total));
+        if let Some(components) = derivs[a].s_psi_penalty_components.as_ref() {
+            for (idx, component) in components {
+                s.scaled_add(lambdas[*idx], &component.to_dense());
+            }
+        }
+        s
+    };
+    let assembled = |psi_eval: &Array1<f64>| -> Array2<f64> {
+        let (f, _, _, _) = toy_family_and_derivatives_with_penalty_mode(psi_eval, true);
+        let mut s = Array2::<f64>::zeros((p_total, p_total));
+        for (k, penalty) in f.tensor_penalties.iter().enumerate() {
+            s.scaled_add(lambdas[k], &penalty.to_dense());
+        }
+        s
+    };
+
+    for a in 0..psi.len() {
+        let mut psi_plus = psi.clone();
+        psi_plus[a] += h;
+        let mut psi_minus = psi.clone();
+        psi_minus[a] -= h;
+        let fd = (assembled(&psi_plus) - assembled(&psi_minus)) / (2.0 * h);
+        let analytic = analytic_first(&blocks[0], a);
+        assert_matrix_derivativefd(
+            &fd,
+            &analytic,
+            2e-4,
+            &format!("CTN response penalty dG_x/dkappa axis {a}"),
+        );
+    }
+}
+
+/// Second-order κ-derivative of `S_y ⊗ G_x(κ)` (assembled from
+/// `s_psi_psi_penalty_components`) matches a central finite difference of the
+/// first-order derivative, per-leg Ψ rebuild. Validates the `d²G_x/dκ²` channel
+/// — including the `(∂Ψ/∂κ_a)ᵀW(∂Ψ/∂κ_j)` cross term — used by the outer
+/// exact-Newton Hessian (gam#2306).
+#[test]
+pub(crate) fn ctn_response_penalty_gx_second_order_kappa_derivative_matches_fd() {
+    let psi = array![0.15, -0.10];
+    let h = 1e-5;
+    let (family, _blocks, _state, _spec) =
+        toy_family_and_derivatives_with_penalty_mode(&psi, true);
+    let p_total = family.p_total();
+    let n_pen = family.tensor_penalties.len();
+    let lambdas = Array1::<f64>::ones(n_pen);
+
+    let analytic_first_at = |psi_eval: &Array1<f64>, a: usize| -> Array2<f64> {
+        let (_, blocks, _, _) = toy_family_and_derivatives_with_penalty_mode(psi_eval, true);
+        let mut s = Array2::<f64>::zeros((p_total, p_total));
+        if let Some(components) = blocks[0][a].s_psi_penalty_components.as_ref() {
+            for (idx, component) in components {
+                s.scaled_add(lambdas[*idx], &component.to_dense());
+            }
+        }
+        s
+    };
+    let analytic_second = |a: usize, j: usize| -> Array2<f64> {
+        let (_, blocks, _, _) = toy_family_and_derivatives_with_penalty_mode(&psi, true);
+        let mut s = Array2::<f64>::zeros((p_total, p_total));
+        if let Some(rows) = blocks[0][a].s_psi_psi_penalty_components.as_ref() {
+            if let Some(pairs) = rows.get(j) {
+                for (idx, component) in pairs {
+                    s.scaled_add(lambdas[*idx], &component.to_dense());
+                }
+            }
+        }
+        s
+    };
+
+    for a in 0..psi.len() {
+        for j in 0..psi.len() {
+            let mut psi_plus = psi.clone();
+            psi_plus[j] += h;
+            let mut psi_minus = psi.clone();
+            psi_minus[j] -= h;
+            let fd =
+                (analytic_first_at(&psi_plus, a) - analytic_first_at(&psi_minus, a)) / (2.0 * h);
+            let analytic = analytic_second(a, j);
+            assert_matrix_derivativefd(
+                &fd,
+                &analytic,
+                3e-4,
+                &format!("CTN response penalty d2G_x/dkappa axes ({a},{j})"),
+            );
+        }
+    }
+}
+
 #[test]
 pub(crate) fn tensor_psi_row_chunks_are_window_consistent() {
     let response = array![-1.0, -0.2, 0.6, 1.3];
