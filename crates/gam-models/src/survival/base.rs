@@ -421,9 +421,8 @@ pub fn cause_specific_survival_alo_row_geometry(
         f64::from(input.event),
     );
     let gradient = atom.gradient();
-    let observed_hessian = std::array::from_fn(|row| {
-        std::array::from_fn(|column| atom.hessian_at(row, column))
-    });
+    let observed_hessian =
+        std::array::from_fn(|row| std::array::from_fn(|column| atom.hessian_at(row, column)));
     if !atom.value().is_finite()
         || gradient.iter().any(|value| !value.is_finite())
         || observed_hessian
@@ -467,12 +466,7 @@ pub struct CauseSpecificRowProgram {
 
 impl CauseSpecificRowProgram {
     /// Construct one canonical predictor-space row program.
-    pub fn new(
-        primary: [f64; 3],
-        weight: f64,
-        entry_active: bool,
-        event: bool,
-    ) -> Self {
+    pub fn new(primary: [f64; 3], weight: f64, entry_active: bool, event: bool) -> Self {
         Self {
             primary,
             weight,
@@ -3421,22 +3415,17 @@ mod tests {
         let eta_entry = -0.3_f64;
         let derivative_exit = 1.7_f64;
         let weight = 2.2_f64;
-        let geometry = cause_specific_survival_alo_row_geometry(
-            CauseSpecificSurvivalAloRowInput {
-                eta_exit,
-                eta_entry,
-                derivative_exit,
-                prior_weight: weight,
-                entry_active: true,
-                event: true,
-            },
-        )
+        let geometry = cause_specific_survival_alo_row_geometry(CauseSpecificSurvivalAloRowInput {
+            eta_exit,
+            eta_entry,
+            derivative_exit,
+            prior_weight: weight,
+            entry_active: true,
+            event: true,
+        })
         .expect("valid cause-specific row");
-        let expected_nll = weight
-            * (eta_exit.exp()
-                - eta_entry.exp()
-                - eta_exit
-                - derivative_exit.ln());
+        let expected_nll =
+            weight * (eta_exit.exp() - eta_entry.exp() - eta_exit - derivative_exit.ln());
         let expected_score = [
             weight * (eta_exit.exp() - 1.0),
             -weight * eta_entry.exp(),
@@ -3452,9 +3441,7 @@ mod tests {
             assert!((geometry.nll_score[row] - expected_score[row]).abs() <= 2.0e-14);
             for column in 0..3 {
                 assert!(
-                    (geometry.observed_hessian[row][column]
-                        - expected_hessian[row][column])
-                        .abs()
+                    (geometry.observed_hessian[row][column] - expected_hessian[row][column]).abs()
                         <= 2.0e-14
                 );
             }
@@ -3673,7 +3660,12 @@ mod tests {
                 let weight = 0.6 + 0.4 * (f * 0.07 + 1.0).sin().abs();
                 let entry_active = idx % 2 == 0;
                 let event = (idx / 2) % 2 == 0;
-                rows.push(([eta_exit, eta_entry, derivative], weight, entry_active, event));
+                rows.push((
+                    [eta_exit, eta_entry, derivative],
+                    weight,
+                    entry_active,
+                    event,
+                ));
             }
             let programs: Vec<crate::survival::CauseSpecificRowProgram> = rows
                 .iter()
@@ -4840,6 +4832,204 @@ mod tests {
             .sum()
     }
 
+    /// Two-ACTIVE-block variant of [`laml_fd_test_model`] (both penalty blocks
+    /// carry `λ > 0`), so the active-ρ vector is 2-dimensional. This lets the
+    /// FD gate probe the survival-transformation outer stall's structure — one
+    /// coordinate driven to the over-smoothing rail, the other free — which the
+    /// existing single-active-block interior FD tests never reach (#2298 / task
+    /// #12).
+    fn laml_rail_fd_test_model(lambda0: f64, lambda1: f64) -> WorkingModelSurvival {
+        let age_entry: Array1<f64> = Array1::from(vec![
+            30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 32.0, 37.0, 42.0, 47.0, 52.0, 57.0, 62.0,
+            34.0, 39.0, 44.0, 49.0, 54.0, 59.0,
+        ]);
+        let age_exit: Array1<f64> = Array1::from(vec![
+            45.0, 48.0, 55.0, 58.0, 62.0, 66.0, 68.0, 47.0, 52.0, 53.0, 55.0, 60.0, 63.0, 70.0,
+            48.0, 51.0, 58.0, 62.0, 66.0, 69.0,
+        ]);
+        let event_target = Array1::from(vec![
+            1u8, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+        ]);
+        let event_competing = Array1::<u8>::zeros(age_entry.len());
+        let sampleweight = Array1::from_elem(age_entry.len(), 1.0_f64);
+        let n = age_entry.len();
+        let ln_age_mean: f64 = {
+            let mut sum = 0.0;
+            for i in 0..n {
+                sum += age_entry[i].ln() + age_exit[i].ln();
+            }
+            sum / (2.0 * n as f64)
+        };
+        let mut x_entry = Array2::<f64>::zeros((n, 2));
+        let mut x_exit = Array2::<f64>::zeros((n, 2));
+        let mut x_derivative = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            x_entry[[i, 0]] = 1.0;
+            x_exit[[i, 0]] = 1.0;
+            x_entry[[i, 1]] = age_entry[i].ln() - ln_age_mean;
+            x_exit[[i, 1]] = age_exit[i].ln() - ln_age_mean;
+            x_derivative[[i, 0]] = 0.0;
+            x_derivative[[i, 1]] = 1.0 / age_exit[i];
+        }
+        let penalties = PenaltyBlocks::new(vec![
+            PenaltyBlock {
+                matrix: array![[3.0]],
+                lambda: lambda0,
+                range: 0..1,
+                nullspace_dim: 0,
+            },
+            PenaltyBlock {
+                matrix: array![[2.5]],
+                lambda: lambda1,
+                range: 1..2,
+                nullspace_dim: 0,
+            },
+        ]);
+        survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
+            penalties,
+            SurvivalMonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect("construct two-active-block rail LAML FD model")
+    }
+
+    /// Rail-regime FD arbiter for the survival-transformation outer stall
+    /// (#2298 / task #12). The outer BFGS dies at `rho_checkpoint[0] ≈ 7.3948`
+    /// with `|Pg|=0.34` on the FREE coordinate, and the objective is gradient-
+    /// only (no analytic outer Hessian), so a value↔gradient desync there is
+    /// uncertifiable. This gate central-differences the analytic ρ-gradient at
+    /// that exact railed checkpoint and asserts PER COORDINATE, so `rho[0]`
+    /// (railed) and `rho[1]` (free, the suspected leaker) are separately visible.
+    ///
+    /// Contract notes:
+    /// * NO frozen θ̂ cache: `evaluate_survival_lamlcost_and_gradient` re-converges
+    ///   β̂(ρ) internally at every ρ±h, so each FD leg is a full re-fit.
+    /// * The neighbour-ρ evaluations double as the A-vs-B discriminator for the
+    ///   stall: an inner-solve `Err` at a probe ρ panics the `.expect` below
+    ///   (⇒ line search starved by inner Errs), whereas a finite-but-wrong FD
+    ///   trips the per-coordinate assert (⇒ outer LAML value↔gradient desync).
+    /// * The inner Hessian conditioning is printed to split hypothesis (a) an
+    ///   envelope/∂β∂ρ leak at ill-conditioned H from (b) a logdet value/deriv
+    ///   split. The per-term FD grid (½·d(dev+pen), ½·dlogdetH, −½·dlogdetS)
+    ///   names which term carries the disagreement.
+    ///
+    /// Scope: this fixture uses full-rank 1×1 penalties, so if it passes with a
+    /// well-conditioned inner H, the real desync needs the ISpline 2nd-difference
+    /// nullspace structure of the transformation baseline — which this gate then
+    /// localizes to the outer term rather than the inner mode.
+    #[test]
+    fn survival_laml_rho_gradient_matches_fd_at_the_over_smoothing_rail() {
+        use gam_linalg::faer_ndarray::FaerEigh;
+
+        const RAIL_RHO0: f64 = 7.394829814011909;
+        const FREE_RHO1: f64 = -2.45;
+        const FD_STEP: f64 = 1.0e-4;
+
+        let beta0 = array![-2.5_f64, 1.0];
+        let rho = array![RAIL_RHO0, FREE_RHO1];
+        let model = laml_rail_fd_test_model(RAIL_RHO0.exp(), FREE_RHO1.exp());
+
+        // Analytic value + ρ-gradient at the re-converged inner mode.
+        let (value, analytic) = model
+            .evaluate_survival_lamlcost_and_gradient(
+                rho.as_slice().expect("contiguous rho"),
+                &beta0,
+            )
+            .expect("rail LAML analytic value+gradient (inner solve must converge at the rail)");
+
+        // Inner-Hessian conditioning at the railed checkpoint (splits a vs b).
+        let (rail_model, beta_hat) = model
+            .reconverge_survival_inner_mode(rho.as_slice().expect("contiguous rho"), &beta0)
+            .expect("reconverge inner mode at the rail");
+        let state = rail_model
+            .update_state(&beta_hat)
+            .expect("inner state at the rail");
+        let h_dense = state.hessian.to_dense();
+        let (evals, _) = h_dense.eigh(faer::Side::Lower).expect("eigh at rail");
+        let min_ev = evals.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_ev = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let cond = max_ev / min_ev.abs().max(f64::MIN_POSITIVE);
+
+        // Per-term VALUE finite differences, so a red run names the culprit term
+        // without a second round. T1 = ½(dev+pen), T2 = ½·logdetH, T3 = −½·logdetS.
+        let term_values = |r: &Array1<f64>| -> (f64, f64, f64) {
+            let (cand, b) = model
+                .reconverge_survival_inner_mode(r.as_slice().expect("contiguous rho"), &beta0)
+                .expect("reconverge for per-term FD");
+            let st = cand.update_state(&b).expect("state for per-term FD");
+            let t1 = 0.5 * (st.deviance + st.penalty_term);
+            let t2 = 0.5 * laml_test_logdet_h(&st);
+            // Active 1×1 blocks: log|λ_k S_k| = ρ_k + ln(matrix_k). rank each = 1.
+            let t3 = -0.5 * (r[0] + 3.0_f64.ln() + r[1] + 2.5_f64.ln());
+            (t1, t2, t3)
+        };
+
+        let mut fd = vec![0.0_f64; rho.len()];
+        let mut fd_terms = vec![(0.0_f64, 0.0_f64, 0.0_f64); rho.len()];
+        for j in 0..rho.len() {
+            let mut plus = rho.clone();
+            plus[j] += FD_STEP;
+            let mut minus = rho.clone();
+            minus[j] -= FD_STEP;
+            let fp = model
+                .evaluate_survival_lamlcost_and_gradient(
+                    plus.as_slice().expect("contiguous rho"),
+                    &beta0,
+                )
+                .expect("rail LAML f+ (probe ρ inner solve must converge)")
+                .0;
+            let fm = model
+                .evaluate_survival_lamlcost_and_gradient(
+                    minus.as_slice().expect("contiguous rho"),
+                    &beta0,
+                )
+                .expect("rail LAML f- (probe ρ inner solve must converge)")
+                .0;
+            fd[j] = (fp - fm) / (2.0 * FD_STEP);
+            let (p1, p2, p3) = term_values(&plus);
+            let (m1, m2, m3) = term_values(&minus);
+            fd_terms[j] = (
+                (p1 - m1) / (2.0 * FD_STEP),
+                (p2 - m2) / (2.0 * FD_STEP),
+                (p3 - m3) / (2.0 * FD_STEP),
+            );
+        }
+
+        eprintln!(
+            "[RAIL-FD] rho=[{RAIL_RHO0:.9}, {FREE_RHO1}] value={value:.9} inner_H min_ev={min_ev:.3e} max_ev={max_ev:.3e} cond={cond:.3e}"
+        );
+        for j in 0..rho.len() {
+            let (dt1, dt2, dt3) = fd_terms[j];
+            eprintln!(
+                "[RAIL-FD] rho[{j}]: analytic_total={:.6e} fd_total={:.6e} abs_err={:.3e} | fd_terms: half_d(dev+pen)={dt1:.6e} half_dlogdetH={dt2:.6e} neg_half_dlogdetS={dt3:.6e}",
+                analytic[j],
+                fd[j],
+                (analytic[j] - fd[j]).abs()
+            );
+        }
+
+        for j in 0..rho.len() {
+            let tol = 1.0e-4 * (1.0 + analytic[j].abs().max(fd[j].abs()));
+            assert!(
+                (analytic[j] - fd[j]).abs() <= tol,
+                "survival LAML ρ-gradient desync at coordinate {j} in the over-smoothing rail regime: \
+                 analytic={:.6e} fd={:.6e} (inner H cond={cond:.3e}); see the per-term [RAIL-FD] grid above",
+                analytic[j],
+                fd[j],
+            );
+        }
+    }
+
     #[test]
     fn survival_solver_damping_converges_undamped_objective() {
         let rho = -0.35_f64;
@@ -4911,7 +5101,8 @@ mod tests {
             .unified_lamlobjective_and_rhogradient(&beta, &state, &rho)
             .expect("survival LAML objective and gradient");
 
-        let expected = 0.5 * (state.deviance + state.penalty_term) + 0.5 * laml_test_logdet_h(&state)
+        let expected = 0.5 * (state.deviance + state.penalty_term)
+            + 0.5 * laml_test_logdet_h(&state)
             - 0.5 * (rho0 + 2.5_f64.ln());
         assert_eq!(
             grad.len(),
