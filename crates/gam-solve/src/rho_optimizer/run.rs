@@ -1603,11 +1603,18 @@ pub(crate) fn certify_outer_optimality(
         .outer_inner_cap
         .as_ref()
         .map(TerminalInnerCapGuard::lift);
-    if terminal_cap_guard.is_some() {
+    if terminal_cap_guard.is_some() || obj.owns_terminal_coefficient_mode() {
         // `reset` is deliberately conditional on the presence of the cap
         // contract.  Those are the REML/mixture objectives whose search cache
         // can contain a coarse inner state; uncapped objectives retain their
         // ordinary stateful certification semantics.
+        //
+        // The `owns_terminal_coefficient_mode()` disjunct (#2334) closes the
+        // gap for cap-less objectives that install an owned coefficient mode:
+        // the certifying re-eval below must start from the same clean baseline
+        // that `finalize_outer_result` used, so the mode's objective bitwise
+        // matches the certified `final_value` even when the inner solve is
+        // bimodal at `rho_star`.
         obj.reset();
     }
     let outcome = certify_outer_optimality_at_terminal_fidelity(obj, config, context, result);
@@ -2428,7 +2435,16 @@ pub(crate) fn run_outer(
             // state their evaluation at `result.rho` depends on — an
             // unconditional reset here wiped it and made the certification
             // evaluation non-finite on the reactive fixture.
-            if terminal_cap_guard.is_some() {
+            //
+            // OR-in the terminal-coefficient-mode ownership signal (#2334):
+            // objectives that install an owned coefficient mode here but hold
+            // their inner cap in a different field (custom families) leave
+            // `outer_inner_cap` `None`, so the cap gate alone never fires and
+            // `finalize` here could land in a different inner basin than the
+            // certifying re-eval below — a spurious bitwise bind failure on a
+            // bimodal inner solve. Forcing the reset for mode-owning objectives
+            // makes both installations start from the same clean baseline.
+            if terminal_cap_guard.is_some() || obj.owns_terminal_coefficient_mode() {
                 obj.reset();
             }
             let terminal_installation = obj.finalize_outer_result(&result.rho, &result.plan_used);

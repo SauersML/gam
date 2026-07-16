@@ -180,6 +180,40 @@ pub trait OuterObjective {
     /// Restore to a clean baseline for the next multi-start candidate.
     fn reset(&mut self);
 
+    /// Whether this objective owns a terminal *coefficient* mode whose bitwise
+    /// identity fit assembly will later bind against the certified outer value.
+    ///
+    /// The certification sequence (`run.rs`) installs the terminal state twice
+    /// at `result.rho`: once via [`Self::finalize_outer_result`] (which the
+    /// mode-owning evaluator uses to install its coefficient mode) and once via
+    /// the analytic re-evaluation inside `certify_outer_optimality` (which sets
+    /// `result.final_value`). On a nonconvex profiled objective those two
+    /// evaluations can settle in *different* coefficient basins unless each is
+    /// forced to re-install from the same clean baseline through [`Self::reset`]
+    /// — otherwise they prime the inner solve off whatever warm state the
+    /// preceding diagnostic/finalize left behind, and the mode's objective and
+    /// the certified value disagree by a whole basin (measured: `9.1931e2` vs
+    /// `9.1671e2` on the cause-specific survival gate).
+    ///
+    /// That terminal reset is otherwise gated on `config.outer_inner_cap`,
+    /// which the REML/mixture objectives wire but the custom-family (and any
+    /// other terminal-mode-owning closure) objective does not — it holds its
+    /// inner cap in a different field and leaves `outer_inner_cap` `None`, so
+    /// the reset never fires and the bitwise bind can spuriously fail on a
+    /// bimodal inner solve. Returning `true` here forces the terminal reset
+    /// *independently of the cap*, so `finalize` and `certify` provably come
+    /// from one fresh evaluation at `rho_star`. It deliberately does NOT touch
+    /// the `inner_solve_converged(config.outer_inner_cap)` gate: an objective
+    /// that owns a terminal mode but does not populate the cap's convergence
+    /// atomic keeps its own stateful convergence semantics.
+    ///
+    /// The default is `false`: an objective that owns no terminal coefficient
+    /// mode (the reactive-domain fixture among them) retains the very state its
+    /// evaluation at `result.rho` depends on and must not be reset.
+    fn owns_terminal_coefficient_mode(&self) -> bool {
+        false
+    }
+
     /// Transition an objective that actually used an approximate derivative
     /// pilot to its exact full-data measure.
     ///
@@ -963,6 +997,19 @@ where
         if let Some(f) = self.reset_fn.as_mut() {
             f(&mut self.state);
         }
+    }
+
+    fn owns_terminal_coefficient_mode(&self) -> bool {
+        // A forced terminal eval order is set *precisely* to install this
+        // objective's owned coefficient mode through one analytic evaluator at
+        // `rho_star` (see `terminal_eval_order`'s field doc and
+        // `with_terminal_eval_order`). So `terminal_eval_order.is_some()` is the
+        // existing, single-source-of-truth marker that this closure objective
+        // owns a terminal coefficient mode — no separate flag to keep in sync.
+        // Only the custom-family builder sets it; every other closure objective
+        // (REML search proxies, reactive fixtures) leaves it `None` and keeps
+        // the default `false`.
+        self.terminal_eval_order.is_some()
     }
 
     fn begin_exact_polish(&mut self) -> bool {
