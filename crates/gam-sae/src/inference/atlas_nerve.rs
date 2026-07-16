@@ -403,6 +403,23 @@ fn certified_surface_name(
         (1, 0, Some(1), 2, AtlasOrientability::Orientable) => {
             Some((GraphCompressionKind::Sphere, "sphere", log_vertices))
         }
+        // A contractible bounded surface: orientable, no handle (b₁ = 0), no
+        // closed 2-cycle (b₂ = 0), χ = 1. This is the sheet a swiss roll glues to
+        // — distinguished from the sphere purely by χ (1 vs 2) and the absent
+        // b₂, exactly the robust simply-connected discriminant the geometry
+        // review endorsed (#2280).
+        (1, 0, Some(0), 1, AtlasOrientability::Orientable) => {
+            Some((GraphCompressionKind::Disk, "disk", log_vertices))
+        }
+        // The Möbius strip: the non-orientable counterpart of the cylinder (same
+        // F₂ homology b₁ = 1, b₂ = 0, χ = 0), separated ONLY by the certified
+        // orientation cocycle — the half-twist read as a discrete sign, the
+        // orientability review's reliable core (#2280).
+        (1, 1, Some(0), 0, AtlasOrientability::NonOrientable) => Some((
+            GraphCompressionKind::MobiusStrip,
+            "mobius_strip",
+            2.0 * log_vertices,
+        )),
         (1, 1, Some(1), 1, AtlasOrientability::NonOrientable) => Some((
             GraphCompressionKind::ProjectivePlane,
             "projective_plane",
@@ -1599,6 +1616,61 @@ mod tests {
             super::certified_surface_name(rp2_betti, 1, AtlasOrientability::Orientable, 8.0,)
                 .is_none(),
             "an impossible orientable RP2 signature must not earn any name"
+        );
+    }
+
+    /// #2280 acceptance shapes the table previously omitted: the contractible
+    /// bounded surface a swiss roll glues to (sheet/disk, χ = 1) and the Möbius
+    /// strip (χ = 0, non-orientable — the cylinder's F₂ homology separated only by
+    /// the orientation cocycle).
+    #[test]
+    fn sheet_and_mobius_strip_earn_their_certified_names() {
+        let disk_betti = crate::manifold::BettiSignature {
+            b0: 1,
+            b1: 0,
+            b2: Some(0),
+        };
+        let strip_betti = crate::manifold::BettiSignature {
+            b0: 1,
+            b1: 1,
+            b2: Some(0),
+        };
+        // Sheet: orientable, no handle, no closed 2-cycle, χ = 1.
+        assert_eq!(
+            super::certified_surface_name(disk_betti, 1, AtlasOrientability::Orientable, 8.0)
+                .map(|row| row.0),
+            Some(GraphCompressionKind::Disk)
+        );
+        // The sphere signature (b₂ = 1, χ = 2) must NOT collapse to a disk — χ and
+        // b₂ are the robust simply-connected discriminant.
+        let sphere_betti = crate::manifold::BettiSignature {
+            b0: 1,
+            b1: 0,
+            b2: Some(1),
+        };
+        assert_eq!(
+            super::certified_surface_name(sphere_betti, 2, AtlasOrientability::Orientable, 8.0)
+                .map(|row| row.0),
+            Some(GraphCompressionKind::Sphere)
+        );
+        // Möbius strip vs cylinder: identical F₂ homology (b₁ = 1, b₂ = 0, χ = 0),
+        // separated ONLY by the certified orientation.
+        assert_eq!(
+            super::certified_surface_name(strip_betti, 0, AtlasOrientability::NonOrientable, 8.0)
+                .map(|row| row.0),
+            Some(GraphCompressionKind::MobiusStrip)
+        );
+        assert_eq!(
+            super::certified_surface_name(strip_betti, 0, AtlasOrientability::Orientable, 8.0)
+                .map(|row| row.0),
+            Some(GraphCompressionKind::Cylinder),
+            "the same F₂ homology becomes cylinder vs Möbius only through certified orientation"
+        );
+        // An orientable disk with a spurious non-orientable label is impossible.
+        assert!(
+            super::certified_surface_name(disk_betti, 1, AtlasOrientability::NonOrientable, 8.0)
+                .is_none(),
+            "a non-orientable contractible surface is not a named type in this table"
         );
     }
 
