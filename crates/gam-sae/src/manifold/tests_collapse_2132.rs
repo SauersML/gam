@@ -327,33 +327,46 @@ fn manifold_circle_mixture_seed_eval_terminates_2132() {
         log::set_max_level(log::LevelFilter::Debug);
     }
 
-    // (C, P): matched-K (K=C) planted circle mixtures, small enough that one inner
-    // solve is seconds. P = 2C + 2 keeps the C planes disjoint with ambient slack.
-    const CONFIGS: [(usize, usize); 3] = [(2, 6), (3, 8), (4, 10)];
-    const N: usize = 240;
+    // (C, P, K, tag): matched-K planted circle mixtures FIRST (fast, known — K=C,
+    // P=2C+2 keeps the C planes disjoint), then the #2267 OVER-COMPLETE lane last:
+    // K=8 atoms on a C-circle mixture at P=32 (the curved-K=8 dense-softmax arm that
+    // HANGS >40min on 508×32 in the #2267 timing runs, per implPERF). Matched arms
+    // run first so their results are captured before any over-complete hang; the
+    // START line before each eval names the culprit config if the job is
+    // walltime-killed (a HANG here = the single inner solve itself has an unbounded
+    // loop, distinct from an outer-search churn).
+    const CONFIGS: [(usize, usize, usize, &str); 5] = [
+        (2, 6, 2, "matched"),
+        (3, 8, 3, "matched"),
+        (4, 10, 4, "matched"),
+        (2, 32, 8, "overcomplete_2267"),
+        (4, 32, 8, "overcomplete_2267"),
+    ];
+    const N: usize = 508;
     const SIGMA: f64 = 0.05;
 
     let mut refusals: Vec<String> = Vec::new();
-    for (c, p) in CONFIGS {
+    for (c, p, k, tag) in CONFIGS {
         let train = planted_circle_mixture(N, p, c, SIGMA, 0xA11CE ^ c as u64);
         // Both routings the close driver / repros exercise: soft (softmax logits are
-        // free Newton params) AND hard TopK (support-sparse — no logit is a Newton
-        // param, membership is the compact active-set whose oscillation is the
-        // exchange-churn signature shared with the CTN joint lane). top_k=1 mirrors
-        // the driver. Covering both means whichever mechanism the driver hit — the
-        // indefinite-Hessian geometry stall OR top-k support ping-pong — reproduces
-        // here, and the forwarded arbiter lines discriminate which.
+        // free Newton params — the #2267 default) AND hard TopK (support-sparse — no
+        // logit is a Newton param, membership is the compact active-set whose
+        // oscillation is the exchange-churn signature shared with the CTN joint lane).
+        // top_k=1 mirrors the driver. Covering both means whichever mechanism the
+        // driver hit — the indefinite-Hessian geometry stall OR top-k support
+        // ping-pong — reproduces here, and the forwarded arbiter lines discriminate.
         for mode_idx in 0..2 {
             let (mode_label, mode) = match mode_idx {
                 0 => ("softmax", AssignmentMode::softmax(1.0)),
                 _ => ("topk1", AssignmentMode::top_k_support(1)),
             };
-            let (mut objective, seed) = objective_and_seed(train.view(), c, Topo::Circle, mode);
+            eprintln!("[#2132 seed-eval] START C={c} K={k} P={p} routing={mode_label} tag={tag}");
+            let (mut objective, seed) = objective_and_seed(train.view(), k, Topo::Circle, mode);
             match objective.eval_efs(&seed) {
                 Ok(eval) => {
                     let steps_finite = eval.steps.iter().all(|v| v.is_finite());
                     eprintln!(
-                        "[#2132 seed-eval] C={c} K={c} P={p} routing={mode_label}: \
+                        "[#2132 seed-eval] C={c} K={k} P={p} routing={mode_label} tag={tag}: \
                          cost={:.6e} n_steps={} steps_finite={steps_finite} cost_finite={}",
                         eval.cost,
                         eval.steps.len(),
@@ -361,16 +374,16 @@ fn manifold_circle_mixture_seed_eval_terminates_2132() {
                     );
                     if !eval.cost.is_finite() {
                         refusals.push(format!(
-                            "C={c}/{mode_label}: non-finite seed cost {:.6e}",
+                            "C={c}/K={k}/{mode_label}: non-finite seed cost {:.6e}",
                             eval.cost
                         ));
                     }
                 }
                 Err(err) => {
                     eprintln!(
-                        "[#2132 seed-eval] C={c} K={c} P={p} routing={mode_label}: REFUSED — {err}"
+                        "[#2132 seed-eval] C={c} K={k} P={p} routing={mode_label} tag={tag}: REFUSED — {err}"
                     );
-                    refusals.push(format!("C={c}/{mode_label}: {err}"));
+                    refusals.push(format!("C={c}/K={k}/{mode_label}: {err}"));
                 }
             }
         }
