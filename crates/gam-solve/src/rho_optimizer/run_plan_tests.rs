@@ -5426,10 +5426,17 @@ fn run_efs_runtime_fallback_marker_degrades_to_bfgs_immediately() {
             let efs_calls = Arc::clone(&efs_calls);
             Some(move |_: &mut (), _: &Array1<f64>| {
                 efs_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Err(EstimationError::RemlOptimizationFailed(format!(
-                    "{} synthetic runtime escape hatch",
-                    EFS_FIRST_ORDER_FALLBACK_MARKER,
-                )))
+                // The runner recognizes the EFS runtime-fallback marker only on a
+                // typed `GradientUnavailable` error (the eval_efs match arm in
+                // bridges.rs), which is the semantically-correct carrier — the
+                // marker signals "no fixed-point/gradient here, degrade to
+                // first order". Carry it in `context` so
+                // `requests_immediate_first_order_fallback` fires and the attempt
+                // degrades to BFGS after this single EFS call.
+                Err(EstimationError::GradientUnavailable {
+                    context: EFS_FIRST_ORDER_FALLBACK_MARKER,
+                    mode: "efs runtime escape hatch",
+                })
             })
         },
     );
