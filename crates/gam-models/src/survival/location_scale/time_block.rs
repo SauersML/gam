@@ -323,15 +323,16 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
     let mut col_maxes: Vec<(usize, f64)> = Vec::with_capacity(p.min(DIAGNOSTIC_COLUMN_PREVIEW));
     let mut total_subtol_nonzeros = 0_usize;
     for col in 0..p {
-        // Derivative integrity: the M-spline derivative basis must be finite and
-        // NON-NEGATIVE at every training row (a monotone I-spline's derivative is
-        // an M-spline, ≥ 0 everywhere). This is an independent basis-validity
-        // check; the derivative is NO LONGER used to decide the sign cone, because
-        // a genuine tail shape column whose M-spline support sits beyond the
-        // largest training exit time is ≈0 at every training row yet still varies
-        // in value — bounding it by derivative activity alone left it unconstrained
-        // and the penalized fit drove it negative, producing a non-monotone warp
-        // at prediction horizons in that column's support (#2332).
+        // Derivative pass: (1) integrity — the M-spline derivative basis must be
+        // finite and NON-NEGATIVE at every training row (a monotone I-spline's
+        // derivative is an M-spline, ≥ 0 everywhere); (2) `has_positive_support`,
+        // one half of the OR sign-cone decision below. On its own the derivative
+        // pass is INSUFFICIENT to classify: a genuine tail shape column whose
+        // M-spline support sits beyond the largest training exit time is ≈0 at
+        // every training row yet still varies in value, so the value pass below is
+        // what actually catches it (#2332). Bounding by derivative activity alone
+        // left it unconstrained and the penalized fit drove it negative, producing
+        // a non-monotone warp at prediction horizons in that column's support.
         let column = design_derivative_exit.extract_column(col);
         if column.len() != nrows {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
