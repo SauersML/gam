@@ -89,7 +89,7 @@ pub(crate) fn paired_neglog_stacks(
 /// the per-`u` evaluator the consumers already use).
 fn surv_derivs(link: &InverseLink, u: f64) -> Option<[f64; 4]> {
     let (_, r, dr, ddr, dddr) =
-        SurvivalExactRowKernel::exact_survival_neglog_derivatives_fourth_rescaled(link, u, 0.0)
+        SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(link, u, 0.0)
             .ok()?;
     Some([r, dr, ddr, dddr])
 }
@@ -97,7 +97,7 @@ fn surv_derivs(link: &InverseLink, u: f64) -> Option<[f64; 4]> {
 /// `[B′, B″, B‴, B⁗](u)` from the existing log-pdf stack.
 fn pdf_derivs(link: &InverseLink, u: f64) -> Option<[f64; 4]> {
     let (_, d1, d2, d3, d4) =
-        SurvivalExactRowKernel::exact_log_pdf_derivatives_rescaled(link, u, 0.0).ok()?;
+        SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(link, u, 0.0).ok()?;
     Some([d1, d2, d3, d4])
 }
 
