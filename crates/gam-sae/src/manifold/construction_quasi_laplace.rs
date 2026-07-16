@@ -1880,9 +1880,18 @@ impl SaeManifoldTerm {
             // rise its own model predicts, or every step is rejected and the
             // fit parks 1.3× above tolerance (measured on the tier-0 fixtures:
             // ‖g‖ 8.0e-5 vs tol 6.1e-5, refused at budget). The gradient-norm
-            // contraction below remains the sole merit; this budget only stops
+            // contraction below is the PRIMARY merit; this budget only stops
             // objective blow-ups, not model-consistent saddle approaches.
             let model_predicted_change = 0.5 * sae_inner(&rhs, &newton).abs();
+            // λ²_pre = gᵀH⁻¹g at the pre-step state (the exact Newton decrement,
+            // = 2·model_predicted_change). The affine SECONDARY merit below accepts
+            // a step that contracts THIS even when raw ‖g‖ does not — the
+            // indefinite/stiff class (#2132/#2228/#2267) where ‖g‖ is non-monotone
+            // under the exact-Newton step, so a valid move toward stationarity would
+            // be rejected by the raw-‖g‖-only merit and the fit refused off-optimum
+            // (measured: "step committed ‖g‖ 3.04e-1→2.73e-1" then "all backtracks
+            // rejected" cycling per tol-round — the merit-rejects-valid-step grind).
+            let pre_decrement_sq = 2.0 * model_predicted_change;
             let obj_rise_budget = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * objective_scale
                 + model_predicted_change;
             let snapshot = self.snapshot_mutable_state();
@@ -1899,16 +1908,47 @@ impl SaeManifoldTerm {
                 let trial_obj = self
                     .penalized_objective_total(target, rho_fixed, registry, 1.0)
                     .unwrap_or(f64::INFINITY);
-                let trial_grad = self
-                    .assemble_arrow_schur(target, rho_fixed, registry)
-                    .ok()
-                    .map(|trial_sys| Self::system_grad_norm_sq(&trial_sys).sqrt());
-                // Gradient-norm merit (this is root-finding at a stalled
-                // objective, so ‖g‖ is the monotone quantity) with the
-                // objective held to the stall detector's own no-change band.
+                // Two affine-consistent merits from the SAME trial system: the raw
+                // KKT gradient norm (PRIMARY — the stronger certificate on a PD
+                // Hessian, where it contracts quadratically) and the exact Newton
+                // decrement λ²_trial = gᵀH⁻¹g (SECONDARY — the monotone quantity at
+                // the indefinite / stiff inner Hessian the over-parametrized circle
+                // charts produce, where raw ‖g‖ is non-monotone under the exact-Newton
+                // step). Accepting on EITHER lets the polish descend the indefinite
+                // class instead of parking above tol and grinding (#2132/#2228/#2267);
+                // this aligns the polish merit with the ½λ² currency of the stall-accept
+                // it feeds, closing the three-currency inconsistency without loosening
+                // any tolerance.
+                let (trial_grad, trial_decrement_sq) =
+                    match self.assemble_arrow_schur(target, rho_fixed, registry) {
+                        Ok(mut trial_sys) => {
+                            let g = Self::system_grad_norm_sq(&trial_sys).sqrt();
+                            let decrement = self
+                                .factor_deflated_evidence_with_grad_norms(
+                                    &mut trial_sys,
+                                    lambda_smooth,
+                                    options,
+                                )
+                                .map(|factor| {
+                                    sae_manifold_newton_directional_decrease(
+                                        &trial_sys,
+                                        factor.delta_t.view(),
+                                        factor.delta_beta.view(),
+                                    )
+                                    .max(0.0)
+                                })
+                                .ok();
+                            (Some(g), decrement)
+                        }
+                        Err(_) => (None, None),
+                    };
+                // Objective held to the stall detector's own no-change band (plus the
+                // model's predicted rise for the indefinite saddle approach).
                 let obj_ok = trial_obj.is_finite() && trial_obj <= pre_obj + obj_rise_budget;
                 let grad_ok = trial_grad.is_some_and(|g| g.is_finite() && g < grad_norm);
-                if obj_ok && grad_ok {
+                let decrement_ok =
+                    trial_decrement_sq.is_some_and(|d| d.is_finite() && d < pre_decrement_sq);
+                if obj_ok && (grad_ok || decrement_ok) {
                     accepted = true;
                     made_progress = true;
                     break;
