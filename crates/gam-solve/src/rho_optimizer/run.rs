@@ -1,5 +1,10 @@
 use super::*;
 
+use super::asymptote_certificate::{
+    AsymptoteSample, AsymptoteSide, AsymptoteTolerances, AsymptoteVerdict, AsymptoteWindow,
+    MIN_TAIL_SAMPLES, assess_coordinate,
+};
+
 pub(crate) const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
 
 /// Inner coefficient state bound to one exact outer seed.
@@ -969,6 +974,13 @@ pub enum OuterConvergedVia {
     /// further outer update provably does not change the fitted state. The
     /// analytic first-order certificate is still taken at the incumbent.
     RecurrentIncumbent { consecutive_restores: usize },
+    /// Stationary-at-asymptote (#2348 Inc 1 / #2299 layer 3): the interior
+    /// (non-railed) coordinates are gradient-stationary, and every coordinate
+    /// railed at the infinite-/zero-smoothing box bound is certified on a
+    /// confirmed exponential tail (Thm 2.1) whose fitted model has reached the
+    /// rail limit to within the estimand tolerance. The typed rail supersedes
+    /// the generic gradient/criterion-flat verdict for a railed optimum.
+    AsymptoteStationary { rails: usize },
 }
 
 impl OuterConvergedVia {
@@ -980,6 +992,7 @@ impl OuterConvergedVia {
             Self::CriterionFlat { .. } => "converged_criterion_flat",
             Self::FixedPointStationary { .. } => "converged_fixed_point",
             Self::RecurrentIncumbent { .. } => "incumbent_stationary",
+            Self::AsymptoteStationary { .. } => "converged_asymptote_rail",
         }
     }
 }
@@ -1796,6 +1809,10 @@ fn certify_outer_optimality_at_terminal_fidelity(
         )
     };
     let grad_norm = evaluation.gradient.dot(&evaluation.gradient).sqrt();
+    // The terminal inner coefficients β(ρ̂), published by the REML bridge on
+    // every eval (`inner_beta_hint`). Used to scale the estimand tolerance for
+    // the asymptote-rail certificate (#2348 Inc 1).
+    let terminal_beta = evaluation.inner_beta_hint.clone();
     // KKT-projected gradient VECTOR (not just its norm): the norm feeds the
     // stationarity certificate below, and the vector feeds the curvature-scaled
     // flat-valley Newton decrement (#2253/#2249/#2015) once the analytic Hessian
@@ -2030,6 +2047,74 @@ fn certify_outer_optimality_at_terminal_fidelity(
     // interior (un-railed) sub-block instead, or a rail-caused indefiniteness would
     // disable the very certificate that exists to certify a railed optimum (#2299).
     let certificate_railed = certificate_railed_lambdas(&result.rho, layout.rho_dim(), config);
+
+    // Typed stationary-at-asymptote rail certificate (#2348 Inc 1, #2299 layer 3,
+    // #2337 Thm 2.1). Before falling through to the generic gradient/criterion-flat
+    // verdict, POSITIVELY certify a railed optimum: the interior (non-railed)
+    // coordinates are gradient-stationary, and each coordinate railed at the
+    // infinite-/zero-smoothing box bound sits on a confirmed exponential tail whose
+    // fitted model has already reached the rail limit to within the estimand
+    // tolerance. This supersedes the untyped `lambdas_railed` flag with a proof that
+    // the criterion improvement and coefficient travel still available by running to
+    // the rail are both below tolerance.
+    //
+    // Computed in its own statement so the borrow of `analytic_hessian` ends before
+    // the mint branch moves it onto the result. Gated to a genuinely railed optimum
+    // with outward pull (`grad_norm` above the stationarity bound) and an analytic
+    // Hessian: a well-conditioned interior fit, or a coordinate merely resting near a
+    // bound with a vanishing gradient, probes nothing and keeps its ordinary verdict.
+    let rail_outcome = match analytic_hessian.as_ref() {
+        Some(hessian)
+            if !certificate_railed.is_empty() && grad_norm > stationarity_bound =>
+        {
+            try_certify_asymptote_rail(
+                obj,
+                &AsymptoteRailInputs {
+                    rho: &result.rho,
+                    projected_gradient: &projected_gradient,
+                    railed: &certificate_railed,
+                    hessian,
+                    bounds: &bounds,
+                    terminal_beta: terminal_beta.as_ref(),
+                    stationarity_bound,
+                    context,
+                },
+            )?
+        }
+        _ => None,
+    };
+    if let Some((interior_projected_grad_norm, rails)) = rail_outcome {
+        let certificate = OuterCriterionCertificate {
+            stationarity: OuterStationarityCertificate::AsymptoteRail {
+                interior_projected_grad_norm,
+                bound: stationarity_bound,
+                rails,
+            },
+            hessian_psd: Some(true),
+            lambdas_railed: certificate_railed.clone(),
+        };
+        // Move the certified curvature onto the result; the mint path returns
+        // immediately, so the fall-through below never observes the move.
+        result.final_hessian = analytic_hessian;
+        result.criterion_certificate = Some(certificate.clone());
+        if !certificate.certifies() {
+            result.converged = false;
+            return Err(outer_nonconvergence_error(
+                context,
+                &certificate.summary(),
+                result,
+                Some(interior_projected_grad_norm),
+                stationarity_bound,
+            ));
+        }
+        result.converged = true;
+        result.converged_via = Some(OuterConvergedVia::AsymptoteStationary {
+            rails: certificate.stationarity.rails().len(),
+        });
+        log::info!("[CERTIFICATE] {context}: {}", certificate.summary());
+        return Ok(certificate);
+    }
+
     let mut certified_projected_grad_norm = projected_grad_norm;
     if projected_grad_norm > stationarity_bound
         && let Some(hessian) = analytic_hessian.as_ref()
@@ -2190,6 +2275,266 @@ fn certify_outer_optimality_at_terminal_fidelity(
     };
     log::info!("[CERTIFICATE] {context}: {}", certificate.summary());
     Ok(certificate)
+}
+
+/// Estimand tolerance relative to the fitted coefficient scale for the
+/// asymptote-rail certificate (#2348 Inc 1): the remaining coefficient travel
+/// to the rail limit must fall below `ASYMPTOTE_ESTIMAND_REL_TOL·(1 + ‖β‖)` for
+/// the fitted model to be certified equal to the rail-limit fit.
+const ASYMPTOTE_ESTIMAND_REL_TOL: f64 = 1.0e-4;
+
+/// Number of one-e-fold-in-`ρ` probes stepped back from a railed coordinate
+/// toward the interior when reconstructing its exponential tail (#2348 Inc 1).
+/// Enough to span both the finite-difference floor next to the rail (rejected)
+/// and a confirmable-tail run further in.
+const ASYMPTOTE_PROBE_COUNT: usize = 12;
+
+/// Read-only inputs to [`try_certify_asymptote_rail`], bundled so the certify
+/// path passes one borrow rather than a long positional argument list.
+struct AsymptoteRailInputs<'a> {
+    rho: &'a Array1<f64>,
+    projected_gradient: &'a Array1<f64>,
+    railed: &'a [usize],
+    hessian: &'a Array2<f64>,
+    bounds: &'a (Array1<f64>, Array1<f64>),
+    terminal_beta: Option<&'a Array1<f64>>,
+    stationarity_bound: f64,
+    context: &'a str,
+}
+
+/// Attempt the typed stationary-at-asymptote rail certificate (#2348 Inc 1).
+///
+/// Returns `Some((interior_projected_grad_norm, rails))` when the interior
+/// (non-railed) coordinates are gradient-stationary, the interior Hessian
+/// sub-block is PSD, and EVERY railed coordinate is certified on a confirmed
+/// exponential tail whose fitted model has reached the rail limit to within the
+/// estimand tolerance. Returns `None` (fall through to the generic verdict) on
+/// any failure — a non-stationary interior, indefinite interior curvature, or
+/// any railed coordinate whose tail is not confirmable. Never errors on a
+/// refusal; the only `Err` is a genuinely broken objective that cannot restore
+/// its inner state to the certified point after probing.
+fn try_certify_asymptote_rail(
+    obj: &mut dyn OuterObjective,
+    inputs: &AsymptoteRailInputs<'_>,
+) -> Result<Option<(f64, Vec<RailCoordinate>)>, EstimationError> {
+    let rho = inputs.rho;
+    let projected_gradient = inputs.projected_gradient;
+    let railed = inputs.railed;
+    // The interior (non-railed) coordinates must be gradient-stationary in their
+    // own right: the asymptote certificate speaks only to the railed directions,
+    // never rescues a still-descending interior.
+    let interior_projected_grad_norm = (0..projected_gradient.len())
+        .filter(|k| !railed.contains(k))
+        .map(|k| projected_gradient[k] * projected_gradient[k])
+        .sum::<f64>()
+        .sqrt();
+    if !(interior_projected_grad_norm <= inputs.stationarity_bound) {
+        return Ok(None);
+    }
+    // The interior sub-block (railed coordinates removed) must be admissible
+    // curvature for a minimum. A rail-caused indefiniteness in the saturated
+    // direction is expected and excluded; genuine interior negative curvature is
+    // not, and refuses the certificate.
+    if certificate_hessian_is_psd_off_railed(inputs.hessian, railed) != Some(true) {
+        return Ok(None);
+    }
+    let beta_norm = inputs
+        .terminal_beta
+        .map(|b| b.dot(b).sqrt())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0);
+    let estimand_tol = ASYMPTOTE_ESTIMAND_REL_TOL * (1.0 + beta_norm);
+    let tol = AsymptoteTolerances::exp4_rail_bands(estimand_tol);
+    let (lower, upper) = inputs.bounds;
+
+    let mut rails: Vec<RailCoordinate> = Vec::new();
+    let mut all_certified = true;
+    let mut probed_any = false;
+    for &k in railed.iter() {
+        if k >= rho.len() || k >= lower.len() || k >= upper.len() {
+            all_certified = false;
+            break;
+        }
+        // Which rail: the box endpoint the coordinate sits nearest. `Upper`
+        // (λ → ∞) probes step ρ downward into the tail; `Lower` (λ → 0) step up.
+        let side = if (upper[k] - rho[k]).abs() <= (rho[k] - lower[k]).abs() {
+            AsymptoteSide::Upper
+        } else {
+            AsymptoteSide::Lower
+        };
+        probed_any = true;
+        match build_and_assess_rail_coordinate(obj, rho, k, side, &tol)? {
+            Some(rail) => rails.push(rail),
+            None => {
+                all_certified = false;
+                break;
+            }
+        }
+    }
+
+    // The probes warm-started the inner solve away from ρ̂; restore it so the
+    // shipped fitted state (and the ρ-uncertainty diagnostic) sees the certified
+    // point. A failure here is a genuinely broken objective, not a refusal.
+    if probed_any {
+        obj.eval_cost(rho).map_err(|err| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "{}: failed to restore the objective to the certified point after \
+                 asymptote-rail probing: {err}",
+                inputs.context
+            ))
+        })?;
+    }
+
+    if all_certified && !rails.is_empty() {
+        Ok(Some((interior_projected_grad_norm, rails)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Reconstruct one railed coordinate's exponential tail by probing the analytic
+/// gradient a fixed number of e-folds back from the rail, locate the longest
+/// finite-difference-clean run (rejecting the noise floor adjacent to the rail),
+/// and assess it against the tail law (#2348 Inc 1 / #2337 Thm 2.1). Returns the
+/// certified [`RailCoordinate`] or `None` if no confirmable tail is found.
+fn build_and_assess_rail_coordinate(
+    obj: &mut dyn OuterObjective,
+    rho: &Array1<f64>,
+    coord: usize,
+    side: AsymptoteSide,
+    tol: &AsymptoteTolerances,
+) -> Result<Option<RailCoordinate>, EstimationError> {
+    const PROBE_DELTA: f64 = 1.0;
+    // Upper rail (ρ → +∞): step ρ DOWN into the tail. Lower rail: step UP.
+    let sign = match side {
+        AsymptoteSide::Upper => -1.0,
+        AsymptoteSide::Lower => 1.0,
+    };
+    // rows[r] corresponds to probe j=r+1: r=0 is the point CLOSEST to the rail,
+    // increasing r steps further into the interior (larger |grad|).
+    let mut rows: Vec<(f64, f64, Option<Array1<f64>>)> = Vec::new();
+    for j in 1..=ASYMPTOTE_PROBE_COUNT {
+        let mut probe = rho.clone();
+        probe[coord] = rho[coord] + sign * (j as f64) * PROBE_DELTA;
+        let eval = match obj.eval_with_order(&probe, OuterEvalOrder::ValueAndGradient) {
+            Ok(eval) => eval,
+            // A failed probe is not evidence against a tail; stop probing and
+            // assess whatever clean run the earlier probes established.
+            Err(_) => break,
+        };
+        if !eval.cost.is_finite() || coord >= eval.gradient.len() || !eval.gradient[coord].is_finite()
+        {
+            break;
+        }
+        rows.push((probe[coord], eval.gradient[coord], eval.inner_beta_hint));
+    }
+    if rows.len() < MIN_TAIL_SAMPLES {
+        return Ok(None);
+    }
+
+    // Per-row pencil constant ĉ and the element-clean predicate: ĉ above the
+    // noise floor AND the gradient above the interior floor (so a row adjacent to
+    // the rail, whose gradient has decayed into finite-difference cancellation, is
+    // excluded rather than mistaken for a settled tail).
+    let constants: Vec<f64> = rows
+        .iter()
+        .map(|(r, g, _)| side.tail_constant(*r, *g))
+        .collect();
+    let element_clean: Vec<bool> = rows
+        .iter()
+        .zip(&constants)
+        .map(|((_, g, _), c)| c.is_finite() && *c > tol.tail_noise_floor && g.abs() > tol.interior_grad_tol)
+        .collect();
+
+    // Longest contiguous run that is element-clean AND holds ĉ within the drift
+    // band; ties broken toward the rail (smallest start) for the most settled
+    // estimand.
+    let mut best: Option<(usize, usize)> = None;
+    for a in 0..rows.len() {
+        if !element_clean[a] {
+            continue;
+        }
+        for b in a..rows.len() {
+            if !element_clean[b] {
+                break;
+            }
+            if b - a + 1 < MIN_TAIL_SAMPLES {
+                continue;
+            }
+            if !run_drift_within_band(&constants[a..=b], tol.tail_drift_rel) {
+                continue;
+            }
+            let len = b - a + 1;
+            match best {
+                Some((ba, bb)) if bb - ba + 1 >= len => {}
+                _ => best = Some((a, b)),
+            }
+        }
+    }
+    let (a, b) = match best {
+        Some(run) => run,
+        None => return Ok(None),
+    };
+
+    // Build the window oldest → newest: newest (window `latest`) is the row
+    // CLOSEST to the rail (r=a). A sample's coefficient move is ‖β(r) − β(r+1)‖,
+    // the step from the next-farther retained row toward the rail.
+    let mut window = AsymptoteWindow::with_capacity(b - a + 1);
+    for r in (a..=b).rev() {
+        let (rho_r, grad_r, beta_r) = &rows[r];
+        let coef_step_norm = match (beta_r, rows.get(r + 1).map(|row| &row.2)) {
+            (Some(cur), Some(Some(farther))) if cur.len() == farther.len() => {
+                (cur - farther).iter().map(|v| v * v).sum::<f64>().sqrt()
+            }
+            _ => 0.0,
+        };
+        window.push(AsymptoteSample {
+            rho: *rho_r,
+            grad: *grad_r,
+            coef_step_norm,
+        });
+    }
+
+    match assess_coordinate(&window, tol) {
+        AsymptoteVerdict::CertifiedAtAsymptote {
+            side,
+            tail_constant,
+            value_gap,
+            estimand_travel_bound,
+        } => Ok(Some(RailCoordinate {
+            index: coord,
+            side,
+            tail_constant,
+            value_gap,
+            estimand_travel_bound,
+            noise_margin: tol.tail_noise_floor,
+        })),
+        _ => Ok(None),
+    }
+}
+
+/// Whether a run of pencil constants holds constant within the relative drift
+/// band `(max − min)/|mean| ≤ band` (deterministic, ordered).
+fn run_drift_within_band(constants: &[f64], band: f64) -> bool {
+    if constants.len() < MIN_TAIL_SAMPLES {
+        return false;
+    }
+    let mut sum = 0.0_f64;
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for &c in constants {
+        if !c.is_finite() {
+            return false;
+        }
+        sum += c;
+        lo = lo.min(c);
+        hi = hi.max(c);
+    }
+    let mean = sum / constants.len() as f64;
+    if !(mean.abs() > 0.0) {
+        return false;
+    }
+    (hi - lo) / mean.abs() <= band
 }
 
 pub(crate) fn compute_rho_uncertainty_diagnostic(
@@ -3239,5 +3584,140 @@ pub(crate) fn run_fixed_point_outer_solver(
         Err(e) => Err(FixedPointOuterRunError::Failed(
             EstimationError::RemlOptimizationFailed(format!("{failure_prefix}: {e:?}")),
         )),
+    }
+}
+
+#[cfg(test)]
+mod asymptote_rail_certify_tests {
+    use super::*;
+    use ndarray::array;
+
+    /// Build a one-coordinate UPPER-rail tail-law objective: at ρ its gradient is
+    /// `−c·e^{−ρ}` (so `ĉ = −e^{ρ}·grad = c` is constant) and its published inner
+    /// β is `a·e^{−ρ}` (so consecutive-probe `‖Δβ‖` contracts geometrically).
+    /// `drift_amp` ramps `ĉ` with ρ to model the finite-difference noise regime
+    /// (a non-constant pencil constant that no drift band can confirm).
+    fn upper_tail_objective(c: f64, a: f64, drift_amp: f64) -> impl OuterObjective {
+        let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
+        problem.build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| {
+                let r = rho[0];
+                let c_eff = c + drift_amp * r;
+                Ok((c_eff * (-r).exp()).abs())
+            },
+            move |_: &mut (), rho: &Array1<f64>| {
+                let r = rho[0];
+                let c_eff = c + drift_amp * r;
+                Ok(OuterEval {
+                    cost: (c_eff * (-r).exp()).abs(),
+                    gradient: array![-c_eff * (-r).exp()],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: Some(array![a * (-r).exp()]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        )
+    }
+
+    /// An exact upper-rail exponential tail is certified: the reconstructed
+    /// pencil constant is `c`, and the value-gap / estimand-travel are finite.
+    #[test]
+    fn asymptote_rail_mints_on_exact_tail_law() {
+        let mut obj = upper_tail_objective(6723.0, 1.0, 0.0);
+        let rho = array![29.9];
+        let tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
+        let rail = build_and_assess_rail_coordinate(&mut obj, &rho, 0, AsymptoteSide::Upper, &tol)
+            .expect("probing the tail-law objective must not error")
+            .expect("an exact exponential tail must certify a rail");
+        assert_eq!(rail.index, 0);
+        assert_eq!(rail.side, AsymptoteSide::Upper);
+        assert!(
+            (rail.tail_constant - 6723.0).abs() / 6723.0 < 1.0e-6,
+            "recovered ĉ={} should equal c=6723",
+            rail.tail_constant,
+        );
+        assert!(rail.value_gap.is_finite() && rail.value_gap >= 0.0);
+        assert!(rail.estimand_travel_bound.is_finite() && rail.estimand_travel_bound >= 0.0);
+    }
+
+    /// A drifting pencil constant (finite-difference noise regime) never
+    /// certifies: no finite-difference-clean run of the required length exists.
+    #[test]
+    fn asymptote_rail_refuses_on_drifting_constant() {
+        let mut obj = upper_tail_objective(6723.0, 1.0, 3000.0);
+        let rho = array![29.9];
+        let tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
+        let verdict =
+            build_and_assess_rail_coordinate(&mut obj, &rho, 0, AsymptoteSide::Upper, &tol)
+                .expect("probing must not error");
+        assert!(
+            verdict.is_none(),
+            "a drifting ĉ must not certify a tail, got {verdict:?}",
+        );
+    }
+
+    /// Build a two-coordinate objective: coordinate 0 follows the upper-rail tail
+    /// law; coordinate 1 (interior) is gradient-flat.
+    fn upper_tail_with_interior(c: f64, a: f64) -> impl OuterObjective {
+        let problem = OuterProblem::new(2).with_gradient(Derivative::Analytic);
+        problem.build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| Ok((c * (-rho[0]).exp()).abs()),
+            move |_: &mut (), rho: &Array1<f64>| {
+                let r = rho[0];
+                Ok(OuterEval {
+                    cost: (c * (-r).exp()).abs(),
+                    gradient: array![-c * (-r).exp(), 0.0],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: Some(array![a * (-r).exp(), 0.0]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        )
+    }
+
+    /// The interior-PSD gate is load-bearing: with a positive-definite interior
+    /// sub-block the confirmed tail mints, but a genuinely indefinite interior
+    /// curvature refuses the rail certificate even though the tail is clean.
+    #[test]
+    fn asymptote_rail_requires_psd_interior_sub_block() {
+        let rho = array![29.9, 0.0];
+        let projected = array![0.0, 0.0];
+        let bounds = (array![-30.0, -30.0], array![30.0, 30.0]);
+        let railed = [0usize];
+
+        let mut obj = upper_tail_with_interior(6723.0, 1.0);
+        let hessian_psd = array![[1.0, 0.0], [0.0, 2.0]];
+        let inputs_psd = AsymptoteRailInputs {
+            rho: &rho,
+            projected_gradient: &projected,
+            railed: &railed,
+            hessian: &hessian_psd,
+            bounds: &bounds,
+            terminal_beta: None,
+            stationarity_bound: 1.0e-6,
+            context: "asymptote-rail psd test",
+        };
+        let minted = try_certify_asymptote_rail(&mut obj, &inputs_psd)
+            .expect("certification must not error");
+        let (interior_norm, rails) = minted.expect("PSD interior + confirmed tail must mint");
+        assert!(interior_norm <= 1.0e-6);
+        assert_eq!(rails.len(), 1);
+        assert_eq!(rails[0].index, 0);
+
+        let hessian_indefinite = array![[1.0, 0.0], [0.0, -2.0]];
+        let inputs_indefinite = AsymptoteRailInputs {
+            hessian: &hessian_indefinite,
+            ..inputs_psd
+        };
+        let refused = try_certify_asymptote_rail(&mut obj, &inputs_indefinite)
+            .expect("certification must not error");
+        assert!(
+            refused.is_none(),
+            "indefinite interior curvature must refuse the rail certificate, got {refused:?}",
+        );
     }
 }

@@ -83,10 +83,10 @@ pub const DEFAULT_ASYMPTOTE_WINDOW: usize = 12;
 /// Minimum confirmed-tail samples before any asymptote verdict is attempted.
 /// Two points make `ĉ` trivially "constant" (no drift signal); three is the
 /// smallest count at which the drift band carries information.
-const MIN_TAIL_SAMPLES: usize = 3;
+pub const MIN_TAIL_SAMPLES: usize = 3;
 
 /// Which rail a coordinate is approaching.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AsymptoteSide {
     /// `ρ → +∞` (e.g. a bending penalty driving `λ → ∞`). Descent direction
     /// `−∂V/∂ρ > 0`, so `∂V/∂ρ < 0`.
@@ -212,6 +212,35 @@ pub struct AsymptoteTolerances {
     /// The estimand tolerance: the remaining coefficient travel to the rail
     /// must fall at or below this for `stationary-at-asymptote`.
     pub estimand_tol: f64,
+}
+
+impl AsymptoteTolerances {
+    /// The interior-stationary floor of the exp4_rail characterization: a
+    /// railed coordinate's tail gradient must exceed this (all confirmed-tail
+    /// rows do) to be an asymptote rather than an interior-zero point.
+    pub const EXP4_INTERIOR_GRAD_TOL: f64 = 1.0e-8;
+    /// The pencil-constant noise floor of the exp4_rail characterization: below
+    /// this `ĉ` is finite-difference noise, not a confirmed tail. See the
+    /// module tail-law derivation and the `exp4_verified_tail_certifies_...`
+    /// characterization test.
+    pub const EXP4_TAIL_NOISE_FLOOR: f64 = 1.0e-6;
+    /// The relative drift band of the exp4_rail characterization: the confirmed
+    /// tail rows (`ρ ∈ {14,…,24}`) hold `ĉ` constant to well within this, while
+    /// the finite-difference floor rows (`ρ ≥ 28`) swing far outside it.
+    pub const EXP4_TAIL_DRIFT_REL: f64 = 1.0e-3;
+
+    /// Rail-certificate tolerances on the exp4_rail characterization bands (the
+    /// same interior/noise/drift constants the `exp4_verified_tail_certifies_...`
+    /// characterization test measures), parameterized only by the estimand
+    /// tolerance, which scales with the fitted coefficient magnitude.
+    pub fn exp4_rail_bands(estimand_tol: f64) -> Self {
+        Self {
+            interior_grad_tol: Self::EXP4_INTERIOR_GRAD_TOL,
+            tail_noise_floor: Self::EXP4_TAIL_NOISE_FLOOR,
+            tail_drift_rel: Self::EXP4_TAIL_DRIFT_REL,
+            estimand_tol,
+        }
+    }
 }
 
 /// The result of assessing one coordinate against its recent history.

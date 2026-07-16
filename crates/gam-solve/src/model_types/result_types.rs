@@ -619,6 +619,29 @@ mod per_term_edf_tests {
 /// counts as railed against its box bound.
 pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
 
+/// One outer smoothing coordinate certified stationary-at-asymptote: it has no
+/// interior optimum (its gradient never clears the fixed bound), but the fitted
+/// model has provably reached its rail limit to within tolerance along it
+/// (#2348 Inc 1 / #2299 layer 3, #2337 Thm 2.1). The certified facts are the
+/// per-coordinate outputs of
+/// [`crate::rho_optimizer::asymptote_certificate::assess_coordinate`].
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RailCoordinate {
+    /// The ρ-block index of the railed coordinate.
+    pub index: usize,
+    /// Which rail (`λ → ∞` upper, `λ → 0` lower) it is approaching.
+    pub side: crate::rho_optimizer::asymptote_certificate::AsymptoteSide,
+    /// The observed pencil constant `ĉ` (window mean) confirming the tail.
+    pub tail_constant: f64,
+    /// The exact remaining criterion value-gap to the rail, `|∂V/∂ρ|`.
+    pub value_gap: f64,
+    /// The bound on remaining coefficient travel to the rail limit.
+    pub estimand_travel_bound: f64,
+    /// The pencil-constant noise floor the tail cleared to be confirmed (the
+    /// `ĉ > noise_margin` self-protection against the finite-difference floor).
+    pub noise_margin: f64,
+}
+
 /// The stationarity equation that certified an outer optimum.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OuterStationarityCertificate {
@@ -635,6 +658,18 @@ pub enum OuterStationarityCertificate {
         bound: f64,
         covered_coordinates: usize,
     },
+    /// Stationary-at-asymptote (#2348 Inc 1): the interior (non-railed)
+    /// coordinates are gradient-stationary, and every coordinate whose gradient
+    /// stays above the fixed bound all the way to a box rail is certified on a
+    /// confirmed exponential tail whose fitted model already equals the rail
+    /// limit to within the estimand tolerance. `interior_projected_grad_norm`
+    /// is the KKT-projected gradient with the railed coordinates removed; it is
+    /// the quantity compared against `bound`.
+    AsymptoteRail {
+        interior_projected_grad_norm: f64,
+        bound: f64,
+        rails: Vec<RailCoordinate>,
+    },
 }
 
 impl OuterStationarityCertificate {
@@ -644,6 +679,13 @@ impl OuterStationarityCertificate {
             Self::FixedPoint {
                 residual_inf_norm, ..
             } => *residual_inf_norm,
+            // The load-bearing residual is the interior (non-railed) projected
+            // gradient; the railed coordinates are certified by their tails, not
+            // by a vanishing residual.
+            Self::AsymptoteRail {
+                interior_projected_grad_norm,
+                ..
+            } => *interior_projected_grad_norm,
         }
     }
 
@@ -657,17 +699,36 @@ impl OuterStationarityCertificate {
                 projected_residual_inf_norm,
                 ..
             } => *projected_residual_inf_norm,
+            Self::AsymptoteRail {
+                interior_projected_grad_norm,
+                ..
+            } => *interior_projected_grad_norm,
         }
     }
 
     pub fn bound(&self) -> f64 {
         match self {
-            Self::AnalyticGradient { bound, .. } | Self::FixedPoint { bound, .. } => *bound,
+            Self::AnalyticGradient { bound, .. }
+            | Self::FixedPoint { bound, .. }
+            | Self::AsymptoteRail { bound, .. } => *bound,
         }
     }
 
     pub fn is_fixed_point(&self) -> bool {
         matches!(self, Self::FixedPoint { .. })
+    }
+
+    /// Whether this optimum was certified stationary-at-asymptote.
+    pub fn is_asymptote_rail(&self) -> bool {
+        matches!(self, Self::AsymptoteRail { .. })
+    }
+
+    /// The certified asymptote rails, when this is an `AsymptoteRail`.
+    pub fn rails(&self) -> &[RailCoordinate] {
+        match self {
+            Self::AsymptoteRail { rails, .. } => rails,
+            _ => &[],
+        }
     }
 }
 
@@ -721,8 +782,32 @@ impl OuterCriterionCertificate {
             && self.stationarity.projected_norm() >= 0.0
             && self.stationarity.bound().is_finite()
             && self.stationarity.bound() >= 0.0
+            && self.rails_are_well_formed()
             && self.is_stationary()
             && self.curvature_admissible()
+    }
+
+    /// An `AsymptoteRail` certificate is only admissible when it carries at
+    /// least one rail and every rail's certified facts are finite (a positive
+    /// pencil constant and non-negative gaps). Non-rail certificates trivially
+    /// pass. This closes the door on a deserialized rail certificate with an
+    /// empty or non-finite `rails` list minting convergence.
+    fn rails_are_well_formed(&self) -> bool {
+        match &self.stationarity {
+            OuterStationarityCertificate::AsymptoteRail { rails, .. } => {
+                !rails.is_empty()
+                    && rails.iter().all(|rail| {
+                        rail.tail_constant.is_finite()
+                            && rail.tail_constant > 0.0
+                            && rail.value_gap.is_finite()
+                            && rail.value_gap >= 0.0
+                            && rail.estimand_travel_bound.is_finite()
+                            && rail.estimand_travel_bound >= 0.0
+                            && rail.noise_margin.is_finite()
+                    })
+            }
+            _ => true,
+        }
     }
 
     /// Whether every audited fact is clean (stationary, PSD-or-untracked
@@ -749,6 +834,34 @@ impl OuterCriterionCertificate {
             } => format!(
                 "fixed-point |r|inf={residual_inf_norm:.3e} |Pr|inf={projected_residual_inf_norm:.3e} bound={bound:.3e} covered={covered_coordinates}"
             ),
+            OuterStationarityCertificate::AsymptoteRail {
+                interior_projected_grad_norm,
+                bound,
+                rails,
+            } => {
+                let rail_summary = rails
+                    .iter()
+                    .map(|rail| {
+                        format!(
+                            "#{}{} ĉ={:.3e} gap={:.3e} travel={:.3e}",
+                            rail.index,
+                            match rail.side {
+                                crate::rho_optimizer::asymptote_certificate::AsymptoteSide::Upper =>
+                                    "↑",
+                                crate::rho_optimizer::asymptote_certificate::AsymptoteSide::Lower =>
+                                    "↓",
+                            },
+                            rail.tail_constant,
+                            rail.value_gap,
+                            rail.estimand_travel_bound,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "asymptote-rail |Pg_interior|={interior_projected_grad_norm:.3e} bound={bound:.3e} rails=[{rail_summary}]"
+                )
+            }
         };
         format!(
             "{stationarity} hessian_psd={} railed={:?} → {}",
