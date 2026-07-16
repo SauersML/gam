@@ -5008,10 +5008,19 @@ mod tests {
         eprintln!(
             "[RAIL-FD] rho=[{RAIL_RHO0:.9}, {FREE_RHO1}] value={value:.9} inner_H min_ev={min_ev:.3e} max_ev={max_ev:.3e} cond={cond:.3e}"
         );
+        // (a2) amplification witness (#2298): the logdet ρ-gradient is the tiny
+        // difference of two ~rank-magnitude traces (`half_dlogdetH ≈ −neg_half_dlogdetS`),
+        // so `max(|canceling term|)/|gradient|` is the catastrophic-cancellation
+        // conditioning number that makes |Pg| host-arithmetic-dependent at the rail.
+        // Recording it here (pre-fix ~2e4 on the railed coordinate) means the fused-
+        // trace reformulation's round will show this DROP to O(1) as a witness diff.
+        let mut amplification = vec![0.0_f64; rho.len()];
         for j in 0..rho.len() {
             let (dt1, dt2, dt3) = fd_terms[j];
+            amplification[j] = dt2.abs().max(dt3.abs()) / analytic[j].abs().max(f64::MIN_POSITIVE);
+            let amp = amplification[j];
             eprintln!(
-                "[RAIL-FD] rho[{j}]: analytic_total={:.6e} fd_total={:.6e} abs_err={:.3e} | fd_terms: half_d(dev+pen)={dt1:.6e} half_dlogdetH={dt2:.6e} neg_half_dlogdetS={dt3:.6e}",
+                "[RAIL-FD] rho[{j}]: analytic_total={:.6e} fd_total={:.6e} abs_err={:.3e} amplification={amp:.3e} | fd_terms: half_d(dev+pen)={dt1:.6e} half_dlogdetH={dt2:.6e} neg_half_dlogdetS={dt3:.6e}",
                 analytic[j],
                 fd[j],
                 (analytic[j] - fd[j]).abs()
@@ -5026,6 +5035,71 @@ mod tests {
                  analytic={:.6e} fd={:.6e} (inner H cond={cond:.3e}); see the per-term [RAIL-FD] grid above",
                 analytic[j],
                 fd[j],
+            );
+        }
+
+        // Generous ceiling for now (no O(1) threshold until the fused-trace fix
+        // lands); this only records that the amplification is finite/bounded on a
+        // green gate. The railed coordinate is expected here to be ~2e4 pre-fix.
+        let max_amplification = amplification
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_amplification.is_finite() && max_amplification <= 1.0e8,
+            "rail logdet-gradient amplification ratio not finite/bounded: {max_amplification:.3e}"
+        );
+    }
+
+    /// Interior-ρ companion to the rail gate (#2298). Away from the over-smoothing
+    /// rail the two logdet traces do NOT cancel, so the analytic ρ-gradient must
+    /// match FD tightly and the amplification is O(1). This is the value baseline
+    /// the (a2) fused-trace reformulation must PRESERVE exactly — the reformulation
+    /// changes only rounding at the rail, never the derivative value — so post-fix
+    /// this doubles as the old-vs-new equality anchor at a non-cancelling point.
+    #[test]
+    fn survival_laml_rho_gradient_matches_fd_at_interior_rho() {
+        const INTERIOR_RHO0: f64 = 0.3;
+        const INTERIOR_RHO1: f64 = -0.5;
+        const FD_STEP: f64 = 1.0e-4;
+
+        let beta0 = array![-2.5_f64, 1.0];
+        let rho = array![INTERIOR_RHO0, INTERIOR_RHO1];
+        let model = laml_rail_fd_test_model(INTERIOR_RHO0.exp(), INTERIOR_RHO1.exp());
+        let (_value, analytic) = model
+            .evaluate_survival_lamlcost_and_gradient(
+                rho.as_slice().expect("contiguous rho"),
+                &beta0,
+            )
+            .expect("interior LAML analytic value+gradient");
+
+        for j in 0..rho.len() {
+            let mut plus = rho.clone();
+            plus[j] += FD_STEP;
+            let mut minus = rho.clone();
+            minus[j] -= FD_STEP;
+            let fp = model
+                .evaluate_survival_lamlcost_and_gradient(
+                    plus.as_slice().expect("contiguous rho"),
+                    &beta0,
+                )
+                .expect("interior LAML f+")
+                .0;
+            let fm = model
+                .evaluate_survival_lamlcost_and_gradient(
+                    minus.as_slice().expect("contiguous rho"),
+                    &beta0,
+                )
+                .expect("interior LAML f-")
+                .0;
+            let fd = (fp - fm) / (2.0 * FD_STEP);
+            let tol = 1.0e-4 * (1.0 + analytic[j].abs().max(fd.abs()));
+            assert!(
+                (analytic[j] - fd).abs() <= tol,
+                "interior survival LAML ρ-gradient mismatch at coordinate {j}: \
+                 analytic={:.6e} fd={:.6e}",
+                analytic[j],
+                fd,
             );
         }
     }
