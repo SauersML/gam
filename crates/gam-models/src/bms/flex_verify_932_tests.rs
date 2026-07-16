@@ -753,6 +753,9 @@ fn standard_normal_flex_canonical_derivative_ladder_matches_vgh_t3_t4_932() {
     let mut max_34 = 0.0_f64;
     let hessian_direction = base.hessian.dot(&direction);
     let fourth = base.fourth.as_ref().expect("requested t4 channel");
+    // #2347 instrumentation: per-entry H->t3 gap with the order-2 gap at the
+    // same (u,v), so the argmax can be classified against the block layout.
+    let mut h3_rows: Vec<(f64, usize, usize, f64, f64, f64)> = Vec::new();
     for u in 0..primary.total {
         let gradient_fd = (plus.gradient[u] - minus.gradient[u]) / (2.0 * step);
         max_gh = max_gh.max(derivative_ladder_relative_error(
@@ -761,10 +764,9 @@ fn standard_normal_flex_canonical_derivative_ladder_matches_vgh_t3_t4_932() {
         ));
         for v in 0..primary.total {
             let third_fd = (plus.hessian[[u, v]] - minus.hessian[[u, v]]) / (2.0 * step);
-            max_h3 = max_h3.max(derivative_ladder_relative_error(
-                base.third[[u, v]],
-                third_fd,
-            ));
+            let h3_err = derivative_ladder_relative_error(base.third[[u, v]], third_fd);
+            max_h3 = max_h3.max(h3_err);
+            h3_rows.push((h3_err, u, v, base.third[[u, v]], third_fd, base.hessian[[u, v]]));
             let fourth_fd = (plus.third[[u, v]] - minus.third[[u, v]]) / (2.0 * step);
             max_34 = max_34.max(derivative_ladder_relative_error(fourth[[u, v]], fourth_fd));
             assert_eq!(
@@ -783,6 +785,41 @@ fn standard_normal_flex_canonical_derivative_ladder_matches_vgh_t3_t4_932() {
                 "canonical StandardNormal t4[d,d] lost exact symmetry at [{u},{v}]"
             );
         }
+    }
+
+    // #2347 instrumentation: classify each primary index by block and dump the
+    // worst H->t3 entries. Prints before the acceptance asserts so it survives
+    // the red run.
+    let classify = |idx: usize| -> String {
+        if idx == primary.q {
+            "q".to_string()
+        } else if idx == primary.logslope {
+            "logslope".to_string()
+        } else if h_range.contains(&idx) {
+            format!("h{}", idx - h_range.start)
+        } else if w_range.contains(&idx) {
+            format!("w{}", idx - w_range.start)
+        } else {
+            format!("?{idx}")
+        }
+    };
+    eprintln!(
+        "#2347 layout: total={} q={} logslope={} h={:?} w={:?}",
+        primary.total, primary.q, primary.logslope, h_range, w_range
+    );
+    let gradient_fd_vec: Vec<f64> = (0..primary.total)
+        .map(|u| (plus.gradient[u] - minus.gradient[u]) / (2.0 * step))
+        .collect();
+    h3_rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    eprintln!("#2347 top H->t3 gaps (err | [block(u),block(v)] | analytic=base.third fd=d(H) | base.hessian | order2 gaps at u,v):");
+    for &(err, u, v, analytic, fd, hess) in h3_rows.iter().take(12) {
+        let gh_u = derivative_ladder_relative_error(hessian_direction[u], gradient_fd_vec[u]);
+        let gh_v = derivative_ladder_relative_error(hessian_direction[v], gradient_fd_vec[v]);
+        eprintln!(
+            "#2347   {err:.3e} | [{}({u}),{}({v})] | a={analytic:+.6e} fd={fd:+.6e} | H={hess:+.6e} | gh_u={gh_u:.2e} gh_v={gh_v:.2e}",
+            classify(u),
+            classify(v)
+        );
     }
 
     assert!(base.value.is_finite());
