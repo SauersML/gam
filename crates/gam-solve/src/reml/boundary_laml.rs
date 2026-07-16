@@ -23,6 +23,7 @@
 //!   unrestricted Gaussian normalizer — the criterion reduces to today's LAML.
 
 use gam_math::probability::{erfcx_nonnegative, normal_logcdf};
+use ndarray::{ArrayView1, ArrayView2};
 use std::f64::consts::{LN_2, PI};
 
 /// `ln(2π)`.
@@ -116,6 +117,107 @@ pub fn log_interior_boundary_g_derivatives(s: f64, h: f64) -> (f64, f64) {
     let d_s = sqrt_h * r;
     let d_h = -0.5 / h + s * r / (2.0 * sqrt_h);
     (d_s, d_h)
+}
+
+/// `−∂ log g/∂μ = (−μ + √h·r)/h`, the truncated-normal mean `m_a` of the
+/// half-line boundary factor (`r = φ(z)/Φ(−z)`, `z = μ/√h`). This is the
+/// coefficient the Proposition 4.3 (#2337 §4) first-order correction contracts
+/// with the precision off-diagonals.
+fn boundary_factor_trunc_mean(mu: f64, h: f64) -> f64 {
+    -log_boundary_g_derivatives(mu, h).0
+}
+
+/// `log I(μ, Λ)` — the log of the Gaussian orthant integral
+/// `∫_{ℝ₊^m} exp(−μᵀu − ½ uᵀ Λ u) du` — the exact boundary factor of the
+/// constrained Laplace normalizer over `m` active reduced-representative faces,
+/// with `Λ = Σ⁻¹` the PRECISION of the slack coordinates
+/// (`Σ = C_A H̄⁻¹ C_Aᵀ`), evaluated by the Proposition 4.3 (#2337 §4)
+/// diagonal-anchored expansion:
+///
+/// ```text
+///   log I = Σ_a log g(μ_a, Λ_aa) − Σ_{a<b} Λ_ab · m_a · m_b + O(‖Λ_off‖²),
+/// ```
+///
+/// `m_a = −∂_μ log g(μ_a, Λ_aa)` the truncated-normal mean. Exact through first
+/// order in the off-diagonal precision: at diagonal `Λ` the orthant factorizes
+/// into the per-face `g`, and `∂_{Λ_ab}` of the integrand is `−u_a u_b`, whose
+/// expectation factorizes to `−m_a m_b` at the diagonal reference. The wiring
+/// supplies `Λ = Σ⁻¹` (m×m, small — the reduced face size) and, separately, the
+/// `det Σ` bookkeeping the criterion also needs (the exact boundary correction
+/// to the log-normalizer is `−(m/2)·ln(2π) − ½·ln det Σ + log I`).
+pub fn log_gaussian_orthant(mu: ArrayView1<'_, f64>, precision: ArrayView2<'_, f64>) -> f64 {
+    let m = mu.len();
+    assert_boundary_precision_shape(m, precision);
+    let mut trunc = Vec::with_capacity(m);
+    let mut acc = 0.0;
+    for a in 0..m {
+        let laa = precision[[a, a]];
+        acc += log_boundary_g(mu[a], laa);
+        trunc.push(boundary_factor_trunc_mean(mu[a], laa));
+    }
+    for a in 0..m {
+        for b in (a + 1)..m {
+            acc -= precision[[a, b]] * trunc[a] * trunc[b];
+        }
+    }
+    acc
+}
+
+/// Deterministic two-sided bracket on `log I(μ, Λ)` (Theorem 4.4, #2337 §4).
+///
+/// Loewner monotonicity: `diag(Λ) − s·I ⪯ Λ ⪯ diag(Λ) + s·I` for any
+/// `s ≥ ‖Λ_off‖₂`, and each per-face `g(μ_a, ·)` is decreasing in its curvature,
+/// so
+///
+/// ```text
+///   Σ_a log g(μ_a, Λ_aa + s)  ≤  log I  ≤  Σ_a log g(μ_a, Λ_aa − s).
+/// ```
+///
+/// `s` is taken as the Gershgorin off-diagonal row-sum bound
+/// `max_a Σ_{b≠a} |Λ_ab| ≥ ‖Λ_off‖₂` (exact for `m ≤ 2`, conservative and
+/// eigensolve-free above), so the bracket is always valid. When any
+/// `Λ_aa − s ≤ 0` the upper factor's curvature is non-positive and the bound
+/// diverges — returned as `+∞`, the escalation signal (block-partition /
+/// tanh-sinh) the criterion uses when the bracket exceeds tolerance.
+pub fn log_gaussian_orthant_bracket(
+    mu: ArrayView1<'_, f64>,
+    precision: ArrayView2<'_, f64>,
+) -> (f64, f64) {
+    let m = mu.len();
+    assert_boundary_precision_shape(m, precision);
+    // Gershgorin bound on ‖Λ_off‖₂: the max absolute off-diagonal row sum.
+    let mut s = 0.0_f64;
+    for a in 0..m {
+        let mut row = 0.0_f64;
+        for b in 0..m {
+            if a != b {
+                row += precision[[a, b]].abs();
+            }
+        }
+        s = s.max(row);
+    }
+    let mut lower = 0.0;
+    let mut upper = 0.0;
+    for a in 0..m {
+        let laa = precision[[a, a]];
+        lower += log_boundary_g(mu[a], laa + s);
+        if laa - s > 0.0 {
+            upper += log_boundary_g(mu[a], laa - s);
+        } else {
+            upper = f64::INFINITY;
+        }
+    }
+    (lower, upper)
+}
+
+#[inline]
+fn assert_boundary_precision_shape(m: usize, precision: ArrayView2<'_, f64>) {
+    assert!(
+        precision.nrows() == m && precision.ncols() == m,
+        "boundary orthant precision must be {m}x{m}, got {}x{}",
+        precision.nrows(),
+        precision.ncols()
+    );
 }
 
 #[cfg(test)]
@@ -307,5 +409,124 @@ mod tests {
                 "∂logg_int/∂h mismatch at ({s},{h}): analytic {d_h} vs fd {fd_h}"
             );
         }
+    }
+
+    /// log of the exact 2D Gaussian orthant integral
+    /// `∫₀^∞∫₀^∞ exp(−μ·u − ½ uᵀ Λ u) du` by composite-Simpson quadrature — the
+    /// ground truth for the Proposition 4.3 / Theorem 4.4 checks (mirrors
+    /// exp2_orthant.py::exact_2d).
+    fn exact_2d_log_orthant(mu: [f64; 2], lam: [[f64; 2]; 2]) -> f64 {
+        let (h1, h2, c) = (lam[0][0], lam[1][1], lam[0][1]);
+        let u1_max = 12.0 / h1.sqrt() + (mu[0] / h1).abs() * 3.0 + 3.0;
+        let u2_max = 12.0 / h2.sqrt() + (mu[1] / h2).abs() * 3.0 + 3.0;
+        let n = 1200usize; // even
+        let s1 = u1_max / n as f64;
+        let s2 = u2_max / n as f64;
+        let f = |u1: f64, u2: f64| {
+            (-mu[0] * u1 - mu[1] * u2 - 0.5 * (h1 * u1 * u1 + h2 * u2 * u2 + 2.0 * c * u1 * u2)).exp()
+        };
+        let w = |i: usize| {
+            if i == 0 || i == n {
+                1.0
+            } else if i % 2 == 1 {
+                4.0
+            } else {
+                2.0
+            }
+        };
+        let mut acc = 0.0;
+        for i in 0..=n {
+            let wi = w(i);
+            let u1 = s1 * i as f64;
+            for j in 0..=n {
+                acc += wi * w(j) * f(u1, s2 * j as f64);
+            }
+        }
+        (acc * s1 * s2 / 9.0).ln()
+    }
+
+    fn precision_2x2(h: [f64; 2], c: f64) -> ndarray::Array2<f64> {
+        ndarray::array![[h[0], c], [c, h[1]]]
+    }
+
+    #[test]
+    fn log_gaussian_orthant_diagonal_is_exact_product() {
+        // Zero off-diagonal: the orthant factorizes, so log I = Σ log g exactly
+        // and matches the 2D quadrature.
+        let mu = ndarray::array![0.7_f64, -0.4];
+        let h = [2.0_f64, 0.9];
+        let lam = precision_2x2(h, 0.0);
+        let got = log_gaussian_orthant(mu.view(), lam.view());
+        let product = log_boundary_g(mu[0], h[0]) + log_boundary_g(mu[1], h[1]);
+        assert!((got - product).abs() <= 1e-14 * product.abs().max(1.0));
+        let quad = exact_2d_log_orthant([mu[0], mu[1]], [[h[0], 0.0], [0.0, h[1]]]);
+        assert!(
+            (got - quad).abs() < 5e-6,
+            "diagonal orthant {got} vs quadrature {quad}"
+        );
+    }
+
+    #[test]
+    fn log_gaussian_orthant_first_order_correction_beats_product() {
+        // The Prop 4.3 −Λ_ab m_a m_b correction is first-order exact: its error
+        // is O(c²), strictly smaller than the product form's O(c) error, and
+        // shrinks quadratically as c → 0 (mirrors exp2_orthant.py).
+        let mu = ndarray::array![0.7_f64, -0.4];
+        let h = [2.0_f64, 0.9];
+        let product = log_boundary_g(mu[0], h[0]) + log_boundary_g(mu[1], h[1]);
+        // Ratio corrected_err/product_err ~ O(c²)/O(c) = O(c): the correction is
+        // strictly better AND its relative advantage grows as c → 0. Both are
+        // constant-free (robust) signatures of first-order exactness — no
+        // magic-number tolerance on the residual magnitude.
+        let mut prev_relative: Option<f64> = None;
+        for &c in &[0.4_f64, 0.2, 0.1, 0.05] {
+            let lam = precision_2x2(h, c);
+            let corrected = log_gaussian_orthant(mu.view(), lam.view());
+            let exact = exact_2d_log_orthant([mu[0], mu[1]], [[h[0], c], [c, h[1]]]);
+            let product_err = (product - exact).abs();
+            let corrected_err = (corrected - exact).abs();
+            assert!(
+                corrected_err < product_err,
+                "c={c}: corrected err {corrected_err:.3e} not < product err {product_err:.3e}"
+            );
+            let relative = corrected_err / product_err;
+            if let Some(prev) = prev_relative {
+                assert!(
+                    relative < prev,
+                    "c={c}: corrected/product err ratio {relative:.3e} did not shrink below {prev:.3e} as c decreased"
+                );
+            }
+            prev_relative = Some(relative);
+        }
+    }
+
+    #[test]
+    fn log_gaussian_orthant_bracket_contains_exact() {
+        // Theorem 4.4 Loewner bracket must two-side the exact log I.
+        let mu = ndarray::array![0.7_f64, -0.4];
+        let h = [2.0_f64, 0.9];
+        for &c in &[0.4_f64, 0.2, 0.1] {
+            let lam = precision_2x2(h, c);
+            let (lo, hi) = log_gaussian_orthant_bracket(mu.view(), lam.view());
+            let exact = exact_2d_log_orthant([mu[0], mu[1]], [[h[0], c], [c, h[1]]]);
+            assert!(
+                lo <= exact && exact <= hi,
+                "c={c}: bracket [{lo:.6}, {hi:.6}] excludes exact {exact:.6}"
+            );
+            // The Prop 4.3 estimate also sits inside its own rigor bracket.
+            let est = log_gaussian_orthant(mu.view(), lam.view());
+            assert!(lo <= est && est <= hi, "c={c}: estimate {est} outside bracket");
+        }
+    }
+
+    #[test]
+    fn log_gaussian_orthant_bracket_escalates_on_nonpositive_curvature() {
+        // A large off-diagonal precision drives Λ_aa − s ≤ 0; the upper bound
+        // must report +∞ (escalate), never panic on a non-positive curvature.
+        let mu = ndarray::array![0.3_f64, 0.1];
+        let lam = precision_2x2([1.0, 1.0], 1.5); // s = 1.5 > diag 1.0
+        let (lo, hi) = log_gaussian_orthant_bracket(mu.view(), lam.view());
+        assert!(lo.is_finite());
+        assert!(hi.is_infinite(), "non-positive upper curvature must escalate to +∞");
     }
 }
