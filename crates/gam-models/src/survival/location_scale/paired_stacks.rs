@@ -58,7 +58,7 @@ const PROBIT_LEFT_TAIL_CUTOFF: f64 = -38.0;
 /// `event[k]` is `s_{k+1}ᵉᵛ` and `censored[k]` is `s_{k+1}ᶜᵉⁿˢ` (index 0 → the
 /// first derivative order).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct PairedNeglogStacks {
+pub struct PairedNeglogStacks {
     pub(crate) event: [f64; 4],
     pub(crate) censored: [f64; 4],
 }
@@ -70,7 +70,7 @@ pub(crate) struct PairedNeglogStacks {
 /// `0.0` for a shared entry/exit channel — the truncation-instant event case).
 /// Returns `None` for links without a closed-form pairing (the consumer falls
 /// back to plain stack differences) and for the probit left tail.
-pub(crate) fn paired_neglog_stacks(
+pub fn paired_neglog_stacks(
     link: &InverseLink,
     u0: f64,
     u1: f64,
