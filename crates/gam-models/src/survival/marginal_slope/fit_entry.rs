@@ -1,6 +1,10 @@
 //! The public fitting entry point `fit_survival_marginal_slope_terms`.
 
 use super::*;
+use crate::bms::block_specs::{
+    ReducedLogslopeOutcome, ReducedLogslopeReparam, reduced_logslope_transform_effective,
+    reparameterize_logslope_design_reduced,
+};
 
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
@@ -459,6 +463,74 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             );
         }
         out
+    };
+    // ---- Cross-block logslope↔marginal identifiability reduction (task #24) ----
+    // `marginal_surface` and `logslope_surface` share their affine/constant
+    // modes; the shared direction `(v, −v)` is BOTH design-null (aliased
+    // surfaces) AND penalty-null (affine ∈ each tensor penalty's nullspace) — a
+    // genuine `ker(J) ∩ ker(S)` the channel-aware identifiability audit correctly
+    // refuses. The auxiliary score_warp/link_dev residualization above does NOT
+    // deduplicate the two anchor surfaces against each other. Mirror the BMS
+    // reduced-logslope reparam (`bms::block_specs`): build the EFFECTIVE-Jacobian
+    // reduced basis `T` (logslope cedes to marginal in the pilot row metric) from
+    // the β/ρ-independent pilot geometry, reparameterize the logslope design to
+    // `G·T` with penalties `Tᵀ S T`, seed the warm start in the reduced basis,
+    // and lift the reported β back to the original basis at assembly. Placed after
+    // the flex-block section (so score_warp/link_dev keep the full-width anchor)
+    // and before the ρ-seed / joint setup so every downstream block + family
+    // build sees the reduced design uniformly.
+    let logslope_reduced_reparam: Option<ReducedLogslopeReparam> = {
+        let marginal_dense = marginal_design
+            .design
+            .try_to_dense_by_chunks("survival marginal-slope logslope-reduce: marginal span")?;
+        let logslope_dense = logslope_design
+            .design
+            .try_to_dense_by_chunks("survival marginal-slope logslope-reduce: logslope span")?;
+        match reduced_logslope_transform_effective(
+            marginal_dense.view(),
+            logslope_dense.view(),
+            &z_primary,
+            &cross_block_pilot_w,
+            &spec.marginal_offset,
+            &spec.logslope_offset,
+            0.0,
+            baseline_slope,
+            probit_scale,
+        )
+        .map_err(|e| format!("survival marginal-slope logslope reduction: {e}"))?
+        {
+            ReducedLogslopeOutcome::Reduced(transform) => {
+                Some(ReducedLogslopeReparam::from_transform(transform))
+            }
+            ReducedLogslopeOutcome::FullRank => None,
+            ReducedLogslopeOutcome::FullyConfounded => {
+                return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                    reason: "survival marginal-slope logslope block is fully confounded with \
+                             the marginal index: every effective logslope direction diag(f)·G·v \
+                             is W-explained by the effective marginal span at the pilot, so the \
+                             data identify only the sum of the marginal and logslope surfaces. \
+                             Remove the logslope terms or supply covariates that separate them \
+                             from the marginal index."
+                        .to_string(),
+                }
+                .into());
+            }
+        }
+    };
+    // Retain the full-width logslope design for the fit RESULT (prediction and
+    // reporting rebuild/consume it at the original width); the reduced design and
+    // reduced warm start drive the joint solve.
+    let logslope_design_full = logslope_design.clone();
+    let (logslope_design, pilot_logslope_beta) = match logslope_reduced_reparam.as_ref() {
+        Some(reparam) => {
+            let reduced_design = reparameterize_logslope_design_reduced(&logslope_design, reparam)
+                .map_err(|e| format!("survival marginal-slope logslope reparam: {e}"))?;
+            let reduced_pilot = reparam
+                .reduce_beta(&pilot_logslope_beta)
+                .map_err(|e| format!("survival marginal-slope logslope pilot reduce: {e}"))?;
+            (reduced_design, reduced_pilot)
+        }
+        None => (logslope_design, pilot_logslope_beta),
     };
     let core_rho0_seed: Vec<f64> = {
         let mut seeds = Vec::with_capacity(
@@ -1500,7 +1572,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // Log the outer-solve outcome on BOTH paths: the inner-solve non-convergence
     // abort (#979/#1040) returns Err before the success log below, so without
     // this the failure stage would be invisible to a `log` backend.
-    let solved = match solved {
+    let mut solved = match solved {
         Ok(s) => s,
         Err(e) => {
             log::warn!(
@@ -1559,6 +1631,26 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         (residuals, curvatures, selected_baseline)
     };
 
+    // Lift the fitted logslope coefficients from the reduced basis β' back to the
+    // original basis β = T·β' (block index 2: time=0, marginal=1, logslope=2) so
+    // the reported/saved coefficients match the full-width logslope design that
+    // prediction rebuilds from the term spec. Done AFTER the final family's
+    // offset-channel geometry (which consumes the reduced fitted basis) and
+    // before the result is assembled with `logslope_design_full`.
+    if let Some(reparam) = logslope_reduced_reparam.as_ref() {
+        const LOGSLOPE_BLOCK: usize = 2;
+        if let Some(block) = solved.fit.blocks.get_mut(LOGSLOPE_BLOCK) {
+            block.beta = reparam
+                .recover_original_logslope_beta(&block.beta)
+                .map_err(|e| format!("survival marginal-slope logslope β recover (block): {e}"))?;
+        }
+        if let Some(state) = solved.fit.block_states.get_mut(LOGSLOPE_BLOCK) {
+            state.beta = reparam
+                .recover_original_logslope_beta(&state.beta)
+                .map_err(|e| format!("survival marginal-slope logslope β recover (state): {e}"))?;
+        }
+    }
+
     let mut resolved_specs = solved.resolved_specs;
     let designs = solved.designs;
     Ok(SurvivalMarginalSlopeFitResult {
@@ -1566,7 +1658,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         marginalspec_resolved: resolved_specs.remove(0),
         logslopespec_resolved: resolved_specs.remove(0),
         marginal_design: designs[0].clone(),
-        logslope_design: designs[1].clone(),
+        // Full-width original logslope design (the fit used the reduced G·T basis;
+        // the reported β was lifted back to this basis above), so the saved
+        // (design, β) pair is width-matched for prediction and reporting.
+        logslope_design: logslope_design_full,
         gaussian_frailty_sd: final_sigma,
         baseline_config: final_baseline_config,
         baseline_slope,

@@ -412,13 +412,21 @@ pub(crate) const LOGSLOPE_REDUCED_BASIS_RELATIVE_TOL: f64 = 1.0e-6;
 /// `β_logslope = T·β'` make the family's geometry consistent at width `r` and
 /// recover the original-basis logslope coefficients for prediction/reporting.
 #[derive(Debug, Clone)]
-pub(super) struct ReducedLogslopeReparam {
+pub(crate) struct ReducedLogslopeReparam {
     /// Reduced transform `T` (`p_logslope × r`). `G_reduced = G·T`,
     /// `β_logslope = T·β'`, `S_reduced = Tᵀ S T`.
     transform: Array2<f64>,
 }
 
 impl ReducedLogslopeReparam {
+    /// Wrap a reduced transform `T` (`p_logslope × r`, orthonormal columns) as
+    /// produced by [`reduced_logslope_transform_effective`]. Lets callers in
+    /// other marginal-slope families (e.g. survival) build the reparam from the
+    /// shared effective-Jacobian geometry without re-deriving the round-trip.
+    pub(crate) fn from_transform(transform: Array2<f64>) -> Self {
+        Self { transform }
+    }
+
     /// Original (full) logslope width `p_logslope`.
     #[inline]
     pub(super) fn original_cols(&self) -> usize {
@@ -431,10 +439,25 @@ impl ReducedLogslopeReparam {
         self.transform.ncols()
     }
 
+    /// Project a full-width logslope coefficient `β` (length `p_logslope`) into
+    /// the reduced basis, `β' = Tᵀ·β` (length `r`). `T` has orthonormal columns,
+    /// so `Tᵀ` is its left inverse and this is the least-squares reduction of a
+    /// full-width warm start onto `span(T)`.
+    pub(crate) fn reduce_beta(&self, beta_full: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if beta_full.len() != self.original_cols() {
+            return Err(format!(
+                "reduced logslope reparam: β length ({}) != original width ({})",
+                beta_full.len(),
+                self.original_cols()
+            ));
+        }
+        Ok(self.transform.t().dot(beta_full))
+    }
+
     /// Map a reduced-basis logslope coefficient `β'` (length `r`) back to the
     /// original logslope basis `β_logslope = T·β'` (length `p_logslope`), so
     /// prediction/reporting are unchanged-in-meaning.
-    pub(super) fn recover_original_logslope_beta(
+    pub(crate) fn recover_original_logslope_beta(
         &self,
         beta_reduced: &Array1<f64>,
     ) -> Result<Array1<f64>, String> {
@@ -715,7 +738,7 @@ pub(crate) fn reduced_logslope_transform_effective(
 /// `S_reduced = Tᵀ S T` over the full reduced column range `0..r`. The reduced
 /// penalty's null space is recomputed from its numerical rank so the REML
 /// log-determinant accounting stays consistent at the reduced width.
-fn reparameterize_logslope_design_reduced(
+pub(crate) fn reparameterize_logslope_design_reduced(
     logslope_design: &TermCollectionDesign,
     reparam: &ReducedLogslopeReparam,
 ) -> Result<TermCollectionDesign, String> {
