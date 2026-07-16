@@ -928,6 +928,73 @@ pub fn reml_laml_evaluate(
             None
         };
 
+    // Cancellation-free fused logdet gradient for singleton penalty blocks (a2).
+    //
+    // On the exact-dense-spectral path the ρ_k-gradient of `½·log|H|` subtracts
+    // the det derivative `first[k] = ∂_{ρ_k} log|S(λ)|₊` from `½·tr(G_ε(H)·Ḣ_k)`.
+    // When coordinate k is the SOLE penalty of its span, `first[k]` is the exact
+    // integer `rank(S_k)`, and at the over-smoothing rail (H ≈ λ_k S_k) the trace
+    // `tr(G_ε(H)·λ_k S_k) → rank(S_k)`, so `trace − first` catastrophically
+    // cancels — the surviving O(1/λ_k) gradient is then decided by the last bits
+    // of a rank-sized sum and drifts with the host's summation order. For those
+    // coordinates we fuse the subtraction eigenpair-by-eigenpair so the result is
+    // host-arithmetic-independent (see
+    // `DenseSpectralOperator::fused_logdet_gradient_minus_rank_full_block`).
+    //
+    // The fused identity holds ONLY for a square full-rank block whose det
+    // derivative equals the integer rank, and only over the complete eigenbasis.
+    // Every other coordinate (coalesced multi-penalty blocks whose `first[k]` is
+    // the fractional `λ_k·tr(S⁺S_k)`, rank-deficient roots, masked null spaces)
+    // is left `None` here and takes the unmodified trace − det path below.  The
+    // stochastic-SLQ branch is intentionally out of scope and unifies under
+    // #2331.
+    let fused_logdet_minus_rank: Vec<Option<f64>> = if incl_logdet_h
+        && incl_logdet_s
+        && stochastic_trace_values.is_none()
+        && projected_trace_values.is_none()
+    {
+        match hop.as_exact_dense_spectral() {
+            Some(ds) if ds.active_rank() == ds.dim() => (0..k)
+                .map(|idx| {
+                    if upper_active_rho[idx] {
+                        return None;
+                    }
+                    let coord = &solution.penalty_coords[idx];
+                    let rank = coord.rank();
+                    let (s_block, start, end) = coord.scaled_block_local(1.0);
+                    // Square full-rank block whose det derivative is the integer
+                    // rank: `P_k` is the block-coordinate identity, so the
+                    // fused subtraction is exact and value-identical to the
+                    // `trace − first[idx]` it replaces.
+                    let is_square_full_rank = end - start == rank;
+                    let det_is_integer_rank = (solution.penalty_logdet.first[idx] - rank as f64)
+                        .abs()
+                        <= 1e-9 * (1.0 + rank as f64);
+                    if !is_square_full_rank || !det_is_integer_rank {
+                        return None;
+                    }
+                    let fused = ds.fused_logdet_gradient_minus_rank_full_block(
+                        &s_block,
+                        start,
+                        end,
+                        curvature_lambdas[idx],
+                    );
+                    // The family curvature correction C[v_k] has no paired det
+                    // term; add its logdet trace back so the fused value equals
+                    // `tr(G_ε·(λ_k S_k + C)) − rank`.
+                    let correction_trace = rho_corrections[idx]
+                        .as_ref()
+                        .map(|c| c.trace_logdet(hop))
+                        .unwrap_or(0.0);
+                    Some(fused + correction_trace)
+                })
+                .collect(),
+            _ => vec![None; k],
+        }
+    } else {
+        vec![None; k]
+    };
+
     // ── Gradient: one shared formula for ALL coordinate types ──
     //
     // Both ρ and ext coordinates are processed through outer_gradient_entry()
@@ -1018,51 +1085,61 @@ pub fn reml_laml_evaluate(
             // `hessian_logdet_correction ≠ 0` (they treat sub-threshold
             // eigendirections differently), so the pairing with the cost
             // identity is what keeps analytic and FD gradients on one surface.
-            let trace_logdet_i = if !incl_logdet_h {
-                0.0
-            } else if let Some(ref stoch_traces) = stochastic_trace_values {
-                stoch_traces[idx]
-            } else if let Some(ref projected_traces) = projected_trace_values {
-                projected_traces[idx]
-            } else if let Some(ref exact_traces) = exact_dense_trace_values {
-                exact_traces[idx]
-            } else if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
-                let drift = penalty_total_drift_result(
-                    coord,
-                    curvature_lambdas[idx],
-                    rho_corrections[idx].as_ref(),
-                );
-                match drift {
-                    DriftDerivResult::Dense(matrix) => kernel.trace_projected_logdet(&matrix),
-                    DriftDerivResult::Operator(op) => kernel.trace_operator(op.as_ref()),
-                }
-            } else if let Some(correction_trace) = rho_operator_correction_traces
-                .as_ref()
-                .and_then(|traces| traces[idx])
-            {
-                let penalty_trace = if coord.is_block_local() {
+            // Fused (a2) path: `fused` already equals `tr(G_ε·Ḣ_k) − rank`, so
+            // the `−rank` det term is folded in and `ld_s_i` must be passed as
+            // 0 to `outer_gradient_entry` (subtracting it again would
+            // double-count). Every non-fused coordinate keeps the exact
+            // `trace_logdet_i` / `first[idx]` det pairing unchanged.
+            let (trace_logdet_i, ld_s_i) = if let Some(fused) = fused_logdet_minus_rank[idx] {
+                (fused, 0.0)
+            } else {
+                let trace = if !incl_logdet_h {
+                    0.0
+                } else if let Some(ref stoch_traces) = stochastic_trace_values {
+                    stoch_traces[idx]
+                } else if let Some(ref projected_traces) = projected_trace_values {
+                    projected_traces[idx]
+                } else if let Some(ref exact_traces) = exact_dense_trace_values {
+                    exact_traces[idx]
+                } else if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
+                    let drift = penalty_total_drift_result(
+                        coord,
+                        curvature_lambdas[idx],
+                        rho_corrections[idx].as_ref(),
+                    );
+                    match drift {
+                        DriftDerivResult::Dense(matrix) => kernel.trace_projected_logdet(&matrix),
+                        DriftDerivResult::Operator(op) => kernel.trace_operator(op.as_ref()),
+                    }
+                } else if let Some(correction_trace) = rho_operator_correction_traces
+                    .as_ref()
+                    .and_then(|traces| traces[idx])
+                {
+                    let penalty_trace = if coord.is_block_local() {
+                        let (block, start, end) = coord.scaled_block_local(1.0);
+                        hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
+                    } else {
+                        penalty_total_drift_result(coord, curvature_lambdas[idx], None)
+                            .trace_logdet(hop)
+                    };
+                    penalty_trace + correction_trace
+                } else if coord.is_block_local() && rho_corrections[idx].is_none() {
                     let (block, start, end) = coord.scaled_block_local(1.0);
                     hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
                 } else {
-                    penalty_total_drift_result(coord, curvature_lambdas[idx], None)
-                        .trace_logdet(hop)
+                    penalty_total_drift_result(
+                        coord,
+                        curvature_lambdas[idx],
+                        rho_corrections[idx].as_ref(),
+                    )
+                    .trace_logdet(hop)
                 };
-                penalty_trace + correction_trace
-            } else if coord.is_block_local() && rho_corrections[idx].is_none() {
-                let (block, start, end) = coord.scaled_block_local(1.0);
-                hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
-            } else {
-                penalty_total_drift_result(
-                    coord,
-                    curvature_lambdas[idx],
-                    rho_corrections[idx].as_ref(),
-                )
-                .trace_logdet(hop)
+                (trace, solution.penalty_logdet.first[idx])
             };
             let value = outer_gradient_entry(
                 a_i,
                 trace_logdet_i,
-                solution.penalty_logdet.first[idx],
+                ld_s_i,
                 &solution.dispersion,
                 dp_cgrad,
                 profiled_scale,
@@ -1075,8 +1152,8 @@ pub fn reml_laml_evaluate(
             // recover it without 91-line-per-iter stderr noise on default
             // runs.
             log::trace!(
-                "[RHO-GRAD] idx={} value={:+.6e} a_i={:+.6e} trace_logdet={:+.6e} ld_s_first={:+.6e} incl_h={} incl_s={}",
-                idx, value, a_i, trace_logdet_i, solution.penalty_logdet.first[idx], incl_logdet_h, incl_logdet_s
+                "[RHO-GRAD] idx={} value={:+.6e} a_i={:+.6e} trace_logdet={:+.6e} ld_s={:+.6e} fused={} incl_h={} incl_s={}",
+                idx, value, a_i, trace_logdet_i, ld_s_i, fused_logdet_minus_rank[idx].is_some(), incl_logdet_h, incl_logdet_s
             );
             (idx, value)
         })

@@ -215,6 +215,60 @@ impl DenseSpectralOperator {
         &self.g_factor
     }
 
+    /// Cancellation-free logdet-gradient reduction for a SQUARE FULL-RANK block
+    /// penalty: computes `tr(G_ε(H)·λ_k S_k) − rank(S_k)` with the `−rank`
+    /// subtraction distributed across eigenpairs.
+    ///
+    /// The ρ_k-gradient of the LAML `½·log|H|` cost carries the term
+    /// `½·(tr(G_ε(H)·λ_k S_k) − ∂_{ρ_k} log|S(λ)|₊)`.  For a penalty coordinate
+    /// whose block is the SOLE penalty of its span the det derivative is the
+    /// exact integer `rank(S_k)`, and at the over-smoothing rail (λ_k → ∞,
+    /// H ≈ λ_k S_k) the trace `tr(G_ε(H)·λ_k S_k) → rank(S_k)` so the difference
+    /// of the two aggregate quantities catastrophically cancels — the surviving
+    /// O(1/λ_k) gradient is then set by the last few bits of a `rank`-sized sum,
+    /// which drift with the host's FMA/SIMD summation order.  Reforming the
+    /// subtraction eigenpair-by-eigenpair keeps every intermediate at the true
+    /// O(1/λ_k) scale, so the result is host-arithmetic-independent.
+    ///
+    /// Uses the identity, valid ONLY when the block is square and full rank
+    /// (`end − start == rank(S_k)`), so the range projection `P_k` of `S_k` is
+    /// the block-coordinate identity:
+    ///
+    /// ```text
+    ///   tr(G_ε λ_k S_k) − rank = Σ_j [ λ_k · (g_jᵀ S_k g_j) − Σ_{i∈block} u_j[i]² ]
+    /// ```
+    ///
+    /// where `g_j = g_factor[:, j] = √φ'(σ_j)·u_j` and `u_j = eigenvectors[:, j]`.
+    /// The aggregate `Σ_j Σ_{i∈block} u_j[i]² = Σ_{i∈block} ‖U[i,:]‖² = width =
+    /// rank` holds only over the COMPLETE eigenbasis, so callers MUST gate on
+    /// `active_rank() == dim()` (no masked-out numerical null space); the
+    /// `first ≈ rank` gate at the call site is what certifies the block is a
+    /// proportional singleton whose det derivative is the integer rank.
+    pub(crate) fn fused_logdet_gradient_minus_rank_full_block(
+        &self,
+        s_block: &Array2<f64>,
+        start: usize,
+        end: usize,
+        scale: f64,
+    ) -> f64 {
+        let g_block = self.g_factor.slice(ndarray::s![start..end, ..]);
+        let u_block = self.eigenvectors.slice(ndarray::s![start..end, ..]);
+        // S_k · g_block once: (width × n), column j is S_k g_j[block].
+        let sg = s_block.dot(&g_block);
+        let mut fused = 0.0;
+        for j in 0..self.n_dim {
+            let s_term: f64 = sg
+                .column(j)
+                .iter()
+                .zip(g_block.column(j).iter())
+                .map(|(&a, &b)| a * b)
+                .sum();
+            let p_term: f64 = u_block.column(j).iter().map(|&u| u * u).sum();
+            fused += scale * s_term - p_term;
+        }
+        fused
+    }
+
     #[inline]
     pub(crate) fn trace_hinv_product_cross_rotated(
         &self,

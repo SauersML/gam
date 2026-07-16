@@ -302,6 +302,27 @@ fn zz_collapse_2132_heldout_ev_nondecreasing_and_beats_pca() {
 /// blocks the whole #2132/#2228 SAE acceptance lane.
 #[test]
 fn manifold_circle_mixture_seed_eval_terminates_2132() {
+    // The engine's `log::debug!` arbiter lines in `terminal_exact_newton_polish`
+    // (bail / step-committed / quotient-solver-refused) are SILENTLY DROPPED by the
+    // test harness unless a logger is installed — so a bare `--nocapture` run would
+    // show the refusal but not WHY. Forward every record to stderr so the discriminator
+    // lines surface without needing RUST_LOG (max level is set to Debug directly).
+    struct ForwardingTestLogger;
+    impl log::Log for ForwardingTestLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+        fn flush(&self) {}
+    }
+    static FORWARDING_TEST_LOGGER: ForwardingTestLogger = ForwardingTestLogger;
+    // Ignore the error when another test already installed a global logger.
+    if log::set_logger(&FORWARDING_TEST_LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Debug);
+    }
+
     // (C, P): matched-K (K=C) planted circle mixtures, small enough that one inner
     // solve is seconds. P = 2C + 2 keeps the C planes disjoint with ambient slack.
     const CONFIGS: [(usize, usize); 3] = [(2, 6), (3, 8), (4, 10)];

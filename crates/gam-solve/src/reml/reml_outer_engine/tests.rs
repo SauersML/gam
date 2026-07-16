@@ -201,6 +201,109 @@ pub(crate) fn dense_spectral_rotated_cross_kernels_match_scalar_references_bitwi
     );
 }
 
+// ─── (a2) fused logdet-gradient is cancellation-free at the over-smoothing rail ───
+//
+// The ρ_k-gradient of the LAML `½·log|H|` cost carries
+// `½·(tr(G_ε(H)·λ_k S_k) − rank(S_k))`. For a singleton penalty block at the
+// over-smoothing rail (`λ_k → ∞`, `H ≈ λ_k S_k`) the trace approaches `rank`, so
+// the NAIVE evaluation forms a ~rank-magnitude sum and subtracts the integer
+// rank — the surviving O(1/λ_k) gradient is then decided by the last bits of a
+// large accumulation and drifts with the host's summation order. The fused
+// per-eigenpair reformulation
+// (`fused_logdet_gradient_minus_rank_full_block`) never forms that large
+// intermediate, so on IDENTICAL spectral inputs its result matches a
+// compensated (Neumaier) reference to roundoff while the naive form's error is
+// amplified by the cancellation ratio `rank/|gradient|`. Both errors are
+// measured against the SAME eigendecomposition, so the eigensolver's own error
+// is common-mode and cancels — the ratio isolates the summation cure alone.
+#[test]
+pub(crate) fn fused_rail_logdet_gradient_beats_naive_trace_minus_rank_on_identical_spectrum() {
+    // Deep-rail 1×1 singleton block at coord 0: H[0,0] ≈ λ·s dominates a small,
+    // well-conditioned data Hessian on the remaining coordinates.
+    let p = 4usize;
+    let s_scalar = 3.0_f64;
+    let lambda = 1.0e6_f64;
+    let mut h = array![
+        [0.9_f64, 0.10, -0.05, 0.02],
+        [0.10, 1.30, 0.08, -0.04],
+        [-0.05, 0.08, 1.10, 0.06],
+        [0.02, -0.04, 0.06, 0.80],
+    ];
+    h[[0, 0]] += lambda * s_scalar;
+    let op = DenseSpectralOperator::from_symmetric(&h).expect("rail SPD fixture");
+    assert_eq!(
+        op.active_rank(),
+        p,
+        "smooth mode keeps the complete eigenbasis"
+    );
+
+    let s_block = array![[s_scalar]];
+
+    // Naive production form: full trace, then subtract the integer rank.
+    let naive = op.trace_logdet_block_local(&s_block, lambda, 0, 1) - 1.0;
+    // Fused production form.
+    let fused = op.fused_logdet_gradient_minus_rank_full_block(&s_block, 0, 1, lambda);
+
+    // Compensated (Neumaier) reference over the SAME per-eigenpair terms the
+    // fused method sums naively — the ground truth for the gradient value.
+    let g_block = op.g_factor.slice(ndarray::s![0..1, ..]);
+    let u_block = op.eigenvectors.slice(ndarray::s![0..1, ..]);
+    let sg = s_block.dot(&g_block);
+    let mut sum = 0.0_f64;
+    let mut comp = 0.0_f64;
+    for j in 0..op.n_dim {
+        let s_term: f64 = sg
+            .column(j)
+            .iter()
+            .zip(g_block.column(j).iter())
+            .map(|(&a, &b)| a * b)
+            .sum();
+        let p_term: f64 = u_block.column(j).iter().map(|&u| u * u).sum();
+        let d = lambda * s_term - p_term;
+        let t = sum + d;
+        if sum.abs() >= d.abs() {
+            comp += (sum - t) + d;
+        } else {
+            comp += (d - t) + sum;
+        }
+        sum = t;
+    }
+    let reference = sum + comp;
+
+    let err_naive = (naive - reference).abs();
+    let err_fused = (fused - reference).abs();
+    // Cancellation ratio of the naive form: |large canceling term| / |gradient|.
+    let cancellation = op.trace_logdet_block_local(&s_block, lambda, 0, 1).abs()
+        / reference.abs().max(f64::MIN_POSITIVE);
+    eprintln!(
+        "[FUSED-RAIL] reference={reference:.6e} naive={naive:.6e} fused={fused:.6e} \
+         err_naive={err_naive:.3e} err_fused={err_fused:.3e} cancellation={cancellation:.3e}"
+    );
+
+    // Value identity: the reformulation must not move the derivative.
+    assert!(
+        (fused - naive).abs() <= 1.0e-6 * (1.0 + reference.abs()),
+        "fused and naive rail gradient disagree beyond roundoff: fused={fused:.6e} naive={naive:.6e}"
+    );
+    // The fused form matches the compensated reference to roundoff.
+    assert!(
+        err_fused <= 1.0e-14 * (1.0 + reference.abs()),
+        "fused rail gradient not accurate to roundoff vs compensated reference: err_fused={err_fused:.3e}"
+    );
+    // The naive form is genuinely in the cancellation regime here.
+    assert!(
+        cancellation >= 1.0e4,
+        "fixture is not deep enough to exercise the cancellation: ratio={cancellation:.3e}"
+    );
+    // The witness: fusing the subtraction cuts the error by at least two orders
+    // of magnitude (in practice ~cancellation×). This is the 2e4 → O(1)
+    // effective-amplification drop that stabilizes cross-host |Pg| certification.
+    assert!(
+        err_naive >= 100.0 * err_fused.max(f64::MIN_POSITIVE),
+        "fused reformulation did not reduce the summation error: err_naive={err_naive:.3e} err_fused={err_fused:.3e}"
+    );
+}
+
 // ─── Batched kernel-trace factor must reproduce the exact kernel ─────
 //
 // `penalty_subspace_trace_drifts_batched` evaluates `tr(K·A_i)` for the
