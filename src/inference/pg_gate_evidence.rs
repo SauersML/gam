@@ -27,7 +27,7 @@
 //!
 //! ```text
 //! −log ∫ exp(−F_ω(g)) dg
-//!   = c_ω − ½ h_ωᵀ Q_ω⁻¹ h_ω + ½ log|Q_ω| − ½ d_g log(2π).
+//!   = c_ω − ½ h_ωᵀ Q_ω⁻¹ h_ω + ½ log|Q_ω| + ½ d_g log(2π).
 //! ```
 //!
 //! The `ω`-independent constant `c_ω` collects the `2^{−b}` PSW prefactor and
