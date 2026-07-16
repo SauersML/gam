@@ -47,7 +47,7 @@ pub(crate) use faer::sparse::{
     SparseColMatMut, SparseColMatRef, SparseRowMat, SymbolicSparseColMat, SymbolicSparseColMatRef,
 };
 
-pub(crate) use faer::{Accum, Par, Side, get_global_parallelism};
+pub(crate) use faer::{Accum, Par, Side, Unbind, get_global_parallelism};
 
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, ShapeBuilder, Zip};
 
