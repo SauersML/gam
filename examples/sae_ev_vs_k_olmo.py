@@ -67,6 +67,7 @@ import argparse
 import concurrent.futures
 import json
 import multiprocessing
+import threading
 import time
 
 import numpy as np
@@ -93,6 +94,43 @@ def _rss_mb() -> float:
     return maxrss / 1024.0 if _sys.platform != "darwin" else maxrss / (1024.0 * 1024.0)
 
 
+class _Heartbeat:
+    """Background thread stamping the in-flight phase every `period` seconds.
+
+    A fit blocks the parent on a spawn child with no timeout, so a slow arm and a
+    dead-hung arm look identical from the main line until the very end. The
+    heartbeat prints the current phase label and RSS on a fixed cadence, so a
+    >900 s run shows whether work is progressing (RSS/phase evolving) or wedged.
+    """
+
+    def __init__(self, period: float = 60.0) -> None:
+        self._period = period
+        self._phase = "startup"
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def set_phase(self, phase: str) -> None:
+        self._phase = phase
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._period):
+            print(
+                f"[HEARTBEAT +{time.perf_counter() - _WALL_ORIGIN:8.1f}s "
+                f"rss={_rss_mb():7.1f}MiB] in-flight: {self._phase}",
+                flush=True,
+            )
+
+    def __enter__(self) -> "_Heartbeat":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._stop.set()
+
+
+_HEARTBEAT: _Heartbeat | None = None
+
+
 def _stage(msg: str) -> None:
     """Emit a wall-clock+RSS phase marker so a hang localizes to a phase/arm.
 
@@ -102,6 +140,8 @@ def _stage(msg: str) -> None:
     the timing contract for #2267 — every phase boundary and every fit start/end
     is stamped with seconds-since-launch and peak RSS.
     """
+    if _HEARTBEAT is not None:
+        _HEARTBEAT.set_phase(msg)
     print(
         f"[STAGE +{time.perf_counter() - _WALL_ORIGIN:8.1f}s rss={_rss_mb():7.1f}MiB] {msg}",
         flush=True,
@@ -752,6 +792,10 @@ def main() -> None:
     if args.sep_mu is not None:
         print(f"[barrier] sep_mu={args.sep_mu}", flush=True)
 
+    global _HEARTBEAT
+    _HEARTBEAT = _Heartbeat()
+    _HEARTBEAT.__enter__()
+
     _stage("load activations START")
     x = _load_activations(args)
     _stage(f"load activations DONE shape={x.shape}")
@@ -942,6 +986,10 @@ def main() -> None:
         with open(args.out, "w") as f:
             json.dump(payload, f, indent=2)
         print(f"JSON -> {args.out}")
+
+    _stage("ALL DONE")
+    if _HEARTBEAT is not None:
+        _HEARTBEAT.__exit__()
 
 
 if __name__ == "__main__":
