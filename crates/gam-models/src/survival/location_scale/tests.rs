@@ -3330,6 +3330,97 @@ fn identified_time_block_constrains_monotone_timewiggle_tail_coefficients() {
     assert_eq!(prepared.initial_beta, Some(array![-0.5, 0.2, 0.0, 0.0]));
 }
 
+/// #2332 regression: a genuine monotone I-spline SHAPE column whose M-spline
+/// derivative support is inactive at every training row (a tail column beyond
+/// the largest training exit time) must still be bound `β ≥ 0` — the exact
+/// domain-wide monotonicity certificate — because it VARIES IN VALUE across the
+/// observed entry∪exit domain (which is exactly why `keep_cols` retained it).
+/// The old builder decided the sign cone from the training-row DERIVATIVE design
+/// alone, so this column read as all-zero (like the free constant column) and
+/// was left `NEG_INFINITY` (unconstrained); the penalized fit then drove it
+/// negative and produced a non-monotone warp at prediction horizons in its
+/// support. Column 2 below is exactly that tail column: value rises 0 → 0.6
+/// between the last two rows (so it survives `keep_cols`) while its exit-time
+/// derivative is 0 at every training row.
+#[test]
+fn structural_bounds_constrain_derivative_inactive_tail_shape_column() {
+    // col 0: free level/intercept (value-constant [1,1,1], derivative ≡ 0).
+    // col 1: ordinary active shape column (value varies, derivative active).
+    // col 2: TAIL shape column — value varies (0 → 0.6) but derivative ≈ 0 at
+    //        every training exit row (support lands past the largest exit time).
+    let design_entry =
+        DesignMatrix::from(array![[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 2.0, 0.0]]);
+    let design_exit =
+        DesignMatrix::from(array![[1.0, 0.5, 0.0], [1.0, 1.5, 0.0], [1.0, 2.5, 0.6]]);
+    let design_derivative_exit =
+        DesignMatrix::from(array![[0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]);
+    let derivative_offset_exit = Array1::from_elem(3, 1e-6);
+
+    let bounds = structural_time_coefficient_lower_bounds(
+        &design_entry,
+        &design_exit,
+        &design_derivative_exit,
+        &derivative_offset_exit,
+        1e-6,
+    )
+    .expect("structural bounds")
+    .expect("some bounds");
+    assert_eq!(bounds, array![f64::NEG_INFINITY, 0.0, 0.0]);
+    // The distinguishing signal is value-variation, NOT derivative activity:
+    // the tail column (col 2) is derivative-inactive at every training row yet
+    // is still bound because its value varies over entry∪exit.
+    assert!(bounds[2] == 0.0, "derivative-inactive tail column must be bound");
+}
+
+/// #2332 corollary: a genuinely value-CONSTANT column (the free level/intercept)
+/// must stay unconstrained even when other columns are shape columns. This pins
+/// the classifier to the `keep_cols` value-variation criterion: only the
+/// value-constant baseline level stays free.
+#[test]
+fn structural_bounds_keep_constant_level_column_free() {
+    // Two value-constant columns (a constant 1 level and a constant 0 pad) plus
+    // one value-varying shape column. Only the shape column is bound.
+    let design_entry =
+        DesignMatrix::from(array![[1.0, 0.0, 0.2], [1.0, 0.0, 0.5], [1.0, 0.0, 1.0]]);
+    let design_exit =
+        DesignMatrix::from(array![[1.0, 0.0, 0.3], [1.0, 0.0, 0.8], [1.0, 0.0, 1.4]]);
+    let design_derivative_exit =
+        DesignMatrix::from(array![[0.0, 0.0, 0.2], [0.0, 0.0, 0.3], [0.0, 0.0, 0.4]]);
+    let derivative_offset_exit = Array1::from_elem(3, 1e-6);
+
+    let bounds = structural_time_coefficient_lower_bounds(
+        &design_entry,
+        &design_exit,
+        &design_derivative_exit,
+        &derivative_offset_exit,
+        1e-6,
+    )
+    .expect("structural bounds")
+    .expect("some bounds");
+    assert_eq!(bounds, array![f64::NEG_INFINITY, f64::NEG_INFINITY, 0.0]);
+}
+
+/// #2332: an all-value-constant time design (no shape column at all — e.g. the
+/// empty-basis `learn_timewiggle` regime with only zero tail placeholders) still
+/// returns `Ok(None)` so the caller's downstream regime handling is preserved.
+#[test]
+fn structural_bounds_no_shape_column_returns_none() {
+    let design_entry = DesignMatrix::from(array![[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]);
+    let design_exit = DesignMatrix::from(array![[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]);
+    let design_derivative_exit = DesignMatrix::from(array![[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]);
+    let derivative_offset_exit = Array1::from_elem(3, 1e-6);
+
+    let bounds = structural_time_coefficient_lower_bounds(
+        &design_entry,
+        &design_exit,
+        &design_derivative_exit,
+        &derivative_offset_exit,
+        1e-6,
+    )
+    .expect("structural bounds");
+    assert!(bounds.is_none(), "no shape column must return Ok(None)");
+}
+
 #[test]
 fn identified_time_block_rejects_offsets_below_derivative_guard() {
     let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];

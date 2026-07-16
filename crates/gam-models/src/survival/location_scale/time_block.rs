@@ -230,6 +230,8 @@ pub(crate) fn append_linear_constraints(
 }
 
 pub(crate) fn structural_time_coefficient_lower_bounds(
+    design_value_entry: &DesignMatrix,
+    design_value_exit: &DesignMatrix,
     design_derivative_exit: &DesignMatrix,
     derivative_offset_exit: &Array1<f64>,
     lower_bound: f64,
@@ -241,7 +243,23 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
             derivative_offset_exit.len()
         ) }.into());
     }
-    if design_derivative_exit.ncols() == 0 {
+    let p = design_derivative_exit.ncols();
+    let nrows = design_derivative_exit.nrows();
+    if design_value_entry.ncols() != p
+        || design_value_exit.ncols() != p
+        || design_value_entry.nrows() != nrows
+        || design_value_exit.nrows() != nrows
+    {
+        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
+            "structural time coefficient bounds require entry/exit/derivative designs of the same shape: \
+             derivative={nrows}x{p}, value_entry={}x{}, value_exit={}x{}",
+            design_value_entry.nrows(),
+            design_value_entry.ncols(),
+            design_value_exit.nrows(),
+            design_value_exit.ncols(),
+        ) }.into());
+    }
+    if p == 0 {
         return Ok(None);
     }
     if !lower_bound.is_finite() || lower_bound <= 0.0 {
@@ -255,19 +273,37 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
 
     const DERIVATIVE_TOL: f64 = 1e-12;
     const FEASIBILITY_TOL: f64 = 1e-12;
+    // A time column is a monotone I-spline SHAPE column — bounded `β ≥ 0`, the
+    // exact domain-wide monotonicity certificate — iff it either VARIES IN VALUE
+    // across the observed entry∪exit domain OR has POSITIVE DERIVATIVE SUPPORT at
+    // some training row. The unique column that satisfies NEITHER is the free
+    // level/intercept column (value-constant everywhere AND derivative ≡ 0),
+    // whose coefficient is the any-sign baseline level; it stays `NEG_INFINITY`.
+    //
+    // The value clause is what closes the #2332 gap: a genuine tail I-spline
+    // column whose M-spline derivative support sits beyond the largest training
+    // exit time is ≈0 at every training row (so the old derivative-only clause
+    // missed it) yet still varies in value — which is EXACTLY why `keep_cols`
+    // retained it (`construction.rs:1513-1532`, `constant_tol = 1e-12`, the same
+    // geometric criterion applied here at the point of use). The derivative
+    // clause is retained so a minimal warp column that carries derivative
+    // structure without a materialized value spread (e.g. an anchor-centered
+    // `log t` stand-in whose exit value design is 0 but whose derivative is
+    // active) is still correctly bound. The two clauses are a strict SUPERSET of
+    // the old derivative-only rule, so no already-bound column ever loses its
+    // constraint.
+    const VALUE_VARIATION_TOL: f64 = 1e-12;
     // Diagnostics only: entries with magnitude in this open band are reported as
     // "sub-tolerance nonzeros" to explain a missing structural lower bound. The
     // lower edge separates genuine round-off from a hard zero; the upper edge is
     // the derivative-activity tolerance above.
     const SUBTOL_NONZERO_FLOOR: f64 = 1e-30;
     // How many leading columns' max(|·|) to surface in the diagnostic message
-    // when no derivative-active column is found.
+    // when no shape column is found.
     const DIAGNOSTIC_COLUMN_PREVIEW: usize = 8;
 
-    let p = design_derivative_exit.ncols();
-    let nrows = design_derivative_exit.nrows();
     let mut lower_bounds = Array1::from_elem(p, f64::NEG_INFINITY);
-    let mut has_structural_support = false;
+    let mut has_shape_column = false;
     for (row, &offset) in derivative_offset_exit.iter().enumerate() {
         if !offset.is_finite() {
             return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
@@ -287,6 +323,16 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
     let mut col_maxes: Vec<(usize, f64)> = Vec::with_capacity(p.min(DIAGNOSTIC_COLUMN_PREVIEW));
     let mut total_subtol_nonzeros = 0_usize;
     for col in 0..p {
+        // Derivative pass: (1) integrity — the M-spline derivative basis must be
+        // finite and NON-NEGATIVE at every training row (a monotone I-spline's
+        // derivative is an M-spline, ≥ 0 everywhere); (2) `has_positive_support`,
+        // one half of the OR sign-cone decision below. On its own the derivative
+        // pass is INSUFFICIENT to classify: a genuine tail shape column whose
+        // M-spline support sits beyond the largest training exit time is ≈0 at
+        // every training row yet still varies in value, so the value pass below is
+        // what actually catches it (#2332). Bounding by derivative activity alone
+        // left it unconstrained and the penalized fit drove it negative, producing
+        // a non-monotone warp at prediction horizons in that column's support.
         let column = design_derivative_exit.extract_column(col);
         if column.len() != nrows {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
@@ -294,8 +340,8 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
                 column.len()
             ) }.into());
         }
-        let mut has_positive_support = false;
         let mut col_max = 0.0_f64;
+        let mut has_positive_support = false;
         for (row, &value) in column.iter().enumerate() {
             if !value.is_finite() {
                 return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
@@ -318,17 +364,45 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
                 total_subtol_nonzeros += 1;
             }
         }
-        if has_positive_support {
+
+        // Value-space classification. A column whose value varies across
+        // entry∪exit is a monotone I-spline shape column and must satisfy
+        // `β ≥ 0` over the WHOLE axis — not only where its derivative happens to
+        // be active at a training row (the #2332 tail case). Combined with the
+        // derivative clause below via OR.
+        let entry_col = design_value_entry.extract_column(col);
+        let exit_col = design_value_exit.extract_column(col);
+        if entry_col.len() != nrows || exit_col.len() != nrows {
+            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
+                "structural time coefficient bounds: value extract_column returned entry={} exit={} entries for column {col}, expected {nrows}",
+                entry_col.len(),
+                exit_col.len()
+            ) }.into());
+        }
+        let mut vmin = f64::INFINITY;
+        let mut vmax = f64::NEG_INFINITY;
+        for &value in entry_col.iter().chain(exit_col.iter()) {
+            if !value.is_finite() {
+                return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
+                    "structural time coefficient bounds require finite value design entries in column {col}"
+                ) }.into());
+            }
+            vmin = vmin.min(value);
+            vmax = vmax.max(value);
+        }
+        let value_varies = (vmax - vmin) > VALUE_VARIATION_TOL;
+        if value_varies || has_positive_support {
             lower_bounds[col] = 0.0;
-            has_structural_support = true;
+            has_shape_column = true;
         }
         if col < DIAGNOSTIC_COLUMN_PREVIEW {
             col_maxes.push((col, col_max));
         }
     }
 
-    if !has_structural_support {
-        // No derivative-active column on this candidate's exit-time design.
+    if !has_shape_column {
+        // No value-varying (monotone I-spline) shape column on this candidate's
+        // time design.
         //
         // Two distinct regimes reach this branch and only one of them is
         // surprising:
@@ -342,8 +416,8 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
         //    not in any basis column. `prepare_survival_time_stack` then
         //    appends `tw.ncols` **exactly zero** tail columns to keep
         //    shapes aligned with the timewiggle-extended coefficient
-        //    vector. Those tail zeros correctly carry no exit-derivative
-        //    signal, there is nothing to constrain with a structural
+        //    vector. Those tail zeros are value-constant (all zero) and carry
+        //    no shape signal, there is nothing to constrain with a structural
         //    lower-bound ridge, and the right answer is `Ok(None)`.
         //
         // 2. `--time-basis ispline` (or bspline) without timewiggle. Here
@@ -353,14 +427,14 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
         //    cell-moment construction, derivative formula, etc.).
         //
         // The two regimes differentiate by whether the design has any
-        // entry whose magnitude exceeds 1e-30 but stays at or below
+        // derivative entry whose magnitude exceeds 1e-30 but stays at or below
         // `DERIVATIVE_TOL`. Regime 1 leaves the tail columns at exact
         // zero (no entry passes 1e-30); regime 2 leaves residual
         // float-scale entries from the upstream basis builder. We log
         // warn-level only in the surprising regime.
         if total_subtol_nonzeros > 0 {
             log::warn!(
-                "structural time coefficient bounds: no derivative-active column on this candidate's exit-time design ({} rows × {} cols, sub-tolerance nonzero entries ({:.0e} < |v| ≤ {:.0e}): {}, first-{} col max(|.|): {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
+                "structural time coefficient bounds: no value-varying shape column on this candidate's time design ({} rows × {} cols, sub-tolerance derivative nonzero entries ({:.0e} < |v| ≤ {:.0e}): {}, first-{} col max(|.|): {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
                 nrows,
                 p,
                 SUBTOL_NONZERO_FLOOR,
@@ -376,12 +450,16 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
 }
 
 pub(crate) fn structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
+    design_value_entry: &DesignMatrix,
+    design_value_exit: &DesignMatrix,
     design_derivative_exit: &DesignMatrix,
     derivative_offset_exit: &Array1<f64>,
     lower_bound: f64,
     monotone_time_wiggle_ncols: usize,
 ) -> Result<Option<Array1<f64>>, String> {
     let mut lower_bounds = structural_time_coefficient_lower_bounds(
+        design_value_entry,
+        design_value_exit,
         design_derivative_exit,
         derivative_offset_exit,
         lower_bound,
@@ -1401,6 +1479,8 @@ pub(crate) fn prepare_identified_time_block(
 
     let penalties = input.penalties.clone();
     let coefficient_lower_bounds = structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
+        &input.design_entry,
+        &input.design_exit,
         &input.design_derivative_exit,
         &input.derivative_offset_exit,
         derivative_guard,

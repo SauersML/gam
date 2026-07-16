@@ -1078,6 +1078,8 @@ pub(crate) fn validate_time_block(
         });
     }
     structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
+        &b.design_entry,
+        &b.design_exit,
         &b.design_derivative_exit,
         &b.derivative_offset_exit,
         derivative_guard,
