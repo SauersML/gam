@@ -790,6 +790,21 @@ fn handle_multinomial_fixed_lambda_stall(
         // boundary already used around the faer / cudarc entry points, and keeps
         // the separation path no worse than the pre-#1854 clean error while the
         // Firth refit is still being hardened.
+        // Start the Firth refit from the well-conditioned origin (β = 0), NOT
+        // from the stalled Newton iterate. That stalled iterate is the runaway
+        // separated point (`|η| ≥ 25`), where the softmax Fisher information
+        // `I(β)` is numerically singular (every fitted probability is pinned to
+        // the {0,1} simplex boundary, so `I → 0`). Warm-starting the Firth
+        // Newton there is catastrophic: the first step `(I + λS)⁻¹ U*` is
+        // unbounded and every backtracked candidate stays on the boundary, so
+        // the line search exhausts without an accepted step and the refit stalls
+        // at iteration 1 — it can never climb back to the interior Firth mode.
+        // The Firth objective's interior mode is start-independent (the
+        // `firth_solver_rejects_a_truncated_iterate` resume contract asserts the
+        // same mode is reached from any interior start), and from `β = 0` the
+        // information is well-conditioned, so a plain from-zero refit converges
+        // reliably on exactly the separated data that defeated the fixed-λ
+        // Newton above.
         let firth = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             fit_penalized_multinomial_firth_fallback(
                 design,
@@ -799,10 +814,7 @@ fn handle_multinomial_fixed_lambda_stall(
                 row_weights,
                 max_iter,
                 tol,
-                Some(FirthResume {
-                    coefficients: stall.coefficients.view(),
-                    completed_iterations: 0,
-                }),
+                None,
             )
         }));
         match firth {
@@ -1937,21 +1949,47 @@ impl MultinomialModelEnvelope {
     /// discriminator so a non-multinomial payload is rejected with a clear
     /// error rather than silently mis-predicted.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, EstimationError> {
+        // Gate on the envelope header (`model_class` + `format_version`) *before*
+        // deserializing the versioned `saved` body. The header parse ignores the
+        // body, so a payload that predates a field which has since become
+        // required (e.g. `saved.formula`) is rejected on the version gate rather
+        // than on whatever inner field is now missing — the version check is the
+        // contract that tells a caller their payload is stale, and it must fire
+        // first regardless of how the body schema has since evolved.
+        #[derive(Deserialize)]
+        struct EnvelopeHeader {
+            #[serde(default)]
+            model_class: Option<String>,
+            #[serde(default)]
+            format_version: Option<u32>,
+        }
+        let header: EnvelopeHeader = serde_json::from_slice(bytes).map_err(|err| {
+            EstimationError::InvalidInput(format!("failed to deserialize multinomial model: {err}"))
+        })?;
+        match header.model_class.as_deref() {
+            Some(MULTINOMIAL_MODEL_CLASS) => {}
+            other => {
+                return Err(EstimationError::InvalidInput(format!(
+                    "multinomial model: model_class = {other:?}, expected {MULTINOMIAL_MODEL_CLASS:?}",
+                )));
+            }
+        }
+        match header.format_version {
+            Some(MULTINOMIAL_MODEL_FORMAT_VERSION) => {}
+            Some(version) => {
+                return Err(EstimationError::InvalidInput(format!(
+                    "multinomial model: format_version = {version}, expected {MULTINOMIAL_MODEL_FORMAT_VERSION}",
+                )));
+            }
+            None => {
+                return Err(EstimationError::InvalidInput(format!(
+                    "multinomial model: format_version is absent (unversioned payload), expected {MULTINOMIAL_MODEL_FORMAT_VERSION}",
+                )));
+            }
+        }
         let envelope: Self = serde_json::from_slice(bytes).map_err(|err| {
             EstimationError::InvalidInput(format!("failed to deserialize multinomial model: {err}"))
         })?;
-        if envelope.model_class != MULTINOMIAL_MODEL_CLASS {
-            return Err(EstimationError::InvalidInput(format!(
-                "multinomial model: model_class = {:?}, expected {MULTINOMIAL_MODEL_CLASS:?}",
-                envelope.model_class
-            )));
-        }
-        if envelope.format_version != MULTINOMIAL_MODEL_FORMAT_VERSION {
-            return Err(EstimationError::InvalidInput(format!(
-                "multinomial model: format_version = {}, expected {}",
-                envelope.format_version, MULTINOMIAL_MODEL_FORMAT_VERSION,
-            )));
-        }
         envelope.saved.validate()?;
         Ok(envelope)
     }
