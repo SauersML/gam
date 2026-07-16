@@ -913,6 +913,37 @@ fn audit_identifiability_impl(
             p_total,
             layout.join(" | "),
         );
+        // For any within-block-deficient block, dump the ACTUAL singular spectrum
+        // of the matrix the audit ranked (its effective Jacobian, penalty-aware),
+        // so a `range_rank ≪ dim` verdict is traceable to the real geometry rather
+        // than guessed from the raw design. Cheap (one Gram + symmetric eig on the
+        // `p×p` block), fires only on a deficiency.
+        for (i, b) in blocks.iter().enumerate() {
+            if b.design_range_rank >= b.original_dim {
+                continue;
+            }
+            let eff = &dense_blocks[i];
+            let (eff_rows, eff_cols) = eff.dim();
+            let gram = eff.t().dot(eff);
+            let spectrum: String = match gram.eigh(Side::Lower) {
+                Ok((evals, _)) => {
+                    let mut sv: Vec<f64> = evals.iter().map(|&l| l.max(0.0).sqrt()).collect();
+                    sv.sort_by(|a, c| c.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    sv.iter()
+                        .map(|s| format!("{s:.3e}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+                Err(_) => "eig-failed".to_string(),
+            };
+            let has_penalty = block_penalties[i].is_some();
+            log::info!(
+                "[identifiability audit/deficient-block] '{}' effective_jacobian={eff_rows}x{eff_cols} range_rank={}/{} penalty_aware={has_penalty}; singular_values=[{spectrum}]",
+                b.block_name,
+                b.design_range_rank,
+                b.original_dim,
+            );
+        }
     }
 
     if p_total == 0 {
