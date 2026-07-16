@@ -1778,7 +1778,15 @@ fn solve_newton_direction_with_linear_constraints_impl(
     let mut visited_working_sets: HashSet<(Vec<usize>, Vec<u64>)> = HashSet::new();
     record_active_working_set(&mut visited_working_sets, &active, &x, 0);
 
+    // See the operator loop's `face_minimized` doc: an unblocked full step
+    // lands on the working-face minimizer, so the following iteration must
+    // adjudicate multipliers rather than re-measure KKT-solve noise against
+    // the absolute `tol_step` (#979 noise-chatter starvation).
+    let mut face_minimized = false;
+
     for iteration in 0..max_iterations {
+        let adjudicate_face = face_minimized;
+        face_minimized = false;
         let compressed_working = compress_active_working_set(&x, constraints, &active)?;
         let mut residualw = Array1::<f64>::zeros(compressed_working.constraints.a.nrows());
         for r in 0..compressed_working.constraints.a.nrows() {
@@ -1792,7 +1800,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
             Some(&residualw),
         )?;
         let step_norm = d.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if step_norm <= tol_step {
+        if step_norm <= tol_step || adjudicate_face {
             // A "stationary" iterate is only a genuine KKT point if it is
             // also primal-feasible on the FULL constraint set. The
             // "blocking-add" loop further down only catches rows that
@@ -1915,6 +1923,11 @@ fn solve_newton_direction_with_linear_constraints_impl(
                     !record_active_working_set(&mut visited_working_sets, &active, &x, iteration);
                 break;
             }
+        }
+        if !added_new_active {
+            // Unblocked full step onto the working-face minimizer: adjudicate
+            // multipliers next iteration instead of re-measuring solve noise.
+            face_minimized = true;
         }
         if working_set_repeated {
             break;
@@ -2713,9 +2726,20 @@ fn solve_newton_direction_with_constraint_set_impl(
     let mut count_release = 0usize;
     let mut ws_repeat_break = false;
     let mut iterations_used = 0usize;
+    // After an UNBLOCKED full step the iterate is the working-face minimizer
+    // up to KKT-solve rounding, so the next iteration's direction is solver
+    // noise, not progress. Measuring that noise against the absolute
+    // `tol_step` starves the stationary branch (where releases and the
+    // terminal acceptance live) on large-scale problems: the CTN cycle-95
+    // witness spent 3146 of 3152 iterations re-solving noise steps with only
+    // 6 transitions. An unblocked full step must be followed by multiplier
+    // adjudication.
+    let mut face_minimized = false;
 
     for iteration in 0..max_iterations {
         iterations_used = iteration + 1;
+        let adjudicate_face = face_minimized;
+        face_minimized = false;
         let compressed_working = ops.compress_working(&active)?;
         let mut residualw = Array1::<f64>::zeros(compressed_working.constraints.a.nrows());
         for r in 0..compressed_working.constraints.a.nrows() {
@@ -2729,7 +2753,7 @@ fn solve_newton_direction_with_constraint_set_impl(
             Some(&residualw),
         )?;
         let step_norm = d.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if step_norm <= tol_step {
+        if step_norm <= tol_step || adjudicate_face {
             let (worst, worst_row) = ops.max_violation(&values_x);
             if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL && !is_active[worst_row] {
                 active.push(worst_row);
@@ -2827,6 +2851,11 @@ fn solve_newton_direction_with_constraint_set_impl(
             log_active_set_transition("blocking-add", iteration, active.len(), Some(row));
             working_set_repeated =
                 !record_active_working_set(&mut visited_working_sets, &active, &x, iteration);
+        } else {
+            // Unblocked full step: the iterate is now the minimizer of the
+            // current working face — the next iteration must adjudicate
+            // multipliers instead of re-measuring KKT-solve noise.
+            face_minimized = true;
         }
         if working_set_repeated {
             ws_repeat_break = true;
