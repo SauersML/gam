@@ -1570,41 +1570,30 @@ impl WorkingModelSurvival {
         if time_columns == 0 {
             return None;
         }
-        const STRUCTURAL_DERIV_TOL: f64 = 1e-12;
-        let mut active_columns = vec![false; time_columns];
-        let mut derivative_row = vec![0.0_f64; p];
-        for i in 0..self.nrows() {
-            if self.sampleweight[i] <= 0.0 {
-                continue;
-            }
-            self.fill_derivative_row(i, &mut derivative_row);
-            for j in 0..time_columns {
-                if derivative_row[j] > STRUCTURAL_DERIV_TOL {
-                    active_columns[j] = true;
-                }
-            }
-        }
-        if let Some(rows) = self.monotonicity_constraint_rows.as_ref() {
-            for i in 0..rows.nrows() {
-                for j in 0..time_columns {
-                    if rows[[i, j]] > STRUCTURAL_DERIV_TOL {
-                        active_columns[j] = true;
-                    }
-                }
-            }
-        }
-        let active_columns: Vec<usize> = active_columns
-            .into_iter()
-            .enumerate()
-            .filter_map(|(j, active)| active.then_some(j))
-            .collect();
-        if active_columns.is_empty() {
-            return None;
-        }
-        let mut a = Array2::<f64>::zeros((active_columns.len(), p));
-        let b = Array1::<f64>::zeros(active_columns.len());
-        for (row, &col) in active_columns.iter().enumerate() {
-            a[[row, col]] = 1.0;
+        // Constrain EVERY time-block coefficient `γ_j ≥ 0`, not only the columns
+        // whose derivative basis is active at a training row. Each I-spline time
+        // column is monotone non-decreasing across the whole log-time axis (its
+        // derivative basis is a non-negative M-spline, verified element-wise in
+        // `set_structural_monotonicity`), so the cumulative hazard is monotone at
+        // EVERY evaluation time — including prediction horizons beyond the training
+        // exit times — iff every time coefficient is non-negative. This whole-block
+        // constraint is therefore the exact domain-wide structural-monotonicity
+        // certificate.
+        //
+        // An earlier version restricted the constraint to columns with
+        // `derivative_row[j] > tol` at some training row. Tail I-spline columns —
+        // whose M-spline support sits beyond the largest training exit time — are
+        // ≈0 at every training row and were left UNCONSTRAINED. The penalized fit
+        // could then drive those `γ_j < 0`: monotonicity still held at every
+        // training row (their basis is ≈0 there) but broke at prediction times in
+        // the tail column's support, yielding a negative log-cumulative-hazard
+        // derivative `d(logΛ)/dt` that the Royston-Parmar predictor correctly
+        // refuses. Constraining the full block closes that tail blind spot at the
+        // fit rather than clamping the derivative at predict time.
+        let mut a = Array2::<f64>::zeros((time_columns, p));
+        let b = Array1::<f64>::zeros(time_columns);
+        for j in 0..time_columns {
+            a[[j, j]] = 1.0;
         }
         Some(LinearInequalityConstraints { a, b })
     }
