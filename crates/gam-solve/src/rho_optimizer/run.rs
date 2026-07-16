@@ -703,12 +703,7 @@ impl OuterProblem {
         let objective_lower = obj.outer_domain_lower_bound()?;
         let objective_upper = obj.outer_domain_upper_bound()?;
         if objective_lower.is_some() || objective_upper.is_some() {
-            install_objective_domain(
-                &mut config,
-                self.n_params,
-                objective_lower,
-                objective_upper,
-            )?;
+            install_objective_domain(&mut config, self.n_params, objective_lower, objective_upper)?;
         }
         let Some(session) = config.cache_session.clone() else {
             return run_outer(obj, &config, context);
@@ -1305,6 +1300,43 @@ pub(crate) fn certificate_hessian_is_psd(hessian: &Array2<f64>) -> Option<bool> 
         }
     }
     Some(true)
+}
+
+/// PSD verdict of the outer Hessian restricted to its UN-RAILED coordinates
+/// (#2299 box-KKT reduced-Hessian / critical-cone gate).
+///
+/// A coordinate railed at ±`rho_bound` with an outward gradient is at the box-KKT
+/// constrained optimum: its curvature direction is the flat/indefinite
+/// infinite-smoothing plateau of a fully-saturated penalty (λ ~ 1e13), carrying
+/// no feasible descent. Including it makes the FULL Hessian indefinite and used to
+/// disable the very flatness certificate that exists to handle rails, so an
+/// honest railed optimum ground to `max_iter` and refused. Judging PSD on the
+/// INTERIOR (un-railed) sub-block is the standard reduced-Hessian condition: a
+/// genuinely indefinite *interior* direction still keeps the sub-block non-PSD,
+/// so this can never over-certify a real saddle. When every coordinate is railed
+/// the interior is empty — there is no feasible curvature to certify and the rail
+/// KKT signs are the whole certificate — so the empty sub-block is trivially PSD.
+/// With no railed coordinate it is exactly [`certificate_hessian_is_psd`].
+pub(crate) fn certificate_hessian_is_psd_off_railed(
+    hessian: &Array2<f64>,
+    railed: &[usize],
+) -> Option<bool> {
+    if railed.is_empty() {
+        return certificate_hessian_is_psd(hessian);
+    }
+    let n = hessian.nrows();
+    let railed_set: std::collections::BTreeSet<usize> = railed.iter().copied().collect();
+    let interior: Vec<usize> = (0..n).filter(|k| !railed_set.contains(k)).collect();
+    if interior.is_empty() {
+        return Some(true);
+    }
+    let mut sub = Array2::<f64>::zeros((interior.len(), interior.len()));
+    for (i, &ri) in interior.iter().enumerate() {
+        for (j, &rj) in interior.iter().enumerate() {
+            sub[[i, j]] = hessian[[ri, rj]];
+        }
+    }
+    certificate_hessian_is_psd(&sub)
 }
 
 /// Second-order predicted objective decrease of a safeguarded Newton step at a
@@ -1968,10 +2000,16 @@ fn certify_outer_optimality_at_terminal_fidelity(
     // noise in hand, and only probes coordinates whose curvature row is below the
     // roundoff floor — so a well-conditioned objective (every scripted mock at its
     // certification point) probes nothing and pays zero extra evaluations.
+    // The coordinates railed at ±rho_bound (the infinite-smoothing ceiling). Their
+    // saturated curvature direction makes the FULL Hessian indefinite, so the
+    // flatness certificate below — and the final curvature gate — judge PSD on the
+    // interior (un-railed) sub-block instead, or a rail-caused indefiniteness would
+    // disable the very certificate that exists to certify a railed optimum (#2299).
+    let certificate_railed = certificate_railed_lambdas(&result.rho, layout.rho_dim(), config);
     let mut certified_projected_grad_norm = projected_grad_norm;
     if projected_grad_norm > stationarity_bound
         && let Some(hessian) = analytic_hessian.as_ref()
-        && certificate_hessian_is_psd(hessian) == Some(true)
+        && certificate_hessian_is_psd_off_railed(hessian, &certificate_railed) == Some(true)
     {
         let n = layout.n_params;
         // Curvature scale of the analytic outer Hessian: its dominant diagonal,
@@ -2085,8 +2123,10 @@ fn certify_outer_optimality_at_terminal_fidelity(
             projected_grad_norm: certified_projected_grad_norm,
             bound: stationarity_bound,
         },
-        hessian_psd: analytic_hessian.as_ref().and_then(certificate_hessian_is_psd),
-        lambdas_railed: certificate_railed_lambdas(&result.rho, layout.rho_dim(), config),
+        hessian_psd: analytic_hessian.as_ref().and_then(|hessian| {
+            certificate_hessian_is_psd_off_railed(hessian, &certificate_railed)
+        }),
+        lambdas_railed: certificate_railed.clone(),
     };
     // Install the measured evidence before deciding its verdict.  A rejected
     // candidate is retained only as a resumable checkpoint, and that
@@ -2143,9 +2183,8 @@ pub(crate) fn compute_rho_uncertainty_diagnostic(
     // diagnostic reuse that exact cache identity (or extend it with analytic
     // Hessian work) instead of reopening the selected rho under the restored
     // search cap and leaving a coarse mode as the shipped state.
-    let diagnostic = compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
-        obj, config, context, result,
-    );
+    let diagnostic =
+        compute_rho_uncertainty_diagnostic_at_terminal_fidelity(obj, config, context, result);
     drop(terminal_cap_guard);
     diagnostic
 }
@@ -2412,56 +2451,56 @@ pub(crate) fn run_outer(
     // assembly binds against IS the certified evidence — bitwise, by
     // construction, independent of basin multiplicity.
     let claimed_converged = result.converged;
-    let certify_diagnose_and_install =
-        |obj: &mut dyn OuterObjective,
-         result: &mut OuterResult|
-         -> Result<OuterCriterionCertificate, EstimationError> {
-            result.rho_uncertainty_diagnostic =
-                Some(compute_rho_uncertainty_diagnostic(obj, config, context, result));
-            // Reinstall the selected point under cap=0 so the certificate below
-            // measures the full-fidelity state belonging to `result.rho`, not
-            // the diagnostic's final proposal (seeding beta alone does not
-            // restore weights, factors, or link state). Reset forces a real
-            // installation instead of an LRU value hit.
-            let terminal_cap_guard = config
-                .outer_inner_cap
-                .as_ref()
-                .map(TerminalInnerCapGuard::lift);
-            // Reset is conditional on the cap contract, mirroring
-            // `certify_outer_optimality`'s own doctrine: REML/mixture
-            // objectives with a cap can hold a coarse search cache that must
-            // not be installed as terminal state, while uncapped stateful
-            // objectives (reactive-domain entries among them) retain the very
-            // state their evaluation at `result.rho` depends on — an
-            // unconditional reset here wiped it and made the certification
-            // evaluation non-finite on the reactive fixture.
-            //
-            // OR-in the terminal-coefficient-mode ownership signal (#2334):
-            // objectives that install an owned coefficient mode here but hold
-            // their inner cap in a different field (custom families) leave
-            // `outer_inner_cap` `None`, so the cap gate alone never fires and
-            // `finalize` here could land in a different inner basin than the
-            // certifying re-eval below — a spurious bitwise bind failure on a
-            // bimodal inner solve. Forcing the reset for mode-owning objectives
-            // makes both installations start from the same clean baseline.
-            if terminal_cap_guard.is_some() || obj.owns_terminal_coefficient_mode() {
-                obj.reset();
-            }
-            let terminal_installation = obj.finalize_outer_result(&result.rho, &result.plan_used);
-            let terminal_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
-            drop(terminal_cap_guard);
-            terminal_installation?;
-            if !terminal_inner_converged {
-                return Err(outer_nonconvergence_error(
-                    context,
-                    "final outer state installation did not converge at full inner fidelity",
-                    result,
-                    result.final_grad_norm,
-                    outer_gradient_tolerance(config).abs,
-                ));
-            }
-            certify_outer_optimality(obj, config, context, result)
-        };
+    let certify_diagnose_and_install = |obj: &mut dyn OuterObjective,
+                                        result: &mut OuterResult|
+     -> Result<OuterCriterionCertificate, EstimationError> {
+        result.rho_uncertainty_diagnostic = Some(compute_rho_uncertainty_diagnostic(
+            obj, config, context, result,
+        ));
+        // Reinstall the selected point under cap=0 so the certificate below
+        // measures the full-fidelity state belonging to `result.rho`, not
+        // the diagnostic's final proposal (seeding beta alone does not
+        // restore weights, factors, or link state). Reset forces a real
+        // installation instead of an LRU value hit.
+        let terminal_cap_guard = config
+            .outer_inner_cap
+            .as_ref()
+            .map(TerminalInnerCapGuard::lift);
+        // Reset is conditional on the cap contract, mirroring
+        // `certify_outer_optimality`'s own doctrine: REML/mixture
+        // objectives with a cap can hold a coarse search cache that must
+        // not be installed as terminal state, while uncapped stateful
+        // objectives (reactive-domain entries among them) retain the very
+        // state their evaluation at `result.rho` depends on — an
+        // unconditional reset here wiped it and made the certification
+        // evaluation non-finite on the reactive fixture.
+        //
+        // OR-in the terminal-coefficient-mode ownership signal (#2334):
+        // objectives that install an owned coefficient mode here but hold
+        // their inner cap in a different field (custom families) leave
+        // `outer_inner_cap` `None`, so the cap gate alone never fires and
+        // `finalize` here could land in a different inner basin than the
+        // certifying re-eval below — a spurious bitwise bind failure on a
+        // bimodal inner solve. Forcing the reset for mode-owning objectives
+        // makes both installations start from the same clean baseline.
+        if terminal_cap_guard.is_some() || obj.owns_terminal_coefficient_mode() {
+            obj.reset();
+        }
+        let terminal_installation = obj.finalize_outer_result(&result.rho, &result.plan_used);
+        let terminal_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
+        drop(terminal_cap_guard);
+        terminal_installation?;
+        if !terminal_inner_converged {
+            return Err(outer_nonconvergence_error(
+                context,
+                "final outer state installation did not converge at full inner fidelity",
+                result,
+                result.final_grad_norm,
+                outer_gradient_tolerance(config).abs,
+            ));
+        }
+        certify_outer_optimality(obj, config, context, result)
+    };
     result.criterion_certificate = match certify_diagnose_and_install(obj, &mut result) {
         Ok(certificate) => Some(certificate),
         Err(refusal) if claimed_converged => {
@@ -3153,14 +3192,12 @@ pub(crate) fn run_fixed_point_outer_solver(
             );
             Ok(solution_into_outer_result(*last_solution, false, the_plan))
         }
-        Err(FixedPointError::ObjectiveFailed { message }) => {
-            Err(FixedPointOuterRunError::Failed(
-                EstimationError::fatal_outer_evaluation(
-                    "outer fixed-point evaluation",
-                    EstimationError::RemlOptimizationFailed(message),
-                ),
-            ))
-        }
+        Err(FixedPointError::ObjectiveFailed { message }) => Err(FixedPointOuterRunError::Failed(
+            EstimationError::fatal_outer_evaluation(
+                "outer fixed-point evaluation",
+                EstimationError::RemlOptimizationFailed(message),
+            ),
+        )),
         Err(e) => Err(FixedPointOuterRunError::Failed(
             EstimationError::RemlOptimizationFailed(format!("{failure_prefix}: {e:?}")),
         )),

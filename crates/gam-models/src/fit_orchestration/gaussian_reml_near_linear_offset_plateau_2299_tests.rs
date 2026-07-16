@@ -10,31 +10,33 @@
 //! The surface is near-flat because the fixture's signal (`0.6 + 1.2·x`, plus a
 //! small offset the model subtracts exactly) lies in the smooth's polynomial
 //! NULL SPACE `{1, x}`. The REML criterion is then asymptotically flat in `ρ` as
-//! `λ → ∞` (the range-space EDF → 0), so the outer optimizer grinds up the
-//! infinite-smoothing plateau — checkpoint `ρ ≈ [28.1, −7.6]` ⇒ `λ₀ = e^28.1 ≈
-//! 1.6e12` — with the projected gradient plateauing at `|Pg| ≈ 3.2e-2`, far above
-//! the n-scaled stationarity bound, until it exhausts the 200-iteration cap.
+//! `λ → ∞` (the range-space EDF → 0), so the bending-penalty coordinate rails at
+//! the `+rho_bound` infinite-smoothing ceiling — locus line checkpoint `ρ ≈
+//! [−7.73, 29.994]` at the `+30` rail, `hessian_psd=NO` — and the projected
+//! gradient plateaus at `|Pg| ≈ 1.1e-1`, far above the n-scaled stationarity
+//! bound, until the standard-REML general outer engine
+//! (`gam-solve rho_optimizer/run.rs`, `certify_outer_optimality`) exhausts its
+//! 200-iteration cap.
 //!
-//! This is the SAME pathology class as #1788
-//! ([`super::gaussian_reml_stall_edf_collapse_1788_tests`]), whose fix (grid-free
-//! stationary-point enumeration in `gam-solve gaussian_reml.rs`) lands the
-//! interior `ρ` optimum on a genuinely wiggly fixture but does not certify the
-//! `λ → ∞` asymptote as a stationary point for a near-null-space fixture. The
-//! estimand-correct fix is to detect that asymptote analytically (the REML
-//! objective has a known limit as the range-space EDF → 0) and certify
-//! stationarity-at-infinity as a `+∞`-RAILED convergence, rather than iterating to
-//! the cap. The fixture's TRUTH is the null-space (linear) fit, so a `+∞` rail is
-//! the correct answer, not a stall.
+//! FIX (landed): the outer certificate's large-step flatness certificate — which
+//! removes a saturated railed coordinate from `|Pg|` — was gated on the FULL
+//! Hessian being PSD, but a coordinate railed at the infinite-smoothing ceiling
+//! makes the full Hessian indefinite along its own flat direction, so the
+//! certificate that exists to handle rails was disabled by the rail. The box-KKT
+//! reduced-Hessian gate (`certificate_hessian_is_psd_off_railed`) judges PSD on
+//! the INTERIOR (un-railed) sub-block for both the flatness-certificate gate and
+//! the final curvature verdict, so the railed coordinate's outward pull is a KKT
+//! multiplier (dropped from the residual) rather than a stationarity obstruction.
+//! The fit certifies RAILED-CONVERGED; `lambdas_railed` stays reported, so the
+//! verdict is converged-with-a-rail-flag, not clean. The fixture's TRUTH is the
+//! null-space (linear) fit, so the rail is the correct answer, not a stall.
+//! (Same pathology class as #1788,
+//! [`super::gaussian_reml_stall_edf_collapse_1788_tests`], whose interior-optimum
+//! fix does not cover the near-null-space rail case.)
 //!
-//! `#[ignore]` is banned workspace-wide, so this cannot be a RED-until-fixed gate.
-//! It is instead a GREEN CHARACTERIZATION of the current stall: it asserts the
-//! fixture does NOT cleanly converge today (a typed non-convergence refusal, or a
-//! minted fit that exhausted the outer iteration cap). When the `gaussian_reml.rs`
-//! plateau-rail fix lands, the SAME commit flips this to the estimand-correct
-//! convergence assertion (mint + `outer_iterations` well under the cap + a finite,
-//! low null-space EDF). The top-level `gam` crate cannot build here (a `build.rs`
-//! author tripwire), so the fixture is exercised through `fit_from_formula` in
-//! `gam-models`, which builds standalone — mirroring the #1788 repro.
+//! The top-level `gam` crate cannot build here (a `build.rs` author tripwire), so
+//! the fixture is exercised through `fit_from_formula` in `gam-models`, which
+//! builds standalone — mirroring the #1788 repro.
 
 use super::entry::fit_from_formula;
 use super::request::{FitConfig, FitResult, StandardFitResult};
@@ -85,47 +87,44 @@ fn fit_near_linear_with_offset(n: usize, seed: u64) -> Result<StandardFitResult,
     }
 }
 
-/// #2299 characterization: the near-linear `s(x)` + offset fit does NOT cleanly
-/// converge today — it either refuses to mint a fit (typed non-convergence) or
-/// mints one only after exhausting the outer iteration loop on the
-/// infinite-smoothing plateau. This is GREEN as a record of the open stall.
+/// #2299 regression gate: the near-linear `s(x)` + offset fit MINTS a
+/// railed-converged fit instead of grinding the outer REML to its iteration cap.
 ///
-/// FLIP-ON-FIX: when the `gaussian_reml.rs` `λ → ∞` plateau-rail fix lands,
-/// replace the body below with the estimand-correct assertion — the fit must MINT
-/// (`fit_near_linear_with_offset(...).expect(...)`), converge well under the outer
-/// cap (`outer_iterations` in the single/low double digits), and report a finite,
-/// low EDF near its polynomial null-space dimension (`0.5 ≤ edf_total < 8`), since
-/// the truth lives in `{1, x}`.
+/// The bending penalty's REML optimum is at ρ→+∞ for a signal that lives in the
+/// smooth's polynomial null space `{1, x}`, so it rails at the +`rho_bound`
+/// infinite-smoothing ceiling and the full outer Hessian goes indefinite along
+/// that saturated direction. The box-KKT reduced-Hessian certificate
+/// (`certificate_hessian_is_psd_off_railed` + the flatness certificate's
+/// un-railed PSD gate, `rho_optimizer/run.rs`) certifies stationarity on the
+/// interior sub-block and drops the railed coordinate's outward pull from `|Pg|`,
+/// so the fit converges rather than exhausting `max_iter`. The truth being the
+/// null-space (linear) fit, the estimator is the honest answer.
 #[test]
-fn near_linear_offset_fit_currently_stalls_on_the_infinite_smoothing_plateau_2299() {
-    // A very low outer-iteration count would be a clean converge — proof the
-    // plateau stall is gone. Anything at/above this many outer steps (well below
-    // the 200 cap, far above a healthy ~5-step converge) is the grinding stall.
-    const STALL_WITNESS_ITERS: usize = 100;
-    match fit_near_linear_with_offset(160, 2299) {
-        // The stall surfaces as a typed non-convergence refusal (the sealed
-        // FitConvergenceEvidence contract refuses to mint a stalled fit). The
-        // refusal's Display text names the EstimationError variant — and thus the
-        // stalling engine — so `--nocapture` pins the fix locus: "block-orthogonal
-        // ... did not converge" ⇒ gaussian_reml block-orthogonal; "REML did not
-        // converge" + rho checkpoint ⇒ gaussian_reml optimize_rho/multi_closed_form;
-        // "REML optimization failed"/projected-KKT ⇒ reml_outer_engine.
-        Err(reason) => eprintln!("[#2299-LOCUS] near-linear+offset fit refused: {reason}"),
-        // ...or a fit minted only after grinding the outer loop up the plateau.
-        Ok(result) => {
-            eprintln!(
-                "[#2299-LOCUS] near-linear+offset fit minted at outer_iterations={}",
-                result.fit.outer_iterations,
-            );
-            assert!(
-                result.fit.outer_iterations >= STALL_WITNESS_ITERS,
-                "#2299: expected the near-linear+offset fit to STALL on the \
-                 infinite-smoothing plateau (typed refusal, or an outer loop grinding to \
-                 the cap), but it converged in {} outer iterations. If the plateau-rail \
-                 fix has landed, flip this characterization to the convergence assertion \
-                 in the doc comment.",
-                result.fit.outer_iterations,
-            );
-        }
-    }
+fn near_linear_offset_fit_converges_railed_off_the_infinite_smoothing_plateau_2299() {
+    let result = fit_near_linear_with_offset(160, 2299).expect(
+        "#2299: the near-linear s(x)+offset fit must MINT a railed-converged fit — the \
+         bending penalty rails at the +rho_bound ceiling and the outer certificate \
+         certifies stationarity-at-rail on the un-railed sub-block, instead of grinding \
+         to the iteration cap",
+    );
+    // The plateau no longer grinds: a railed-converged fit lands well under the
+    // 200-iteration outer cap.
+    assert!(
+        result.fit.outer_iterations < 200,
+        "#2299: railed-converged fit must land under the outer iteration cap, got {} \
+         iterations (still grinding the infinite-smoothing plateau)",
+        result.fit.outer_iterations,
+    );
+    // The truth lives in the polynomial null space `{1, x}`, so the range-space EDF
+    // is driven out and the reported EDF is finite and low — never NaN or the
+    // algebraic ceiling.
+    let edf_total = result
+        .fit
+        .edf_total()
+        .expect("converged fit reports edf_total");
+    assert!(
+        edf_total.is_finite() && (0.5..8.0).contains(&edf_total),
+        "#2299: a near-linear fit must report a finite, low null-space EDF, got \
+         edf_total={edf_total}",
+    );
 }
