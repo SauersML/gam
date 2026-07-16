@@ -1188,7 +1188,15 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         inv: &Array2<f64>,
         channel: ThetaAdjointDhChannel,
+        eigen_htt: Option<&Array2<f64>>,
     ) -> Result<SaeArrowVector, String> {
+        // #2330 — eigen-twist mode: when `eigen_htt = Some(∂H/∂ρ_i)` this emits
+        // ONLY the `−∂(deflation_block_correction)/∂ρ_i` term through the deflation
+        // eigendecomposition's ρ-dependence (the piece the frozen `−G Mᵢ G` twist
+        // drops). `inv` is then the BASE joint inverse `G` (for `inv_vv`), and the
+        // trace / t-β / β-β terms are suppressed (they are the part-(a)/(b)
+        // channels). `None` = the ordinary contraction.
+        let eigen_mode = eigen_htt.is_some();
         let ard_precisions = self.validated_ard_precisions(rho)?;
         let total_t = cache.delta_t_len();
         let k = cache.k;
@@ -1277,6 +1285,12 @@ impl SaeManifoldTerm {
             } else {
                 inv.slice(s![base..base + q, base..base + q]).to_owned()
             };
+            // Eigen-twist: this row's ∂H_tt/∂ρ_i block (from the Mᵢ operator).
+            let htt_block = if defl_dirs.is_empty() {
+                None
+            } else {
+                eigen_htt.map(|h| h.slice(s![base..base + q, base..base + q]).to_owned())
+            };
             for w in 0..q {
                 let logit_w = match jets.vars[w] {
                     SaeLocalRowVar::Logit { atom } => Some(atom),
@@ -1352,18 +1366,29 @@ impl SaeManifoldTerm {
                         if !defl_dirs.is_empty() {
                             dh_mat[[a, b]] = dh;
                         }
-                        gamma += inv[[base + b, base + a]] * dh;
+                        if !eigen_mode {
+                            gamma += inv[[base + b, base + a]] * dh;
+                        }
                     }
                 }
                 if !defl_dirs.is_empty() {
-                    gamma -= Self::deflation_block_correction(
-                        &inv_vv_block,
-                        &dh_mat,
-                        defl_dirs,
-                        defl_spectrum,
-                    );
+                    if let Some(htt) = htt_block.as_ref() {
+                        gamma -= Self::deflation_block_correction_rho_eigen_derivative(
+                            &inv_vv_block,
+                            &dh_mat,
+                            defl_spectrum,
+                            htt,
+                        );
+                    } else {
+                        gamma -= Self::deflation_block_correction(
+                            &inv_vv_block,
+                            &dh_mat,
+                            defl_dirs,
+                            defl_spectrum,
+                        );
+                    }
                 }
-                if want_data {
+                if want_data && !eigen_mode {
                     for a in 0..q {
                         for (beta_pos, ch) in border.iter().enumerate() {
                             let dh = sae_dot(jets.second(a, w), jets.beta(beta_pos))
@@ -1396,21 +1421,35 @@ impl SaeManifoldTerm {
                             if !defl_dirs.is_empty() {
                                 dh_mat[[a, b]] = dh;
                             }
-                            gamma += inv[[base + b, base + a]] * dh;
+                            if !eigen_mode {
+                                gamma += inv[[base + b, base + a]] * dh;
+                            }
                         }
                     }
                     if !defl_dirs.is_empty() {
-                        gamma -= Self::deflation_block_correction(
-                            &inv_vv_block,
-                            &dh_mat,
-                            defl_dirs,
-                            defl_spectrum,
-                        );
+                        if let Some(htt) = htt_block.as_ref() {
+                            gamma -= Self::deflation_block_correction_rho_eigen_derivative(
+                                &inv_vv_block,
+                                &dh_mat,
+                                defl_spectrum,
+                                htt,
+                            );
+                        } else {
+                            gamma -= Self::deflation_block_correction(
+                                &inv_vv_block,
+                                &dh_mat,
+                                defl_dirs,
+                                defl_spectrum,
+                            );
+                        }
                     }
-                    for a in 0..q {
-                        for (beta_pos, ch) in border.iter().enumerate() {
-                            let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
-                            gamma += 2.0 * inv[[base + a, total_t + ch.index]] * dh;
+                    if !eigen_mode {
+                        for a in 0..q {
+                            for (beta_pos, ch) in border.iter().enumerate() {
+                                let dh =
+                                    sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
+                                gamma += 2.0 * inv[[base + a, total_t + ch.index]] * dh;
+                            }
                         }
                     }
                     gamma_beta[w_channel.index] += gamma;
@@ -1723,10 +1762,20 @@ impl SaeManifoldTerm {
             let h_bd_i = -h_bd.dot(m_i).dot(&h_bd);
 
             // dΓ_joint/dρ_i and dΓ_tt/dρ_i = part(a) twist + part(b) mixed.
-            let mut d_gamma_joint =
-                self.logdet_theta_adjoint_dense(rho, cache, &g_i, ThetaAdjointDhChannel::All)?;
-            let mut d_gamma_tt =
-                self.logdet_theta_adjoint_dense(rho, cache, &h_bd_i, ThetaAdjointDhChannel::All)?;
+            let mut d_gamma_joint = self.logdet_theta_adjoint_dense(
+                rho,
+                cache,
+                &g_i,
+                ThetaAdjointDhChannel::All,
+                None,
+            )?;
+            let mut d_gamma_tt = self.logdet_theta_adjoint_dense(
+                rho,
+                cache,
+                &h_bd_i,
+                ThetaAdjointDhChannel::All,
+                None,
+            )?;
             if smooth_range.contains(&i) {
                 // Smooth part(b) = 0; the only smooth ρ-derivative of Γ_eff is
                 // through the rank-charge adjoint.
@@ -1739,12 +1788,14 @@ impl SaeManifoldTerm {
                     cache,
                     &g,
                     ThetaAdjointDhChannel::SoftmaxSparseMixed,
+                    None,
                 )?;
                 let mixed_tt = self.logdet_theta_adjoint_dense(
                     rho,
                     cache,
                     &h_bd,
                     ThetaAdjointDhChannel::SoftmaxSparseMixed,
+                    None,
                 )?;
                 d_gamma_joint.t += &mixed_joint.t;
                 d_gamma_joint.beta += &mixed_joint.beta;
@@ -1757,18 +1808,45 @@ impl SaeManifoldTerm {
                     cache,
                     &g,
                     ThetaAdjointDhChannel::ArdMixed { target_flat: i },
+                    None,
                 )?;
                 let mixed_tt = self.logdet_theta_adjoint_dense(
                     rho,
                     cache,
                     &h_bd,
                     ThetaAdjointDhChannel::ArdMixed { target_flat: i },
+                    None,
                 )?;
                 d_gamma_joint.t += &mixed_joint.t;
                 d_gamma_joint.beta += &mixed_joint.beta;
                 d_gamma_tt.t += &mixed_tt.t;
                 d_gamma_tt.beta += &mixed_tt.beta;
             }
+
+            // #2330 — the deflation eigendecomposition's ρ-dependence: `∂H_tt/∂ρ_i`
+            // (nonzero for t-block coords: ARD majorizer / softmax) moves `U, raw,
+            // cond`, so the DK correction moves with them. The frozen `−G Mᵢ G`
+            // twist above drops this `−∂(DK)/∂ρ_i|_eigen` piece — one-sided
+            // (present for ρ_ard, zero for ρ_smooth whose Mᵢ has no t-block), which
+            // is the smooth↔ARD non-conservation. Add it with the BASE inverse.
+            let eigen_joint = self.logdet_theta_adjoint_dense(
+                rho,
+                cache,
+                &g,
+                ThetaAdjointDhChannel::All,
+                Some(m_i),
+            )?;
+            d_gamma_joint.t += &eigen_joint.t;
+            d_gamma_joint.beta += &eigen_joint.beta;
+            let eigen_tt = self.logdet_theta_adjoint_dense(
+                rho,
+                cache,
+                &h_bd,
+                ThetaAdjointDhChannel::All,
+                Some(m_i),
+            )?;
+            d_gamma_tt.t += &eigen_tt.t;
+            d_gamma_tt.beta += &eigen_tt.beta;
 
             // dΓ_eff/dρ_i = dΓ_joint − dΓ_tt (+2∇R' folded into joint above).
             let mut d_gamma = flatten(&d_gamma_joint);
@@ -2735,9 +2813,14 @@ mod test_support {
             let g = self.materialize_joint_inverse(cache, &solver)?;
             let h_bd = self.materialize_block_diag_t_inverse(cache);
             let dense_joint =
-                self.logdet_theta_adjoint_dense(rho, cache, &g, ThetaAdjointDhChannel::All)?;
-            let dense_tt =
-                self.logdet_theta_adjoint_dense(rho, cache, &h_bd, ThetaAdjointDhChannel::All)?;
+                self.logdet_theta_adjoint_dense(rho, cache, &g, ThetaAdjointDhChannel::All, None)?;
+            let dense_tt = self.logdet_theta_adjoint_dense(
+                rho,
+                cache,
+                &h_bd,
+                ThetaAdjointDhChannel::All,
+                None,
+            )?;
             let prod_joint = self.logdet_theta_adjoint(rho, cache, &solver)?;
             let prod_tt = self.coordinate_block_logdet_theta_adjoint(rho, cache, &solver)?;
             let max_diff = |a: &SaeArrowVector, b: &SaeArrowVector| -> f64 {

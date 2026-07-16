@@ -3692,6 +3692,93 @@ impl SaeManifoldTerm {
         acc
     }
 
+    /// #2330 — the ρ-derivative of [`Self::deflation_block_correction`] through the
+    /// eigendecomposition's OWN ρ-dependence, holding `inv_vv` and `d_mat` fixed
+    /// (their ρ-derivatives are the part-(a) twist and part-(b) mixed channels).
+    /// This is the term the frozen-deflation twist drops: `H_tt` moves under a
+    /// t-block coordinate (ARD majorizer / softmax), so `U`, `raw`, `cond` move,
+    /// and the DK correction with them — nonzero for ρ_ard, zero for ρ_smooth (no
+    /// t-block dependence), which is exactly the smooth↔ARD non-conservation
+    /// (#2330). `d_htt` is `∂H_tt/∂ρ_i` for this row (q×q, the row t-block of the
+    /// `∂H/∂ρ_i` majorizer operator).
+    ///
+    /// With `Uᵀ (∂H_tt) U = Gp` (Hellmann–Feynman), the eigenvalue derivatives are
+    /// `∂raw[a] = Gp[a,a]`, `∂cond[a] = Gp[a,a]` for a KEPT direction
+    /// (`cond==raw`, `∂cond/∂raw = 1`) and `0` for a deflated one (`cond = 1`,
+    /// unit stiffness). The eigenvector rotation is `∂U = U·C`, `C[c,a] =
+    /// Gp[c,a]/(raw[a]−raw[c])` for a non-degenerate pair and `0` within a
+    /// degenerate subspace (where the DK `F` term is locally constant, so its
+    /// second-order derivative vanishes for the piecewise-linear conditioning).
+    /// Then `∂W = CᵀW + WC`, `∂M = CᵀM + MC`, and
+    /// `∂corr = Σ ∂W·M·(1−F) + W·∂M·(1−F) − W·M·∂F`. Gauge-only deflation
+    /// (`spectrum = None`) has ρ-independent structural directions, so its
+    /// eigen-derivative is `0`.
+    pub(crate) fn deflation_block_correction_rho_eigen_derivative(
+        inv_vv: &Array2<f64>,
+        d_mat: &Array2<f64>,
+        spectrum: Option<&RowDeflationSpectrum>,
+        d_htt: &Array2<f64>,
+    ) -> f64 {
+        let q = inv_vv.nrows();
+        let Some(spec) = spectrum else {
+            return 0.0;
+        };
+        let u = &spec.evecs;
+        if u.nrows() != q || u.ncols() != q || d_htt.nrows() != q || d_htt.ncols() != q {
+            return 0.0;
+        }
+        let raw = &spec.raw_evals;
+        let cond = &spec.cond_evals;
+        let w = u.t().dot(inv_vv).dot(u);
+        let m = u.t().dot(d_mat).dot(u);
+        let gp = u.t().dot(d_htt).dot(u);
+        let eigen_scale = raw
+            .iter()
+            .chain(cond.iter())
+            .copied()
+            .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+        let gap_threshold = eigen_gap_threshold(eigen_scale, raw.len());
+        // C[c,a] = Gp[c,a]/(raw[a]−raw[c]) for non-degenerate pairs; ∂U = U·C.
+        let mut c = Array2::<f64>::zeros((q, q));
+        for a in 0..q {
+            for cc in 0..q {
+                if cc == a {
+                    continue;
+                }
+                let denom = raw[a] - raw[cc];
+                if denom.abs() > gap_threshold {
+                    c[[cc, a]] = gp[[cc, a]] / denom;
+                }
+            }
+        }
+        let dw = c.t().dot(&w) + w.dot(&c);
+        let dm = c.t().dot(&m) + m.dot(&c);
+        let mut acc = 0.0_f64;
+        for a in 0..q {
+            for b in 0..q {
+                let denom = raw[a] - raw[b];
+                let (f1, df1) = if denom.abs() > gap_threshold {
+                    let f = (cond[a] - cond[b]) / denom;
+                    let dcond_a = if cond[a] == raw[a] { gp[[a, a]] } else { 0.0 };
+                    let dcond_b = if cond[b] == raw[b] { gp[[b, b]] } else { 0.0 };
+                    let draw_a = gp[[a, a]];
+                    let draw_b = gp[[b, b]];
+                    let df = ((dcond_a - dcond_b) * denom
+                        - (cond[a] - cond[b]) * (draw_a - draw_b))
+                        / (denom * denom);
+                    (f, df)
+                } else if cond[a] == raw[a] {
+                    (1.0, 0.0)
+                } else {
+                    (0.0, 0.0)
+                };
+                acc += dw[[a, b]] * m[[a, b]] * (1.0 - f1) + w[[a, b]] * dm[[a, b]] * (1.0 - f1)
+                    - w[[a, b]] * m[[a, b]] * df1;
+            }
+        }
+        acc
+    }
+
     /// β-tier selected inverse `(H⁻¹)_ββ`, shared across rows (#932 FRONT C). On
     /// the plain bordered arrow this is the cached dense `S⁻¹` formed once from the
     /// Schur factor; when gauge deflation is active the row-local
