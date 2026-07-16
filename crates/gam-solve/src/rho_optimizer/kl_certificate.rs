@@ -657,7 +657,7 @@ pub fn energy_budget_defect(
 }
 
 #[cfg(test)]
-mod kl_certificate_suite {
+mod kl_certificate_tests {
     use super::*;
 
     /// Push a synthetic geometric decrease sequence `d_k = d0 · r^k` into a
