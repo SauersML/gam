@@ -1243,7 +1243,7 @@ pub struct ReducedFace {
 /// tolerance mirrors the Dense scan (`100·ε·max(n_tight, p_cov)·max‖ψ‖`), so the
 /// two arms cut to the same numerical rank. Flat id is `slot*n + obs`, matching
 /// [`KhatriRaoConeConstraints::values`].
-pub(crate) fn khatri_rao_cone_reduced_face(
+pub fn khatri_rao_cone_reduced_face(
     cone: &KhatriRaoConeConstraints,
     beta: ndarray::ArrayView1<'_, f64>,
     membership_tol: f64,
@@ -1363,7 +1363,7 @@ pub(crate) fn khatri_rao_cone_reduced_face(
 /// dependent row's flat id) — so both carriers produce the same `ReducedFace`
 /// contract. Flat id = the constraint row index. A zero-norm row is vacuous
 /// (never a direction, never a representative).
-pub(crate) fn dense_reduced_face(
+pub fn dense_reduced_face(
     lin: &LinearInequalityConstraints,
     beta: ndarray::ArrayView1<'_, f64>,
     membership_tol: f64,
@@ -1466,10 +1466,10 @@ pub(crate) fn dense_reduced_face(
 }
 
 /// The shared tight-face reduction op over the `ConstraintSet` carrier union.
-/// A local extension trait (not an inherent method) so the numeric reduction
+/// An extension trait (not an inherent method) so the numeric reduction
 /// stays in gam-solve where the solvers consume it, keeping `gam-problem` a pure
 /// data crate. All three arms produce the same `ReducedFace` contract.
-pub(crate) trait ConstraintSetReducedFace {
+pub trait ConstraintSetReducedFace {
     fn reduced_face(
         &self,
         beta: ndarray::ArrayView1<'_, f64>,
