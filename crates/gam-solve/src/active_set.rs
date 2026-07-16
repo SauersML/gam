@@ -245,6 +245,62 @@ fn solve_dense_system_via_pseudoinverse(
     Ok(())
 }
 
+/// Least-squares `min_z ‖A z − b‖` for `A` of shape `(p, k)` and rhs `b`
+/// (length `p`), returning `z` (length `k`) or `None` on numerical failure.
+///
+/// - Tall or square (`p ≥ k`): the rank-revealing col-pivoted QR (faer
+///   `solve_lstsq`) — the exact prior behavior, byte-for-byte.
+/// - Wide (`k > p`): the system is underdetermined. This arises on a DEGENERATE
+///   active face where more constraint rows are active than the problem has
+///   dimensions — e.g. a monotone coefficient cone plus many binding per-row
+///   derivative guards. The minimum-norm solution `z = Aᵀ (A Aᵀ)⁺ b` is taken
+///   via the SVD pseudoinverse of the square (possibly rank-deficient) Gram
+///   `A Aᵀ`, matching what a wide-capable least-squares would return.
+///
+/// Faer's `solve_lstsq` asserts `nrows ≥ ncols`, so feeding it a wide matrix
+/// panics — and here that panic would cross the Rust/Python FFI boundary,
+/// violating the typed-error contract. Routing the wide case through this helper
+/// keeps the failure typed: callers receive `None` and treat it as
+/// "not certified" (conservative), never a process abort.
+fn least_squares_min_norm_any_shape(a: &Array2<f64>, b: &Array1<f64>) -> Option<Array1<f64>> {
+    let p = a.nrows();
+    let k = a.ncols();
+    if b.len() != p {
+        return None;
+    }
+    if k == 0 {
+        return Some(Array1::zeros(0));
+    }
+    if k <= p {
+        let mut rhs = Array2::<f64>::zeros((p, 1));
+        rhs.column_mut(0).assign(b);
+        let a_view = FaerArrayView::new(a);
+        let rhs_view = FaerArrayView::new(&rhs);
+        let solved = a_view.as_ref().col_piv_qr().solve_lstsq(rhs_view.as_ref());
+        let mut z = Array1::<f64>::zeros(k);
+        for c in 0..k {
+            let value = solved[(c, 0)];
+            if !value.is_finite() {
+                return None;
+            }
+            z[c] = value;
+        }
+        Some(z)
+    } else {
+        // Underdetermined: min-norm `z = Aᵀ (A Aᵀ)⁺ b`. `A Aᵀ` is `p × p`, so it
+        // satisfies the square precondition of the SVD pseudoinverse solve, and
+        // the pseudoinverse absorbs the rank deficiency of an over-complete face.
+        let gram = a.dot(&a.t());
+        let mut y = Array1::<f64>::zeros(p);
+        solve_dense_system_via_pseudoinverse(&gram, b, &mut y).ok()?;
+        let z = a.t().dot(&y);
+        if z.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        Some(z)
+    }
+}
+
 pub(crate) fn compute_constraint_kkt_diagnostics(
     beta: &Array1<f64>,
     gradient: &Array1<f64>,
@@ -418,27 +474,15 @@ pub(crate) fn nonnegative_cone_multipliers(
 
     let solve_passive = |passive: &[usize]| -> Option<Array1<f64>> {
         let k = passive.len();
+        // `design` is `p × k` (each column is a unit active row). On a degenerate
+        // over-complete face `k` can exceed `p` (more active rows than
+        // dimensions); the min-norm least-squares helper handles that wide case
+        // instead of panicking inside faer's tall-only `solve_lstsq`.
         let mut design = Array2::<f64>::zeros((p, k));
         for (col, &row) in passive.iter().enumerate() {
             design.column_mut(col).assign(&unit.row(row));
         }
-        let mut rhs = Array2::<f64>::zeros((p, 1));
-        rhs.column_mut(0).assign(target);
-        let design_view = FaerArrayView::new(&design);
-        let rhs_view = FaerArrayView::new(&rhs);
-        let solved = design_view
-            .as_ref()
-            .col_piv_qr()
-            .solve_lstsq(rhs_view.as_ref());
-        let mut z = Array1::<f64>::zeros(k);
-        for col in 0..k {
-            let value = solved[(col, 0)];
-            if !value.is_finite() {
-                return None;
-            }
-            z[col] = value;
-        }
-        Some(z)
+        least_squares_min_norm_any_shape(&design, target)
     };
 
     let max_outer = 3 * m + 30;
@@ -622,22 +666,19 @@ fn moreau_projection_via_primal_qp(
     let mut lambda_canonical = Array1::<f64>::zeros(m);
     if !tangent_active.is_empty() {
         let gathered = gather_linear_constraint_rows(&constraints, &tangent_active).ok()?;
+        // `design` is `p × |tangent_active|`. The face is meant to be
+        // full-row-rank (≤ p active rows), but a degenerate iterate can present
+        // more active rows than dimensions; the min-norm helper handles that wide
+        // case rather than panicking inside faer's tall-only `solve_lstsq`.
         let design = gathered.a.t().to_owned();
-        let mut rhs = Array2::<f64>::zeros((p, 1));
-        rhs.column_mut(0).assign(&(residual + &tangent_direction));
-        let design_view = FaerArrayView::new(&design);
-        let rhs_view = FaerArrayView::new(&rhs);
-        let solved = design_view
-            .as_ref()
-            .col_piv_qr()
-            .solve_lstsq(rhs_view.as_ref());
+        let solved = least_squares_min_norm_any_shape(&design, &(residual + &tangent_direction))?;
         let scale = residual
             .iter()
             .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
             .max(1.0);
         let tol = 100.0 * f64::EPSILON * (p.max(m) as f64) * scale;
         for (position, &row) in tangent_active.iter().enumerate() {
-            let value = solved[(position, 0)];
+            let value = solved[position];
             if !value.is_finite() || value < -tol {
                 return None;
             }
