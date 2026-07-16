@@ -1287,31 +1287,52 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
         return (a, b, groups, multiplier_dependence);
     }
 
-    let mut at_faer = faer::Mat::<f64>::zeros(p, k);
-    for i in 0..k {
-        for j in 0..p {
-            at_faer[(j, i)] = a[[i, j]];
+    // DETERMINISTIC, host-independent representative selection. The former faer
+    // `col_piv_qr` pivots by largest column norm; on an equal-norm tie
+    // (near-parallel / identical active rows — the degenerate-face case) faer's
+    // internal tie-break can differ across CPU arch / SIMD width / library
+    // version, which would record a host-dependent active face and re-introduce
+    // the nondeterministic cross-host certification the face feeds. Instead do a
+    // greedy ASCENDING-original-index independence scan: iterate rows in index
+    // order and keep row r iff its residual after projecting onto the orthonormal
+    // span of the already-kept rows exceeds the rank tolerance; otherwise record
+    // it dependent. This yields the lowest-index representative per independent
+    // direction with no float-comparison tie-break.
+    //
+    // Rank tolerance is relative to the largest row norm — the same |R00| scale
+    // (= largest column norm of Aᵀ = largest row norm of A) the pivoted QR used —
+    // so the accepted COUNT matches the prior numerical rank; only WHICH
+    // representative is chosen among tied near-parallel rows changes, and it
+    // changes deterministically. The scale carries NO absolute floor, preserving
+    // the unit-robustness of the prior tolerance (a perfectly independent system
+    // in tiny units, e.g. A = 1e-20·I, keeps full rank rather than being dropped).
+    const RANK_ALPHA: f64 = 100.0;
+    let max_row_norm = (0..k)
+        .map(|r| {
+            let row = a.row(r);
+            row.dot(&row).sqrt()
+        })
+        .fold(0.0_f64, f64::max);
+    let tol = RANK_ALPHA * f64::EPSILON * (k.max(p).max(1) as f64) * max_row_norm;
+
+    let mut ortho_basis: Vec<Array1<f64>> = Vec::new();
+    let mut kept_orig: Vec<usize> = Vec::new();
+    let mut dropped_orig: Vec<usize> = Vec::new();
+    for r in 0..k {
+        let mut resid = a.row(r).to_owned();
+        for q in &ortho_basis {
+            let proj = resid.dot(q);
+            resid.scaled_add(-proj, q);
+        }
+        let resid_norm = resid.dot(&resid).sqrt();
+        if resid_norm > tol {
+            kept_orig.push(r);
+            ortho_basis.push(&resid / resid_norm);
+        } else {
+            dropped_orig.push(r);
         }
     }
-
-    let qr = at_faer.as_ref().col_piv_qr();
-    let r_mat = qr.thin_R();
-    let diag_len = r_mat.nrows().min(r_mat.ncols());
-    let leading_diag = if diag_len > 0 {
-        r_mat[(0, 0)].abs()
-    } else {
-        0.0
-    };
-
-    // Rank tolerance relative to the leading pivot |R00| ONLY. The former
-    // absolute `max(|R00|, 1)` floor made rank detection unit-dependent: a
-    // perfectly independent system expressed in small units (A = 1e-20·I — the
-    // nonnegative orthant) had every pivot below the floor-driven tolerance and
-    // was silently declared rank zero, i.e. the constraints were DROPPED.
-    const RANK_ALPHA: f64 = 100.0;
-    let tol = RANK_ALPHA * f64::EPSILON * (k.max(p).max(1) as f64) * leading_diag;
-
-    let rank = (0..diag_len).filter(|&i| r_mat[(i, i)].abs() > tol).count();
+    let rank = kept_orig.len();
     if rank >= k {
         let multiplier_dependence = identity_multiplier_dependence(&groups);
         return (a, b, groups, multiplier_dependence);
@@ -1328,10 +1349,6 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
             Vec::new(),
         );
     }
-
-    let (perm_fwd, _) = qr.P().arrays();
-    let kept_orig: Vec<usize> = (0..rank).map(|j| perm_fwd[j].unbound()).collect();
-    let dropped_orig: Vec<usize> = (rank..k).map(|j| perm_fwd[j].unbound()).collect();
 
     let mut orig_to_out = std::collections::HashMap::with_capacity(rank);
     let mut a_out = Array2::<f64>::zeros((rank, p));
