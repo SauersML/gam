@@ -78,6 +78,46 @@ pub fn log_boundary_g_derivatives(mu: f64, h: f64) -> (f64, f64) {
     (d_mu, d_h)
 }
 
+/// Log of the interior (inactive-face) boundary factor
+/// `g_int(s, h) = √(2π/h) · Φ(s√h)`, the normal-direction contribution of one
+/// near-boundary INACTIVE constraint whose constrained mode sits at signed slack
+/// `s > 0` inside the feasible half-space (gam#2306 §4). Unlike the active factor
+/// [`log_boundary_g`], the mode is the unconstrained peak so there is no linear
+/// (multiplier) term — the integral is just the Gaussian tail past the boundary.
+///
+/// This is what makes the criterion smooth across an activation event: at `s = 0`
+/// it equals `½√(2π/h)`, exactly the active factor `g(μ=0, h)`, and as
+/// `s√h → +∞` it recovers `√(2π/h)` — the unrestricted Gaussian normalizer, i.e.
+/// a far-interior row reduces byte-identically to today's LAML.
+///
+/// `log g_int = ½ln(2π/h) + logΦ(s√h)`, stable for all `s` via `normal_logcdf`.
+pub fn log_interior_boundary_g(s: f64, h: f64) -> f64 {
+    assert!(
+        h.is_finite() && h > 0.0,
+        "interior boundary-g curvature h must be finite and positive, got {h}"
+    );
+    assert!(s.is_finite(), "interior boundary-g slack s must be finite, got {s}");
+    0.5 * ((2.0 * PI) / h).ln() + normal_logcdf(s * h.sqrt())
+}
+
+/// `(∂ log g_int/∂s, ∂ log g_int/∂h)`.
+///
+/// `∂ log g_int/∂s = √h · r`, `∂ log g_int/∂h = −1/(2h) + s·r/(2√h)`, with
+/// `r = φ(s√h)/Φ(s√h)` the (forward) Mills ratio — the same log-domain
+/// `exp(lnφ − logΦ)` form used by the active factor.
+pub fn log_interior_boundary_g_derivatives(s: f64, h: f64) -> (f64, f64) {
+    assert!(
+        h.is_finite() && h > 0.0,
+        "interior boundary-g curvature h must be finite and positive, got {h}"
+    );
+    assert!(s.is_finite(), "interior boundary-g slack s must be finite, got {s}");
+    let sqrt_h = h.sqrt();
+    let r = reverse_mills(s * sqrt_h);
+    let d_s = sqrt_h * r;
+    let d_h = -0.5 / h + s * r / (2.0 * sqrt_h);
+    (d_s, d_h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +225,82 @@ mod tests {
             assert!(
                 (d_h - fd_h).abs() <= 1e-5 * fd_h.abs().max(1.0),
                 "∂logg/∂h mismatch at ({mu},{h}): analytic {d_h} vs fd {fd_h}"
+            );
+        }
+    }
+
+    #[test]
+    fn interior_factor_joins_active_factor_at_the_boundary() {
+        // s = 0 (inactive mode exactly on the boundary) must equal μ = 0 (active
+        // face with zero multiplier) — the continuity that removes the log2 jump.
+        for &h in &[0.3_f64, 1.0, 7.0, 25.0] {
+            let interior = log_interior_boundary_g(0.0, h);
+            let active = log_boundary_g(0.0, h);
+            assert!(
+                (interior - active).abs() <= 1e-13 * active.abs().max(1.0),
+                "boundary join mismatch at h={h}: interior {interior} vs active {active}"
+            );
+        }
+    }
+
+    #[test]
+    fn interior_factor_far_from_boundary_recovers_full_gaussian() {
+        // s√h → ∞: g_int → √(2π/h) ⇒ log g_int → ½ln(2π/h). This is the
+        // unrestricted normalizer — a far-interior row costs nothing extra, so
+        // the criterion reduces byte-identically to today's LAML there.
+        for &(s, h) in &[(10.0_f64, 1.0), (30.0, 4.0), (6.0, 0.5)] {
+            let got = log_interior_boundary_g(s, h);
+            let want = 0.5 * ((2.0 * PI) / h).ln();
+            assert!(
+                (got - want).abs() < 1e-6,
+                "far-interior mismatch at s={s}, h={h}: {got} vs {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn interior_factor_matches_gaussian_tail_integral() {
+        // g_int(s,h) = √(2π/h)·Φ(s√h) = ∫_{−s}^∞ e^{−½ h u²} du.
+        for &(s, h) in &[(0.0_f64, 1.0), (0.4, 2.0), (1.0, 0.7), (2.0, 3.0)] {
+            let got = log_interior_boundary_g(s, h).exp();
+            // Composite-Simpson of the Gaussian tail from the boundary (−s) out.
+            let u_lo = -s;
+            let u_hi = (80.0 / h).sqrt();
+            let panels = 2_000_000usize;
+            let step = (u_hi - u_lo) / panels as f64;
+            let f = |u: f64| (-0.5 * h * u * u).exp();
+            let mut acc = f(u_lo) + f(u_hi);
+            for i in 1..panels {
+                let u = u_lo + step * i as f64;
+                acc += if i % 2 == 1 { 4.0 } else { 2.0 } * f(u);
+            }
+            let want = acc * step / 3.0;
+            let rel = (got - want).abs() / want.abs();
+            assert!(
+                rel < 5e-6,
+                "interior g({s},{h}) = {got:.10e} but the tail integral is {want:.10e} (rel {rel:.2e})"
+            );
+        }
+    }
+
+    #[test]
+    fn interior_factor_derivatives_match_central_difference() {
+        for &(s, h) in &[(0.0, 1.0), (0.6, 2.0), (1.5, 0.6), (-0.3, 3.0), (2.0, 0.9)] {
+            let (d_s, d_h) = log_interior_boundary_g_derivatives(s, h);
+            let eps = 1e-6;
+            let fd_s = (log_interior_boundary_g(s + eps, h)
+                - log_interior_boundary_g(s - eps, h))
+                / (2.0 * eps);
+            let fd_h = (log_interior_boundary_g(s, h + eps)
+                - log_interior_boundary_g(s, h - eps))
+                / (2.0 * eps);
+            assert!(
+                (d_s - fd_s).abs() <= 1e-5 * fd_s.abs().max(1.0),
+                "∂logg_int/∂s mismatch at ({s},{h}): analytic {d_s} vs fd {fd_s}"
+            );
+            assert!(
+                (d_h - fd_h).abs() <= 1e-5 * fd_h.abs().max(1.0),
+                "∂logg_int/∂h mismatch at ({s},{h}): analytic {d_h} vs fd {fd_h}"
             );
         }
     }
