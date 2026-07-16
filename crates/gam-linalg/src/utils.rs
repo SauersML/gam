@@ -680,7 +680,7 @@ pub fn certified_spd_inverse(
     certified_spd_factorize(matrix, label)?.inverse()
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct KahanSum {
     sum: f64,
     c: f64,
