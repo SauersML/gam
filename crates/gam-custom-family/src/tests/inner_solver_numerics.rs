@@ -2491,12 +2491,26 @@ pub(crate) fn outer_lamlhessian_joint_exact_binomial_location_scale_hard_case_ma
     }
 }
 
+/// The block solver factorizes ONE assembled system with the symmetric
+/// algorithm fallback `LLᵀ → LDLᵀ → LBLᵀ` (Bunch–Kaufman): when the penalized
+/// normal matrix is indefinite, Cholesky is rejected and an indefinite-capable
+/// factorization takes over, still returning the exact solution. The former
+/// eight-step ridge-ESCALATION retry was deliberately retired — escalating the
+/// ridge past `ridge_floor` changes the solved system (hence the fitted β̂ and
+/// the REML/LAML estimand), a shortcut this solver no longer takes; a genuinely
+/// singular system is now surfaced rather than silently biased.
+///
+/// Fixture: column 1 of the design is identically zero, so `XᵀWX` carries no
+/// curvature there, and a negative penalty makes the assembled system
+/// indefinite (one negative eigenvalue) but non-singular. Cholesky rejects it;
+/// the fallback resolves `β₀ = 2` from the informative column and leaves the
+/// unidentified `β₁` at zero because its right-hand side is zero.
 #[test]
 pub(crate) fn block_solve_falls_backwhen_llt_rejects_indefinite_system() {
     let x_dense = array![[1.0, 0.0], [0.0, 0.0]];
     let y_star = array![2.0, 0.0];
     let w = array![1.0, 1.0];
-    let s_lambda = array![[0.0, 0.0], [0.0, -1e-12]];
+    let s_lambda = array![[0.0, 0.0], [0.0, -0.5]];
 
     let beta = solve_blockweighted_system(
         &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_dense)),
@@ -2515,7 +2529,7 @@ pub(crate) fn block_solve_falls_backwhen_llt_rejects_indefinite_system() {
     );
     assert!(
         beta[1].abs() < 1e-8,
-        "null-space coefficient should stay near zero"
+        "unidentified coefficient should stay near zero"
     );
 }
 
