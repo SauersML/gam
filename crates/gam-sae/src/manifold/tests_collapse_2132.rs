@@ -332,25 +332,42 @@ fn manifold_circle_mixture_seed_eval_terminates_2132() {
     let mut refusals: Vec<String> = Vec::new();
     for (c, p) in CONFIGS {
         let train = planted_circle_mixture(N, p, c, SIGMA, 0xA11CE ^ c as u64);
-        let (mut objective, seed) =
-            objective_and_seed(train.view(), c, Topo::Circle, AssignmentMode::softmax(1.0));
-        match objective.eval_efs(&seed) {
-            Ok(eval) => {
-                let steps_finite = eval.steps.iter().all(|v| v.is_finite());
-                eprintln!(
-                    "[#2132 seed-eval] C={c} K={c} P={p}: cost={:.6e} n_steps={} \
-                     steps_finite={steps_finite} cost_finite={}",
-                    eval.cost,
-                    eval.steps.len(),
-                    eval.cost.is_finite()
-                );
-                if !eval.cost.is_finite() {
-                    refusals.push(format!("C={c}: non-finite seed cost {:.6e}", eval.cost));
+        // Both routings the close driver / repros exercise: soft (softmax logits are
+        // free Newton params) AND hard TopK (support-sparse — no logit is a Newton
+        // param, membership is the compact active-set whose oscillation is the
+        // exchange-churn signature shared with the CTN joint lane). top_k=1 mirrors
+        // the driver. Covering both means whichever mechanism the driver hit — the
+        // indefinite-Hessian geometry stall OR top-k support ping-pong — reproduces
+        // here, and the forwarded arbiter lines discriminate which.
+        for mode_idx in 0..2 {
+            let (mode_label, mode) = match mode_idx {
+                0 => ("softmax", AssignmentMode::softmax(1.0)),
+                _ => ("topk1", AssignmentMode::top_k_support(1)),
+            };
+            let (mut objective, seed) = objective_and_seed(train.view(), c, Topo::Circle, mode);
+            match objective.eval_efs(&seed) {
+                Ok(eval) => {
+                    let steps_finite = eval.steps.iter().all(|v| v.is_finite());
+                    eprintln!(
+                        "[#2132 seed-eval] C={c} K={c} P={p} routing={mode_label}: \
+                         cost={:.6e} n_steps={} steps_finite={steps_finite} cost_finite={}",
+                        eval.cost,
+                        eval.steps.len(),
+                        eval.cost.is_finite()
+                    );
+                    if !eval.cost.is_finite() {
+                        refusals.push(format!(
+                            "C={c}/{mode_label}: non-finite seed cost {:.6e}",
+                            eval.cost
+                        ));
+                    }
                 }
-            }
-            Err(err) => {
-                eprintln!("[#2132 seed-eval] C={c} K={c} P={p}: REFUSED — {err}");
-                refusals.push(format!("C={c}: {err}"));
+                Err(err) => {
+                    eprintln!(
+                        "[#2132 seed-eval] C={c} K={c} P={p} routing={mode_label}: REFUSED — {err}"
+                    );
+                    refusals.push(format!("C={c}/{mode_label}: {err}"));
+                }
             }
         }
     }
