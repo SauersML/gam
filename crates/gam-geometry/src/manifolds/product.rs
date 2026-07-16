@@ -412,3 +412,135 @@ mod tests {
         assert!((q[2] - 3.0).abs() < 1e-12);
     }
 }
+
+#[cfg(test)]
+mod parallel_transport_tests {
+    use super::*;
+    use crate::manifold::quad_form;
+    use crate::manifolds::euclidean::EuclideanManifold;
+    use crate::manifolds::sphere::SphereManifold;
+    use ndarray::array;
+
+    /// A product with one curved factor (`S^2`, ambient 3) and one flat
+    /// factor (`R^2`), so `parallel_transport`'s per-component splitting and
+    /// re-stitching (see [`ProductManifold::parallel_transport`]) is
+    /// exercised against a genuinely non-trivial transport, not the
+    /// componentwise-identity case a two-Euclidean-factor fixture would
+    /// give. The fixture points mirror `sphere.rs`'s own
+    /// `parallel_transport_tests::fixture` for the curved half.
+    fn fixture() -> (ProductManifold, Array1<f64>, Array1<f64>) {
+        let product = ProductManifold::new(vec![
+            Box::new(SphereManifold::new(2)),
+            Box::new(EuclideanManifold::new(2)),
+        ]);
+        let sphere_p = array![1.0_f64, 0.0, 0.0];
+        let raw = array![1.0_f64, 1.0, 1.0];
+        let sphere_q = &raw / (raw.dot(&raw)).sqrt();
+        let p = concat_1d(&[sphere_p.view(), array![0.5_f64, -1.0].view()]);
+        let q = concat_1d(&[sphere_q.view(), array![2.0_f64, 0.5].view()]);
+        (product, p, q)
+    }
+
+    fn concat_1d(parts: &[ArrayView1<'_, f64>]) -> Array1<f64> {
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let mut out = Array1::<f64>::zeros(total);
+        let mut off = 0usize;
+        for part in parts {
+            for &x in part.iter() {
+                out[off] = x;
+                off += 1;
+            }
+        }
+        out
+    }
+
+    fn path2(a: &Array1<f64>, b: &Array1<f64>) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((2, a.len()));
+        out.row_mut(0).assign(a);
+        out.row_mut(1).assign(b);
+        out
+    }
+
+    /// Parallel transport on a product manifold is the block-diagonal
+    /// concatenation of each factor's own transport, so it must still be a
+    /// linear isometry of the *product* metric — `⟨Γ(U),Γ(V)⟩_Q = ⟨U,V⟩_P` —
+    /// even though the two blocks have unrelated (curved vs. flat)
+    /// geometries. `quad_form` against `metric_tensor` (block identity here,
+    /// since both factors carry the embedded/ambient metric) is the
+    /// manifold-agnostic inner product, so this genuinely checks the
+    /// splitting/re-stitching in `ProductManifold::parallel_transport`
+    /// rather than re-deriving each factor's own formula.
+    #[test]
+    fn parallel_transport_preserves_product_inner_product() {
+        let (product, p, q) = fixture();
+        let path = path2(&p, &q);
+        // Tangent at p: sphere block orthogonal to (1,0,0) (zero first
+        // coordinate), Euclidean block unconstrained.
+        let u = array![0.0_f64, 1.0, 0.4, 3.0, -2.0];
+        let v = array![0.0_f64, -0.3, 1.2, -1.0, 0.5];
+
+        let tu = product
+            .parallel_transport(path.view(), u.view())
+            .expect("Γ(U)");
+        let tv = product
+            .parallel_transport(path.view(), v.view())
+            .expect("Γ(V)");
+
+        let g_p = product.metric_tensor(p.view()).expect("G(P)");
+        let g_q = product.metric_tensor(q.view()).expect("G(Q)");
+        let before = quad_form(g_p.view(), u.view(), v.view());
+        let after = quad_form(g_q.view(), tu.view(), tv.view());
+        assert!(
+            (before - after).abs() <= 1e-10 * before.abs().max(1.0),
+            "product parallel transport is not an isometry: ⟨U,V⟩_P={before:.12e}, ⟨ΓU,ΓV⟩_Q={after:.12e}"
+        );
+    }
+
+    /// Same geodesic-velocity sign identity checked per-factor elsewhere
+    /// (`sphere.rs`, `spd.rs`): `Γ_{P→Q}(log_P Q) = −log_Q P`, now across the
+    /// whole product vector at once — a bug that swapped or misaligned a
+    /// component's offset while splitting `point_along`/`vec` would show up
+    /// here even if each factor's own transport were correct in isolation.
+    #[test]
+    fn parallel_transport_matches_geodesic_velocity_identity() {
+        let (product, p, q) = fixture();
+        let forward = path2(&p, &q);
+        let v_p_to_q = product.log_map(p.view(), q.view()).expect("log_P(Q)");
+        let v_q_to_p = product.log_map(q.view(), p.view()).expect("log_Q(P)");
+
+        let transported = product
+            .parallel_transport(forward.view(), v_p_to_q.view())
+            .expect("Γ(log_P Q)");
+        for (i, (&t, &v)) in transported.iter().zip(v_q_to_p.iter()).enumerate() {
+            assert!(
+                (t + v).abs() <= 1e-9 * v.abs().max(1.0),
+                "component {i}: Γ(log_P Q)={t:.12e}, −log_Q P={:.12e}",
+                -v
+            );
+        }
+    }
+
+    /// Transporting forward `P→Q` then back `Q→P` must recover the original
+    /// tangent exactly, block by block.
+    #[test]
+    fn parallel_transport_round_trip_is_identity() {
+        let (product, p, q) = fixture();
+        let forward = path2(&p, &q);
+        let backward = path2(&q, &p);
+        let u = array![0.0_f64, 0.6, -0.2, 1.5, -0.7];
+
+        let out = product
+            .parallel_transport(forward.view(), u.view())
+            .expect("Γ_{P→Q}(U)");
+        let back = product
+            .parallel_transport(backward.view(), out.view())
+            .expect("Γ_{Q→P}(Γ_{P→Q}(U))");
+
+        for (i, (&b, &orig)) in back.iter().zip(u.iter()).enumerate() {
+            assert!(
+                (b - orig).abs() <= 1e-9 * orig.abs().max(1.0),
+                "component {i}: round-trip {b:.12e} vs original {orig:.12e}"
+            );
+        }
+    }
+}
