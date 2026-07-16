@@ -32,13 +32,22 @@ pub const ACTIVE_SET_PRIMAL_FEASIBILITY_TOL: f64 = 1e-8;
 /// subsegment of the endpoint chord.
 pub const ACTIVE_SET_WORKING_FACE_TOL: f64 = 1e-10;
 
-/// Step fraction to the boundary of the solver's *certified numerical feasible
-/// set*. Every active-set exit accepts scaled slack `>=
-/// -ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`; ratio tests must therefore measure the
-/// remaining distance to that same boundary, not to exact zero. Using raw
-/// slack makes a point that is feasible to machine precision but happens to
-/// sit at `-O(eps)` produce an exact zero step, so a valid tangent escape is
-/// refused before the final feasibility certificate can inspect it (#979).
+/// Step fraction to the EXACT constraint boundary. A strictly feasible row
+/// (`slack > 0`) clips the step so the iterate lands ON the boundary — never
+/// inside the `±ACTIVE_SET_PRIMAL_FEASIBILITY_TOL` certified band. The former
+/// `slack + TOL` target deliberately overshot to the band's outer edge, which
+/// (a) returned band-edge answers from problems whose true optimum is on the
+/// boundary (`maxiter_accepts_current_boundary_solution` observed 0.1+1e-8),
+/// (b) made every downstream feasibility re-check a rounding coin flip, and
+/// (c) broke the strict-interior projection repair, whose own identity-QP
+/// landed band-edge and was then rejected by its interior margin.
+///
+/// A row already at or marginally past the boundary (`slack <= 0`, moving
+/// outward) clips to a zero step: the row is added as blocking, and the
+/// zero-progress machinery (projected-gradient tangent escape at
+/// `primal_step_norm <= tol_step`, plus the post-full-step multiplier
+/// adjudication) inspects the escape the pre-#979 code refused — the original
+/// reason the `+TOL` overshoot was introduced, now handled structurally.
 #[inline]
 fn active_set_boundary_hit_step_fraction(
     scaled_slack: f64,
@@ -46,7 +55,7 @@ fn active_set_boundary_hit_step_fraction(
     current_step_limit: f64,
 ) -> Option<f64> {
     boundary_hit_step_fraction(
-        scaled_slack + ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
+        scaled_slack.max(0.0),
         scaled_directional_change,
         current_step_limit,
     )
