@@ -2806,7 +2806,18 @@ fn channel_aware_penalty_aware_joint_rank(
         }
     }
 
-    rank_of_gram(&aug_gram, n_design_rows + n_penalty_rows)
+    // Equilibrate the penalty-augmented Gram (diagonal congruence, exactly rank-
+    // preserving) before the numerical rank count. `count_rank`'s tolerance is
+    // relative to the LARGEST singular value, so a small penalty-covered σ on a
+    // weakly-distinguished direction — the pilot-effective marginal-slope shared-
+    // affine modes, where the c−f channel weighting is weak — is stranded below
+    // the cutoff by a stiff direction (the c_i-scale anisotropy), mislabeling an
+    // identified model as rank-deficient and blocking the penalty-coverage
+    // suppression. This is the keep_positive_eigenspace equilibration (b58bd1909)
+    // one layer down; it shares `gam_linalg::decision::equilibrate_gram`, whose
+    // own test certifies exactly this strand-vs-equilibrate case.
+    let (equilibrated, _) = gam_linalg::decision::equilibrate_gram(&aug_gram);
+    rank_of_gram(&equilibrated, n_design_rows + n_penalty_rows)
 }
 
 /// Pairwise overlap scan on the channel-weighted joint design
