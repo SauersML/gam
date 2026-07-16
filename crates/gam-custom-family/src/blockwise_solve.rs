@@ -1135,6 +1135,7 @@ pub(crate) struct BlockUpdateContext<'a> {
     pub(crate) cached_active_set: Option<&'a [usize]>,
 }
 
+#[derive(Debug)]
 pub(crate) struct BlockUpdateResult {
     pub(crate) beta_new_raw: Array1<f64>,
     pub(crate) active_set: Option<Vec<usize>>,
