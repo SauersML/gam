@@ -22,7 +22,8 @@ use gam_linalg::matrix::DesignMatrix;
 use gam_problem::{
     BlockGeometryDirectionalDerivative, BlockWorkingSet, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactNewtonOuterObjective,
-    ExactOuterDerivativeOrder, ParameterBlockSpec, ParameterBlockState, PseudoLogdetMode,
+    ExactOuterDerivativeOrder, ParameterBlockSpec,
+    ParameterBlockState, PseudoLogdetMode,
 };
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
@@ -1514,30 +1515,6 @@ pub trait CustomFamily {
     /// (`survival_location_scale`), whose intercept-only-scale fits can be
     /// high-cond and which a shared (unconditional) gate would regress (#735/#736).
     fn levenberg_on_ill_conditioning(&self) -> bool {
-        false
-    }
-
-    /// Whether this family's penalized inner objective `−ℓ(β) + ½βᵀS(λ)β` is
-    /// SELF-CONCORDANT in the coefficients, so the coupled-joint inner Newton
-    /// may globalize with a self-concordant DAMPED step (`α = 1/(1+λ_N)`,
-    /// `λ_N` the Newton decrement) instead of the trust-region ratio search.
-    ///
-    /// Default `false`: every family keeps the existing trust-region
-    /// globalization byte-for-byte. The conditional transformation model
-    /// (`transformation_normal`, direct-α chart) overrides to `true`: its
-    /// log-density carries the change-of-variables Jacobian `+log h'(y)` with
-    /// `h'` AFFINE in β (the direct-α payoff), so `−log h'` is a canonical
-    /// self-concordant barrier; the Gaussian log-kernel `−½h²` and the quadratic
-    /// penalty are trivially self-concordant. The self-concordant damped step has
-    /// the textbook bounded-decrease-then-quadratic guarantee, which the
-    /// trust-region metric lacks on the barrier's `1/h'²` curvature — where it
-    /// otherwise collapses to a ~1e-6 linear-rate crawl toward the tiny-positive
-    /// `h'` interior optimum (gam#979). The endpoint normalizer `−log Z` is
-    /// convex but not reliably self-concordant, so it is left to the retained
-    /// trust-ratio acceptance gate; the damping keys only on the barrier's
-    /// Newton decrement. This flag changes STEP POLICY only — the KKT/curvature
-    /// certificates still gate acceptance unchanged.
-    fn inner_objective_is_self_concordant(&self) -> bool {
         false
     }
 

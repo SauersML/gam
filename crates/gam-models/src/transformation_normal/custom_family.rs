@@ -12,6 +12,15 @@ impl CustomFamily for TransformationNormalFamily {
     /// The inner Newton may therefore globalize with the self-concordant damped
     /// step, which converges to the tiny-positive-`h'` interior optimum instead
     /// of the trust-region metric's `1/h'²` linear-rate crawl (gam#979).
+    ///
+    /// The one non-strictly-self-concordant term is the finite-support endpoint
+    /// normalizer `−log(Φ(h_U) − Φ(h_L))`: it is convex (log-concave Gaussian
+    /// measure, Prékopa) but its truncated-Gaussian third cumulant is not
+    /// SC-bounded on a tight support. The damped step therefore keys the
+    /// decrement on the barrier and carries the endpoint term through the
+    /// existing acceptance ratio — the barrier is the term whose `1/h'²`
+    /// curvature stalls the crawl, so flagging the family self-concordant is the
+    /// correct trigger for that step.
     fn inner_objective_is_self_concordant(&self) -> bool {
         true
     }

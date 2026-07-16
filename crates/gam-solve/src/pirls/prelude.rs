@@ -47,12 +47,7 @@ pub(crate) use faer::sparse::{
     SparseColMatMut, SparseColMatRef, SparseRowMat, SymbolicSparseColMat, SymbolicSparseColMatRef,
 };
 
-// `Unbind` is intentionally NOT re-exported here: the deny-warnings build
-// flags this glob re-export as unused (trait-method resolution via a glob
-// re-export chain does not count as a use for the lint). The two call sites
-// that need `.unbound()` (newton_solve.rs, gam_working_model.rs) import
-// `faer::Unbind` directly instead. See #2306/build.
-pub(crate) use faer::{Accum, Par, Side, get_global_parallelism};
+pub(crate) use faer::{Accum, Par, Side, Unbind, get_global_parallelism};
 
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, ShapeBuilder, Zip};
 
