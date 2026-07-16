@@ -4,7 +4,7 @@ use gam::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform,
 };
 use gam::families::survival::latent::fixed_latent_hazard_frailty;
-use gam::families::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
+use gam::families::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
 use gam::families::vector_response::{GaussianVectorLikelihood, VectorNoise, VectorResponseTarget};
 use gam::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
 use gam::types::inverse_link_to_binomial_spec;
@@ -204,7 +204,7 @@ fn bug_scale_design_apply_then_inverse_apply_round_trips_identity() {
 #[test]
 fn bug_latent_survival_fixed_frailty_accepts_valid_hazard_multiplier_spec() {
     let frailty = FrailtySpec::HazardMultiplier {
-        sigma_fixed: Some(0.7),
+        scale: FrailtyScale::Fixed { sigma: 0.7 },
         loading: HazardLoading::Full,
     };
     let (sigma, loading) = fixed_latent_hazard_frailty(&frailty, "latent-survival")

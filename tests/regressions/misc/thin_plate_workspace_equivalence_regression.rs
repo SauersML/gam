@@ -32,8 +32,8 @@ fn bug_thin_plate_workspace_variant_mismatch() {
     let b = with_ws.design.to_dense();
     assert_eq!(a.dim(), b.dim(), "design shape mismatch");
     assert_eq!(
-        no_ws.penalties.len(),
-        with_ws.penalties.len(),
+        no_ws.active_penalties.len(),
+        with_ws.active_penalties.len(),
         "penalty count mismatch"
     );
 
