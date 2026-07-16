@@ -4,6 +4,11 @@
 //! active-set KKT machinery, and the soft-acceptance progress test.
 
 use super::*;
+// `Unbind::unbound()` maps a faer bound sparse column index back to `usize`
+// for `x_dense` indexing. Imported directly at the call site rather than via
+// the pirls prelude re-export (which the deny-warnings build flagged as an
+// unused re-export even though the trait method is used here, #2306/build).
+use faer::Unbind;
 
 pub(crate) const DENSE_OUTER_MAX_P: usize = 1024;
 

@@ -4,6 +4,10 @@
 //! fixed stabilization ridge and the `GamModelFinalState` snapshot.
 
 use super::*;
+// `Unbind::unbound()` maps a faer bound sparse column index back to `usize`
+// for dense-matrix indexing (see also newton_solve.rs). Imported directly at
+// the call site rather than via the pirls prelude re-export (#2306/build).
+use faer::Unbind;
 
 // Fixed stabilization ridge for PIRLS/PLS. `penalty_term` carries this as
 // ridge * ||beta||^2 (equivalently 0.5 * ridge * ||beta||^2 in the
