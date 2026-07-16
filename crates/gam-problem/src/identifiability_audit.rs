@@ -27,6 +27,14 @@ pub struct BlockIdentity {
     /// flag a within-block rank deficiency that escaped within-smooth
     /// nullspace absorption.
     pub design_range_rank: usize,
+    /// Comma-joined descending singular values (√eig of the ranked Gram) of the
+    /// matrix whose rank produced `design_range_rank`, populated ONLY when the
+    /// block is within-block rank-deficient (`design_range_rank < original_dim`);
+    /// empty otherwise. Surfaced in the intra-block-deficiency refusal so a
+    /// `range_rank ≪ dim` verdict names the real geometry (a one-dominant-value
+    /// spectrum = numerical rank collapse, e.g. an extreme per-row channel
+    /// weight; a genuinely low-rank design has several near-zero values).
+    pub singular_spectrum: String,
 }
 
 /// A pair `(block_a.column → block_b.column)` whose normalised
@@ -157,6 +165,7 @@ mod tests {
             original_dim: 5,
             effective_dim: 4,
             design_range_rank: 4,
+            singular_spectrum: String::new(),
         };
         assert_eq!(bi.block_name, "smooth_1");
         assert_eq!(bi.original_dim, 5);

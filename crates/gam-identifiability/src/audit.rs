@@ -861,11 +861,17 @@ fn audit_identifiability_impl(
         // (design-null but regularized) directions count as identified. RRQR is
         // rank-revealing (the prior plain-QR diagonal was not), so the reported
         // range_rank is now an honest numerical rank.
+        let singular_spectrum = if block_ranks[idx] < p_block {
+            block_effective_singular_spectrum(&dense_blocks[idx])
+        } else {
+            String::new()
+        };
         blocks.push(BlockIdentity {
             block_name: spec.name.clone(),
             original_dim: p_block,
             effective_dim: p_block,
             design_range_rank: block_ranks[idx],
+            singular_spectrum,
         });
         let next_offset = col_offsets[col_offsets.len() - 1] + p_block;
         col_offsets.push(next_offset);
@@ -913,37 +919,6 @@ fn audit_identifiability_impl(
             p_total,
             layout.join(" | "),
         );
-        // For any within-block-deficient block, dump the ACTUAL singular spectrum
-        // of the matrix the audit ranked (its effective Jacobian, penalty-aware),
-        // so a `range_rank ≪ dim` verdict is traceable to the real geometry rather
-        // than guessed from the raw design. Cheap (one Gram + symmetric eig on the
-        // `p×p` block), fires only on a deficiency.
-        for (i, b) in blocks.iter().enumerate() {
-            if b.design_range_rank >= b.original_dim {
-                continue;
-            }
-            let eff = &dense_blocks[i];
-            let (eff_rows, eff_cols) = eff.dim();
-            let gram = eff.t().dot(eff);
-            let spectrum: String = match gram.eigh(Side::Lower) {
-                Ok((evals, _)) => {
-                    let mut sv: Vec<f64> = evals.iter().map(|&l| l.max(0.0).sqrt()).collect();
-                    sv.sort_by(|a, c| c.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                    sv.iter()
-                        .map(|s| format!("{s:.3e}"))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                }
-                Err(_) => "eig-failed".to_string(),
-            };
-            let has_penalty = block_penalties[i].is_some();
-            log::info!(
-                "[identifiability audit/deficient-block] '{}' effective_jacobian={eff_rows}x{eff_cols} range_rank={}/{} penalty_aware={has_penalty}; singular_values=[{spectrum}]",
-                b.block_name,
-                b.design_range_rank,
-                b.original_dim,
-            );
-        }
     }
 
     if p_total == 0 {
@@ -1802,8 +1777,12 @@ fn audit_identifiability_impl(
                             "; block '{}' is INTRA-BLOCK rank-deficient \
                              (range_rank {}/{}) — NOT resolvable by cross-block \
                              gauge_priority; the redundant column must be removed \
-                             or centered within the block",
-                            first_drop.block, b.design_range_rank, b.original_dim
+                             or centered within the block; ranked-Gram singular \
+                             values=[{}]",
+                            first_drop.block,
+                            b.design_range_rank,
+                            b.original_dim,
+                            b.singular_spectrum
                         )
                     })
                     .unwrap_or_default();
@@ -2163,6 +2142,19 @@ pub fn audit_identifiability_channel_aware(
     for (idx, spec) in specs.iter().enumerate() {
         let p_block = spec.design.ncols();
         let kept = compiled_map.compiled_block_ranges[idx].len();
+        // Diagnostic spectrum for a rank-deficient block: √eig of its diagonal
+        // structural sub-Gram — the exact matrix whose pivoted-Cholesky rank
+        // produced `kept`. Only computed on deficiency.
+        let singular_spectrum = if kept < p_block {
+            let off = col_offsets[idx];
+            let sub = geometry
+                .gram_struct
+                .slice(ndarray::s![off..off + p_block, off..off + p_block])
+                .to_owned();
+            gram_singular_spectrum(&sub)
+        } else {
+            String::new()
+        };
         blocks.push(BlockIdentity {
             block_name: spec.name.clone(),
             original_dim: p_block,
@@ -2171,6 +2163,7 @@ pub fn audit_identifiability_channel_aware(
             // per-block penalty-aware rank; rely on `effective_dim`
             // < `original_dim` as the structural-rank signal.
             design_range_rank: kept,
+            singular_spectrum,
         });
     }
     let p_total = *col_offsets.last().expect("col_offsets non-empty");
@@ -2518,8 +2511,12 @@ pub fn audit_identifiability_channel_aware(
                             "; block '{}' is INTRA-BLOCK rank-deficient \
                              (range_rank {}/{}) — NOT resolvable by cross-block \
                              gauge_priority; the redundant column must be removed \
-                             or centered within the block",
-                            first_drop.block, b.design_range_rank, b.original_dim
+                             or centered within the block; ranked-Gram singular \
+                             values=[{}]",
+                            first_drop.block,
+                            b.design_range_rank,
+                            b.original_dim,
+                            b.singular_spectrum
                         )
                     })
                     .unwrap_or_default();
@@ -3176,6 +3173,30 @@ pub(crate) fn block_structural_penalty_dense(spec: &ParameterBlockSpec) -> Optio
 /// rather than a plain (non-pivoted) QR whose R diagonal can scatter a near-zero
 /// pivot early and under/over-count the rank of a deficient matrix. Tolerance
 /// matches the joint RRQR.
+/// Comma-joined descending singular values (`√eig`) of a symmetric Gram — the
+/// diagnostic spectrum surfaced in the intra-block-deficiency refusal. A single
+/// dominant value with the rest orders of magnitude below the pivot tolerance is
+/// a numerical rank collapse (e.g. an extreme per-row channel weight); a
+/// genuinely low-rank design shows several near-zero values.
+fn gram_singular_spectrum(gram: &Array2<f64>) -> String {
+    match gram.eigh(Side::Lower) {
+        Ok((evals, _)) => {
+            let mut sv: Vec<f64> = evals.iter().map(|&l| l.max(0.0).sqrt()).collect();
+            sv.sort_by(|a, c| c.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            sv.iter()
+                .map(|s| format!("{s:.3e}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        Err(_) => "eig-failed".to_string(),
+    }
+}
+
+/// Singular spectrum of a block's effective (dense) Jacobian, via its Gram.
+fn block_effective_singular_spectrum(dense: &Array2<f64>) -> String {
+    gram_singular_spectrum(&dense.t().dot(dense))
+}
+
 fn block_penalty_aware_rank(
     block: &Array2<f64>,
     structural_penalty: Option<&Array2<f64>>,
