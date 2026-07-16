@@ -54,7 +54,7 @@
 //! body fails loudly and this test fails — a missing reference is a real
 //! failure, never a silent pass.
 
-use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_python};
+use gam::test_support::reference::{Column, QualityPair, max_abs_diff, relative_l2, run_python};
 use gam::{RiemannianManifold, SpdManifold};
 use ndarray::{Array1, Array2, ArrayView1};
 use std::fs::File;
@@ -530,6 +530,18 @@ emit("gam_mean_grad_norm", [float(metric.norm(grad, G))])
          geomstats_frechet_variance={gs_frechet_variance:.6} \
          gam_mean_grad_in_geomstats={gs_grad_norm:.3e}"
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "manifolds",
+            "quality_vs_geomstats_crabs_spd_manifold",
+            "frechet_variance",
+            gam_frechet_variance,
+            "geomstats",
+            gs_frechet_variance,
+        )
+        .line()
+    );
 
     // ===================== (1) distance vs ANALYTIC GROUND TRUTH =============
     // The affine-invariant geodesic distance is the exact closed form
@@ -765,6 +777,18 @@ emit("acc", [correct / M])
          {N_TEST_PER_GROUP}/group) | gam_acc={gam_acc:.3} geomstats_acc={gs_acc:.3} \
          gam_dist_vs_ANALYTIC={dist_vs_analytic:.3e} (PRIMARY) \
          geomstats_dist_vs_analytic={dist_gs_vs_analytic:.3e} (informational)"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::score(
+            "manifolds",
+            "quality_vs_geomstats_crabs_spd_manifold::holdout_accuracy",
+            "holdout_accuracy",
+            gam_acc,
+            "geomstats",
+            gs_acc,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: perfect held-out recovery ------------

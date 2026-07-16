@@ -53,7 +53,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, r2, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -268,6 +268,18 @@ fn gam_solar_zenith_cylinder_predicts_heldout_and_closes_seam() {
          rel_to_mgcv(context)={rel_to_mgcv:.5}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "manifolds",
+            "quality_vs_mgcv_solar_zenith_cylinder",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- (1) PRIMARY: held-out prediction ---------------------------------

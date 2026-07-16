@@ -40,7 +40,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, rmse, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::io::Write as _;
@@ -306,6 +306,18 @@ fn gam_sphere_matches_mgcv_sos_on_geographic_surface() {
          gam_rmse/range={rmse_to_range:.4} \
          [context: gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} edf_rel={edf_rel:.3} \
          rel_l2_to_mgcv={rel:.4} pearson_to_mgcv={corr:.5}] seam_rel={seam_rel:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "manifolds",
+            "quality_vs_mgcv_sphere_s2_wahba_vs_sos",
+            "rmse",
+            gam_rmse,
+            "mgcv",
+            mgcv_rmse,
+        )
+        .line()
     );
 
     // PRIMARY claim — truth recovery, calibrated to the mature reference on the

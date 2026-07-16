@@ -38,7 +38,7 @@
 //! back `gamfit.PoincareAtoms` against their defining geometric axioms.
 
 use gam::geometry::poincare::{exp_origin, log_origin, poincare_distance};
-use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_python};
+use gam::test_support::reference::{Column, QualityPair, max_abs_diff, relative_l2, run_python};
 use ndarray::Array1;
 
 /// Curvature exposed to both engines. `c = -1` ⇒ `k = 1` ⇒ unit ball, which is
@@ -296,6 +296,42 @@ emit("closed_maxabs_max", [float(np.max(closed_maxabs))])
          geomstats round-trip: L2_rel_max={geo_self_l2_max:.3e} maxabs={geo_self_maxabs_max:.3e} (baseline)\n  \
          geomstats closed-form maxabs={geo_closed_maxabs_max:.3e} (baseline)\n  \
          context: cross-engine exp_rel_l2={cross_exp_rel_l2:.3e} (NOT asserted)"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "manifolds",
+            "quality_vs_geomstats_poincare_exp_log_roundtrip::roundtrip_maxabs",
+            "roundtrip_maxabs",
+            gam_roundtrip_maxabs,
+            "geomstats",
+            geo_self_maxabs_max,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "manifolds",
+            "quality_vs_geomstats_poincare_exp_log_roundtrip::roundtrip_l2",
+            "roundtrip_relative_l2",
+            gam_roundtrip_l2_max,
+            "geomstats",
+            geo_self_l2_max,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "manifolds",
+            "quality_vs_geomstats_poincare_exp_log_roundtrip::closedform",
+            "closedform_maxabs",
+            gam_closedform_maxabs,
+            "geomstats",
+            geo_closed_maxabs_max,
+        )
+        .line()
     );
 
     // --- PRIMARY OBJECTIVE BOUND 1: round-trip identity log∘exp == v ---

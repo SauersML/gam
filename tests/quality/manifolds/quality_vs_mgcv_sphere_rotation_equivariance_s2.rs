@@ -40,7 +40,9 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, r2, relative_l2, rmse, run_r};
+use gam::test_support::reference::{
+    Column, QualityPair, pad_to, pearson, r2, relative_l2, rmse, run_r,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -300,6 +302,18 @@ fn gam_sphere_smooth_is_rotation_equivariant_and_recovers_truth() {
         "[s2-truth] gam_truth_rmse={gam_truth_rmse:.4} mgcv_truth_rmse={mgcv_truth_rmse:.4} \
          mgcv_edf={mgcv_edf:.3} | context: rel_l2(gam,mgcv)={rel:.4} pearson={corr:.5}"
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "manifolds",
+            "quality_vs_mgcv_sphere_rotation_equivariance_s2",
+            "truth_rmse",
+            gam_truth_rmse,
+            "mgcv",
+            mgcv_truth_rmse,
+        )
+        .line()
+    );
 
     // PRIMARY CLAIM: gam recovers the known surface AT LEAST AS WELL AS the mature
     // spline-on-sphere on the IDENTICAL design. The absolute recovery bar for this
@@ -502,6 +516,18 @@ fn gam_sphere_smooth_is_rotation_equivariant_and_recovers_truth_on_real_data() {
          equivariance: edf_orig={edf_orig:.3} edf_rot={edf_rot:.3} max|g(p)-g_R(Rp)|={equiv_max_abs:.3e}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "manifolds",
+            "quality_vs_mgcv_sphere_rotation_equivariance_s2::test",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY (intrinsic axiom): rotation equivariance ------------------

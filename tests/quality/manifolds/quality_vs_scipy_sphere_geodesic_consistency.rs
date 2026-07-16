@@ -62,7 +62,9 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python, run_r};
+use gam::test_support::reference::{
+    Column, QualityPair, pearson, relative_l2, rmse, run_python, run_r,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -335,6 +337,18 @@ emit("metric_gap", [metric_gap])
          pearson(f_mgcv, f_true)={mgcv_corr_true:.4} \
          rmse_ratio(gam/mgcv)={:.4}",
         gam_rmse / mgcv_rmse.max(1e-12)
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "manifolds",
+            "quality_vs_scipy_sphere_geodesic_consistency",
+            "rmse_to_truth",
+            gam_rmse,
+            "mgcv",
+            mgcv_rmse,
+        )
+        .line()
     );
 
     // ---- antimeridian-seam discriminator ----------------------------------

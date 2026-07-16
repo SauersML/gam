@@ -35,7 +35,9 @@
 //! lies strictly inside the open unit ball where the arccosh formula is smooth.
 
 use gam::geometry::poincare::poincare_distance;
-use gam::test_support::reference::{Column, max_abs_diff, relative_l2, rmse, run_python};
+use gam::test_support::reference::{
+    Column, QualityPair, max_abs_diff, relative_l2, rmse, run_python,
+};
 use ndarray::ArrayView1;
 
 /// Deterministic SplitMix64 -> uniform f64 in `[lo, hi)`. Fixed seed makes the
@@ -238,6 +240,18 @@ emit("dist", d)
         let ref_truth_rmse = rmse(ref_dist, &truth_d);
         eprintln!(
             "poincare d={dim}: gam-vs-geomstats relative_l2={gam_vs_ref:.3e} | geomstats-vs-closed-form rmse={ref_truth_rmse:.3e}"
+        );
+        eprintln!(
+            "{}",
+            QualityPair::error(
+                "manifolds",
+                &format!("quality_vs_geomstats_poincare_geodesic::d{dim}"),
+                "rmse_to_truth",
+                gam_truth_rmse,
+                "geomstats",
+                ref_truth_rmse,
+            )
+            .line()
         );
         // Match-or-beat on ACCURACY against the shared analytic truth: gam's
         // RMSE to ground truth must not exceed geomstats' RMSE by more than a

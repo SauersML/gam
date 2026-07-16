@@ -34,7 +34,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -237,6 +237,30 @@ fn gam_thin_plate_by_factor_recovers_per_level_truth() {
          cross-group pearson(A,B)={cross_corr:.4} \
          (A range [{a_min:.3},{a_max:.3}] B range [{b_min:.3},{b_max:.3}])",
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "factors",
+            "quality_vs_mgcv_thin_plate_by_factor::a",
+            "err_a",
+            gam_err_a,
+            "mgcv",
+            mgcv_err_a,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "factors",
+            "quality_vs_mgcv_thin_plate_by_factor::b",
+            "err_b",
+            gam_err_b,
+            "mgcv",
+            mgcv_err_b,
+        )
+        .line()
+    );
 
     // (1) TRUTH RECOVERY — the primary claim. Each group's fitted smooth must
     // recover its OWN true generating function to well within the noise level.
@@ -271,6 +295,18 @@ fn gam_thin_plate_by_factor_recovers_per_level_truth() {
     let truth_pooled: Vec<f64> = truth_a.iter().chain(truth_b.iter()).copied().collect();
     let gam_err_pooled = rmse(&gam_pooled, &truth_pooled);
     let mgcv_err_pooled = rmse(&mgcv_pooled, &truth_pooled);
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "factors",
+            "quality_vs_mgcv_thin_plate_by_factor::pooled",
+            "err_pooled",
+            gam_err_pooled,
+            "mgcv",
+            mgcv_err_pooled,
+        )
+        .line()
+    );
     assert!(
         gam_err_pooled <= mgcv_err_pooled * 1.10,
         "gam is less accurate than mgcv against truth (pooled over both levels): \

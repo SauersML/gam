@@ -42,7 +42,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, r2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, pearson, r2, rmse, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -186,6 +186,18 @@ fn gam_sphere_smooth_predicts_global_city_temp_better_than_mgcv_sos() {
          gam_test_rmse={gam_test_rmse:.4} mgcv_test_rmse={mgcv_test_rmse:.4}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "manifolds",
+            "quality_vs_mgcv_global_city_temp_sphere_s2",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts the held-out field ------
@@ -355,6 +367,18 @@ fn gam_sphere_smooth_predicts_global_city_temp_better_than_mgcv_sos_on_real_data
          gam_test_rmse={gam_test_rmse:.4} mgcv_test_rmse={mgcv_test_rmse:.4}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "manifolds",
+            "quality_vs_mgcv_global_city_temp_sphere_s2::i5",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam tracks the held-out field --------
