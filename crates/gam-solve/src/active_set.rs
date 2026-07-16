@@ -1799,16 +1799,28 @@ fn solve_newton_direction_with_linear_constraints_impl(
         if feasible {
             // Face provenance of the RETURNED point: the unconstrained optimum
             // can land exactly on a boundary (the warm filter above may have
-            // just emptied the hint because the START was interior). Report
-            // the rows tight at the answer so the next warm start carries the
-            // face instead of an empty hint.
+            // just emptied the hint because the START was interior). Report the
+            // rows tight at the answer so the next warm start carries the face
+            // instead of an empty hint — but RANK-REDUCED to one representative
+            // per independent direction, the same contract every other return
+            // path honors via `canonicalize_active_constraint_ids`. The prior
+            // code stored the RAW tight set here, so a degenerate face leaked all
+            // K co-tight rows (e.g. K near-parallel `x >= 0` rows returned all K
+            // instead of a single representative), re-seeding the next solve with
+            // redundant rows and the phantom-dual release/re-add they drive.
             if let Some(hint) = active_hint.as_mut() {
-                hint.clear();
+                let mut tight: Vec<usize> = Vec::new();
                 for i in 0..m {
                     if scaled_constraint_slack(&candidate, constraints, i) <= tol_active {
-                        hint.push(i);
+                        tight.push(i);
                     }
                 }
+                hint.clear();
+                hint.extend(canonicalize_active_constraint_ids(
+                    &candidate,
+                    constraints,
+                    &tight,
+                )?);
             }
             return Ok(());
         }
