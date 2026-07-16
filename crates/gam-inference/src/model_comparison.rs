@@ -28,6 +28,7 @@
 
 use gam_problem::types::{GlmLikelihoodSpec, LikelihoodSpec};
 use gam_solve::estimate::{EstimationError, UnifiedFitResult};
+use gam_solve::model_types::SmoothingCorrectionMethod;
 use gam_solve::psis::pareto_smooth_weights;
 use ndarray::{Array1, ArrayView1, ArrayView2};
 
@@ -502,13 +503,21 @@ pub fn model_comparison_from_unified(
             })
         })
         .transpose()?;
+    // The WPS correction is reported as exact only under the typed provenance
+    // the optimizer retained with the correction itself: first-order IFT on the
+    // identified outer-Hessian subspace. SigmaPointCubature is a named
+    // approximation and must stay out of the exact channel.
+    let method_certified_exact = matches!(
+        fit.smoothing_correction_method(),
+        Some(SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace { .. })
+    );
     let edf = corrected_edf(
         edf_conditional,
         fit.weighted_gram().map(|g| g.view()),
         fit.smoothing_correction().map(|c| c.view()),
         covariance_scale,
         fit.log_lambdas.len(),
-        false,
+        method_certified_exact,
     )?;
 
     // The user-facing `log_likelihood` (and the AIC / elpd derived from it) must
