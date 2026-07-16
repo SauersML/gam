@@ -68,10 +68,17 @@ def _parse(stream) -> list[dict]:
     return list(rows.values())
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+# nextest's per-test result line: `<STATUS> [<dur>] <binary-id> <test-path>`.
+# STATUS is right-padded with spaces; FLAKY = passed on retry (NOT a failure);
+# intermediate `TRY N FAIL` retry lines don't match (they start with TRY, not
+# the status). Signal aborts appear as SIGSEGV/SIGABRT/ABORT/TIMEOUT/LEAK.
 _NEXTEST = re.compile(
-    r"^\s*(?P<status>PASS|FAIL|LEAK|TIMEOUT|SIGSEGV|ABORT)\s+"
+    r"^\s*(?P<status>PASS|FLAKY|FAIL|LEAK|TIMEOUT|SIGSEGV|SIGABRT|ABORT)\s+"
     r"\[[^\]]*\]\s+\S*quality\S*\s+(?P<path>\S+)"
 )
+_NEXTEST_PASS = {"PASS", "FLAKY"}
 
 
 def _parse_nextest(lines: list[str]) -> dict[str, dict]:
@@ -87,14 +94,14 @@ def _parse_nextest(lines: list[str]) -> dict[str, dict]:
         lambda: {"executed": 0, "failed": 0, "failed_paths": []}
     )
     for raw in lines:
-        m = _NEXTEST.match(raw)
+        m = _NEXTEST.match(_ANSI.sub("", raw))
         if m is None:
             continue
         path = m["path"]
         category = path.split("::", 1)[0]
         rec = by_cat[category]
         rec["executed"] += 1
-        if m["status"] != "PASS":
+        if m["status"] not in _NEXTEST_PASS:
             rec["failed"] += 1
             rec["failed_paths"].append(f"{m['status']} {path}")
     return dict(by_cat)
