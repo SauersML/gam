@@ -774,12 +774,39 @@ impl ArrowSchurSystem {
             op.matvec(x, y);
         } else {
             let k = self.hbb.nrows();
-            for a in 0..k {
-                let mut acc = 0.0_f64;
-                for b in 0..k {
-                    acc += self.hbb[[a, b]] * x[b];
+            // The dense `H_ββ·x` accumulate is the serial `O(k²)` GEMV left
+            // inside the per-CG-iteration cross-row matvec (`arrow_cross_row_matvec`)
+            // and the once-per-Newton-step model reduction: at the SAE wide border
+            // (k≈2048, #1017) it is ≈4M ops/call that pinned one core while the
+            // per-row work fans out. Parallelism is over independent output rows
+            // `a` — each `y[a] += Σ_b hbb[a,b]·x[b]` accumulates in the SAME order
+            // as serial, so the result is bit-identical to serial (not merely
+            // deterministic run-to-run), the #1017 gate. Same `dense_parallel`
+            // guard as `penalty_ridge_prologue_into`: only when not nested in a
+            // rayon worker (the topology race fans candidates) and above the
+            // width floor, so it never oversubscribes and small `k` avoids rayon
+            // overhead on a trivial GEMV.
+            let dense_parallel = self.hbb.dim() == (k, k)
+                && k >= SCHUR_PROLOGUE_PARALLEL_K_MIN
+                && rayon::current_thread_index().is_none();
+            if dense_parallel {
+                use rayon::prelude::*;
+                let hbb = &self.hbb;
+                y.par_iter_mut().enumerate().for_each(|(a, ya)| {
+                    let mut acc = 0.0_f64;
+                    for b in 0..k {
+                        acc += hbb[[a, b]] * x[b];
+                    }
+                    *ya += acc;
+                });
+            } else {
+                for a in 0..k {
+                    let mut acc = 0.0_f64;
+                    for b in 0..k {
+                        acc += self.hbb[[a, b]] * x[b];
+                    }
+                    y[a] += acc;
                 }
-                y[a] += acc;
             }
         }
     }

@@ -3303,11 +3303,16 @@ pub(crate) fn parallel_penalty_prologue_bit_identical_to_serial() {
     let x = Array1::from_iter((0..k).map(|a| 0.4 * (a as f64 * 0.31).cos() - 0.17));
     let xs = x.as_slice().unwrap();
 
-    // Serial reference: penalty_matvec_add + ridge axpy into a zeroed buffer.
+    // Serial reference: a hand GEMV `hbb·x + ridge·x`, independent of
+    // `penalty_matvec_add` (which itself now parallelizes at this border width,
+    // so it can no longer serve as the serial oracle for either stage).
     let mut serial = vec![0.0_f64; k];
-    sys.penalty_matvec_add(xs, &mut serial);
     for a in 0..k {
-        serial[a] += ridge * xs[a];
+        let mut acc = 0.0_f64;
+        for b in 0..k {
+            acc += sys.hbb[[a, b]] * xs[b];
+        }
+        serial[a] = acc + ridge * xs[a];
     }
 
     // Parallel prologue (parallel=true engages the rayon dense GEMV at this k).
@@ -3327,6 +3332,54 @@ pub(crate) fn parallel_penalty_prologue_bit_identical_to_serial() {
             ser_branch[a].to_bits(),
             serial[a].to_bits(),
             "serial prologue branch must match the reference at index {a}"
+        );
+    }
+}
+
+/// `penalty_matvec_add` is the serial `H_ββ·x` accumulate left inside the
+/// per-CG-iteration cross-row matvec (`arrow_cross_row_matvec`); at the wide SAE
+/// border it fans over output rows. Because each `y[a] += Σ_b hbb[a,b]·x[b]` is
+/// one thread's own dot in the same `b` order as serial, the parallel accumulate
+/// is **bit-identical** to serial (not merely deterministic), so the criterion
+/// ranking cannot move. Also pins the accumulate semantics — the parallel path
+/// must ADD into a pre-seeded `y`, not overwrite it.
+#[test]
+pub(crate) fn parallel_penalty_matvec_add_bit_identical_to_serial() {
+    let k = 576usize; // ≥ SCHUR_PROLOGUE_PARALLEL_K_MIN: trips the parallel GEMV
+    assert!(k >= SCHUR_PROLOGUE_PARALLEL_K_MIN);
+    let d = 4usize;
+    let n = 8usize; // rows below the per-row floor: isolate the GEMV branch
+    let sys = dense_arrow_system(n, d, k);
+    let x = Array1::from_iter((0..k).map(|a| 0.6 * (a as f64 * 0.23).sin() + 0.11));
+    let xs = x.as_slice().unwrap();
+    // Pre-seed `y` so the accumulate (not overwrite) semantics are exercised.
+    let seed: Vec<f64> = (0..k).map(|a| (a as f64 * 0.017).cos() - 0.3).collect();
+
+    // Hand serial reference: `y = seed + hbb·x`.
+    let mut serial = seed.clone();
+    for a in 0..k {
+        let mut acc = 0.0_f64;
+        for b in 0..k {
+            acc += sys.hbb[[a, b]] * xs[b];
+        }
+        serial[a] += acc;
+    }
+
+    // Two parallel calls: bit-identical to serial AND to each other.
+    let mut par_a = seed.clone();
+    sys.penalty_matvec_add(xs, &mut par_a);
+    let mut par_b = seed.clone();
+    sys.penalty_matvec_add(xs, &mut par_b);
+    for a in 0..k {
+        assert_eq!(
+            par_a[a].to_bits(),
+            serial[a].to_bits(),
+            "parallel penalty_matvec_add must be bit-identical to serial at index {a}"
+        );
+        assert_eq!(
+            par_a[a].to_bits(),
+            par_b[a].to_bits(),
+            "parallel penalty_matvec_add must be run-to-run deterministic at index {a}"
         );
     }
 }
