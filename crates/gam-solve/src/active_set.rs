@@ -1187,14 +1187,38 @@ pub(crate) struct CompressedActiveWorkingSet {
     pub(crate) original_active_count: usize,
 }
 
-// Visible at `pub` (with private fields) so it can appear in the signature of
-// the `pub` cross-crate `rank_reduce_rows_pivoted_qr_with_dependence`, which the
-// gam-custom-family rank-reduction tests call directly after the #1521 crate
-// carve. The fields stay private: external callers ignore the dependence return.
+/// One tight active row expressed against its representative: `a_dep ≈ coeff · a_rep`.
+///
+/// Recorded ONLY for exactly-parallel (positively-aligned scalar-multiple)
+/// dependents; a general-position dependent is dropped from the working set with
+/// NO entry and re-enters via the next feasibility scan (it never receives a
+/// distributed/phantom multiplier). `active_pos` is the DEPENDENT row's flat id
+/// (in the tight-set index space); the representative is identified by the index
+/// of the owning [`ReducedFace::dependence`] slot, which is aligned with
+/// [`ReducedFace::representatives`].
 #[derive(Clone, Copy, Debug)]
 pub struct ActiveRowDependence {
-    active_pos: usize,
-    coeff: f64,
+    pub active_pos: usize,
+    pub coeff: f64,
+}
+
+/// The result of reducing a tight active face to a minimal independent set — the
+/// shared output of the `ConstraintSet` reduced-face op (Dense arm = the
+/// ascending-index scan here; KhatriRaoCone / BlockDiagonal arms produce the same
+/// shape). Determinism: representatives are the lowest-flat-index row per
+/// independent direction, ascending, with no float tie-break.
+#[derive(Clone, Debug)]
+pub struct ReducedFace {
+    /// Kept independent rows — the lowest-flat-index representative per direction,
+    /// ascending. Flat id space is `0..nrows` (Dense) / `slot*n + obs` (cone).
+    pub representatives: Vec<usize>,
+    /// Per-representative parallel-dependent map, index-aligned with
+    /// `representatives`. `dependence[i]` lists the exactly-parallel dependents of
+    /// `representatives[i]` (empty when it has none); general-position dependents
+    /// are absent (dropped, re-enter on the next feasibility scan).
+    pub dependence: Vec<Vec<ActiveRowDependence>>,
+    /// The full tight set that was reduced, ascending flat ids.
+    pub tight_rows: Vec<usize>,
 }
 
 impl CompressedActiveWorkingSet {
