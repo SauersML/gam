@@ -273,17 +273,25 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
 
     const DERIVATIVE_TOL: f64 = 1e-12;
     const FEASIBILITY_TOL: f64 = 1e-12;
-    // A time column is a monotone I-spline SHAPE column — bounded `β ≥ 0`,
-    // the exact domain-wide monotonicity certificate — iff its *value* varies
-    // across the observed entry∪exit domain by more than this tolerance. This
-    // is EXACTLY the geometric criterion `keep_cols` uses to retain a shape
-    // column at construction (`construction.rs:1513-1532`, `constant_tol =
-    // 1e-12`), so classifying at the point of use here stays consistent with
-    // it by construction: every column present in the design that varies in
-    // value is a retained I-spline shape column, and the only value-CONSTANT
-    // columns are the free level/intercept column (any-sign baseline level,
-    // derivative ≡ 0) and the zero-valued monotone-timewiggle tail placeholders
-    // (constrained separately by the wiggle wrapper).
+    // A time column is a monotone I-spline SHAPE column — bounded `β ≥ 0`, the
+    // exact domain-wide monotonicity certificate — iff it either VARIES IN VALUE
+    // across the observed entry∪exit domain OR has POSITIVE DERIVATIVE SUPPORT at
+    // some training row. The unique column that satisfies NEITHER is the free
+    // level/intercept column (value-constant everywhere AND derivative ≡ 0),
+    // whose coefficient is the any-sign baseline level; it stays `NEG_INFINITY`.
+    //
+    // The value clause is what closes the #2332 gap: a genuine tail I-spline
+    // column whose M-spline derivative support sits beyond the largest training
+    // exit time is ≈0 at every training row (so the old derivative-only clause
+    // missed it) yet still varies in value — which is EXACTLY why `keep_cols`
+    // retained it (`construction.rs:1513-1532`, `constant_tol = 1e-12`, the same
+    // geometric criterion applied here at the point of use). The derivative
+    // clause is retained so a minimal warp column that carries derivative
+    // structure without a materialized value spread (e.g. an anchor-centered
+    // `log t` stand-in whose exit value design is 0 but whose derivative is
+    // active) is still correctly bound. The two clauses are a strict SUPERSET of
+    // the old derivative-only rule, so no already-bound column ever loses its
+    // constraint.
     const VALUE_VARIATION_TOL: f64 = 1e-12;
     // Diagnostics only: entries with magnitude in this open band are reported as
     // "sub-tolerance nonzeros" to explain a missing structural lower bound. The
@@ -332,6 +340,7 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
             ) }.into());
         }
         let mut col_max = 0.0_f64;
+        let mut has_positive_support = false;
         for (row, &value) in column.iter().enumerate() {
             if !value.is_finite() {
                 return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
@@ -343,6 +352,9 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
                     "structural time coefficient bounds require a non-negative derivative basis at row {row}, column {col}; found {value:.3e}"
                 ) }.into());
             }
+            if value > DERIVATIVE_TOL {
+                has_positive_support = true;
+            }
             let abs_value = value.abs();
             if abs_value > col_max {
                 col_max = abs_value;
@@ -352,10 +364,11 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
             }
         }
 
-        // Value-space classification (the actual sign-cone decision). A column
-        // whose value varies across entry∪exit is a monotone I-spline shape
-        // column and must satisfy `β ≥ 0` over the WHOLE axis — not only where
-        // its derivative happens to be active at a training row.
+        // Value-space classification. A column whose value varies across
+        // entry∪exit is a monotone I-spline shape column and must satisfy
+        // `β ≥ 0` over the WHOLE axis — not only where its derivative happens to
+        // be active at a training row (the #2332 tail case). Combined with the
+        // derivative clause below via OR.
         let entry_col = design_value_entry.extract_column(col);
         let exit_col = design_value_exit.extract_column(col);
         if entry_col.len() != nrows || exit_col.len() != nrows {
@@ -376,7 +389,8 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
             vmin = vmin.min(value);
             vmax = vmax.max(value);
         }
-        if (vmax - vmin) > VALUE_VARIATION_TOL {
+        let value_varies = (vmax - vmin) > VALUE_VARIATION_TOL;
+        if value_varies || has_positive_support {
             lower_bounds[col] = 0.0;
             has_shape_column = true;
         }
