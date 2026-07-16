@@ -24,7 +24,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -181,6 +181,18 @@ fn gam_beta_logit_recovers_smooth_truth() {
         "beta-logit truth-recovery: n={N} phi_true={PHI} betareg_phi={betareg_phi:.3} \
          noise_sd_bar={noise_sd_bar:.5} gam_rmse_truth={gam_rmse_truth:.5} \
          betareg_rmse_truth={betareg_rmse_truth:.5} pearson(mu_gam,mu_betareg)={corr_mu_ref:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_betareg_beta_logit",
+            "mu_rmse_to_truth",
+            gam_rmse_truth,
+            "betareg",
+            betareg_rmse_truth,
+        )
+        .line()
     );
 
     // (1) ACCURACY FLOOR: a smoother that recovers the mean averages the Beta
