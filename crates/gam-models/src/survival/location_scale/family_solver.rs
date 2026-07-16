@@ -722,6 +722,42 @@ impl SurvivalLocationScaleFamily {
             + dynamic.time_jac_exit.t().dot(&grad_time_eta_h1)
             + dynamic.time_jac_deriv.t().dot(&grad_time_eta_d);
 
+        // #2342: stable combined index-derivative sum `S1 = d1_q0 + d1_q1` for
+        // the far-tail rows whose entry (`d1_q0 = w·A′(u0)`) and exit
+        // (`d1_q1`) hazard channels are each ~1e300 and (near-)opposite. The
+        // naive coefficient contraction `d1_q1·dq_exit + d1_q0·dq_entry` sums
+        // them at a SHARED coefficient and cancels catastrophically; the
+        // regroup `S1·dq_exit + d1_q0·(dq_entry − dq_exit)` keeps every retained
+        // quantity moderate (or honestly-huge times an exact/Sterbenz zero). We
+        // compute `S1` cancellation-free (paired stacks) only where the gate
+        // fires; every other row keeps today's op order bitwise. `δu` is the
+        // Sterbenz-safe channel gap `(h1−h0)+(q1−q0)` — never `u1−u0`, which
+        // rounds to 0 in the far tail.
+        let mut paired_s1 = Array1::<f64>::zeros(n);
+        let mut use_paired = vec![false; n];
+        for i in 0..n {
+            let u0 = dynamic.h_entry[i] + dynamic.q_entry[i];
+            if self.w[i] > 0.0
+                && paired_stacks::paired_contraction_needs_regroup(&self.inverse_link, u0)
+            {
+                let u1 = dynamic.h_exit[i] + dynamic.q_exit[i];
+                let delta_u = (dynamic.h_exit[i] - dynamic.h_entry[i])
+                    + (dynamic.q_exit[i] - dynamic.q_entry[i]);
+                let w_eff = self.w[i] * mask_at(i);
+                if let Some(sums) = paired_stacks::weighted_paired_index_sums(
+                    &self.inverse_link,
+                    u0,
+                    u1,
+                    delta_u,
+                    self.y[i],
+                    w_eff,
+                ) {
+                    paired_s1[i] = sums[0];
+                    use_paired[i] = true;
+                }
+            }
+        }
+
         let mut scratch = Array1::<f64>::zeros(n);
 
         let grad_t = if let (Some(x_t_entry), Some(x_t_deriv)) = (
@@ -750,12 +786,17 @@ impl SurvivalLocationScaleFamily {
             out + x_t_deriv.transpose_vector_multiply(&scratch)
         } else {
             // combined[i] = d1_q1[i]*dq_t_exit[i] + d1_q0[i]*dq_t_entry[i] + d1_qdot[i]*dqdot_t[i]
-            ndarray::Zip::from(&mut scratch)
-                .and(&d1_q1)
-                .and(&dynamic.dq_t_exit)
-                .and(&d1_q0)
-                .and(&dynamic.dq_t_entry)
-                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
+            // regrouped to S1·dq_exit + d1_q0·(dq_entry − dq_exit) on the far-tail
+            // rows (#2342); byte-identical to the pre-#2342 Zip on every other row.
+            for i in 0..n {
+                let exit = dynamic.dq_t_exit[i];
+                let entry = dynamic.dq_t_entry[i];
+                scratch[i] = if use_paired[i] {
+                    paired_s1[i] * exit + d1_q0[i] * (entry - exit)
+                } else {
+                    d1_q1[i] * exit + d1_q0[i] * entry
+                };
+            }
             ndarray::Zip::from(&mut scratch)
                 .and(&d1_qdot)
                 .and(&dynamic.dqdot_t)
@@ -785,12 +826,21 @@ impl SurvivalLocationScaleFamily {
                 .for_each(|s, &a, &b| *s = a * b);
             out + x_ls_deriv.transpose_vector_multiply(&scratch)
         } else {
-            ndarray::Zip::from(&mut scratch)
-                .and(&d1_q1)
-                .and(&dynamic.dq_ls_exit)
-                .and(&d1_q0)
-                .and(&dynamic.dq_ls_entry)
-                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
+            // combined[i] = d1_q1[i]*dq_ls_exit[i] + d1_q0[i]*dq_ls_entry[i],
+            // regrouped to S1·dq_exit + d1_q0·(dq_entry − dq_exit) on the
+            // far-tail rows (#2342). The `else` arm is byte-identical to the
+            // pre-#2342 Zip (`a*b + c*d`, same operands/order) for every
+            // non-regrouped row. A shared (time-invariant) log-sigma channel has
+            // dq_ls_entry == dq_ls_exit, so the huge d1_q0 multiplies an exact 0.
+            for i in 0..n {
+                let exit = dynamic.dq_ls_exit[i];
+                let entry = dynamic.dq_ls_entry[i];
+                scratch[i] = if use_paired[i] {
+                    paired_s1[i] * exit + d1_q0[i] * (entry - exit)
+                } else {
+                    d1_q1[i] * exit + d1_q0[i] * entry
+                };
+            }
             ndarray::Zip::from(&mut scratch)
                 .and(&d1_qdot)
                 .and(&dynamic.dqdot_ls)

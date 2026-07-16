@@ -269,6 +269,47 @@ fn identity_paired(link: &InverseLink, u0: f64, u1: f64) -> Option<PairedNeglogS
     })
 }
 
+/// Whether the naive coefficient-space contraction
+/// `d1_q1·dq_exit + d1_q0·dq_entry` loses precision to catastrophic
+/// cancellation for a row with entry index `u0` — i.e. the entry hazard
+/// `A′(u0)` is astronomically large and (near-)opposite to the exit term.
+///
+/// Only links with an unbounded `A′` cancel: probit (`A′ ≈ u0`) and cloglog
+/// (`A′ = e^{u0}`). Logistic (`A′ = μ ∈ [0,1]`) and identity (bounded on its
+/// domain) never lose an O(1) result to two ~1e300 operands, so their naive
+/// contraction stays exact and this returns `false` — the consumer keeps
+/// today's op order, preserving the moderate-regime bitwise contract. Cloglog
+/// is deliberately **not** enabled here yet (it has no failing far-tail test
+/// and cannot be validated this increment); enabling it is a trivial follow-on.
+pub(crate) fn paired_contraction_needs_regroup(link: &InverseLink, u0: f64) -> bool {
+    matches!(link, InverseLink::Standard(StandardLink::Probit))
+        && u0.is_finite()
+        && u0 > PROBIT_FAR_TAIL_ENTRY
+}
+
+/// The stable, weighted, event-mixed combined index-derivative sums
+/// `S_k = w·event_mix(d, s_kᵉᵛ, s_kᶜᵉⁿˢ)` for `k = 1..3` — exactly
+/// `d_k_q0 + d_k_q1` but computed cancellation-free via [`paired_neglog_stacks`]
+/// instead of adding the two ~1e300 index-derivative channels. `d` is the row
+/// event indicator and `w` the combined row weight already folded into the
+/// `d_k_q0`/`d_k_q1` arrays (family weight × HT mask). Returns `None` for links
+/// without a closed-form pairing (the consumer keeps the naive contraction).
+pub(crate) fn weighted_paired_index_sums(
+    link: &InverseLink,
+    u0: f64,
+    u1: f64,
+    delta_u: f64,
+    d: f64,
+    w: f64,
+) -> Option<[f64; 3]> {
+    let p = paired_neglog_stacks(link, u0, u1, delta_u)?;
+    Some([
+        w * event_mix(d, p.event[0], p.censored[0]),
+        w * event_mix(d, p.event[1], p.censored[1]),
+        w * event_mix(d, p.event[2], p.censored[2]),
+    ])
+}
+
 #[cfg(test)]
 mod paired_stack_tests {
     use super::*;
@@ -519,5 +560,45 @@ mod paired_stack_tests {
         let growth = 1.0_f64.exp() * 0.5_f64.exp_m1();
         assert_close(q.event[0], 1.0 - growth, 1e-14, 0.0, "cloglog s1 growth");
         assert_close(q.censored[3], -growth, 1e-14, 0.0, "cloglog cens growth");
+    }
+
+    /// The regroup gate fires only in the probit far tail; bounded links and
+    /// moderate probit rows keep the naive contraction.
+    #[test]
+    fn regroup_gate_fires_only_in_probit_far_tail() {
+        assert!(paired_contraction_needs_regroup(&probit(), 3.6e150));
+        assert!(paired_contraction_needs_regroup(&probit(), 1.0e4));
+        assert!(!paired_contraction_needs_regroup(&probit(), 5.0));
+        assert!(!paired_contraction_needs_regroup(&probit(), 1.0e3));
+        assert!(!paired_contraction_needs_regroup(&logit(), 3.6e150));
+        assert!(!paired_contraction_needs_regroup(&cloglog(), 3.6e150));
+        assert!(!paired_contraction_needs_regroup(&identity(), 0.9));
+    }
+
+    /// `weighted_paired_index_sums[0]` reproduces `w·(A′(u0)+B′(u1))` in the
+    /// moderate regime and stays the moderate `w·(ρ(u0)−δu)` in the far tail,
+    /// where forming `A′(u0)+B′(u1)` directly collapses to 0.
+    #[test]
+    fn weighted_paired_index_sums_are_stable() {
+        // Moderate event row: S1 equals the naive weighted stack sum exactly.
+        let (u0, u1, w) = (0.3_f64, 0.5_f64, 1.5_f64);
+        let s = weighted_paired_index_sums(&probit(), u0, u1, u1 - u0, 1.0, w).unwrap();
+        let a = surv_derivs(&probit(), u0).unwrap();
+        let b = pdf_derivs(&probit(), u1).unwrap();
+        assert_close(s[0], w * (a[0] + b[0]), 1e-12, 0.0, "moderate S1 event");
+
+        // Far-tail event row (u0 ≈ u1 ≈ 3.6e150, δu = 0.08): S1 = w·(ρ(u0)−δu)
+        // ≈ −w·δu since ρ(u0) ~ 1/u0 ~ 1e-151. Forming A′(u0)+B′(u1) directly is
+        // u0 − u1 rounded to exactly 0 — the moderate answer is lost.
+        let (u0, delta_u, w) = (3.6e150_f64, 0.08_f64, 1.2_f64);
+        let u1 = u0 + delta_u;
+        let s = weighted_paired_index_sums(&probit(), u0, u1, delta_u, 1.0, w).unwrap();
+        assert_close(s[0], w * (-delta_u), 1e-6, 0.0, "far-tail S1 event");
+        let naive = w * (surv_derivs(&probit(), u0).unwrap()[0] + pdf_derivs(&probit(), u1).unwrap()[0]);
+        assert!(
+            naive.abs() < 1e-3 && (s[0] - w * (-delta_u)).abs() < 1e-6,
+            "naive S1 collapses ({naive:e}) while paired recovers {:e}",
+            s[0]
+        );
     }
 }
