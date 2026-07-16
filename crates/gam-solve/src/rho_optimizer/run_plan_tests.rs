@@ -4209,9 +4209,10 @@ fn active_outer_domain_refuses_singleton_search_interval() {
         .expect_err("an active optimizer coordinate needs a nonzero-width interval");
     let message = error.to_string();
     assert!(
-        message.contains("no finite searchable interval")
-            && message.contains("fixed-rho")
-            && message.contains("lower < upper"),
+        message.contains("objective-domain intersection is empty or non-finite")
+            && message.contains("coordinate 0")
+            && message.contains("lower=700")
+            && message.contains("upper=700"),
         "unexpected singleton-domain refusal: {message}"
     );
 }
