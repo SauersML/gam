@@ -618,6 +618,17 @@ pub struct FittedModelPayload {
     /// refuses (typed) rather than heuristically converting.
     #[serde(default)]
     pub transformation_geometry: Option<SavedTransformationNormalGeometry>,
+    /// Transformation-normal: the monotonicity-cone carrier `Ψ` (the fitted
+    /// covariate design at `κ̂`), row-major `n × p_cov` where
+    /// `n = cone_carrier_row_count` and `p_cov = cone_carrier_covariate_width`
+    /// from [`SavedTransformationNormalGeometry`]. REQUIRED for a v13+ CTN model:
+    /// constrained posterior sampling rejects draws whose realized shape field
+    /// `Γ = Ψ Aᵀ` leaves the positivity cone, and the carrier is persisted (not
+    /// reconstructed) because `Ψ(κ̂)` goes through the exp/log spatial warp whose
+    /// replay is not bitwise-stable, and a sign flip on a near-zero `Γ` entry
+    /// would wrongly accept a non-monotone transformation.
+    #[serde(default)]
+    pub transformation_cone_carrier: Option<Vec<f64>>,
     /// Transformation-normal saved score contract. The score is the exact
     /// finite-support PIT:
     /// z = Phi^{-1}((Phi(h) - Phi(h_L)) / (Phi(h_U) - Phi(h_L))).
@@ -900,6 +911,7 @@ impl FittedModelPayload {
             transformation_response_degree: None,
             transformation_response_median: None,
             transformation_geometry: None,
+            transformation_cone_carrier: None,
             transformation_score_calibration: None,
             resolved_termspec: None,
             resolved_termspec_noise: None,
@@ -4717,6 +4729,42 @@ impl FittedModel {
                     });
                 }
             }
+            // The monotonicity-cone carrier Ψ is REQUIRED at v13: constrained
+            // posterior sampling rejects draws leaving the positivity cone, and
+            // Ψ(κ̂) is persisted (not replayed) because the spatial warp is not
+            // bitwise-stable. Its length must equal the geometry's cone dims.
+            let carrier = self.transformation_cone_carrier.as_ref().ok_or_else(|| {
+                FittedModelError::MissingField {
+                    reason: "transformation-normal model is missing the monotonicity-cone carrier \
+                             (transformation_cone_carrier); constrained posterior sampling cannot \
+                             certify draws against the positivity cone — refit"
+                        .to_string(),
+                }
+            })?;
+            let expected = geometry
+                .cone_carrier_row_count
+                .checked_mul(geometry.cone_carrier_covariate_width)
+                .ok_or_else(|| FittedModelError::SchemaMismatch {
+                    reason: "transformation-normal cone carrier dimensions overflow usize"
+                        .to_string(),
+                })?;
+            if carrier.len() != expected {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "transformation-normal cone carrier length {} disagrees with geometry \
+                         {} rows x {} covariate columns = {expected}",
+                        carrier.len(),
+                        geometry.cone_carrier_row_count,
+                        geometry.cone_carrier_covariate_width,
+                    ),
+                });
+            }
+            if carrier.iter().any(|value| !value.is_finite()) {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: "transformation-normal cone carrier contains a non-finite entry"
+                        .to_string(),
+                });
+            }
         }
         if matches!(self.family_state, FittedFamily::MarginalSlope { .. }) {
             if self.formula_logslope.is_none() {
@@ -5427,6 +5475,10 @@ mod tests {
             certified_response_support: (0.0, 1.0),
             response_median: 0.5,
         });
+        // Monotonicity-cone carrier Ψ (row-major 16 × 2), required at v13.
+        payload.transformation_cone_carrier = Some(
+            (0..16 * 2).map(|i| 1.0 + 0.01 * i as f64).collect(),
+        );
         payload
     }
 
@@ -5506,6 +5558,35 @@ mod tests {
         assert!(
             err.to_string().contains("response_knot_count"),
             "message names the mismatch: {err}"
+        );
+    }
+
+    /// gam#2306 v13: the monotonicity-cone carrier Ψ is REQUIRED (constrained
+    /// posterior sampling certifies draws against it) and its length must match
+    /// the geometry cone dimensions — both are typed rejections.
+    #[test]
+    fn validate_for_persistence_rejects_ctn_without_or_with_mismatched_cone_carrier() {
+        let mut missing =
+            transformation_normal_payload(MODEL_PAYLOAD_VERSION, transformation_normal_fit());
+        missing.transformation_cone_carrier = None;
+        let err = FittedModel::from_payload(missing)
+            .validate_for_persistence()
+            .expect_err("CTN model without the cone carrier must be rejected");
+        assert!(
+            err.to_string().contains("transformation_cone_carrier"),
+            "message names the missing field: {err}"
+        );
+
+        let mut mismatched =
+            transformation_normal_payload(MODEL_PAYLOAD_VERSION, transformation_normal_fit());
+        // Geometry declares 16 × 2 = 32 entries; a shorter carrier is corruption.
+        mismatched.transformation_cone_carrier = Some(vec![0.0; 31]);
+        let err = FittedModel::from_payload(mismatched)
+            .validate_for_persistence()
+            .expect_err("a cone carrier disagreeing with the geometry dimensions must be rejected");
+        assert!(
+            err.to_string().contains("cone carrier length"),
+            "message names the dimension mismatch: {err}"
         );
     }
 

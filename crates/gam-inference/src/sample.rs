@@ -446,7 +446,11 @@ pub fn sample_saved_model(
             laplace_gaussian_fallback(model, cfg, "bernoulli marginal-slope posterior")
         }
         PredictModelClass::TransformationNormal => {
-            laplace_gaussian_fallback(model, cfg, "transformation-normal posterior")
+            // The CTN posterior is the Laplace Gaussian TRUNCATED to the
+            // monotonicity cone Γ = Ψ Aᵀ ≥ 0 (gam#2306 §5); draw it by rejection
+            // rather than the unconstrained Gaussian fallback, which would put
+            // mass on non-monotone (invalid) transformations.
+            sample_transformation_normal_constrained(model, cfg)
         }
     }
 }
@@ -553,6 +557,165 @@ pub fn laplace_gaussian_fallback(
         .unwrap_or_else(|| Array1::<f64>::zeros(p));
     let posterior_std = samples.std_axis(ndarray::Axis(0), 1.0);
 
+    Ok(NutsResult {
+        samples,
+        posterior_mean,
+        posterior_std,
+        rhat: 1.0,
+        ess: n_total as f64,
+        converged: true,
+    })
+}
+
+/// Draw constrained transformation-normal posterior samples by rejection from
+/// the Laplace Gaussian `N(mode, cov_scale·H⁻¹)`, keeping only draws inside the
+/// monotonicity cone `Γ = Ψ Aᵀ ≥ 0` (gam#2306 §5).
+///
+/// The truncated posterior IS the model: a draw whose realized shape field has
+/// any negative entry is a non-monotone transformation and not a member of the
+/// parameter space, so rejection is exact sampling from the correct target (no
+/// projection, no clamping). The fitted mode is strictly interior — the
+/// monotonicity floor keeps `h' > 0` — so acceptance is high for a well-fit
+/// model. If acceptance collapses (a pathological fit hugging the cone boundary)
+/// we refuse (typed) with the measured acceptance rate rather than silently
+/// returning unconstrained draws or spending an unbounded draw budget.
+fn sample_transformation_normal_constrained(
+    model: &SavedModel,
+    cfg: &NutsConfig,
+) -> Result<NutsResult, String> {
+    const RATIONALE: &str = "transformation-normal constrained posterior";
+    // Hard per-chain draw cap (no wall-clock budget): if a chain cannot fill its
+    // sample quota within `n_samples · MAX_REJECTION_FACTOR` draws the fit hugs
+    // the cone boundary and we refuse with the measured rate.
+    const MAX_REJECTION_FACTOR: usize = 1000;
+
+    validate_nuts_config(cfg).map_err(String::from)?;
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let mode = fit.beta.clone();
+    let p = mode.len();
+    if p == 0 {
+        return Err(format!(
+            "{RATIONALE}: cannot sample from an empty coefficient vector"
+        ));
+    }
+
+    let geometry = model.transformation_geometry.as_ref().ok_or_else(|| {
+        format!("{RATIONALE}: missing the direct-α geometry record; refit (gam#2306)")
+    })?;
+    let carrier = model.transformation_cone_carrier.as_ref().ok_or_else(|| {
+        format!(
+            "{RATIONALE}: missing the monotonicity-cone carrier (transformation_cone_carrier); \
+             refit to persist the cone so constrained sampling can certify draws"
+        )
+    })?;
+    let n = geometry.cone_carrier_row_count;
+    let p_cov = geometry.cone_carrier_covariate_width;
+    let p_resp = geometry.shape_coordinate_count + 1;
+    if carrier.len() != n.saturating_mul(p_cov) {
+        return Err(format!(
+            "{RATIONALE}: cone carrier length {} != {n} rows x {p_cov} covariate columns",
+            carrier.len()
+        ));
+    }
+    if p != p_resp.saturating_mul(p_cov) {
+        return Err(format!(
+            "{RATIONALE}: coefficient length {p} != p_resp {p_resp} x p_cov {p_cov}; the saved \
+             coefficient block does not match the persisted cone geometry"
+        ));
+    }
+    let psi = Array2::from_shape_vec((n, p_cov), carrier.clone())
+        .map_err(|err| format!("{RATIONALE}: cone carrier reshape to {n}x{p_cov} failed: {err}"))?;
+
+    // Feasibility: the realized shape field of each monotone (non-location) row
+    // `k` is `Γ_k = Ψ · A_{k,:} ≥ 0` on every certified training row.
+    let is_feasible = |beta: &Array1<f64>| -> bool {
+        for k in 1..p_resp {
+            let block = beta.slice(ndarray::s![k * p_cov..(k + 1) * p_cov]);
+            if psi.dot(&block).iter().any(|value| *value < 0.0) {
+                return false;
+            }
+        }
+        true
+    };
+    if !is_feasible(&mode) {
+        return Err(format!(
+            "{RATIONALE}: the fitted mode violates the monotonicity cone Γ ≥ 0 — the saved model is \
+             not a valid monotone transformation; refit"
+        ));
+    }
+
+    let h = fit.penalized_hessian().ok_or_else(|| {
+        format!(
+            "{RATIONALE}: requires the explicit penalised Hessian; refit with exact geometry export"
+        )
+    })?;
+    let sqrt_cov_scale = sampling_sqrt_covariance_scale(&fit, RATIONALE)?;
+    if h.nrows() != p || h.ncols() != p {
+        return Err(format!(
+            "{RATIONALE}: penalised Hessian is {}x{}, expected {p}x{p}",
+            h.nrows(),
+            h.ncols()
+        ));
+    }
+    let chol = h.cholesky(Side::Lower).map_err(|err| {
+        format!("{RATIONALE}: Cholesky factorisation of the penalised Hessian failed: {err:?}")
+    })?;
+    let l = chol.lower_triangular();
+
+    let n_total = cfg.n_samples.saturating_mul(cfg.n_chains);
+    let mut samples = Array2::<f64>::zeros((n_total, p));
+    let mut eps = Array1::<f64>::zeros(p);
+    let mut delta = Array1::<f64>::zeros(p);
+    let mut draw = Array1::<f64>::zeros(p);
+    let attempts_cap = cfg
+        .n_samples
+        .saturating_mul(MAX_REJECTION_FACTOR)
+        .max(MAX_REJECTION_FACTOR);
+    let mut total_attempts: u64 = 0;
+    let mut total_accepted: u64 = 0;
+
+    for chain in 0..cfg.n_chains {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(chain_stream_seed(
+            cfg.seed,
+            chain,
+            0xA0B7_6C5D_E431_298F,
+        ));
+        let mut accepted_in_chain = 0usize;
+        let mut attempts_in_chain = 0usize;
+        while accepted_in_chain < cfg.n_samples {
+            if attempts_in_chain >= attempts_cap {
+                let rate = total_accepted as f64 / (total_attempts.max(1) as f64);
+                return Err(format!(
+                    "{RATIONALE}: acceptance collapsed — {total_accepted} accepted of \
+                     {total_attempts} draws (rate {rate:.3e}); the fit hugs the monotonicity-cone \
+                     boundary so its truncated posterior cannot be rejection-sampled within \
+                     {attempts_cap} draws per chain. Refit or widen the certified response support."
+                ));
+            }
+            attempts_in_chain += 1;
+            total_attempts += 1;
+            for i in 0..p {
+                eps[i] = sample_standard_normal(&mut rng);
+            }
+            back_substitution_lower_transpose_guarded_into(&l, &eps, &mut delta);
+            for i in 0..p {
+                draw[i] = mode[i] + sqrt_cov_scale * delta[i];
+            }
+            if is_feasible(&draw) {
+                let k = chain * cfg.n_samples + accepted_in_chain;
+                samples.row_mut(k).assign(&draw);
+                accepted_in_chain += 1;
+                total_accepted += 1;
+            }
+        }
+    }
+
+    let posterior_mean = samples
+        .mean_axis(ndarray::Axis(0))
+        .unwrap_or_else(|| Array1::<f64>::zeros(p));
+    let posterior_std = samples.std_axis(ndarray::Axis(0), 1.0);
+    // Accepted draws are iid from the truncated posterior by construction, so the
+    // chains are exact-independent: rhat = 1 and ess = n_total.
     Ok(NutsResult {
         samples,
         posterior_mean,

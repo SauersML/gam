@@ -800,6 +800,16 @@ pub fn assemble_transformation_normal_payload(
     payload.transformation_response_degree = Some(family.response_degree());
     payload.transformation_response_median = Some(family.response_median());
     payload.transformation_geometry = Some(transformation_normal_geometry(family));
+    // Persist the monotonicity-cone carrier Ψ (the fitted covariate design at
+    // κ̂), row-major n × p_cov, so constrained posterior sampling can certify
+    // draws against the positivity cone without replaying the (non-bitwise)
+    // spatial warp. The covariate design is materialized during fitting, so this
+    // is a cache hit; a post-fit materialization failure is an internal invariant
+    // break, not a recoverable condition.
+    let cone_carrier = family
+        .covariate_dense_arc()
+        .expect("CTN covariate design must materialize for the persisted cone carrier");
+    payload.transformation_cone_carrier = Some(cone_carrier.iter().copied().collect());
     payload.transformation_score_calibration = Some(score_calibration);
     source.apply_to(&mut payload);
     payload
