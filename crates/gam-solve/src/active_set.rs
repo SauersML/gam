@@ -1355,6 +1355,180 @@ pub(crate) fn khatri_rao_cone_reduced_face(
     })
 }
 
+/// Dense arm of the reduced-face op: reduce the tight rows of an explicit
+/// `A x ≥ b` set at `beta` to a minimal independent set. Mirrors
+/// [`khatri_rao_cone_reduced_face`] exactly — ascending-index greedy MGS,
+/// `RANK_ALPHA·ε·max(n_tight,p)·max‖a‖` tolerance, (A)-strict parallel-only
+/// dependence (|cos| ≥ 1−1e-9, `coeff = a_depᵀa_rep/‖a_rep‖²`, `active_pos` = the
+/// dependent row's flat id) — so both carriers produce the same `ReducedFace`
+/// contract. Flat id = the constraint row index. A zero-norm row is vacuous
+/// (never a direction, never a representative).
+pub(crate) fn dense_reduced_face(
+    lin: &LinearInequalityConstraints,
+    beta: ndarray::ArrayView1<'_, f64>,
+    membership_tol: f64,
+) -> Result<ReducedFace, EstimationError> {
+    let a = &lin.a;
+    let b = &lin.b;
+    let n = a.nrows();
+    let p = a.ncols();
+
+    let row_norms: Vec<f64> = (0..n)
+        .map(|i| {
+            let row = a.row(i);
+            row.dot(&row).sqrt()
+        })
+        .collect();
+
+    const RANK_ALPHA: f64 = 100.0;
+    const PARALLEL_COS_TOL: f64 = 1.0 - 1e-9;
+
+    let mut tight_rows: Vec<usize> = Vec::new();
+    for i in 0..n {
+        let norm_i = row_norms[i];
+        if norm_i <= 0.0 {
+            continue;
+        }
+        let scaled_slack = (a.row(i).dot(&beta) - b[i]) / norm_i;
+        if scaled_slack <= membership_tol {
+            tight_rows.push(i);
+        }
+    }
+
+    let mut representatives: Vec<usize> = Vec::new();
+    let mut dependence: Vec<Vec<ActiveRowDependence>> = Vec::new();
+    if tight_rows.is_empty() {
+        return Ok(ReducedFace {
+            representatives,
+            dependence,
+            tight_rows,
+        });
+    }
+
+    let max_norm = tight_rows
+        .iter()
+        .map(|&i| row_norms[i])
+        .fold(0.0_f64, f64::max);
+    let rank_tol = RANK_ALPHA * f64::EPSILON * (tight_rows.len().max(p).max(1) as f64) * max_norm;
+
+    let mut ortho_basis: Vec<Array1<f64>> = Vec::new();
+    // Kept representatives: (row, a_row, index into `representatives`).
+    let mut kept: Vec<(usize, Array1<f64>, usize)> = Vec::new();
+    for &i in &tight_rows {
+        let a_i = a.row(i).to_owned();
+        let mut resid = a_i.clone();
+        for q in &ortho_basis {
+            let proj = resid.dot(q);
+            resid.scaled_add(-proj, q);
+        }
+        let resid_norm = resid.dot(&resid).sqrt();
+        if resid_norm > rank_tol {
+            ortho_basis.push(&resid / resid_norm);
+            let out_idx = representatives.len();
+            representatives.push(i);
+            dependence.push(Vec::new());
+            kept.push((i, a_i, out_idx));
+        } else {
+            // (A)-strict: record ONLY an exactly-parallel single-representative
+            // dependence; a general-position drop carries no multiplier and
+            // re-enters via the next feasibility scan.
+            let mut best_abs_cos = 0.0_f64;
+            let mut best: Option<(usize, f64)> = None;
+            for (rep_row, rep_a, rep_out_idx) in &kept {
+                let rep_norm = row_norms[*rep_row];
+                let dot = a_i.dot(rep_a);
+                let cos = if rep_norm > 0.0 {
+                    dot / (row_norms[i] * rep_norm)
+                } else {
+                    0.0
+                };
+                if cos.abs() > best_abs_cos {
+                    best_abs_cos = cos.abs();
+                    best = Some((*rep_out_idx, dot / (rep_norm * rep_norm)));
+                }
+            }
+            if best_abs_cos >= PARALLEL_COS_TOL {
+                if let Some((out_idx, coeff)) = best {
+                    dependence[out_idx].push(ActiveRowDependence {
+                        active_pos: i,
+                        coeff,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(ReducedFace {
+        representatives,
+        dependence,
+        tight_rows,
+    })
+}
+
+/// The shared tight-face reduction op over the `ConstraintSet` carrier union.
+/// A local extension trait (not an inherent method) so the numeric reduction
+/// stays in gam-solve where the solvers consume it, keeping `gam-problem` a pure
+/// data crate. All three arms produce the same `ReducedFace` contract.
+pub(crate) trait ConstraintSetReducedFace {
+    fn reduced_face(
+        &self,
+        beta: ndarray::ArrayView1<'_, f64>,
+        membership_tol: f64,
+    ) -> Result<ReducedFace, EstimationError>;
+}
+
+impl ConstraintSetReducedFace for ConstraintSet {
+    fn reduced_face(
+        &self,
+        beta: ndarray::ArrayView1<'_, f64>,
+        membership_tol: f64,
+    ) -> Result<ReducedFace, EstimationError> {
+        match self {
+            ConstraintSet::Dense(lin) => dense_reduced_face(lin, beta, membership_tol),
+            ConstraintSet::KhatriRaoCone(cone) => {
+                khatri_rao_cone_reduced_face(cone, beta, membership_tol)
+            }
+            ConstraintSet::BlockDiagonal { blocks, .. } => {
+                // Compose per inner block over its disjoint column range; row ids
+                // are the concatenation of the member row ids in order, so each
+                // member's flat ids shift by the running member row count.
+                let mut representatives: Vec<usize> = Vec::new();
+                let mut dependence: Vec<Vec<ActiveRowDependence>> = Vec::new();
+                let mut tight_rows: Vec<usize> = Vec::new();
+                let mut row_offset = 0usize;
+                for block in blocks {
+                    let start = block.col_start;
+                    let end = start + block.set.ncols();
+                    let beta_block = beta.slice(ndarray::s![start..end]);
+                    let sub = block.set.reduced_face(beta_block, membership_tol)?;
+                    for r in sub.representatives {
+                        representatives.push(r + row_offset);
+                    }
+                    for deps in sub.dependence {
+                        dependence.push(
+                            deps.into_iter()
+                                .map(|d| ActiveRowDependence {
+                                    active_pos: d.active_pos + row_offset,
+                                    coeff: d.coeff,
+                                })
+                                .collect(),
+                        );
+                    }
+                    for t in sub.tight_rows {
+                        tight_rows.push(t + row_offset);
+                    }
+                    row_offset += block.set.nrows();
+                }
+                Ok(ReducedFace {
+                    representatives,
+                    dependence,
+                    tight_rows,
+                })
+            }
+        }
+    }
+}
+
 impl CompressedActiveWorkingSet {
     fn is_degenerate_face(&self) -> bool {
         self.constraints.a.nrows() < self.original_active_count
@@ -4416,6 +4590,53 @@ mod tests {
         assert_eq!(face.representatives, vec![0, 1, 2, 3]);
         assert!(face.dependence.iter().all(|d| d.is_empty()));
         assert_eq!(face.tight_rows, vec![0, 1, 2, 3]);
+    }
+
+    /// The Dense arm of the `ConstraintSet::reduced_face` dispatcher matches the
+    /// cone arm's contract: parallel tight rows collapse to the lowest-index
+    /// representative with the scalar ratio recorded; flat id = the row index.
+    #[test]
+    fn dense_reduced_face_via_dispatcher_collapses_parallel_rows() {
+        // Row 2 = 2·row 0 (parallel); row 1 independent. b = 0 ⇒ every row tight
+        // at β = 0 (scaled slack 0).
+        let a = array![[1.0_f64, 0.0], [0.0, 1.0], [2.0, 0.0]];
+        let set = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(a, Array1::<f64>::zeros(3)).expect("dense"),
+        );
+        let beta = Array1::<f64>::zeros(2);
+        let face = set.reduced_face(beta.view(), 1e-8).expect("reduce");
+        assert_eq!(face.tight_rows, vec![0, 1, 2]);
+        assert_eq!(face.representatives, vec![0, 1]);
+        assert_eq!(face.dependence[0].len(), 1);
+        assert_eq!(face.dependence[0][0].active_pos, 2);
+        assert!((face.dependence[0][0].coeff - 2.0).abs() < 1e-12);
+        assert!(face.dependence[1].is_empty());
+    }
+
+    /// The BlockDiagonal arm composes member reductions and concatenates their
+    /// row ids in order (each member's flat ids shift by the running member row
+    /// count), so a parallel dependent in the second block reports its global id.
+    #[test]
+    fn block_diagonal_reduced_face_concatenates_member_row_ids() {
+        // Two Dense blocks over disjoint columns; each: row0 independent, row1 =
+        // 2·row0. b = 0 ⇒ all tight. Block 1's rows shift by block 0's 2 rows.
+        let make = |c0: usize| gam_problem::PlacedConstraintBlock {
+            col_start: c0,
+            set: ConstraintSet::Dense(
+                LinearInequalityConstraints::new(
+                    array![[1.0_f64, 0.0], [2.0, 0.0]],
+                    Array1::<f64>::zeros(2),
+                )
+                .expect("dense block"),
+            ),
+        };
+        let set = ConstraintSet::block_diagonal(vec![make(0), make(2)], 4).expect("block-diagonal");
+        let beta = Array1::<f64>::zeros(4);
+        let face = set.reduced_face(beta.view(), 1e-8).expect("reduce");
+        assert_eq!(face.tight_rows, vec![0, 1, 2, 3]);
+        assert_eq!(face.representatives, vec![0, 2]);
+        assert_eq!(face.dependence[0][0].active_pos, 1);
+        assert_eq!(face.dependence[1][0].active_pos, 3);
     }
 
     /// Deterministic PD Hessian with off-diagonal coupling so active-set
