@@ -6545,14 +6545,14 @@ impl OuterObjective for BimodalTerminalObjective {
     fn eval_with_order(
         &mut self,
         rho: &Array1<f64>,
-        _order: OuterEvalOrder,
+        _: OuterEvalOrder,
     ) -> Result<OuterEval, EstimationError> {
         Ok(self.basin_eval(rho))
     }
     fn finalize_outer_result(
         &mut self,
         rho: &Array1<f64>,
-        _plan: &OuterPlan,
+        _: &OuterPlan,
     ) -> Result<(), EstimationError> {
         // Install the owned coefficient mode: record the objective value the
         // mode carries, exactly as the custom-family evaluator does.
@@ -6566,7 +6566,7 @@ impl OuterObjective for BimodalTerminalObjective {
     fn reset(&mut self) {
         *self.warm_bumped.lock().unwrap() = false;
     }
-    fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+    fn seed_inner_state(&mut self, _: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
         // The bimodal basin is carried by `warm_bumped`, not an inner-β slot.
         Ok(SeedOutcome::NoSlot)
     }
