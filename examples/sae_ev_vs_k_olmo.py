@@ -76,6 +76,37 @@ CPU_PARTIAL_LADDER = (1, 2, 4, 8)
 OFFICIAL_QWEN_W32K_EV = 0.523
 DEFAULT_ACTIVE_SUPPORT = 1
 
+_WALL_ORIGIN = time.perf_counter()
+
+
+def _rss_mb() -> float:
+    """Resident set size in MiB, or nan where the platform cannot report it."""
+    try:
+        import resource
+
+        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except (ImportError, ValueError, OSError):
+        return float("nan")
+    # ru_maxrss is KiB on Linux, bytes on macOS/BSD.
+    import sys as _sys
+
+    return maxrss / 1024.0 if _sys.platform != "darwin" else maxrss / (1024.0 * 1024.0)
+
+
+def _stage(msg: str) -> None:
+    """Emit a wall-clock+RSS phase marker so a hang localizes to a phase/arm.
+
+    The fits block on a spawn child with no timeout by design (#2055). Without a
+    marker printed BEFORE each fit, an overrun at the 900 s cap is invisible: the
+    log ends mid-fit with no record of which K/arm was in flight. These lines are
+    the timing contract for #2267 — every phase boundary and every fit start/end
+    is stamped with seconds-since-launch and peak RSS.
+    """
+    print(
+        f"[STAGE +{time.perf_counter() - _WALL_ORIGIN:8.1f}s rss={_rss_mb():7.1f}MiB] {msg}",
+        flush=True,
+    )
+
 DENSE_MANIFOLD_LANE = "dense_manifold_softmax"
 CURVED_TOPK_LANE = "curved_manifold_topk"
 LINEAR_SPARSE_LANE = "linear_sparse_dictionary"
@@ -506,6 +537,7 @@ def _fit_ev(
     and machine-dependent (#2055).
     """
     route = _arm_route(k, z_tr.shape[1], arm, active_support)
+    _stage(f"fit START  arm={arm} K={k} lane={route['lane']}")
     ctx = multiprocessing.get_context("spawn")
     executor = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx)
     try:
@@ -537,6 +569,10 @@ def _fit_ev(
         executor.shutdown(wait=False)
 
     result["route"] = route
+    _stage(
+        f"fit DONE   arm={arm} K={k} "
+        f"fit_s={result['fit_seconds']:.1f} recon_s={result['reconstruct_seconds']:.1f}"
+    )
     print(
         f"[{arm} K={k} lane={route['lane']}] IN_SAMPLE_EV={result['train_ev']:.4f}  "
         f"held_out_EV={result['test_ev']:.4f}",
@@ -716,7 +752,9 @@ def main() -> None:
     if args.sep_mu is not None:
         print(f"[barrier] sep_mu={args.sep_mu}", flush=True)
 
+    _stage("load activations START")
     x = _load_activations(args)
+    _stage(f"load activations DONE shape={x.shape}")
     rng = np.random.default_rng(args.seed)
     if args.max_rows is not None and args.max_rows < x.shape[0]:
         if args.max_rows < 8:
@@ -728,7 +766,9 @@ def main() -> None:
     perm = rng.permutation(n)
     n_test = max(1, int(round(args.test_frac * n)))
     test_idx, train_idx = perm[:n_test], perm[n_test:]
+    _stage(f"PCA project START pcs={args.pcs} train={len(train_idx)} test={len(test_idx)}")
     z_tr, z_te, r = _pca_project(x[train_idx], x[test_idx], args.pcs)
+    _stage(f"PCA project DONE realized_p={z_tr.shape[1]} retained_r={r:.4f}")
     ladder = list(CPU_PARTIAL_LADDER) if args.cpu_partial else _parse_ladder(args.k_ladder)
     if args.active_support <= 0:
         raise SystemExit("--active-support must be positive")
@@ -770,6 +810,7 @@ def main() -> None:
     )
     rows = []
     for k in ladder:
+        _stage(f"ladder rung START K={k}")
         hybrid = _fit_ev(
             z_tr,
             z_te,
