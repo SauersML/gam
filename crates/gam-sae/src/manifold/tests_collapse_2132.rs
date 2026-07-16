@@ -279,3 +279,63 @@ fn zz_collapse_2132_heldout_ev_nondecreasing_and_beats_pca() {
         2 * C
     );
 }
+
+/// #2132/#2228 — CHEAP fixed-ρ discriminator for the inner quotient stall.
+///
+/// The full EV-vs-K close driver runs THREE outer ρ searches (K=C, C+2, 2C), each
+/// a 12-iteration BFGS over repeated inner solves — hours of walltime, and the
+/// 13281964 trace showed it never even reached the sweep: it refused at the FIRST
+/// fit's SEED evaluation with the SAE inner quotient stall (‖g‖=0.174 ≫ tol 3.6e-4,
+/// ½λ²/scale=3.1e-6, terminal-polish bail → "refusing to rank an off-optimum Laplace
+/// criterion"). This probe reproduces exactly that seed-evaluation refusal for a
+/// FRACTION of the cost: a SINGLE `eval_efs(seed)` inner solve per small matched-K
+/// (K=C) circle mixture — no outer loop at all. Seconds, not hours.
+///
+/// Run with `RUST_LOG=debug --nocapture` to surface the terminal-polish arbiter
+/// lines ("terminal Newton bail: all backtracks rejected" vs "terminal Newton step
+/// committed" vs "quotient solver refused"/"GMRES bail") that discriminate the root:
+/// merit-rejects-valid-indefinite-Newton-step (the raw-‖g‖-only polish merit) vs an
+/// objective↔gradient/pencil desync vs a preconditioner defect.
+///
+/// Acceptance: every seed evaluation must TERMINATE with a finite criterion — a
+/// converged inner solve or a best-incumbent, never the off-optimum refusal that
+/// blocks the whole #2132/#2228 SAE acceptance lane.
+#[test]
+fn manifold_circle_mixture_seed_eval_terminates_2132() {
+    // (C, P): matched-K (K=C) planted circle mixtures, small enough that one inner
+    // solve is seconds. P = 2C + 2 keeps the C planes disjoint with ambient slack.
+    const CONFIGS: [(usize, usize); 3] = [(2, 6), (3, 8), (4, 10)];
+    const N: usize = 240;
+    const SIGMA: f64 = 0.05;
+
+    let mut refusals: Vec<String> = Vec::new();
+    for (c, p) in CONFIGS {
+        let train = planted_circle_mixture(N, p, c, SIGMA, 0xA11CE ^ c as u64);
+        let (mut objective, seed) =
+            objective_and_seed(train.view(), c, Topo::Circle, AssignmentMode::softmax(1.0));
+        match objective.eval_efs(&seed) {
+            Ok(eval) => {
+                let steps_finite = eval.steps.iter().all(|v| v.is_finite());
+                eprintln!(
+                    "[#2132 seed-eval] C={c} K={c} P={p}: cost={:.6e} n_steps={} \
+                     steps_finite={steps_finite} cost_finite={}",
+                    eval.cost,
+                    eval.steps.len(),
+                    eval.cost.is_finite()
+                );
+                if !eval.cost.is_finite() {
+                    refusals.push(format!("C={c}: non-finite seed cost {:.6e}", eval.cost));
+                }
+            }
+            Err(err) => {
+                eprintln!("[#2132 seed-eval] C={c} K={c} P={p}: REFUSED — {err}");
+                refusals.push(format!("C={c}: {err}"));
+            }
+        }
+    }
+    assert!(
+        refusals.is_empty(),
+        "#2132/#2228: inner seed evaluation refused / went non-finite on a clean planted \
+         circle mixture (the seed-evaluation stall the close driver never gets past): {refusals:?}"
+    );
+}
