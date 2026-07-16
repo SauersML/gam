@@ -17,6 +17,7 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, Array3, Axis, s};
 
 use faer::Side;
+use gam_linalg::decision::{RankDecision, certified_rank, equilibrate_gram};
 use gam_linalg::faer_ndarray::{
     FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb, fast_xt_diag_y,
     rrqr_with_permutation,
@@ -31,6 +32,14 @@ use gam_linalg::faer_ndarray::{
 /// keeps numerically-zero directions out of the kept subspace while preserving
 /// every genuinely identified direction at large-scale conditioning.
 const RANK_REVEAL_EPS_SLACK: f64 = 64.0;
+
+/// Two-sided multiplicative half-gap for the certified-rank guard band (issue
+/// #2337 §9-step-6). A rank decision is host-stable only when no equilibrated
+/// eigenvalue lands inside `(τ/(1+gap), τ·(1+gap))`. `gap = 1.0` (a factor-of-2
+/// band on each side) is used purely to *observe* Ambiguous frequency in this
+/// stage-1, observe-only rollout; the actual retained rank still comes from the
+/// unchanged threshold count.
+const RANK_DECISION_GAP: f64 = 1.0;
 
 /// Maps a coefficient perturbation `δβ ∈ R^p` for one parameter block into
 /// its contribution to the per-row primary state `u_i ∈ R^K`.
@@ -893,25 +902,45 @@ fn keep_positive_eigenspace(
     // eigenvalue), so blocks already ranked correctly are byte-identical — only
     // stiff-direction-mislabeled blocks gain their true rank.
     let rank = {
-        let scale_col: Vec<f64> = (0..p)
-            .map(|j| {
-                let d = g_tilde[[j, j]].max(0.0);
-                if d > 0.0 { d.sqrt() } else { 1.0 }
-            })
-            .collect();
-        let mut g_eq = Array2::<f64>::zeros((p, p));
-        for i in 0..p {
-            for j in 0..p {
-                g_eq[[i, j]] = g_tilde[[i, j]] / (scale_col[i] * scale_col[j]);
-            }
-        }
+        // Diagonally equilibrate into the column-scale gauge (Sylvester's law of
+        // inertia: the congruence preserves rank), then take the count from the
+        // equilibrated spectrum. See `gam_linalg::decision::equilibrate_gram`.
+        let (g_eq, _) = equilibrate_gram(g_tilde);
         let (evals_eq, _) = g_eq.eigh(Side::Lower).map_err(|err| {
             CompilerError::LinalgFailure(format!("equilibrated residual Gram eigh failed: {err:?}"))
         })?;
         let lambda_max_eq = evals_eq.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
         let nk = (n.saturating_mul(k)).max(p).max(1) as f64;
         let tau_eq = lambda_max_eq * RANK_REVEAL_EPS_SLACK * nk * f64::EPSILON;
-        evals_eq.iter().filter(|&&e| e > tau_eq).count()
+        // Threshold count the pipeline has always acted on: the decision we must
+        // preserve exactly.
+        let threshold_count = evals_eq.iter().filter(|&&e| e > tau_eq).count();
+        // Two-stage rollout (#2337 §9-step-6). STAGE 1 — OBSERVE ONLY: classify
+        // the same decision against a two-sided guard band. When the band is
+        // clean the certified rank equals `threshold_count` by construction (no
+        // eigenvalue lies in `(τ/(1+gap), τ·(1+gap))`, so `#{e ≥ high}` =
+        // `#{e > τ}`). When a value sits inside the band the decision is
+        // host-unstable; we do NOT refuse here — we log the payload so we can
+        // measure Ambiguous frequency before enforcing a refusal path in stage 2
+        // — and fall back to the preserved threshold count.
+        match certified_rank(evals_eq.as_slice().unwrap_or(&[]), tau_eq, RANK_DECISION_GAP) {
+            RankDecision::Certified { rank, .. } => rank,
+            RankDecision::Ambiguous {
+                rank_floor,
+                rank_ceil,
+                sigma_in_band,
+                tol,
+                gap,
+            } => {
+                log::warn!(
+                    "keep_positive_eigenspace: ambiguous equilibrated rank (observe-only, \
+                     #2337 stage 1): rank_floor={rank_floor}, rank_ceil={rank_ceil}, \
+                     sigma_in_band={sigma_in_band:.3e}, tol={tol:.3e}, gap={gap}, \
+                     falling back to threshold_count={threshold_count}"
+                );
+                threshold_count
+            }
+        }
     };
 
     // Top-`rank` RAW eigenvectors by descending raw eigenvalue (stable order).
