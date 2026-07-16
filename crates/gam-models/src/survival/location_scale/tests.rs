@@ -166,6 +166,8 @@ impl gam_math::jet_tower::RowProgram<2> for SurvivalLsLocationScaleNllProgram<'_
             d2logphi1: 0.0,
             d3logphi1: 0.0,
             d4logphi1: 0.0,
+            log_pdf1_minus_log_s0: 0.0,
+            log_s1_minus_log_s0: 0.0,
             log_g: 0.0,
             d_log_g: 0.0,
             d2_log_g: 0.0,
@@ -181,6 +183,7 @@ impl gam_math::jet_tower::RowProgram<2> for SurvivalLsLocationScaleNllProgram<'_
             kernel.dr1 = -stack_exit[2];
             kernel.ddr1 = -stack_exit[3];
             kernel.dddr1 = -stack_exit[4];
+            kernel.log_s1_minus_log_s0 = stack_exit[0] - stack_entry[0];
         }
 
         let event_weight = self.row.weight * self.row.event;
@@ -192,6 +195,7 @@ impl gam_math::jet_tower::RowProgram<2> for SurvivalLsLocationScaleNllProgram<'_
             kernel.d2logphi1 = stack_pdf[2];
             kernel.d3logphi1 = stack_pdf[3];
             kernel.d4logphi1 = stack_pdf[4];
+            kernel.log_pdf1_minus_log_s0 = stack_pdf[0] - stack_entry[0];
             let stack_g = survival_ls_positive_log_stack(g);
             kernel.log_g = stack_g[0];
             kernel.d_log_g = stack_g[1];
@@ -6353,8 +6357,23 @@ fn survival_q0dot_from_base_preserves_far_tail_cancellation() {
         (factorized - expected).abs() <= 1e-12 * expected.abs().max(1.0),
         "factorized qdot mismatch: got {factorized}, expected {expected}"
     );
+    // The expanded (distributed) form sums two ~inv_sigma-magnitude terms
+    // whose difference is 12 orders smaller, so it is in the huge-magnitude
+    // regime with only ~4 surviving digits, while the factorized form does the
+    // local cancellation `eta_t·eta_ls_deriv − eta_t_deriv` BEFORE the
+    // inv_sigma product and keeps full relative precision. (A former
+    // `factorized.abs() <= 1e206` ceiling here was a relic of the removed
+    // +500 σ-inverse cap: under the current f64-representability saturation of
+    // `exp_sigma_inverse_from_eta_scalar` the exact value is ≈1.01e292 —
+    // magnitude is not the property this test pins; preserved precision is.)
     assert!(expanded.abs() >= 1e200);
-    assert!(factorized.abs() <= 1e206);
+    let factorized_rel = ((factorized - expected) / expected).abs().max(1e-16);
+    let expanded_rel = ((expanded - expected) / expected).abs();
+    assert!(
+        expanded_rel >= 1e3 * factorized_rel,
+        "far-tail cancellation not demonstrated: expanded rel err {expanded_rel:e} \
+         should dwarf factorized rel err {factorized_rel:e}"
+    );
 }
 
 #[test]

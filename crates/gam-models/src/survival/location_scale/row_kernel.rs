@@ -28,6 +28,16 @@ pub(crate) struct SurvivalExactRowKernel {
     pub(crate) d2logphi1: f64,
     pub(crate) d3logphi1: f64,
     pub(crate) d4logphi1: f64,
+    /// Stable pair value `log f(u1) − log S(u0)` (exit event density against
+    /// entry survival). In the far tail both log stacks are astronomically
+    /// large (|log| up to ~1e300) while their true difference is moderate —
+    /// for a left-truncated event row with entry == exit it is exactly
+    /// `log hazard(u0)` — so the naked stack difference is pure roundoff
+    /// (#2335). Built cancellation-free per link at kernel construction.
+    pub(crate) log_pdf1_minus_log_s0: f64,
+    /// Stable pair value `log S(u1) − log S(u0)` (censored exit against entry
+    /// survival), same construction.
+    pub(crate) log_s1_minus_log_s0: f64,
     pub(crate) log_g: f64,
     pub(crate) d_log_g: f64,
     pub(crate) d2_log_g: f64,
@@ -72,7 +82,33 @@ fn survival_predictor_state(
 impl SurvivalExactRowKernel {
     #[inline]
     pub(crate) fn log_likelihood(self) -> f64 {
-        self.w * (event_mix(self.d, self.logphi1 + self.log_g, self.log_s1) - self.log_s0)
+        // `mix(d, a, b) − c == mix(d, a − c, b − c)` exactly for d ∈ {0, 1}
+        // (and to rounding for fractional d); the pre-paired differences keep
+        // the far-tail value from cancelling (#2335).
+        self.w
+            * event_mix(
+                self.d,
+                self.log_pdf1_minus_log_s0 + self.log_g,
+                self.log_s1_minus_log_s0,
+            )
+    }
+}
+
+/// `softplus(a) − softplus(b)`, cancellation-free for large same-sign
+/// arguments where the naked difference of two ~|a| softplus values would
+/// round away the O(a−b) result.
+#[inline]
+fn softplus_diff(a: f64, b: f64) -> f64 {
+    if a >= 0.0 && b >= 0.0 {
+        // softplus(x) = x + ln(1 + e^{−x}) on x ≥ 0; the log terms are ≤ ln 2.
+        (a - b) + ((-a).exp().ln_1p() - (-b).exp().ln_1p())
+    } else if a <= 0.0 && b <= 0.0 {
+        // softplus(x) = ln(1 + e^{x}) on x ≤ 0; both values are ≤ ln 2.
+        a.exp().ln_1p() - b.exp().ln_1p()
+    } else {
+        // Mixed signs: both magnitudes are bounded by max(|a|,|b|) + 1 and the
+        // difference is at least min(|a|,|b|)-scale, so the naked form is fine.
+        softplus(a) - softplus(b)
     }
 }
 
@@ -4039,6 +4075,82 @@ impl SurvivalLocationScaleFamily {
         )
     }
 
+    /// Cancellation-free `(log f(u1) − log S(u0), log S(u1) − log S(u0))`.
+    ///
+    /// In the far tail the two log stacks are each astronomically large while
+    /// their true difference is moderate — for a left-truncated event row with
+    /// entry == exit the exact value is `log hazard(u0)` — so the naked
+    /// difference of the rounded stacks is pure roundoff (observed ~1e285
+    /// noise at |log S| ~ 6.7e300, #2335). Pair the terms analytically:
+    /// `log f(u1) − log S(u0) = ln r(u0) + [log φ(u1) − log φ(u0)]` with the
+    /// pdf-log increment in closed form per link, and `δu = u1 − u0` supplied
+    /// from the channel differences so identical entry/exit channels give an
+    /// exact zero. When `r(u0)` underflows, `log S(u0)` is itself ≈ 0 and the
+    /// naked difference is cancellation-free, so it is used directly; the
+    /// same holds for every link without a closed-form increment (their
+    /// survival values are bounded into (0,1], keeping both logs moderate).
+    /// Assumes the monotone contract `u1 ≥ u0` (exit index at or after the
+    /// entry index) the row kernel's monotonicity guard enforces.
+    fn stable_exit_entry_log_pairs(
+        inverse_link: &InverseLink,
+        u0: f64,
+        u1: f64,
+        delta_u: f64,
+        log_s0: f64,
+        log_s1: f64,
+        logphi1: f64,
+        r0: f64,
+        r1: f64,
+    ) -> (f64, f64) {
+        if matches!(inverse_link, InverseLink::Standard(StandardLink::CLogLog)) {
+            // log S = −e^u, log f = u − e^u: fully closed forms in the
+            // indices. (The r stacks carry the CLogLog `exp(−L)` derivative
+            // rescale, so they must not enter the value channel here.)
+            let growth = if delta_u == 0.0 {
+                0.0
+            } else {
+                u0.exp() * delta_u.exp_m1()
+            };
+            return (u1 - growth, -growth);
+        }
+        let dlogphi = match inverse_link {
+            InverseLink::Standard(StandardLink::Probit) => {
+                if delta_u == 0.0 {
+                    // Guard 0·(u0 + u1): the sum may round to ±inf.
+                    Some(0.0)
+                } else {
+                    // log φ(u1) − log φ(u0) = −(u1² − u0²)/2.
+                    Some(-(0.5 * delta_u) * (u0 + u1))
+                }
+            }
+            InverseLink::Standard(StandardLink::Logit) => {
+                // log φ(u) = −softplus(u) − softplus(−u).
+                Some(softplus_diff(u0, u1) + softplus_diff(-u0, -u1))
+            }
+            // Identity-link pdf is constant 1: log φ ≡ 0.
+            InverseLink::Standard(StandardLink::Identity) => Some(0.0),
+            _ => None,
+        };
+        match dlogphi {
+            Some(dphi) => {
+                let r0_ok = r0.is_finite() && r0 >= f64::MIN_POSITIVE;
+                let r1_ok = r1.is_finite() && r1 >= f64::MIN_POSITIVE;
+                let event = if r0_ok {
+                    r0.ln() + dphi
+                } else {
+                    logphi1 - log_s0
+                };
+                let censor = if r0_ok && r1_ok {
+                    (r0.ln() - r1.ln()) + dphi
+                } else {
+                    log_s1 - log_s0
+                };
+                (event, censor)
+            }
+            None => (logphi1 - log_s0, log_s1 - log_s0),
+        }
+    }
+
     fn exact_row_kernel_from_parts(
         inverse_link: &InverseLink,
         derivative_guard: f64,
@@ -4206,6 +4318,23 @@ impl SurvivalLocationScaleFamily {
         }
         let (log_g, d_log_g, d2_log_g, d3_log_g, d4_log_g) = Self::logwith_derivatives_positive(g);
 
+        // δu from the channel differences, not from the rounded u's: identical
+        // entry/exit channels (a truncation-instant event) give an exact zero
+        // where `u1 − u0` at far-tail magnitudes cannot even represent the
+        // physical difference.
+        let delta_u = (state.h1 - state.h0) + (state.q1 - state.q0);
+        let (log_pdf1_minus_log_s0, log_s1_minus_log_s0) = Self::stable_exit_entry_log_pairs(
+            inverse_link,
+            u0,
+            u1,
+            delta_u,
+            log_s0,
+            log_s1,
+            logphi1,
+            r0,
+            r1,
+        );
+
         Ok(Some(SurvivalExactRowKernel {
             w,
             d,
@@ -4224,6 +4353,8 @@ impl SurvivalLocationScaleFamily {
             d2logphi1,
             d3logphi1,
             d4logphi1,
+            log_pdf1_minus_log_s0,
+            log_s1_minus_log_s0,
             log_g,
             d_log_g,
             d2_log_g,
@@ -4332,6 +4463,8 @@ mod index_derivative_lowering_tests {
             d2logphi1: -0.16 * density_exp - 0.3,
             d3logphi1: -0.064 * density_exp,
             d4logphi1: -0.0256 * density_exp,
+            log_pdf1_minus_log_s0: log_density(U1) - (-exp0),
+            log_s1_minus_log_s0: -exp1 - (-exp0),
             log_g: G.ln(),
             d_log_g: G.recip(),
             d2_log_g: -G.recip().powi(2),
@@ -4549,6 +4682,8 @@ mod patterned_order2_perf_tests {
                 d2logphi1: -1.0,
                 d3logphi1: 0.0,
                 d4logphi1: 0.0,
+                log_pdf1_minus_log_s0: -1.4 - (-0.8),
+                log_s1_minus_log_s0: -1.1 - (-0.8),
                 log_g: -0.2,
                 d_log_g: 1.4,
                 d2_log_g: -1.96,
@@ -5071,24 +5206,44 @@ mod simd_batch_bit_identity_tests {
         };
         let cens = w * (1.0 - d) != 0.0;
         let ev = w * d != 0.0;
+        // Draw the stacks in the same sequence as the original struct literal
+        // so the LCG stream (and thus every downstream expectation) is
+        // unchanged; the pair fields are derived, not drawn.
+        let log_s0 = rng.val();
+        let r0 = rng.val();
+        let dr0 = rng.val();
+        let ddr0 = rng.val();
+        let dddr0 = rng.val();
+        let log_s1 = stack_entry(cens, rng);
+        let r1 = stack_entry(cens, rng);
+        let dr1 = stack_entry(cens, rng);
+        let ddr1 = stack_entry(cens, rng);
+        let dddr1 = stack_entry(cens, rng);
+        let logphi1 = stack_entry(ev, rng);
+        let dlogphi1 = stack_entry(ev, rng);
+        let d2logphi1 = stack_entry(ev, rng);
+        let d3logphi1 = stack_entry(ev, rng);
+        let d4logphi1 = stack_entry(ev, rng);
         SurvivalExactRowKernel {
             w,
             d,
-            log_s0: rng.val(),
-            r0: rng.val(),
-            dr0: rng.val(),
-            ddr0: rng.val(),
-            dddr0: rng.val(),
-            log_s1: stack_entry(cens, rng),
-            r1: stack_entry(cens, rng),
-            dr1: stack_entry(cens, rng),
-            ddr1: stack_entry(cens, rng),
-            dddr1: stack_entry(cens, rng),
-            logphi1: stack_entry(ev, rng),
-            dlogphi1: stack_entry(ev, rng),
-            d2logphi1: stack_entry(ev, rng),
-            d3logphi1: stack_entry(ev, rng),
-            d4logphi1: stack_entry(ev, rng),
+            log_s0,
+            r0,
+            dr0,
+            ddr0,
+            dddr0,
+            log_s1,
+            r1,
+            dr1,
+            ddr1,
+            dddr1,
+            logphi1,
+            dlogphi1,
+            d2logphi1,
+            d3logphi1,
+            d4logphi1,
+            log_pdf1_minus_log_s0: logphi1 - log_s0,
+            log_s1_minus_log_s0: log_s1 - log_s0,
             log_g: stack_entry(ev, rng),
             d_log_g: stack_entry(ev, rng),
             d2_log_g: stack_entry(ev, rng),
