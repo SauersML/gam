@@ -139,23 +139,41 @@ fn certified_reduced_face_newton_candidate(
     // QP marched at ~0.989×/cycle and exhausted the 184-cycle budget with the
     // residual at 0.82 vs tol 1.3e-4).
     //
-    // CRITICAL: the truncation lands STRICTLY INSIDE the boundary (fraction
-    // from the raw slack, then a 1e-12 inward shave), never past it. The
-    // previous behavior added ACTIVE_SET_PRIMAL_FEASIBILITY_TOL to the
-    // numerator — deliberately overstepping the boundary by up to 1e-8 so the
-    // blocker would register tight — which collided with the trial
-    // feasibility gate at the SAME 1e-8 tolerance: the trial classified
-    // infeasible, the strictly-interior repair projection failed at the
-    // active face, a silent shrink-retry accepted only the HALF step, and the
-    // blocker (now half a chord away) was dropped by the accepted-face
-    // tightness filter — a bit-frozen fixed point (cycles 29-45: warm_rows=21
-    // vs candidate face 22, β pinned at 4.4377, the same 8.194e-7 proposal
-    // every cycle, residual pinned at 1.556, diagnosis
-    // active_set_incomplete). Landing exactly on the face keeps the trial
-    // feasible (violation ≤ 0 passes the gate), the full chord is accepted,
-    // and the blocker's remaining slack (~1e-12 of the original) classifies
-    // tight under the working-face tolerance, so the exchange completes in
-    // one cycle.
+    // CRITICAL: the truncated chord must land inside the ACCEPTED-FACE WORKING
+    // BAND, not merely inside the looser primal-feasibility band. Two tolerances
+    // govern this seam and they differ by 100×:
+    //   * the trial-feasibility gate accepts a step whose worst scaled violation
+    //     is ≤ ACTIVE_SET_PRIMAL_FEASIBILITY_TOL (1e-8) — "still feasible";
+    //   * the accepted-face filter (`constraint_set_rows_tight_at_point`, the
+    //     caller's line ~4279) classifies a row TIGHT only when its scaled slack
+    //     is ≤ ACTIVE_SET_WORKING_FACE_TOL (1e-10) — "on the face".
+    // The carry (returning the blocker in `next_active`) is honored only if the
+    // accepted β lands inside the *working* band; otherwise the filter drops the
+    // blocker and the exchange the truncation exists to complete never records.
+    //
+    // The prior code shaved inward by a RELATIVE 1e-12 (`alpha *= 1 - 1e-12`),
+    // landing the blocker at scaled slack `≈ 1e-12 · original_slack`. That is
+    // inside the working band ONLY while the original scaled slack is ≲ 100.
+    // Above that — routine for the #2298 competing-risks fit, whose derivative-
+    // guard cone rows carry O(10–100) coefficients and thus O(10²–10⁴) scaled
+    // slacks — the landing point sits in the 1e-10 … 1e-8 gap: feasible, so the
+    // trial gate accepts the step and β advances, but NOT tight, so the filter
+    // drops the carried blocker. The warm face never grows, the reduced-face
+    // fast path re-proposes the identical blocker-bound chord every cycle, the
+    // inner joint-Newton never lands a cleanly-projected stationary point, and
+    // the outer ρ-loop evaluates its gradient at a non-stationary inner mode and
+    // wanders (measured: 60 outer iters, |Pg|=0.398 vs bound 0.021, PSD/un-
+    // railed — #2298 last convergence blocker, #2301 exchange stall).
+    //
+    // Fix: target an ABSOLUTE inward scaled slack `τ = min(½·WORKING_FACE_TOL,
+    // ½·slack)`, independent of the original slack magnitude. `τ > 0` clears the
+    // trial gate with a ~200 000× margin; `τ ≤ WORKING_FACE_TOL` guarantees the
+    // accepted-face filter classifies the blocker tight, so the carry completes
+    // in one cycle whenever the full chord is accepted. The `½·slack` cap keeps
+    // τ below the current slack (strictly positive shaved length, real inward
+    // progress) when the iterate already presses within the band. A zero
+    // feasible length along the tangent (`alpha == 0`) still declines to the
+    // full QP.
     let values_beta = constraints
         .values(beta.view())
         .map_err(|error| format!("exact active-face value evaluation failed: {error}"))?;
@@ -164,6 +182,8 @@ fn certified_reduced_face_newton_candidate(
         .map_err(|error| format!("exact active-face direction evaluation failed: {error}"))?;
     let mut alpha = 1.0_f64;
     let mut blocking_row = None;
+    let mut blocker_slack = 0.0_f64;
+    let mut blocker_rate = 0.0_f64;
     for row in 0..constraints.nrows() {
         if active_rows.contains(&row) {
             continue;
@@ -187,6 +207,8 @@ fn certified_reduced_face_newton_candidate(
             if fraction.is_finite() && fraction >= 0.0 && fraction < alpha {
                 alpha = fraction;
                 blocking_row = Some(row);
+                blocker_slack = scaled_slack;
+                blocker_rate = scaled_rate;
             }
         }
     }
@@ -197,7 +219,16 @@ fn certified_reduced_face_newton_candidate(
         return Ok(None);
     }
     if alpha < 1.0 {
-        alpha *= 1.0 - 1e-12;
+        // Land the blocker at scaled slack τ inside the working band (see above).
+        // `blocker_slack > 0` here (a slack ≤ 0 gives `alpha ≈ 0`, caught above),
+        // so `blocker_rate < 0` and the shaved fraction is well defined.
+        let target_slack = (0.5 * gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL)
+            .min(0.5 * blocker_slack);
+        let shaved = (blocker_slack - target_slack) / -blocker_rate;
+        alpha = shaved.clamp(0.0, alpha);
+        if !(alpha.is_finite() && alpha > 0.0) {
+            return Ok(None);
+        }
         delta *= alpha;
     }
     let candidate = beta + &delta;
@@ -291,9 +322,9 @@ mod exact_face_newton_tests {
         // STRICTLY INSIDE that boundary (never past it — the old
         // +PRIMAL_FEASIBILITY_TOL overshoot collided with the trial
         // feasibility gate at the same tolerance and produced the #2301
-        // silent-reject/half-step fixed point), land close enough that the
-        // row classifies tight, and carry the blocker in the returned face
-        // so the next cycle solves the exchanged face directly.
+        // silent-reject/half-step fixed point), land inside the working-face
+        // band so the row classifies tight, and carry the blocker in the
+        // returned face so the next cycle solves the exchanged face directly.
         let hessian = array![[1.0_f64, 0.0], [0.0, -2.0]];
         let rhs = array![0.0_f64, 2.0];
         let beta = array![0.0_f64, 0.0];
@@ -314,14 +345,73 @@ mod exact_face_newton_tests {
             "candidate must never overstep the blocker boundary (y={})",
             candidate[1]
         );
+        // Lands inside the working-face band (scaled slack ≤ WORKING_FACE_TOL),
+        // not merely inside the looser feasibility band.
         assert!(
-            (candidate[1] - 0.5).abs() <= 1e-9,
-            "candidate must land on the blocker face to within the inward \
-             shave (y={})",
+            (0.5 - candidate[1]) > 0.0
+                && (0.5 - candidate[1])
+                    <= gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL,
+            "candidate must land inside the working-face band (y={})",
             candidate[1]
         );
         assert_eq!(active, vec![0, 1]);
         assert!(!exact);
+    }
+
+    #[test]
+    fn reduced_face_blocker_carry_survives_the_accepted_face_filter_at_large_slack() {
+        // #2298/#2301 exchange stall. The blocker is approached from a LARGE
+        // scaled slack (here 1e5, the magnitude the competing-risks derivative-
+        // guard cone rows reach). The relative 1e-12 inward shave used to land
+        // the truncated chord at scaled slack ≈ 1e5·1e-12 = 1e-7 — feasible
+        // (passes the 1e-8 trial gate, so the step is accepted and β advances),
+        // but ABOVE the 1e-10 working-face tolerance, so the caller's accepted-
+        // face filter (`constraint_set_rows_tight_at_point`) dropped the carried
+        // blocker. The warm face never grew, the fast path re-proposed the same
+        // blocker-bound chord every cycle, and the exchange never completed.
+        //
+        // Drive the candidate through that exact filter (the caller's line
+        // ~4279): the blocker MUST survive it. Before the absolute-band shave
+        // this assertion fails (the filter returns an empty tight set); after it
+        // the blocker lands at scaled slack ½·WORKING_FACE_TOL and is retained.
+        let hessian = array![[1.0_f64, 0.0], [0.0, 1.0]];
+        // Tangent (y-axis) Newton step is g/h = 2e5, overshooting the y<=1e5
+        // blocker at half its length: a genuine blocker truncation.
+        let rhs = array![0.0_f64, 2.0e5];
+        let beta = array![0.0_f64, 0.0];
+        let constraints = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(
+                array![[1.0_f64, 0.0], [0.0, -1.0]],
+                array![0.0, -1.0e5],
+            )
+            .expect("x>=0 and y<=1e5"),
+        );
+        let (candidate, active, exact) =
+            certified_reduced_face_newton_candidate(&hessian, &rhs, &beta, &constraints, &[0])
+                .expect("reduced face classification")
+                .expect("strict tangent descent truncated at the far blocker");
+        // The fast path claims to carry the blocker (row 1) into the returned
+        // face...
+        assert_eq!(active, vec![0, 1]);
+        assert!(!exact);
+        // ...and the accepted-face filter, applied at the candidate exactly as
+        // the caller applies it at the accepted β, must AGREE — row 1 stays
+        // tight. This is the assertion that fails before the fix.
+        let tight = gam_solve::active_set::constraint_set_rows_tight_at_point(
+            &constraints,
+            &candidate,
+            &active,
+        )
+        .expect("accepted-face classification");
+        assert!(
+            tight.contains(&1),
+            "the carried blocker (row 1) must survive the accepted-face filter, \
+             else the exchange never records (candidate y={}, scaled slack={:.3e})",
+            candidate[1],
+            1.0e5 - candidate[1],
+        );
+        // And it stays strictly feasible under the primal-feasibility gate.
+        assert!(candidate[1] < 1.0e5);
     }
 
     #[test]
@@ -616,8 +706,54 @@ fn resolve_constrained_converged_mode<F: CustomFamily + Clone + Send + Sync + 's
     saddle_escapes_used: usize,
     objective_tol: f64,
 ) -> Result<ConstrainedModeResolution, String> {
+    // Certify on the tangent of every NUMERICALLY-TIGHT constraint, not only the
+    // QP's recorded active set. At a degenerate binding vertex the QP can leave a
+    // row with slack below the primal-feasibility tolerance OUT of
+    // `cached_active_sets` (a phantom-dual / zero-multiplier omission). Such a row
+    // is on the active face all the same: the Laplace tangent must null it, or
+    // the certificate over-counts free directions and manufactures a PHANTOM
+    // saddle whose negative curvature lives almost entirely normal to that
+    // near-tight row — the escape direction then points straight into it and the
+    // feasible step collapses to ~1e-11 (the measured CTN witness: lambda_min=
+    // -7.1e-1 with alpha=-1e-11, a no-op). Building the face from all tight rows
+    // resolves that phantom to a genuine constrained mode, and any REAL saddle
+    // keeps a feasible escape (its direction lies in the tight-face tangent, so
+    // it has zero rate on every tight row and a meaningful feasible length).
+    let feasibility_tol = gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
+    let mut tight_active_sets: Vec<Option<Vec<usize>>> =
+        Vec::with_capacity(block_constraints.len());
+    for (block_idx, constraints_opt) in block_constraints.iter().enumerate() {
+        let Some(constraints) = constraints_opt else {
+            tight_active_sets.push(None);
+            continue;
+        };
+        let block_values = constraints.values(states[block_idx].beta.view())?;
+        let mut rows: Vec<usize> = cached_active_sets
+            .get(block_idx)
+            .and_then(|active| active.clone())
+            .unwrap_or_default();
+        for row in 0..constraints.nrows() {
+            if rows.contains(&row) {
+                continue;
+            }
+            let norm = constraints.row_norm(row)?;
+            if !(norm.is_finite() && norm > 0.0) {
+                continue;
+            }
+            let bound = constraints.bound(row)?;
+            if bound == f64::NEG_INFINITY {
+                continue;
+            }
+            if (block_values[row] - bound) / norm < feasibility_tol {
+                rows.push(row);
+            }
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        tight_active_sets.push((!rows.is_empty()).then_some(rows));
+    }
     let mode_active_block =
-        assemble_active_constraint_block(block_constraints, cached_active_sets, ranges, total_p);
+        assemble_active_constraint_block(block_constraints, &tight_active_sets, ranges, total_p);
     let certificate = exact_joint_mode_curvature_certificate(
         family,
         states,
@@ -676,7 +812,7 @@ fn resolve_constrained_converged_mode<F: CustomFamily + Clone + Send + Sync + 's
     // ratio). Both signs of `δ` give the same second-order decrease, so choose
     // the sign that admits the longer feasible step.
     let joint_active =
-        flatten_joint_active_set(cached_active_sets, block_constraints).unwrap_or_default();
+        flatten_joint_active_set(&tight_active_sets, block_constraints).unwrap_or_default();
     let mut feasible_positive = f64::INFINITY;
     let mut feasible_negative = f64::INFINITY;
     if let Some(joint_constraints) =
