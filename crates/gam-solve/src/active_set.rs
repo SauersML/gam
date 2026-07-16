@@ -3314,15 +3314,23 @@ mod tests {
     }
 
     #[test]
-    fn boundary_ratio_uses_the_same_feasibility_contract_as_the_exit_gate() {
-        let slack = -2.5e-15_f64;
-        let rate = -1.0_f64;
-        let alpha = active_set_boundary_hit_step_fraction(slack, rate, 1.0)
-            .expect("machine-epsilon feasible point has positive numerical slack budget");
+    fn boundary_ratio_lands_on_the_exact_boundary_and_blocks_at_it() {
+        // Strictly feasible row: the clipped step lands ON the boundary, not
+        // TOL past it — the exit gate then re-derives the same zero slack
+        // instead of coin-flipping on band-edge rounding.
+        let alpha = active_set_boundary_hit_step_fraction(0.1, -1.0, 1.0)
+            .expect("a strictly feasible row moving toward its boundary must clip");
+        assert_relative_eq!(alpha, 0.1, epsilon = 0.0);
+        assert_relative_eq!(0.1 + alpha * -1.0, 0.0, epsilon = 0.0);
 
-        assert!(alpha > 0.0);
-        let terminal_slack = slack + alpha * rate;
-        assert!(terminal_slack >= -ACTIVE_SET_PRIMAL_FEASIBILITY_TOL * (1.0 + 1e-12));
+        // A row at (or a rounding hair past) its boundary and moving outward
+        // clips the step to zero: it becomes blocking, and the escape is
+        // adjudicated structurally (projected-gradient tangent fallback plus
+        // post-full-step multiplier adjudication) rather than by overshooting
+        // into the certified tolerance band.
+        let blocked = active_set_boundary_hit_step_fraction(-2.5e-15, -1.0, 1.0)
+            .expect("an at-boundary outward-moving row must block");
+        assert_eq!(blocked, 0.0);
     }
 
     #[test]
@@ -4067,10 +4075,33 @@ mod tests {
                 beta_dense[j]
             );
         }
-        // The binding face must agree row-for-row (ids share the same layout).
+        // The binding face must agree GEOMETRICALLY: both carriers land on the
+        // same point (asserted above), so every reported active row must be
+        // tight there, and both must carry the same number of independent
+        // rows. Exact row-id equality is too strong — the fixture's coupled
+        // rows admit alternate representations of the same face, and which
+        // redundant row a carrier keeps is a tie-break, not semantics.
         active_op.sort_unstable();
         active_dense.sort_unstable();
-        assert_eq!(active_op, active_dense, "active faces disagree");
+        let values_at_solution = set.values(beta_op.view()).expect("values at solution");
+        let tight_at_solution: Vec<usize> = (0..set.nrows())
+            .filter(|&row| {
+                let norm = set.row_norm(row).expect("norm");
+                norm > 0.0 && values_at_solution[row] / norm <= 1e-7
+            })
+            .collect();
+        for &row in active_op.iter().chain(active_dense.iter()) {
+            assert!(
+                tight_at_solution.contains(&row),
+                "reported active row {row} is not tight at the common solution \
+                 (op face {active_op:?}, dense face {active_dense:?}, tight {tight_at_solution:?})"
+            );
+        }
+        assert_eq!(
+            active_op.len(),
+            active_dense.len(),
+            "carriers disagree on the face dimension: op {active_op:?} vs dense {active_dense:?}"
+        );
         assert!(
             !active_op.is_empty(),
             "fixture must actually bind at least one cone row"
