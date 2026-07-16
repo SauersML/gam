@@ -90,7 +90,7 @@ fn main() {
             .smooth_terms
             .iter()
             .find_map(|t| match &t.basis {
-                SmoothBasisSpec::Matern { spec, .. } => Some(spec.length_scale),
+                SmoothBasisSpec::Matern { spec, .. } => spec.length_scale.resolved(),
                 _ => None,
             });
         let edf = fit.fit.edf_total().unwrap_or(f64::NAN);
