@@ -587,6 +587,91 @@ mod asymptote_certificate_tests {
         }
     }
 
+    /// The exp4_rail.py tail, fed as *verified* `(ρ, ∂V/∂ρ)` literals, is
+    /// classified correctly by the full `assess_coordinate` path:
+    ///
+    /// * On the confirmed-tail rows `ρ ∈ {14,…,24}` the pencil constant
+    ///   `ĉ = −e^{ρ}·∂V` sits at `≈ 6723` with spread well under the band, so a
+    ///   loose estimand tolerance yields `CertifiedAtAsymptote` (Upper rail).
+    /// * On the finite-difference noise floor `ρ ∈ {28,30,32}` the same
+    ///   statistic swings (`ĉ ≈ 6577, 9112, −11221` — the last one *negative*),
+    ///   so the tail is NOT confirmed and the certificate refuses. This is the
+    ///   self-protection against the repro floor: the detector never
+    ///   false-certifies FD noise as a tail.
+    ///
+    /// The coefficient moves are a clean geometric decay (matching exp4's
+    /// `‖b−b_inf‖` column, which contracts by ≈ e^{−2} per Δρ=2) so the
+    /// estimand machinery reaches the tail verdict rather than short-circuiting.
+    #[test]
+    fn exp4_verified_tail_certifies_and_noise_floor_refuses() {
+        // exp4_rail.py, columns ρ and dV/drho (FD). Upper rail (ρ → +∞).
+        let confirmed: [(f64, f64); 6] = [
+            (14.0, -5.589576e-03),
+            (16.0, -7.565987e-04),
+            (18.0, -1.023966e-04),
+            (20.0, -1.385843e-05),
+            (22.0, -1.874980e-06),
+            (24.0, -2.538059e-07),
+        ];
+        let mut tail = AsymptoteWindow::with_capacity(confirmed.len());
+        // ‖b−b_inf‖ from exp4 at these rows, used as the per-step estimand move.
+        let coef = [6.196e-05, 8.398e-06, 1.137e-06, 1.539e-07, 2.082e-08, 2.818e-09];
+        for (i, (rho, grad)) in confirmed.iter().enumerate() {
+            tail.push(AsymptoteSample {
+                rho: *rho,
+                grad: *grad,
+                coef_step_norm: coef[i],
+            });
+        }
+        // The recovered ĉ is the exp4 pencil constant to 3+ figures.
+        let constants: Vec<f64> = tail
+            .samples()
+            .map(|s| AsymptoteSide::Upper.tail_constant(s.rho, s.grad))
+            .collect();
+        for c in &constants {
+            assert!(
+                (c - 6723.0).abs() / 6723.0 < 5.0e-3,
+                "exp4 pencil constant ĉ={c} should be ≈ 6723"
+            );
+        }
+        match assess_coordinate(&tail, &tol(1.0)) {
+            AsymptoteVerdict::CertifiedAtAsymptote { side, tail_constant, .. } => {
+                assert_eq!(side, AsymptoteSide::Upper);
+                assert!((tail_constant - 6723.0).abs() / 6723.0 < 5.0e-3);
+            }
+            other => panic!("exp4 confirmed-tail rows must certify, got {other:?}"),
+        }
+
+        // The finite-difference noise floor: e^{ρ}·dV = −6577, −9112, +11221
+        // (exp4's ρ=28,30,32 rows). The ρ=32 FD gradient even flips sign, so
+        // the pencil constant is not uniformly one sign — not a coherent single
+        // tail. These gradients are tiny (≤ 5e-9), so we drive the tail logic
+        // directly with an interior_grad_tol below them; the point is to prove
+        // the tail-confirmation stage itself rejects the noise regime, not that
+        // the interior short-circuit happens to catch it.
+        let noise: [(f64, f64); 3] = [
+            (28.0, -4.547474e-09),
+            (30.0, -8.526513e-10),
+            (32.0, 1.421085e-10),
+        ];
+        let mut floor = AsymptoteWindow::with_capacity(noise.len());
+        for (rho, grad) in noise.iter() {
+            floor.push(AsymptoteSample {
+                rho: *rho,
+                grad: *grad,
+                coef_step_norm: 1.0e-11,
+            });
+        }
+        let noise_tol = AsymptoteTolerances {
+            interior_grad_tol: 1.0e-13,
+            ..tol(1.0)
+        };
+        match assess_coordinate(&floor, &noise_tol) {
+            AsymptoteVerdict::NoAsymptote { .. } => {}
+            other => panic!("the FD noise floor must NOT certify as a tail, got {other:?}"),
+        }
+    }
+
     /// Too few samples never certify (a snapshot cannot confirm a tail).
     #[test]
     fn too_few_samples_never_certify() {
