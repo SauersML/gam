@@ -1201,7 +1201,7 @@ mod amortized_encoder_tests {
         use ndarray::{Array1, Array2, array, s};
         // This module does not `use super::*`; the arbiter is the first test here
         // to build a `SaeArrowVector`, call `.eigh` (FaerEigh), and name `Side`.
-        use super::{FaerEigh, SaeArrowVector, Side};
+        use super::{FaerEigh, SaeArrowVector, SaeCriterionError, Side};
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
         let mut rho_eval = rho.clone();
@@ -1222,14 +1222,14 @@ mod amortized_encoder_tests {
                 1.0e-6,
             )
             .expect("fixed-theta cache");
-        let (log_a, log_a_tt) = term
-            .exact_observed_information_log_dets(&rho, target.view(), &cache)
-            .expect("exact observed-information log-dets");
-
         // Independent oracle: materialize A densely via the exact-Hessian apply,
-        // then eigendecompose. The strict-Cholesky logdet (production) must equal
-        // Σ ln λ (oracle), and every eigenvalue must be positive — A is PD at a
-        // true maximum, so the typed refusal must NOT fire on this converged mode.
+        // then eigendecompose FIRST. The eigen spectrum decides which parity to
+        // assert — because a majorizer-converged fixture mode need NOT be an
+        // exact-A maximum. `B`-Newton stops where `B`'s gradient vanishes; in the
+        // ARD negative-curvature region the exact `A = B + ΔC` (ΔC subtracts the
+        // clamped `min(V'',0)` the majorizer drops) can be INDEFINITE there. That
+        // indefinite point is exactly the #2330 mispricing made visible — not a
+        // true max — so `½log|A|` is undefined and the typed refusal MUST fire.
         let total_t = cache.delta_t_len();
         let k = cache.k;
         let dim = total_t + k;
@@ -1262,22 +1262,45 @@ mod amortized_encoder_tests {
         let sym = (&a + &a.t()) * 0.5;
         let (eigs, _vecs) = sym.eigh(Side::Lower).expect("A eigendecomposition");
         let min_eig = eigs.iter().copied().fold(f64::INFINITY, f64::min);
-        assert!(
-            min_eig > 0.0,
-            "A must be positive definite at the converged mode; min eigenvalue {min_eig}"
+        let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let n_nonpos = eigs.iter().filter(|&&l| l <= 0.0).count();
+        eprintln!(
+            "A spectrum: min_eig={min_eig:.6e} max_eig={max_eig:.6e} n_nonpos={n_nonpos}/{dim}"
         );
-        let eig_log_det: f64 = eigs.iter().map(|l| l.ln()).sum();
-        assert!(
-            (log_a - eig_log_det).abs() <= 1.0e-9 * (1.0 + eig_log_det.abs()),
-            "log|A| strict-Cholesky path {log_a} != eigendecomposition oracle {eig_log_det}"
-        );
-        let a_tt = sym.slice(s![..total_t, ..total_t]).to_owned();
-        let (eigs_tt, _) = a_tt.eigh(Side::Lower).expect("A_tt eigendecomposition");
-        let eig_log_det_tt: f64 = eigs_tt.iter().map(|l| l.ln()).sum();
-        assert!(
-            (log_a_tt - eig_log_det_tt).abs() <= 1.0e-9 * (1.0 + eig_log_det_tt.abs()),
-            "log|A_tt| strict-Cholesky path {log_a_tt} != eigendecomposition oracle {eig_log_det_tt}"
-        );
+        let result = term.exact_observed_information_log_dets(&rho, target.view(), &cache);
+        let pd_floor = 1.0e-9 * max_eig.max(1.0);
+        if min_eig > pd_floor {
+            // A ≻ 0: a genuine exact-Laplace maximum. Refusal must NOT fire, and
+            // the strict-Cholesky logdet must equal Σ ln λ (both joint and tt).
+            let (log_a, log_a_tt) =
+                result.expect("A is positive definite so the log-dets must be Ok");
+            let eig_log_det: f64 = eigs.iter().map(|l| l.ln()).sum();
+            assert!(
+                (log_a - eig_log_det).abs() <= 1.0e-9 * (1.0 + eig_log_det.abs()),
+                "log|A| strict-Cholesky path {log_a} != eigendecomposition oracle {eig_log_det}"
+            );
+            let a_tt = sym.slice(s![..total_t, ..total_t]).to_owned();
+            let (eigs_tt, _) = a_tt.eigh(Side::Lower).expect("A_tt eigendecomposition");
+            let eig_log_det_tt: f64 = eigs_tt.iter().map(|l| l.ln()).sum();
+            assert!(
+                (log_a_tt - eig_log_det_tt).abs() <= 1.0e-9 * (1.0 + eig_log_det_tt.abs()),
+                "log|A_tt| strict-Cholesky path {log_a_tt} != eigendecomposition oracle \
+                 {eig_log_det_tt}"
+            );
+        } else {
+            // A is non-PD: the typed refusal must fire on the joint block, and the
+            // eigen oracle independently confirms the non-positive spectrum. This
+            // is a complete parity test (refusal ⟺ indefinite), not a skipped one.
+            match result {
+                Err(SaeCriterionError::IndefiniteObservedInformation { block }) => {
+                    assert_eq!(block, "joint", "refusal fired on the wrong block: {block}");
+                }
+                other => panic!(
+                    "A is non-PD (min_eig={min_eig:.3e}) but exact_observed_information_log_dets \
+                     did not refuse: {other:?}"
+                ),
+            }
+        }
     }
 
     /// The fitted amplitudes the encoder derives are exactly the posterior gate
