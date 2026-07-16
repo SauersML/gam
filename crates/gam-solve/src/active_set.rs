@@ -1179,8 +1179,11 @@ pub(crate) fn solve_kkt_direction(
 #[derive(Clone, Debug)]
 pub(crate) struct CompressedActiveWorkingSet {
     pub(crate) constraints: LinearInequalityConstraints,
+    /// Original active positions collapsed into each compressed (representative)
+    /// row: `groups[g][0]` is the representative and the rest are its exactly-
+    /// parallel (positively-aligned, same-constraint-up-to-scale) dependents. The
+    /// whole group is released together when the representative's dual is negative.
     pub(crate) groups: Vec<Vec<usize>>,
-    multiplier_dependence: Vec<Vec<ActiveRowDependence>>,
     pub(crate) original_active_count: usize,
 }
 
@@ -1200,19 +1203,45 @@ impl CompressedActiveWorkingSet {
             || self.groups.iter().any(|group| group.len() > 1)
     }
 
-    fn reconstructed_active_multipliers(&self, lambda_system: &Array1<f64>) -> Vec<(usize, f64)> {
-        let mut multipliers = Vec::new();
-        for (group_pos, &lambda_system_value) in lambda_system.iter().enumerate() {
-            let lambda_true = -lambda_system_value;
-            if let Some(dependencies) = self.multiplier_dependence.get(group_pos) {
-                for dependency in dependencies {
-                    if dependency.coeff.abs() > f64::EPSILON {
-                        multipliers.push((dependency.active_pos, lambda_true / dependency.coeff));
-                    }
-                }
-            }
-        }
-        multipliers
+    /// The lowest-original-index representative direction whose compressed dual is
+    /// negative beyond `tol_dual`, returned as the FULL set of original active
+    /// positions collapsed into it (the representative plus its exactly-parallel
+    /// dependents — the same constraint up to positive scale).
+    ///
+    /// Adjudicating the representative and releasing the WHOLE direction replaces
+    /// the former per-original-row reconstruction, which divided the direction's
+    /// dual by each dependent's `coeff` to synthesize a per-row multiplier and
+    /// released ONE row at a time — a phantom ±1/ε dual on a redundant tight row
+    /// (#2298/#979/#2132) and a churn source: releasing one row of an exactly-
+    /// parallel group leaves the others pinning the same direction, so the working
+    /// set oscillates. A negative representative dual means the aggregate pull along
+    /// that independent direction is wrong-signed, so the whole group is released
+    /// together; general-position dependents were never grouped (they carry no
+    /// dependence entry and re-enter via the next feasibility scan).
+    ///
+    /// `active` maps `active_pos → original constraint id` so the choice is the
+    /// deterministic lowest-original-index direction. `None` ⇒ every representative
+    /// dual is non-negative: a KKT point on the reduced face.
+    fn negative_representative_group(
+        &self,
+        lambda_system: &Array1<f64>,
+        tol_dual: f64,
+        active: &[usize],
+    ) -> Option<Vec<usize>> {
+        self.groups
+            .iter()
+            .enumerate()
+            .filter(|&(group_pos, _)| {
+                // lambda_true = -lambda_system[group_pos]; release iff < -tol_dual.
+                lambda_system
+                    .get(group_pos)
+                    .is_some_and(|&value| -value < -tol_dual)
+            })
+            .min_by_key(|&(_, group)| {
+                let first = group.first().copied().unwrap_or(usize::MAX);
+                (active.get(first).copied().unwrap_or(usize::MAX), first)
+            })
+            .map(|(_, group)| group.clone())
     }
 }
 
@@ -1242,14 +1271,16 @@ pub(crate) fn compress_active_working_set(
         groups_out.push(vec![pos]);
     }
 
-    let (a_out, b_out, groups_out, multiplier_dependence) =
+    // The parallel-dependent map (4th return) is consumed only by the shared
+    // `ReducedFace` op; the working-set release adjudicates whole representative
+    // groups, so it is not stored here.
+    let (a_out, b_out, groups_out, _) =
         rank_reduce_rows_pivoted_qr_with_dependence(a_out, b_out, groups_out);
 
     Ok(CompressedActiveWorkingSet {
         constraints: LinearInequalityConstraints::new(a_out, b_out)
             .expect("compressed active constraint shape invariant"),
         groups: groups_out,
-        multiplier_dependence,
         original_active_count: active.len(),
     })
 }
@@ -1933,20 +1964,24 @@ fn solve_newton_direction_with_linear_constraints_impl(
                 direction_out.assign(&d_total);
                 return Ok(());
             }
-            let remove_pos = compressed_working
-                .reconstructed_active_multipliers(&lambdaw)
-                .into_iter()
-                .filter(|&(_, lambda_true)| lambda_true < -tol_dual)
-                .min_by_key(|(active_pos, _)| (active[*active_pos], *active_pos))
-                .map(|(active_pos, _)| active_pos);
-            if let Some(active_pos) = remove_pos {
-                let idx = active.remove(active_pos);
-                is_active[idx] = false;
+            let remove_group =
+                compressed_working.negative_representative_group(&lambdaw, tol_dual, &active);
+            if let Some(mut group) = remove_group {
+                // Release the whole independent direction. Remove positions in
+                // DESCENDING order so each `active.remove` does not shift a
+                // not-yet-removed position in the same group.
+                group.sort_unstable_by(|a, b| b.cmp(a));
+                let mut released = None;
+                for active_pos in group {
+                    let idx = active.remove(active_pos);
+                    is_active[idx] = false;
+                    released = Some(idx);
+                }
                 log_active_set_transition(
-                    "remove-negative-dual",
+                    "release-negative-representative",
                     iteration,
                     active.len(),
-                    Some(idx),
+                    released,
                 );
                 if !record_active_working_set(&mut visited_working_sets, &active, &x, iteration) {
                     break;
@@ -2321,13 +2356,14 @@ impl<'a> ConstraintSetOps<'a> {
     ) -> Result<CompressedActiveWorkingSet, EstimationError> {
         let gathered = self.gather_unit_rows(active)?;
         let groups: Vec<Vec<usize>> = (0..active.len()).map(|pos| vec![pos]).collect();
-        let (a_out, b_out, groups_out, multiplier_dependence) =
+        // 4th return (parallel-dependent map) is consumed only by the shared
+        // `ReducedFace` op; whole-group release does not need it here.
+        let (a_out, b_out, groups_out, _) =
             rank_reduce_rows_pivoted_qr_with_dependence(gathered.a, gathered.b, groups);
         Ok(CompressedActiveWorkingSet {
             constraints: LinearInequalityConstraints::new(a_out, b_out)
                 .expect("compressed operator working-set shape invariant"),
             groups: groups_out,
-            multiplier_dependence,
             original_active_count: active.len(),
         })
     }
@@ -2876,21 +2912,25 @@ fn solve_newton_direction_with_constraint_set_impl(
                 direction_out.assign(&d_total);
                 return Ok(());
             }
-            let remove_pos = compressed_working
-                .reconstructed_active_multipliers(&lambdaw)
-                .into_iter()
-                .filter(|&(_, lambda_true)| lambda_true < -tol_dual)
-                .min_by_key(|(active_pos, _)| (active[*active_pos], *active_pos))
-                .map(|(active_pos, _)| active_pos);
-            if let Some(active_pos) = remove_pos {
-                let idx = active.remove(active_pos);
-                is_active[idx] = false;
-                count_release += 1;
+            let remove_group =
+                compressed_working.negative_representative_group(&lambdaw, tol_dual, &active);
+            if let Some(mut group) = remove_group {
+                // Release the whole independent direction (representative +
+                // exactly-parallel dependents). Descending removal so each
+                // `active.remove` does not shift a not-yet-removed position.
+                group.sort_unstable_by(|a, b| b.cmp(a));
+                let mut released = None;
+                for active_pos in group {
+                    let idx = active.remove(active_pos);
+                    is_active[idx] = false;
+                    count_release += 1;
+                    released = Some(idx);
+                }
                 log_active_set_transition(
-                    "remove-negative-dual",
+                    "release-negative-representative",
                     iteration,
                     active.len(),
-                    Some(idx),
+                    released,
                 );
                 if !record_active_working_set(&mut visited_working_sets, &active, &x, iteration) {
                     ws_repeat_break = true;
