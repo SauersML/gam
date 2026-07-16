@@ -616,8 +616,54 @@ fn resolve_constrained_converged_mode<F: CustomFamily + Clone + Send + Sync + 's
     saddle_escapes_used: usize,
     objective_tol: f64,
 ) -> Result<ConstrainedModeResolution, String> {
+    // Certify on the tangent of every NUMERICALLY-TIGHT constraint, not only the
+    // QP's recorded active set. At a degenerate binding vertex the QP can leave a
+    // row with slack below the primal-feasibility tolerance OUT of
+    // `cached_active_sets` (a phantom-dual / zero-multiplier omission). Such a row
+    // is on the active face all the same: the Laplace tangent must null it, or
+    // the certificate over-counts free directions and manufactures a PHANTOM
+    // saddle whose negative curvature lives almost entirely normal to that
+    // near-tight row — the escape direction then points straight into it and the
+    // feasible step collapses to ~1e-11 (the measured CTN witness: lambda_min=
+    // -7.1e-1 with alpha=-1e-11, a no-op). Building the face from all tight rows
+    // resolves that phantom to a genuine constrained mode, and any REAL saddle
+    // keeps a feasible escape (its direction lies in the tight-face tangent, so
+    // it has zero rate on every tight row and a meaningful feasible length).
+    let feasibility_tol = gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
+    let mut tight_active_sets: Vec<Option<Vec<usize>>> =
+        Vec::with_capacity(block_constraints.len());
+    for (block_idx, constraints_opt) in block_constraints.iter().enumerate() {
+        let Some(constraints) = constraints_opt else {
+            tight_active_sets.push(None);
+            continue;
+        };
+        let block_values = constraints.values(states[block_idx].beta.view())?;
+        let mut rows: Vec<usize> = cached_active_sets
+            .get(block_idx)
+            .and_then(|active| active.clone())
+            .unwrap_or_default();
+        for row in 0..constraints.nrows() {
+            if rows.contains(&row) {
+                continue;
+            }
+            let norm = constraints.row_norm(row)?;
+            if !(norm.is_finite() && norm > 0.0) {
+                continue;
+            }
+            let bound = constraints.bound(row)?;
+            if bound == f64::NEG_INFINITY {
+                continue;
+            }
+            if (block_values[row] - bound) / norm < feasibility_tol {
+                rows.push(row);
+            }
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        tight_active_sets.push((!rows.is_empty()).then_some(rows));
+    }
     let mode_active_block =
-        assemble_active_constraint_block(block_constraints, cached_active_sets, ranges, total_p);
+        assemble_active_constraint_block(block_constraints, &tight_active_sets, ranges, total_p);
     let certificate = exact_joint_mode_curvature_certificate(
         family,
         states,
@@ -676,7 +722,7 @@ fn resolve_constrained_converged_mode<F: CustomFamily + Clone + Send + Sync + 's
     // ratio). Both signs of `δ` give the same second-order decrease, so choose
     // the sign that admits the longer feasible step.
     let joint_active =
-        flatten_joint_active_set(cached_active_sets, block_constraints).unwrap_or_default();
+        flatten_joint_active_set(&tight_active_sets, block_constraints).unwrap_or_default();
     let mut feasible_positive = f64::INFINITY;
     let mut feasible_negative = f64::INFINITY;
     if let Some(joint_constraints) =
