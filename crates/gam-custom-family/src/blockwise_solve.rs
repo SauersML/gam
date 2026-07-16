@@ -1902,22 +1902,50 @@ pub(crate) fn stable_logdet_with_ridge_policy(
     }
 
     match ridge_policy.determinant_mode() {
-        RidgeDeterminantMode::Full => {
-            let chol = a.cholesky(Side::Lower).map_err(|_| {
-                // Failure-path diagnosis only: name the spectrum so the caller's
-                // error says WHY the full SPD contract was violated (indefinite
-                // constrained-mode curvature vs. genuine numerical breakdown).
-                let spectrum = gam_linalg::utils::symmetric_extremes(&a)
-                    .map(|(min_eig, max_eig)| {
-                        format!("min_eig={min_eig:.6e}, max_eig={max_eig:.6e}")
-                    })
-                    .unwrap_or_else(|| "spectrum unavailable".to_string());
-                format!(
-                    "cholesky failed while computing full ridge-aware logdet (p={p}, ridge={ridge:.3e}, {spectrum})"
-                )
-            })?;
-            Ok(2.0 * chol.diag().mapv(f64::ln).sum())
-        }
+        RidgeDeterminantMode::Full => match a.cholesky(Side::Lower) {
+            Ok(chol) => Ok(2.0 * chol.diag().mapv(f64::ln).sum()),
+            Err(_) => {
+                // Cholesky failed. Separate a genuinely INDEFINITE Hessian — a real
+                // SPD-contract violation, no Laplace mode exists — from a PD-but-
+                // ILL-CONDITIONED one (cond > 1/ε: every true eigenvalue is
+                // positive, but a rounding-negative pivot aborts the
+                // factorization). The latter is exactly what a competing-risks
+                // joint Hessian produces from its near-duplicate cross-cause time
+                // columns (fit_orchestration comment on the K block-pairs of
+                // near-identical columns): min_eig ≫ 0 yet cond > 1/ε.
+                //
+                // For a PD matrix the exact SPD log-determinant still exists and
+                // equals `Σ log σ_j` over the symmetric spectrum — the SAME
+                // estimand as `2·Σ log L_ii`, computed stably — so return it rather
+                // than failing the whole ρ evaluation, which otherwise strands the
+                // outer REML search at a non-stationary point (the joint Hessian
+                // logdet is unavailable at that ρ, so no gradient/value is
+                // produced). Only a certified-negative eigenvalue propagates the
+                // error. This is byte-identical on every input where Cholesky
+                // already succeeds.
+                let (evals, _) = gam_linalg::faer_ndarray::FaerEigh::eigh(&a, Side::Lower)
+                    .map_err(|_| {
+                        format!(
+                            "cholesky failed and the eigendecomposition also failed while computing full ridge-aware logdet (p={p}, ridge={ridge:.3e})"
+                        )
+                    })?;
+                let min_eig = evals.iter().copied().fold(f64::INFINITY, f64::min);
+                let max_eig = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                // Negative-eigenvalue tolerance, relative to the spectrum scale.
+                let neg_tol = CUSTOM_FAMILY_CONDITION_RELATIVE_FLOOR * max_eig.abs().max(1.0);
+                if min_eig <= -neg_tol {
+                    return Err(format!(
+                        "cholesky failed while computing full ridge-aware logdet and the symmetric spectrum is genuinely indefinite (p={p}, ridge={ridge:.3e}, min_eig={min_eig:.6e}, max_eig={max_eig:.6e}); an indefinite Hessian has no SPD log-determinant and defines no Laplace mode"
+                    ));
+                }
+                // PD but ill-conditioned: exact logdet from the positive spectrum,
+                // flooring round-off-nonpositive eigenvalues at the ridge-relative
+                // floor so a numerically-singular direction contributes a bounded
+                // (not `-inf`) term.
+                let floor = ridge.max(neg_tol);
+                Ok(evals.iter().map(|&e| e.max(floor).ln()).sum())
+            }
+        },
         RidgeDeterminantMode::PositivePartApproximation => {
             smooth_regularized_logdet_hessian_finite_check(&a, None)?;
             // Smooth-regularized logdet objective, aligned with the gradient
