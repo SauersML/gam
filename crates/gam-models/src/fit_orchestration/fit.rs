@@ -1664,6 +1664,18 @@ fn survival_edf_from_dense_hessian(
 /// unconstrained. Right-censored data (`entry == 0`) has a PD `H`, so its bounds
 /// are untouched and the fit is bit-for-bit preserved. Time blocks are those
 /// whose penalty range lies in the leading `[0, time_block_cols)` columns.
+/// Outcome of the survival smoothing-parameter selection: the selected λ plus
+/// the OUTER convergence evidence (#2301 defect D). The analytic
+/// stationarity certificate that `OuterProblem::run` mints is threaded through
+/// to the fit's `FitArtifacts` so assembly can certify the outer optimum, rather
+/// than being discarded (which left the assembly gate comparing the outer
+/// residual `against None` and refusing a converged fit).
+struct SurvivalSmoothingSelection {
+    lambdas: Vec<f64>,
+    outer_iterations: usize,
+    criterion_certificate: Option<gam_solve::estimate::OuterCriterionCertificate>,
+}
+
 fn optimize_survival_transformation_smoothing(
     model: &crate::survival::WorkingModelSurvival,
     penalty_blocks: &[PenaltyBlock],
@@ -1672,7 +1684,7 @@ fn optimize_survival_transformation_smoothing(
     structural_lower_bounds: Option<&Array1<f64>>,
     time_block_cols: usize,
     left_truncated: bool,
-) -> Result<Option<Vec<f64>>, String> {
+) -> Result<Option<SurvivalSmoothingSelection>, String> {
     use gam_problem::{Derivative, HessianValue, OuterEval};
     use gam_solve::rho_optimizer::OuterProblem;
     if num_smoothing == 0 {
@@ -1905,6 +1917,12 @@ fn optimize_survival_transformation_smoothing(
     let result = problem
         .run(&mut obj, &context)
         .map_err(|error| error.to_string())?;
+    // Capture the OUTER convergence evidence before consuming `result.rho`:
+    // `run` certified the selected ρ, so `iterations` is the true outer count and
+    // `criterion_certificate` carries the analytic stationarity bound the fit
+    // assembly gate requires (#2301 defect D).
+    let outer_iterations = result.iterations;
+    let criterion_certificate = result.criterion_certificate;
     let selected_rho = result.rho;
     if selected_rho.len() != num_smoothing {
         return Err(format!(
@@ -1920,7 +1938,11 @@ fn optimize_survival_transformation_smoothing(
     for (slot, lambda) in lambdas.iter_mut().zip(selected_lambdas) {
         *slot = lambda;
     }
-    Ok(Some(lambdas))
+    Ok(Some(SurvivalSmoothingSelection {
+        lambdas,
+        outer_iterations,
+        criterion_certificate,
+    }))
 }
 
 fn survival_unified_fit_result(
@@ -1929,6 +1951,13 @@ fn survival_unified_fit_result(
     summary: &gam_solve::pirls::WorkingModelPirlsResult,
     state: &gam_solve::pirls::WorkingState,
     penalty_blocks: &[PenaltyBlock],
+    // OUTER convergence evidence from the smoothing selection (#2301 defect D):
+    // the real outer-iteration count (0 when no smoothing coordinate was
+    // optimized) and the analytic stationarity certificate `OuterProblem::run`
+    // minted. `summary` is the INNER PIRLS result, so its iteration count and
+    // gradient norm are inner quantities and must NOT be used for the outer.
+    outer_iterations: usize,
+    criterion_certificate: Option<gam_solve::estimate::OuterCriterionCertificate>,
 ) -> Result<UnifiedFitResult, String> {
     let log_lambdas = Array1::from_vec(
         lambdas
@@ -2009,9 +2038,16 @@ fn survival_unified_fit_result(
         stable_penalty_term: state.penalty_term,
         penalized_objective: reml_score,
         used_device: false,
-        outer_iterations: summary.iterations,
+        // The OUTER counts come from the smoothing selection, NOT the inner PIRLS
+        // `summary` (#2301 defect D). When a certificate is present its projected
+        // stationarity residual is the outer gradient; a fixed-outer fit (no
+        // smoothing coordinate) reports the inner residual as a diagnostic only.
+        outer_iterations,
         outer_converged: true,
-        outer_gradient_norm: Some(summary.lastgradient_norm),
+        outer_gradient_norm: criterion_certificate
+            .as_ref()
+            .map(|certificate| certificate.stationarity.projected_norm())
+            .or(Some(summary.lastgradient_norm)),
         standard_deviation: 1.0,
         covariance_conditional: None,
         covariance_corrected: None,
@@ -2028,6 +2064,11 @@ fn survival_unified_fit_result(
         constraint_kkt: None,
         artifacts: gam_solve::estimate::FitArtifacts {
             pirls: None,
+            // Thread the outer analytic stationarity certificate so assembly can
+            // certify the outer optimum (#2301 defect D). `None` here with
+            // `outer_iterations == 0` is a fixed-outer fit, which assembly accepts
+            // as `Fixed` evidence.
+            criterion_certificate,
             ..Default::default()
         },
         inner_cycles: 0,
@@ -2938,22 +2979,31 @@ pub(crate) fn fit_survival_transformation_model(
         .iter()
         .any(|&t| t > crate::survival::ENTRY_AT_ORIGIN_THRESHOLD);
     let p_time_total = prepared.time_design_exit.ncols();
-    if let Some(selected_lambdas) = optimize_survival_transformation_smoothing(
-        &model,
-        &penalty_blocks,
-        num_smoothing_blocks,
-        &beta0,
-        structural_lower_bounds.as_ref(),
-        p_time_total,
-        is_left_truncated,
-    )? {
-        model
-            .set_penalty_lambdas(&selected_lambdas)
-            .map_err(|e| e.to_string())?;
-        for (block, &lam) in penalty_blocks.iter_mut().zip(selected_lambdas.iter()) {
-            block.lambda = lam;
-        }
-    }
+    let (survival_outer_iterations, survival_outer_certificate) =
+        if let Some(selection) = optimize_survival_transformation_smoothing(
+            &model,
+            &penalty_blocks,
+            num_smoothing_blocks,
+            &beta0,
+            structural_lower_bounds.as_ref(),
+            p_time_total,
+            is_left_truncated,
+        )? {
+            model
+                .set_penalty_lambdas(&selection.lambdas)
+                .map_err(|e| e.to_string())?;
+            for (block, &lam) in penalty_blocks.iter_mut().zip(selection.lambdas.iter()) {
+                block.lambda = lam;
+            }
+            (selection.outer_iterations, selection.criterion_certificate)
+        } else {
+            // No smoothing coordinate was optimized (e.g. the fixed-λ parametric
+            // Weibull baseline path): the fit is fixed-outer, so it carries 0 outer
+            // iterations and no analytic certificate — assembly reads that as
+            // `Fixed` convergence evidence rather than demanding a certificate
+            // (#2301 defect D).
+            (0, None)
+        };
     let opts = gam_solve::pirls::WorkingModelPirlsOptions {
         max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
         convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
@@ -3039,7 +3089,15 @@ pub(crate) fn fit_survival_transformation_model(
         } else {
             baseline_cfg
         };
-    let fit = survival_unified_fit_result(beta, lambdas, &summary, &state, &penalty_blocks)?;
+    let fit = survival_unified_fit_result(
+        beta,
+        lambdas,
+        &summary,
+        &state,
+        &penalty_blocks,
+        survival_outer_iterations,
+        survival_outer_certificate,
+    )?;
 
     let time_base_ncols = spec.time_build.x_exit_time.ncols();
     let time_basis = crate::survival::construction::SavedSurvivalTimeBasis::from_build(
