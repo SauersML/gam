@@ -13,6 +13,63 @@ pub(crate) fn build_time_blockspec(
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
 ) -> ParameterBlockSpec {
+    // Diagnostic (fires once per fit): the identifiability audit has reported the
+    // `time_surface` design as intra-block rank-deficient on degenerate fixtures.
+    // Dump the per-column span (max−min over exit rows) and mean so a rank
+    // collapse is traceable to constant/collinear columns vs a genuine full-rank
+    // design. Cheap (n×p pass, once), never on a hot path.
+    if let Ok(dense) = design_exit.try_to_dense_arc("build_time_blockspec::diag") {
+        let d = dense.as_ref();
+        let (n_rows, p_cols) = d.dim();
+        let mut spans: Vec<f64> = Vec::with_capacity(p_cols);
+        let mut norms: Vec<f64> = Vec::with_capacity(p_cols);
+        let mut degenerate_cols = 0usize;
+        for j in 0..p_cols {
+            let col = d.column(j);
+            let lo = col.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = col.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let span = hi - lo;
+            if span.abs() <= 1e-10 {
+                degenerate_cols += 1;
+            }
+            spans.push(span);
+            norms.push(col.dot(&col).sqrt());
+        }
+        // Collinearity probe: pick the highest-norm column as the reference and
+        // report |cos angle| of every other column against it (after mean-
+        // centering, so a shared constant offset doesn't inflate the cosine).
+        // Near-1 across the board ⇒ all columns collinear ⇒ the rank-1 collapse
+        // is genuine near-collinearity, not just constant columns.
+        let ref_col = norms
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(j, _)| j)
+            .unwrap_or(0);
+        let centered = |j: usize| -> Array1<f64> {
+            let col = d.column(j).to_owned();
+            let mean = col.sum() / (n_rows.max(1) as f64);
+            col.mapv(|v| v - mean)
+        };
+        let r = centered(ref_col);
+        let rn = r.dot(&r).sqrt().max(1e-300);
+        let cosines: Vec<String> = (0..p_cols)
+            .map(|j| {
+                let c = centered(j);
+                let cn = c.dot(&c).sqrt();
+                if cn <= 1e-300 {
+                    "const".to_string()
+                } else {
+                    format!("{:.4}", (c.dot(&r) / (cn * rn)).abs())
+                }
+            })
+            .collect();
+        log::info!(
+            "[marginal-slope/time_surface-diag] design_exit {n_rows}x{p_cols}; near-constant cols={degenerate_cols}/{p_cols}; ref_col={ref_col}; per-col span={:?}; |cos vs ref (mean-centered)|={:?}",
+            spans.iter().map(|s| format!("{s:.3e}")).collect::<Vec<_>>(),
+            cosines,
+        );
+    }
     // Share the three dense design matrices with the multi-output Jacobian
     // via `Arc` — `try_to_dense_arc` is zero-copy for materialized designs,
     // so the callback retains no duplicate `n × p` storage. Falls back to no
