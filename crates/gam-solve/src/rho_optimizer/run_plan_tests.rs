@@ -4395,11 +4395,40 @@ fn run_indefinite_analytic_seed_stays_on_arc() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let result = problem
+    // The seed is stationary (|g|=0) but sits on genuinely indefinite analytic
+    // curvature ([[-1.0]]) — a saddle/maximum, NOT an interior minimum. The
+    // second-order ARC plan must REFUSE it (a certified optimum cannot waive
+    // negative curvature; see `curvature_admissible`), returning typed
+    // non-convergence rather than minting. The refusal is itself the proof that
+    // the run STAYED on the analytic second-order plan and did not demote to
+    // BFGS: only the analytic-Hessian path can observe indefinite curvature and
+    // set `hessian_psd=NO` → "INDEFINITE CURVATURE AT INTERIOR OPTIMUM". A BFGS
+    // demote (BfgsApprox curvature) never inspects the analytic Hessian and
+    // would report `hessian_psd=n/a`, so it could not produce this verdict.
+    let err = problem
         .run(&mut obj, "indefinite seed geometry")
-        .expect("indefinite analytic seed geometry should stay on the second-order plan");
-    assert_eq!(result.plan_used.solver, Solver::Arc);
-    assert_eq!(result.plan_used.hessian_source, HessianSource::Analytic);
+        .expect_err(
+            "an indefinite analytic seed is a saddle: the second-order plan must refuse \
+             to certify it, not mint an optimum",
+        );
+    let EstimationError::RemlDidNotConverge {
+        reason,
+        projected_grad_norm,
+        ..
+    } = err
+    else {
+        panic!("expected typed REML non-convergence carrying the certificate verdict, got {err}");
+    };
+    assert!(
+        reason.contains("INDEFINITE CURVATURE AT INTERIOR OPTIMUM"),
+        "the refusal must be the analytic second-order curvature verdict (proving the run \
+         stayed on ARC/Analytic, not demoted to BFGS); got reason: {reason}"
+    );
+    assert!(
+        projected_grad_norm.is_some_and(|value| value.abs() <= 1.0e-9),
+        "the refusal is a CURVATURE verdict at a stationary point, not a stationarity \
+         failure: the projected gradient must be ~0; got {projected_grad_norm:?}"
+    );
 }
 
 #[test]
@@ -4816,9 +4845,12 @@ fn run_starts_solver_with_direct_startup_eval() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    problem
-        .run(&mut obj, "solver should start from a direct startup eval")
-        .expect("analytic plans should start with a direct full evaluation");
+    // This test pins the STARTUP eval ORDER, not convergence. The single-iter
+    // budget leaves a small residual gradient above the tight stationarity bound,
+    // so the run may legitimately refuse to certify — that outcome is orthogonal
+    // to what is asserted here. The `calls` trace records the startup sequence
+    // whether or not the run mints, so the run's Result is deliberately ignored.
+    let _ = problem.run(&mut obj, "solver should start from a direct startup eval");
     let calls = calls.lock().unwrap();
     let first_eval_idx = calls
         .iter()
@@ -5565,9 +5597,13 @@ fn run_bfgs_projects_seed_before_seed_validation_eval() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    problem
-        .run(&mut obj, "bfgs seed projection")
-        .expect("BFGS should evaluate the projected seed");
+    // This test pins seed PROJECTION (the initial ρ=[2.0] is clamped to the box
+    // upper bound [1.0] before the first sample eval), not convergence. The
+    // single-iter budget from the projected seed need not reach the [0.25]
+    // optimum, so the run may legitimately refuse to certify — orthogonal to the
+    // projection assertion. The `seen` trace records the first evaluated point
+    // whether or not the run mints, so the run's Result is deliberately ignored.
+    let _ = problem.run(&mut obj, "bfgs seed projection");
     assert_eq!(
         seen.lock().unwrap().first().cloned(),
         Some(array![1.0]),
