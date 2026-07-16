@@ -1146,6 +1146,52 @@ mod amortized_encoder_tests {
         }
     }
 
+    /// #2330 — is the eigen-twist term actually DELIVERED? Prints, per coordinate,
+    /// `|eigen_joint|`, `|eigen_tt|`, and `|eigen_joint − eigen_tt|` (the piece that
+    /// enters `dΓ_eff`). Distinguishes builder-returns-0 vs joint/tt-cancel vs
+    /// delivered-but-fullset-was-stale.
+    #[test]
+    fn eigen_twist_delivery_probe_2330() {
+        use ndarray::array;
+        let (mut term, target, rho, _stationary_cache) =
+            super::exact_hessian_fixture_tests::converged_state_with_residual();
+        let mut rho_eval = rho.clone();
+        rho_eval.log_lambda_sparse = 0.5;
+        for v in rho_eval.log_lambda_smooth.iter_mut() {
+            *v = -2.0;
+        }
+        rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
+        let rho = rho_eval;
+        let (_value, _loss, cache) = term
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                0,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("deflated cache");
+        let mut coords = vec![
+            ("smooth0", rho.smooth_flat_index(0)),
+            ("ard0", rho.ard_flat_index(0, 0)),
+            ("ard1", rho.ard_flat_index(1, 0)),
+        ];
+        if let Some(s) = rho.sparse_flat_index() {
+            coords.push(("sparse", s));
+        }
+        for (name, i) in coords {
+            let (ej, et, diff) = term
+                .ch5_eigen_twist_delivery_check(&rho, &cache, i)
+                .expect("eigen delivery check");
+            eprintln!(
+                "EIGEN-DELIVER {name}(flat={i}): |eigen_joint|={ej:.6e} |eigen_tt|={et:.6e} \
+                 |joint-tt|={diff:.6e}"
+            );
+        }
+    }
+
     /// The fitted amplitudes the encoder derives are exactly the posterior gate
     /// coordinates used by reconstruction. Decoder magnitude stays in `B`, so
     /// there is no second radial-scale channel to fold into these values.

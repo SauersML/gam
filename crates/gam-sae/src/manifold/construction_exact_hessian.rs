@@ -2842,5 +2842,45 @@ mod test_support {
                 max_diff(&dense_tt, &prod_tt),
             ))
         }
+
+        /// #2330 delivery check — the norms of the eigen-twist contribution for a
+        /// flat coordinate: `(|eigen_joint|, |eigen_tt|, |eigen_joint − eigen_tt|)`.
+        /// The last is what actually enters `dΓ_eff = dΓ_joint − dΓ_tt`. If
+        /// `|eigen_joint| ≈ 0` the builder's eigen mode is broken; if it is nonzero
+        /// but `|joint − tt| ≈ 0` the two legs cancel (so the fix must not be split
+        /// joint/tt this way); if `|joint − tt|` is nonzero the term IS delivered
+        /// and a byte-identical fullset was a stale binary.
+        pub(crate) fn ch5_eigen_twist_delivery_check(
+            &self,
+            rho: &SaeManifoldRho,
+            cache: &ArrowFactorCache,
+            flat_i: usize,
+        ) -> Result<(f64, f64, f64), String> {
+            let solver = DeflatedArrowSolver::plain(cache);
+            let g = self.materialize_joint_inverse(cache, &solver)?;
+            let h_bd = self.materialize_block_diag_t_inverse(cache);
+            let operators = self.penalty_curvature_operators_by_flat(rho, cache)?;
+            let m_i = &operators[&flat_i];
+            let eigen_joint = self.logdet_theta_adjoint_dense(
+                rho,
+                cache,
+                &g,
+                ThetaAdjointDhChannel::All,
+                Some(m_i),
+            )?;
+            let eigen_tt = self.logdet_theta_adjoint_dense(
+                rho,
+                cache,
+                &h_bd,
+                ThetaAdjointDhChannel::All,
+                Some(m_i),
+            )?;
+            let norm = |v: &SaeArrowVector| (v.t.dot(&v.t) + v.beta.dot(&v.beta)).sqrt();
+            let diff = SaeArrowVector {
+                t: &eigen_joint.t - &eigen_tt.t,
+                beta: &eigen_joint.beta - &eigen_tt.beta,
+            };
+            Ok((norm(&eigen_joint), norm(&eigen_tt), norm(&diff)))
+        }
     }
 }
