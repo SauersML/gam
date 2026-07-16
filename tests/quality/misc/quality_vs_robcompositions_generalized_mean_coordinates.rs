@@ -34,7 +34,7 @@
 
 use gam::geometry::simplex::simplex_frechet_mean;
 use gam::load_csvwith_inferred_schema;
-use gam::test_support::reference::{Column, max_abs_diff, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, max_abs_diff, rmse, run_r};
 use ndarray::Array2;
 use std::path::Path;
 
@@ -245,6 +245,18 @@ fn gam_simplex_frechet_mean_recovers_known_aitchison_center() {
     let ref_recovery_rmse = rmse(&ref_clr_comp_arr, &mu_clr);
     eprintln!(
         "MATCH-OR-BEAT recovery: gam_rmse={gam_recovery_rmse:.3e} ref_rmse={ref_recovery_rmse:.3e}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_robcompositions_generalized_mean_coordinates",
+            "recovery_rmse",
+            gam_recovery_rmse,
+            "compositions",
+            ref_recovery_rmse,
+        )
+        .line()
     );
     assert!(
         gam_recovery_rmse <= ref_recovery_rmse * 1.10 + 1e-12,

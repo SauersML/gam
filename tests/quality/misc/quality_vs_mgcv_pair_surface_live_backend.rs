@@ -38,7 +38,7 @@
 //! worse than mgcv's by more than 10%.
 
 use gam::terms::structure::anova_atom::{PairSurfaceBackend, fit_pair_surface};
-use gam::test_support::reference::{Column, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, rmse, run_r};
 use ndarray::Array2;
 
 const N: usize = 2000;
@@ -154,6 +154,18 @@ fn fit_pair_surface_recovers_truth_and_matches_or_beats_mgcv_te() {
          lambda={:.6} edf={:.3} mgcv_edf={mgcv_edf:.3} signal_range={signal_range:.4} \
          backend={:?}",
         fit.surface.lambda, fit.surface.edf, fit.backend
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_mgcv_pair_surface_live_backend",
+            "rmse_vs_truth",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
     );
 
     // PRIMARY: the live backend recovers the generating surface well below the

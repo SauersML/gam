@@ -77,7 +77,7 @@ use gam::custom_family::{
 };
 use gam::load_csvwith_inferred_schema;
 use gam::matrix::DesignMatrix;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -911,6 +911,30 @@ fn gam_dirichlet_regression_recovers_truth() {
          RMSE(log_phi) gam={gam_rmse_logconc:.4} dr={dr_rmse_logconc:.4} | \
          context rel_l2_vs_dr mu={rel_mu_vs_dr:.4} log_phi={rel_logconc_vs_dr:.4}"
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_simplex_dirichlet_regression::mu",
+            "mu_rmse_to_truth",
+            gam_rmse_mu,
+            "DirichletReg",
+            dr_rmse_mu,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_simplex_dirichlet_regression::log_phi",
+            "log_phi_rmse_to_truth",
+            gam_rmse_logconc,
+            "DirichletReg",
+            dr_rmse_logconc,
+        )
+        .line()
+    );
 
     // PRIMARY claim: gam recovers the true compositional surface. The simplex
     // coordinates μ_k ∈ (0,1); recovering the smooth truth from n=150 noisy
@@ -1179,6 +1203,18 @@ fn gam_dirichlet_regression_recovers_truth_on_real_data() {
         "skye AFM held-out Dirichlet NLL: n_train={n_train} n_test={n_test} p={p_cols} | \
          gam_nll={gam_test_nll:.4} dr_nll={dr_test_nll:.4} | \
          context rel_l2(eta) vs dr={rel_eta_vs_dr:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_simplex_dirichlet_regression::holdout_nll",
+            "held_out_nll",
+            gam_test_nll,
+            "DirichletReg",
+            dr_test_nll,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: absolute held-out NLL bar ------------

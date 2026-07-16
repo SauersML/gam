@@ -56,7 +56,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, r2, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, r2, relative_l2, rmse, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -249,6 +249,18 @@ fn gam_torus_predicts_bike_sharing_diurnal_seasonal_cycle_vs_mgcv() {
          season_seam_gap={season_seam_gap:.3e} hour_seam_gap={hour_seam_gap:.3e}",
         train_rows.len(),
         test_rows.len()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_mgcv_bike_sharing_torus",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // (1) PREDICTION — the primary objective claim. The diurnal×seasonal rental

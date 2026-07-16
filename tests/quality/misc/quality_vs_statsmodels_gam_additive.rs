@@ -34,7 +34,9 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, r2, relative_l2, rmse, run_python};
+use gam::test_support::reference::{
+    Column, QualityPair, pad_to, pearson, r2, relative_l2, rmse, run_python,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -448,6 +450,18 @@ emit("test_pred", test_pred)
          sm_test_rmse={sm_test_rmse:.4}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_statsmodels_gam_additive",
+            "test_rmse",
+            gam_test_rmse,
+            "statsmodels",
+            sm_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts the held-out signal -----

@@ -63,7 +63,7 @@ use gam::families::survival::construction::{
 };
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -326,6 +326,18 @@ fn gam_monotone_baseline_recovers_log_cumhaz_truth() {
          p_time={p_time} grid=[1,10,50,100] \
          gam_logLambda={gam_log_cumhaz:?} truth={truth_log_cumhaz:?} scam_mpi={scam_mpi:?} \
          rmse(gam,truth)={gam_rmse_truth:.4} rmse(scam,truth)={scam_rmse_truth:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_scam_monotone_baseline",
+            "rmse_truth",
+            gam_rmse_truth,
+            "scam",
+            scam_rmse_truth,
+        )
+        .line()
     );
 
     // PRIMARY: the truth spans ~4.6 log-units across [1,100]; 0.35 RMSE is < 8%

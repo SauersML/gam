@@ -26,7 +26,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::io::Write;
@@ -277,6 +277,18 @@ fn gam_thin_plate_1d_predicts_heldout_lidar_at_least_as_well_as_mgcv() {
         train_rows.len(),
         test_rows.len()
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_mgcv_thin_plate_1d::seeded_split",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
+    );
 
     // PRIMARY objective claim: gam generalizes — it predicts held-out lidar
     // logratio with real skill. The lidar curve is a smooth nonlinear trend with
@@ -431,6 +443,18 @@ fn gam_thin_plate_1d_predicts_heldout_lidar_at_least_as_well_as_mgcv_on_real_dat
          train_rel_l2={train_rel:.4}",
         train_rows.len(),
         test_rows.len()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_mgcv_thin_plate_1d::i_mod_4_split",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // PRIMARY objective claim: gam recovers the real range->logratio curve and

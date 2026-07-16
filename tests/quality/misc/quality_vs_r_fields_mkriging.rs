@@ -27,7 +27,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, max_abs_diff, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, max_abs_diff, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -187,6 +187,18 @@ fn gam_matern_kriging_matches_fields_mkrig() {
          gam_rmse={gam_rmse:.4} fields_rmse={fields_rmse:.4} gam_maxerr={gam_maxerr:.4} \
          fields_maxerr={fields_maxerr:.4} surface_rel_l2={surface_rel:.4} \
          fields_aRange={fields_arange:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_r_fields_mkriging",
+            "rmse",
+            gam_rmse,
+            "fields",
+            fields_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY: objective truth recovery (gam's own predictions) --------

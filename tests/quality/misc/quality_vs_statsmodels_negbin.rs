@@ -45,7 +45,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -488,6 +488,18 @@ emit("test_mu", mu_te)
          rel_l2(gam,sm)={rel_l2_vs_sm:.4} (context only)",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_statsmodels_negbin",
+            "test_deviance",
+            gam_test_dev,
+            "statsmodels",
+            sm_test_dev,
+        )
+        .line()
     );
 
     // (1) PRIMARY accuracy: held-out mean NB deviance below the constant-mean

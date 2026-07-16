@@ -38,7 +38,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
+use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, rmse, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::io::Write;
@@ -211,6 +211,18 @@ emit("edf", [float(gam.statistics_["edof"])])
          gam_err_to_truth={gam_err:.4} pygam_err_to_truth={pygam_err:.4} \
          gam_edf={gam_edf:.3} pygam_edf={pygam_edf:.3} (edf_rel={edf_rel:.3}) \
          [diag only] eta-vs-pygam pearson={corr:.5} rel_l2={rel:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "misc",
+            "quality_vs_pygam_logistic_1d_shape",
+            "err_to_truth",
+            gam_err,
+            "pygam",
+            pygam_err,
+        )
+        .line()
     );
 
     // (1) PRIMARY truth-recovery claim: gam's fitted logit-scale eta tracks the
