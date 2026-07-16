@@ -2582,6 +2582,115 @@ pub(crate) fn ctn_response_penalty_matches_direct_function_roughness_quadrature(
     );
 }
 
+/// The assembled covariate-direction tensor penalty is the exact SPEC-5
+/// function-measure roughness `½ βᵀ (G_y ⊗ S_x) β` with `G_y = Vᵀ W V` the
+/// response value-basis mass Gram — NOT the retired identity shape-row factor
+/// (`diag(0,1,…,1) ⊗ S_x`), which is coefficient geometry (gam#2306). This
+/// pins three discriminating properties: the left factor equals `G_y`, a
+/// centering field in `null(S_x)` stays exactly unpenalized (free intercept),
+/// and a genuine covariate main-effect of the location field IS smoothed — the
+/// behavior the identity shape-row factor dropped.
+#[test]
+pub(crate) fn ctn_covariate_penalty_is_response_mass_gram_function_roughness() {
+    let response = array![-1.0, -0.2, 0.6, 1.3];
+    let (val_basis, deriv_basis, knots, transform, p_resp) = toy_response_basis(&response);
+    let weights = Array1::from_elem(response.len(), 1.0);
+    let offset = Array1::zeros(response.len());
+    let cov_design = array![[1.0, 0.2], [1.0, -0.1], [1.0, 0.4], [1.0, -0.3]];
+    let p_cov = cov_design.ncols();
+
+    // Rank-1 covariate roughness with a known null vector [1, 1]: `S_x v = 0`,
+    // so any covariate coefficient row proportional to [1, 1] carries no
+    // roughness while [1, 0] does.
+    let s_cov = array![[1.0, -1.0], [-1.0, 1.0]];
+
+    let expected_g_resp =
+        weighted_function_gram(val_basis.view(), weights.view(), p_resp, "response")
+            .expect("response mass gram");
+
+    let family = TransformationNormalFamily::from_prebuilt_response_basis(
+        &response,
+        val_basis,
+        deriv_basis,
+        vec![],
+        knots,
+        toy_scop_ctn_config().response_degree,
+        transform,
+        &weights,
+        &offset,
+        DesignMatrix::Dense(DenseDesignMatrix::from(cov_design)),
+        vec![PenaltyMatrix::Dense(s_cov.clone())],
+        &toy_scop_ctn_config(),
+        None,
+    )
+    .expect("toy transformation family");
+
+    // Covariate penalties are assembled first; index 0 is `G_y ⊗ S_x`.
+    let PenaltyMatrix::KroneckerFactored { left, right } = &family.tensor_penalties[0] else {
+        panic!("covariate-direction penalty must be Kronecker-factored");
+    };
+    assert_eq!(right, &s_cov, "right factor must be the covariate roughness Gram");
+    assert_eq!(left.dim(), (p_resp, p_resp));
+    for ((r, c), &value) in left.indexed_iter() {
+        let want = expected_g_resp[[r, c]];
+        assert!(
+            (value - want).abs() <= 1e-12 * (1.0 + want.abs()),
+            "left factor [{r},{c}] = {value} must equal G_y {want}"
+        );
+    }
+
+    // Discriminator: G_y is materially different from the retired identity
+    // shape-row factor diag(0, 1, …, 1) — the cutover genuinely changed the
+    // penalized metric.
+    let mut max_gap = 0.0_f64;
+    for r in 0..p_resp {
+        for c in 0..p_resp {
+            let old = if r == c && r > 0 { 1.0 } else { 0.0 };
+            let scale = expected_g_resp[[r, c]].abs().max(old.abs()).max(1e-9);
+            max_gap = max_gap.max((expected_g_resp[[r, c]] - old).abs() / scale);
+        }
+    }
+    assert!(
+        max_gap > 0.1,
+        "G_y must differ materially from the identity shape-row factor (max rel {max_gap:.3e})"
+    );
+
+    let penalty_dense = family.tensor_penalties[0].to_dense();
+    let quad_form = |a_rows: &[[f64; 2]]| -> f64 {
+        let mut beta = Array1::<f64>::zeros(p_resp * p_cov);
+        for (k, row) in a_rows.iter().enumerate() {
+            for (a, &value) in row.iter().enumerate() {
+                beta[k * p_cov + a] = value;
+            }
+        }
+        beta.dot(&penalty_dense.dot(&beta))
+    };
+
+    // A location field whose covariate coefficients lie in null(S_x) (∝ [1,1])
+    // is a null-roughness direction: the free intercept stays unpenalized.
+    let mut null_location = vec![[0.0, 0.0]; p_resp];
+    null_location[0] = [1.0, 1.0];
+    assert!(
+        quad_form(&null_location).abs() < 1e-12,
+        "a centering field in null(S_x) must carry zero covariate roughness"
+    );
+
+    // A genuine covariate main-effect of the location field (∉ null(S_x)) IS
+    // penalized now — exactly the term the identity shape-row factor dropped.
+    let mut main_effect = vec![[0.0, 0.0]; p_resp];
+    main_effect[0] = [1.0, 0.0];
+    let expected_main = expected_g_resp[[0, 0]] * 1.0; // [1,0] S_x [1,0]ᵀ = 1
+    let got_main = quad_form(&main_effect);
+    assert!(
+        (got_main - expected_main).abs() <= 1e-12 * (1.0 + expected_main.abs()),
+        "location main-effect roughness {got_main} must equal G_y[0,0]·(vᵀS_x v) {expected_main}"
+    );
+    assert!(
+        got_main > 1e-6,
+        "location main-effect must be smoothed (was dropped by the identity shape-row factor)"
+    );
+}
+
 /// Unsupported response-direction derivative orders are hard errors, not
 /// silently skipped no-ops (the retired `if order==0 || order>=p {return Ok}`
 /// path). Order 0 is the value function; an order above the I-spline value
