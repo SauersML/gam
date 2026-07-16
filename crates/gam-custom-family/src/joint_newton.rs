@@ -1245,7 +1245,28 @@ pub(crate) fn active_face_logdet_with_ridge_policy(
     let logdet = if strict_spd {
         strict_exact_pseudo_logdet(determinant_matrix, n_observations)?
     } else {
-        stable_logdet_with_ridge_policy(determinant_matrix, ridge_floor, ridge_policy)?
+        stable_logdet_with_ridge_policy(determinant_matrix, ridge_floor, ridge_policy).map_err(
+            |error| {
+                let face = match (&projected, active_constraints) {
+                    (Some(reduced), _) => format!(
+                        "tangent-projected face (tangent_dim={}, full_dim={})",
+                        reduced.nrows(),
+                        matrix.nrows()
+                    ),
+                    (None, Some(active)) => format!(
+                        "fully-pinned face (active_rows={}, full_dim={})",
+                        active.a.nrows(),
+                        matrix.nrows()
+                    ),
+                    (None, None) => format!(
+                        "no active-constraint block supplied (full_dim={}) — a constrained \
+                         mode evaluated here would wrongly ask full-space curvature to be SPD",
+                        matrix.nrows()
+                    ),
+                };
+                format!("{error}; geometry: {face}")
+            },
+        )?
     };
     Ok(logdet + logdet_correction)
 }
@@ -1282,10 +1303,8 @@ pub(crate) fn active_face_penalty_logdet(
     if tangent_components.is_empty() {
         return Ok(Some(0.0));
     }
-    let penalty =
-        PenaltyPseudologdet::from_components(&tangent_components, &lambdas, ridge).map_err(
-            |error| format!("active-face penalty pseudo-logdet failed: {error}"),
-        )?;
+    let penalty = PenaltyPseudologdet::from_components(&tangent_components, &lambdas, ridge)
+        .map_err(|error| format!("active-face penalty pseudo-logdet failed: {error}"))?;
     Ok(Some(penalty.value()))
 }
 
@@ -1709,7 +1728,9 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
         h += s_lambda;
         if let Some(h_joint) = active_face_hessian.as_mut() {
             let (start, end) = ranges[b];
-            h_joint.slice_mut(ndarray::s![start..end, start..end]).assign(&h);
+            h_joint
+                .slice_mut(ndarray::s![start..end, start..end])
+                .assign(&h);
         } else {
             logdet_h_total += active_face_logdet_with_ridge_policy(
                 &h,
@@ -2680,8 +2701,7 @@ pub(crate) mod whitened_spectrum {
             let whitened_rhs = &d_inv_sqrt * rhs;
             let c = evecs.t().dot(&whitened_rhs);
             let lambda_max_abs = gamma.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-            let numerical_floor =
-                joint_hessian_numerical_eigenvalue_floor(lambda_max_abs, p);
+            let numerical_floor = joint_hessian_numerical_eigenvalue_floor(lambda_max_abs, p);
             let rank_cutoff = rank_tol * lambda_max_abs;
             let null_cutoff = rank_cutoff.max(numerical_floor);
             // gam#979 diagnostic (WARN survives the default INFO filter that
@@ -2849,8 +2869,7 @@ pub(crate) mod whitened_spectrum {
         pub(crate) fn weakly_identified_decrement(&self) -> f64 {
             let p = self.gamma.len();
             // Reconstruct the genuine numerical-rank floor used by `decompose`.
-            let numerical_floor =
-                joint_hessian_numerical_eigenvalue_floor(self.lambda_max_abs, p);
+            let numerical_floor = joint_hessian_numerical_eigenvalue_floor(self.lambda_max_abs, p);
             let mut acc = 0.0_f64;
             for k in 0..p {
                 let abs_gamma = self.gamma[k].abs();
@@ -4489,13 +4508,7 @@ mod penalized_hessian_rank_tests {
         let ranges = vec![(0, P)];
         let s_lambdas = vec![penalty.clone()];
         let mut h_penalized = h_likelihood.clone();
-        add_joint_penalty_to_matrix(
-            &mut h_penalized,
-            &ranges,
-            &s_lambdas,
-            0.0,
-            None,
-        );
+        add_joint_penalty_to_matrix(&mut h_penalized, &ranges, &s_lambdas, 0.0, None);
 
         let condition = 1.0 / WEAK_CURVATURE;
         assert!(
@@ -4542,6 +4555,5 @@ mod penalized_hessian_rank_tests {
             "the diagonal witness has no step on the zero-RHS strong modes; delta={:?}",
             step.delta,
         );
-
     }
 }

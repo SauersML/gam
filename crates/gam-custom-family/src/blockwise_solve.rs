@@ -800,9 +800,9 @@ pub(crate) fn assemble_joint_linear_constraints(
             ) }.into());
         }
     }
-    let all_dense = block_constraints.iter().all(|constraints| {
-        matches!(constraints, None | Some(ConstraintSet::Dense(_)))
-    });
+    let all_dense = block_constraints
+        .iter()
+        .all(|constraints| matches!(constraints, None | Some(ConstraintSet::Dense(_))));
     if all_dense {
         // Explicit-row concatenation, exactly the historical joint system.
         let mut a = Array2::<f64>::zeros((total_rows, total_p));
@@ -1877,7 +1877,17 @@ pub(crate) fn stable_logdet_with_ridge_policy(
     match ridge_policy.determinant_mode() {
         RidgeDeterminantMode::Full => {
             let chol = a.cholesky(Side::Lower).map_err(|_| {
-                "cholesky failed while computing full ridge-aware logdet".to_string()
+                // Failure-path diagnosis only: name the spectrum so the caller's
+                // error says WHY the full SPD contract was violated (indefinite
+                // constrained-mode curvature vs. genuine numerical breakdown).
+                let spectrum = gam_linalg::utils::symmetric_extremes(&a)
+                    .map(|(min_eig, max_eig)| {
+                        format!("min_eig={min_eig:.6e}, max_eig={max_eig:.6e}")
+                    })
+                    .unwrap_or_else(|| "spectrum unavailable".to_string());
+                format!(
+                    "cholesky failed while computing full ridge-aware logdet (p={p}, ridge={ridge:.3e}, {spectrum})"
+                )
             })?;
             Ok(2.0 * chol.diag().mapv(f64::ln).sum())
         }
@@ -2325,10 +2335,7 @@ pub(crate) fn symmetric_constrained_hessian_geometry(
             lambda.abs().max(floor)
         }
     }));
-    let stabilized_min_eigenvalue = stabilized
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let stabilized_min_eigenvalue = stabilized.iter().copied().fold(f64::INFINITY, f64::min);
     let scaled = &evecs * &stabilized.view().insert_axis(ndarray::Axis(0));
     Ok(ConstrainedHessianGeometry {
         matrix: scaled.dot(&evecs.t()),
@@ -2366,11 +2373,7 @@ mod constrained_hessian_geometry_tests {
     fn rank_deficient_levenberg_curvature_is_confined_to_the_null_projector() {
         // Eigenpairs: range vectors (1,0,-1)/sqrt(2) at lambda=4 and
         // (0,1,0) at lambda=1; gauge vector (1,0,1)/sqrt(2) at lambda=0.
-        let hessian = array![
-            [2.0, 0.0, -2.0],
-            [0.0, 1.0, 0.0],
-            [-2.0, 0.0, 2.0]
-        ];
+        let hessian = array![[2.0, 0.0, -2.0], [0.0, 1.0, 0.0], [-2.0, 0.0, 2.0]];
         let mu = 0.25;
         let geometry = symmetric_constrained_hessian_geometry(&hessian, mu, false)
             .expect("rank-deficient symmetric geometry");
