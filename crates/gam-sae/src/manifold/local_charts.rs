@@ -409,6 +409,35 @@ impl ChartTransition {
     }
 }
 
+/// A pair of charts flagged as a co-collapse candidate: they cover nearly the
+/// same region AND glue by one coherent transition, so they represent ONE
+/// manifold redundantly rather than two distinct structures.
+///
+/// This is the detection half of the #2280 gluing-consistency mechanism, which is
+/// also the #2080 model-level anti-collapse readout: "two atoms decoding the same
+/// region either agree on a transition (one manifold → merge) or provably do not
+/// (genuinely distinct structure)." A confinement/ownership force needs this
+/// detector — you cannot confine what you cannot name — and the atlas already
+/// carries both signals (shared support and the fitted transition residual), so
+/// the readout is a pure function of the built atlas with no fit in the loop.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoCollapseCandidate {
+    /// Source patch index (`< to_patch`, the canonical undirected orientation).
+    pub from_patch: usize,
+    /// Target patch index.
+    pub to_patch: usize,
+    /// The overlap component id of the underlying transition.
+    pub overlap_id: usize,
+    /// `|shared| / min(|members_from|, |members_to|) ∈ (0, 1]`: how completely the
+    /// two patches cover the same rows. Near `1` ⇒ duplicate coverage; a healthy
+    /// adjacent overlap shares only a band and stays well below `1`.
+    pub mutual_coverage: f64,
+    /// The transition's Procrustes residual on the shared support. Near `0` ⇒ the
+    /// two charts glue by one exact isometry ⇒ the same manifold; a large residual
+    /// is genuinely distinct structure sharing the region, NOT a collapse.
+    pub transition_residual: f64,
+}
+
 /// A collection of overlapping injective local charts glued by a signed
 /// transition cocycle — the atlas-first manifold primitive (#2280).
 #[derive(Clone, Debug, PartialEq)]
@@ -641,6 +670,58 @@ impl LocalAtlas {
         let (_, s_bc) = self.directed_rotation(b, c)?;
         let (_, s_ca) = self.directed_rotation(c, a)?;
         Some(s_ab * s_bc * s_ca)
+    }
+
+    /// Chart pairs that redundantly represent the SAME manifold — the #2280
+    /// gluing-consistency / #2080 anti-collapse detector.
+    ///
+    /// A well-conditioned transition is flagged when BOTH hold: its mutual
+    /// coverage (`|shared| / min(patch sizes)`) is at least `coverage_threshold`
+    /// (the two charts cover nearly the same rows), AND its Procrustes residual is
+    /// at most `residual_threshold` (they glue by one smooth transition ⇒ one
+    /// manifold). A high-coverage pair whose residual EXCEEDS the threshold is
+    /// genuinely distinct co-located structure and is deliberately NOT flagged —
+    /// that is the whole discrimination the mechanism turns on. Degenerate
+    /// (ill-conditioned) transitions carry no verdict and are skipped, exactly as
+    /// they are excluded from the observed sign cocycle. Returned sorted by the
+    /// underlying overlap id (deterministic).
+    ///
+    /// This is a diagnostic of the fitted atlas, not a promotion or a merge: it
+    /// names the collapse candidates a confinement/ownership solution acts on; it
+    /// does not itself merge or confine anything.
+    #[must_use]
+    pub fn co_collapse_candidates(
+        &self,
+        coverage_threshold: f64,
+        residual_threshold: f64,
+    ) -> Vec<CoCollapseCandidate> {
+        let mut out = Vec::new();
+        for transition in &self.transitions {
+            if !matches!(
+                transition.conditioning,
+                TransitionConditioning::WellConditioned
+            ) {
+                continue;
+            }
+            let members_from = self.patches[transition.from_patch].members.len();
+            let members_to = self.patches[transition.to_patch].members.len();
+            let smaller = members_from.min(members_to);
+            if smaller == 0 {
+                continue;
+            }
+            let mutual_coverage = transition.shared_rows.len() as f64 / smaller as f64;
+            if mutual_coverage >= coverage_threshold && transition.residual <= residual_threshold {
+                out.push(CoCollapseCandidate {
+                    from_patch: transition.from_patch,
+                    to_patch: transition.to_patch,
+                    overlap_id: transition.overlap_id,
+                    mutual_coverage,
+                    transition_residual: transition.residual,
+                });
+            }
+        }
+        out.sort_by_key(|candidate| candidate.overlap_id);
+        out
     }
 }
 
@@ -1431,5 +1512,101 @@ mod tests {
         assert!((determinant(&reflection) + 1.0).abs() < 1e-12);
         let rotation = Array2::<f64>::eye(3);
         assert!((determinant(&rotation) - 1.0).abs() < 1e-12);
+    }
+
+    /// #2280/#2080 co-collapse detector: two charts covering the SAME region and
+    /// gluing by one exact isometry are flagged as one redundant manifold. Forced
+    /// by an explicit config whose patches each grow to the whole flat cloud, so
+    /// the two charts share every row (mutual coverage 1) at ~zero residual.
+    #[test]
+    fn co_collapse_flags_duplicate_charts_2280() {
+        let z = embedded_plane(6, 6); // 36 exactly-planar points
+        let config = LocalAtlasConfig {
+            intrinsic_dim: 2,
+            patch_count: 2,
+            patch_size: z.nrows(),
+            min_overlap: 3,
+        };
+        let atlas = LocalAtlas::build(z.view(), config).expect("duplicate-patch atlas must build");
+        assert_eq!(
+            atlas.chart_count(),
+            2,
+            "config pins two whole-cloud patches"
+        );
+        let candidates = atlas.co_collapse_candidates(0.9, 1.0e-6);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the two identical-support charts are one co-collapse candidate"
+        );
+        let candidate = candidates[0];
+        assert!(
+            candidate.mutual_coverage > 0.99,
+            "duplicate charts must have near-total mutual coverage, got {}",
+            candidate.mutual_coverage
+        );
+        assert!(
+            candidate.transition_residual < 1.0e-6,
+            "an exact-isometry glue must have ~zero transition residual, got {}",
+            candidate.transition_residual
+        );
+    }
+
+    /// The detector honors BOTH thresholds monotonically: a coverage bar above 1
+    /// admits nothing (coverage is at most 1), while the fully permissive query
+    /// flags exactly the well-conditioned transitions — the deterministic bracket
+    /// on the gate logic.
+    #[test]
+    fn co_collapse_thresholds_bracket_the_gate_2280() {
+        let z = embedded_plane(6, 6);
+        let config = LocalAtlasConfig {
+            intrinsic_dim: 2,
+            patch_count: 2,
+            patch_size: z.nrows(),
+            min_overlap: 3,
+        };
+        let atlas = LocalAtlas::build(z.view(), config).unwrap();
+        assert!(
+            atlas.co_collapse_candidates(1.5, f64::INFINITY).is_empty(),
+            "no pair can exceed a coverage bar above 1"
+        );
+        let permissive = atlas.co_collapse_candidates(0.0, f64::INFINITY);
+        let well_conditioned = atlas.observed_signed_edges().len();
+        assert_eq!(
+            permissive.len(),
+            well_conditioned,
+            "the fully permissive query flags exactly the well-conditioned transitions"
+        );
+    }
+
+    /// On a genuine 2-D swiss roll the detector is SELECTIVE, not a rubber stamp on
+    /// every overlap: tightening either the coverage bar (healthy adjacency shares
+    /// only a band, well below duplicate) or the residual bar (curved patches glue
+    /// with a nonzero sagitta residual) strictly shrinks the flagged set. This is
+    /// the discrimination the anti-collapse force rests on — redundant coverage is
+    /// flagged, honest adjacency and distinct co-located structure are spared.
+    #[test]
+    fn co_collapse_spares_healthy_swiss_roll_atlas_2280() {
+        let z = swiss_roll(40, 8);
+        let atlas = LocalAtlas::build(z.view(), LocalAtlasConfig::balanced(z.nrows(), 2)).unwrap();
+        let permissive = atlas.co_collapse_candidates(0.0, f64::INFINITY).len();
+        assert!(
+            permissive > 0,
+            "the swiss-roll atlas has overlapping charts"
+        );
+        // Coverage gate discriminates: not every overlap is near-duplicate.
+        let strict_coverage = atlas.co_collapse_candidates(0.98, f64::INFINITY).len();
+        assert!(
+            strict_coverage < permissive,
+            "a strict coverage bar must spare healthy partial-overlap adjacency \
+             (strict {strict_coverage} vs permissive {permissive})"
+        );
+        // Residual gate discriminates: curved patches do not glue at exactly zero.
+        let strict_residual = atlas.co_collapse_candidates(0.0, 0.0).len();
+        assert!(
+            strict_residual < permissive,
+            "a strict residual bar must spare curved (nonzero-residual) glues \
+             (strict {strict_residual} vs permissive {permissive})"
+        );
     }
 }
