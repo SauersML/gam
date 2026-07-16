@@ -1775,13 +1775,36 @@ fn certify_outer_optimality_at_terminal_fidelity(
     }
 
     let bounds = outer_bounds_template(config, layout.n_params);
+    // A penalty creeping toward the ±rho_bound infinite-smoothing ceiling never reaches
+    // it EXACTLY — each outer step only shrinks the gap, so it lands strictly inside the
+    // box (the #2299 checkpoint sits at ρ=29.9938, not 30). `certificate_railed_lambdas`
+    // then flags it railed via `CERTIFICATE_RAIL_MARGIN`, but the exact `x >= upper` /
+    // `x <= lower` box-KKT projection treats it as INTERIOR and its outward pull inflates
+    // |Pg| above the (tiny) stationarity bound — the fit refuses a genuine railed optimum.
+    // Project the stationarity residual with the box endpoints relaxed inward by that SAME
+    // rail margin, so "railed" means ONE thing to the detector AND the projector: a
+    // within-tolerance coordinate whose gradient points OUT of the box has its KKT-multiplier
+    // component removed rather than counted as a stationarity residual (#2299). The
+    // projection only zeros the OUTWARD half (`.max(0.0)`/`.min(0.0)`), so a coordinate near
+    // the bound that still has feasible-descent gradient keeps it and is never falsely
+    // certified.
+    let rail_projection_bounds = {
+        let (lower, upper) = &bounds;
+        (
+            lower.mapv(|v| v + CERTIFICATE_RAIL_MARGIN),
+            upper.mapv(|v| v - CERTIFICATE_RAIL_MARGIN),
+        )
+    };
     let grad_norm = evaluation.gradient.dot(&evaluation.gradient).sqrt();
     // KKT-projected gradient VECTOR (not just its norm): the norm feeds the
     // stationarity certificate below, and the vector feeds the curvature-scaled
     // flat-valley Newton decrement (#2253/#2249/#2015) once the analytic Hessian
     // is in hand.
-    let projected_gradient =
-        project_gradient_vector(&result.rho, &evaluation.gradient, Some(&bounds));
+    let projected_gradient = project_gradient_vector(
+        &result.rho,
+        &evaluation.gradient,
+        Some(&rail_projection_bounds),
+    );
     let projected_grad_norm = projected_gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
     let solver_bound = outer_gradient_tolerance(config).threshold(evaluation.cost, grad_norm);
     let mut stationarity_bound = if matches!(
@@ -1957,7 +1980,8 @@ fn certify_outer_optimality_at_terminal_fidelity(
             .max(COST_STALL_REL_TOL_FLOOR)
             * (1.0 + evaluation.cost.abs());
         let cost_drift = (run_recorded_value - evaluation.cost).abs();
-        let prior_projected = project_gradient_vector(&result.rho, prior_gradient, Some(&bounds));
+        let prior_projected =
+            project_gradient_vector(&result.rho, prior_gradient, Some(&rail_projection_bounds));
         let spread = (&prior_projected - &projected_gradient)
             .iter()
             .map(|v| v * v)
