@@ -700,83 +700,6 @@ impl SaeManifoldTerm {
         })
     }
 
-    /// PATH C / #2330 — the EXACT observed-information Laplace log-determinants
-    /// `(log|A|, log|A_tt|)` at the converged fixed-θ̂ mode, where `A = ∇²_θθ L`
-    /// is the exact stationarity Hessian (`A = B + ΔC`,
-    /// `ΔC = apply_exact_hessian_minus_b`) — NOT the majorized inner-solver
-    /// surrogate `B`. `B` exists only to keep the inner Newton positive definite
-    /// (a solver device); the quantity the DENSE capability route ranks is the
-    /// observed-information Laplace term on the exact `A`, so its value, gradient,
-    /// and Hessian form one conservative currency (#2330). The large-K
-    /// matrix-free/streaming regime keeps the majorized `½log|B|` surrogate with a
-    /// gradient consistent with THAT value; see the regime contract at the
-    /// criterion seam.
-    ///
-    /// `A` is materialized densely (`dim×dim`, `dim = total_t + k`) column by
-    /// column via [`Self::apply_exact_hessian`] — the same small-dense scale this
-    /// route already pays for [`Self::materialize_joint_inverse`] — then factored
-    /// with a STRICT Cholesky. A Cholesky failure means `A` is indefinite: the
-    /// converged inner point is a saddle, not a maximum, so `½log|A|` is undefined
-    /// and we refuse [`SaeCriterionError::IndefiniteObservedInformation`] rather
-    /// than rank a non-maximum. `log|A_tt|` drops the `β` border; a principal
-    /// submatrix of a positive-definite matrix is positive definite, so it cannot
-    /// fail once the joint factor succeeds.
-    pub(crate) fn exact_observed_information_log_dets(
-        &self,
-        rho: &SaeManifoldRho,
-        target: ArrayView2<'_, f64>,
-        cache: &ArrowFactorCache,
-    ) -> Result<(f64, f64), SaeCriterionError> {
-        let total_t = cache.delta_t_len();
-        let k = cache.k;
-        let dim = total_t + k;
-        let mut a = Array2::<f64>::zeros((dim, dim));
-        let mut unit = SaeArrowVector {
-            t: Array1::<f64>::zeros(total_t),
-            beta: Array1::<f64>::zeros(k),
-        };
-        for col in 0..dim {
-            if col < total_t {
-                unit.t[col] = 1.0;
-            } else {
-                unit.beta[col - total_t] = 1.0;
-            }
-            let av = self
-                .apply_exact_hessian(rho, target, cache, &unit)
-                .map_err(SaeCriterionError::Numerical)?;
-            if col < total_t {
-                unit.t[col] = 0.0;
-            } else {
-                unit.beta[col - total_t] = 0.0;
-            }
-            for r in 0..total_t {
-                a[[r, col]] = av.t[r];
-            }
-            for r in 0..k {
-                a[[total_t + r, col]] = av.beta[r];
-            }
-        }
-        // The matrix-free apply is symmetric only up to round-off; symmetrize so
-        // the Cholesky sees an exactly symmetric operand.
-        for r in 0..dim {
-            for c in (r + 1)..dim {
-                let avg = 0.5 * (a[[r, c]] + a[[c, r]]);
-                a[[r, c]] = avg;
-                a[[c, r]] = avg;
-            }
-        }
-        let cholesky_log_det = |m: &Array2<f64>, block: &'static str| -> Result<f64, SaeCriterionError> {
-            let factor = m
-                .cholesky(Side::Lower)
-                .map_err(|_| SaeCriterionError::IndefiniteObservedInformation { block })?;
-            Ok(2.0 * factor.diag().iter().map(|d| d.ln()).sum::<f64>())
-        };
-        let log_a = cholesky_log_det(&a, "joint")?;
-        let a_tt = a.slice(s![..total_t, ..total_t]).to_owned();
-        let log_a_tt = cholesky_log_det(&a_tt, "coordinate")?;
-        Ok((log_a, log_a_tt))
-    }
-
     /// #1418: solve `A x = rhs` for the EXACT stationarity Jacobian `A = ∇²_θθ L`
     /// on the closed-form gauge quotient via right-`B_Q`-preconditioned GMRES
     /// ([`solve_b_preconditioned_gmres`]) with the matrix-free
@@ -2818,12 +2741,109 @@ impl SaeManifoldTerm {
 #[cfg(test)]
 mod test_support {
     use super::{
-        ArrowFactorCache, DeflatedArrowSolver, SaeArrowVector, SaeManifoldRho,
-        ThetaAdjointDhChannel,
+        ArrowFactorCache, DeflatedArrowSolver, FaerCholesky, SaeArrowVector, SaeCriterionError,
+        SaeManifoldRho, Side, ThetaAdjointDhChannel,
     };
-    use ndarray::{Array1, s};
+    use ndarray::{Array1, Array2, ArrayView2, s};
 
     impl super::SaeManifoldTerm {
+        /// PATH C / #2330 — the EXACT observed-information Laplace log-determinants
+        /// `(log|A|, log|A_tt|)` at the converged fixed-θ̂ mode, where `A = ∇²_θθ L`
+        /// is the exact stationarity Hessian (`A = B + ΔC`,
+        /// `ΔC = apply_exact_hessian_minus_b`) — NOT the majorized inner-solver
+        /// surrogate `B`. `B` exists only to keep the inner Newton positive definite
+        /// (a solver device); the quantity the DENSE capability route ranks is the
+        /// observed-information Laplace term on the exact `A`, so its value,
+        /// gradient, and Hessian form one conservative currency (#2330).
+        ///
+        /// Phase 1 of the #2330 cutover: this and [`Self::materialize_exact_hessian_dense`]
+        /// live in `test_support` until the Phase 2 value+gradient wiring gives them
+        /// production callers (a `pub(crate)` fn with only a `#[cfg(test)]` caller
+        /// trips deny-warnings dead-code). The eigendecomposition arbiter exercises
+        /// them here.
+        ///
+        /// `A` is materialized densely (`dim×dim`, `dim = total_t + k`) column by
+        /// column via [`Self::apply_exact_hessian`] then factored with a STRICT
+        /// Cholesky. A Cholesky failure means `A` is indefinite: the converged inner
+        /// point is a saddle, not a maximum, so `½log|A|` is undefined and we refuse
+        /// [`SaeCriterionError::IndefiniteObservedInformation`] rather than rank a
+        /// non-maximum. `log|A_tt|` drops the `β` border.
+        pub(crate) fn exact_observed_information_log_dets(
+            &self,
+            rho: &SaeManifoldRho,
+            target: ArrayView2<'_, f64>,
+            cache: &ArrowFactorCache,
+        ) -> Result<(f64, f64), SaeCriterionError> {
+            let total_t = cache.delta_t_len();
+            let a = self
+                .materialize_exact_hessian_dense(rho, target, cache)
+                .map_err(SaeCriterionError::Numerical)?;
+            let cholesky_log_det =
+                |m: &Array2<f64>, block: &'static str| -> Result<f64, SaeCriterionError> {
+                    let factor = m
+                        .cholesky(Side::Lower)
+                        .map_err(|_| SaeCriterionError::IndefiniteObservedInformation { block })?;
+                    Ok(2.0 * factor.diag().iter().map(|d| d.ln()).sum::<f64>())
+                };
+            let log_a = cholesky_log_det(&a, "joint")?;
+            let a_tt = a.slice(s![..total_t, ..total_t]).to_owned();
+            let log_a_tt = cholesky_log_det(&a_tt, "coordinate")?;
+            Ok((log_a, log_a_tt))
+        }
+
+        /// PATH C / #2330 — dense symmetric materialization of the EXACT stationarity
+        /// Hessian `A = ∇²_θθ L = B + ΔC` (`dim×dim`, `dim = total_t + k`), built
+        /// column by column via [`Self::apply_exact_hessian`] and symmetrized. The
+        /// small-dense (circle-mint) scale this route already pays for
+        /// [`Self::materialize_joint_inverse`]; shared by the observed-information
+        /// log-determinant (VALUE) and its `A⁻¹` selected inverse (GRADIENT) so both
+        /// factor one identical operator. `test_support`-scoped until Phase 2 wiring
+        /// (see [`Self::exact_observed_information_log_dets`]).
+        pub(crate) fn materialize_exact_hessian_dense(
+            &self,
+            rho: &SaeManifoldRho,
+            target: ArrayView2<'_, f64>,
+            cache: &ArrowFactorCache,
+        ) -> Result<Array2<f64>, String> {
+            let total_t = cache.delta_t_len();
+            let k = cache.k;
+            let dim = total_t + k;
+            let mut a = Array2::<f64>::zeros((dim, dim));
+            let mut unit = SaeArrowVector {
+                t: Array1::<f64>::zeros(total_t),
+                beta: Array1::<f64>::zeros(k),
+            };
+            for col in 0..dim {
+                if col < total_t {
+                    unit.t[col] = 1.0;
+                } else {
+                    unit.beta[col - total_t] = 1.0;
+                }
+                let av = self.apply_exact_hessian(rho, target, cache, &unit)?;
+                if col < total_t {
+                    unit.t[col] = 0.0;
+                } else {
+                    unit.beta[col - total_t] = 0.0;
+                }
+                for r in 0..total_t {
+                    a[[r, col]] = av.t[r];
+                }
+                for r in 0..k {
+                    a[[total_t + r, col]] = av.beta[r];
+                }
+            }
+            // The matrix-free apply is symmetric only up to round-off; symmetrize
+            // so downstream Cholesky / selected-inverse factors see an exactly
+            // symmetric operand.
+            for r in 0..dim {
+                for c in (r + 1)..dim {
+                    let avg = 0.5 * (a[[r, c]] + a[[c, r]]);
+                    a[[r, c]] = avg;
+                    a[[c, r]] = avg;
+                }
+            }
+            Ok(a)
+        }
         /// PATH C (#2253) CH5 test-support — the max `|dense − production|` of the
         /// θ-adjoint reconstruction over the `(t, β)` blocks, for the joint
         /// (`inv = G`) and coordinate-block (`inv = h_bd`) legs. A failing FD gate
