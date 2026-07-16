@@ -4075,6 +4075,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     self.probe_telemetry.infeasible_criterion_evals += 1;
                     return Ok(OuterEval::infeasible(rho.len()));
                 }
+                Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
+                    return Err(EstimationError::RemlOptimizationFailed(err.to_string()));
+                }
                 Err(SaeCriterionError::Numerical(err)) => {
                     return Err(EstimationError::RemlOptimizationFailed(err));
                 }
