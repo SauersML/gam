@@ -1812,4 +1812,134 @@ mod tests {
         assert!(log_origin(v.view(), 0.5).is_err());
         assert!(mobius_add(v.view(), v.view(), 0.0).is_err());
     }
+
+    /// Central-difference Jacobian of `exp_origin` at `t`, i.e. a numeric
+    /// stand-in for `D exp_0(t)` that never uses the closed spectral form
+    /// (`e_t`, `e_r`) the production code relies on.
+    fn numeric_dexp0_jacobian(t: ArrayView1<'_, f64>, curvature: f64) -> Array2<f64> {
+        let d = t.len();
+        let eps = 1.0e-6;
+        let mut jac = Array2::<f64>::zeros((d, d));
+        for j in 0..d {
+            let mut tp = t.to_owned();
+            tp[j] += eps;
+            let mut tm = t.to_owned();
+            tm[j] -= eps;
+            let yp = exp_origin(tp.view(), curvature).expect("exp+");
+            let ym = exp_origin(tm.view(), curvature).expect("exp-");
+            for i in 0..d {
+                jac[[i, j]] = (yp[i] - ym[i]) / (2.0 * eps);
+            }
+        }
+        jac
+    }
+
+    /// Gauss-Jordan inverse + determinant via partial pivoting, generic in
+    /// `n`. Only used by tests as an independent linear-algebra path (the
+    /// production code never inverts a dense matrix this way).
+    fn small_inverse_and_det(m: &Array2<f64>) -> (Array2<f64>, f64) {
+        let n = m.nrows();
+        let mut a = m.clone();
+        let mut inv = Array2::<f64>::eye(n);
+        let mut det = 1.0_f64;
+        for col in 0..n {
+            let mut pivot_row = col;
+            let mut pivot_val = a[[col, col]].abs();
+            for r in (col + 1)..n {
+                if a[[r, col]].abs() > pivot_val {
+                    pivot_val = a[[r, col]].abs();
+                    pivot_row = r;
+                }
+            }
+            if pivot_row != col {
+                for k in 0..n {
+                    a.swap([col, k], [pivot_row, k]);
+                    inv.swap([col, k], [pivot_row, k]);
+                }
+                det = -det;
+            }
+            let piv = a[[col, col]];
+            det *= piv;
+            for k in 0..n {
+                a[[col, k]] /= piv;
+                inv[[col, k]] /= piv;
+            }
+            for r in 0..n {
+                if r != col {
+                    let factor = a[[r, col]];
+                    for k in 0..n {
+                        let a_ck = a[[col, k]];
+                        let inv_ck = inv[[col, k]];
+                        a[[r, k]] -= factor * a_ck;
+                        inv[[r, k]] -= factor * inv_ck;
+                    }
+                }
+            }
+        }
+        (inv, det)
+    }
+
+    #[test]
+    fn conformal_dirichlet_penalty_matches_finite_difference_pullback_metric() {
+        // Independent oracle for the closed-form `G(t) = sqrt(det h) * h^-1`
+        // spectral shortcut used inside `conformal_dirichlet_penalty` (see its
+        // doc comment). This builds `h(t) = D exp_0(t)^T * lambda(p)^2 *
+        // D exp_0(t)` from a finite-difference Jacobian and a Gauss-Jordan
+        // inverse/det — neither borrowed from the function under test — and
+        // compares it against the function's output on a single point with an
+        // identity basis jacobian (`Phi_k(t) = t_k`), which algebraically
+        // reduces `conformal_dirichlet_penalty` to exactly `G(t)` itself.
+        let curvatures = [-1.0_f64, -0.3, -2.5];
+        for &curvature in &curvatures {
+            let points_by_dim: [(usize, Vec<Vec<f64>>); 3] = [
+                (1, vec![vec![0.37], vec![-0.62], vec![1.0e-4]]),
+                (
+                    2,
+                    vec![
+                        vec![0.2, -0.1],
+                        vec![0.55, 0.4],
+                        vec![1.0e-4, -2.0e-4],
+                    ],
+                ),
+                (3, vec![vec![0.15, -0.2, 0.05], vec![0.4, 0.3, -0.5]]),
+            ];
+            for (d, points) in points_by_dim.iter() {
+                let d = *d;
+                for coeffs in points {
+                    let t = Array1::<f64>::from_vec(coeffs.clone());
+
+                    let jac = numeric_dexp0_jacobian(t.view(), curvature);
+                    let p = exp_origin(t.view(), curvature).expect("exp");
+                    let lambda = conformal_factor(p.view(), curvature).expect("lambda");
+                    let mut h = jac.t().dot(&jac);
+                    h.mapv_inplace(|v| v * lambda * lambda);
+                    let (h_inv, det_h) = small_inverse_and_det(&h);
+                    assert!(det_h > 0.0, "h must be SPD, got det={det_h}");
+                    let g_fd = h_inv.mapv(|v| v * det_h.sqrt());
+
+                    let mut basis_jac = Array3::<f64>::zeros((1, d, d));
+                    for k in 0..d {
+                        basis_jac[[0, k, k]] = 1.0;
+                    }
+                    let coords = Array2::from_shape_vec((1, d), coeffs.clone()).unwrap();
+                    let g_closed =
+                        conformal_dirichlet_penalty(coords.view(), basis_jac.view(), curvature)
+                            .expect("closed form");
+
+                    for i in 0..d {
+                        for j in 0..d {
+                            let fd = g_fd[[i, j]];
+                            let closed = g_closed[[i, j]];
+                            let tol = 1.0e-4 * (1.0 + fd.abs());
+                            assert!(
+                                (fd - closed).abs() < tol,
+                                "G mismatch d={d} c={curvature} t={coeffs:?} at ({i},{j}): \
+                                 fd={fd} closed={closed}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
