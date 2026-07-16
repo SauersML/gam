@@ -2650,6 +2650,44 @@ impl SurvivalLocationScaleFamily {
         }
 
         let kernel = self.survival_ls_row_kernel_rescaled(dynamic, deriv_log_scale);
+
+        // #2342: per-row stable paired index-derivative sums S1, S2 for the
+        // far-tail rows whose entry/exit hazard channels are each ~1e300 and
+        // (near-)opposite. The compiled 24-pair Hessian merges them onto a
+        // shared coefficient (H[6][6]+H[7][7] for log-sigma, H[3][3]+H[4][4] for
+        // threshold) and cancels catastrophically — A''(u0) rounds to exactly
+        // 1.0, losing ρ'(u0) = −1/u0², which the ∂²q/∂η_ls² ≈ q ~ 1e150 chain
+        // amplifies back to a moderate O(1e149) information. The merged
+        // coefficient is recomputed cancellation-free in the per-row loop below;
+        // every non-far-tail row keeps the naive fold (moderate-regime bitwise).
+        // Weighted by the family weight only — the HT mask is applied uniformly
+        // inside the loop, exactly as it is to the compiled coefficients.
+        let mut paired_s1 = Array1::<f64>::zeros(self.n);
+        let mut paired_s2 = Array1::<f64>::zeros(self.n);
+        let mut use_paired = vec![false; self.n];
+        for row in 0..self.n {
+            let u0 = dynamic.h_entry[row] + dynamic.q_entry[row];
+            if self.w[row] > 0.0
+                && paired_stacks::paired_contraction_needs_regroup(&self.inverse_link, u0)
+            {
+                let u1 = dynamic.h_exit[row] + dynamic.q_exit[row];
+                let delta_u = (dynamic.h_exit[row] - dynamic.h_entry[row])
+                    + (dynamic.q_exit[row] - dynamic.q_entry[row]);
+                if let Some(sums) = paired_stacks::weighted_paired_index_sums(
+                    &self.inverse_link,
+                    u0,
+                    u1,
+                    delta_u,
+                    self.y[row],
+                    self.w[row],
+                ) {
+                    paired_s1[row] = sums[0];
+                    paired_s2[row] = sums[1];
+                    use_paired[row] = true;
+                }
+            }
+        }
+
         let mut slots = Array2::<f64>::zeros((groups.len(), self.n));
         slots
             .axis_iter_mut(Axis(1))
@@ -2661,10 +2699,32 @@ impl SurvivalLocationScaleFamily {
                     None => [0.0; SLS_HESSIAN_PAIRS.len()],
                 };
                 for (slot, group) in groups.iter().enumerate() {
-                    let coefficient = group
+                    let mut coefficient = group
                         .pair_slots
                         .iter()
                         .fold(0.0, |sum, &pair_slot| sum + coefficients[pair_slot]);
+                    // #2342: on far-tail rows, replace the cancelling merged
+                    // (entry+exit) block-diagonal coefficient with the stable
+                    // paired form −(S1·D2 + S2·D²), D=∂q/∂η, D2=∂²q/∂η² (entry ==
+                    // exit for a time-invariant channel). The merged group's
+                    // representative pair is the diagonal (6,6)/(3,3), so the
+                    // block contraction adds it once (no transpose doubling); the
+                    // dropped shared-axis event-rate term is ~1e-150 relative.
+                    if use_paired[row]
+                        && group.left_design == group.right_design
+                        && group.left_channel / 3 == group.right_channel / 3
+                    {
+                        let block = group.left_channel / 3;
+                        if block == 2 && self.x_log_sigma_entry.is_none() {
+                            let d1 = dynamic.dq_ls_exit[row];
+                            let d2 = dynamic.d2q_ls_exit[row];
+                            coefficient = -(paired_s1[row] * d2 + paired_s2[row] * d1 * d1);
+                        } else if block == 1 && self.x_threshold_entry.is_none() {
+                            // Threshold index is LINEAR in η_t (∂²u/∂η_t² = 0).
+                            let d1 = dynamic.dq_t_exit[row];
+                            coefficient = -(paired_s2[row] * d1 * d1);
+                        }
+                    }
                     row_slots[slot] = match row_mask {
                         Some(mask) => coefficient * mask[row],
                         None => coefficient,
