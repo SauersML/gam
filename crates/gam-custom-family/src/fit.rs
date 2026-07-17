@@ -2496,3 +2496,56 @@ pub fn fit_custom_family_fixed_log_lambda_warm_start<
     }
     Ok((block_beta, inner.converged, inner.cycles))
 }
+
+/// Diagnostic-only entry: evaluate the SAME labeled outer criterion and
+/// analytic gradient the production outer optimizer descends (identifiability
+/// canonicalization → pulled-back joint penalty specs → labeled layout →
+/// `outerobjectivegradienthessian_labeled` with a flat ρ-prior), at a
+/// caller-supplied outer coordinate. This exists so obj↔grad desync
+/// investigations (#2349) can FD-gate the exact production functional from an
+/// integration test; it performs a cold inner solve per call and is not a
+/// fitting API.
+pub fn evaluate_labeled_outer_criterion_for_diagnostics<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    raw_specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho: &Array1<f64>,
+) -> Result<(f64, Array1<f64>, bool), CustomFamilyError> {
+    let canonical =
+        gam_identifiability::canonical::canonicalize_for_identifiability_with_operating_scalars(
+            raw_specs,
+            pre_fit_operating_scalars(family, raw_specs)?,
+        )?;
+    let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
+    let penalty_counts = validate_blockspecs(specs)?;
+    let reduced_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    let joint_specs = pulled_back_joint_penalty_specs(family, &canonical, reduced_total)?;
+    let label_layout = penalty_label_layout_with_joint(specs, penalty_counts, joint_specs)?;
+    if rho.len() != label_layout.initial_rho.len() {
+        return Err(CustomFamilyError::Optimization {
+            context: "evaluate_labeled_outer_criterion_for_diagnostics",
+            reason: format!(
+                "outer coordinate has {} entries but the labeled layout carries {}",
+                rho.len(),
+                label_layout.initial_rho.len()
+            ),
+        });
+    }
+    let eval = outerobjectivegradienthessian_labeled(
+        family,
+        specs,
+        options,
+        &label_layout,
+        rho,
+        None,
+        &gam_problem::RhoPrior::Flat,
+        EvalMode::ValueAndGradient,
+    )
+    .map_err(|reason| CustomFamilyError::Optimization {
+        context: "evaluate_labeled_outer_criterion_for_diagnostics",
+        reason,
+    })?;
+    Ok((eval.objective, eval.gradient, eval.inner_converged))
+}
