@@ -4574,6 +4574,12 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_u = Array1::<f64>::zeros(r);
         let mut f_au = Array1::<f64>::zeros(r);
         let mut f_uv = Array2::<f64>::zeros((r, r));
+        // Intercept a-chain moments (#2347): a-derivatives of the second-order
+        // calibration moments, needed to promote the reverse-mode directional
+        // moment adjoints to TOTAL derivatives through the moving intercept root.
+        let mut f_aaa = 0.0;
+        let mut f_aau = Array1::<f64>::zeros(r);
+        let mut f_auv = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
         let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
@@ -4620,6 +4626,7 @@ impl BernoulliMarginalSlopeFamily {
             let dc_daa = scale_coeff4(dc_daa_raw, scale);
             let dc_dab = scale_coeff4(dc_dab_raw, scale);
             let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
+            let dc_daaa = scale_coeff4(denested_third.0, scale);
             let dc_daab = scale_coeff4(denested_third.1, scale);
             let dc_dabb = scale_coeff4(denested_third.2, scale);
             let dc_dbbb = scale_coeff4(denested_third.3, scale);
@@ -4732,6 +4739,46 @@ impl BernoulliMarginalSlopeFamily {
                     f_uv[[u, v]] += val;
                     if u != v {
                         f_uv[[v, u]] += val;
+                    }
+                }
+            }
+            // Intercept a-chain moments (#2347): ∂ₐ of the second-order moments.
+            f_aaa += exact::cell_third_derivative_from_moments(
+                cell, &dc_da, &dc_da, &dc_da, &dc_daa, &dc_daa, &dc_daa, &dc_daaa, &state.moments,
+            )?;
+            for u in 1..r {
+                f_aau[u] += exact::cell_third_derivative_from_moments(
+                    cell,
+                    &dc_da,
+                    &dc_da,
+                    &coeff_jet.first[u],
+                    &dc_daa,
+                    &coeff_jet.a_first[u],
+                    &coeff_jet.a_first[u],
+                    &coeff_jet.aa_first[u],
+                    &state.moments,
+                )?;
+            }
+            for u in 1..r {
+                for v in u..r {
+                    let second_lr =
+                        coeff_jet.pair_from_b_family(coeff_jet.b_first, u, v, COEFF_SUPPORT_BHW);
+                    let third_alr =
+                        coeff_jet.pair_from_b_family(coeff_jet.ab_first, u, v, COEFF_SUPPORT_BW);
+                    let val = exact::cell_third_derivative_from_moments(
+                        cell,
+                        &dc_da,
+                        &coeff_jet.first[u],
+                        &coeff_jet.first[v],
+                        &coeff_jet.a_first[u],
+                        &coeff_jet.a_first[v],
+                        &second_lr,
+                        &third_alr,
+                        &state.moments,
+                    )?;
+                    f_auv[[u, v]] += val;
+                    if u != v {
+                        f_auv[[v, u]] += val;
                     }
                 }
             }
@@ -5007,6 +5054,22 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
         direction_adjoint[0] -= adj_f_uv_dir[[0, 0]] * marginal.mu3;
+
+        // Intercept a-chain (#2347), reverse mode. The forward directional
+        // moments are TOTAL derivatives f_dir_total = f_dir_explicit +
+        // (∂f/∂a)·a_dir, so the adjoints of those moments flow back to a_dir
+        // through the a-derivative moments: ∂f_a/∂a=f_aa, ∂f_aa/∂a=f_aaa,
+        // ∂f_au[p]/∂a=f_aau[p], ∂f_uv[l,r]/∂a=f_auv[l,r]. (Index-0 entries carry
+        // no a-dependence — f_aau[0]=f_auv[0,·]=0 — so they contribute nothing.)
+        adj_a_dir += adj_f_a_dir * f_aa + adj_f_aa_dir * f_aaa;
+        for p in 0..r {
+            adj_a_dir += adj_f_au_dir[p] * f_aau[p];
+        }
+        for u in 0..r {
+            for v in u..r {
+                adj_a_dir += adj_f_uv_dir[[u, v]] * f_auv[[u, v]];
+            }
+        }
 
         for u in 0..r {
             let adj = adj_a_u_dir[u];

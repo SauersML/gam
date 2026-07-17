@@ -945,125 +945,16 @@ fn zz_measure_2347_t4_richardson() {
         );
     }
 
-    // Pure-direction channel isolation for the t4 residual. The mixed-direction
-    // gap smears one corrupt direction-channel across every entry; running the
-    // ladder with each pure channel identifies which direction owns the residual.
-    let channels: Vec<(String, usize, f64)> = vec![
-        ("q".to_string(), primary.q, 0.55),
-        ("logslope".to_string(), primary.logslope, -0.35),
-        ("h0".to_string(), h_range.start, 0.45),
-        ("w0".to_string(), w_range.start, -0.40),
-    ];
-    for (name, index, magnitude) in channels {
-        let mut pdir = Array1::<f64>::zeros(primary.total);
-        pdir[index] = magnitude;
-        let pbase = standard_normal_flex_channels(&family, &states, &cache, row, &pdir, true);
-        let pfourth = pbase.fourth.as_ref().expect("t4");
-        let step = 1.0e-4_f64;
-        let plus_states =
-            perturb_standard_normal_flex_states(&states, &primary, row, &pdir, step);
-        let minus_states =
-            perturb_standard_normal_flex_states(&states, &primary, row, &pdir, -step);
-        let plus_cache = family.build_exact_eval_cache(&plus_states).expect("pc");
-        let minus_cache = family.build_exact_eval_cache(&minus_states).expect("mc");
-        let plus =
-            standard_normal_flex_channels(&family, &plus_states, &plus_cache, row, &pdir, false);
-        let minus = standard_normal_flex_channels(
-            &family,
-            &minus_states,
-            &minus_cache,
-            row,
-            &pdir,
-            false,
-        );
-        let mut prows: Vec<(f64, usize, usize)> = Vec::new();
-        for u in 0..primary.total {
-            for v in 0..primary.total {
-                let fd = (plus.third[[u, v]] - minus.third[[u, v]]) / (2.0 * step);
-                prows.push((
-                    derivative_ladder_relative_error(pfourth[[u, v]], fd),
-                    u,
-                    v,
-                ));
-            }
-        }
-        prows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        let (e, u, v) = prows[0];
-        let fd = (plus.third[[u, v]] - minus.third[[u, v]]) / (2.0 * step);
-        eprintln!(
-            "#2347 t4 PURE {name}: max={e:.3e} at [{}({u}),{}({v})] a={:+.6e} fd={fd:+.6e}",
-            classify(u),
-            classify(v),
-            pfourth[[u, v]],
-        );
-    }
-}
-
-/// #2347 t4 intercept-IFT probe: FD the calibrated intercept a(b) to 4th order
-/// along pure-logslope and compare to the code's internal a_uv_mixed[1,1]
-/// (printed under BMS_T4_DEBUG). a_uv_mixed[1,1] for a pure direction of
-/// magnitude m equals m²·∂²_bb(a_uv[1,1]) = m²·a_bbbb. Isolates whether the t4
-/// residual lives in the intercept IFT (a-chain) or the observed NegLog path.
-#[test]
-fn zz_measure_2347_t4_intercept_ift() {
-    let row = 0usize;
-    let (family, states) = standard_normal_flex_fixture();
-    let cache = family
-        .build_exact_eval_cache(&states)
-        .expect("base cache");
-    let primary = cache.primary.clone();
-
-    let mag = -0.35_f64;
-    let mut pdir = Array1::<f64>::zeros(primary.total);
-    pdir[primary.logslope] = mag;
-
-    // Ground-truth intercept derivatives from a central stencil on the scalar
-    // map b -> a(b) (perturb logslope only, re-solve the intercept). Use a
-    // generous step (the fourth difference needs the numerator well above the
-    // ~1e-12 intercept-solve roundoff floor) and two steps for a convergence
-    // read.
-    let intercept_at = |t: f64| -> f64 {
-        let mut e = Array1::<f64>::zeros(primary.total);
-        e[primary.logslope] = 1.0;
-        let st = perturb_standard_normal_flex_states(&states, &primary, row, &e, t);
-        let c = family.build_exact_eval_cache(&st).expect("perturbed cache");
-        BernoulliMarginalSlopeFamily::row_ctx(&c, row).intercept
-    };
-    let derivs = |h: f64| -> (f64, f64, f64, f64) {
-        let a_m2 = intercept_at(-2.0 * h);
-        let a_m1 = intercept_at(-h);
-        let a_0 = intercept_at(0.0);
-        let a_p1 = intercept_at(h);
-        let a_p2 = intercept_at(2.0 * h);
-        let a_b = (a_p1 - a_m1) / (2.0 * h);
-        let a_bb = (a_p1 - 2.0 * a_0 + a_m1) / (h * h);
-        let a_bbb = (a_p2 - 2.0 * a_p1 + 2.0 * a_m1 - a_m2) / (2.0 * h * h * h);
-        let a_bbbb = (a_p2 - 4.0 * a_p1 + 6.0 * a_0 - 4.0 * a_m1 + a_m2) / (h * h * h * h);
-        (a_b, a_bb, a_bbb, a_bbbb)
-    };
-    let (a_b, a_bb, a_bbb, a_bbbb) = derivs(6.0e-3);
-    let (_, _, a_bbb2, a_bbbb2) = derivs(1.2e-2);
-    eprintln!(
-        "BMS_T4_PROBE true a_b={a_b:.8e} a_bb={a_bb:.8e} a_bbb={a_bbb:.8e}/{a_bbb2:.8e} a_bbbb={a_bbbb:.8e}/{a_bbbb2:.8e}"
+    // #2347 regression guard: the analytic fourth (a-chain + moving-boundary
+    // flux) must reproduce the finite difference of the exact third. The gaps
+    // are FD-converged (identical across the three steps above), so the analytic
+    // fourth is the ground truth to match, not the FD.
+    let max_gap = rows[0].0;
+    assert!(
+        max_gap <= 2e-4,
+        "analytic t4 vs FD(t3) max gap {max_gap:.3e} exceeds 2e-4 — a dropped \
+         a-chain or moving-boundary flux term"
     );
-    // Raw-tensor predictions (a_uv_dirs contracts ONE direction, a_uv_mixed TWO):
-    eprintln!(
-        "BMS_T4_PROBE predicted a_u[1]={a_b:.8e} a_uv[1,1]={a_bb:.8e} a_uv_dirs_L[1,1]={:.8e} a_uv_mixed[1,1]={:.8e}",
-        mag * a_bbb,
-        mag * mag * a_bbbb,
-    );
-    // Trigger the production print of the analytic internals for pure-b.
-    // SAFETY: single-threaded test setting a process env var for this probe.
-    unsafe {
-        std::env::set_var("BMS_T4_DEBUG", "1");
-    }
-    let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(&cache, row);
-    let _ = family
-        .row_primary_fourth_contracted_ordered(row, &states, &cache, row_ctx, &pdir, &pdir)
-        .expect("t4");
-    unsafe {
-        std::env::remove_var("BMS_T4_DEBUG");
-    }
 }
 
 /// #2347 order-4 moment FD check: verify f_auv=∂ₐf_uv, f_aauv=∂ₐf_auv,
@@ -1103,6 +994,30 @@ fn zz_measure_2347_bb_moment_fd() {
     );
     eprintln!("BMS_BB flux_aauv={flux_aauv:.8e}");
     eprintln!("BMS_BB f_auv_db(closed)={f_auv_db:.8e}  (fd ∂_b f_auv)={fd_auv_db:.8e}");
+
+    // #2347 regression guards. The order-3 calibration moment f_auv is the exact
+    // fixed-domain derivative (no boundary flux — its integrand ∝ L'' is
+    // continuous). The order-4 moment f_aauv needs the moving-link-knot flux to
+    // match the true ∂ₐf_auv, and the flux is NON-trivial here (proving the test
+    // exercises a real crossing).
+    assert!(
+        (f_auv - fd_auv).abs() <= 1e-4,
+        "f_auv (order-3) must match FD without flux: {f_auv} vs {fd_auv}"
+    );
+    assert!(
+        flux_aauv.abs() > 1e-3,
+        "fixture must exercise a genuine moving link-knot flux, got {flux_aauv}"
+    );
+    assert!(
+        (f_aauv + flux_aauv - fd_aauv).abs() <= 5e-4,
+        "f_aauv closed+flux must match FD ∂ₐf_auv: {} vs {fd_aauv}",
+        f_aauv + flux_aauv
+    );
+    // Without the flux the closed 4th moment is materially wrong.
+    assert!(
+        (f_aauv - fd_aauv).abs() > 1e-3,
+        "the flux must be necessary: closed f_aauv={f_aauv} should be far from {fd_aauv}"
+    );
 }
 
 /// #2347 channel-isolation measurement: run the H→t3 ladder with PURE
