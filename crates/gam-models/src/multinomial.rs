@@ -4644,5 +4644,66 @@ mod reference_class_invariance_tests {
              (certificate claimed |Pg|=2.047e0, bound 2.697e-3)",
             if outer_uses_laml { "LAML" } else { "plain penalized-NLL" }
         );
+
+        // ── Warm-start stall isolation (#2349, round 3) ────────────────────
+        //
+        // The unbiased-arm refusal recorded objective 268.740 at its OWN best
+        // iterate ρ*, while a cold fixed-λ solve at the same ρ* reaches
+        // 256.166 — the outer's warm-started inner state sat ~12.6 above the
+        // mode of a CONVEX objective while claiming convergence. If that stall
+        // is real it must reproduce in isolation: warm-start the fixed-λ solve
+        // at ρ* from the mode of a DISTANT ρ (the outer's actual eval pattern)
+        // and compare against the cold value. A warm-started value ≫ cold with
+        // an Ok return is the minimal repro of a lying inner certificate; an
+        // Err is the honest refusal; a matching value clears the inner solver
+        // and points the 12.6 gap at the outer eval bookkeeping instead.
+        for delta in [2.0_f64, -2.0] {
+            let rho_far: Vec<f64> = rho_star.iter().map(|r| r + delta).collect();
+            let fam_far = parts
+                .family
+                .clone()
+                .with_joint_initial_log_lambdas(rho_far.clone());
+            let far_fit = crate::custom_family::fit_custom_family_fixed_log_lambdas(
+                &fam_far,
+                &parts.blocks,
+                &probe_options,
+                None,
+            )
+            .expect("cold fixed-lambda solve at the far point");
+            let far_beta: Vec<f64> = far_fit
+                .block_states
+                .iter()
+                .flat_map(|bs| bs.beta.iter().copied())
+                .collect();
+            let block_cols: Vec<usize> =
+                parts.blocks.iter().map(|s| s.design.ncols()).collect();
+            let warm = crate::custom_family::CustomFamilyWarmStart::from_cached_beta(
+                &block_cols,
+                &ndarray::Array1::from(far_beta),
+            )
+            .expect("warm start from far-point mode");
+            let fam_star = parts
+                .family
+                .clone()
+                .with_joint_initial_log_lambdas(rho_star.to_vec());
+            match crate::custom_family::fit_custom_family_fixed_log_lambdas(
+                &fam_star,
+                &parts.blocks,
+                &probe_options,
+                Some(&warm),
+            ) {
+                Ok(fit) => eprintln!(
+                    "#2349 warm-from(delta={delta:+.1}): V={:.9e} (cold {:.9e}, refusal 2.687403e2) \
+                     gap_to_cold={:+.3e}",
+                    fit.reml_score,
+                    v_laml,
+                    fit.reml_score - v_laml
+                ),
+                Err(e) => eprintln!(
+                    "#2349 warm-from(delta={delta:+.1}): inner REFUSED honestly: {}",
+                    format!("{e}").chars().take(220).collect::<String>()
+                ),
+            }
+        }
     }
 }
