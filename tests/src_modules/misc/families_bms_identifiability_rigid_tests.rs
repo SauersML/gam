@@ -4370,6 +4370,18 @@ fn h_only_gradient_hessian_finite_and_symmetric() {
 
 #[test]
 fn w_only_exact_outer_directional_derivatives_are_present_and_finite() {
+    // #2347 PRINCIPLED FIX (mirrors the h_only sibling). This test previously
+    // used zero-width marginal/logslope designs, forcing b ≡ 0. At b = 0 the
+    // link argument u = a + b·z is constant in z, so the link-warp deviation
+    // L(u) = L(a) does not vary across the row and its outer directional
+    // derivatives are STRUCTURALLY zero — the FD of the joint Hessian in a
+    // w-only direction is ~4e-12 (noise). The test only "passed" because the
+    // pre-#2347 flex third dropped the intercept a-chain and produced a spurious
+    // nonzero value; the corrected third matches the FD (~0), so `max > 1e-10`
+    // is analytically impossible for the degenerate fixture. As with h_only,
+    // restore the geometry the test is meant to exercise: scalar marginal /
+    // logslope designs at nondegenerate values (b ≠ 0) and a direction on all
+    // three blocks, so the w-only derivatives are genuinely nonzero.
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
     let prepared = build_test_link_deviation_block_from_seed(
         &seed,
@@ -4386,36 +4398,50 @@ fn w_only_exact_outer_directional_derivatives_are_present_and_finite() {
         .expect("link initial beta")
         .len();
     let beta_link = Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0)));
+    let scalar_design = || {
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((seed.len(), 1), 1.0),
+        ))
+    };
 
     let family = BernoulliMarginalSlopeFamily {
         y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-            Array2::zeros((seed.len(), 0)),
-        )),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-            Array2::zeros((seed.len(), 0)),
-        )),
+        marginal_design: scalar_design(),
+        logslope_design: scalar_design(),
         link_dev: Some(prepared.runtime.clone()),
         ..default_test_family()
     };
     let block_states = vec![
-        dummy_block_state(array![0.0], seed.len()),
-        dummy_block_state(array![0.0], seed.len()),
-        dummy_block_state(beta_link, seed.len()),
+        ParameterBlockState {
+            beta: array![0.25],
+            eta: Array1::from_elem(seed.len(), 0.25),
+        },
+        ParameterBlockState {
+            beta: array![0.15],
+            eta: Array1::from_elem(seed.len(), 0.15),
+        },
+        ParameterBlockState {
+            beta: beta_link,
+            eta: Array1::zeros(seed.len()),
+        },
     ];
 
     let slices = block_slices(&family);
     let total = slices.total;
     let mut dir_u = Array1::<f64>::zeros(total);
     let mut dir_v = Array1::<f64>::zeros(total);
+    dir_u[slices.marginal.start] = -0.35;
+    dir_u[slices.logslope.start] = 0.28;
     let w_range = slices.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.15;
     if w_range.len() > 1 {
         dir_u[w_range.start + 1] = -0.07;
     }
 
+    dir_v[slices.marginal.start] = 0.18;
+    dir_v[slices.logslope.start] = -0.22;
     dir_v[w_range.start] = 0.09;
     if w_range.len() > 1 {
         dir_v[w_range.start + 1] = 0.03;
