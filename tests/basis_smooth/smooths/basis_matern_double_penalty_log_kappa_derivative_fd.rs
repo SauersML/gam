@@ -109,7 +109,12 @@ fn spec_at(rho: f64, nu: MaternNu) -> MaternBasisSpec {
 /// the ψ-derivative lists.
 fn penalties_at(data: &Array2<f64>, rho: f64, nu: MaternNu) -> Vec<Array2<f64>> {
     let spec = spec_at(rho, nu);
-    build_matern_basis(data.view(), &spec).unwrap().penalties
+    build_matern_basis(data.view(), &spec)
+        .unwrap()
+        .active_penalties
+        .into_iter()
+        .map(|p| p.matrix)
+        .collect()
 }
 
 fn max_abs(a: &Array2<f64>) -> f64 {

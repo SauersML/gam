@@ -7794,3 +7794,232 @@ fn survival_sparse_tower4_full_t4_matches_dense_oracle_979() {
         "[979 isolation] full t4 max_abs_gap={max_abs_gap:e} max_rel_gap={max_rel_gap:e} over {n} rows"
     );
 }
+
+// ── #2352 ports: logslope block-jacobian production contract ────────────────
+//
+// Moved from `tests/survival/misc/frailty_scale_audit_plumbing.rs` and
+// `tests/survival/survival/survival_marginal_slope_jacobian_hyperbolic_correction.rs`
+// when `LogslopeBlockJacobian` construction went crate-internal (layout +
+// covariance record; probit scale read from the linearization state). The
+// old root-tree contract "Err when family_scalars is None at nonzero β" was
+// deliberately replaced by origin-linearization (q ≡ 0) for the pre-fit
+// structural audit, so the ports assert the CURRENT contract.
+
+fn logslope_port_design(n: usize, p: usize, seed: u64) -> Array2<f64> {
+    let mut out = Array2::<f64>::zeros((n, p));
+    let mut state = seed;
+    for i in 0..n {
+        for j in 0..p {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out[[i, j]] = ((state >> 33) as f64) / (u32::MAX as f64) - 0.5;
+        }
+    }
+    out
+}
+
+fn logslope_port_z(n: usize, seed: u64) -> Vec<f64> {
+    let mut state = seed ^ 0xdeadbeef;
+    (0..n)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            0.3 + ((state >> 33) as f64) / (u32::MAX as f64) * 1.4
+        })
+        .collect()
+}
+
+fn logslope_port_jacobian(
+    design: &Array2<f64>,
+    z: &[f64],
+) -> super::block_jacobians::LogslopeBlockJacobian {
+    let n = design.nrows();
+    let layout = LogslopeLayout::shared(DesignMatrix::from(design.clone()), Array1::zeros(n));
+    let z_mat = Array2::from_shape_fn((n, 1), |(i, _)| z[i]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0]).expect("unit covariance");
+    super::block_jacobians::LogslopeBlockJacobian::new(layout, Arc::new(z_mat), covariance)
+        .expect("logslope jacobian construction")
+}
+
+/// At β = 0 the logslope Jacobian's η0/η1 channels are `s·z_i·G[i,j]` with `s`
+/// read from `state.probit_frailty_scale` (NOT baked in at construction), and
+/// the ad1 channel is zero; two states with different `s` scale exactly.
+#[test]
+fn logslope_jacobian_reads_probit_scale_from_state_at_beta_zero() {
+    use crate::custom_family::{BlockEffectiveJacobian, FamilyLinearizationState};
+    let n = 40;
+    let p = 5;
+    let design = logslope_port_design(n, p, 42);
+    let z = logslope_port_z(n, 42);
+    let s_f = 0.75_f64;
+    let cb = logslope_port_jacobian(&design, &z);
+
+    let beta_zero = vec![0.0f64; p];
+    let jac_at = |s: f64| {
+        let state = FamilyLinearizationState {
+            beta: &beta_zero,
+            family_scalars: None,
+            channel_hessian: None,
+            probit_frailty_scale: s,
+        };
+        cb.effective_jacobian_at(&state)
+            .expect("beta=0 logslope jacobian")
+    };
+    let jac_sf = jac_at(s_f);
+    let jac_1 = jac_at(1.0);
+
+    assert_eq!(jac_sf.nrows(), 3 * n, "jacobian must have 3*n rows");
+    assert_eq!(jac_sf.ncols(), p, "jacobian must have p cols");
+    for i in 0..n {
+        for j in 0..p {
+            let expected = s_f * z[i] * design[[i, j]];
+            let got = jac_sf[[i, j]];
+            let err = (got - expected).abs();
+            assert!(
+                err / expected.abs().max(1e-14) < 1e-10 || err < 1e-12,
+                "eta0[{i},{j}]: got {got:.6e} expected {expected:.6e}"
+            );
+            let ad1 = jac_sf[[2 * n + i, j]];
+            assert!(ad1.abs() < 1e-12, "ad1[{i},{j}] must be 0 at beta=0: {ad1:.3e}");
+            if got.abs() > 1e-14 {
+                let ratio = jac_1[[i, j]] / got;
+                assert!(
+                    (ratio - 1.0 / s_f).abs() < 1e-10,
+                    "state probit scale must set the jacobian scale: ratio {ratio:.12} != {:.12}",
+                    1.0 / s_f
+                );
+            }
+        }
+    }
+}
+
+/// With populated `SurvivalMarginalSlopeFamilyScalars` at moderate β, the
+/// production logslope Jacobian carries the full hyperbolic correction
+/// `(q·dc/dg + s·z)·G` — FD-verified against the frozen-q η stack. Without
+/// scalars the same point linearizes q at the origin (pre-fit audit
+/// convention) and returns the pure `s·z_i·G` rows.
+#[test]
+fn logslope_jacobian_hyperbolic_correction_matches_fd_with_scalars() {
+    use crate::custom_family::{BlockEffectiveJacobian, FamilyLinearizationState};
+    use std::any::Any;
+    let n = 40;
+    let p = 5;
+    let design = logslope_port_design(n, p, 31415);
+    let z = logslope_port_z(n, 31415);
+    let s_f = 0.8_f64;
+    let cb = logslope_port_jacobian(&design, &z);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0]).expect("unit covariance");
+
+    // Moderate deterministic beta so g_i != 0 on every row scale.
+    let beta: Vec<f64> = (0..p)
+        .map(|j| 0.35 * ((j as f64 + 1.0) * 0.7).sin())
+        .collect();
+    let g: Vec<f64> = (0..n)
+        .map(|i| {
+            design
+                .row(i)
+                .iter()
+                .zip(beta.iter())
+                .map(|(&x, &b)| x * b)
+                .sum()
+        })
+        .collect();
+    assert!(g.iter().any(|&v| v.abs() > 0.05), "fixture must reach nonzero g");
+
+    // Frozen primary scalars (pilot q values held fixed for the FD functional).
+    let q0: Vec<f64> = (0..n).map(|i| -0.5 + 0.3 * z[i]).collect();
+    let q1: Vec<f64> = (0..n).map(|i| 0.2 + 0.4 * z[i]).collect();
+    let qd1: Vec<f64> = (0..n).map(|i| 0.5 + 0.1 * (z[i] * z[i]).min(2.0)).collect();
+    let slopes = Array2::from_shape_fn((n, 1), |(i, _)| g[i]);
+    let scalars: Arc<dyn Any + Send + Sync> = Arc::new(
+        SurvivalMarginalSlopeFamilyScalars::new(
+            q0.clone(),
+            q1.clone(),
+            qd1.clone(),
+            slopes,
+            None,
+            s_f,
+            &covariance,
+        )
+        .expect("family scalars"),
+    );
+    let state = FamilyLinearizationState {
+        beta: &beta,
+        family_scalars: Some(scalars),
+        channel_hessian: None,
+        probit_frailty_scale: s_f,
+    };
+    let jac = cb
+        .effective_jacobian_at(&state)
+        .expect("logslope jacobian with scalars");
+    assert_eq!(jac.nrows(), 3 * n);
+    assert_eq!(jac.ncols(), p);
+
+    // Central-difference reference of the frozen-q eta stack
+    //   eta0 = q0·c(β) + s·g(β)·z, eta1 likewise, ad1 = qd1·c(β),
+    //   c(β) = sqrt(1 + s²·g(β)²).
+    let eta_stack = |b: &[f64]| -> Vec<f64> {
+        let mut out = vec![0.0; 3 * n];
+        for i in 0..n {
+            let gi: f64 = design
+                .row(i)
+                .iter()
+                .zip(b.iter())
+                .map(|(&x, &bb)| x * bb)
+                .sum();
+            let c = (1.0 + s_f * s_f * gi * gi).sqrt();
+            out[i] = q0[i] * c + s_f * gi * z[i];
+            out[n + i] = q1[i] * c + s_f * gi * z[i];
+            out[2 * n + i] = qd1[i] * c;
+        }
+        out
+    };
+    let h = 1e-6;
+    let mut max_rel = 0.0_f64;
+    for col in 0..p {
+        let mut bp = beta.clone();
+        let mut bm = beta.clone();
+        bp[col] += h;
+        bm[col] -= h;
+        let ep = eta_stack(&bp);
+        let em = eta_stack(&bm);
+        for row in 0..3 * n {
+            let fd = (ep[row] - em[row]) / (2.0 * h);
+            let an = jac[[row, col]];
+            let denom = fd.abs().max(1e-8);
+            max_rel = max_rel.max((an - fd).abs() / denom);
+        }
+    }
+    assert!(
+        max_rel < 1e-5,
+        "logslope jacobian must carry the hyperbolic correction: max rel err vs FD = {max_rel:.3e}"
+    );
+
+    // Origin-linearized fallback: scalars=None at the SAME nonzero beta gives
+    // the pure s·z·G rows (q ≡ 0) with a zero ad1 channel.
+    let state_none = FamilyLinearizationState {
+        beta: &beta,
+        family_scalars: None,
+        channel_hessian: None,
+        probit_frailty_scale: s_f,
+    };
+    let jac_none = cb
+        .effective_jacobian_at(&state_none)
+        .expect("origin-linearized logslope jacobian");
+    for i in 0..n {
+        for j in 0..p {
+            let expected = s_f * z[i] * design[[i, j]];
+            let got = jac_none[[i, j]];
+            assert!(
+                (got - expected).abs() < 1e-10 * (1.0 + expected.abs()),
+                "origin-linearized eta0[{i},{j}]: got {got:.6e} expected {expected:.6e}"
+            );
+            assert!(
+                jac_none[[2 * n + i, j]].abs() < 1e-12,
+                "origin-linearized ad1 channel must be zero"
+            );
+        }
+    }
+}

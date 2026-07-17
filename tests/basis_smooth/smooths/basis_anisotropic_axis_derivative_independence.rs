@@ -71,7 +71,10 @@ fn anisotropic_penalty_contrast_derivative_matches_finite_difference() {
         trial.aniso_log_scales = Some(vec![delta, -delta]);
         build_matern_basiswithworkspace(data.view(), &trial, &mut BasisWorkspace::default())
             .unwrap()
-            .penalties
+            .active_penalties
+            .into_iter()
+            .map(|p| p.matrix)
+            .collect::<Vec<_>>()
     };
     let h = 1.0e-5;
     let plus = build_penalties_at(h);

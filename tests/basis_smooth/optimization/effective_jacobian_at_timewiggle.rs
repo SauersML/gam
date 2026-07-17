@@ -245,7 +245,6 @@ fn make_time_jac() -> SmsTimewiggleTimeJacobian {
     }
 
     let dm = design_marginal();
-    let dg = design_logslope();
     let (oe, ox, od) = offsets();
     let mo = marginal_offset();
 
@@ -254,7 +253,6 @@ fn make_time_jac() -> SmsTimewiggleTimeJacobian {
         Arc::new(dx),
         Arc::new(dd),
         Arc::new(dm),
-        Arc::new(dg),
         Arc::new(oe),
         Arc::new(ox),
         Arc::new(od),
@@ -263,8 +261,6 @@ fn make_time_jac() -> SmsTimewiggleTimeJacobian {
         WIGGLE_DEGREE,
         P_TW,
         P_M,
-        P_G,
-        1.0, // probit_scale = 1
     )
 }
 
@@ -286,7 +282,6 @@ fn make_marginal_jac() -> SmsTimewiggleMarginalJacobian {
     }
 
     let dm = design_marginal();
-    let dg = design_logslope();
     let (oe, ox, od) = offsets();
     let mo = marginal_offset();
 
@@ -295,7 +290,6 @@ fn make_marginal_jac() -> SmsTimewiggleMarginalJacobian {
         Arc::new(dx),
         Arc::new(dd),
         Arc::new(dm),
-        Arc::new(dg),
         Arc::new(oe),
         Arc::new(ox),
         Arc::new(od),
@@ -304,8 +298,6 @@ fn make_marginal_jac() -> SmsTimewiggleMarginalJacobian {
         WIGGLE_DEGREE,
         P_TIME,
         P_TW,
-        P_G,
-        1.0,
     )
 }
 

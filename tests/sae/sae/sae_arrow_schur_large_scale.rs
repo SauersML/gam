@@ -364,7 +364,7 @@ fn data_fit_beta_hessian_kronecker_matches_dense_reference() {
         .term
         .atoms
         .iter()
-        .map(|a| a.smooth_penalty.clone())
+        .map(|a| a.smooth_penalty().clone())
         .collect();
 
     let sys = f

@@ -63,6 +63,9 @@ fn fit_constant_exposure_cause_specific(event_counts: &[usize], n: usize) -> Arr
             offset_eta_exit: offset_exit.clone(),
             offset_derivative_exit: offset_derivative.clone(),
             derivative_floor: 0.0,
+            // The shared exit design is a single constant column, not a
+            // structural monotone I-spline time basis — no coefficient cone.
+            structural_time_columns: 0,
         });
         // The K cause-specific blocks share the constant `x_exit` design,
         // so the joint design carries K identical columns. The cause-specific

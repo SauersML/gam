@@ -30,10 +30,15 @@
 //! evaluation time, ensuring outer-loop σ updates (which rebuild the family
 //! with a new fixed σ) are reflected without requiring spec reconstruction.
 
+// The direct `LogslopeBlockJacobian` construction tests moved in-crate
+// (crates/gam-models/src/survival/marginal_slope/tests.rs::
+// logslope_jacobian_reads_probit_scale_from_state_at_beta_zero) when the
+// constructor went crate-internal (#2352). The public-surface guards below
+// (RowScaledJacobian scaling and the identifiability audit) remain here.
+
 use gam::custom_family::{
     BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec, RowScaledJacobian,
 };
-use gam::families::survival::marginal_slope::LogslopeBlockJacobian;
 use gam::identifiability::audit::audit_identifiability;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::{Array1, Array2};
@@ -113,73 +118,6 @@ fn make_marginal_spec(design: &Array2<f64>) -> ParameterBlockSpec {
     }
 }
 
-/// At β=0 the logslope Jacobian's η0 channel should equal s_f · z_i · G[i,j].
-/// Verify that the Jacobian from `effective_jacobian_at` with
-/// `probit_frailty_scale = s_f` has the right s_f scaling.
-#[test]
-fn logslope_jacobian_incorporates_sf_from_state_at_beta_zero() {
-    let design = make_design(42);
-    let z = make_z(42);
-    let s_f = 0.75_f64; // σ = √(1/s_f² − 1) ≈ 0.882
-
-    let jac_cb = LogslopeBlockJacobian::new(design.clone(), z.clone(), s_f);
-
-    let beta_zero = vec![0.0f64; P];
-
-    // State with the correct s_f.
-    let state_sf = FamilyLinearizationState {
-        beta: &beta_zero,
-        family_scalars: None,
-        channel_hessian: None,
-        probit_frailty_scale: s_f,
-    };
-    let jac_sf = jac_cb
-        .effective_jacobian_at(&state_sf)
-        .expect("effective_jacobian_at with s_f must succeed");
-
-    // State with s_f = 1.0 (no frailty default).
-    let state_1 = FamilyLinearizationState {
-        beta: &beta_zero,
-        family_scalars: None,
-        channel_hessian: None,
-        probit_frailty_scale: 1.0,
-    };
-    let jac_1 = jac_cb
-        .effective_jacobian_at(&state_1)
-        .expect("effective_jacobian_at with s_f=1 must succeed");
-
-    assert_eq!(jac_sf.nrows(), 3 * N, "Jacobian must have 3*N rows");
-    assert_eq!(jac_sf.ncols(), P, "Jacobian must have P cols");
-
-    // At β=0 and no family_scalars, the η0 and η1 rows are s_f·z_i·G[i,j].
-    // The ad1 rows are zero.
-    // So jac_sf[i,j] / jac_1[i,j] == s_f for all i,j where z_i != 0.
-    let mut max_ratio_err = 0.0_f64;
-    for i in 0..N {
-        for j in 0..P {
-            let got_sf = jac_sf[[i, j]];
-            let got_1 = jac_1[[i, j]];
-            let expected = s_f * z[i] * design[[i, j]];
-            let err_sf = (got_sf - expected).abs();
-            let denom = expected.abs().max(1e-14);
-            assert!(
-                err_sf / denom < 1e-10 || err_sf < 1e-12,
-                "η0[{i},{j}]: got {got_sf:.6e} expected {expected:.6e}",
-            );
-            // jac_1 should be 1/s_f times jac_sf (since s_f→1.0 means scale by 1/s_f).
-            if got_sf.abs() > 1e-14 {
-                let ratio = got_1 / got_sf;
-                max_ratio_err = max_ratio_err.max((ratio - 1.0 / s_f).abs());
-            }
-        }
-    }
-    assert!(
-        max_ratio_err < 1e-10,
-        "Ratio jac_1/jac_sf must equal 1/s_f = {:.6} everywhere; max err = {max_ratio_err:.3e}",
-        1.0 / s_f,
-    );
-}
-
 /// The logslope spec's `RowScaledJacobian` uses s_f·z, not bare z.
 /// Verify that the flat single-output effective Jacobian (via `RowScaledJacobian`)
 /// has the correct s_f factor.
@@ -250,77 +188,3 @@ fn audit_marginal_logslope_not_aliased_under_nontrivial_sf() {
     );
 }
 
-/// Changing s_f changes the effective Jacobian: two specs with the same design
-/// and z but different s_f values must produce different effective Jacobians
-/// at β=0 — confirming s_f is consumed at eval time, not baked in at construction.
-#[test]
-fn different_sf_values_produce_different_jacobians() {
-    let design = make_design(999);
-    let z = make_z(999);
-
-    let s_f_a = 1.0_f64;
-    let s_f_b = 0.5_f64;
-
-    // Both specs use the same design and z, but different s_f captured at construction.
-    let jac_a = LogslopeBlockJacobian::new(design.clone(), z.clone(), s_f_a);
-    let jac_b = LogslopeBlockJacobian::new(design.clone(), z.clone(), s_f_b);
-
-    let beta_zero = vec![0.0f64; P];
-
-    // Test with state.probit_frailty_scale = s_f_b for both callbacks.
-    // jac_b should return s_f_b·z·G; jac_a should return s_f_b·z·G too (state wins).
-    let state_b = FamilyLinearizationState {
-        beta: &beta_zero,
-        family_scalars: None,
-        channel_hessian: None,
-        probit_frailty_scale: s_f_b,
-    };
-    let out_a_with_b_state = jac_a
-        .effective_jacobian_at(&state_b)
-        .expect("effective_jacobian_at a with s_f_b state");
-    let out_b_with_b_state = jac_b
-        .effective_jacobian_at(&state_b)
-        .expect("effective_jacobian_at b with s_f_b state");
-
-    // Both should agree: state value takes precedence over captured self.s.
-    let max_diff: f64 = out_a_with_b_state
-        .iter()
-        .zip(out_b_with_b_state.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0_f64, f64::max);
-    assert!(
-        max_diff < 1e-12,
-        "When state.probit_frailty_scale = s_f_b, both callbacks (constructed with s_f_a \
-         and s_f_b) must produce the same Jacobian (state wins); max diff = {max_diff:.3e}",
-    );
-
-    // With s_f_a state vs s_f_b state, jac_a should differ by ratio s_f_a/s_f_b on each row.
-    let state_a = FamilyLinearizationState {
-        beta: &beta_zero,
-        family_scalars: None,
-        channel_hessian: None,
-        probit_frailty_scale: s_f_a,
-    };
-    let out_a_with_a_state = jac_a
-        .effective_jacobian_at(&state_a)
-        .expect("effective_jacobian_at a with s_f_a state");
-
-    // At β=0: row i should scale by s_f; ratio = s_f_a / s_f_b = 2.0.
-    let expected_ratio = s_f_a / s_f_b;
-    let mut max_ratio_err = 0.0_f64;
-    for i in 0..N {
-        for j in 0..P {
-            let with_a = out_a_with_a_state[[i, j]];
-            let with_b = out_a_with_b_state[[i, j]];
-            if with_b.abs() > 1e-14 {
-                let ratio = with_a / with_b;
-                max_ratio_err = max_ratio_err.max((ratio - expected_ratio).abs());
-            }
-        }
-    }
-    assert!(
-        max_ratio_err < 1e-10,
-        "η0 rows at β=0: ratio with_s_f_a/with_s_f_b must equal {expected_ratio:.2}; \
-         max err = {max_ratio_err:.3e}",
-    );
-}

@@ -49,6 +49,9 @@ fn fake_audit(effective_dims: &[usize], original_dims: &[usize]) -> Identifiabil
             original_dim: orig,
             effective_dim: eff,
             design_range_rank: eff,
+            // Populated only for within-block rank deficiency; these fake
+            // audit blocks are full-rank by construction.
+            singular_spectrum: String::new(),
         })
         .collect();
     // Pilot drops: any column where effective < original.

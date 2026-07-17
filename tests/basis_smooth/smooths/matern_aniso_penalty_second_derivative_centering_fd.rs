@@ -44,7 +44,10 @@ fn realized_penalties_at_psi(
     trial.aniso_log_scales = Some(eta);
     build_matern_basiswithworkspace(data.view(), &trial, &mut BasisWorkspace::default())
         .expect("realized aniso penalty build")
-        .penalties
+        .active_penalties
+        .into_iter()
+        .map(|p| p.matrix)
+        .collect()
 }
 
 #[test]
