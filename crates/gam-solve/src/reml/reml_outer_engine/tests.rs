@@ -3840,7 +3840,16 @@ pub(crate) fn callback_outer_hessian_ignores_generic_large_n_small_p_crossover()
 
 #[test]
 pub(crate) fn outer_hessian_route_respects_dense_workspace_budget() {
-    let plan = outer_hessian_route_plan(10_000, 10_000, 2, true, true, false);
+    // The budget comes from the host's resource policy (#2317: host
+    // MemAvailable), so a FIXED p only exceeds it on small machines. Derive a
+    // p just past THIS host's budget — the route decision is pure size
+    // arithmetic, nothing is allocated — so the memory-budget arm (checked
+    // before every other scale rule) fires on any host.
+    let k = 2usize;
+    let per_matrix_bytes = 8usize * (2 * k + 3);
+    let budget = outer_hessian_dense_workspace_budget_bytes();
+    let p_over_budget = ((budget / per_matrix_bytes) as f64).sqrt() as usize + 2;
+    let plan = outer_hessian_route_plan(10_000, p_over_budget, k, true, true, false);
     assert!(plan.use_operator);
     assert_eq!(plan.reason, "dense_memory_budget");
     assert!(plan.dense_workspace_bytes > outer_hessian_dense_workspace_budget_bytes());

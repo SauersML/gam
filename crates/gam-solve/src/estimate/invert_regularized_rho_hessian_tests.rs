@@ -95,10 +95,17 @@ fn structurally_certified_zero_direction_uses_pseudoinverse() {
     assert_eq!(inv.active_rank, 3, "expected three identified directions");
     assert_eq!(inv.structural_zero, 1);
     assert!(inv.used_structural_pseudoinverse);
-    assert!(matches!(
-        inv.classifications.last(),
-        Some(EigenClassification::StructuralZero)
-    ));
+    // Exactly one eigenpair classifies as the certified structural zero; its
+    // POSITION in the classification list is an eigensolver ordering detail,
+    // not part of the contract.
+    assert_eq!(
+        inv.classifications
+            .iter()
+            .filter(|class| matches!(class, EigenClassification::StructuralZero))
+            .count(),
+        1,
+        "exactly one structural-zero classification expected"
+    );
 
     let v_flat = q.column(3).to_owned();
     let inv_vflat = inv.inverse.dot(&v_flat);
