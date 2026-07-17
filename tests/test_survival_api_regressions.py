@@ -251,25 +251,25 @@ def test_joint_competing_risks_survival_is_reachable_from_fit(tmp_path) -> None:
         assert np.all(eta <= eta_upper)
         assert np.any(np.asarray(interval_pred.cif_se, dtype=float) > 0.0)
 
-        # Current cause-specific custom-family fits carry a complete joint
-        # conditional covariance but no smoothing correction. The public
-        # default is required smoothing, so both the omitted mode and the
-        # explicit spelling must refuse rather than relabeling Vb as Vp.
+        # #2346: cause-specific custom-family fits now carry the smoothing-
+        # corrected joint covariance (first-order rho-uncertainty inflation
+        # with FirstOrderIdentifiedSubspace provenance), so the omitted mode
+        # and the explicit spelling both succeed and report the corrected
+        # provenance — never a silent relabeling of Vb as Vp.
         for requested_mode in (None, "smoothing"):
             kwargs = (
                 {}
                 if requested_mode is None
                 else {"covariance_mode": requested_mode}
             )
-            try:
-                model.predict(rows, interval=0.9, **kwargs)
-            except gamfit.GamError as error:
-                assert "smoothing-corrected covariance" in str(error)
-            else:
-                raise AssertionError(
-                    f"{likelihood_mode}/{requested_mode}: corrected covariance "
-                    "request silently used conditional covariance"
-                )
+            corrected_pred = model.predict(rows, interval=0.9, **kwargs)
+            assert corrected_pred.covariance_source == "smoothing-corrected", (
+                f"{likelihood_mode}/{requested_mode}: expected smoothing-corrected "
+                f"provenance, got {corrected_pred.covariance_source!r}"
+            )
+            assert np.any(
+                np.asarray(corrected_pred.cif_se, dtype=float) > 0.0
+            ), f"{likelihood_mode}/{requested_mode}: corrected CIF SEs are all zero"
 
 
 def test_survival_location_scale_regressor_prediction_does_not_saturate() -> None:
