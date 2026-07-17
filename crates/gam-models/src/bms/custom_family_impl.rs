@@ -2845,6 +2845,12 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_aa_dir = vec![0.0; n_dirs];
         let mut f_au_dir = vec![0.0; n_dirs * r];
         let mut f_uv_dir = vec![0.0; n_dirs * r * r];
+        // Intercept a-chain of the second-order calibration moments; these are
+        // direction-independent and promote the explicit directional moments to
+        // TOTAL derivatives through the moving intercept root (#2347).
+        let mut f_aaa = 0.0;
+        let mut f_aau = Array1::<f64>::zeros(r);
+        let mut f_auv = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
         let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
@@ -2889,6 +2895,9 @@ impl BernoulliMarginalSlopeFamily {
             &mut f_aa_dir,
             &mut f_au_dir,
             &mut f_uv_dir,
+            &mut f_aaa,
+            &mut f_aau,
+            &mut f_auv,
         )?;
 
         f_u[0] = -marginal.mu1;
@@ -3067,15 +3076,25 @@ impl BernoulliMarginalSlopeFamily {
 
             for u in 0..r {
                 for v in u..r {
-                    let fuvd = f_uv_dir[dir_base + u * r + v];
+                    // Promote the explicit (a-fixed) directional calibration
+                    // moments to TOTAL directional derivatives through the
+                    // moving intercept root: `d/d_dir f = f_dir_explicit +
+                    // (∂f/∂a)·a_dir` with `∂f_a/∂a = f_aa`, `∂f_aa/∂a = f_aaa`,
+                    // `∂f_au[p]/∂a = f_aau[p]`, `∂f_uv[l,r]/∂a = f_auv[l,r]`
+                    // (#2347).
+                    let fuvd = f_uv_dir[dir_base + u * r + v] + f_auv[[u, v]] * a_dir;
+                    let f_au_dir_u = f_au_dir[dir_idx * r + u] + f_aau[u] * a_dir;
+                    let f_au_dir_v = f_au_dir[dir_idx * r + v] + f_aau[v] * a_dir;
+                    let f_aa_dir_total = f_aa_dir[dir_idx] + f_aaa * a_dir;
+                    let f_a_dir_total = f_a_dir[dir_idx] + f_aa * a_dir;
                     let n_dir = fuvd
-                        + f_au_dir[dir_idx * r + u] * a_u[v]
+                        + f_au_dir_u * a_u[v]
                         + f_au[u] * a_u_dir[v]
-                        + f_au_dir[dir_idx * r + v] * a_u[u]
+                        + f_au_dir_v * a_u[u]
                         + f_au[v] * a_u_dir[u]
-                        + f_aa_dir[dir_idx] * a_u[u] * a_u[v]
+                        + f_aa_dir_total * a_u[u] * a_u[v]
                         + f_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v]);
-                    let a_uv_dir = -(n_dir + f_a_dir[dir_idx] * a_uv[[u, v]]) * inv_f_a;
+                    let a_uv_dir = -(n_dir + f_a_dir_total * a_uv[[u, v]]) * inv_f_a;
                     let third_coeff = g_jet.pair_directional_from_bb_family(
                         g_jet.bb_first,
                         u,

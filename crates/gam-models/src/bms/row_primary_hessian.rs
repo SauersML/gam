@@ -3938,6 +3938,13 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_aa_dirs = [0.0];
         let mut f_au_dirs = vec![0.0; r];
         let mut f_uv_dirs = vec![0.0; r * r];
+        // Intercept a-chain of the second-order calibration moments (see
+        // `accumulate_primary_third_cell_moments`): needed to make the
+        // directional third moments TOTAL derivatives through the moving
+        // intercept root (#2347).
+        let mut f_aaa = 0.0;
+        let mut f_aau = Array1::<f64>::zeros(r);
+        let mut f_auv = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
         let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
@@ -3981,6 +3988,9 @@ impl BernoulliMarginalSlopeFamily {
             &mut f_aa_dirs,
             &mut f_au_dirs,
             &mut f_uv_dirs,
+            &mut f_aaa,
+            &mut f_aau,
+            &mut f_auv,
         )?;
         let f_a_dir = f_a_dirs[0];
         let f_aa_dir = f_aa_dirs[0];
@@ -4181,14 +4191,26 @@ impl BernoulliMarginalSlopeFamily {
                 BmsFlexRowOrder3FinalizerNode::ImplicitDirectionalSecond {
                     left, right, ..
                 } => {
-                    let numerator = f_uv_dir[[left, right]]
-                        + f_au_dir[left] * a_u[right]
+                    // The intercept `a(θ)` moves with the direction, so the
+                    // explicit (a-fixed) directional calibration moments must be
+                    // promoted to TOTAL directional derivatives before entering
+                    // the third-order IFT: `d/d_dir f = f_dir_explicit +
+                    // (∂f/∂a)·a_dir`. `∂f_a/∂a = f_aa`, `∂f_aa/∂a = f_aaa`,
+                    // `∂f_au[p]/∂a = f_aau[p]`, `∂f_uv[l,r]/∂a = f_auv[l,r]`.
+                    // Omitting this a-chain is the #2347 defect.
+                    let f_uv_dir_total = f_uv_dir[[left, right]] + f_auv[[left, right]] * a_dir;
+                    let f_au_dir_left = f_au_dir[left] + f_aau[left] * a_dir;
+                    let f_au_dir_right = f_au_dir[right] + f_aau[right] * a_dir;
+                    let f_aa_dir_total = f_aa_dir + f_aaa * a_dir;
+                    let f_a_dir_total = f_a_dir + f_aa * a_dir;
+                    let numerator = f_uv_dir_total
+                        + f_au_dir_left * a_u[right]
                         + f_au[left] * a_u_dir[right]
-                        + f_au_dir[right] * a_u[left]
+                        + f_au_dir_right * a_u[left]
                         + f_au[right] * a_u_dir[left]
-                        + f_aa_dir * a_u[left] * a_u[right]
+                        + f_aa_dir_total * a_u[left] * a_u[right]
                         + f_aa * (a_u_dir[left] * a_u[right] + a_u[left] * a_u_dir[right]);
-                    let value = -(numerator + f_a_dir * a_uv[[left, right]]) * inv_f_a;
+                    let value = -(numerator + f_a_dir_total * a_uv[[left, right]]) * inv_f_a;
                     a_uv_dir[[left, right]] = value;
                     a_uv_dir[[right, left]] = value;
                 }
@@ -5193,6 +5215,9 @@ impl BernoulliMarginalSlopeFamily {
         f_aa_dir: &mut [f64],
         f_au_dir: &mut [f64],
         f_uv_dir: &mut [f64],
+        f_aaa: &mut f64,
+        f_aau: &mut Array1<f64>,
+        f_auv: &mut Array2<f64>,
     ) -> Result<(), String> {
         use super::exact_kernel as exact;
 
@@ -5221,6 +5246,9 @@ impl BernoulliMarginalSlopeFamily {
             let dc_daa = scale_coeff4(dc_daa_raw, scale);
             let dc_dab = scale_coeff4(dc_dab_raw, scale);
             let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
+            // `denested_third.0` is `∂³coeff/∂a³` (`dc_daaa`); the intercept
+            // a-chain of the second-order moments (below) needs it.
+            let dc_daaa = scale_coeff4(denested_third.0, scale);
             let dc_daab = scale_coeff4(denested_third.1, scale);
             let dc_dabb = scale_coeff4(denested_third.2, scale);
             let dc_dbbb = scale_coeff4(denested_third.3, scale);
@@ -5356,6 +5384,77 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(())
                 },
             )?;
+
+            // Intercept a-chain of the second-order calibration moments:
+            // `f_aaa = ∂³M/∂a³`, `f_aau[p] = ∂³M/∂a²∂θp`, `f_auv[l,r] = ∂³M/∂a∂θl∂θr`,
+            // where `M(a, θ)` is the calibration moment `∫ μ(η) φ`. These are the
+            // pieces the third-order intercept IFT needs to promote the (a-fixed)
+            // explicit directional moments `f_*_dir` into TOTAL directional
+            // derivatives: the intercept `a(θ)` moves with every primary
+            // direction, so `d/d_dir f_uv = f_uv_dir_explicit + f_auv·a_dir`
+            // (and likewise for `f_a`, `f_aa`, `f_au`). Dropping this a-chain is
+            // the #2347 defect (pure-q third off by the whole `f_aaa·a_q³ +
+            // f_aa·a_q·a_qq` block). Only `a` moves here, so these are ordinary
+            // third moments with the intercept coefficient `dc_da` occupying one,
+            // two, or three of the derivative slots. Index 0 (the marginal `q`)
+            // enters `M` only through `a`, so its rows/entries stay zero — the
+            // `1..r` loops below leave them untouched, matching the manual
+            // `-mu*` q-corrections applied by the callers.
+            *f_aaa += exact::cell_third_derivative_from_moments(
+                cell,
+                &dc_da,
+                &dc_da,
+                &dc_da,
+                &dc_daa,
+                &dc_daa,
+                &dc_daa,
+                &dc_daaa,
+                &state.moments,
+            )?;
+            for primary in 1..r {
+                f_aau[primary] += exact::cell_third_derivative_from_moments(
+                    cell,
+                    &dc_da,
+                    &dc_da,
+                    &coeff_jet.first[primary],
+                    &dc_daa,
+                    &coeff_jet.a_first[primary],
+                    &coeff_jet.a_first[primary],
+                    &coeff_jet.aa_first[primary],
+                    &state.moments,
+                )?;
+            }
+            for left in 1..r {
+                for right in left..r {
+                    let second_lr = coeff_jet.pair_from_b_family(
+                        coeff_jet.b_first,
+                        left,
+                        right,
+                        COEFF_SUPPORT_BHW,
+                    );
+                    let third_alr = coeff_jet.pair_from_b_family(
+                        coeff_jet.ab_first,
+                        left,
+                        right,
+                        COEFF_SUPPORT_BW,
+                    );
+                    let value = exact::cell_third_derivative_from_moments(
+                        cell,
+                        &dc_da,
+                        &coeff_jet.first[left],
+                        &coeff_jet.first[right],
+                        &coeff_jet.a_first[left],
+                        &coeff_jet.a_first[right],
+                        &second_lr,
+                        &third_alr,
+                        &state.moments,
+                    )?;
+                    f_auv[[left, right]] += value;
+                    if left != right {
+                        f_auv[[right, left]] += value;
+                    }
+                }
+            }
 
             let mut coeff_dir = [0.0; 4];
             let mut coeff_a_dir = [0.0; 4];
