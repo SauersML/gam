@@ -625,9 +625,16 @@ pub fn fit_penalized_multinomial(
         );
     }
     let m = k - 1;
-    if lambdas.len() != m {
+    // #2344: the fixed-λ contract is K per-CLASS lambdas (reference class
+    // included), matching the permutation-equivariant carrier the REML route
+    // selects (1326d0794). K−1 per-CONTRAST lambdas anchored the smoothing to
+    // the arbitrary ALR baseline — relabeling the classes changed the fitted
+    // model. No backcompat shim: K lambdas is the honest contract for nominal
+    // classes.
+    if lambdas.len() != k {
         crate::bail_invalid_estim!(
-            "fit_penalized_multinomial: lambdas length {} ≠ K-1 = {m}",
+            "fit_penalized_multinomial: lambdas length {} ≠ K = {k} (one λ per class, \
+             reference class included — the permutation-equivariant per-class contract, #2344)",
             lambdas.len()
         );
     }
@@ -715,11 +722,11 @@ pub fn fit_penalized_multinomial(
             fisher_w_override,
             max_iter,
             tol,
-            // #1587: production multinomial still uses the per-class Diagonal
-            // metric pending the REML per-class→per-term λ re-key that the
-            // reference-symmetric Centered metric requires (shared λ). The
-            // Centered engine path + its invariance proof land first.
-            class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Diagonal,
+            // #2344: the permutation-equivariant per-class metric — the fixed-λ
+            // twin of the REML equivariant carrier (1326d0794). K per-class
+            // lambdas on the centered class functions; reference-free by
+            // construction, collapsing to the shared Centered metric at equal λ.
+            class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::EquivariantPerClass,
             resume_from: vector_resume,
         },
         &likelihood,
@@ -1069,13 +1076,19 @@ fn fit_penalized_multinomial_firth_fallback(
                 }
             }
         }
+        // #2344: equivariant per-class penalty ½·Σ_{a,b} A[a,b]·β_aᵀSβ_b —
+        // the same metric the shared vector-GLM engine applies, so the Firth
+        // arm optimizes the identical reference-free objective.
+        let a_mat = crate::penalized_vector_glm::equivariant_class_metric(lambdas, m);
         let mut pen = 0.0_f64;
         for a in 0..m {
-            let la = lambdas[a];
-            if la != 0.0 {
-                let bcol = beta.column(a);
-                let sbeta = penalty.dot(&bcol);
-                pen += 0.5 * la * bcol.dot(&sbeta);
+            let bcol = beta.column(a);
+            for b in 0..m {
+                let coef = a_mat[[a, b]];
+                if coef != 0.0 {
+                    let sbeta = penalty.dot(&beta.column(b));
+                    pen += 0.5 * coef * bcol.dot(&sbeta);
+                }
             }
         }
         ll - pen + 0.5 * logdet_info
@@ -1147,30 +1160,40 @@ fn fit_penalized_multinomial_firth_fallback(
                     }
                 }
             }
-            // Smoothing penalty gradient: U[(a,i)] −= λ_a (S β_a)_i.
-            for a in 0..m {
-                let la = lambdas[a];
-                if la != 0.0 {
-                    let sbeta = penalty.dot(&beta.column(a));
+            // Smoothing penalty gradient (#2344 equivariant metric):
+            // U[(a,i)] −= Σ_b A[a,b]·(S β_b)_i.
+            let a_mat = crate::penalized_vector_glm::equivariant_class_metric(lambdas, m);
+            for b in 0..m {
+                let sbeta = penalty.dot(&beta.column(b));
+                for a in 0..m {
+                    let coef = a_mat[[a, b]];
+                    if coef == 0.0 {
+                        continue;
+                    }
                     let ao = a * p;
                     for i in 0..p {
-                        u[ao + i] -= la * sbeta[i];
+                        u[ao + i] -= coef * sbeta[i];
                     }
                 }
             }
             u
         };
 
-    // Penalized Hessian H = I + blockdiag_a(λ_a S) (positive definite).
+    // Penalized Hessian H = I + A(λ) ⊗ S (#2344 equivariant metric; PSD sum
+    // of rank-1 class projections, so H stays positive definite).
     let penalized_hessian = |info: &Array2<f64>| -> Array2<f64> {
         let mut h = info.clone();
+        let a_mat = crate::penalized_vector_glm::equivariant_class_metric(lambdas, m);
         for a in 0..m {
-            let la = lambdas[a];
-            if la != 0.0 {
-                let ao = a * p;
+            for b in 0..m {
+                let coef = a_mat[[a, b]];
+                if coef == 0.0 {
+                    continue;
+                }
+                let (ao, bo) = (a * p, b * p);
                 for i in 0..p {
                     for j in 0..p {
-                        h[[ao + i, ao + j]] += la * penalty[[i, j]];
+                        h[[ao + i, bo + j]] += coef * penalty[[i, j]];
                     }
                 }
             }
@@ -1338,11 +1361,19 @@ fn fit_penalized_multinomial_firth_fallback(
         }
     }
 
+    // #2344 equivariant metric: the reported penalty term matches the
+    // objective the solve optimized.
+    let a_mat = crate::penalized_vector_glm::equivariant_class_metric(lambdas, m);
     let mut penalty_term = 0.0_f64;
     for a in 0..m {
         let beta_col = coefficients_active.column(a);
-        let sbeta = penalty.dot(&beta_col);
-        penalty_term += 0.5 * lambdas[a] * beta_col.dot(&sbeta);
+        for b in 0..m {
+            let coef = a_mat[[a, b]];
+            if coef != 0.0 {
+                let sbeta = penalty.dot(&coefficients_active.column(b));
+                penalty_term += 0.5 * coef * beta_col.dot(&sbeta);
+            }
+        }
     }
 
     // Recompute the Firth score and Newton decrement AT the final accepted
@@ -3398,7 +3429,8 @@ mod fisher_override_tests {
             y[[i, i % k]] = 1.0;
         }
         let penalty = Array2::<f64>::eye(p);
-        let lambdas = Array1::<f64>::from_elem(k - 1, 0.5);
+        // #2344: K per-class lambdas (reference class included).
+        let lambdas = Array1::<f64>::from_elem(k, 0.5);
         (design, y, penalty, lambdas)
     }
 
@@ -3803,7 +3835,8 @@ mod fisher_override_tests {
             y[[row, class]] = 1.0;
         }
         let penalty = Array2::<f64>::zeros((2, 2));
-        let lambdas = Array1::<f64>::zeros(2);
+        // #2344: K per-class lambdas (reference class included); K = 3 here.
+        let lambdas = Array1::<f64>::zeros(3);
         let out = fit_penalized_multinomial(MultinomialFitInputs {
             design: design.view(),
             y_one_hot: y.view(),
@@ -4114,7 +4147,8 @@ mod separation_firth_tests {
         }
         // S = 0: no smoothing direction can bound the separated logits.
         let penalty = Array2::<f64>::zeros((p, p));
-        let lambdas = Array1::<f64>::from_elem(k - 1, 1.0);
+        // #2344: K per-class lambdas (reference class included).
+        let lambdas = Array1::<f64>::from_elem(k, 1.0);
         (design, y, penalty, lambdas)
     }
 

@@ -773,14 +773,20 @@ fn latent_multi_output_fit_to_pydict<'py>(
     }
 
     // Per-class smoothing pulled from `init_lambda`: the latent path is a
-    // fixed-λ inner solve, so every active class shares the same λ. REML
-    // selection per class is a separate slice (issue #349 follow-up).
+    // fixed-λ inner solve, so every class shares the same λ. REML selection
+    // per class is a separate slice (issue #349 follow-up).
     let active_outputs = if multinomial {
         n_outputs - 1
     } else {
         n_outputs
     };
-    let lambdas_vec = Array1::<f64>::from_elem(active_outputs, lambda);
+    // #2344: the multinomial fixed-λ contract is K per-CLASS lambdas
+    // (reference class included; the equivariant metric collapses to the
+    // shared Centered penalty at uniform λ, so a uniform vector preserves the
+    // intended "one shared λ" semantics reference-freely). Binomial-multi
+    // keeps one λ per independent output column. Both are `n_outputs` long —
+    // the wire K — with different meanings per family.
+    let lambdas_vec = Array1::<f64>::from_elem(n_outputs, lambda);
 
     let max_iter = 50usize;
     let tol = 1.0e-7_f64;
@@ -952,8 +958,10 @@ fn latent_multi_output_fit_to_pydict<'py>(
 /// stacked Newton solve.
 ///
 /// REML / LAML λ selection is a separate slice (the multinomial CustomFamily
-/// outer that lifts this driver into the ρ loop). Until that lands, callers
-/// pass an explicit `lambdas` vector (length `K - 1`).
+/// outer that lifts this driver into the ρ loop). Callers pass an explicit
+/// `lambdas` vector of length `K` — one λ per CLASS, reference included
+/// (#2344: the permutation-equivariant per-class contract; the penalty is
+/// `Σ_c λ_c·γ_cᵀSγ_c` on the centered class functions, reference-free).
 #[pyfunction(signature = (
     design,
     y_one_hot,
