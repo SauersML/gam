@@ -4592,6 +4592,29 @@ mod reference_class_invariance_tests {
             "#2349 V(rho*)={v0:.9e} (the refusal reported final objective 2.687403e2 \
              at this checkpoint — a mismatch here means reml_score is not the outer criterion)"
         );
+        // Term-for-term decomposition of the fixed-ρ score so the ~12.5 offset
+        // from the outer criterion can be attributed to a specific missing
+        // term. A ρ-CONSTANT offset leaves the FD gradient verdict intact; a
+        // missing ½·log|S_λ|₊ (strongly ρ-dependent, O(1) gradient per
+        // coordinate) would contaminate it.
+        {
+            let fam = parts
+                .family
+                .clone()
+                .with_joint_initial_log_lambdas(rho_star.to_vec());
+            let fit = crate::custom_family::fit_custom_family_fixed_log_lambdas(
+                &fam,
+                &parts.blocks,
+                &probe_options,
+                None,
+            )
+            .expect("fixed-lambda decomposition fit at the checkpoint");
+            eprintln!(
+                "#2349 decompose: reml_score={:.9e} penalized_objective={:.9e} \
+                 log_likelihood={:.9e} deviance={:.9e}",
+                fit.reml_score, fit.penalized_objective, fit.log_likelihood, fit.deviance
+            );
+        }
         let h = 1.0e-3;
         let mut grad_fd = [0.0_f64; 6];
         for s in 0..6 {
