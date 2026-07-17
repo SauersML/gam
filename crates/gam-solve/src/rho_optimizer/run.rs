@@ -2545,12 +2545,18 @@ fn try_tail_snap_to_rail(
             None => continue,
         };
         let h_kk = hessian[[k, k]];
-        let ratio = h_kk / g_k.abs();
-        if !(h_kk > 0.0)
-            || !(TAIL_SNAP_CURVATURE_BAND.0..=TAIL_SNAP_CURVATURE_BAND.1).contains(&ratio)
-        {
+        // The tie is judged on |H_kk|/|g_k| — MAGNITUDE only. On the exact
+        // tail `H_kk = |g_k|` (positive), but the assembled ρ-Hessian's tail
+        // entry is `λV_λ + λ²V_λλ`, and when the `λ²V_λλ` trace pair cancels
+        // to roundoff in the deep-smoothing regime (the #2298 rail-cancellation
+        // class), what survives is `λV_λ = g_k` — magnitude right, SIGN
+        // flipped (measured on the #2299 fixture: g=-1.040e-2, H_kk=-1.018e-2,
+        // ratio -0.979). The sign at the tail is exactly the corrupted datum,
+        // so it cannot gate; the probing confirmation is the rigorous test.
+        let ratio = h_kk.abs() / g_k.abs();
+        if !(TAIL_SNAP_CURVATURE_BAND.0..=TAIL_SNAP_CURVATURE_BAND.1).contains(&ratio) {
             rejected.push(format!(
-                "k={k}: g={g_k:.3e} H_kk={h_kk:.3e} ratio={ratio:.3e} outside tie band"
+                "k={k}: g={g_k:.3e} H_kk={h_kk:.3e} |ratio|={ratio:.3e} outside tie band"
             ));
             continue;
         }
