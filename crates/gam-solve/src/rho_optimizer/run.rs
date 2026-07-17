@@ -2247,11 +2247,13 @@ fn certify_outer_optimality_at_terminal_fidelity(
     // inner problem at the snapped point and judges it with the FULL Inc 1
     // rail discipline — this path grants nothing by itself. On a refused snap
     // the checkpoint is restored and the ordinary refusal below proceeds.
+    let mut tail_snap_note: Option<String> = None;
     if allow_tail_snap
         && !certificate.certifies()
         && grad_norm > stationarity_bound
         && let Some(hessian) = analytic_hessian.as_ref()
-        && let Some(snapped) = try_tail_snap_to_rail(
+    {
+        match try_tail_snap_to_rail(
             obj,
             &AsymptoteRailInputs {
                 rho: &result.rho,
@@ -2263,40 +2265,50 @@ fn certify_outer_optimality_at_terminal_fidelity(
                 stationarity_bound,
                 context,
             },
-        )?
-    {
-        let original_rho = result.rho.clone();
-        // The run-recorded first-order evidence describes the PRE-snap point;
-        // the recursive certification must not consume it as a same-ρ second
-        // measurement for its gradient-reproducibility floor.
-        let saved_gradient = result.final_gradient.take();
-        result.final_value = f64::NAN;
-        log::info!(
-            "[CERTIFICATE] {context}: confirmed exponential tail on un-railed \
-             coordinate(s); snapping ρ {original_rho} → {snapped} and re-certifying \
-             at the rail (#2348 Inc 2)"
-        );
-        result.rho = snapped;
-        match certify_outer_optimality_at_terminal_fidelity(obj, config, context, result, false) {
-            Ok(snap_certificate) => return Ok(snap_certificate),
-            Err(snap_err) => {
+        )? {
+            TailSnapOutcome::Snapped(snapped) => {
+                let original_rho = result.rho.clone();
+                // The run-recorded first-order evidence describes the PRE-snap
+                // point; the recursive certification must not consume it as a
+                // same-ρ second measurement for its gradient-reproducibility
+                // floor.
+                let saved_gradient = result.final_gradient.take();
+                result.final_value = f64::NAN;
                 log::info!(
-                    "[CERTIFICATE] {context}: snapped point refused \
-                     ({snap_err}); restoring the checkpoint and refusing at the \
-                     original point"
+                    "[CERTIFICATE] {context}: confirmed exponential tail on un-railed \
+                     coordinate(s); snapping ρ {original_rho} → {snapped} and re-certifying \
+                     at the rail (#2348 Inc 2)"
                 );
-                result.rho = original_rho;
-                result.final_value = evaluation.cost;
-                result.final_grad_norm = Some(projected_grad_norm);
-                result.final_gradient = saved_gradient;
-                // Best-effort restore of the inner state to the checkpoint; the
-                // refusal below is the verdict either way.
-                if let Err(restore_err) = obj.eval_cost(&result.rho) {
-                    log::warn!(
-                        "[CERTIFICATE] {context}: failed to restore the objective \
-                         to the checkpoint after a refused tail snap: {restore_err}"
-                    );
+                result.rho = snapped;
+                match certify_outer_optimality_at_terminal_fidelity(
+                    obj, config, context, result, false,
+                ) {
+                    Ok(snap_certificate) => return Ok(snap_certificate),
+                    Err(snap_err) => {
+                        log::info!(
+                            "[CERTIFICATE] {context}: snapped point refused \
+                             ({snap_err}); restoring the checkpoint and refusing at the \
+                             original point"
+                        );
+                        tail_snap_note = Some(format!("snapped point refused: {snap_err}"));
+                        result.rho = original_rho;
+                        result.final_value = evaluation.cost;
+                        result.final_grad_norm = Some(projected_grad_norm);
+                        result.final_gradient = saved_gradient;
+                        // Best-effort restore of the inner state to the
+                        // checkpoint; the refusal below is the verdict either
+                        // way.
+                        if let Err(restore_err) = obj.eval_cost(&result.rho) {
+                            log::warn!(
+                                "[CERTIFICATE] {context}: failed to restore the objective \
+                                 to the checkpoint after a refused tail snap: {restore_err}"
+                            );
+                        }
+                    }
                 }
+            }
+            TailSnapOutcome::Declined(reason) => {
+                tail_snap_note = Some(reason);
             }
         }
     }
@@ -2309,9 +2321,15 @@ fn certify_outer_optimality_at_terminal_fidelity(
     result.criterion_certificate = Some(certificate.clone());
     if !certificate.certifies() {
         result.converged = false;
+        // Carry the tail-snap decline evidence into the refusal so a
+        // budget-exhausted crawl explains why it was not snapped to the rail.
+        let summary = match tail_snap_note {
+            Some(note) => format!("{}; tail-snap declined: {note}", certificate.summary()),
+            None => certificate.summary(),
+        };
         return Err(outer_nonconvergence_error(
             context,
-            &certificate.summary(),
+            &summary,
             result,
             Some(certified_projected_grad_norm),
             stationarity_bound,
@@ -2488,21 +2506,35 @@ const TAIL_SNAP_CURVATURE_BAND: (f64, f64) = (0.25, 4.0);
 /// 3. every candidate's tail is confirmed by the same probing engine the rail
 ///    mint uses (`CertifiedAtAsymptote` or `OnTailNotYetEquivalent`; the final
 ///    at-rail equivalence is re-judged by the Inc 1 mint after the snap).
+/// Outcome of a certify-time tail-snap attempt: either the snapped point to
+/// re-certify, or a human-readable decline reason that is carried into the
+/// refusal summary so a budget-exhausted crawl explains WHY it was not
+/// snapped (the decline evidence is otherwise invisible in a red test/fit).
+enum TailSnapOutcome {
+    Snapped(Array1<f64>),
+    Declined(String),
+}
+
 fn try_tail_snap_to_rail(
     obj: &mut dyn OuterObjective,
     inputs: &AsymptoteRailInputs<'_>,
-) -> Result<Option<Array1<f64>>, EstimationError> {
+) -> Result<TailSnapOutcome, EstimationError> {
     let rho = inputs.rho;
     let gradient = inputs.projected_gradient;
     let hessian = inputs.hessian;
     let (lower, upper) = inputs.bounds;
     let n = gradient.len();
-    if rho.len() != n || hessian.nrows() != n || hessian.ncols() != n || lower.len() < n || upper.len() < n
+    if rho.len() != n
+        || hessian.nrows() != n
+        || hessian.ncols() != n
+        || lower.len() < n
+        || upper.len() < n
     {
-        return Ok(None);
+        return Ok(TailSnapOutcome::Declined("shape mismatch".to_string()));
     }
 
     let mut candidates: Vec<(usize, AsymptoteSide)> = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
     for k in 0..n {
         if inputs.railed.contains(&k) {
             continue;
@@ -2513,17 +2545,23 @@ fn try_tail_snap_to_rail(
             None => continue,
         };
         let h_kk = hessian[[k, k]];
-        if !(h_kk > 0.0) {
-            continue;
-        }
         let ratio = h_kk / g_k.abs();
-        if !(TAIL_SNAP_CURVATURE_BAND.0..=TAIL_SNAP_CURVATURE_BAND.1).contains(&ratio) {
+        if !(h_kk > 0.0)
+            || !(TAIL_SNAP_CURVATURE_BAND.0..=TAIL_SNAP_CURVATURE_BAND.1).contains(&ratio)
+        {
+            rejected.push(format!(
+                "k={k}: g={g_k:.3e} H_kk={h_kk:.3e} ratio={ratio:.3e} outside tie band"
+            ));
             continue;
         }
         candidates.push((k, side));
     }
     if candidates.is_empty() {
-        return Ok(None);
+        return Ok(TailSnapOutcome::Declined(if rejected.is_empty() {
+            "no super-bound coordinate".to_string()
+        } else {
+            format!("no candidate passed the curvature tie ({})", rejected.join("; "))
+        }));
     }
 
     // The residual must be EXPLAINED by the candidate tails: every other
@@ -2537,7 +2575,10 @@ fn try_tail_snap_to_rail(
         .sum::<f64>()
         .sqrt();
     if !(interior_grad_norm <= inputs.stationarity_bound) {
-        return Ok(None);
+        return Ok(TailSnapOutcome::Declined(format!(
+            "interior not stationary: |g_int|={interior_grad_norm:.3e} > bound {:.3e}",
+            inputs.stationarity_bound
+        )));
     }
     let excluded: Vec<usize> = inputs
         .railed
@@ -2546,7 +2587,9 @@ fn try_tail_snap_to_rail(
         .chain(candidates.iter().map(|(k, _)| *k))
         .collect();
     if certificate_hessian_is_psd_off_railed(hessian, &excluded) != Some(true) {
-        return Ok(None);
+        return Ok(TailSnapOutcome::Declined(
+            "interior Hessian sub-block not PSD".to_string(),
+        ));
     }
 
     let beta_norm = inputs
@@ -2555,22 +2598,22 @@ fn try_tail_snap_to_rail(
         .filter(|v| v.is_finite())
         .unwrap_or(0.0);
     let tol = AsymptoteTolerances::exp4_rail_bands(ASYMPTOTE_ESTIMAND_REL_TOL * (1.0 + beta_norm));
-    let mut confirmed_all = true;
+    let mut decline: Option<String> = None;
     for (k, side) in &candidates {
-        let confirmed = match probe_tail_window(obj, rho, *k, *side, &tol)? {
-            Some(window) => matches!(
-                assess_coordinate(&window, &tol),
+        let verdict = match probe_tail_window(obj, rho, *k, *side, &tol)? {
+            Some(window) => match assess_coordinate(&window, &tol) {
                 AsymptoteVerdict::CertifiedAtAsymptote { .. }
-                    | AsymptoteVerdict::OnTailNotYetEquivalent { .. }
-            ),
-            None => false,
+                | AsymptoteVerdict::OnTailNotYetEquivalent { .. } => None,
+                AsymptoteVerdict::NoAsymptote { reason } => Some(reason),
+            },
+            None => Some("no finite-difference-clean tail run".to_string()),
         };
-        if !confirmed {
-            confirmed_all = false;
+        if let Some(reason) = verdict {
+            decline = Some(format!("candidate k={k} tail unconfirmed: {reason}"));
             break;
         }
     }
-    if !confirmed_all {
+    if let Some(reason) = decline {
         // The probes warm-started the inner solve away from the checkpoint;
         // restore it before the caller falls through to the ordinary refusal.
         obj.eval_cost(rho).map_err(|err| {
@@ -2580,7 +2623,7 @@ fn try_tail_snap_to_rail(
                 inputs.context
             ))
         })?;
-        return Ok(None);
+        return Ok(TailSnapOutcome::Declined(reason));
     }
 
     let mut snapped = rho.clone();
@@ -2590,7 +2633,7 @@ fn try_tail_snap_to_rail(
             AsymptoteSide::Lower => lower[*k],
         };
     }
-    Ok(Some(snapped))
+    Ok(TailSnapOutcome::Snapped(snapped))
 }
 
 /// Reconstruct one railed coordinate's exponential tail by probing the analytic
