@@ -854,6 +854,102 @@ fn standard_normal_flex_canonical_derivative_ladder_matches_vgh_t3_t4_932() {
     );
 }
 
+/// #2347 channel-isolation measurement: run the H→t3 ladder with PURE
+/// directions, one primary channel at a time. The mixed-direction gap smears a
+/// single corrupt direction-channel across every (u,v) entry (the contraction
+/// adds `t3[u,v,c]·dir_c` for each channel `c`), so per-channel purity is the
+/// discriminating measurement: whichever pure direction reproduces the gap owns
+/// the missing flux. Diagnostic only — prints, never asserts a bound.
+#[test]
+fn zz_measure_2347_pure_direction_h_to_t3_ladder() {
+    let row = 0usize;
+    let (family, states) = standard_normal_flex_fixture();
+    let cache = family
+        .build_exact_eval_cache(&states)
+        .expect("base StandardNormal FLEX exact cache");
+    let primary = cache.primary.clone();
+    let h_range = primary.h.as_ref().expect("active score-warp range").clone();
+    let w_range = primary
+        .w
+        .as_ref()
+        .expect("active link-deviation range")
+        .clone();
+
+    let classify = |idx: usize| -> String {
+        if idx == primary.q {
+            "q".to_string()
+        } else if idx == primary.logslope {
+            "logslope".to_string()
+        } else if h_range.contains(&idx) {
+            format!("h{}", idx - h_range.start)
+        } else if w_range.contains(&idx) {
+            format!("w{}", idx - w_range.start)
+        } else {
+            format!("?{idx}")
+        }
+    };
+
+    let channels: Vec<(String, usize, f64)> = vec![
+        ("q".to_string(), primary.q, 0.55),
+        ("logslope".to_string(), primary.logslope, -0.35),
+        ("h0".to_string(), h_range.start, 0.45),
+        ("w0".to_string(), w_range.start, -0.40),
+    ];
+    let step = 2.0e-4_f64;
+    for (name, index, magnitude) in channels {
+        let mut direction = Array1::<f64>::zeros(primary.total);
+        direction[index] = magnitude;
+
+        let base = standard_normal_flex_channels(&family, &states, &cache, row, &direction, false);
+        let plus_states =
+            perturb_standard_normal_flex_states(&states, &primary, row, &direction, step);
+        let minus_states =
+            perturb_standard_normal_flex_states(&states, &primary, row, &direction, -step);
+        let plus_cache = family
+            .build_exact_eval_cache(&plus_states)
+            .expect("positive-direction StandardNormal FLEX exact cache");
+        let minus_cache = family
+            .build_exact_eval_cache(&minus_states)
+            .expect("negative-direction StandardNormal FLEX exact cache");
+        let plus = standard_normal_flex_channels(
+            &family,
+            &plus_states,
+            &plus_cache,
+            row,
+            &direction,
+            false,
+        );
+        let minus = standard_normal_flex_channels(
+            &family,
+            &minus_states,
+            &minus_cache,
+            row,
+            &direction,
+            false,
+        );
+
+        let mut rows: Vec<(f64, usize, usize, f64, f64)> = Vec::new();
+        let mut max_h3 = 0.0_f64;
+        for u in 0..primary.total {
+            for v in 0..primary.total {
+                let third_fd = (plus.hessian[[u, v]] - minus.hessian[[u, v]]) / (2.0 * step);
+                let err = derivative_ladder_relative_error(base.third[[u, v]], third_fd);
+                max_h3 = max_h3.max(err);
+                rows.push((err, u, v, base.third[[u, v]], third_fd));
+            }
+        }
+        rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        eprintln!("#2347 PURE dir={name} (mag {magnitude:+.2}): max_h3={max_h3:.3e}");
+        for &(err, u, v, analytic, fd) in rows.iter().take(4) {
+            eprintln!(
+                "#2347   {err:.3e} | [{}({u}),{}({v})] | a={analytic:+.6e} fd={fd:+.6e}",
+                classify(u),
+                classify(v)
+            );
+        }
+    }
+}
+
 // ==================================================================
 // GATE 3: moving-edge Leibniz cross-check. Couple a cell edge to a
 // knot crossing zE = (τ − a)/b and central-difference a moving-domain
