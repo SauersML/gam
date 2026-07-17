@@ -255,10 +255,12 @@ fn inner_gradient_matches_penalized_objective_fd_2015() {
     // the frozen-gate repulsion/barrier gradients `gb` legitimately carries.
     base.refresh_decoder_repulsion_gate();
     base.refresh_barrier_coactivation_gate();
+    base.refresh_amplitude_barrier_gate(); // #2343 — third frozen per-assembly gate
     let base = base;
     let reinstall = |t: &mut SaeManifoldTerm| {
         t.decoder_repulsion_gate = base.decoder_repulsion_gate.clone();
         t.barrier_coactivation_gate = base.barrier_coactivation_gate.clone();
+        t.amplitude_barrier_gate = base.amplitude_barrier_gate;
     };
 
     let obj = |t: &SaeManifoldTerm| -> f64 {

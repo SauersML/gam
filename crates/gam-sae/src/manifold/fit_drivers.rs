@@ -7649,6 +7649,11 @@ impl SaeManifoldTerm {
         if self.streaming_gates_frozen {
             term.decoder_repulsion_gate = self.decoder_repulsion_gate.clone();
             term.barrier_coactivation_gate = self.barrier_coactivation_gate.clone();
+            // #2343 — the amplitude barrier's frozen turn-on radius `ε²` is a global
+            // dictionary property (a function of the SHARED decoders `B_k`, not the
+            // chunk routing), so carrying it onto the chunk keeps its assembly from
+            // needing a per-chunk refresh, exactly like the gates above.
+            term.amplitude_barrier_gate = self.amplitude_barrier_gate;
             term.streaming_gates_frozen = true;
         }
         Ok(term)
@@ -7775,6 +7780,9 @@ impl SaeManifoldTerm {
             // so the streaming gate matches the full-batch gate. Reset after the loop.
             self.refresh_decoder_repulsion_gate();
             self.refresh_barrier_coactivation_gate();
+            // #2343 — freeze the amplitude barrier's turn-on radius from the full
+            // resident decoders, carried onto every chunk below.
+            self.refresh_amplitude_barrier_gate();
             self.streaming_gates_frozen = true;
             // ── Pass 1: accumulate the global reduced Schur over β online. ──
             let options = ArrowSolveOptions::automatic(border_dim)

@@ -1944,10 +1944,12 @@ fn unscaled_jeffreys_assembled_gradient_matches_penalized_objective_fd() {
     let mut base = term0.clone();
     base.refresh_decoder_repulsion_gate();
     base.refresh_barrier_coactivation_gate();
+    base.refresh_amplitude_barrier_gate(); // #2343 — third frozen per-assembly gate
     let base = base;
     let reinstall_frozen_gates = |t: &mut SaeManifoldTerm| {
         t.decoder_repulsion_gate = base.decoder_repulsion_gate.clone();
         t.barrier_coactivation_gate = base.barrier_coactivation_gate.clone();
+        t.amplitude_barrier_gate = base.amplitude_barrier_gate;
     };
 
     // The barrier must be live, otherwise the seam check would be vacuous.

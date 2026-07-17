@@ -526,10 +526,15 @@ pub(crate) fn sae_pen_fd_check(
     let mut base = term.clone();
     base.refresh_decoder_repulsion_gate();
     base.refresh_barrier_coactivation_gate();
+    // #2343 — the amplitude barrier is a third frozen per-assembly gate; Clone
+    // resets it to `None` too, so freeze it on `base` and re-install it on every
+    // perturbation clone below, exactly like the other two.
+    base.refresh_amplitude_barrier_gate();
     let base = base;
     let reinstall_frozen_gates = |t: &mut SaeManifoldTerm| {
         t.decoder_repulsion_gate = base.decoder_repulsion_gate.clone();
         t.barrier_coactivation_gate = base.barrier_coactivation_gate.clone();
+        t.amplitude_barrier_gate = base.amplitude_barrier_gate;
     };
 
     let base_obj = base

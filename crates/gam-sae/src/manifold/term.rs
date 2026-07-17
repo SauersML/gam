@@ -236,14 +236,29 @@ pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
 /// it never truncates the reconstruction or its derivatives.
 pub(crate) const SAE_COACTIVE_RELATIVE_MASS_FLOOR: f64 = 1.0e-3;
 
-// ── #1026 / #1522 interior-point COLLAPSE-PREVENTION barriers ────────────────
+// ── #1026 / #1522 / #2343 interior-point COLLAPSE-PREVENTION barriers ─────────
 //
 // The collinearity-gated `SAE_DECODER_REPULSION_*` term above is a SEPARATOR for
 // already-large, already-collinear decoders; it is a strict no-op at the
 // principal failure state (a decoder with norm → 0) because a zero decoder has
 // no direction to be collinear with. The two barriers below are the actual
-// anti-collapse core: they are interior-point log-barriers that DIVERGE at the
-// collapse boundary, so the inner Newton can never reach it.
+// anti-collapse core, addressing the two distinct collapse modes with genuine
+// interior-point log-barriers that DIVERGE at the collapse boundary so the inner
+// Newton can never reach it:
+//
+//   * the AMPLITUDE barrier (`SAE_AMPLITUDE_BARRIER_STRENGTH`, #2343) —
+//     `μ_A·log(1 + ε²/s_k²)` on each atom's decoder norm `s_k = ‖B_k‖_F` —
+//     supplies the OUTWARD RADIAL force at the norm→0 collapse point the repulsion
+//     and the separation barrier both structurally cannot (both act on NORMALIZED
+//     shapes, radial derivative ≡ 0, and skip/drop sub-floor atoms); and
+//   * the SEPARATION barrier (below) — `−½ log det F`, `F = Q ∘ O` — supplies the
+//     alignment-divergent SHAPE-separating curvature when two co-firing atoms drift
+//     onto the same decoder direction.
+//
+// The amplitude barrier keys its turn-on radius `ε` to the SAME scale-equivariant
+// [`SAE_BARRIER_ACTIVE_NORM_REL_FLOOR`] floor the separation barrier uses to DROP
+// sub-floor atoms, so the two cover complementary regimes (below-floor radius vs.
+// above-floor shape) with no overlap and no gap.
 
 // The SEPARATION barrier has NO strength scalar `μ_C` at all: it is the SAE decoder
 // Jeffreys prior `−½ log det F` (see [`super::penalties::BarrierComponent`]), whose
@@ -294,6 +309,40 @@ pub(crate) const SAE_SEPARATION_BARRIER_EPS: f64 = 1.0e-6;
 /// for both the barrier value and its gradient/curvature, so the line-search
 /// value never desyncs from the step.
 pub(crate) const SAE_BARRIER_ACTIVE_NORM_REL_FLOOR: f64 = 1.0e-6;
+
+/// #2343 — AMPLITUDE barrier coefficient `μ_A`. The interior-point amplitude
+/// barrier `P_A(s_k) = μ_A · log(1 + ε²/s_k²)` on each atom's decoder norm
+/// `s_k = ‖B_k‖_F` supplies the OUTWARD radial force at the zero-decoder collapse
+/// point that the collinearity-gated repulsion cannot: the repulsion penalizes
+/// the NORMALIZED cross-Gram (homogeneous degree 0 in any single decoder radius,
+/// radial derivative ≡ 0) and its gate explicitly skips a ~zero-norm decoder, so
+/// at collapse it is inert; the separation barrier likewise separates NORMALIZED
+/// shapes and drops sub-floor atoms. Neither creates amplitude. `P_A` closes that
+/// gap — `P_A′(s) = −2μ_A ε²/(s(s²+ε²)) < 0` (strictly outward), convex on all of
+/// `s > 0`, and `→ 0` as `s ≫ ε` (a healthy atom feels `≈ μ_A ε²/s² ≈ 0`), so it
+/// perturbs no well-scaled fit while diverging as `s → 0` to keep the norm off the
+/// singular collapse point the discrete `enforce_decoder_norm_guard` reseed could
+/// previously only recover from AFTER the fact.
+///
+/// The pole is placed at the TRUE collapse manifold `s = 0` (not at a nonzero
+/// floor `ε`, as the naive `−μ log(1 − ε²/s²)` form would): with the pole at `ε`
+/// the feasible set is `s > ε` and an atom that starts (or is driven) below the
+/// floor is INFEASIBLE — the log argument goes negative and the barrier is
+/// undefined exactly where it is needed most. Placing the pole at `s = 0` makes
+/// the whole positive ray feasible, so the barrier is defined and strictly
+/// outward for every atom the optimiser can ever reach, while `ε` (the
+/// scale-equivariant [`SAE_BARRIER_ACTIVE_NORM_REL_FLOOR`]-derived floor radius,
+/// frozen per assembly) sets the turn-on scale. `log(1 + ε²/s²)` is exactly the
+/// `−μ log(1 − ε²/s²)` form to leading order for `s ≫ ε`, so it honours the
+/// interior-point design while fixing its domain pathology.
+///
+/// `μ_A` is a fixed dimensionless coefficient (the barrier value is dimensionless
+/// once `ε ∝ dictionary scale`), on the same O(1) footing as the separation
+/// barrier's parameter-free Jeffreys exponent `½` and NOT a data-fit magnitude:
+/// near collapse `P_A → +∞` dominates any finite reconstruction pull regardless
+/// of `μ_A`, so its exact value only sets where the barrier-vs-fit balance sits,
+/// and the barrier's role is solely to keep that balance strictly off `s = 0`.
+pub(crate) const SAE_AMPLITUDE_BARRIER_STRENGTH: f64 = 0.5;
 
 /// Allocation-only workspace for repeated nonlinear Arrow-Schur assemblies.
 ///
@@ -538,6 +587,22 @@ pub struct SaeManifoldTerm {
     /// the trial decoders. The Jeffreys exponent `½` is fixed, so there is no
     /// per-pair strength `μ_jk` to freeze (that under-derived scalar is gone).
     pub(crate) barrier_coactivation_gate: Option<BarrierCoactivationGate>,
+    /// #2343 — the AMPLITUDE barrier's frozen turn-on radius `ε² = floor²`, the
+    /// analog of [`Self::decoder_repulsion_gate`] / [`Self::barrier_coactivation_gate`]
+    /// for the interior-point amplitude barrier `μ_A·log(1 + ε²/s_k²)`. `ε²` is the
+    /// scale-equivariant [`super::penalties::barrier_norm_floor_sq`]
+    /// (`SAE_BARRIER_ACTIVE_NORM_REL_FLOOR²·max_k ‖B_k‖²_F`), FROZEN at assembly
+    /// entry at the same chokepoint as the smoothness Gram and the other gates so
+    /// the barrier's gradient/curvature (assembled in
+    /// [`super::penalties::SaeManifoldTerm::add_sae_amplitude_barrier`]) and its
+    /// value (read by the line-search [`Self::penalized_objective_total`] via
+    /// [`super::penalties::SaeManifoldTerm::amplitude_barrier_value`]) share ONE
+    /// `ε` while each atom's LIVE norm `s_k` moves with the trial decoders — no
+    /// value/gradient desync across the line search. `None` when no decoder carries
+    /// positive energy (`max_k ‖B_k‖²_F = 0`, the strict no-op — a fully-dead
+    /// dictionary the discrete reseed owns, not this term). Transient: not part of
+    /// the persisted term identity (Clone starts `None`, rebuilt next assembly).
+    pub(crate) amplitude_barrier_gate: Option<f64>,
     /// #1801 — STREAMING gate-freeze flag. The collapse-prevention gates
     /// ([`Self::decoder_repulsion_gate`], [`Self::barrier_coactivation_gate`]) are
     /// GLOBAL dictionary properties: their per-pair strength `μ_jk` inverts the
@@ -707,6 +772,9 @@ impl Clone for SaeManifoldTerm {
             // #1625 — transient per-assembly frozen barrier coactivation; rebuilt
             // at the next assembly, exactly like the repulsion gate above.
             barrier_coactivation_gate: None,
+            // #2343 — transient per-assembly frozen amplitude-barrier turn-on
+            // radius; rebuilt at the next assembly like the gates above.
+            amplitude_barrier_gate: None,
             // #1801 — transient streaming gate-freeze flag; a fresh clone refreshes
             // its gates per assembly like the dense path until a streaming fit
             // re-arms it.

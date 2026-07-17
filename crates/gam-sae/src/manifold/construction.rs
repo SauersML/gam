@@ -726,6 +726,7 @@ impl SaeManifoldTerm {
             structural_cocollapse_reseeds: 0,
             decoder_repulsion_gate: None,
             barrier_coactivation_gate: None,
+            amplitude_barrier_gate: None,
             // #1801 — default false: the dense/full-batch assembly refreshes the
             // collapse-prevention gates per assembly (bit-for-bit historical). The
             // streaming fit driver re-arms this to freeze them once globally.
@@ -908,6 +909,7 @@ impl SaeManifoldTerm {
         primary.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
         primary.decoder_repulsion_gate = None;
         primary.barrier_coactivation_gate = None;
+        primary.amplitude_barrier_gate = None;
         // Evidence-gauge / co-collapse cluster — the canonical reset (mirrors
         // outer_objective.rs and the ctor) clears all FIVE fields together: the
         // reanchor count and last-delta sign feed the penalized_quasi_laplace_criterion reversal-
@@ -5328,7 +5330,8 @@ impl SaeManifoldTerm {
     /// terms carry energy. The base is now exactly
     /// `penalized_objective_total − loss.total()`: the full registry value
     /// (ARD skipped inside, `loss.ard` already carries it) plus repulsion plus
-    /// the separation barrier. All of these have zero DIRECT ρ-derivative
+    /// the amplitude barrier (#2343) plus the separation barrier. All of these have
+    /// zero DIRECT ρ-derivative
     /// (their weights are not ρ coordinates), so the analytic outer-gradient
     /// channels are unchanged — this only restores value/gradient consistency.
     pub fn reml_extra_penalty_value_total(
@@ -5342,6 +5345,7 @@ impl SaeManifoldTerm {
         Ok(
             registry_energy
                 + self.decoder_repulsion_value(1.0)
+                + self.amplitude_barrier_value(1.0)
                 + self.separation_barrier_value(1.0),
         )
     }
@@ -5363,9 +5367,11 @@ impl SaeManifoldTerm {
         // used, so the line search sees the term the Newton step optimizes. 0
         // unless two atoms are near-collinear (the no-op case).
         total += self.decoder_repulsion_value(penalty_scale);
-        // #1026/#1522 — interior-point collapse-prevention barriers, on the SAME
-        // decoders the assembly's gradient/curvature used, so the line search sees
-        // exactly the term the inner Newton step optimises (no value/grad desync).
+        // #1026/#1522/#2343 — interior-point collapse-prevention barriers, on the
+        // SAME decoders (and SAME frozen gates) the assembly's gradient/curvature
+        // used, so the line search sees exactly the term the inner Newton step
+        // optimises (no value/grad desync).
+        total += self.amplitude_barrier_value(penalty_scale);
         total += self.separation_barrier_value(penalty_scale);
         Ok(total)
     }

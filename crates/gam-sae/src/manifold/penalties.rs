@@ -454,11 +454,175 @@ impl SaeManifoldTerm {
         penalty_scale * per_fit.value(target_beta.view(), rho_local.view())
     }
 
-    // ── #1026/#1522 COLLAPSE-PREVENTION interior-point barriers ──────────────
+    /// #2343 — per-atom interior amplitude-barrier scalars at squared decoder norm
+    /// `u = ‖B_k‖²_F`, frozen turn-on radius `f = ε²`, and coefficient `μ`, for the
+    /// barrier `P_A(s) = μ·ln(1 + f/u)` (`s = √u`):
+    ///
+    /// ```text
+    ///   value  P     = μ·ln(1 + f/u)               → +∞ as u→0,  → 0 as u≫f
+    ///   g_coef 2φ(u) = −2μf / (u(u+f))             ∂P/∂B = g_coef·B  (strictly outward: <0)
+    ///   prr    P″(s) = 2μf(3u+f) / (u(u+f)²)       exact radial 2nd deriv, > 0 (PSD ridge)
+    /// ```
+    ///
+    /// `φ(u) = dP/du = −μf/(u(u+f))`; the full Hessian in the flat decoder is
+    /// `H_A = 2φ·I + 4φ′·B Bᵀ` with `φ<0`, `φ′>0`, whose ONLY positive eigenvalue is
+    /// the radial `2φ + 4uφ′ = prr` (the tangential `2φ<0` directions are the
+    /// gradient field rotating on the sphere), so `prr·I ⪰ H_A ⪰ 0`-free is the
+    /// tight isotropic Levenberg majorizer the assembly installs.
+    ///
+    /// Returns `None` (the barrier abstains for this atom — exactly zero
+    /// value/gradient/curvature) when `u ≤ 0` (an exactly-collapsed decoder has no
+    /// radial direction to push along — the same degeneracy the repulsion gate and
+    /// the separation floor skip; the discrete `enforce_decoder_norm_guard` reseed
+    /// owns that state) or when any scalar would be non-finite (an unreachably tiny
+    /// `u` underflowing `u(u+f)`), so the penalized objective the line search
+    /// consumes stays finite. Value and gradient/curvature call this with the SAME
+    /// `(u, f, μ)`, so they abstain on exactly the same atoms — no value/grad desync.
+    fn amplitude_barrier_scalars(u: f64, f: f64, mu: f64) -> Option<(f64, f64, f64)> {
+        if !(u > 0.0 && f > 0.0 && mu > 0.0) {
+            return None;
+        }
+        let upf = u + f;
+        let value = mu * (f / u).ln_1p();
+        let g_coef = -2.0 * mu * f / (u * upf);
+        let prr = 2.0 * mu * f * (3.0 * u + f) / (u * upf * upf);
+        (value.is_finite() && g_coef.is_finite() && prr.is_finite())
+            .then_some((value, g_coef, prr))
+    }
+
+    /// #2343 — freeze the AMPLITUDE barrier's turn-on radius `ε² = floor²` at the
+    /// SAME assembly chokepoint as the repulsion gate and the smoothness Gram, so
+    /// the barrier's gradient/curvature ([`Self::add_sae_amplitude_barrier`]) and
+    /// its value ([`Self::amplitude_barrier_value`], read by the line-search
+    /// `penalized_objective_total`) share one `ε` while each atom's LIVE norm moves
+    /// with the trial decoders. `ε²` is the scale-equivariant
+    /// [`Self::barrier_norm_floor_sq`] (`SAE_BARRIER_ACTIVE_NORM_REL_FLOOR²·max_k
+    /// ‖B_k‖²_F`) — the SAME floor the separation barrier uses to DROP sub-floor
+    /// atoms, so the amplitude barrier picks up exactly the collapsing atoms the
+    /// separation barrier abstains on (complementary coverage). `None` when no
+    /// decoder carries positive energy (the strict no-op — a fully-dead dictionary
+    /// the discrete reseed owns).
+    pub(crate) fn refresh_amplitude_barrier_gate(&mut self) {
+        if self.k_atoms() == 0 {
+            self.amplitude_barrier_gate = None;
+            return;
+        }
+        let norm_sq: Vec<f64> = self
+            .atoms
+            .iter()
+            .map(|atom| atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>())
+            .collect();
+        let floor2 = Self::barrier_norm_floor_sq(&norm_sq);
+        self.amplitude_barrier_gate = (floor2 > 0.0).then_some(floor2);
+    }
+
+    /// #2343 — accumulate the interior AMPLITUDE barrier's gradient into `sys.gb`
+    /// and its exact radial curvature into `sys.hbb` (dense path) or the per-atom
+    /// scalar ridge `atom_curv` (matrix-free / framed path, folded into the smooth
+    /// Gram by the caller exactly like the separation barrier's `lev`), in the
+    /// full-`B` β layout (index `beta_offsets[k] + a*p + o`) so a framed system
+    /// carries it identically to the analytic β penalties. Returns whether any
+    /// gradient was written (`false`/no-op when the frozen gate is `None`,
+    /// `penalty_scale == 0`, or every atom abstains).
+    ///
+    /// This is the term the audit (#2343 Finding 9) found MISSING: the
+    /// collinearity-gated repulsion and the separation barrier both operate on
+    /// NORMALIZED shapes (homogeneous degree 0 in a single decoder radius, radial
+    /// derivative ≡ 0) and skip/drop sub-floor atoms, so neither supplies an
+    /// outward radial force at the zero-decoder collapse point. `P_A′(s) < 0`
+    /// does, for every atom the optimiser can reach.
+    pub(crate) fn add_sae_amplitude_barrier(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        penalty_scale: f64,
+        dense_beta_curvature: bool,
+        atom_curv: &mut [f64],
+    ) -> bool {
+        if penalty_scale == 0.0 {
+            return false;
+        }
+        let Some(floor2) = self.amplitude_barrier_gate else {
+            return false;
+        };
+        let mu = SAE_AMPLITUDE_BARRIER_STRENGTH;
+        let p = self.output_dim();
+        let offsets = self.beta_offsets();
+        let mut wrote = false;
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let b = &atom.decoder_coefficients;
+            let m = b.nrows();
+            if m == 0 || b.ncols() != p {
+                continue;
+            }
+            let u = b.iter().map(|v| v * v).sum::<f64>();
+            let Some((_value, g_coef, prr)) = Self::amplitude_barrier_scalars(u, floor2, mu) else {
+                continue;
+            };
+            let off = offsets[atom_idx];
+            // Gradient ∂P/∂B = g_coef·B — radial and, since `g_coef < 0`, strictly
+            // OUTWARD (the penalized objective decreases as the norm grows).
+            let gscale = penalty_scale * g_coef;
+            for a in 0..m {
+                for o in 0..p {
+                    sys.gb[off + a * p + o] += gscale * b[[a, o]];
+                }
+            }
+            wrote = true;
+            // Exact radial curvature `P″(s)` as the isotropic PSD ridge `prr·I` on
+            // the atom block — `prr·I ⪰ H_A` (H_A's max eigenvalue IS `prr`), the
+            // tight Levenberg majorizer, same discipline as the separation
+            // barrier's `lev`. Dense: scatter onto `hbb`'s diagonal; matrix-free:
+            // hand back the per-atom scalar the caller folds into the smooth Gram.
+            let ridge = penalty_scale * prr;
+            if ridge > 0.0 {
+                if dense_beta_curvature {
+                    for idx in 0..(m * p) {
+                        let gi = off + idx;
+                        sys.hbb[[gi, gi]] += ridge;
+                    }
+                } else {
+                    atom_curv[atom_idx] += ridge;
+                }
+            }
+        }
+        wrote
+    }
+
+    /// #2343 — penalized-objective contribution of the interior AMPLITUDE barrier
+    /// at the current decoders, reading the SAME frozen turn-on radius
+    /// ([`Self::amplitude_barrier_gate`]) the assembly's gradient/curvature used, so
+    /// the line-search value is consistent with the step. `0` when the gate is
+    /// `None` or `penalty_scale == 0`; abstains per atom on exactly the same
+    /// condition as the gradient ([`Self::amplitude_barrier_scalars`]).
+    pub(crate) fn amplitude_barrier_value(&self, penalty_scale: f64) -> f64 {
+        if penalty_scale == 0.0 {
+            return 0.0;
+        }
+        let Some(floor2) = self.amplitude_barrier_gate else {
+            return 0.0;
+        };
+        let mu = SAE_AMPLITUDE_BARRIER_STRENGTH;
+        let p = self.output_dim();
+        let mut acc = 0.0_f64;
+        for atom in &self.atoms {
+            let b = &atom.decoder_coefficients;
+            if b.nrows() == 0 || b.ncols() != p {
+                continue;
+            }
+            let u = b.iter().map(|v| v * v).sum::<f64>();
+            if let Some((value, _, _)) = Self::amplitude_barrier_scalars(u, floor2, mu) {
+                acc += value;
+            }
+        }
+        penalty_scale * acc
+    }
+
+    // ── #1026/#1522/#2343 COLLAPSE-PREVENTION interior-point barriers ─────────
     //
-    // These two log-barriers are the anti-collapse core. Unlike the
+    // These log-barriers are the anti-collapse core. Unlike the
     // collinearity-gated repulsion they have a genuine restoring force at the
-    // zero-decoder collapse point and at the alignment limit. They operate
+    // zero-decoder collapse point (the AMPLITUDE barrier `add_sae_amplitude_barrier`,
+    // #2343) and at the alignment limit (the SEPARATION barrier below). They operate
     // directly on the per-atom decoders `B_k` (shape `M_k × p`, row-major in the
     // flat-β layout: index `beta_offsets[k] + a*p + o`), so the gradient /
     // curvature written into `sys.gb` / `sys.hbb` are in EXACTLY the same
