@@ -3844,6 +3844,76 @@ impl BernoulliMarginalSlopeFamily {
     /// already parallelize the outer row reductions with Rayon (`row_iter` /
     /// chunk `into_par_iter()` folds), which avoids nested Rayon overhead for
     /// the small per-row matrices assembled here.
+    /// #2347 test helper: compute the (b,b) calibration moments
+    /// `f_uv = ∂²M/∂b²`, `f_auv = ∂³M/∂a∂b²`, `f_aauv = ∂⁴M/∂a²∂b²`, and
+    /// `f_auv_db = ∂⁴M/∂a∂b³` at an ARBITRARY intercept `a` (not necessarily the
+    /// solved root). FD-differencing this in `a` and `b` independently verifies
+    /// the intercept a-chain moments used by the fourth-order IFT.
+    #[cfg(test)]
+    pub(crate) fn debug_bb_moments_at_intercept(
+        &self,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<(f64, f64, f64, f64, f64), String> {
+        use super::exact_kernel as exact;
+        let scale = self.probit_frailty_scale();
+        let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
+        // Moving-boundary flux for f_aauv = ∂ₐf_auv: the 3rd integrand F_abb has
+        // a jump at each interior link-knot crossing z*=(τ-a)/b (because
+        // c_abb=∂³coeff/∂a∂b² ∝ link α₃, which differs across the crossing),
+        // and z* moves with a (velocity -1/b). Only c_abb jumps; the other F_abb
+        // terms are continuous. flux = Σ [c_abb]⁻₊ · e^{-q(z*)}/2π · (-1/b).
+        let inv_two_pi = 1.0 / (2.0 * std::f64::consts::PI);
+        let mut flux_aauv = 0.0;
+        for pair in cells.windows(2) {
+            let z_star = pair[0].cell.right;
+            if !z_star.is_finite() || (pair[1].cell.left - z_star).abs() > 1e-12 {
+                continue;
+            }
+            let alpha3_left = pair[0].link_span.c3;
+            let alpha3_right = pair[1].link_span.c3;
+            let c_abb_jump = 6.0 * scale * z_star * z_star * (alpha3_left - alpha3_right);
+            let weight = (-pair[0].cell.q(z_star)).exp() * inv_two_pi;
+            flux_aauv += c_abb_jump * weight * (-1.0 / b);
+        }
+        let (mut f_uv, mut f_auv, mut f_aauv, mut f_auv_db) = (0.0, 0.0, 0.0, 0.0);
+        for pc in &cells {
+            let cell = pc.cell;
+            let state = exact::evaluate_cell_derivative_moments_uncached(cell, 21)?;
+            let m = &state.moments;
+            let (dc_da_raw, dc_db_raw) =
+                exact::denested_cell_coefficient_partials(pc.score_span, pc.link_span, a, b);
+            let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
+                exact::denested_cell_second_partials(pc.score_span, pc.link_span, a, b);
+            let third = exact::denested_cell_third_partials(pc.link_span);
+            let dc_da = scale_coeff4(dc_da_raw, scale);
+            let dc_db = scale_coeff4(dc_db_raw, scale);
+            let dc_daa = scale_coeff4(dc_daa_raw, scale);
+            let dc_dab = scale_coeff4(dc_dab_raw, scale);
+            let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
+            let dc_daab = scale_coeff4(third.1, scale);
+            let dc_dabb = scale_coeff4(third.2, scale);
+            let dc_dbbb = scale_coeff4(third.3, scale);
+            f_uv += exact::cell_second_derivative_from_moments(cell, &dc_db, &dc_db, &dc_dbb, m)?;
+            f_auv += exact::cell_third_derivative_from_moments(
+                cell, &dc_da, &dc_db, &dc_db, &dc_dab, &dc_dab, &dc_dbb, &dc_dabb, m,
+            )?;
+            // ∂⁴M/∂a²∂b²: slots (a,a,b,b); fourth coeff ∂⁴η/∂a²∂b² = 0.
+            f_aauv += exact::cell_fourth_derivative_from_moments(
+                cell, &dc_da, &dc_da, &dc_db, &dc_db, &dc_daa, &dc_dab, &dc_dab, &dc_dab, &dc_dab,
+                &dc_dbb, &dc_daab, &dc_daab, &dc_dabb, &dc_dabb, &[0.0; 4], m,
+            )?;
+            // ∂⁴M/∂a∂b³: slots (a,b,b,b); fourth coeff ∂⁴η/∂a∂b³ = 0.
+            f_auv_db += exact::cell_fourth_derivative_from_moments(
+                cell, &dc_da, &dc_db, &dc_db, &dc_db, &dc_dab, &dc_dab, &dc_dab, &dc_dbb, &dc_dbb,
+                &dc_dbb, &dc_dabb, &dc_dabb, &dc_dabb, &dc_dbbb, &[0.0; 4], m,
+            )?;
+        }
+        Ok((f_uv, f_auv, f_aauv, f_auv_db, flux_aauv))
+    }
+
     pub(super) fn row_primary_third_contracted(
         &self,
         row: usize,
@@ -6411,6 +6481,58 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(())
                 },
             )?;
+        }
+
+        // Moving-boundary Leibniz flux (#2347). At 4th order the 3rd-derivative
+        // calibration integrand F₃ ∝ c₃ ∝ L'''(a+bz) is DISCONTINUOUS at
+        // interior link-knot crossings z*=(τ-a)/b, and z* moves with a and b. So
+        // the honest ∂⁴M picks up a boundary term that the fixed-domain cell sum
+        // misses. Only c₃ jumps (the lower F₃ terms are continuous), and by the
+        // symmetry of mixed partials every differentiation ordering agrees, so
+        //   flux = Σ_knots (-6·scale·Δc₃/b)·e^{-q(z*)}/2π · ∏(∂u/∂slot)
+        // with ∂u/∂a=1, ∂u/∂b=z*, ∂u/∂(warp or q)=0. The flux therefore lands
+        // only on the b/a-heavy entries of each 4th-order calibration moment
+        // (validated to 5 digits by zz_measure_2347_bb_moment_fd). 3rd order is
+        // exact — its integrand ∝ L'' is continuous — which is why the H→t3 rung
+        // needs no flux. Score-warp knots live in z-space (fixed), so only link
+        // knots contribute; Δc₃ is automatically zero at a score-only boundary.
+        {
+            let inv_two_pi = 1.0 / (2.0 * std::f64::consts::PI);
+            let lg = primary.logslope;
+            let du_b = dir_u[lg];
+            let dv_b = dir_v[lg];
+            for window in cells.windows(2) {
+                let z_star = window[0].partition_cell.cell.right;
+                if !z_star.is_finite()
+                    || (window[1].partition_cell.cell.left - z_star).abs() > 1.0e-12
+                {
+                    continue;
+                }
+                let delta_c3 = window[0].partition_cell.link_span.c3
+                    - window[1].partition_cell.link_span.c3;
+                if delta_c3 == 0.0 {
+                    continue;
+                }
+                let w_knot = (-window[0].partition_cell.cell.q(z_star)).exp()
+                    * inv_two_pi
+                    * (-6.0 * scale * delta_c3 / b);
+                let z2 = z_star * z_star;
+                let z3 = z2 * z_star;
+                let z4 = z2 * z2;
+                // a-chain 4th moments (slots list ∂u/∂: aaaa→1, aaa·b→z*,
+                // aa·bb→z*², a·bb·dir→z*³·dir_b).
+                f_aaaa += w_knot;
+                f_aaau[lg] += w_knot * z_star;
+                f_aauv[[lg, lg]] += w_knot * z2;
+                for d in 0..directions.len() {
+                    f_auv_dir[d * r * r + lg * r + lg] += w_knot * z3 * directions[d][lg];
+                }
+                // explicit mixed 4th moments (aa·du·dv→z*²·du_b·dv_b,
+                // a·b·du·dv→z*³·du_b·dv_b, bb·du·dv→z*⁴·du_b·dv_b).
+                f_aa_mixed[0] += w_knot * z2 * du_b * dv_b;
+                f_au_mixed[lg] += w_knot * z3 * du_b * dv_b;
+                f_uv_mixed[lg * r + lg] += w_knot * z4 * du_b * dv_b;
+            }
         }
 
         f_u[0] = -marginal.mu1;
