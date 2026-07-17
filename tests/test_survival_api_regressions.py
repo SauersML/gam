@@ -190,14 +190,14 @@ def test_joint_competing_risks_survival_is_reachable_from_fit(tmp_path) -> None:
             restored.sample_replicates(rows, 41, seed=2300),
         )
 
-        interval_pred = model.predict(
-            rows,
-            interval=0.9,
-            covariance_mode="conditional",
-        )
+        # DEFAULT covariance mode: per the #2296 provenance contract this is
+        # the smoothing-corrected covariance with no silent fallback. #2346
+        # landed the fit-side corrected matrix for custom-family (competing
+        # risks) fits, so the default mode must work end-to-end here.
+        interval_pred = model.predict(rows, interval=0.9)
         assert isinstance(interval_pred, gamfit.CompetingRisksPrediction)
         assert interval_pred.interval_level == 0.9
-        assert interval_pred.covariance_source == "conditional"
+        assert interval_pred.covariance_source == "smoothing-corrected"
         np.testing.assert_allclose(interval_pred.cif, pred.cif)
         np.testing.assert_allclose(
             interval_pred.overall_survival, pred.overall_survival
