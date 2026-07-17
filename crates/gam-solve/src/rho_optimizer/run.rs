@@ -2088,10 +2088,8 @@ fn certify_outer_optimality_at_terminal_fidelity(
         .max(COST_STALL_REL_TOL_FLOOR)
         * (1.0 + evaluation.cost.abs());
     let rail_outcome = match analytic_hessian.as_ref() {
-        Some(hessian)
-            if !certificate_railed.is_empty() && grad_norm > stationarity_bound =>
-        {
-            try_certify_asymptote_rail(
+        Some(hessian) if !certificate_railed.is_empty() && grad_norm > stationarity_bound => {
+            Some(try_certify_asymptote_rail(
                 obj,
                 &AsymptoteRailInputs {
                     rho: &result.rho,
@@ -2104,44 +2102,54 @@ fn certify_outer_optimality_at_terminal_fidelity(
                     objective_tol: asymptote_objective_tol,
                     context,
                 },
-            )?
+            )?)
         }
         _ => None,
     };
-    if let Some((interior_projected_grad_norm, effective_interior_bound, rails)) = rail_outcome {
-        let certificate = OuterCriterionCertificate {
-            stationarity: OuterStationarityCertificate::AsymptoteRail {
-                interior_projected_grad_norm,
-                // The bound that admitted the interior: the raw stationarity
-                // bound, or the curvature-scaled flat-valley widening when the
-                // interior sub-block's Newton decrement is below the loop's
-                // cost resolution (shared judgment with the Inc 2c mint).
-                bound: effective_interior_bound,
-                rails,
-            },
-            hessian_psd: Some(true),
-            lambdas_railed: certificate_railed.clone(),
-        };
-        // Move the certified curvature onto the result; the mint path returns
-        // immediately, so the fall-through below never observes the move.
-        result.final_hessian = analytic_hessian;
-        result.criterion_certificate = Some(certificate.clone());
-        if !certificate.certifies() {
-            result.converged = false;
-            return Err(outer_nonconvergence_error(
-                context,
-                &certificate.summary(),
-                result,
-                Some(interior_projected_grad_norm),
-                stationarity_bound,
-            ));
+    // A refused railed mint carries its typed decline reason into the final
+    // refusal summary (mirroring the tail-snap decline note), so a railed
+    // non-mint names the gate that refused instead of failing silently.
+    let mut asymptote_rail_note: Option<String> = None;
+    if let Some(outcome) = rail_outcome {
+        match outcome {
+            Err(reason) => asymptote_rail_note = Some(reason),
+            Ok(minted) => {
+                let (interior_projected_grad_norm, effective_interior_bound, rails) = minted;
+                let certificate = OuterCriterionCertificate {
+                    stationarity: OuterStationarityCertificate::AsymptoteRail {
+                        interior_projected_grad_norm,
+                        // The bound that admitted the interior: the raw stationarity
+                        // bound, or the curvature-scaled flat-valley widening when the
+                        // interior sub-block's Newton decrement is below the loop's
+                        // cost resolution (shared judgment with the Inc 2c mint).
+                        bound: effective_interior_bound,
+                        rails,
+                    },
+                    hessian_psd: Some(true),
+                    lambdas_railed: certificate_railed.clone(),
+                };
+                // Move the certified curvature onto the result; the mint path returns
+                // immediately, so the fall-through below never observes the move.
+                result.final_hessian = analytic_hessian;
+                result.criterion_certificate = Some(certificate.clone());
+                if !certificate.certifies() {
+                    result.converged = false;
+                    return Err(outer_nonconvergence_error(
+                        context,
+                        &certificate.summary(),
+                        result,
+                        Some(interior_projected_grad_norm),
+                        stationarity_bound,
+                    ));
+                }
+                result.converged = true;
+                result.converged_via = Some(OuterConvergedVia::AsymptoteStationary {
+                    rails: certificate.stationarity.rails().len(),
+                });
+                log::info!("[CERTIFICATE] {context}: {}", certificate.summary());
+                return Ok(certificate);
+            }
         }
-        result.converged = true;
-        result.converged_via = Some(OuterConvergedVia::AsymptoteStationary {
-            rails: certificate.stationarity.rails().len(),
-        });
-        log::info!("[CERTIFICATE] {context}: {}", certificate.summary());
-        return Ok(certificate);
     }
 
     let mut certified_projected_grad_norm = projected_grad_norm;
@@ -2407,11 +2415,16 @@ fn certify_outer_optimality_at_terminal_fidelity(
     result.criterion_certificate = Some(certificate.clone());
     if !certificate.certifies() {
         result.converged = false;
-        // Carry the tail-snap decline evidence into the refusal so a
-        // budget-exhausted crawl explains why it was not snapped to the rail.
+        // Carry the railed-mint and tail-snap decline evidence into the
+        // refusal so a railed or budget-exhausted crawl explains which
+        // certificate gate refused instead of failing silently.
+        let mut summary = certificate.summary();
+        if let Some(note) = asymptote_rail_note {
+            summary = format!("{summary}; asymptote-rail declined: {note}");
+        }
         let summary = match tail_snap_note {
-            Some(note) => format!("{}; tail-snap declined: {note}", certificate.summary()),
-            None => certificate.summary(),
+            Some(note) => format!("{summary}; tail-snap declined: {note}"),
+            None => summary,
         };
         return Err(outer_nonconvergence_error(
             context,
@@ -2490,7 +2503,7 @@ struct AsymptoteRailInputs<'a> {
 fn try_certify_asymptote_rail(
     obj: &mut dyn OuterObjective,
     inputs: &AsymptoteRailInputs<'_>,
-) -> Result<Option<(f64, f64, Vec<RailCoordinate>)>, EstimationError> {
+) -> Result<Result<(f64, f64, Vec<RailCoordinate>), String>, EstimationError> {
     let rho = inputs.rho;
     let projected_gradient = inputs.projected_gradient;
     let railed = inputs.railed;
@@ -2506,23 +2519,23 @@ fn try_certify_asymptote_rail(
     let interior_indices: Vec<usize> = (0..projected_gradient.len())
         .filter(|k| !railed.contains(k))
         .collect();
-    let Some((interior_projected_grad_norm, effective_interior_bound)) =
-        certify_interior_stationarity(
+    let (interior_projected_grad_norm, effective_interior_bound) =
+        match certify_interior_stationarity(
             projected_gradient,
             inputs.hessian,
             &interior_indices,
             inputs.stationarity_bound,
             inputs.objective_tol,
-        )
-    else {
-        return Ok(None);
-    };
+        ) {
+            Ok(certified) => certified,
+            Err(reason) => return Ok(Err(reason)),
+        };
     // The interior sub-block (railed coordinates removed) must be admissible
     // curvature for a minimum. A rail-caused indefiniteness in the saturated
     // direction is expected and excluded; genuine interior negative curvature is
     // not, and refuses the certificate.
     if certificate_hessian_is_psd_off_railed(inputs.hessian, railed) != Some(true) {
-        return Ok(None);
+        return Ok(Err("interior Hessian sub-block is not PSD".to_string()));
     }
     let beta_norm = inputs
         .terminal_beta
@@ -2534,11 +2547,11 @@ fn try_certify_asymptote_rail(
     let (lower, upper) = inputs.bounds;
 
     let mut rails: Vec<RailCoordinate> = Vec::new();
-    let mut all_certified = true;
+    let mut decline: Option<String> = None;
     let mut probed_any = false;
     for &k in railed.iter() {
         if k >= rho.len() || k >= lower.len() || k >= upper.len() {
-            all_certified = false;
+            decline = Some(format!("railed coordinate {k} outside the box layout"));
             break;
         }
         // Which rail: the box endpoint the coordinate sits nearest. `Upper`
@@ -2550,9 +2563,9 @@ fn try_certify_asymptote_rail(
         };
         probed_any = true;
         match build_and_assess_rail_coordinate(obj, rho, k, side, &tol)? {
-            Some(rail) => rails.push(rail),
-            None => {
-                all_certified = false;
+            Ok(rail) => rails.push(rail),
+            Err(reason) => {
+                decline = Some(reason);
                 break;
             }
         }
@@ -2571,15 +2584,19 @@ fn try_certify_asymptote_rail(
         })?;
     }
 
-    if all_certified && !rails.is_empty() {
-        Ok(Some((
-            interior_projected_grad_norm,
-            effective_interior_bound,
-            rails,
-        )))
-    } else {
-        Ok(None)
+    if let Some(reason) = decline {
+        return Ok(Err(reason));
     }
+    if rails.is_empty() {
+        return Ok(Err(
+            "no railed coordinate produced a certifiable tail".to_string()
+        ));
+    }
+    Ok(Ok((
+        interior_projected_grad_norm,
+        effective_interior_bound,
+        rails,
+    )))
 }
 
 /// Two-stage interior stationarity judgment shared by the Inc 1 railed mint
@@ -2590,23 +2607,24 @@ fn try_certify_asymptote_rail(
 /// improve the objective by less than `objective_tol` — the loop's own cost
 /// resolution — so the point is cost-indistinguishable from the interior
 /// optimum and the measured gradient is resolution noise, not slope. Returns
-/// `Some((interior_grad_norm, effective_bound))` when certified (the bound
-/// that admitted the norm: raw, or the curvature-scaled widening), `None`
-/// when real interior descent remains.
+/// `Ok((interior_grad_norm, effective_bound))` when certified (the bound
+/// that admitted the norm: raw, or the curvature-scaled widening); `Err`
+/// carries the measured evidence when real interior descent remains, so a
+/// refused mint explains WHICH interior stage failed and by how much.
 pub(crate) fn certify_interior_stationarity(
     gradient: &Array1<f64>,
     hessian: &Array2<f64>,
     interior_indices: &[usize],
     stationarity_bound: f64,
     objective_tol: f64,
-) -> Option<(f64, f64)> {
+) -> Result<(f64, f64), String> {
     let interior_grad_norm = interior_indices
         .iter()
         .map(|&k| gradient[k] * gradient[k])
         .sum::<f64>()
         .sqrt();
     if interior_grad_norm <= stationarity_bound {
-        return Some((interior_grad_norm, stationarity_bound));
+        return Ok((interior_grad_norm, stationarity_bound));
     }
     let m = interior_indices.len();
     let mut sub_h = Array2::<f64>::zeros((m, m));
@@ -2617,18 +2635,23 @@ pub(crate) fn certify_interior_stationarity(
             sub_h[[i, j]] = hessian[[ri, rj]];
         }
     }
-    if let Some(predicted_decrease) = newton_predicted_decrease(&sub_h, &sub_g)
-        && predicted_decrease.is_finite()
-        && predicted_decrease > 0.0
-        && predicted_decrease <= objective_tol
-    {
-        let curvature_grad_bound =
-            interior_grad_norm * (objective_tol / predicted_decrease).sqrt();
-        if curvature_grad_bound.is_finite() && curvature_grad_bound >= interior_grad_norm {
-            return Some((interior_grad_norm, curvature_grad_bound));
+    match newton_predicted_decrease(&sub_h, &sub_g) {
+        Some(predicted_decrease) if predicted_decrease.is_finite() && predicted_decrease > 0.0 => {
+            if predicted_decrease <= objective_tol {
+                let curvature_grad_bound =
+                    interior_grad_norm * (objective_tol / predicted_decrease).sqrt();
+                if curvature_grad_bound.is_finite() && curvature_grad_bound >= interior_grad_norm {
+                    return Ok((interior_grad_norm, curvature_grad_bound));
+                }
+            }
+            Err(format!(
+                "interior not stationary: |Pg_int|={interior_grad_norm:.3e} > bound                  {stationarity_bound:.3e}, sub-block Newton decrement                  {predicted_decrease:.3e} > cost resolution {objective_tol:.3e}"
+            ))
         }
+        _ => Err(format!(
+            "interior not stationary: |Pg_int|={interior_grad_norm:.3e} > bound              {stationarity_bound:.3e} and the interior sub-block yields no PD Newton              decrement"
+        )),
     }
-    None
 }
 
 /// Curvature-tie acceptance band for a certify-time tail-snap candidate
@@ -2780,7 +2803,10 @@ fn try_tail_snap_to_rail(
         return Ok(TailSnapOutcome::Declined(if rejected.is_empty() {
             "no super-bound coordinate".to_string()
         } else {
-            format!("no candidate passed the curvature tie ({})", rejected.join("; "))
+            format!(
+                "no candidate passed the curvature tie ({})",
+                rejected.join("; ")
+            )
         }));
     }
 
@@ -2828,8 +2854,7 @@ fn try_tail_snap_to_rail(
                         AsymptoteSide::Upper => tail_constant * (-rho[*k]).exp(),
                         AsymptoteSide::Lower => tail_constant * rho[*k].exp(),
                     };
-                    if extrapolated_gap.is_finite()
-                        && extrapolated_gap <= inputs.stationarity_bound
+                    if extrapolated_gap.is_finite() && extrapolated_gap <= inputs.stationarity_bound
                     {
                         at_point_rails.push(RailCoordinate {
                             index: *k,
@@ -2888,7 +2913,7 @@ fn try_tail_snap_to_rail(
     // full-Hessian widening is unavailable here exactly because the
     // noise-corrupted tail entry makes the full matrix non-PD).
     if at_point_rails.len() == candidates.len() {
-        if let Some((interior_projected_grad_norm, effective_interior_bound)) =
+        if let Ok((interior_projected_grad_norm, effective_interior_bound)) =
             certify_interior_stationarity(
                 gradient,
                 hessian,
@@ -2941,10 +2966,14 @@ fn build_and_assess_rail_coordinate(
     coord: usize,
     side: AsymptoteSide,
     tol: &AsymptoteTolerances,
-) -> Result<Option<RailCoordinate>, EstimationError> {
+) -> Result<Result<RailCoordinate, String>, EstimationError> {
     let window = match probe_tail_window(obj, rho, coord, side, tol)? {
         (Some(window), _) => window,
-        (None, _) => return Ok(None),
+        (None, rows) => {
+            return Ok(Err(format!(
+                "k={coord}: no finite-difference-clean tail window; probes {rows}"
+            )));
+        }
     };
     match assess_coordinate(&window, tol) {
         AsymptoteVerdict::CertifiedAtAsymptote {
@@ -2952,7 +2981,7 @@ fn build_and_assess_rail_coordinate(
             tail_constant,
             value_gap,
             estimand_travel_bound,
-        } => Ok(Some(RailCoordinate {
+        } => Ok(Ok(RailCoordinate {
             index: coord,
             side,
             tail_constant,
@@ -2960,7 +2989,7 @@ fn build_and_assess_rail_coordinate(
             estimand_travel_bound,
             noise_margin: tol.tail_noise_floor,
         })),
-        _ => Ok(None),
+        other => Ok(Err(format!("k={coord}: tail verdict {other:?}"))),
     }
 }
 
@@ -2997,7 +3026,9 @@ fn probe_tail_window(
             // assess whatever clean run the earlier probes established.
             Err(_) => break,
         };
-        if !eval.cost.is_finite() || coord >= eval.gradient.len() || !eval.gradient[coord].is_finite()
+        if !eval.cost.is_finite()
+            || coord >= eval.gradient.len()
+            || !eval.gradient[coord].is_finite()
         {
             break;
         }
@@ -3005,7 +3036,12 @@ fn probe_tail_window(
     }
     let rows_summary = rows
         .iter()
-        .map(|(r, g, _)| format!("(ρ={r:.2}, g={g:.3e}, ĉ={:.3e})", side.tail_constant(*r, *g)))
+        .map(|(r, g, _)| {
+            format!(
+                "(ρ={r:.2}, g={g:.3e}, ĉ={:.3e})",
+                side.tail_constant(*r, *g)
+            )
+        })
         .collect::<Vec<_>>()
         .join(" ");
     if rows.len() < MIN_TAIL_SAMPLES {
@@ -3023,7 +3059,9 @@ fn probe_tail_window(
     let element_clean: Vec<bool> = rows
         .iter()
         .zip(&constants)
-        .map(|((_, g, _), c)| c.is_finite() && *c > tol.tail_noise_floor && g.abs() > tol.interior_grad_tol)
+        .map(|((_, g, _), c)| {
+            c.is_finite() && *c > tol.tail_noise_floor && g.abs() > tol.interior_grad_tol
+        })
         .collect();
 
     // Longest contiguous run that is element-clean AND holds ĉ within the drift
@@ -4218,7 +4256,7 @@ mod asymptote_rail_certify_tests {
             build_and_assess_rail_coordinate(&mut obj, &rho, 0, AsymptoteSide::Upper, &tol)
                 .expect("probing must not error");
         assert!(
-            verdict.is_none(),
+            verdict.is_err(),
             "a drifting ĉ must not certify a tail, got {verdict:?}",
         );
     }
@@ -4287,8 +4325,13 @@ mod asymptote_rail_certify_tests {
         let refused = try_certify_asymptote_rail(&mut obj, &inputs_indefinite)
             .expect("certification must not error");
         assert!(
-            refused.is_none(),
+            refused.is_err(),
             "indefinite interior curvature must refuse the rail certificate, got {refused:?}",
+        );
+        let reason = refused.unwrap_err();
+        assert!(
+            reason.contains("not PSD") || reason.contains("interior"),
+            "the decline must name the refusing gate, got: {reason}"
         );
     }
 }
