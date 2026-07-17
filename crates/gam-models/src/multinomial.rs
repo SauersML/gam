@@ -4054,6 +4054,10 @@ mod fisher_override_tests {
         let (design, y, penalty, lambdas) = toy();
         let n = design.nrows();
         let m = y.ncols() - 1;
+        // #2344: toy() now carries K per-class lambdas for the multinomial
+        // ENTRY; the direct Centered-metric ENGINE calls below read
+        // M = lambdas.len(), so hand them the M-length shared-lambda vector.
+        let engine_lambdas = Array1::<f64>::from_elem(m, lambdas[0]);
         // Analytic block at β = 0: p_a = 1/K = 1/3, so diag = p_a(1−p_a),
         // off-diag = −p_a p_b. Scale that exact block by 4.
         let pk = 1.0 / (y.ncols() as f64);
@@ -4073,7 +4077,7 @@ mod fisher_override_tests {
                 design: design.view(),
                 y: y.view(),
                 penalty: penalty.view(),
-                lambdas: lambdas.view(),
+                lambdas: engine_lambdas.view(),
                 fisher_w_override: Some(over.view()),
                 max_iter: 1,
                 tol: 1.0e-9,
@@ -4089,7 +4093,7 @@ mod fisher_override_tests {
                 design: design.view(),
                 y: y.view(),
                 penalty: penalty.view(),
-                lambdas: lambdas.view(),
+                lambdas: engine_lambdas.view(),
                 fisher_w_override: None,
                 max_iter: 1,
                 tol: 1.0e-9,
