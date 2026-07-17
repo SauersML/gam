@@ -2467,7 +2467,14 @@ const ASYMPTOTE_ESTIMAND_REL_TOL: f64 = 1.0e-4;
 /// toward the interior when reconstructing its exponential tail (#2348 Inc 1).
 /// Enough to span both the finite-difference floor next to the rail (rejected)
 /// and a confirmable-tail run further in.
-const ASYMPTOTE_PROBE_COUNT: usize = 12;
+// 18 e-folds: the window must REACH the finite-difference-clean constant-ĉ
+// band from a coordinate railed AT the box ceiling. The fused-Hessian
+// trajectory (#2348) rails fits at ρ=30 that previously stalled mid-box, and
+// the #2299 fixture's clean band sits 13–16 e-folds inside — the old 12-probe
+// window (sized for mid-box crawls) stopped one row short of it, so a fully
+// confirmed tail declined with "no finite-difference-clean tail window". Six
+// extra value+gradient evals, paid only at certification of railed fits.
+const ASYMPTOTE_PROBE_COUNT: usize = 18;
 
 /// Read-only inputs to [`try_certify_asymptote_rail`], bundled so the certify
 /// path passes one borrow rather than a long positional argument list.
@@ -2543,7 +2550,12 @@ fn try_certify_asymptote_rail(
         .filter(|v| v.is_finite())
         .unwrap_or(0.0);
     let estimand_tol = ASYMPTOTE_ESTIMAND_REL_TOL * (1.0 + beta_norm);
-    let tol = AsymptoteTolerances::exp4_rail_bands(estimand_tol);
+    let mut tol = AsymptoteTolerances::exp4_rail_bands(estimand_tol);
+    // Real REML tails hold ĉ to ~5e-3 relative, not the exp4 synthetic
+    // characterization's 1e-3 (measured on the #2299 fixture during Inc 2c);
+    // the tail-snap path already certifies against the widened band, and the
+    // railed mint must judge the SAME physical tail by the same standard.
+    tol.tail_drift_rel = TAIL_SNAP_DRIFT_REL;
     let (lower, upper) = inputs.bounds;
 
     let mut rails: Vec<RailCoordinate> = Vec::new();
