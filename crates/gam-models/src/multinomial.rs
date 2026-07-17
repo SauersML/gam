@@ -4527,6 +4527,14 @@ mod reference_class_invariance_tests {
             -0.4894709703255621,
             1.299144316808675,
         ];
+        // The criterion probe needs no posterior covariance — and at this
+        // checkpoint it CANNOT have one: the joint precision H + S_λ is
+        // measurably singular there (1 flat direction, the first hard datum
+        // this gate produced), so the covariance factorization honestly
+        // refuses. The REML criterion value is still well-defined through the
+        // pseudo-logdet.
+        let mut probe_options = parts.options.clone();
+        probe_options.compute_covariance = false;
         let v_at = |rho: &[f64]| -> f64 {
             let fam = parts
                 .family
@@ -4535,7 +4543,7 @@ mod reference_class_invariance_tests {
             let fit = crate::custom_family::fit_custom_family_fixed_log_lambdas(
                 &fam,
                 &parts.blocks,
-                &parts.options,
+                &probe_options,
                 None,
             )
             .expect("fixed-lambda inner solve at the checkpoint must converge");
