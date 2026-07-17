@@ -9,7 +9,8 @@ use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
 };
 use gam::families::custom_family::{
-    CustomFamilyBlockPsiDerivative, EvalMode, evaluate_custom_family_joint_hyper,
+    CustomFamilyBlockPsiDerivative, CustomFamilyHyperLayout, EvalMode,
+    evaluate_custom_family_joint_hyper,
 };
 use gam::families::gamlss::GaussianLocationScaleFamily;
 use gam::families::survival::{
@@ -907,14 +908,19 @@ fn custom_family_joint_laml_penalized_quadratic_row() -> Vec<GradientChannel> {
     };
     let specs = penalized_quadratic_specs(&target, distinct_diag_penalty(target.len()));
     let opts = custom_family_opts();
-    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
+    let hyper_layout = CustomFamilyHyperLayout::new(
+        vec![Vec::<CustomFamilyBlockPsiDerivative>::new()],
+        vec![],
+        Array1::zeros(0),
+    )
+    .expect("empty hyper layout");
     let rho = array![0.4];
     let analytic = evaluate_custom_family_joint_hyper(
         &family,
         &specs,
         &opts,
         &rho,
-        &derivative_blocks,
+        &hyper_layout,
         None,
         EvalMode::ValueAndGradient,
     )
@@ -931,7 +937,7 @@ fn custom_family_joint_laml_penalized_quadratic_row() -> Vec<GradientChannel> {
             &specs,
             &opts,
             &plus,
-            &derivative_blocks,
+            &hyper_layout,
             None,
             EvalMode::ValueAndGradient,
         )
@@ -942,7 +948,7 @@ fn custom_family_joint_laml_penalized_quadratic_row() -> Vec<GradientChannel> {
             &specs,
             &opts,
             &minus,
-            &derivative_blocks,
+            &hyper_layout,
             None,
             EvalMode::ValueAndGradient,
         )

@@ -80,7 +80,8 @@ use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
 };
 use gam::families::custom_family::{
-    CustomFamilyBlockPsiDerivative, EvalMode, evaluate_custom_family_joint_hyper,
+    CustomFamilyBlockPsiDerivative, CustomFamilyHyperLayout, EvalMode,
+    evaluate_custom_family_joint_hyper,
 };
 use gam::families::survival::{
     PenaltyBlock, PenaltyBlocks, SurvivalEngineInputs, SurvivalMonotonicityPenalty, SurvivalSpec,
@@ -824,7 +825,7 @@ fn custom_objective(
     family: &PenalizedQuadraticFamily,
     specs: &[ParameterBlockSpec],
     opts: &BlockwiseFitOptions,
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    hyper_layout: &CustomFamilyHyperLayout,
     rho: &Array1<f64>,
 ) -> f64 {
     evaluate_custom_family_joint_hyper(
@@ -832,7 +833,7 @@ fn custom_objective(
         specs,
         opts,
         rho,
-        derivative_blocks,
+        hyper_layout,
         None,
         EvalMode::ValueAndGradient,
     )
@@ -844,7 +845,7 @@ fn custom_gradient(
     family: &PenalizedQuadraticFamily,
     specs: &[ParameterBlockSpec],
     opts: &BlockwiseFitOptions,
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    hyper_layout: &CustomFamilyHyperLayout,
     rho: &Array1<f64>,
 ) -> Array1<f64> {
     evaluate_custom_family_joint_hyper(
@@ -852,7 +853,7 @@ fn custom_gradient(
         specs,
         opts,
         rho,
-        derivative_blocks,
+        hyper_layout,
         None,
         EvalMode::ValueAndGradient,
     )
@@ -865,11 +866,11 @@ fn assert_custom_consistent(
     family: &PenalizedQuadraticFamily,
     specs: &[ParameterBlockSpec],
     opts: &BlockwiseFitOptions,
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    hyper_layout: &CustomFamilyHyperLayout,
     rho: &Array1<f64>,
     tol: f64,
 ) {
-    let analytic = custom_gradient(family, specs, opts, derivative_blocks, rho);
+    let analytic = custom_gradient(family, specs, opts, hyper_layout, rho);
     let k = rho.len();
     let mut fd = Array1::<f64>::zeros(k);
     for i in 0..k {
@@ -877,8 +878,8 @@ fn assert_custom_consistent(
         rp[i] += FD_STEP;
         let mut rm = rho.clone();
         rm[i] -= FD_STEP;
-        let cp = custom_objective(family, specs, opts, derivative_blocks, &rp);
-        let cm = custom_objective(family, specs, opts, derivative_blocks, &rm);
+        let cp = custom_objective(family, specs, opts, hyper_layout, &rp);
+        let cm = custom_objective(family, specs, opts, hyper_layout, &rm);
         fd[i] = (cp - cm) / (2.0 * FD_STEP);
     }
     assert!(
@@ -934,7 +935,12 @@ fn custom_family_lamlobjective_gradient_consistent_interior() {
     };
     let specs = penalized_quadratic_specs(&target, distinct_diag_penalty(target.len()));
     let opts = custom_family_opts();
-    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
+    let hyper_layout = CustomFamilyHyperLayout::new(
+        vec![Vec::<CustomFamilyBlockPsiDerivative>::new()],
+        vec![],
+        Array1::zeros(0),
+    )
+    .expect("empty hyper layout");
     for rho in [
         Array1::from(vec![-0.8_f64]),
         Array1::from(vec![0.0_f64]),
@@ -946,7 +952,7 @@ fn custom_family_lamlobjective_gradient_consistent_interior() {
             &family,
             &specs,
             &opts,
-            &derivative_blocks,
+            &hyper_layout,
             &rho,
             TOL_INTERIOR,
         );
@@ -961,7 +967,12 @@ fn custom_family_lamlobjective_gradient_consistent_near_degenerate() {
     };
     let specs = penalized_quadratic_specs(&target, near_degenerate_diag_penalty(target.len()));
     let opts = custom_family_opts();
-    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
+    let hyper_layout = CustomFamilyHyperLayout::new(
+        vec![Vec::<CustomFamilyBlockPsiDerivative>::new()],
+        vec![],
+        Array1::zeros(0),
+    )
+    .expect("empty hyper layout");
     for rho in [
         Array1::from(vec![-0.5_f64]),
         Array1::from(vec![0.3_f64]),
@@ -972,7 +983,7 @@ fn custom_family_lamlobjective_gradient_consistent_near_degenerate() {
             &family,
             &specs,
             &opts,
-            &derivative_blocks,
+            &hyper_layout,
             &rho,
             TOL_DEGENERATE,
         );
@@ -987,7 +998,12 @@ fn custom_family_lamlobjective_gradient_consistent_at_large_lambda_boundary() {
     };
     let specs = penalized_quadratic_specs(&target, distinct_diag_penalty(target.len()));
     let opts = custom_family_opts();
-    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
+    let hyper_layout = CustomFamilyHyperLayout::new(
+        vec![Vec::<CustomFamilyBlockPsiDerivative>::new()],
+        vec![],
+        Array1::zeros(0),
+    )
+    .expect("empty hyper layout");
     // Large ρ ⇒ λ = exp(ρ) huge: β̂ → 0 against the penalty, the inner
     // mode rides the boundary where the penalized-block curvature is
     // dominated by λS — the regime where the ridge/floor logic and the
@@ -1002,7 +1018,7 @@ fn custom_family_lamlobjective_gradient_consistent_at_large_lambda_boundary() {
             &family,
             &specs,
             &opts,
-            &derivative_blocks,
+            &hyper_layout,
             &rho,
             TOL_BOUNDARY,
         );

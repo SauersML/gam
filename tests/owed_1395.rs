@@ -42,7 +42,8 @@ use gam::custom_family::{
     ParameterBlockState, PenaltyMatrix,
 };
 use gam::families::custom_family::{
-    CustomFamilyBlockPsiDerivative, ExactNewtonOuterObjective, evaluate_custom_family_joint_hyper,
+    CustomFamilyBlockPsiDerivative, CustomFamilyHyperLayout, ExactNewtonOuterObjective,
+    evaluate_custom_family_joint_hyper,
 };
 use gam::matrix::SymmetricMatrix;
 use gam_problem::ExactNewtonJointPsiTerms;
@@ -207,7 +208,7 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
         &self,
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         assert_eq!(
@@ -216,9 +217,9 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
             "psi terms: states/specs aligned"
         );
         assert_eq!(
-            derivative_blocks.len(),
+            hyper_layout.block_count(),
             block_states.len(),
-            "psi terms: derivs/states aligned"
+            "psi terms: layout blocks/states aligned"
         );
         assert_eq!(psi_index, 0, "psi terms: scalar psi index expected 0");
         let beta = block_states
@@ -271,7 +272,6 @@ fn owed_1395_pseudo_laplace_psi_objective_keeps_full_logdet() {
         None,
         None,
     );
-    let derivative_blocks = vec![vec![deriv]];
     let options = BlockwiseFitOptions {
         use_remlobjective: true,
         compute_covariance: false,
@@ -292,12 +292,18 @@ fn owed_1395_pseudo_laplace_psi_objective_keeps_full_logdet() {
 
     for (psi, expected) in cases {
         let family = ScalarPseudoLaplacePsiFamily { psi };
+        let hyper_layout = CustomFamilyHyperLayout::new(
+            vec![vec![deriv.clone()]],
+            vec![],
+            array![psi],
+        )
+        .expect("single psi-axis hyper layout");
         let result = evaluate_custom_family_joint_hyper(
             &family,
             std::slice::from_ref(&spec),
             &options,
             &Array1::zeros(0),
-            &derivative_blocks,
+            &hyper_layout,
             None,
             gam::families::custom_family::EvalMode::ValueAndGradient,
         )
@@ -331,7 +337,12 @@ fn owed_1395_pseudo_laplace_rho_objective_matches_closed_form() {
         stacked_design: None,
         stacked_offset: None,
     };
-    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
+    let hyper_layout = CustomFamilyHyperLayout::new(
+        vec![Vec::<CustomFamilyBlockPsiDerivative>::new()],
+        vec![],
+        Array1::zeros(0),
+    )
+    .expect("empty hyper layout");
     let options = BlockwiseFitOptions {
         use_remlobjective: true,
         compute_covariance: false,
@@ -349,7 +360,7 @@ fn owed_1395_pseudo_laplace_rho_objective_matches_closed_form() {
             std::slice::from_ref(&spec),
             &options,
             &array![rho],
-            &derivative_blocks,
+            &hyper_layout,
             None,
             gam::families::custom_family::EvalMode::ValueAndGradient,
         )
@@ -530,7 +541,12 @@ fn owed_1395_matrix_free_pseudo_laplace_rho_objective_matches_closed_form() {
         targets: targets.clone(),
     };
     let spec = diagonal_pseudo_laplace_rho_spec(p);
-    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
+    let hyper_layout = CustomFamilyHyperLayout::new(
+        vec![Vec::<CustomFamilyBlockPsiDerivative>::new()],
+        vec![],
+        Array1::zeros(0),
+    )
+    .expect("empty hyper layout");
     let options = BlockwiseFitOptions {
         use_remlobjective: true,
         compute_covariance: false,
@@ -544,7 +560,7 @@ fn owed_1395_matrix_free_pseudo_laplace_rho_objective_matches_closed_form() {
             std::slice::from_ref(&spec),
             &options,
             &array![rho],
-            &derivative_blocks,
+            &hyper_layout,
             None,
             gam::families::custom_family::EvalMode::ValueAndGradient,
         )
@@ -582,7 +598,12 @@ fn owed_1395_matrix_free_pseudo_laplace_rho_gradient_matches_num_dual() {
         targets: targets.clone(),
     };
     let spec = diagonal_pseudo_laplace_rho_spec(p);
-    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
+    let hyper_layout = CustomFamilyHyperLayout::new(
+        vec![Vec::<CustomFamilyBlockPsiDerivative>::new()],
+        vec![],
+        Array1::zeros(0),
+    )
+    .expect("empty hyper layout");
     let options = BlockwiseFitOptions {
         use_remlobjective: true,
         compute_covariance: false,
@@ -596,7 +617,7 @@ fn owed_1395_matrix_free_pseudo_laplace_rho_gradient_matches_num_dual() {
             std::slice::from_ref(&spec),
             &options,
             &array![rho],
-            &derivative_blocks,
+            &hyper_layout,
             None,
             gam::families::custom_family::EvalMode::ValueAndGradient,
         )
