@@ -40,6 +40,12 @@ pub struct DenseSpectralOperator {
     pub(crate) projected_factor_cache: ProjectedFactorCache,
     /// Full dimension.
     pub(crate) n_dim: usize,
+    /// Raw (unregularized) eigenvalues σ_i of H, in eigenpair order. The fused
+    /// second-order reductions need `σ` itself (not `r_ε(σ)`) to reassociate
+    /// the logdet-Hessian diagonal cancellation-free.
+    pub(crate) raw_eigenvalues: Vec<f64>,
+    /// The spectral regularization scale ε used to build every kernel.
+    pub(crate) epsilon: f64,
 }
 
 impl DenseSpectralOperator {
@@ -198,6 +204,8 @@ impl DenseSpectralOperator {
             cached_logdet,
             projected_factor_cache: ProjectedFactorCache::default(),
             n_dim: n,
+            raw_eigenvalues: eigenvalues.to_vec(),
+            epsilon,
         })
     }
 
@@ -432,6 +440,84 @@ impl DenseSpectralOperator {
             weight_sum += w_jk;
         }
         (fused, weight_sum)
+    }
+
+    /// Cancellation-free logdet-HESSIAN diagonal reduction for a block-local
+    /// penalty coordinate: computes `tr(G_ε Ḧ_kk) + Γ-cross(Ḣ_k, Ḣ_k)` — the
+    /// full `2·L_kk` logdet contribution of `∂²_{ρ_k} ½log|H|` — with the
+    /// second-order trace pair reassociated eigenpair-by-eigenpair.
+    ///
+    /// For a pure penalty coordinate (`Ḣ_k = Ḧ_kk = A = λ_k S_k`, no family
+    /// curvature correction) the naive assembly forms
+    ///
+    /// ```text
+    ///   base  =  tr(G_ε A)          = Σ_a φ'_a Ã_aa            → rank  (rail)
+    ///   cross =  Σ_{ab} Γ_ab Ã_ab²                              → −rank (rail)
+    /// ```
+    ///
+    /// (`Ã = Uᵀ A U`, `φ'(σ) = 1/√(σ²+4ε²)`, `Γ` the divided-difference kernel
+    /// with `Γ_aa = −σ_a/(σ_a²+4ε²)^{3/2}`).  At the over-smoothing rail
+    /// (`H ≈ λ_k S_k`) each aggregate approaches `rank(S_k)` and their sum's
+    /// true value is the O(1/λ_k) tail curvature `+c·e^{−ρ}` — which the naive
+    /// difference of two rank-sized sums surrenders to summation-order noise.
+    /// This is the SECOND-ORDER instance of the #2298 rail trace−rank
+    /// cancellation (first order fixed by the fused gradient reductions above);
+    /// it is why deep-λ outer Hessian diagonals came back `≈ g` with the
+    /// gradient's own sign (`hessian_psd=NO` at every deep-λ point, #2348).
+    ///
+    /// The reassociation pairs each diagonal eigenterm with its own cross
+    /// share.  Exactly, per active eigenpair `a`:
+    ///
+    /// ```text
+    ///   φ'_a Ã_aa + Γ_aa Ã_aa²  =  φ'_a · Ã_aa · (σ_a·b_a + 4ε²) / (σ_a²+4ε²),
+    ///   b_a = σ_a − Ã_aa
+    /// ```
+    ///
+    /// (algebraic identity: substitute `Γ_aa = −σ_a φ'_a/(σ_a²+4ε²)`).  The
+    /// residual `b_a` is the mass of `H − A` on eigendirection `a` — O(1) at
+    /// the rail while `σ_a, Ã_aa` are O(λ_k) — so every term stays at the true
+    /// O(1/λ_k) scale.  Off-diagonal cross terms `Γ_ab Ã_ab²` (a ≠ b) are kept
+    /// as-is: for in-block pairs `Ã_ab = −u_aᵀ(H−A)u_b` is already O(1) and
+    /// `Γ_ab = O(1/λ²)`, so they are single products with no cancellation.
+    ///
+    /// Value-identical to `trace_logdet_block_local(S_k, λ_k, ..) +
+    /// trace_logdet_hessian_cross(A, A)`; callers gate on
+    /// `active_rank() == dim()` and on the coordinate having no drift
+    /// correction (`Ḣ_k = A_k`), mirroring the fused-gradient gating.
+    pub(crate) fn fused_logdet_hessian_diagonal_block(
+        &self,
+        s_block: &Array2<f64>,
+        start: usize,
+        end: usize,
+        scale: f64,
+    ) -> f64 {
+        let u_block = self.eigenvectors.slice(ndarray::s![start..end, ..]);
+        // Ã = scale · u_blkᵀ (S · u_blk): n × n, symmetric.
+        let su = s_block.dot(&u_block);
+        let mut a_tilde = u_block.t().dot(&su);
+        a_tilde.mapv_inplace(|v| v * scale);
+
+        let four_eps_sq = 4.0 * self.epsilon * self.epsilon;
+        let mut fused = 0.0;
+        for a in 0..self.n_dim {
+            if !self.active_mask[a] {
+                continue;
+            }
+            let sigma = self.raw_eigenvalues[a];
+            let disc = sigma * sigma + four_eps_sq;
+            let phi_prime = 1.0 / disc.sqrt();
+            let t = a_tilde[[a, a]];
+            let residual = sigma - t;
+            fused += phi_prime * t * (sigma * residual + four_eps_sq) / disc;
+            for b in 0..self.n_dim {
+                if b == a || !self.active_mask[b] {
+                    continue;
+                }
+                let cross = a_tilde[[a, b]];
+                fused += self.logdet_hessian_kernel[[a, b]] * cross * cross;
+            }
+        }
+        fused
     }
 
     #[inline]

@@ -304,6 +304,123 @@ pub(crate) fn fused_rail_logdet_gradient_beats_naive_trace_minus_rank_on_identic
     );
 }
 
+// ─── (#2348) fused logdet-HESSIAN diagonal is cancellation-free at the rail ───
+//
+// The ρ_k-DIAGONAL of the LAML `½·log|H|` Hessian carries
+// `½·(tr(G_ε·λ_k S_k) + Γ-cross(λ_k S_k, λ_k S_k))`. At the over-smoothing rail
+// the two aggregates approach +rank and −rank while their sum's true value is
+// the O(1/λ_k) tail curvature `+c·e^{−ρ}` — the SECOND-order instance of the
+// #2298 rail cancellation. The naive difference of two rank-sized sums loses
+// the value (and routinely its SIGN: #2348's decline evidence measured
+// `H_kk ≈ g` with the gradient's own sign, `hessian_psd=NO` at every deep-λ
+// point). `fused_logdet_hessian_diagonal_block` pairs each diagonal eigenterm
+// with its own cross share via the residual `b_a = σ_a − Ã_aa`, keeping every
+// intermediate at the true scale.
+#[test]
+pub(crate) fn fused_rail_logdet_hessian_diagonal_beats_naive_and_restores_tail_sign() {
+    // Deep-rail 1×1 singleton block at coord 0 (same fixture family as the
+    // gradient witness): H[0,0] ≈ λ·s dominates a small SPD data Hessian.
+    let s_scalar = 3.0_f64;
+    let lambda = 1.0e6_f64;
+    let mut h = array![
+        [0.9_f64, 0.10, -0.05, 0.02],
+        [0.10, 1.30, 0.08, -0.04],
+        [-0.05, 0.08, 1.10, 0.06],
+        [0.02, -0.04, 0.06, 0.80],
+    ];
+    h[[0, 0]] += lambda * s_scalar;
+    let op = DenseSpectralOperator::from_symmetric(&h).expect("rail SPD fixture");
+    let p = op.n_dim;
+    assert_eq!(op.active_rank(), p, "smooth mode keeps the complete eigenbasis");
+
+    let s_block = array![[s_scalar]];
+    // Full-space drift A = λ_k S_k for the naive cross contraction.
+    let mut a_dense = Array2::<f64>::zeros((p, p));
+    a_dense[[0, 0]] = lambda * s_scalar;
+
+    // Naive production form: rank-sized base trace plus rank-sized cross trace.
+    let base = op.trace_logdet_block_local(&s_block, lambda, 0, 1);
+    let cross = op.trace_logdet_hessian_cross(&a_dense, &a_dense);
+    let naive = base + cross;
+    // Fused production form.
+    let fused = op.fused_logdet_hessian_diagonal_block(&s_block, 0, 1, lambda);
+
+    // Compensated (Neumaier) reference over the SAME per-eigenpair fused terms —
+    // the ground truth for the diagonal value on this eigendecomposition.
+    let u_block = op.eigenvectors.slice(ndarray::s![0..1, ..]);
+    let su = s_block.dot(&u_block);
+    let mut a_tilde = u_block.t().dot(&su);
+    a_tilde.mapv_inplace(|v| v * lambda);
+    let four_eps_sq = 4.0 * op.epsilon * op.epsilon;
+    let mut sum = 0.0_f64;
+    let mut comp = 0.0_f64;
+    let add = |d: f64, sum: &mut f64, comp: &mut f64| {
+        let t = *sum + d;
+        if sum.abs() >= d.abs() {
+            *comp += (*sum - t) + d;
+        } else {
+            *comp += (d - t) + *sum;
+        }
+        *sum = t;
+    };
+    for a in 0..p {
+        let sigma = op.raw_eigenvalues[a];
+        let disc = sigma * sigma + four_eps_sq;
+        let phi_prime = 1.0 / disc.sqrt();
+        let t_aa = a_tilde[[a, a]];
+        let residual = sigma - t_aa;
+        add(
+            phi_prime * t_aa * (sigma * residual + four_eps_sq) / disc,
+            &mut sum,
+            &mut comp,
+        );
+        for b in 0..p {
+            if b == a {
+                continue;
+            }
+            let c = a_tilde[[a, b]];
+            add(op.logdet_hessian_kernel[[a, b]] * c * c, &mut sum, &mut comp);
+        }
+    }
+    let reference = sum + comp;
+
+    let err_naive = (naive - reference).abs();
+    let err_fused = (fused - reference).abs();
+    // Cancellation ratio: |large canceling aggregate| / |true curvature|.
+    let cancellation = base.abs() / reference.abs().max(f64::MIN_POSITIVE);
+    eprintln!(
+        "[FUSED-RAIL-H] reference={reference:.6e} naive={naive:.6e} fused={fused:.6e} \
+         err_naive={err_naive:.3e} err_fused={err_fused:.3e} cancellation={cancellation:.3e}"
+    );
+
+    // The tail curvature of ½log|H| at a deep rail over an SPD residual is
+    // strictly POSITIVE (scalar model: λs·b/(λs+b)² > 0) — the sign the naive
+    // aggregate surrenders on real fixtures.
+    assert!(
+        reference > 0.0 && fused > 0.0,
+        "deep-rail logdet diagonal must be positive: reference={reference:.6e} fused={fused:.6e}"
+    );
+    // Value identity: the reassociation must not move the derivative.
+    assert!(
+        (fused - naive).abs() <= 1.0e-6 * (1.0 + reference.abs()),
+        "fused and naive rail diagonals disagree beyond roundoff: fused={fused:.6e} naive={naive:.6e}"
+    );
+    // The fused form matches the compensated reference to roundoff.
+    assert!(
+        err_fused <= 1.0e-14 * (1.0 + reference.abs()),
+        "fused rail diagonal not accurate to roundoff vs compensated reference: err_fused={err_fused:.3e}"
+    );
+    // The naive form is genuinely in the cancellation regime here.
+    assert!(
+        cancellation >= 1.0e4,
+        "fixture is not deep enough to exercise the cancellation: ratio={cancellation:.3e}"
+    );
+    assert!(
+        err_naive >= 100.0 * err_fused.max(f64::MIN_POSITIVE),
+        "fused reformulation did not reduce the summation error: err_naive={err_naive:.3e} err_fused={err_fused:.3e}"
+    );
+}
+
 // ─── Rank-deficient fused rail gradient (#2331) ─────────────────────
 //
 // The survival transformation / competing-risks lanes carry SINGLETON penalty
