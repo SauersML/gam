@@ -1505,6 +1505,18 @@ pub struct MultiBlockAloDiagnostics {
     /// Outer length = n_obs, inner length = n_coordinates (B) containing the
     /// diagonal entries of the variance matrix.
     pub alo_variance: Vec<Array1<f64>>,
+    /// Model-based posterior predictive variance of each coordinate at each
+    /// observation: `diag(A_i) = x_{d,i}ᵀ [H⁻¹] x_{d,i}` (unit dispersion; the
+    /// caller scales by φ where applicable). Unlike [`Self::alo_variance`] —
+    /// which for a single deleted row with the rank-1 self-score covariance
+    /// collapses EXACTLY to the squared deletion correction `Δη²` and is
+    /// therefore an influence magnitude, not an uncertainty — this is the
+    /// genuine posterior uncertainty of the fitted coordinate, and the
+    /// principled scale for judging how far an exact LOO refit (which also
+    /// reselects smoothing on n−1 rows) may legitimately sit from the
+    /// fixed-smoothing ALO point (#2301).
+    /// Outer length = n_obs, inner length = n_coordinates (B).
+    pub predictive_variance: Vec<Array1<f64>>,
     /// Cook-type ALO influence: D_i = Δη_iᵀ C_i Δη_i.
     /// Length = n_obs.
     pub cook_distance: Array1<f64>,
@@ -1789,6 +1801,7 @@ fn compute_multiblock_alo_inner(
     let mut eta_tilde = Vec::with_capacity(n);
     let mut leverage = Array1::<f64>::zeros(n);
     let mut alo_variance = Vec::with_capacity(n);
+    let mut predictive_variance = Vec::with_capacity(n);
     let mut cook_distance = Array1::<f64>::zeros(n);
 
     let mut chunks = Vec::with_capacity(chunk_results.len());
@@ -1801,6 +1814,7 @@ fn compute_multiblock_alo_inner(
         let chunk_start = chunk.chunk_start;
         eta_tilde.extend(chunk.eta_tilde);
         alo_variance.extend(chunk.alo_variance);
+        predictive_variance.extend(chunk.predictive_variance);
         for (local_i, lev) in chunk.leverage.into_iter().enumerate() {
             leverage[chunk_start + local_i] = lev;
         }
@@ -1813,6 +1827,7 @@ fn compute_multiblock_alo_inner(
         eta_tilde,
         leverage,
         alo_variance,
+        predictive_variance,
         cook_distance,
     })
 }
@@ -1889,6 +1904,7 @@ struct MultiBlockAloChunkDiagnostics {
     eta_tilde: Vec<Array1<f64>>,
     leverage: Vec<f64>,
     alo_variance: Vec<Array1<f64>>,
+    predictive_variance: Vec<Array1<f64>>,
     cook_distance: Vec<f64>,
 }
 
@@ -1943,6 +1959,7 @@ fn compute_multiblock_alo_chunk(
     let mut eta_tilde = Vec::with_capacity(chunk_len);
     let mut leverage = vec![0.0f64; chunk_len];
     let mut alo_variance = Vec::with_capacity(chunk_len);
+    let mut predictive_variance = Vec::with_capacity(chunk_len);
     let mut cook_distance = vec![0.0f64; chunk_len];
 
     for local_i in 0..chunk_len {
@@ -1974,6 +1991,16 @@ fn compute_multiblock_alo_chunk(
                 scratch.a_i[a * b + bb] = dot;
             }
         }
+
+        // diag(A_i): the coordinate-wise posterior predictive variance
+        // x_dᵀ H⁻¹ x_d (unit dispersion), captured before A_i is consumed by
+        // the deletion algebra below. Clamped at zero: A_i is a Gram diagonal
+        // of the SPD-certified H⁻¹, so a negative entry is pure roundoff.
+        let mut pred_var = Array1::<f64>::zeros(b);
+        for d in 0..b {
+            pred_var[d] = scratch.a_i[d * b + d].max(0.0);
+        }
+        predictive_variance.push(pred_var);
 
         // WA = W_i · A_i (row-major).
         mat_mul_flat(&scratch.w_flat, &scratch.a_i, &mut scratch.wa, b);
@@ -2184,6 +2211,7 @@ fn compute_multiblock_alo_chunk(
         eta_tilde,
         leverage,
         alo_variance,
+        predictive_variance,
         cook_distance,
     })
 }

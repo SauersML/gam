@@ -354,19 +354,27 @@ fn assert_alo_matches_brute_force_loo(
     let mut gaps = Vec::with_capacity(fold_rows.len());
     for &(row, brute) in brute_force {
         let alo = diag.diagnostics.eta_tilde[row][0];
-        let se = diag.diagnostics.alo_variance[row][0].sqrt();
+        // Per-row bound scale: the coordinate's POSTERIOR PREDICTIVE SE
+        // √(x_dᵀH⁻¹x_d) — the genuine model-based uncertainty. The previous
+        // scale, √alo_variance, is NOT an uncertainty: with the rank-1
+        // self-score covariance of a single deletion it collapses exactly to
+        // |Δη| (the ALO correction itself), so the gate degenerated to
+        // |ALO − refit| ≤ 4·|ALO| and was guaranteed fragile at boundary rows
+        // where the exact refit's smoothing RESELECTION (a global effect the
+        // fixed-smoothing ALO correctly does not model) dominates the local
+        // deletion correction (#2301: 0.117 vs 0.102 at the worst-leverage
+        // row). The posterior SE is legitimately large exactly at those rows,
+        // bounding the reselection shift on a derived basis.
+        let se = diag.diagnostics.predictive_variance[row][0].sqrt();
         let gap = (alo - brute).abs();
-        // Per-row bound: ALO is a first-order LOO approximation at the
-        // full-data smoothing, so its deviation from an exact refit (which also
-        // reselects the smoothing on n-1 rows) must sit within a few standard
-        // errors of the coordinate's own posterior uncertainty; a small
-        // absolute floor covers finite-precision fits and near-zero SEs. A
-        // wrong coordinate frame or a logic bug would blow far past this — the
-        // gap would be of order the coordinate magnitude, not a few sigma.
+        // A wrong coordinate frame or a logic bug would still blow far past
+        // this — the gap would be of order the coordinate magnitude, not a
+        // few posterior SEs; the small absolute floor covers finite-precision
+        // fits and near-zero SEs.
         assert!(
             gap <= f64::max(5.0e-2, 4.0 * se),
             "{class_label} row {row}: production ALO {coordinate_name}={alo:.6} vs brute-force \
-             LOO refit {brute:.6} (|gap|={gap:.6}) exceeds max(5.0e-2, 4sigma={:.6})",
+             LOO refit {brute:.6} (|gap|={gap:.6}) exceeds max(5.0e-2, 4·predictive_se={:.6})",
             4.0 * se
         );
         alo_values.push(alo);

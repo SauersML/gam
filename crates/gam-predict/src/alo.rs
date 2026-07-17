@@ -1014,6 +1014,15 @@ fn compute_saved_standard_alo(
         .copied()
         .map(|standard_error| Array1::from_vec(vec![standard_error * standard_error]))
         .collect::<Vec<_>>();
+    // Model-based posterior predictive variance: the scalar path's Bayesian
+    // SE squared (φ·x_iᵀH⁻¹x_i), the same quantity the multi-block core
+    // surfaces as diag(A_i) (#2301).
+    let predictive_variance = scalar
+        .se_bayes
+        .iter()
+        .copied()
+        .map(|standard_error| Array1::from_vec(vec![standard_error * standard_error]))
+        .collect::<Vec<_>>();
     let mut cook_distance = Array1::<f64>::zeros(n);
     for row in 0..n {
         let deletion = scalar.eta_tilde[row] - eta[row];
@@ -1032,6 +1041,7 @@ fn compute_saved_standard_alo(
             eta_tilde,
             leverage: scalar.leverage,
             alo_variance,
+            predictive_variance,
             cook_distance,
         },
     })
