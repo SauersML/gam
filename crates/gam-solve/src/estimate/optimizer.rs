@@ -2273,9 +2273,41 @@ where
             )?;
             match smoothing_outcome {
                 super::reml::eval::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "exact smoothing-corrected covariance unavailable: {reason:?}"
-                    )));
+                    // A fit certified at an infinite-smoothing rail (typed
+                    // AsymptoteRail, or box-railed coordinates) has NO finite
+                    // ρ-variance along the rail direction — the outer Hessian
+                    // is legitimately non-PD there, so the first-order
+                    // smoothing correction is TYPED-unavailable rather than a
+                    // defect. Ship the certified fit with the plug-in
+                    // covariance and no correction; the downstream corrected
+                    // EDF/AIC channels report the typed absence (#946/#1027)
+                    // instead of the whole fit dying over an enhancement. A
+                    // fit WITHOUT rail evidence keeps the fail-loud error: an
+                    // unexpectedly uninvertible outer Hessian on a
+                    // well-conditioned interior optimum is a real defect.
+                    let rail_certified =
+                        outer_result
+                            .criterion_certificate
+                            .as_ref()
+                            .is_some_and(|certificate| {
+                                matches!(
+                            certificate.stationarity,
+                            crate::model_types::OuterStationarityCertificate::AsymptoteRail { .. }
+                        ) || !certificate.lambdas_railed.is_empty()
+                            });
+                    if !rail_certified {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "exact smoothing-corrected covariance unavailable: {reason:?}"
+                        )));
+                    }
+                    log::info!(
+                        "[SMOOTHING-CORRECTION] typed-unavailable on a rail-certified \
+                         fit ({reason:?}); shipping the plug-in covariance without a \
+                         smoothing correction"
+                    );
+                    rho_covariance = None;
+                    smoothing_correction = None;
+                    smoothing_correction_method = None;
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();

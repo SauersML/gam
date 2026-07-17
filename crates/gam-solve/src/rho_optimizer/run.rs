@@ -2662,6 +2662,25 @@ fn try_tail_snap_to_rail(
             Some(side) => side,
             None => continue,
         };
+        // A tail candidate must be DEEP toward the bound its gradient points
+        // at — within the probe span of the box. The tail law is an asymptotic
+        // statement; a coordinate sitting many probe-spans inside the interior
+        // (every scripted mock optimum, every ordinary unconverged fit) has no
+        // asymptote to confirm there, and probing it would spend a dozen
+        // objective evaluations per would-refuse certification for nothing
+        // (breaking eval-count-asserting harnesses along the way).
+        let probe_span = ASYMPTOTE_PROBE_COUNT as f64;
+        let deep_enough = match side {
+            AsymptoteSide::Upper => upper[k] - rho[k] <= probe_span,
+            AsymptoteSide::Lower => rho[k] - lower[k] <= probe_span,
+        };
+        if !deep_enough {
+            rejected.push(format!(
+                "k={k}: ρ={:.2} more than {probe_span:.0} e-folds inside the box",
+                rho[k]
+            ));
+            continue;
+        }
         let h_kk = hessian[[k, k]];
         // The tie is judged on |H_kk|/|g_k| — MAGNITUDE only. On the exact
         // tail `H_kk = |g_k|` (positive), but the assembled ρ-Hessian's tail
