@@ -6,7 +6,7 @@ use gam_math::jet_scalar::{
     MappedOrder2Accumulator, OneSeedBatch, Order2AtomChannels, RuntimeJetScalar,
 };
 use gam_row_macros::row_atom;
-use wide::{CmpEq, f64x4};
+use wide::{CmpNe, f64x4};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurvivalExactRowKernel {
@@ -5432,5 +5432,135 @@ mod simd_batch_bit_identity_tests {
             tail_batches_seen > 0,
             "non-multiple-of-4 trailing batches were never exercised"
         );
+    }
+
+    /// Direct root-cause guard for the per-lane zero-stack skip. A single
+    /// homogeneous (pure-censored) SIMD group whose four lanes MIX
+    /// no-left-truncation rows (entry `u0` stack exactly `[0,0,0,0,0]`, because
+    /// `S(entry)=1`, yet a nonzero row weight) with left-truncated rows (nonzero
+    /// entry stack). The scalar `sls_row_nll` SKIPS the zero `u0` stack
+    /// (`stack_is_exactly_zero`) and leaves it a clean `+0.0`; the batch must
+    /// reproduce that lane-by-lane rather than compose the zero stack (which
+    /// forms `0·(neg channel) = -0.0`, or `0·∞ = NaN` on a far-tail lane).
+    ///
+    /// This is the angle the random sweep under-covers: `make_kernel` only zeros
+    /// the WHOLE entry stack for `w = 0` rows, never for a weighted row, so it
+    /// never exercises a weighted no-truncation lane sharing a group with a
+    /// truncated one — the exact per-lane divergence this guards.
+    #[test]
+    fn per_lane_zero_entry_stack_skip_matches_scalar_to_bits() {
+        // A pure-censored kernel: event terms inactive (poisoned non-finite so a
+        // regression that composes them would surface), entry stack zeroed for
+        // the no-left-truncation lanes.
+        fn censored_kernel(entry_zero: bool) -> SurvivalExactRowKernel {
+            let (log_s0, r0, dr0, ddr0, dddr0) = if entry_zero {
+                (0.0, 0.0, 0.0, 0.0, 0.0)
+            } else {
+                (-0.73, 0.41, 0.29, -0.17, 0.11)
+            };
+            SurvivalExactRowKernel {
+                w: 1.3,
+                d: 0.0, // pure censored -> (cens_on, event_on) = (true, false)
+                log_s0,
+                r0,
+                dr0,
+                ddr0,
+                dddr0,
+                log_s1: -1.07,
+                r1: 0.88,
+                dr1: 0.52,
+                ddr1: -0.31,
+                dddr1: 0.19,
+                logphi1: f64::NAN,
+                dlogphi1: f64::NAN,
+                d2logphi1: f64::NAN,
+                d3logphi1: f64::NAN,
+                d4logphi1: f64::NAN,
+                log_pdf1_minus_log_s0: f64::NAN,
+                log_s1_minus_log_s0: -1.07 - log_s0,
+                log_g: f64::NAN,
+                d_log_g: f64::NAN,
+                d2_log_g: f64::NAN,
+                d3_log_g: f64::NAN,
+                d4_log_g: f64::NAN,
+            }
+        }
+
+        // Lane layout: truncated / no-truncation / no-truncation-FAR-TAIL /
+        // truncated — a mixed group so the per-lane mask (not a group-level skip)
+        // is what must fire. `entry_zero[lane]` marks the no-truncation lanes.
+        let entry_zero = [false, true, true, false];
+        let kernels: [SurvivalExactRowKernel; 4] =
+            std::array::from_fn(|lane| censored_kernel(entry_zero[lane]));
+
+        // Per-row primary channels and directions. Lane 2 is a far-tail lane:
+        // primary[7] = -720 makes `exp(-p7) = exp(720) = +inf`, so `u0`'s jet
+        // channels blow up to +/-inf; composing its zero stack would form NaN.
+        let primaries: [[f64; SLS_ROW_K]; 4] = [
+            [0.3, -0.4, 0.5, 0.6, -0.2, 0.1, 0.25, -0.35, 0.15],
+            [-0.2, 0.35, -0.15, 0.45, 0.3, -0.05, 0.2, 0.4, -0.1],
+            [0.1, -0.25, 0.2, 0.55, 0.6, 0.05, -0.3, -720.0, 0.2],
+            [0.4, 0.2, -0.3, -0.5, 0.15, -0.2, 0.35, 0.1, -0.4],
+        ];
+        let dirs: [[f64; SLS_ROW_K]; 4] = [
+            [1.0, 0.5, -0.5, 0.3, 0.7, -0.2, 0.4, 0.6, -0.3],
+            [-0.6, 0.4, 0.2, -0.3, 0.5, 0.1, -0.4, 0.35, 0.25],
+            [0.3, -0.7, 0.6, 0.2, -0.4, 0.15, 0.5, 0.45, -0.2],
+            [0.2, 0.3, -0.4, 0.6, 0.1, -0.5, 0.25, -0.35, 0.4],
+        ];
+
+        // Batch: seed one OneSeedBatch per channel, four rows packed lane-wise.
+        let batch_vars: [OneSeedBatch<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(|c| {
+            let value = f64x4::new(std::array::from_fn(|lane| primaries[lane][c]));
+            let dir = f64x4::new(std::array::from_fn(|lane| dirs[lane][c]));
+            OneSeedBatch::seed_direction(value, c, dir)
+        });
+        let kernel_refs: [&SurvivalExactRowKernel; 4] = std::array::from_fn(|lane| &kernels[lane]);
+        let batched = sls_row_nll_onesseed_batch(&batch_vars, &kernel_refs, true, false)
+            .contracted_third();
+
+        for lane in 0..4 {
+            let scalar_vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(|c| {
+                OneSeed::seed_direction(primaries[lane][c], c, dirs[lane][c])
+            });
+            let scalar = sls_row_nll(&scalar_vars, &kernels[lane])
+                .expect("scalar row NLL")
+                .contracted_third();
+            for x in 0..SLS_ROW_K {
+                for y in 0..SLS_ROW_K {
+                    let b = batched[x][y].to_array()[lane];
+                    let s = scalar[x][y];
+                    if s.is_nan() {
+                        assert!(b.is_nan(), "scalar NaN but SIMD finite at lane={lane} x={x} y={y}");
+                    } else {
+                        assert_eq!(
+                            b.to_bits(),
+                            s.to_bits(),
+                            "SIMD batch != scalar at lane={lane} x={x} y={y} (b={b}, s={s})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Explicit sign/finiteness pins for the no-truncation lanes: the `u0`-only
+        // cross channel [4][7] (entry eta_t x entry eta_ls) must be a clean +0.0,
+        // and the far-tail lane 2 must not leak the composed `0·∞ = NaN`.
+        for &lane in &[1usize, 2] {
+            let entry_cross = batched[4][7].to_array()[lane];
+            assert_eq!(
+                entry_cross.to_bits(),
+                0.0f64.to_bits(),
+                "no-truncation lane {lane} entry cross channel must be +0.0, got {entry_cross}"
+            );
+            for x in 0..SLS_ROW_K {
+                for y in 0..SLS_ROW_K {
+                    assert!(
+                        batched[x][y].to_array()[lane].is_finite(),
+                        "no-truncation lane {lane} leaked non-finite at [{x}][{y}]"
+                    );
+                }
+            }
+        }
     }
 }
