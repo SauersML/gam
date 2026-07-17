@@ -5851,8 +5851,7 @@ fn sae_manifold_reconstruct_ffi<'py>(
     assignments: PyReadonlyArray2<'py, f64>,
     p_out: usize,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let geometry_plans =
-        sae_geometry_plans_from_py("sae_manifold_reconstruct", geometry_plans)?;
+    let geometry_plans = sae_geometry_plans_from_py("sae_manifold_reconstruct", geometry_plans)?;
     let decoder_values = decoder_blocks
         .iter()
         .map(|block| block.as_array().to_owned())
@@ -7981,9 +7980,7 @@ fn predict_dataset_impl(
         covariance_source: provenance
             .uncertainty
             .map(|source| source.as_str().to_string()),
-        point_covariance_source: provenance
-            .point
-            .map(|source| source.as_str().to_string()),
+        point_covariance_source: provenance.point.map(|source| source.as_str().to_string()),
     })
     .map_err(|err| format!("failed to serialize prediction payload: {err}"))
 }
@@ -8002,7 +7999,13 @@ fn predict_columns(
     model: &FittedModel,
     dataset: EncodedDataset,
     options: &PyPredictOptions,
-) -> Result<(BTreeMap<String, Vec<f64>>, PredictColumnsCovarianceProvenance), String> {
+) -> Result<
+    (
+        BTreeMap<String, Vec<f64>>,
+        PredictColumnsCovarianceProvenance,
+    ),
+    String,
+> {
     let col_map = dataset.column_map();
     // Spline-scan saved model (#1030/#1034): replay the exact Gaussian bridge
     // per row (identity link, η == mean). No design reconstruction, no
