@@ -4573,25 +4573,38 @@ mod reference_class_invariance_tests {
         // pseudo-logdet.
         let mut probe_options = parts.options.clone();
         probe_options.compute_covariance = false;
-        let v_at = |rho: &[f64]| -> f64 {
+        eprintln!(
+            "#2349 gate state: use_remlobjective={} (RidgedQuadraticReml default => \
+             logdet_h/logdet_s included in the fixed-lambda score iff this is true)",
+            probe_options.use_remlobjective
+        );
+        let v_at_with = |rho: &[f64], use_reml: bool| -> f64 {
             let fam = parts
                 .family
                 .clone()
                 .with_joint_initial_log_lambdas(rho.to_vec());
+            let mut opts = probe_options.clone();
+            opts.use_remlobjective = use_reml;
             let fit = crate::custom_family::fit_custom_family_fixed_log_lambdas(
                 &fam,
                 &parts.blocks,
-                &probe_options,
+                &opts,
                 None,
             )
             .expect("fixed-lambda inner solve at the checkpoint must converge");
             fit.reml_score
         };
-        let v0 = v_at(&rho_star);
+        let v_plain = v_at_with(&rho_star, false);
+        let v_laml = v_at_with(&rho_star, true);
         eprintln!(
-            "#2349 V(rho*)={v0:.9e} (the refusal reported final objective 2.687403e2 \
-             at this checkpoint — a mismatch here means reml_score is not the outer criterion)"
+            "#2349 V(rho*): plain(penalized NLL)={v_plain:.9e} \
+             laml(+0.5logdetH-0.5logdetS)={v_laml:.9e} logdet_pair={:.9e} \
+             (the refusal reported final objective 2.687403e2 at this checkpoint — \
+             whichever variant matches IS the outer criterion)",
+            v_laml - v_plain
         );
+        let outer_uses_laml = (v_laml - 2.687403e2).abs() < (v_plain - 2.687403e2).abs();
+        let v_at = |rho: &[f64]| -> f64 { v_at_with(rho, outer_uses_laml) };
         // Term-for-term decomposition of the fixed-ρ score so the ~12.5 offset
         // from the outer criterion can be attributed to a specific missing
         // term. A ρ-CONSTANT offset leaves the FD gradient verdict intact; a
@@ -4627,7 +4640,9 @@ mod reference_class_invariance_tests {
         }
         let norm = grad_fd.iter().map(|g| g * g).sum::<f64>().sqrt();
         eprintln!(
-            "#2349 |FD grad| = {norm:.6e} (certificate claimed |Pg|=2.047e0, bound 2.697e-3)"
+            "#2349 |FD grad| = {norm:.6e} on the {} criterion \
+             (certificate claimed |Pg|=2.047e0, bound 2.697e-3)",
+            if outer_uses_laml { "LAML" } else { "plain penalized-NLL" }
         );
     }
 }
