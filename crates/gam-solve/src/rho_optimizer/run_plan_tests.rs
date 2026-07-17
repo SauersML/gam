@@ -1838,6 +1838,7 @@ fn auxiliary_psi_is_never_synthetically_oversmoothed() {
         "psi phase authority",
         &cap,
         &the_plan,
+        true,
     )
     .expect("literal stationary joint seed must be accepted");
     assert!(matches!(outcome, PlanRunOutcome::Converged(_)));
