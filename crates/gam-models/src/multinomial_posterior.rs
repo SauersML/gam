@@ -58,15 +58,22 @@ impl Default for MultinomialPosteriorIntegrationControl {
         // transform of a covariance estimated in double precision: asking for
         // substantially more would certify quadrature noise below the input's
         // own numerical resolution. Three sparse levels are required before a
-        // result may certify; level eight reaches the 17-point one-dimensional
-        // Gauss-Hermite rule. The streaming evaluator never stores the node
-        // set, and the evaluation ceiling bounds work on high-rank rows.
+        // result may certify. The level ceiling is 12 (the 25-point
+        // one-dimensional Gauss–Hermite rule): a converged integrand certifies
+        // early and never visits the deeper levels, so the ceiling only
+        // matters for WIDE posteriors — the #2344 equivariant class metric
+        // honestly penalizes the class-mean logit direction at λ/K, ≈K× the
+        // variance of the old ALR-anchored penalty, and at the former ceiling
+        // of 8 such rows plateaued at a level difference ~1.6× the tolerance
+        // with only ~0.1% of the evaluation budget spent (#2350). The
+        // evaluation ceiling remains the cost guard; the streaming evaluator
+        // never stores the node set.
         let tolerance = f64::EPSILON.sqrt();
         Self {
             absolute_tolerance: tolerance,
             relative_tolerance: tolerance,
             minimum_sparse_level: 2,
-            maximum_sparse_level: 8,
+            maximum_sparse_level: 12,
             maximum_function_evaluations: 2_000_000,
         }
     }
