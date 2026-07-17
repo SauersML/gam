@@ -2278,9 +2278,29 @@ fn resolve_multinomial_row_weights(
 /// (`ColumnKindTag::Categorical`); reference class = last level. Returns a
 /// [`MultinomialSavedModel`] that can be serialised to bytes for the Python
 /// wrapper or used in-process for `predict_probabilities`.
-pub fn fit_penalized_multinomial_formula(
+/// Everything [`fit_penalized_multinomial_formula`] constructs BEFORE the REML
+/// solve: the family (unbiased criterion, Jeffreys disarmed), the per-class
+/// block specs with seeded `initial_log_lambdas`, the calibrated solver
+/// options, and the design artifacts the post-solve repack consumes. Exposed
+/// at crate level so diagnostics can drive the EXACT production objective at
+/// fixed smoothing parameters (finite-difference gates on the outer ρ-gradient
+/// of the coalesced joint penalty family, #2349) instead of replicating the
+/// construction and diverging from it.
+pub(crate) struct PenalizedMultinomialFormulaParts {
+    pub(crate) family: MultinomialFamily,
+    pub(crate) blocks: Vec<ParameterBlockSpec>,
+    pub(crate) options: BlockwiseFitOptions,
+    pub(crate) spec: TermCollectionSpec,
+    pub(crate) design: TermCollectionDesign,
+    pub(crate) class_levels: Vec<String>,
+    pub(crate) y_one_hot: Array2<f64>,
+    pub(crate) parametric_standardization: Vec<(usize, f64, f64)>,
+    pub(crate) penalties_arc: Arc<Vec<PenaltyMatrix>>,
+}
+
+pub(crate) fn penalized_multinomial_formula_parts(
     request: &MultinomialFitRequest<'_>,
-) -> Result<MultinomialSavedModel, EstimationError> {
+) -> Result<PenalizedMultinomialFormulaParts, EstimationError> {
     let MultinomialFitRequest {
         data,
         formula,
@@ -2603,6 +2623,34 @@ pub fn fit_penalized_multinomial_formula(
         compute_covariance: true,
         ..BlockwiseFitOptions::default()
     };
+    Ok(PenalizedMultinomialFormulaParts {
+        family,
+        blocks,
+        options,
+        spec,
+        design,
+        class_levels,
+        y_one_hot,
+        parametric_standardization,
+        penalties_arc,
+    })
+}
+
+pub fn fit_penalized_multinomial_formula(
+    request: &MultinomialFitRequest<'_>,
+) -> Result<MultinomialSavedModel, EstimationError> {
+    let PenalizedMultinomialFormulaParts {
+        family,
+        blocks,
+        options,
+        spec,
+        design,
+        class_levels,
+        y_one_hot,
+        parametric_standardization,
+        penalties_arc,
+    } = penalized_multinomial_formula_parts(request)?;
+    let m = family.active_classes();
     // ── Conditional Firth/Jeffreys engagement (#715 arm (b) / #753) ──────────
     // Attempt 1: the unbiased criterion (Jeffreys disarmed above). If the
     // returned mode is converged, finite, and interior, it is the exact penalized-REML
@@ -4433,6 +4481,80 @@ mod reference_class_invariance_tests {
             drift < 1e-3,
             "predicted probabilities must be invariant to the reference class; \
              cross-labeling drift = {drift:.3e} (refit noise = {refit_noise:.3e})"
+        );
+    }
+
+    /// #2349 diagnostic (zz_measure): finite-difference the OUTER REML
+    /// criterion of the EXACT production multinomial objective at the refusal
+    /// checkpoint from MSI job 13390650. The certificate there claimed
+    /// `|Pg| = 2.047` against a bound of `2.697e-3` after the optimizer
+    /// stalled — if the fixed-ρ criterion's central FD gradient at that same
+    /// checkpoint is comparably large, the surface is genuinely non-stationary
+    /// and the stall is the optimizer's; if it is orders of magnitude smaller,
+    /// the analytic outer gradient is desynced from the criterion (the
+    /// coalesced overlapping joint-family pseudo-logdet is the suspect).
+    /// Prints only; never asserts a bound.
+    #[test]
+    fn zz_measure_2349_outer_gradient_fd_at_refusal_checkpoint() {
+        let td = tempdir().expect("tempdir");
+        let dir = td.path();
+        let (x, cls) = sample_classes(0, 300);
+        let labels: Vec<String> = cls
+            .iter()
+            .map(|&c| ["A", "B", "C"][c].to_string())
+            .collect();
+        let train = dataset_xy(dir, "fd2349", &x, &labels);
+        let config = FitConfig::default();
+        let request = MultinomialFitRequest {
+            init_lambda: 1.0,
+            max_iter: 60,
+            tol: 1e-6,
+            ..MultinomialFitRequest::new(&train, "y ~ s(x)", &config)
+        };
+        let parts = penalized_multinomial_formula_parts(&request)
+            .expect("production formula parts must build");
+        // Unbiased-arm refusal checkpoint (MSI job 13390650, #2349): the
+        // 6-coordinate joint ρ = 2 terms × 3 per-class λ, term-major.
+        let rho_star = [
+            6.50584039279757,
+            -1.6183906983083074,
+            5.922109861708934,
+            -0.5810545109816936,
+            -0.4894709703255621,
+            1.299144316808675,
+        ];
+        let v_at = |rho: &[f64]| -> f64 {
+            let fam = parts
+                .family
+                .clone()
+                .with_joint_initial_log_lambdas(rho.to_vec());
+            let fit = crate::custom_family::fit_custom_family_fixed_log_lambdas(
+                &fam,
+                &parts.blocks,
+                &parts.options,
+                None,
+            )
+            .expect("fixed-lambda inner solve at the checkpoint must converge");
+            fit.reml_score
+        };
+        let v0 = v_at(&rho_star);
+        eprintln!(
+            "#2349 V(rho*)={v0:.9e} (the refusal reported final objective 2.687403e2 \
+             at this checkpoint — a mismatch here means reml_score is not the outer criterion)"
+        );
+        let h = 1.0e-3;
+        let mut grad_fd = [0.0_f64; 6];
+        for s in 0..6 {
+            let mut plus = rho_star;
+            plus[s] += h;
+            let mut minus = rho_star;
+            minus[s] -= h;
+            grad_fd[s] = (v_at(&plus) - v_at(&minus)) / (2.0 * h);
+            eprintln!("#2349 FD dV/drho[{s}] = {:+.6e}", grad_fd[s]);
+        }
+        let norm = grad_fd.iter().map(|g| g * g).sum::<f64>().sqrt();
+        eprintln!(
+            "#2349 |FD grad| = {norm:.6e} (certificate claimed |Pg|=2.047e0, bound 2.697e-3)"
         );
     }
 }

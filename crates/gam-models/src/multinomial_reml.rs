@@ -840,6 +840,14 @@ pub struct MultinomialFamily {
     /// per-block path used historically; the outer loop then selects the true
     /// optimum. Defaults to `0.0` (`λ = 1`).
     initial_log_lambda: f64,
+    /// Optional PER-SPEC warm-start seeds for the joint smoothing penalties,
+    /// overriding the shared `initial_log_lambda` (one entry per joint spec, in
+    /// the builders' term-major spec order). This is how a caller follows the
+    /// outer refusal's "resume by seeding the outer search at rho_checkpoint"
+    /// hint for a joint-penalty family — the checkpoint is a PER-SPEC ρ vector
+    /// a single shared seed cannot express — and how fixed-ρ diagnostics pin
+    /// the joint λs when probing the criterion surface (#2349).
+    joint_initial_log_lambdas: Option<Vec<f64>>,
 }
 
 /// One frozen-`β` snapshot of every canonical-axis joint-Hessian directional
@@ -973,6 +981,7 @@ impl MultinomialFamily {
             axis_derivative_cache: Arc::new(Mutex::new(None)),
             use_joint_jeffreys_term: true,
             initial_log_lambda: 0.0,
+            joint_initial_log_lambdas: None,
         })
     }
 
@@ -990,6 +999,40 @@ impl MultinomialFamily {
     pub fn with_initial_log_lambda(mut self, log_lambda: f64) -> Self {
         self.initial_log_lambda = log_lambda;
         self
+    }
+
+    /// Seed PER-SPEC warm-start `log λ` values for the joint smoothing
+    /// penalties, in the builders' term-major spec order (equivariant carrier:
+    /// `s = t·K + c`; shared centered carrier: `s = t`). Overrides the shared
+    /// [`Self::with_initial_log_lambda`] seed entry-by-entry; the spec builders
+    /// reject a wrong length. This is the resume path for a joint-penalty
+    /// `rho_checkpoint` and the fixed-ρ pin for criterion diagnostics (#2349).
+    pub fn with_joint_initial_log_lambdas(mut self, seeds: Vec<f64>) -> Self {
+        self.joint_initial_log_lambdas = Some(seeds);
+        self
+    }
+
+    /// Per-spec joint warm-start seed: the override entry when present, else
+    /// the shared `initial_log_lambda`.
+    fn joint_seed(&self, spec_index: usize) -> f64 {
+        self.joint_initial_log_lambdas
+            .as_ref()
+            .and_then(|seeds| seeds.get(spec_index))
+            .copied()
+            .unwrap_or(self.initial_log_lambda)
+    }
+
+    /// Validate an override seed vector against the joint-spec count the
+    /// builder is about to produce.
+    fn validate_joint_seed_len(&self, expected: usize, carrier: &str) -> Result<(), String> {
+        match self.joint_initial_log_lambdas.as_ref() {
+            Some(seeds) if seeds.len() != expected => Err(format!(
+                "multinomial {carrier} carrier: joint_initial_log_lambdas has {} entries, \
+                 expected {expected} (one per joint spec, term-major)",
+                seeds.len()
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Build the canonical block specs for this family.
@@ -1089,6 +1132,7 @@ impl MultinomialFamily {
         let p = self.design.ncols();
         let metric = centered_class_metric(m, k);
         let raw_total = m * p;
+        self.validate_joint_seed_len(self.penalties.len(), "shared centered")?;
         self.penalties
             .iter()
             .enumerate()
@@ -1114,7 +1158,7 @@ impl MultinomialFamily {
                 Ok(gam_problem::JointPenaltySpec {
                     label: Some(format!("multinomial_term_{t}")),
                     matrix,
-                    initial_log_lambda: self.initial_log_lambda,
+                    initial_log_lambda: self.joint_seed(t),
                     nullspace_dim: raw_total - m * rank_s,
                 })
             })
@@ -1161,6 +1205,7 @@ impl MultinomialFamily {
             return self.centered_joint_penalty_specs();
         }
         let raw_total = m * p;
+        self.validate_joint_seed_len(self.penalties.len() * k, "equivariant per-class")?;
         let mut specs = Vec::with_capacity(self.penalties.len() * k);
         for (t, pen) in self.penalties.iter().enumerate() {
             let s_t = pen.to_dense();
@@ -1197,7 +1242,7 @@ impl MultinomialFamily {
                 specs.push(gam_problem::JointPenaltySpec {
                     label: Some(format!("multinomial_term_{t}_class_{c}")),
                     matrix,
-                    initial_log_lambda: self.initial_log_lambda,
+                    initial_log_lambda: self.joint_seed(t * k + c),
                     nullspace_dim,
                 });
             }
