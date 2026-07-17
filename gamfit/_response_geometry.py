@@ -275,41 +275,29 @@ def fit_response_curvature(values: Any, *, geometry: str, level: float = 0.95) -
     scale-dependent ``kappa_hat`` alone.
     """
     np = _np()
-    (
-        kappa_hat,
-        ci_lo,
-        ci_hi,
-        lo_at_bound,
-        hi_at_bound,
-        verdict,
-        lr_stat,
-        p_value,
-        railed,
-        railed_hyperbolic,
-        kappa_r2,
-        characteristic_radius,
-        base_point,
-    ) = _ffi(
+    payload = _ffi(
         "response_geometry_fit_curvature",
         np.asarray(values, dtype=float),
         str(geometry),
         float(level),
     )
     return {
-        "kappa_hat": float(kappa_hat),
+        "kappa_hat": float(payload["kappa_hat"]),
         "ci_level": float(level),
-        "ci_lo": float(ci_lo),
-        "ci_hi": float(ci_hi),
-        "ci_lo_at_bound": bool(lo_at_bound),
-        "ci_hi_at_bound": bool(hi_at_bound),
-        "verdict": str(verdict),
-        "flatness_lr": float(lr_stat),
-        "flatness_pvalue": float(p_value),
-        "railed_at_resolution_limit": bool(railed),
-        "railed_at_hyperbolic_resolution_limit": bool(railed_hyperbolic),
-        "kappa_r2": float(kappa_r2),
-        "characteristic_radius": float(characteristic_radius),
-        "base_point": list(map(float, base_point)),
+        "ci_lo": float(payload["ci_lo"]),
+        "ci_hi": float(payload["ci_hi"]),
+        "ci_lo_at_bound": bool(payload["ci_lo_at_bound"]),
+        "ci_hi_at_bound": bool(payload["ci_hi_at_bound"]),
+        "verdict": str(payload["verdict"]),
+        "flatness_lr": float(payload["flatness_lr"]),
+        "flatness_pvalue": float(payload["flatness_pvalue"]),
+        "railed_at_resolution_limit": bool(payload["railed_at_resolution_limit"]),
+        "railed_at_hyperbolic_resolution_limit": bool(
+            payload["railed_at_hyperbolic_resolution_limit"]
+        ),
+        "kappa_r2": float(payload["kappa_r2"]),
+        "characteristic_radius": float(payload["characteristic_radius"]),
+        "base_point": list(map(float, payload["base_point"])),
     }
 
 

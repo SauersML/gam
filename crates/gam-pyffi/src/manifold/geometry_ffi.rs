@@ -1105,21 +1105,7 @@ fn response_geometry_fit_curvature<'py>(
     values: PyReadonlyArray2<'py, f64>,
     geometry: String,
     level: f64,
-) -> PyResult<(
-    f64,
-    f64,
-    f64,
-    bool,
-    bool,
-    String,
-    f64,
-    f64,
-    bool,
-    bool,
-    f64,
-    f64,
-    Py<PyArray1<f64>>,
-)> {
+) -> PyResult<Py<PyDict>> {
     let arr = values.as_array().to_owned();
     let fit = detach_py_result(py, "response_geometry_fit_curvature", move || {
         let manifold =
@@ -1151,21 +1137,30 @@ fn response_geometry_fit_curvature<'py>(
         gam::geometry::CurvatureVerdict::Flat => "flat",
     }
     .to_string();
-    Ok((
-        fit.kappa_hat,
-        fit.profile_ci.ci_lo,
-        fit.profile_ci.ci_hi,
-        fit.profile_ci.lo_at_bound,
-        fit.profile_ci.hi_at_bound,
-        verdict,
-        fit.flatness.lr_stat,
-        fit.flatness.p_value,
+    // Named payload: PyO3 tuples cap at 12 elements, and a positional tuple
+    // is an arity trap every added field re-arms. Keys mirror the Rust field
+    // names one-to-one.
+    let out = PyDict::new(py);
+    out.set_item("kappa_hat", fit.kappa_hat)?;
+    out.set_item("ci_lo", fit.profile_ci.ci_lo)?;
+    out.set_item("ci_hi", fit.profile_ci.ci_hi)?;
+    out.set_item("ci_lo_at_bound", fit.profile_ci.lo_at_bound)?;
+    out.set_item("ci_hi_at_bound", fit.profile_ci.hi_at_bound)?;
+    out.set_item("verdict", verdict)?;
+    out.set_item("flatness_lr", fit.flatness.lr_stat)?;
+    out.set_item("flatness_pvalue", fit.flatness.p_value)?;
+    out.set_item(
+        "railed_at_resolution_limit",
         fit.railed_at_resolution_limit,
+    )?;
+    out.set_item(
+        "railed_at_hyperbolic_resolution_limit",
         fit.railed_at_hyperbolic_resolution_limit,
-        fit.kappa_r2,
-        fit.characteristic_radius,
-        fit.base.into_pyarray(py).unbind(),
-    ))
+    )?;
+    out.set_item("kappa_r2", fit.kappa_r2)?;
+    out.set_item("characteristic_radius", fit.characteristic_radius)?;
+    out.set_item("base_point", fit.base.into_pyarray(py).unbind())?;
+    Ok(out.unbind())
 }
 
 /// Replicate latent-angle agreement modulo exactly the circle's `O(2)` gauge

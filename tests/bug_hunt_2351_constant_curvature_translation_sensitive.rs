@@ -109,14 +109,29 @@ fn constant_curvature_verdict_is_translation_invariant() {
     // living on a sphere by construction; neither fit should claim a
     // maximally confident (p < 1e-6) verdict of either sign, since that
     // confidence has nowhere honest to come from for pure noise directions.
+    // #2351 twin-flag contract: EITHER rail flag is the honest
+    // "not a resolved point estimate" report. Unit-normalized isotropic
+    // vectors centred at their mean genuinely fill the hyperbolic ball of
+    // their own spread, so the search rails at the hyperbolic chart-domain
+    // bound and the HYPERBOLIC flag fires — the confident-looking p-value is
+    // explicitly disclaimed by that flag.
     assert!(
-        at_origin.flatness.p_value > 1e-6 || at_origin.railed_at_resolution_limit,
+        at_origin.flatness.p_value > 1e-6
+            || at_origin.railed_at_resolution_limit
+            || at_origin.railed_at_hyperbolic_resolution_limit,
         "unresolved-signal cloud reported a maximally confident, unflagged verdict: \
-         kappa_hat={} verdict={:?} p={} railed={}",
+         kappa_hat={} verdict={:?} p={} railed={} railed_hyperbolic={}",
         at_origin.kappa_hat,
         at_origin.profile_ci.verdict,
         at_origin.flatness.p_value,
         at_origin.railed_at_resolution_limit,
+        at_origin.railed_at_hyperbolic_resolution_limit,
+    );
+    // Both rail flags must ALSO be translation-invariant.
+    assert_eq!(
+        at_origin.railed_at_hyperbolic_resolution_limit,
+        away_from_origin.railed_at_hyperbolic_resolution_limit,
+        "hyperbolic rail flag flipped under a pure ambient translation"
     );
 
     // Sanity: the two fits should at least not both claim opposite signs
