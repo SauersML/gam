@@ -1189,6 +1189,14 @@ impl CertifiedOuterResult {
             .as_ref()
             .expect("CertifiedOuterResult always owns a validated certificate")
     }
+
+    /// The analytic outer ρ-Hessian measured at the certified point, when the
+    /// certification retained one. This is the curvature evidence behind the
+    /// certificate's PSD verdict — and the `V_ρ = H_ρ⁻¹` input to first-order
+    /// smoothing-correction inflation (#2346).
+    pub fn final_hessian(&self) -> Option<&Array2<f64>> {
+        self.result.final_hessian.as_ref()
+    }
 }
 
 #[cfg(test)]

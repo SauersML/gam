@@ -208,6 +208,14 @@ pub struct BlockwiseFitResultParts {
     /// its converged smoothing — the per-block `lambdas` are empty for it. `None`
     /// for every per-block-only family.
     pub joint_log_lambdas: Option<Array1<f64>>,
+    /// First-order ρ-uncertainty smoothing correction `C` (raw/lifted frame)
+    /// with its typed provenance (#2346): `V_c = V_cond + C` is published as
+    /// `beta_covariance_corrected`; `None` = typed absence (no outer ρ
+    /// curvature retained, or the interior V_ρ is not honestly finite).
+    pub smoothing_corrected: Option<(
+        Array2<f64>,
+        gam_solve::model_types::SmoothingCorrectionMethod,
+    )>,
 }
 
 pub(crate) fn validate_parameter_block_state_finiteness(
@@ -465,6 +473,7 @@ mod assembly_convergence_tests {
             geometry: None,
             precomputed_edf: None,
             joint_log_lambdas: None,
+            smoothing_corrected: None,
         }
     }
 
@@ -537,6 +546,7 @@ pub fn blockwise_fit_from_parts(
         geometry,
         precomputed_edf,
         joint_log_lambdas,
+        smoothing_corrected,
     } = parts;
 
     // SPEC 20: a fit object only ever comes from a converged optimization.
@@ -767,19 +777,38 @@ pub fn blockwise_fit_from_parts(
     // Hessian is reported unscaled (dispersion = 1) — the EDF trace is
     // dispersion-free, and downstream covariance scaling pairs `H` with the
     // family's own dispersion where needed.
+    // #2346: publish the first-order corrected covariance when the outer ρ
+    // curvature supplied one — `V_c = V_cond + C`, with the correction matrix
+    // and its typed method provenance carried exactly like the standard lane.
+    let (smoothing_correction, smoothing_correction_method, corrected_cov, corrected_se) =
+        match (&smoothing_corrected, &covariance_conditional) {
+            (Some((correction, method)), Some(v_cond))
+                if correction.dim() == v_cond.dim() =>
+            {
+                let corrected = v_cond + correction;
+                let se = corrected.diag().mapv(|v| v.max(0.0).sqrt());
+                (
+                    Some(correction.clone()),
+                    Some(method.clone()),
+                    Some(corrected),
+                    Some(se),
+                )
+            }
+            _ => (None, None, None, None),
+        };
     let inference = Some(gam_solve::model_types::FitInference {
         edf_by_block: edf_by_penalty,
         penalty_block_trace: penalty_trace,
         edf_total,
-        smoothing_correction: None,
-        smoothing_correction_method: None,
+        smoothing_correction,
+        smoothing_correction_method,
         penalized_hessian: geom.penalized_hessian.clone(),
         reparam_qs: None,
         dispersion: gam_solve::model_types::Dispersion::UNIT,
         beta_covariance: None,
         beta_standard_errors: None,
-        beta_covariance_corrected: None,
-        beta_standard_errors_corrected: None,
+        beta_covariance_corrected: corrected_cov,
+        beta_standard_errors_corrected: corrected_se,
         beta_covariance_frequentist: None,
         coefficient_influence: None,
         weighted_gram: None,

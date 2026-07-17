@@ -1753,3 +1753,166 @@ pub(crate) fn joint_penalty_subspace_trace_parts(
         }),
     ))
 }
+
+/// First-order ρ-uncertainty inflation of the joint coefficient covariance for
+/// custom-family fits (#2346): the correction term `C = A · V_ρ · Aᵀ` with
+/// `A = V_cond · U` and `U[:, o] = (∂S_λ/∂ρ_o) · β̂` — each outer smoothing
+/// coordinate's penalty derivative applied to the fitted coefficients. By
+/// first-order IFT `J_o = ∂β̂/∂ρ_o = −V_cond · U[:, o]`, so
+/// `Σ_{o,t} J_o · V_ρ[o,t] · J_tᵀ = C` and `V_c = V_cond + C` is the Vc-style
+/// corrected covariance the standard lane ships, with the same typed
+/// `FirstOrderIdentifiedSubspace` provenance.
+///
+/// Rail-aware (#2337 Thm 2.3): outer coordinates in `excluded_outer` (box
+/// rails and typed AsymptoteRail coordinates) have no finite ρ-variance and
+/// are excluded from the inflation. The interior sub-Hessian must be strictly
+/// PD; a non-PD interior returns `Ok(None)` — a typed absence, not an error,
+/// because the deep-smoothing regime legitimately reaches it. Returns the
+/// correction together with the identified interior rank.
+pub(crate) fn joint_smoothing_correction(
+    v_cond: &Array2<f64>,
+    specs: &[ParameterBlockSpec],
+    layout: &crate::penalty_labels::PenaltyLabelLayout,
+    rho_outer: &Array1<f64>,
+    block_states: &[ParameterBlockState],
+    outer_hessian: &Array2<f64>,
+    excluded_outer: &[usize],
+) -> Result<Option<(Array2<f64>, usize)>, String> {
+    let p_total: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+    let k_outer = rho_outer.len();
+    if v_cond.dim() != (p_total, p_total) {
+        return Err(format!(
+            "joint smoothing correction: V_cond shape {:?} ≠ ({p_total}, {p_total})",
+            v_cond.dim()
+        ));
+    }
+    if outer_hessian.dim() != (k_outer, k_outer) {
+        return Err(format!(
+            "joint smoothing correction: outer Hessian shape {:?} ≠ ({k_outer}, {k_outer})",
+            outer_hessian.dim()
+        ));
+    }
+    if block_states.len() != specs.len() {
+        return Err(format!(
+            "joint smoothing correction: {} block states vs {} specs",
+            block_states.len(),
+            specs.len()
+        ));
+    }
+
+    // β̂ stacked in block order — the reduced coefficient frame V_cond lives in.
+    let mut beta_flat = Array1::<f64>::zeros(p_total);
+    let mut offsets = Vec::with_capacity(specs.len() + 1);
+    let mut at = 0usize;
+    for (spec, state) in specs.iter().zip(block_states) {
+        let width = spec.design.ncols();
+        if state.beta.len() != width {
+            return Err(format!(
+                "joint smoothing correction: block '{}' beta length {} ≠ design width {width}",
+                spec.name,
+                state.beta.len()
+            ));
+        }
+        offsets.push(at);
+        beta_flat
+            .slice_mut(ndarray::s![at..at + width])
+            .assign(&state.beta);
+        at += width;
+    }
+    offsets.push(at);
+
+    // U[:, o] = Σ_{slots tied to outer o} λ_slot · S_slot · β̂. Per-block
+    // penalties act on their block slice; joint specs act on the full stacked
+    // space. Fixed (untied) physical slots carry no ρ coordinate — no
+    // ρ-uncertainty flows through them.
+    let mut u_mat = Array2::<f64>::zeros((p_total, k_outer));
+    let mut physical = 0usize;
+    for (block_idx, spec) in specs.iter().enumerate() {
+        let base = offsets[block_idx];
+        let width = spec.design.ncols();
+        for penalty in &spec.penalties {
+            let outer = layout.physical_to_outer.get(physical).copied().flatten();
+            physical += 1;
+            let Some(outer) = outer else {
+                continue;
+            };
+            let lambda = rho_outer[outer].exp();
+            if lambda == 0.0 {
+                continue;
+            }
+            let s_dense = penalty.to_dense();
+            if s_dense.dim() != (width, width) {
+                return Err(format!(
+                    "joint smoothing correction: block '{}' penalty shape {:?} ≠ ({width}, {width})",
+                    spec.name,
+                    s_dense.dim()
+                ));
+            }
+            let s_beta = s_dense.dot(&beta_flat.slice(ndarray::s![base..base + width]));
+            for i in 0..width {
+                u_mat[[base + i, outer]] += lambda * s_beta[i];
+            }
+        }
+    }
+    for (joint_idx, spec) in layout.joint_specs.iter().enumerate() {
+        let outer = layout.joint_to_outer[joint_idx];
+        let lambda = rho_outer[outer].exp();
+        if lambda == 0.0 {
+            continue;
+        }
+        if spec.matrix.dim() != (p_total, p_total) {
+            return Err(format!(
+                "joint smoothing correction: joint penalty '{}' shape {:?} ≠ ({p_total}, {p_total})",
+                spec.label.as_deref().unwrap_or("<unlabeled>"),
+                spec.matrix.dim()
+            ));
+        }
+        let m_beta = spec.matrix.dot(&beta_flat);
+        for i in 0..p_total {
+            u_mat[[i, outer]] += lambda * m_beta[i];
+        }
+    }
+
+    // Interior V_ρ: strict SPD inverse of the non-excluded outer sub-block.
+    let included: Vec<usize> = (0..k_outer)
+        .filter(|o| !excluded_outer.contains(o))
+        .collect();
+    if included.is_empty() {
+        return Ok(None);
+    }
+    let ki = included.len();
+    let mut h_sub = Array2::<f64>::zeros((ki, ki));
+    for (i, &oi) in included.iter().enumerate() {
+        for (j, &oj) in included.iter().enumerate() {
+            h_sub[[i, j]] = outer_hessian[[oi, oj]];
+        }
+    }
+    let (evals, evecs) = FaerEigh::eigh(&h_sub, Side::Lower).map_err(|e| {
+        format!("joint smoothing correction: outer Hessian eigendecomposition failed: {e}")
+    })?;
+    let max_abs = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+    let tol = (100.0 * f64::EPSILON * (ki as f64) * max_abs).max(100.0 * f64::EPSILON);
+    if evals.iter().any(|&ev| ev <= tol) {
+        return Ok(None);
+    }
+    let mut v_rho = Array2::<f64>::zeros((ki, ki));
+    for (idx, &ev) in evals.iter().enumerate() {
+        let inv = 1.0 / ev;
+        for i in 0..ki {
+            let vi = evecs[[i, idx]];
+            for j in 0..ki {
+                v_rho[[i, j]] += inv * vi * evecs[[j, idx]];
+            }
+        }
+    }
+
+    // C = (V·U_inc) · V_ρ · (V·U_inc)ᵀ — symmetric PSD by construction.
+    let mut u_inc = Array2::<f64>::zeros((p_total, ki));
+    for (col, &o) in included.iter().enumerate() {
+        u_inc.column_mut(col).assign(&u_mat.column(o));
+    }
+    let a_mat = v_cond.dot(&u_inc);
+    let mut correction = a_mat.dot(&v_rho).dot(&a_mat.t());
+    symmetrize_dense_in_place(&mut correction);
+    Ok(Some((correction, ki)))
+}

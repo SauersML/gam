@@ -217,6 +217,15 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     /// joint-penalized family (the multinomial centered metric) can recover its
     /// converged smoothing. `None` for every per-block-only family.
     pub(crate) joint_log_lambdas: Option<Array1<f64>>,
+    /// First-order ρ-uncertainty smoothing correction `C` (in the REDUCED
+    /// coefficient frame; lifted through the gauge alongside the conditional
+    /// covariance) with its typed provenance (#2346). `V_c = V_cond + C` is
+    /// published as `beta_covariance_corrected`. `None` when no outer ρ
+    /// curvature was retained or the interior V_ρ is not honestly finite.
+    pub(crate) smoothing_corrected: Option<(
+        Array2<f64>,
+        gam_solve::model_types::SmoothingCorrectionMethod,
+    )>,
 }
 
 pub(crate) fn assemble_custom_family_fit_result(
@@ -236,22 +245,28 @@ pub(crate) fn assemble_custom_family_fit_result(
         criterion_certificate,
         outer_converged,
         joint_log_lambdas,
+        smoothing_corrected,
     } = assembly;
     let log_lambdas = rho_physical;
     let lambdas =
         exact_lambdas_from_log_strengths(&log_lambdas, "custom-family fitted log strength")?;
-    let (block_states, covariance_conditional, geometry, precomputed_edf) =
+    let (block_states, covariance_conditional, geometry, precomputed_edf, smoothing_corrected) =
         if let Some(canonical) = canonical {
             let precomputed_edf = precomputed_edf
                 .or_else(|| reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas));
             let block_states = lift_block_states_to_raw(canonical, inner.block_states);
             let (covariance_conditional, geometry) =
                 lift_fit_geometry_to_raw(canonical, covariance_conditional, geometry)?;
+            // The correction is a coefficient-space bilinear form exactly like
+            // the conditional covariance: same gauge congruence (#2346).
+            let smoothing_corrected = smoothing_corrected
+                .map(|(c, method)| (canonical.gauge.lift_covariance(&c), method));
             (
                 block_states,
                 covariance_conditional,
                 geometry,
                 precomputed_edf,
+                smoothing_corrected,
             )
         } else {
             (
@@ -259,6 +274,7 @@ pub(crate) fn assemble_custom_family_fit_result(
                 covariance_conditional,
                 geometry,
                 precomputed_edf,
+                smoothing_corrected,
             )
         };
 
@@ -279,6 +295,7 @@ pub(crate) fn assemble_custom_family_fit_result(
             geometry,
             precomputed_edf,
             joint_log_lambdas,
+            smoothing_corrected,
         },
         result_specs,
     )
@@ -1052,6 +1069,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 criterion_certificate: None,
                 outer_converged: true,
                 joint_log_lambdas: None,
+                smoothing_corrected: None,
             },
         );
     }
@@ -1799,6 +1817,48 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // EDF. `None` (no allocation) for every per-block-only family.
     let joint_log_lambdas = (!label_layout.joint_specs.is_empty())
         .then(|| Array1::from(label_layout.joint_log_lambdas(&rho_star)));
+    // #2346: first-order ρ-uncertainty smoothing correction for the joint
+    // coefficient covariance, from the SAME analytic outer ρ-Hessian the
+    // certificate judged. Rail coordinates (box rails + typed AsymptoteRail
+    // rails) have no finite ρ-variance and are excluded (#2337 Thm 2.3);
+    // a non-PD interior V_ρ yields a typed absence, never an error.
+    let smoothing_corrected = match (
+        covariance_conditional.as_ref(),
+        certified_outer.final_hessian(),
+    ) {
+        (Some(v_cond), Some(outer_hessian)) => {
+            let certificate = certified_outer.criterion_certificate();
+            let mut excluded: Vec<usize> = certificate.lambdas_railed.clone();
+            for rail in certificate.stationarity.rails() {
+                if !excluded.contains(&rail.index) {
+                    excluded.push(rail.index);
+                }
+            }
+            crate::covariance::joint_smoothing_correction(
+                v_cond,
+                specs,
+                &label_layout,
+                &rho_star,
+                &inner.block_states,
+                outer_hessian,
+                &excluded,
+            )
+            .map_err(|reason| CustomFamilyError::Optimization {
+                context: "fit_custom_family smoothing correction",
+                reason,
+            })?
+            .map(|(correction, active_rank)| {
+                (
+                    correction,
+                    gam_solve::model_types::SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                        active_rank,
+                        rho_dimension: rho_star.len(),
+                    },
+                )
+            })
+        }
+        _ => None,
+    };
     assemble_custom_family_fit_result(
         inner,
         BlockwiseFitAssembly {
@@ -1814,6 +1874,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             criterion_certificate: Some(certified_outer.criterion_certificate().clone()),
             outer_converged: true,
             joint_log_lambdas,
+            smoothing_corrected,
         },
     )
 }
@@ -2040,6 +2101,7 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
             criterion_certificate: None,
             outer_converged: true,
             joint_log_lambdas,
+            smoothing_corrected: None,
         },
     )
 }
@@ -2258,6 +2320,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
             criterion_certificate,
             outer_converged: true,
             joint_log_lambdas: None,
+            smoothing_corrected: None,
         },
     )
 }
