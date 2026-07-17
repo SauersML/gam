@@ -5022,10 +5022,19 @@ fn survival_q_chain_derivatives_match_exact_exp_link_in_far_tails() {
 
 #[test]
 fn survival_exact_log_sigma_dh_matches_far_tail_third_derivative() {
+    // Representable far tail: q spans ~{4e-2, 1e21, 2e14} across the three
+    // rows, so the u>1e3 stable paired path engages while the log-likelihood
+    // (|ℓ| ~ 5e41) and its third derivative stay inside f64 — the old
+    // beta_log_sigma=701 fixture pushed |ℓ| beyond 1e300 into clamp-land,
+    // where an ABSOLUTE 1e-3 gate on an ~1e148-scale quantity demands 1e-151
+    // relative agreement no implementation can deliver (#2342; the clamp-land
+    // fixture keeps a finiteness gate below). The FD reference at h=1e-3
+    // resolves this magnitude to ~1e-6 relative, so the RELATIVE 1e-3 gate is
+    // honest.
     let family = survival_exact_newton_test_family();
     let beta_time = array![0.2];
-    let beta_threshold = array![0.1 * crate::sigma_link::safe_exp(700.0)];
-    let beta_log_sigma0 = 701.0_f64;
+    let beta_threshold = array![0.1 * crate::sigma_link::safe_exp(20.0)];
+    let beta_log_sigma0 = 21.0_f64;
     let beta_log_sigma = array![beta_log_sigma0];
     let states = survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
 
@@ -5048,25 +5057,67 @@ fn survival_exact_log_sigma_dh_matches_far_tail_third_derivative() {
             .expect("eval objective")
             .log_likelihood
     };
-    let h = 1e-4_f64;
+    let h = 1e-3_f64;
     let fd3 = (objective(beta_log_sigma0 + 2.0 * h) - 2.0 * objective(beta_log_sigma0 + h)
         + 2.0 * objective(beta_log_sigma0 - h)
         - objective(beta_log_sigma0 - 2.0 * h))
         / (2.0 * h.powi(3));
     assert!(
-        (analytic[[0, 0]] + fd3).abs() < 1e-3,
+        (analytic[[0, 0]] + fd3).abs() < 1e-3 * fd3.abs().max(1.0),
         "the exact-newton survival log-sigma dH entry should equal the negative third derivative in the far tail at beta_log_sigma={beta_log_sigma0}; got analytic {} vs expected {}",
         analytic[[0, 0]],
         -fd3
     );
 }
 
+/// #2342 clamp-land finiteness gate: at the extreme `beta_log_sigma = 701`
+/// fixture the likelihood itself exceeds f64 range (`q ~ e150`-scale rows,
+/// `|ℓ| > 1e300`), so no DERIVATIVE agreement can be asserted there — but the
+/// analytic dH must still be FINITE. The zero-stack far-tail rows (censored,
+/// `S ≈ 1`, all outer derivatives exactly zero) used to compose against
+/// clamped index channels and manufacture `0·∞ = NaN`.
 #[test]
-fn survival_joint_exact_log_sigma_dh_matches_far_tail_third_derivative() {
+fn survival_exact_log_sigma_dh_stays_finite_at_clamped_extreme_tail() {
     let family = survival_exact_newton_test_family();
     let beta_time = array![0.2];
     let beta_threshold = array![0.1 * crate::sigma_link::safe_exp(700.0)];
-    let beta_log_sigma0 = 701.0_f64;
+    let beta_log_sigma = array![701.0_f64];
+    let states = survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+
+    let analytic = family
+        .exact_newton_hessian_directional_derivative(
+            &states,
+            SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA,
+            &array![1.0],
+        )
+        .expect("analytic dH")
+        .expect("expected exact dH");
+    assert!(
+        analytic[[0, 0]].is_finite(),
+        "clamped extreme-tail dH must stay finite (a zero-stack row must \
+         contribute exactly zero, never 0·∞ = NaN); got {}",
+        analytic[[0, 0]]
+    );
+
+    let joint = family
+        .exact_newton_joint_hessian_directional_derivative(&states, &array![0.0, 0.0, 1.0])
+        .expect("analytic joint dH")
+        .expect("expected exact joint dH");
+    assert!(
+        joint.iter().all(|v| v.is_finite()),
+        "clamped extreme-tail joint dH must stay finite everywhere; got {joint:?}"
+    );
+}
+
+#[test]
+fn survival_joint_exact_log_sigma_dh_matches_far_tail_third_derivative() {
+    // Same representable far-tail fixture and RELATIVE gate as
+    // `survival_exact_log_sigma_dh_matches_far_tail_third_derivative` (see the
+    // #2342 rationale there); this variant pins the joint-path entry.
+    let family = survival_exact_newton_test_family();
+    let beta_time = array![0.2];
+    let beta_threshold = array![0.1 * crate::sigma_link::safe_exp(20.0)];
+    let beta_log_sigma0 = 21.0_f64;
     let beta_log_sigma = array![beta_log_sigma0];
     let states = survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
 
@@ -5085,13 +5136,13 @@ fn survival_joint_exact_log_sigma_dh_matches_far_tail_third_derivative() {
             .expect("eval objective")
             .log_likelihood
     };
-    let h = 1e-4_f64;
+    let h = 1e-3_f64;
     let fd3 = (objective(beta_log_sigma0 + 2.0 * h) - 2.0 * objective(beta_log_sigma0 + h)
         + 2.0 * objective(beta_log_sigma0 - h)
         - objective(beta_log_sigma0 - 2.0 * h))
         / (2.0 * h.powi(3));
     assert!(
-        (analytic[[2, 2]] + fd3).abs() < 1e-3,
+        (analytic[[2, 2]] + fd3).abs() < 1e-3 * fd3.abs().max(1.0),
         "the exact joint survival dH log-sigma/log-sigma entry should equal the negative third derivative in the far tail at beta_log_sigma={beta_log_sigma0}; got analytic {} vs expected {}",
         analytic[[2, 2]],
         -fd3

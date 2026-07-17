@@ -539,6 +539,19 @@ row_atom! {
     }
 }
 
+/// Whether a composition stack is exactly zero in every entry. Such a stack
+/// contributes nothing to the row NLL at ANY derivative order, so it must be
+/// SKIPPED rather than composed: at a clamped far-tail row (a censored
+/// observation with `S ≈ 1` carries `q` at f64 extremes) the index jet's
+/// direction channels are enormous, and Faà di Bruno would form jet-channel
+/// products that overflow to `∞` BEFORE the zero outer derivative multiplies
+/// them — manufacturing `0·∞ = NaN` out of an exactly-zero term (#2342
+/// far-tail dH NaN, localized by `zz_measure_2342_far_tail_dh_nan_localization`).
+#[inline(always)]
+fn stack_is_exactly_zero(stack: &[f64; 5]) -> bool {
+    stack.iter().all(|v| *v == 0.0)
+}
+
 #[inline(always)]
 pub(crate) fn sls_row_nll<S: JetScalar<SLS_ROW_K>>(
     vars: &[S; SLS_ROW_K],
@@ -549,11 +562,19 @@ pub(crate) fn sls_row_nll<S: JetScalar<SLS_ROW_K>>(
     let g = sls_event_rate(&vars[2], &vars[3], &vars[5], &vars[6], &vars[8]);
     let plan = sls_outer_plan(kernel);
 
-    let mut nll = u0.compose_unary(plan.u0);
-    if let Some(stack) = plan.u1 {
+    let mut nll = if stack_is_exactly_zero(&plan.u0) {
+        S::constant(0.0)
+    } else {
+        u0.compose_unary(plan.u0)
+    };
+    if let Some(stack) = plan.u1
+        && !stack_is_exactly_zero(&stack)
+    {
         nll = nll.add(&u1.compose_unary(stack));
     }
-    if let Some(stack) = plan.g {
+    if let Some(stack) = plan.g
+        && !stack_is_exactly_zero(&stack)
+    {
         nll = nll.add(&g.compose_unary(stack));
     }
     Ok(nll)
@@ -833,51 +854,56 @@ pub(crate) fn sls_row_nll_wiggle<'arena, S: RuntimeJetScalar<'arena>>(
     let u0w = vars[0].add(&q0w);
     let u1w = vars[1].add(&q1w);
     let g = vars[2].add(&m1.mul(&qdot0));
-    let mut nll = u0w
-        .compose_unary([
-            kernel.log_s0,
-            -kernel.r0,
-            -kernel.dr0,
-            -kernel.ddr0,
-            -kernel.dddr0,
-        ])
-        .scale(kernel.w);
+    // Skip exactly-zero stacks instead of composing them (same #2342 far-tail
+    // 0·∞ = NaN guard as [`sls_row_nll`]); `vars[0]` is a plain seed jet with
+    // finite channels, so scaling it by zero is a safe zero of the right type.
+    let u0_stack = [
+        kernel.log_s0,
+        -kernel.r0,
+        -kernel.dr0,
+        -kernel.ddr0,
+        -kernel.dddr0,
+    ];
+    let mut nll = if stack_is_exactly_zero(&u0_stack) {
+        vars[0].scale(0.0)
+    } else {
+        u0w.compose_unary(u0_stack).scale(kernel.w)
+    };
     let censored_weight = kernel.w * (1.0 - kernel.d);
     if censored_weight != 0.0 {
-        nll = nll.add(
-            &u1w.compose_unary([
-                kernel.log_s1,
-                -kernel.r1,
-                -kernel.dr1,
-                -kernel.ddr1,
-                -kernel.dddr1,
-            ])
-            .scale(-censored_weight),
-        );
+        let u1_stack = [
+            kernel.log_s1,
+            -kernel.r1,
+            -kernel.dr1,
+            -kernel.ddr1,
+            -kernel.dddr1,
+        ];
+        if !stack_is_exactly_zero(&u1_stack) {
+            nll = nll.add(&u1w.compose_unary(u1_stack).scale(-censored_weight));
+        }
     }
     let event_weight = kernel.w * kernel.d;
     if event_weight != 0.0 {
-        nll = nll
-            .add(
-                &u1w.compose_unary([
-                    kernel.logphi1,
-                    kernel.dlogphi1,
-                    kernel.d2logphi1,
-                    kernel.d3logphi1,
-                    kernel.d4logphi1,
-                ])
-                .scale(-event_weight),
-            )
-            .add(
-                &g.compose_unary([
-                    kernel.log_g,
-                    kernel.d_log_g,
-                    kernel.d2_log_g,
-                    kernel.d3_log_g,
-                    kernel.d4_log_g,
-                ])
-                .scale(-event_weight),
-            );
+        let pdf_stack = [
+            kernel.logphi1,
+            kernel.dlogphi1,
+            kernel.d2logphi1,
+            kernel.d3logphi1,
+            kernel.d4logphi1,
+        ];
+        if !stack_is_exactly_zero(&pdf_stack) {
+            nll = nll.add(&u1w.compose_unary(pdf_stack).scale(-event_weight));
+        }
+        let g_stack = [
+            kernel.log_g,
+            kernel.d_log_g,
+            kernel.d2_log_g,
+            kernel.d3_log_g,
+            kernel.d4_log_g,
+        ];
+        if !stack_is_exactly_zero(&g_stack) {
+            nll = nll.add(&g.compose_unary(g_stack).scale(-event_weight));
+        }
     }
     nll
 }
