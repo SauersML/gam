@@ -31,8 +31,8 @@ use gam::families::bms::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
 };
 use gam::families::survival::marginal_slope::{
-    survival_marginal_slope_vector_eta, survival_marginal_slope_vector_neglog,
-    survival_marginal_slope_vector_scale,
+    RigidVectorValueWorkspace, survival_marginal_slope_vector_eta,
+    survival_marginal_slope_vector_neglog, survival_marginal_slope_vector_scale,
 };
 use gam::probability::{normal_cdf, normal_pdf};
 use ndarray::{Array1, Array2};
@@ -118,7 +118,7 @@ fn total_neglog(
             data.qd1[i],
             slopes,
             &z_row,
-            covariance,
+            &RigidVectorValueWorkspace::new(covariance),
             data.weights[i],
             data.event[i],
             DERIV_GUARD,

@@ -1,7 +1,7 @@
 use gam::families::bms::{MarginalSlopeCovariance, MarginalSlopeCovarianceShape};
 use gam::families::survival::marginal_slope::{
-    survival_marginal_slope_vector_eta, survival_marginal_slope_vector_neglog,
-    survival_marginal_slope_vector_scale,
+    RigidVectorValueWorkspace, survival_marginal_slope_vector_eta,
+    survival_marginal_slope_vector_neglog, survival_marginal_slope_vector_scale,
 };
 use gam::probability::normal_cdf;
 use ndarray::array;
@@ -92,7 +92,7 @@ fn survival_multi_z_shared_slope_neglog_uses_row_sum_and_covariance_quadratic() 
         qd1,
         &[shared_slope, shared_slope],
         &z,
-        &covariance,
+        &RigidVectorValueWorkspace::new(&covariance),
         weight,
         event,
         1e-6,
@@ -185,7 +185,7 @@ fn survival_multi_z_k1_neglog_matches_scalar_identity_fixture() {
         qd1,
         &slope,
         &z,
-        &covariance,
+        &RigidVectorValueWorkspace::new(&covariance),
         1.2,
         1.0,
         1e-6,
@@ -207,7 +207,7 @@ fn survival_multi_z_neglog_rejects_derivative_guard_violation() {
         1e-7,
         &[0.2, -0.1],
         &[0.4, 0.5],
-        &covariance,
+        &RigidVectorValueWorkspace::new(&covariance),
         1.0,
         1.0,
         1e-6,

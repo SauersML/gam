@@ -8,8 +8,8 @@ use gam::families::bms::{
     marginal_slope_preserving_scale, marginal_slope_probit_eta,
 };
 use gam::families::survival::marginal_slope::{
-    survival_marginal_slope_vector_eta, survival_marginal_slope_vector_neglog,
-    survival_marginal_slope_vector_scale,
+    RigidVectorValueWorkspace, survival_marginal_slope_vector_eta,
+    survival_marginal_slope_vector_neglog, survival_marginal_slope_vector_scale,
 };
 use gam::probability::normal_cdf;
 use ndarray::{Array1, Array2};
@@ -524,7 +524,7 @@ fn survival_neglog_k1_matches_closed_form_20_fixtures() {
             qd1,
             &slope,
             &z,
-            &cov,
+            &RigidVectorValueWorkspace::new(&cov),
             weight,
             event,
             derivative_guard,

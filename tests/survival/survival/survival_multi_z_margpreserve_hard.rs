@@ -14,8 +14,8 @@
 
 use gam::families::bms::{MarginalSlopeCovariance, marginal_slope_covariance_from_scores};
 use gam::families::survival::marginal_slope::{
-    survival_marginal_slope_vector_eta, survival_marginal_slope_vector_neglog,
-    survival_marginal_slope_vector_scale,
+    RigidVectorValueWorkspace, survival_marginal_slope_vector_eta,
+    survival_marginal_slope_vector_neglog, survival_marginal_slope_vector_scale,
 };
 use gam::probability::normal_cdf;
 use ndarray::{Array1, Array2, array};
@@ -625,7 +625,16 @@ fn survival_multi_z_neglog_finite_under_random_shapes() {
         let q1 = q0 + 0.5 + rng.next_unit();
         let qd1 = 0.1 + rng.next_unit();
         let value = survival_marginal_slope_vector_neglog(
-            q0, q1, qd1, &slopes, &z, &cov, 1.0, 0.0, 1e-6, 1.0,
+            q0,
+            q1,
+            qd1,
+            &slopes,
+            &z,
+            &RigidVectorValueWorkspace::new(&cov),
+            1.0,
+            0.0,
+            1e-6,
+            1.0,
         )
         .expect("neglog");
         assert!(value.is_finite(), "seed={seed}: neglog not finite: {value}");
