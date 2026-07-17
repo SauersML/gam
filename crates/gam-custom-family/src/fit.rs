@@ -879,90 +879,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // gam#1587: full-width cross-block joint penalties (the reference-symmetric
     // `M⊗S_t` multinomial smoothing penalty). Empty for every other family, so
     // the joint-penalty code paths below are skipped and behaviour is identical.
-    // The specs are produced in raw (pre-canonicalisation) stacked coordinates;
-    // pull each back through the identifiability gauge `T_full`
-    // (`S_red = T_fullᵀ S_raw T_full`) so it acts on the reduced coordinate space
-    // the inner solve and outer evaluator run in.
     let reduced_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
-    let joint_specs: Vec<gam_problem::JointPenaltySpec> = {
-        let raw_specs_joint =
-            family
-                .joint_penalty_specs()
-                .map_err(|reason| CustomFamilyError::Optimization {
-                    context: "fit_custom_family joint penalty specs",
-                    reason,
-                })?;
-        let t_full = &canonical.gauge.t_full;
-        // The trait contract fixes the coordinates: joint penalties arrive in
-        // RAW (pre-canonicalisation) stacked coordinates, so the pullback
-        // decision must key on whether the gauge is the identity — NOT on a
-        // dimension comparison. When no columns are dropped the raw and
-        // reduced totals coincide even though `T_full` can still be a
-        // nontrivial rotation, and skipping `TᵀST` there would smooth the
-        // wrong quadratic form (a coordinate swap with S = diag(1,2) must
-        // become diag(2,1)).
-        let gauge_is_identity = t_full.nrows() == t_full.ncols()
-            && t_full
-                .indexed_iter()
-                .all(|((i, j), &v)| v == if i == j { 1.0 } else { 0.0 });
-        raw_specs_joint
-            .into_iter()
-            .map(|spec| {
-                if spec.matrix.nrows() != t_full.nrows() {
-                    return Err(CustomFamilyError::DimensionMismatch {
-                        reason: format!(
-                            "joint penalty '{}' has dim {} but the trait contract requires the \
-                             raw stacked total {} (pre-canonicalisation coordinates)",
-                            spec.label.as_deref().unwrap_or("<unlabeled>"),
-                            spec.matrix.nrows(),
-                            t_full.nrows(),
-                        ),
-                    });
-                }
-                let (pulled, nullspace_dim) = if gauge_is_identity {
-                    (spec.matrix, spec.nullspace_dim)
-                } else {
-                    let pulled = t_full.t().dot(&spec.matrix).dot(t_full);
-                    // The gauge changes rank/nullity nontrivially — a dropped
-                    // or rotated column can absorb penalized directions or
-                    // fold null directions away (reducing diag(1,0) to its
-                    // first coordinate has nullity 0, not 1) — so the declared
-                    // raw nullity is recomputed on the pulled-back operator
-                    // instead of being capped at the reduced total.
-                    let (evals, _) = pulled.eigh(Side::Lower).map_err(|e| {
-                        CustomFamilyError::Optimization {
-                            context: "fit_custom_family joint penalty pullback rank",
-                            reason: format!(
-                                "eigendecomposition of pulled-back joint penalty '{}' failed: {e}",
-                                spec.label.as_deref().unwrap_or("<unlabeled>"),
-                            ),
-                        }
-                    })?;
-                    let evals_slice =
-                        evals
-                            .as_slice()
-                            .ok_or_else(|| CustomFamilyError::Optimization {
-                                context: "fit_custom_family joint penalty pullback rank",
-                                reason: "non-contiguous eigenvalue buffer".to_string(),
-                            })?;
-                    let thresh = positive_eigenvalue_threshold(evals_slice);
-                    let rank = evals.iter().filter(|&&ev| ev > thresh).count();
-                    (pulled, reduced_total - rank)
-                };
-                let out = gam_problem::JointPenaltySpec {
-                    label: spec.label,
-                    matrix: pulled,
-                    initial_log_lambda: spec.initial_log_lambda,
-                    nullspace_dim,
-                };
-                out.validate()
-                    .map_err(|e| CustomFamilyError::ConstraintViolation {
-                        reason: format!("joint penalty validation failed: {e}"),
-                    })?;
-                Ok(out)
-            })
-            .collect::<Result<Vec<_>, CustomFamilyError>>()?
-    };
+    let joint_specs = pulled_back_joint_penalty_specs(family, &canonical, reduced_total)?;
 
     let label_layout = penalty_label_layout_with_joint(specs, penalty_counts.clone(), joint_specs)?;
     let mut rho0 = label_layout.initial_rho.clone();
@@ -1908,6 +1826,99 @@ enum OwnedModeProvenance<'a> {
     },
 }
 
+/// Pull the family's raw-coordinate joint penalty specs back through the
+/// identifiability gauge into the reduced coordinate space the inner solve and
+/// outer evaluator run in (`S_red = T_fullᵀ S_raw T_full`), recomputing the
+/// declared nullity on the pulled-back operator when the gauge is nontrivial.
+///
+/// The trait contract fixes the coordinates: joint penalties arrive in RAW
+/// (pre-canonicalisation) stacked coordinates, so the pullback decision must
+/// key on whether the gauge is the identity — NOT on a dimension comparison.
+/// When no columns are dropped the raw and reduced totals coincide even though
+/// `T_full` can still be a nontrivial rotation, and skipping `TᵀST` there
+/// would smooth the wrong quadratic form (a coordinate swap with S = diag(1,2)
+/// must become diag(2,1)).
+///
+/// Shared by the outer-optimizing entry AND the fixed-log-lambda entry
+/// (#2349: the fixed path previously never consulted the joint specs, so a
+/// joint-penalty family — the multinomial per-class centered carrier, whose
+/// per-block penalties are EMPTY — fit completely unpenalized at fixed λ).
+fn pulled_back_joint_penalty_specs<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    canonical: &gam_identifiability::canonical::CanonicalSpecs,
+    reduced_total: usize,
+) -> Result<Vec<gam_problem::JointPenaltySpec>, CustomFamilyError> {
+    let raw_specs_joint =
+        family
+            .joint_penalty_specs()
+            .map_err(|reason| CustomFamilyError::Optimization {
+                context: "fit_custom_family joint penalty specs",
+                reason,
+            })?;
+    let t_full = &canonical.gauge.t_full;
+    let gauge_is_identity = t_full.nrows() == t_full.ncols()
+        && t_full
+            .indexed_iter()
+            .all(|((i, j), &v)| v == if i == j { 1.0 } else { 0.0 });
+    raw_specs_joint
+        .into_iter()
+        .map(|spec| {
+            if spec.matrix.nrows() != t_full.nrows() {
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "joint penalty '{}' has dim {} but the trait contract requires the \
+                         raw stacked total {} (pre-canonicalisation coordinates)",
+                        spec.label.as_deref().unwrap_or("<unlabeled>"),
+                        spec.matrix.nrows(),
+                        t_full.nrows(),
+                    ),
+                });
+            }
+            let (pulled, nullspace_dim) = if gauge_is_identity {
+                (spec.matrix, spec.nullspace_dim)
+            } else {
+                let pulled = t_full.t().dot(&spec.matrix).dot(t_full);
+                // The gauge changes rank/nullity nontrivially — a dropped
+                // or rotated column can absorb penalized directions or
+                // fold null directions away (reducing diag(1,0) to its
+                // first coordinate has nullity 0, not 1) — so the declared
+                // raw nullity is recomputed on the pulled-back operator
+                // instead of being capped at the reduced total.
+                let (evals, _) = pulled.eigh(Side::Lower).map_err(|e| {
+                    CustomFamilyError::Optimization {
+                        context: "fit_custom_family joint penalty pullback rank",
+                        reason: format!(
+                            "eigendecomposition of pulled-back joint penalty '{}' failed: {e}",
+                            spec.label.as_deref().unwrap_or("<unlabeled>"),
+                        ),
+                    }
+                })?;
+                let evals_slice =
+                    evals
+                        .as_slice()
+                        .ok_or_else(|| CustomFamilyError::Optimization {
+                            context: "fit_custom_family joint penalty pullback rank",
+                            reason: "non-contiguous eigenvalue buffer".to_string(),
+                        })?;
+                let thresh = positive_eigenvalue_threshold(evals_slice);
+                let rank = evals.iter().filter(|&&ev| ev > thresh).count();
+                (pulled, reduced_total - rank)
+            };
+            let out = gam_problem::JointPenaltySpec {
+                label: spec.label,
+                matrix: pulled,
+                initial_log_lambda: spec.initial_log_lambda,
+                nullspace_dim,
+            };
+            out.validate()
+                .map_err(|e| CustomFamilyError::ConstraintViolation {
+                    reason: format!("joint penalty validation failed: {e}"),
+                })?;
+            Ok(out)
+        })
+        .collect::<Result<Vec<_>, CustomFamilyError>>()
+}
+
 fn fit_custom_family_user_fixed_log_lambdas_impl<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
@@ -1925,6 +1936,29 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
     let penalty_counts = validate_blockspecs(specs)?;
     let rho = flatten_log_lambdas(specs);
     let per_block = split_log_lambdas(&rho, &penalty_counts)?;
+    // #2349: carry the family's joint penalty specs exactly like the outer
+    // entry does — the fixed path previously never consulted them, so a
+    // joint-penalty family fit completely UNPENALIZED at user-fixed λ. Each
+    // joint spec's user-fixed λ is its `initial_log_lambda` (per-spec settable
+    // through the family's seed API — the same vector a refusal checkpoint
+    // resume carries).
+    let reduced_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    let joint_specs = pulled_back_joint_penalty_specs(family, &canonical, reduced_total)?;
+    let mut fixed_options = options.clone();
+    let joint_log_lambdas: Option<Array1<f64>> = if joint_specs.is_empty() {
+        None
+    } else {
+        let lambdas: Vec<f64> = joint_specs.iter().map(|s| s.initial_log_lambda).collect();
+        let bundle = gam_problem::JointPenaltyBundle::new(
+            std::sync::Arc::new(joint_specs),
+            lambdas.clone(),
+            reduced_total,
+        )
+        .map_err(CustomFamilyError::from)?;
+        fixed_options.joint_penalties = Some(std::sync::Arc::new(bundle));
+        Some(Array1::from(lambdas))
+    };
+    let options = &fixed_options;
     let reduced_warm_start = fixed_lambda_warm_start_for_reduced_specs(warm_start, &canonical);
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, reduced_warm_start)
         .map_err(|error| CustomFamilyError::Optimization {
@@ -2005,7 +2039,7 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
             outer_gradient_norm: None,
             criterion_certificate: None,
             outer_converged: true,
-            joint_log_lambdas: None,
+            joint_log_lambdas,
         },
     )
 }
