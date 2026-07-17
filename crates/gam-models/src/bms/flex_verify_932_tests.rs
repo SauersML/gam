@@ -950,6 +950,84 @@ fn zz_measure_2347_pure_direction_h_to_t3_ladder() {
     }
 }
 
+/// #2347 flex-β scaling measurement: run the pure-q H→t3 ladder with the
+/// score-warp and link-deviation coefficients scaled toward zero. The fixture's
+/// flex β are already tiny (~1e-3) yet the pure-q third is wrong at O(1)
+/// RELATIVE — if the relative gap is INVARIANT under β_flex scaling, the
+/// corruption lives in the warp-independent base terms of the flex third
+/// assembly (present whenever the flex path is taken at all); if it shrinks
+/// with the scale, it lives in the warp-coupling terms. Diagnostic only.
+#[test]
+fn zz_measure_2347_flex_beta_scaling_pure_q_ladder() {
+    let row = 0usize;
+    let step = 2.0e-4_f64;
+    for scale in [1.0_f64, 0.3, 0.1, 0.03] {
+        let (family, mut states) = standard_normal_flex_fixture();
+        for block in [2usize, 3] {
+            states[block].beta.mapv_inplace(|v| v * scale);
+        }
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("scaled StandardNormal FLEX exact cache");
+        let primary = cache.primary.clone();
+        let mut direction = Array1::<f64>::zeros(primary.total);
+        direction[primary.q] = 0.55;
+
+        let base = standard_normal_flex_channels(&family, &states, &cache, row, &direction, false);
+        let plus_states =
+            perturb_standard_normal_flex_states(&states, &primary, row, &direction, step);
+        let minus_states =
+            perturb_standard_normal_flex_states(&states, &primary, row, &direction, -step);
+        let plus_cache = family
+            .build_exact_eval_cache(&plus_states)
+            .expect("positive-direction scaled cache");
+        let minus_cache = family
+            .build_exact_eval_cache(&minus_states)
+            .expect("negative-direction scaled cache");
+        let plus = standard_normal_flex_channels(
+            &family,
+            &plus_states,
+            &plus_cache,
+            row,
+            &direction,
+            false,
+        );
+        let minus = standard_normal_flex_channels(
+            &family,
+            &minus_states,
+            &minus_cache,
+            row,
+            &direction,
+            false,
+        );
+
+        let mut max_h3 = 0.0_f64;
+        let mut max_gh = 0.0_f64;
+        let hessian_direction = base.hessian.dot(&direction);
+        for u in 0..primary.total {
+            let gradient_fd = (plus.gradient[u] - minus.gradient[u]) / (2.0 * step);
+            max_gh = max_gh.max(derivative_ladder_relative_error(
+                hessian_direction[u],
+                gradient_fd,
+            ));
+            for v in 0..primary.total {
+                let third_fd = (plus.hessian[[u, v]] - minus.hessian[[u, v]]) / (2.0 * step);
+                max_h3 = max_h3.max(derivative_ladder_relative_error(
+                    base.third[[u, v]],
+                    third_fd,
+                ));
+            }
+        }
+        let qq_fd = (plus.hessian[[primary.q, primary.q]] - minus.hessian[[primary.q, primary.q]])
+            / (2.0 * step);
+        eprintln!(
+            "#2347 SCALE beta_flex x{scale:>5.2}: max_gh={max_gh:.3e} max_h3={max_h3:.3e} \
+             [q,q]: a={:+.6e} fd={qq_fd:+.6e}",
+            base.third[[primary.q, primary.q]],
+        );
+    }
+}
+
 // ==================================================================
 // GATE 3: moving-edge Leibniz cross-check. Couple a cell edge to a
 // knot crossing zE = (τ − a)/b and central-difference a moving-domain
