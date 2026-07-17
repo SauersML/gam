@@ -95,12 +95,17 @@ fn retain_best_outer_checkpoint(slot: &mut Option<OuterResult>, candidate: Outer
 }
 
 /// Execute a single plan attempt (seed generation → solver loop → best result).
+///
+/// `allow_tail_snap_reseed` gates the one-shot #2348 Inc 2b retry from a
+/// confirmed-tail snapped checkpoint (see [`OuterResult::tail_snap_reseed`]);
+/// the retry pass itself runs with it `false` so a reseed can never recurse.
 pub(crate) fn run_outer_with_plan(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     context: &str,
     cap: &OuterCapability,
     the_plan: &OuterPlan,
+    allow_tail_snap_reseed: bool,
 ) -> Result<PlanRunOutcome, EstimationError> {
     let mut seeds = {
         let generated = crate::seeding::generate_rho_candidates(
@@ -182,6 +187,10 @@ pub(crate) fn run_outer_with_plan(
 
     let mut best: Option<CertifiedOuterCandidate> = None;
     let mut best_checkpoint: Option<OuterResult> = None;
+    // First confirmed-tail snapped reseed published by a refused certification
+    // (#2348 Inc 2b). Consumed once, after the seed cascade, for a single
+    // polishing retry pinned at the snapped rail point.
+    let mut tail_snap_reseed_point: Option<Array1<f64>> = None;
     // A reactive domain-entry path is created inside a seed attempt only after
     // that objective's exact seed cost is non-finite. Already-feasible seeds
     // therefore stay on the zero-heavy-entry path.
@@ -368,6 +377,9 @@ pub(crate) fn run_outer_with_plan(
                         "[OUTER] {context}: zero-iteration seed {seed_idx} claimed acceptance but \
                          failed analytic certification: {error}"
                     );
+                    if tail_snap_reseed_point.is_none() {
+                        tail_snap_reseed_point = checkpoint.tail_snap_reseed.clone();
+                    }
                     retain_best_outer_checkpoint(&mut best_checkpoint, checkpoint);
                     rejection_reasons.push((seed_idx, "certificate", error.to_string()));
                     continue 'seed_attempts;
@@ -1737,6 +1749,9 @@ pub(crate) fn run_outer_with_plan(
                             "[OUTER] {context}: seed {seed_idx} solver convergence claim failed \
                              analytic certification: {error}; retaining only a resume checkpoint"
                         );
+                        if tail_snap_reseed_point.is_none() {
+                            tail_snap_reseed_point = checkpoint.tail_snap_reseed.clone();
+                        }
                         retain_best_outer_checkpoint(&mut best_checkpoint, checkpoint);
                         rejection_reasons.push((seed_idx, "certificate", error.to_string()));
                         continue 'seed_attempts;
@@ -1864,6 +1879,37 @@ pub(crate) fn run_outer_with_plan(
         drop(finalize_cap_guard);
         finalize_outcome?;
         return Ok(PlanRunOutcome::Converged(result));
+    }
+
+    // #2348 Inc 2b: a refused certification CONFIRMED an exponential tail
+    // (probing passed) but the interior was still unpolished — the budget died
+    // mid-crawl while the interior tracked the crawling tail coordinate.
+    // Retry ONCE seeded at the snapped rail point: the box projection pins the
+    // tail coordinate at its bound while the interior converges in its few
+    // remaining Newton steps, and the Inc 1 railed mint then certifies through
+    // the natural path. The retry pass runs with the reseed gate closed, so
+    // this can never recurse; a failed retry falls back to the original
+    // exhaustion accounting.
+    if allow_tail_snap_reseed && let Some(reseed) = tail_snap_reseed_point {
+        log::info!(
+            "[OUTER] {context}: retrying once from the confirmed-tail snapped \
+             reseed {reseed} (#2348 Inc 2b)"
+        );
+        let mut retry_config = config.clone();
+        retry_config.initial_rho = Some(reseed);
+        retry_config.screen_initial_rho = false;
+        retry_config.seed_config.max_seeds = 1;
+        retry_config.seed_config.seed_budget = 1;
+        obj.reset();
+        match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
+            Ok(outcome) => return Ok(outcome),
+            Err(retry_error) => {
+                log::warn!(
+                    "[OUTER] {context}: confirmed-tail reseed retry failed ({retry_error}); \
+                     falling through to the original exhaustion accounting"
+                );
+            }
+        }
     }
 
     if let Some(checkpoint) = best_checkpoint {

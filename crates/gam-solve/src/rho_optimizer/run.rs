@@ -1050,6 +1050,15 @@ pub struct OuterResult {
     /// show evidence that plug-in REML/LAML intervals are unreliable. Populated
     /// once by [`run_outer`] when the exact rho Hessian is cheap enough to use.
     pub rho_uncertainty_diagnostic: Option<crate::rho_uncertainty::RhoUncertaintyDiagnostic>,
+    /// Reseed point minted by a refused certification whose tail snap CONFIRMED
+    /// an exponential tail (probing passed) but whose interior coordinates were
+    /// not yet raw-gradient stationary (#2348 Inc 2b): the loop budget died
+    /// mid-crawl while the interior tracked the crawling tail coordinate. The
+    /// plan runner retries ONCE from this point — the box projection pins the
+    /// snapped coordinate at its rail while the interior polishes, and the
+    /// Inc 1 railed mint then judges the result through the natural path with
+    /// untouched evidence semantics.
+    pub tail_snap_reseed: Option<Array1<f64>>,
 }
 
 impl OuterResult {
@@ -1075,6 +1084,7 @@ impl OuterResult {
             converged_via: None,
             flat_noise_grad_bound: None,
             rho_uncertainty_diagnostic: None,
+            tail_snap_reseed: None,
         }
     }
 
@@ -2307,6 +2317,18 @@ fn certify_outer_optimality_at_terminal_fidelity(
                     }
                 }
             }
+            TailSnapOutcome::ConfirmedNeedsReseed(snapped) => {
+                log::info!(
+                    "[CERTIFICATE] {context}: confirmed exponential tail on un-railed \
+                     coordinate(s) but the interior is not yet stationary; publishing \
+                     the snapped point {snapped} as a reseed for one retry (#2348 Inc 2b)"
+                );
+                tail_snap_note = Some(
+                    "tail confirmed; interior unpolished — retry seeded at the snapped rail point"
+                        .to_string(),
+                );
+                result.tail_snap_reseed = Some(snapped);
+            }
             TailSnapOutcome::Declined(reason) => {
                 tail_snap_note = Some(reason);
             }
@@ -2506,12 +2528,22 @@ const TAIL_SNAP_CURVATURE_BAND: (f64, f64) = (0.25, 4.0);
 /// 3. every candidate's tail is confirmed by the same probing engine the rail
 ///    mint uses (`CertifiedAtAsymptote` or `OnTailNotYetEquivalent`; the final
 ///    at-rail equivalence is re-judged by the Inc 1 mint after the snap).
-/// Outcome of a certify-time tail-snap attempt: either the snapped point to
-/// re-certify, or a human-readable decline reason that is carried into the
-/// refusal summary so a budget-exhausted crawl explains WHY it was not
-/// snapped (the decline evidence is otherwise invisible in a red test/fit).
+/// Outcome of a certify-time tail-snap attempt: the snapped point to
+/// re-certify, a confirmed tail whose interior still needs a polishing
+/// reseed-retry (#2348 Inc 2b), or a human-readable decline reason that is
+/// carried into the refusal summary so a budget-exhausted crawl explains WHY
+/// it was not snapped (the decline evidence is otherwise invisible in a red
+/// test/fit).
 enum TailSnapOutcome {
+    /// Tails confirmed AND the interior is already gradient-stationary:
+    /// re-certify the snapped point directly (the Inc 1 railed mint judges it).
     Snapped(Array1<f64>),
+    /// Tails confirmed but the interior is not yet raw-gradient stationary —
+    /// the loop budget died mid-crawl while the interior tracked the crawling
+    /// tail coordinate. Re-certifying in place cannot help (the interior
+    /// gradient does not move without re-optimization); the plan runner
+    /// should retry ONCE seeded at this point instead.
+    ConfirmedNeedsReseed(Array1<f64>),
     Declined(String),
 }
 
@@ -2570,22 +2602,9 @@ fn try_tail_snap_to_rail(
         }));
     }
 
-    // The residual must be EXPLAINED by the candidate tails: every other
-    // interior coordinate is stationary in its own right, and the curvature
-    // left after excluding the railed + candidate directions is admissible for
-    // a minimum. A still-descending or indefinite interior refuses before any
-    // probe is spent.
-    let interior_grad_norm = (0..n)
-        .filter(|k| !inputs.railed.contains(k) && !candidates.iter().any(|(c, _)| c == k))
-        .map(|k| gradient[k] * gradient[k])
-        .sum::<f64>()
-        .sqrt();
-    if !(interior_grad_norm <= inputs.stationarity_bound) {
-        return Ok(TailSnapOutcome::Declined(format!(
-            "interior not stationary: |g_int|={interior_grad_norm:.3e} > bound {:.3e}",
-            inputs.stationarity_bound
-        )));
-    }
+    // The curvature left after excluding the railed + candidate directions
+    // must be admissible for a minimum; a genuinely indefinite interior
+    // refuses before any probe is spent.
     let excluded: Vec<usize> = inputs
         .railed
         .iter()
@@ -2619,16 +2638,17 @@ fn try_tail_snap_to_rail(
             break;
         }
     }
+    // The probes warm-started the inner solve away from the checkpoint; every
+    // exit below leaves the CURRENT point as the shipped state, so restore it
+    // before returning. A failure here is a genuinely broken objective.
+    obj.eval_cost(rho).map_err(|err| {
+        EstimationError::RemlOptimizationFailed(format!(
+            "{}: failed to restore the objective to the certified point after \
+             tail-snap probing: {err}",
+            inputs.context
+        ))
+    })?;
     if let Some(reason) = decline {
-        // The probes warm-started the inner solve away from the checkpoint;
-        // restore it before the caller falls through to the ordinary refusal.
-        obj.eval_cost(rho).map_err(|err| {
-            EstimationError::RemlOptimizationFailed(format!(
-                "{}: failed to restore the objective to the certified point after \
-                 tail-snap probing: {err}",
-                inputs.context
-            ))
-        })?;
         return Ok(TailSnapOutcome::Declined(reason));
     }
 
@@ -2639,7 +2659,25 @@ fn try_tail_snap_to_rail(
             AsymptoteSide::Lower => lower[*k],
         };
     }
-    Ok(TailSnapOutcome::Snapped(snapped))
+
+    // Tails confirmed. Whether the snapped point can be re-certified DIRECTLY
+    // depends on the interior: the asymptote mint requires every non-rail
+    // coordinate gradient-stationary, and snapping the tail coordinate does
+    // not move the interior gradient. A budget-exhausted crawl typically
+    // leaves the interior UNPOLISHED (it was still tracking the crawling tail
+    // coordinate), so hand the runner a reseed point instead — one more
+    // optimizer pass pins the snapped coordinate at its rail (box projection)
+    // while the interior converges in its few remaining Newton steps.
+    let interior_grad_norm = (0..n)
+        .filter(|k| !inputs.railed.contains(k) && !candidates.iter().any(|(c, _)| c == k))
+        .map(|k| gradient[k] * gradient[k])
+        .sum::<f64>()
+        .sqrt();
+    if interior_grad_norm <= inputs.stationarity_bound {
+        Ok(TailSnapOutcome::Snapped(snapped))
+    } else {
+        Ok(TailSnapOutcome::ConfirmedNeedsReseed(snapped))
+    }
 }
 
 /// Reconstruct one railed coordinate's exponential tail by probing the analytic
@@ -3363,7 +3401,7 @@ pub(crate) fn run_outer_uncertified(
             let active_config_owned: OuterConfig =
                 retry_config.clone().unwrap_or_else(|| config.clone());
             let active_config: &OuterConfig = &active_config_owned;
-            match run_outer_with_plan(obj, active_config, context, attempt_cap, &the_plan) {
+            match run_outer_with_plan(obj, active_config, context, attempt_cap, &the_plan, true) {
                 Ok(PlanRunOutcome::Converged(result)) => break Ok(result),
                 Ok(PlanRunOutcome::Exhausted(result)) => {
                     if arc_retries_left == 0

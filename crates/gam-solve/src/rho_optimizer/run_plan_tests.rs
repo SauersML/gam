@@ -1766,6 +1766,7 @@ fn writable_inner_seed_hook_does_not_authorize_off_target_evaluations() {
         "writable seed hook phase authority",
         &cap,
         &the_plan,
+        true,
     )
     .expect("literal stationary seed must be accepted");
     assert!(matches!(outcome, PlanRunOutcome::Converged(_)));
