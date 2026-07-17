@@ -87,6 +87,29 @@ pub enum CriterionStationarityRow {
         bound: f64,
         covered_coordinates: usize,
     },
+    /// Stationary-at-asymptote (#2348): the interior (non-railed) coordinates
+    /// are gradient-stationary, and every railed coordinate is certified on a
+    /// confirmed exponential tail instead of a vanishing gradient.
+    /// `interior_projected_grad_norm` is compared against `bound`; `rails`
+    /// lists the coordinates certified by tail instead.
+    AsymptoteRail {
+        interior_projected_grad_norm: f64,
+        bound: f64,
+        rails: Vec<AsymptoteRailRow>,
+    },
+}
+
+/// One outer coordinate certified stationary-at-asymptote rather than by a
+/// vanishing gradient (plain-data mirror of
+/// `gam_solve::model_types::RailCoordinate`, kept independent so this crate
+/// stays decoupled from the solver's internal types).
+pub struct AsymptoteRailRow {
+    pub index: usize,
+    /// `true` when railing toward `λ → ∞`, `false` toward `λ → 0`.
+    pub upper: bool,
+    pub tail_constant: f64,
+    pub value_gap: f64,
+    pub estimand_travel_bound: f64,
 }
 
 impl CriterionStationarityRow {
@@ -108,6 +131,23 @@ impl CriterionStationarityRow {
             } => format!(
                 "fixed-point |r|\u{221e}={residual_inf_norm:.3e}, |Pr|\u{221e}={projected_residual_inf_norm:.3e} {relation} bound={bound:.3e}, coordinates={covered_coordinates}"
             ),
+            Self::AsymptoteRail {
+                interior_projected_grad_norm,
+                bound,
+                rails,
+            } => {
+                let rail_list = rails
+                    .iter()
+                    .map(|r| {
+                        let side = if r.upper { "\u{03bb}\u{2192}\u{221e}" } else { "\u{03bb}\u{2192}0" };
+                        format!("#{} ({side}, tail={:.3e})", r.index, r.tail_constant)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "stationary-at-asymptote: interior |Pg|={interior_projected_grad_norm:.3e} {relation} bound={bound:.3e}, rails=[{rail_list}]"
+                )
+            }
         }
     }
 }

@@ -487,7 +487,6 @@ pub(crate) fn fused_rank_deficient_matches_full_block_on_full_rank_penalty() {
 // reference to roundoff, and (4) the naive form's error is ≥100× larger (it is
 // in the cancellation regime). Fixtures: rank-deficient target, full-span ridge
 // overlap (the #2298 survival shape), and a coalesced same-span pair.
-#[cfg(test)]
 fn assert_weighted_fused_kernel_gate(
     h: &Array2<f64>,
     s_k_full: &[Array2<f64>],
@@ -600,7 +599,6 @@ fn assert_weighted_fused_kernel_gate(
     );
 }
 
-#[cfg(test)]
 fn second_difference_penalty(p: usize) -> Array2<f64> {
     // Sᵀ = D₂ᵀD₂ with D₂ the (p-2)×p second-difference operator: rank p-2,
     // null space = {constant, linear}.
@@ -613,7 +611,6 @@ fn second_difference_penalty(p: usize) -> Array2<f64> {
     d2.t().dot(&d2)
 }
 
-#[cfg(test)]
 fn small_data_hessian(p: usize) -> Array2<f64> {
     // Fixed well-conditioned SPD data-curvature floor.
     Array2::from_shape_fn((p, p), |(i, j)| {

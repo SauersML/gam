@@ -996,6 +996,25 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                     bound: *bound,
                     covered_coordinates: *covered_coordinates,
                 },
+                gam::model_types::OuterStationarityCertificate::AsymptoteRail {
+                    interior_projected_grad_norm,
+                    bound,
+                    rails,
+                } => report::CriterionStationarityRow::AsymptoteRail {
+                    interior_projected_grad_norm: *interior_projected_grad_norm,
+                    bound: *bound,
+                    rails: rails
+                        .iter()
+                        .map(|r| report::AsymptoteRailRow {
+                            index: r.index,
+                            upper: r.side
+                                == gam::solver::rho_optimizer::asymptote_certificate::AsymptoteSide::Upper,
+                            tail_constant: r.tail_constant,
+                            value_gap: r.value_gap,
+                            estimand_travel_bound: r.estimand_travel_bound,
+                        })
+                        .collect(),
+                },
             };
             report::CriterionCertificateRow {
                 stationarity,
