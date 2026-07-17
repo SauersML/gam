@@ -64,7 +64,8 @@
 //! Fisher block instead.
 
 use crate::custom_family::{
-    BlockwiseFitOptions, ParameterBlockState, PenaltyMatrix, fit_custom_family_with_rho_prior,
+    BlockwiseFitOptions, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    fit_custom_family_with_rho_prior,
 };
 use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use crate::fit_orchestration::{
@@ -2650,6 +2651,12 @@ pub fn fit_penalized_multinomial_formula(
         parametric_standardization,
         penalties_arc,
     } = penalized_multinomial_formula_parts(request)?;
+    let MultinomialFitRequest {
+        data,
+        formula,
+        config,
+        ..
+    } = *request;
     let m = family.active_classes();
     // ── Conditional Firth/Jeffreys engagement (#715 arm (b) / #753) ──────────
     // Attempt 1: the unbiased criterion (Jeffreys disarmed above). If the
