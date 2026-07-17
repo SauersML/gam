@@ -1662,7 +1662,7 @@ pub(crate) fn certify_outer_optimality(
         // bimodal at `rho_star`.
         obj.reset();
     }
-    let outcome = certify_outer_optimality_at_terminal_fidelity(obj, config, context, result);
+    let outcome = certify_outer_optimality_at_terminal_fidelity(obj, config, context, result, true);
     drop(terminal_cap_guard);
     outcome
 }
@@ -1672,6 +1672,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
     config: &OuterConfig,
     context: &str,
     result: &mut OuterResult,
+    allow_tail_snap: bool,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
     let capability = obj.capability();
     let layout = capability.theta_layout();
@@ -2237,6 +2238,68 @@ fn certify_outer_optimality_at_terminal_fidelity(
         }),
         lambdas_railed: certificate_railed.clone(),
     };
+    // Certify-time tail snap (#2348 Inc 2). About to refuse a point whose
+    // residual gradient is carried by un-railed coordinates crawling a
+    // CONFIRMED exponential tail toward the ρ-box (the one-e-fold-per-step
+    // grind: the loop budget can exhaust strictly inside the box, where the
+    // Inc 1 railed mint can never fire), snap those coordinates to their box
+    // bound and re-certify once. The recursive certification re-solves the
+    // inner problem at the snapped point and judges it with the FULL Inc 1
+    // rail discipline — this path grants nothing by itself. On a refused snap
+    // the checkpoint is restored and the ordinary refusal below proceeds.
+    if allow_tail_snap
+        && !certificate.certifies()
+        && grad_norm > stationarity_bound
+        && let Some(hessian) = analytic_hessian.as_ref()
+        && let Some(snapped) = try_tail_snap_to_rail(
+            obj,
+            &AsymptoteRailInputs {
+                rho: &result.rho,
+                projected_gradient: &projected_gradient,
+                railed: &certificate_railed,
+                hessian,
+                bounds: &bounds,
+                terminal_beta: terminal_beta.as_ref(),
+                stationarity_bound,
+                context,
+            },
+        )?
+    {
+        let original_rho = result.rho.clone();
+        // The run-recorded first-order evidence describes the PRE-snap point;
+        // the recursive certification must not consume it as a same-ρ second
+        // measurement for its gradient-reproducibility floor.
+        let saved_gradient = result.final_gradient.take();
+        result.final_value = f64::NAN;
+        log::info!(
+            "[CERTIFICATE] {context}: confirmed exponential tail on un-railed \
+             coordinate(s); snapping ρ {original_rho} → {snapped} and re-certifying \
+             at the rail (#2348 Inc 2)"
+        );
+        result.rho = snapped;
+        match certify_outer_optimality_at_terminal_fidelity(obj, config, context, result, false) {
+            Ok(snap_certificate) => return Ok(snap_certificate),
+            Err(snap_err) => {
+                log::info!(
+                    "[CERTIFICATE] {context}: snapped point refused \
+                     ({snap_err}); restoring the checkpoint and refusing at the \
+                     original point"
+                );
+                result.rho = original_rho;
+                result.final_value = evaluation.cost;
+                result.final_grad_norm = Some(projected_grad_norm);
+                result.final_gradient = saved_gradient;
+                // Best-effort restore of the inner state to the checkpoint; the
+                // refusal below is the verdict either way.
+                if let Err(restore_err) = obj.eval_cost(&result.rho) {
+                    log::warn!(
+                        "[CERTIFICATE] {context}: failed to restore the objective \
+                         to the checkpoint after a refused tail snap: {restore_err}"
+                    );
+                }
+            }
+        }
+    }
     // Install the measured evidence before deciding its verdict.  A rejected
     // candidate is retained only as a resumable checkpoint, and that
     // checkpoint must carry the actual analytic residual/curvature evidence
@@ -2392,6 +2455,144 @@ fn try_certify_asymptote_rail(
     }
 }
 
+/// Curvature-tie acceptance band for a certify-time tail-snap candidate
+/// (#2348 Inc 2). On the #2337 Thm 2.1 exponential tail `V = V_∞ + c·e^{∓ρ}`
+/// the coordinate's own curvature equals its gradient magnitude EXACTLY
+/// (`H_kk = c·e^{∓ρ} = |g_k|`, unit decay rate in ρ = log λ), so `H_kk/|g_k| ≈ 1`
+/// is a zero-cost analytic signature separating a live tail crawl from a
+/// genuinely unconverged curved coordinate before any probe is spent. The band
+/// tolerates the `O(e^{∓2ρ})` next-order term and assembly round-off; the
+/// probing confirmation is the rigorous gate.
+const TAIL_SNAP_CURVATURE_BAND: (f64, f64) = (0.25, 4.0);
+
+/// Certify-time tail snap (#2348 Inc 2): when certification is about to refuse
+/// a point whose gradient residual is carried entirely by coordinates crawling
+/// an exponential tail TOWARD the ρ-box (the one-e-fold-per-Newton-step grind
+/// the asymptote certificate exists to kill — the loop can exhaust its budget
+/// strictly inside the box, where the Inc 1 railed mint can never fire),
+/// positively confirm each such coordinate's tail from the current point and
+/// return the point with those coordinates snapped to their box bound. The
+/// caller re-certifies the snapped point, where `certificate_railed_lambdas`
+/// flags the coordinates and the Inc 1 rail mint takes over with its full
+/// probe/assess discipline.
+///
+/// Refusal semantics mirror [`try_certify_asymptote_rail`]: any gate failure
+/// returns `Ok(None)` (fall through to the ordinary refusal); the only `Err` is
+/// a genuinely broken objective that cannot restore its inner state after
+/// probing. Gates, in order of cost:
+/// 1. candidate coordinates = un-railed, `|g_k|` above the stationarity bound,
+///    positive own-curvature within [`TAIL_SNAP_CURVATURE_BAND`] of `|g_k|`
+///    (the tail-law tie), with the rail side read from the gradient sign;
+/// 2. every remaining interior coordinate is gradient-stationary and the
+///    interior Hessian sub-block (railed + candidates excluded) is PSD;
+/// 3. every candidate's tail is confirmed by the same probing engine the rail
+///    mint uses (`CertifiedAtAsymptote` or `OnTailNotYetEquivalent`; the final
+///    at-rail equivalence is re-judged by the Inc 1 mint after the snap).
+fn try_tail_snap_to_rail(
+    obj: &mut dyn OuterObjective,
+    inputs: &AsymptoteRailInputs<'_>,
+) -> Result<Option<Array1<f64>>, EstimationError> {
+    let rho = inputs.rho;
+    let gradient = inputs.projected_gradient;
+    let hessian = inputs.hessian;
+    let (lower, upper) = inputs.bounds;
+    let n = gradient.len();
+    if rho.len() != n || hessian.nrows() != n || hessian.ncols() != n || lower.len() < n || upper.len() < n
+    {
+        return Ok(None);
+    }
+
+    let mut candidates: Vec<(usize, AsymptoteSide)> = Vec::new();
+    for k in 0..n {
+        if inputs.railed.contains(&k) {
+            continue;
+        }
+        let g_k = gradient[k];
+        let side = match AsymptoteSide::from_gradient(g_k, inputs.stationarity_bound) {
+            Some(side) => side,
+            None => continue,
+        };
+        let h_kk = hessian[[k, k]];
+        if !(h_kk > 0.0) {
+            continue;
+        }
+        let ratio = h_kk / g_k.abs();
+        if !(TAIL_SNAP_CURVATURE_BAND.0..=TAIL_SNAP_CURVATURE_BAND.1).contains(&ratio) {
+            continue;
+        }
+        candidates.push((k, side));
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    // The residual must be EXPLAINED by the candidate tails: every other
+    // interior coordinate is stationary in its own right, and the curvature
+    // left after excluding the railed + candidate directions is admissible for
+    // a minimum. A still-descending or indefinite interior refuses before any
+    // probe is spent.
+    let interior_grad_norm = (0..n)
+        .filter(|k| !inputs.railed.contains(k) && !candidates.iter().any(|(c, _)| c == k))
+        .map(|k| gradient[k] * gradient[k])
+        .sum::<f64>()
+        .sqrt();
+    if !(interior_grad_norm <= inputs.stationarity_bound) {
+        return Ok(None);
+    }
+    let excluded: Vec<usize> = inputs
+        .railed
+        .iter()
+        .copied()
+        .chain(candidates.iter().map(|(k, _)| *k))
+        .collect();
+    if certificate_hessian_is_psd_off_railed(hessian, &excluded) != Some(true) {
+        return Ok(None);
+    }
+
+    let beta_norm = inputs
+        .terminal_beta
+        .map(|b| b.dot(b).sqrt())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0);
+    let tol = AsymptoteTolerances::exp4_rail_bands(ASYMPTOTE_ESTIMAND_REL_TOL * (1.0 + beta_norm));
+    let mut confirmed_all = true;
+    for (k, side) in &candidates {
+        let confirmed = match probe_tail_window(obj, rho, *k, *side, &tol)? {
+            Some(window) => matches!(
+                assess_coordinate(&window, &tol),
+                AsymptoteVerdict::CertifiedAtAsymptote { .. }
+                    | AsymptoteVerdict::OnTailNotYetEquivalent { .. }
+            ),
+            None => false,
+        };
+        if !confirmed {
+            confirmed_all = false;
+            break;
+        }
+    }
+    if !confirmed_all {
+        // The probes warm-started the inner solve away from the checkpoint;
+        // restore it before the caller falls through to the ordinary refusal.
+        obj.eval_cost(rho).map_err(|err| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "{}: failed to restore the objective to the certified point after \
+                 tail-snap probing: {err}",
+                inputs.context
+            ))
+        })?;
+        return Ok(None);
+    }
+
+    let mut snapped = rho.clone();
+    for (k, side) in &candidates {
+        snapped[*k] = match side {
+            AsymptoteSide::Upper => upper[*k],
+            AsymptoteSide::Lower => lower[*k],
+        };
+    }
+    Ok(Some(snapped))
+}
+
 /// Reconstruct one railed coordinate's exponential tail by probing the analytic
 /// gradient a fixed number of e-folds back from the rail, locate the longest
 /// finite-difference-clean run (rejecting the noise floor adjacent to the rail),
@@ -2404,6 +2605,41 @@ fn build_and_assess_rail_coordinate(
     side: AsymptoteSide,
     tol: &AsymptoteTolerances,
 ) -> Result<Option<RailCoordinate>, EstimationError> {
+    let window = match probe_tail_window(obj, rho, coord, side, tol)? {
+        Some(window) => window,
+        None => return Ok(None),
+    };
+    match assess_coordinate(&window, tol) {
+        AsymptoteVerdict::CertifiedAtAsymptote {
+            side,
+            tail_constant,
+            value_gap,
+            estimand_travel_bound,
+        } => Ok(Some(RailCoordinate {
+            index: coord,
+            side,
+            tail_constant,
+            value_gap,
+            estimand_travel_bound,
+            noise_margin: tol.tail_noise_floor,
+        })),
+        _ => Ok(None),
+    }
+}
+
+/// Probe one coordinate's tail by stepping the analytic gradient a fixed number
+/// of e-folds from `rho[coord]` toward the interior (the shared probing engine of
+/// [`build_and_assess_rail_coordinate`] and the certify-time tail snap), locate
+/// the longest finite-difference-clean constant-`ĉ` run, and return it as an
+/// assessment window (newest sample nearest `rho[coord]`). `None` when no clean
+/// run of at least [`MIN_TAIL_SAMPLES`] rows exists.
+fn probe_tail_window(
+    obj: &mut dyn OuterObjective,
+    rho: &Array1<f64>,
+    coord: usize,
+    side: AsymptoteSide,
+    tol: &AsymptoteTolerances,
+) -> Result<Option<AsymptoteWindow>, EstimationError> {
     const PROBE_DELTA: f64 = 1.0;
     // Upper rail (ρ → +∞): step ρ DOWN into the tail. Lower rail: step UP.
     let sign = match side {
@@ -2495,22 +2731,7 @@ fn build_and_assess_rail_coordinate(
         });
     }
 
-    match assess_coordinate(&window, tol) {
-        AsymptoteVerdict::CertifiedAtAsymptote {
-            side,
-            tail_constant,
-            value_gap,
-            estimand_travel_bound,
-        } => Ok(Some(RailCoordinate {
-            index: coord,
-            side,
-            tail_constant,
-            value_gap,
-            estimand_travel_bound,
-            noise_margin: tol.tail_noise_floor,
-        })),
-        _ => Ok(None),
-    }
+    Ok(Some(window))
 }
 
 /// Whether a run of pencil constants holds constant within the relative drift
