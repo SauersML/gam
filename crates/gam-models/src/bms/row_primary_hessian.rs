@@ -5722,6 +5722,23 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_aa_mixed = [0.0];
         let mut f_au_mixed = vec![0.0; r];
         let mut f_uv_mixed = vec![0.0; r * r];
+        // Intercept a-chain moments (#2347). The calibrated intercept a(theta)
+        // moves with every primary direction, so the explicit (a-fixed)
+        // directional/mixed calibration moments above must be promoted to TOTAL
+        // directional derivatives in the finalizer. Order-3 a-derivatives of the
+        // second-order moments (for a_uv_dir):
+        //   f_aaa = d^3 M/da^3, f_aau[p] = d^3 M/da^2 dp, f_auv[l,r] = d^3 M/da dl dr.
+        // Order-4 a-derivatives (for the mixed a_uv_mixed):
+        //   f_aaaa = d^4 M/da^4, f_aaau[p] = d^4 M/da^3 dp,
+        //   f_aauv[l,r] = d^4 M/da^2 dl dr, and f_auv_dir[d][l,r] =
+        //   d^4 M/da dl dr d(dir_d) (the explicit directional of f_auv).
+        let mut f_aaa = 0.0;
+        let mut f_aau = Array1::<f64>::zeros(r);
+        let mut f_auv = Array2::<f64>::zeros((r, r));
+        let mut f_aaaa = 0.0;
+        let mut f_aaau = Array1::<f64>::zeros(r);
+        let mut f_aauv = Array2::<f64>::zeros((r, r));
+        let mut f_auv_dir = vec![0.0; directions.len() * r * r];
 
         let owned_cells;
         let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
@@ -5769,6 +5786,11 @@ impl BernoulliMarginalSlopeFamily {
             let dc_daa = scale_coeff4(dc_daa_raw, scale);
             let dc_dab = scale_coeff4(dc_dab_raw, scale);
             let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
+            // `denested_third.0 = dc_daaa = d^3 coeff/da^3`; the intercept
+            // a-chain moments need it (and d^4 coeff/da^4 vanishes: the coeff is
+            // cubic in the intercept shift).
+            let dc_daaa = scale_coeff4(denested_third.0, scale);
+            let dc_daaaa = [0.0; 4];
             let dc_daab = scale_coeff4(denested_third.1, scale);
             let dc_dabb = scale_coeff4(denested_third.2, scale);
             let dc_dbbb = scale_coeff4(denested_third.3, scale);
@@ -5915,6 +5937,109 @@ impl BernoulliMarginalSlopeFamily {
                 },
             )?;
 
+            // Direction-independent intercept a-chain moments (#2347): the a-th
+            // derivatives of the second-order calibration moments, needed to
+            // promote the directional/mixed moments to TOTAL derivatives through
+            // the moving intercept root. Same cell moments, with the intercept
+            // coefficient jet (dc_da / dc_daa / dc_daaa) in the extra slots.
+            f_aaa += exact::cell_third_derivative_from_moments(
+                cell, &dc_da, &dc_da, &dc_da, &dc_daa, &dc_daa, &dc_daa, &dc_daaa, &state.moments,
+            )?;
+            f_aaaa += exact::cell_fourth_derivative_from_moments(
+                cell, &dc_da, &dc_da, &dc_da, &dc_da, &dc_daa, &dc_daa, &dc_daa, &dc_daa, &dc_daa,
+                &dc_daa, &dc_daaa, &dc_daaa, &dc_daaa, &dc_daaa, &dc_daaaa, &state.moments,
+            )?;
+            for primary in 1..r {
+                f_aau[primary] += exact::cell_third_derivative_from_moments(
+                    cell,
+                    &dc_da,
+                    &dc_da,
+                    &coeff_jet.first[primary],
+                    &dc_daa,
+                    &coeff_jet.a_first[primary],
+                    &coeff_jet.a_first[primary],
+                    &coeff_jet.aa_first[primary],
+                    &state.moments,
+                )?;
+                f_aaau[primary] += exact::cell_fourth_derivative_from_moments(
+                    cell,
+                    &dc_da,
+                    &dc_da,
+                    &dc_da,
+                    &coeff_jet.first[primary],
+                    &dc_daa,
+                    &dc_daa,
+                    &coeff_jet.a_first[primary],
+                    &dc_daa,
+                    &coeff_jet.a_first[primary],
+                    &coeff_jet.a_first[primary],
+                    &dc_daaa,
+                    &coeff_jet.aa_first[primary],
+                    &coeff_jet.aa_first[primary],
+                    &coeff_jet.aa_first[primary],
+                    &coeff_jet.aaa_first[primary],
+                    &state.moments,
+                )?;
+            }
+            for left in 1..r {
+                for right in left..r {
+                    let second_lr = coeff_jet.pair_from_b_family(
+                        coeff_jet.b_first,
+                        left,
+                        right,
+                        COEFF_SUPPORT_BHW,
+                    );
+                    let third_alr = coeff_jet.pair_from_b_family(
+                        coeff_jet.ab_first,
+                        left,
+                        right,
+                        COEFF_SUPPORT_BW,
+                    );
+                    let fourth_aalr = coeff_jet.pair_from_b_family(
+                        coeff_jet.aab_first,
+                        left,
+                        right,
+                        COEFF_SUPPORT_W,
+                    );
+                    let auv = exact::cell_third_derivative_from_moments(
+                        cell,
+                        &dc_da,
+                        &coeff_jet.first[left],
+                        &coeff_jet.first[right],
+                        &coeff_jet.a_first[left],
+                        &coeff_jet.a_first[right],
+                        &second_lr,
+                        &third_alr,
+                        &state.moments,
+                    )?;
+                    let aauv = exact::cell_fourth_derivative_from_moments(
+                        cell,
+                        &dc_da,
+                        &dc_da,
+                        &coeff_jet.first[left],
+                        &coeff_jet.first[right],
+                        &dc_daa,
+                        &coeff_jet.a_first[left],
+                        &coeff_jet.a_first[right],
+                        &coeff_jet.a_first[left],
+                        &coeff_jet.a_first[right],
+                        &second_lr,
+                        &coeff_jet.aa_first[left],
+                        &coeff_jet.aa_first[right],
+                        &third_alr,
+                        &third_alr,
+                        &fourth_aalr,
+                        &state.moments,
+                    )?;
+                    f_auv[[left, right]] += auv;
+                    f_aauv[[left, right]] += aauv;
+                    if left != right {
+                        f_auv[[right, left]] += auv;
+                        f_aauv[[right, left]] += aauv;
+                    }
+                }
+            }
+
             let mut coeff_dirs = [[0.0; 4]; 2];
             let mut coeff_a_dirs = [[0.0; 4]; 2];
             let mut coeff_aa_dirs = [[0.0; 4]; 2];
@@ -6039,6 +6164,72 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(())
                 },
             )?;
+
+            // f_auv_dir[d][l,r] = d^4 M/da dl dr d(dir_d): the explicit
+            // directional derivative of f_auv, i.e. the a-chain contribution to
+            // the mixed f_uv total. Same shape as f_uv_dir but with the intercept
+            // occupying one derivative slot. `d^4 eta/da dl dr d(dir)` is
+            // `pair_directional_from_bb_family(abb_first, ..)` (the a-prefixed
+            // analogue of the l,r,dir third coefficient). Reuses the directional
+            // coefficient jets built by the order-3 block above.
+            for direction in 0..directions.len() {
+                let dir = directions[direction];
+                let vector_base = direction * r;
+                let matrix_base = direction * r * r;
+                for left in 1..r {
+                    for right in left..r {
+                        let second_lr = coeff_jet.pair_from_b_family(
+                            coeff_jet.b_first,
+                            left,
+                            right,
+                            COEFF_SUPPORT_BHW,
+                        );
+                        let third_alr = coeff_jet.pair_from_b_family(
+                            coeff_jet.ab_first,
+                            left,
+                            right,
+                            COEFF_SUPPORT_BW,
+                        );
+                        let third_lrd = coeff_jet.pair_directional_from_bb_family(
+                            coeff_jet.bb_first,
+                            left,
+                            right,
+                            dir,
+                            COEFF_SUPPORT_BW,
+                        );
+                        let fourth_alrd = coeff_jet.pair_directional_from_bb_family(
+                            coeff_jet.abb_first,
+                            left,
+                            right,
+                            dir,
+                            COEFF_SUPPORT_W,
+                        );
+                        let value = exact::cell_fourth_derivative_from_moments(
+                            cell,
+                            &dc_da,
+                            &coeff_jet.first[left],
+                            &coeff_jet.first[right],
+                            &coeff_dirs[direction],
+                            &coeff_jet.a_first[left],
+                            &coeff_jet.a_first[right],
+                            &coeff_a_dirs[direction],
+                            &second_lr,
+                            &coeff_u_dirs[vector_base + left],
+                            &coeff_u_dirs[vector_base + right],
+                            &third_alr,
+                            &coeff_au_dirs[vector_base + left],
+                            &coeff_au_dirs[vector_base + right],
+                            &third_lrd,
+                            &fourth_alrd,
+                            &state.moments,
+                        )?;
+                        f_auv_dir[matrix_base + left * r + right] += value;
+                        if left != right {
+                            f_auv_dir[matrix_base + right * r + left] += value;
+                        }
+                    }
+                }
+            }
 
             let mut coeff_dir_mixed = [0.0; 4];
             let mut coeff_a_dir_mixed = [0.0; 4];
@@ -6484,17 +6675,27 @@ impl BernoulliMarginalSlopeFamily {
                         } => {
                             let vector_base = direction * r;
                             let matrix_base = direction * r * r;
-                            let numerator = f_uv_dir[matrix_base + left * r + right]
-                                + f_au_dir[vector_base + left] * a_u[right]
+                            // Promote the explicit directional moments to TOTAL
+                            // derivatives through the moving intercept root (#2347):
+                            // d/d_dir f = f_dir_explicit + (df/da)*a_dir.
+                            let a_dir = a_dirs[direction];
+                            let f_uv_dir_total =
+                                f_uv_dir[matrix_base + left * r + right] + f_auv[[left, right]] * a_dir;
+                            let f_au_dir_left = f_au_dir[vector_base + left] + f_aau[left] * a_dir;
+                            let f_au_dir_right = f_au_dir[vector_base + right] + f_aau[right] * a_dir;
+                            let f_aa_dir_total = f_aa_dir[direction] + f_aaa * a_dir;
+                            let f_a_dir_total = f_a_dir[direction] + f_aa * a_dir;
+                            let numerator = f_uv_dir_total
+                                + f_au_dir_left * a_u[right]
                                 + f_au[left] * a_u_dirs[direction][right]
-                                + f_au_dir[vector_base + right] * a_u[left]
+                                + f_au_dir_right * a_u[left]
                                 + f_au[right] * a_u_dirs[direction][left]
-                                + f_aa_dir[direction] * a_u[left] * a_u[right]
+                                + f_aa_dir_total * a_u[left] * a_u[right]
                                 + f_aa
                                     * (a_u_dirs[direction][left] * a_u[right]
                                         + a_u[left] * a_u_dirs[direction][right]);
                             let value =
-                                -(numerator + f_a_dir[direction] * a_uv[[left, right]]) * inv_f_a;
+                                -(numerator + f_a_dir_total * a_uv[[left, right]]) * inv_f_a;
                             a_uv_dirs[direction][[left, right]] = value;
                             a_uv_dirs[direction][[right, left]] = value;
                         }
@@ -6596,24 +6797,76 @@ impl BernoulliMarginalSlopeFamily {
                     }
                     BmsFlexRowOrder4FinalizerNode::ImplicitMixedSecond { pair, left, right } => {
                         let (left_direction, right_direction) = direction_pairs[pair];
+                        let left_dir = directions[left_direction];
+                        let right_dir = directions[right_direction];
                         let left_vector_base = left_direction * r;
                         let right_vector_base = right_direction * r;
                         let mixed_vector_base = pair * r;
                         let mixed_matrix_base = pair * r * r;
-                        let numerator = f_uv_mixed[mixed_matrix_base + left * r + right]
-                            + f_au_mixed[mixed_vector_base + left] * a_u[right]
-                            + f_au_dir[left_vector_base + left] * a_u_dirs[right_direction][right]
-                            + f_au_dir[right_vector_base + left] * a_u_dirs[left_direction][right]
+                        let a_l = a_dirs[left_direction];
+                        let a_r = a_dirs[right_direction];
+                        let a_dir_mixed = a_u_dirs[left_direction].dot(right_dir);
+
+                        // Promote every explicit calibration moment to its TOTAL
+                        // directional derivative through the moving intercept root
+                        // (#2347). Order-3 totals: D_X f = f_dir[X] + (df/da)*a_X.
+                        let f_a_dir_l = f_a_dir[left_direction] + f_aa * a_l;
+                        let f_a_dir_r = f_a_dir[right_direction] + f_aa * a_r;
+                        let f_aa_dir_l = f_aa_dir[left_direction] + f_aaa * a_l;
+                        let f_aa_dir_r = f_aa_dir[right_direction] + f_aaa * a_r;
+                        let f_au_dir_l_left =
+                            f_au_dir[left_vector_base + left] + f_aau[left] * a_l;
+                        let f_au_dir_r_left =
+                            f_au_dir[right_vector_base + left] + f_aau[left] * a_r;
+                        let f_au_dir_l_right =
+                            f_au_dir[left_vector_base + right] + f_aau[right] * a_l;
+                        let f_au_dir_r_right =
+                            f_au_dir[right_vector_base + right] + f_aau[right] * a_r;
+                        // Order-4 totals: D_L D_R f = f_mixed
+                        //   + (d f_dir_expl[L]/da)*a_R + (d f_dir_expl[R]/da)*a_L
+                        //   + (d^2 f/da^2)*a_L*a_R + (df/da)*a_dir_mixed.
+                        // The (d f_dir_expl[X]/da) factors are the EXPLICIT
+                        // directional of the a-derivative moment.
+                        let f_a_mixed_total = f_a_mixed[pair]
+                            + f_aa_dir[left_direction] * a_r
+                            + f_aa_dir[right_direction] * a_l
+                            + f_aaa * a_l * a_r
+                            + f_aa * a_dir_mixed;
+                        let f_aa_mixed_total = f_aa_mixed[pair]
+                            + f_aaau.dot(left_dir) * a_r
+                            + f_aaau.dot(right_dir) * a_l
+                            + f_aaaa * a_l * a_r
+                            + f_aaa * a_dir_mixed;
+                        let f_au_mixed_left = f_au_mixed[mixed_vector_base + left]
+                            + f_aauv.row(left).dot(left_dir) * a_r
+                            + f_aauv.row(left).dot(right_dir) * a_l
+                            + f_aaau[left] * a_l * a_r
+                            + f_aau[left] * a_dir_mixed;
+                        let f_au_mixed_right = f_au_mixed[mixed_vector_base + right]
+                            + f_aauv.row(right).dot(left_dir) * a_r
+                            + f_aauv.row(right).dot(right_dir) * a_l
+                            + f_aaau[right] * a_l * a_r
+                            + f_aau[right] * a_dir_mixed;
+                        let f_uv_mixed_total = f_uv_mixed[mixed_matrix_base + left * r + right]
+                            + f_auv_dir[left_direction * r * r + left * r + right] * a_r
+                            + f_auv_dir[right_direction * r * r + left * r + right] * a_l
+                            + f_aauv[[left, right]] * a_l * a_r
+                            + f_auv[[left, right]] * a_dir_mixed;
+
+                        let numerator = f_uv_mixed_total
+                            + f_au_mixed_left * a_u[right]
+                            + f_au_dir_l_left * a_u_dirs[right_direction][right]
+                            + f_au_dir_r_left * a_u_dirs[left_direction][right]
                             + f_au[left] * a_u_mixed[pair][right]
-                            + f_au_mixed[mixed_vector_base + right] * a_u[left]
-                            + f_au_dir[left_vector_base + right] * a_u_dirs[right_direction][left]
-                            + f_au_dir[right_vector_base + right] * a_u_dirs[left_direction][left]
+                            + f_au_mixed_right * a_u[left]
+                            + f_au_dir_l_right * a_u_dirs[right_direction][left]
+                            + f_au_dir_r_right * a_u_dirs[left_direction][left]
                             + f_au[right] * a_u_mixed[pair][left]
-                            + f_aa_mixed[pair] * a_u[left] * a_u[right]
-                            + f_aa_dir[left_direction]
+                            + f_aa_mixed_total * a_u[left] * a_u[right]
+                            + f_aa_dir_l
                                 * (a_u_dirs[right_direction][left] * a_u[right]
                                     + a_u[left] * a_u_dirs[right_direction][right])
-                            + f_aa_dir[right_direction]
+                            + f_aa_dir_r
                                 * (a_u_dirs[left_direction][left] * a_u[right]
                                     + a_u[left] * a_u_dirs[left_direction][right])
                             + f_aa
@@ -6624,9 +6877,9 @@ impl BernoulliMarginalSlopeFamily {
                                         * a_u_dirs[left_direction][right]
                                     + a_u[left] * a_u_mixed[pair][right]);
                         let value = -(numerator
-                            + f_a_dir[right_direction] * a_uv_dirs[left_direction][[left, right]]
-                            + f_a_dir[left_direction] * a_uv_dirs[right_direction][[left, right]]
-                            + f_a_mixed[pair] * a_uv[[left, right]])
+                            + f_a_dir_r * a_uv_dirs[left_direction][[left, right]]
+                            + f_a_dir_l * a_uv_dirs[right_direction][[left, right]]
+                            + f_a_mixed_total * a_uv[[left, right]])
                             * inv_f_a;
                         a_uv_mixed[pair][[left, right]] = value;
                         a_uv_mixed[pair][[right, left]] = value;

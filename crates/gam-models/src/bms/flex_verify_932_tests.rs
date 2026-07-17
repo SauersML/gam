@@ -854,6 +854,98 @@ fn standard_normal_flex_canonical_derivative_ladder_matches_vgh_t3_t4_932() {
     );
 }
 
+/// #2347 t3→t4 diagnostic: dump the top t3→t4 gaps and Richardson-check the
+/// worst entry at two FD steps. If the gap scales like O(step²) it is FD
+/// truncation of the (correct) analytic fourth; if it plateaus it is a genuine
+/// residual in `row_primary_fourth_contracted_ordered`. Diagnostic only.
+#[test]
+fn zz_measure_2347_t4_richardson() {
+    let row = 0usize;
+    let (family, states) = standard_normal_flex_fixture();
+    let cache = family
+        .build_exact_eval_cache(&states)
+        .expect("base StandardNormal FLEX exact cache");
+    let primary = cache.primary.clone();
+    let h_range = primary.h.as_ref().expect("active score-warp range").clone();
+    let w_range = primary
+        .w
+        .as_ref()
+        .expect("active link-deviation range")
+        .clone();
+    let mut direction = Array1::<f64>::zeros(primary.total);
+    direction[primary.q] = 0.55;
+    direction[primary.logslope] = -0.35;
+    direction[h_range.start] = 0.45;
+    direction[w_range.start] = -0.40;
+
+    let base = standard_normal_flex_channels(&family, &states, &cache, row, &direction, true);
+    let fourth = base.fourth.as_ref().expect("t4 channel");
+    let classify = |idx: usize| -> String {
+        if idx == primary.q {
+            "q".to_string()
+        } else if idx == primary.logslope {
+            "logslope".to_string()
+        } else if h_range.contains(&idx) {
+            format!("h{}", idx - h_range.start)
+        } else if w_range.contains(&idx) {
+            format!("w{}", idx - w_range.start)
+        } else {
+            format!("?{idx}")
+        }
+    };
+
+    let fourth_fd_at = |step: f64| -> Array2<f64> {
+        let plus_states =
+            perturb_standard_normal_flex_states(&states, &primary, row, &direction, step);
+        let minus_states =
+            perturb_standard_normal_flex_states(&states, &primary, row, &direction, -step);
+        let plus_cache = family.build_exact_eval_cache(&plus_states).expect("plus cache");
+        let minus_cache = family
+            .build_exact_eval_cache(&minus_states)
+            .expect("minus cache");
+        let plus =
+            standard_normal_flex_channels(&family, &plus_states, &plus_cache, row, &direction, false);
+        let minus = standard_normal_flex_channels(
+            &family,
+            &minus_states,
+            &minus_cache,
+            row,
+            &direction,
+            false,
+        );
+        let mut fd = Array2::<f64>::zeros((primary.total, primary.total));
+        for u in 0..primary.total {
+            for v in 0..primary.total {
+                fd[[u, v]] = (plus.third[[u, v]] - minus.third[[u, v]]) / (2.0 * step);
+            }
+        }
+        fd
+    };
+
+    let steps = [2.0e-4_f64, 1.0e-4, 5.0e-5];
+    let fds: Vec<Array2<f64>> = steps.iter().map(|&s| fourth_fd_at(s)).collect();
+    let mut rows: Vec<(f64, usize, usize)> = Vec::new();
+    for u in 0..primary.total {
+        for v in 0..primary.total {
+            let err = derivative_ladder_relative_error(fourth[[u, v]], fds[0][[u, v]]);
+            rows.push((err, u, v));
+        }
+    }
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    eprintln!("#2347 t4 top gaps (err | [block(u),block(v)] | analytic | fd@steps):");
+    for &(err, u, v) in rows.iter().take(12) {
+        eprintln!(
+            "#2347   {err:.3e} | [{}({u}),{}({v})] | a={:+.6e} | fd={:+.6e},{:+.6e},{:+.6e}",
+            classify(u),
+            classify(v),
+            fourth[[u, v]],
+            fds[0][[u, v]],
+            fds[1][[u, v]],
+            fds[2][[u, v]],
+        );
+    }
+}
+
 /// #2347 channel-isolation measurement: run the H→t3 ladder with PURE
 /// directions, one primary channel at a time. The mixed-direction gap smears a
 /// single corrupt direction-channel across every (u,v) entry (the contraction
