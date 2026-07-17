@@ -1420,15 +1420,37 @@ mod parity_tests {
                 }
             }
         }
+        // #2344 equivariant per-class penalty, RE-DERIVED independently of the
+        // engine's metric assembly (Σ_c λ_c·γ_cᵀSγ_c on the centered class
+        // functions, γ_c = β_c − β̄ with β_ref ≡ 0) so the FD parity witness
+        // still checks the production algebra against a second formulation.
+        let kf = k as f64;
         let mut pen = 0.0_f64;
+        let mut beta_bar = vec![0.0_f64; p];
         for a in 0..m {
-            let la = lambdas[a];
             for i in 0..p {
-                let mut sbi = 0.0_f64;
-                for j in 0..p {
-                    sbi += penalty[[i, j]] * beta[[j, a]];
+                beta_bar[i] += beta[[i, a]] / kf;
+            }
+        }
+        for c in 0..k {
+            let lc = lambdas[c];
+            if lc == 0.0 {
+                continue;
+            }
+            // γ_c[i] = β_c[i] − β̄[i]; the reference class has β_ref ≡ 0.
+            let gamma_i = |i: usize| -> f64 {
+                if c < m {
+                    beta[[i, c]] - beta_bar[i]
+                } else {
+                    -beta_bar[i]
                 }
-                pen += 0.5 * la * beta[[i, a]] * sbi;
+            };
+            for i in 0..p {
+                let mut s_gamma_i = 0.0_f64;
+                for j in 0..p {
+                    s_gamma_i += penalty[[i, j]] * gamma_i(j);
+                }
+                pen += 0.5 * lc * gamma_i(i) * s_gamma_i;
             }
         }
         -ll + pen
@@ -1491,7 +1513,9 @@ mod parity_tests {
             y[[i, (i * 3 + 1) % k]] = 1.0;
         }
         let penalty = Array2::<f64>::eye(p);
-        let lambdas = Array1::from(vec![0.5_f64, 1.0, 2.0]);
+        // #2344: K per-class lambdas (reference class included), heterogeneous
+        // so the equivariant metric's off-diagonal coupling is exercised.
+        let lambdas = Array1::from(vec![0.5_f64, 1.0, 2.0, 0.8]);
         (design, y, penalty, lambdas)
     }
 
@@ -1685,7 +1709,8 @@ mod parity_tests {
         // unregularized — exactly the rank-deficient regime that triggered #557.
         let mut penalty = Array2::<f64>::zeros((p, p));
         penalty[[3, 3]] = 1.0;
-        let lambdas = Array1::from(vec![1.0e-10_f64, 1.0e-10, 1.0e-10]);
+        // #2344: K per-class lambdas (reference class included).
+        let lambdas = Array1::from(vec![1.0e-10_f64, 1.0e-10, 1.0e-10, 1.0e-10]);
 
         let fit = fit_penalized_multinomial(MultinomialFitInputs {
             design: design.view(),
