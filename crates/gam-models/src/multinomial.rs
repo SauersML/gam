@@ -2294,7 +2294,6 @@ pub(crate) struct PenalizedMultinomialFormulaParts {
     pub(crate) spec: TermCollectionSpec,
     pub(crate) design: TermCollectionDesign,
     pub(crate) class_levels: Vec<String>,
-    pub(crate) y_one_hot: Array2<f64>,
     pub(crate) parametric_standardization: Vec<(usize, f64, f64)>,
     pub(crate) penalties_arc: Arc<Vec<PenaltyMatrix>>,
 }
@@ -2631,7 +2630,6 @@ pub(crate) fn penalized_multinomial_formula_parts(
         spec,
         design,
         class_levels,
-        y_one_hot,
         parametric_standardization,
         penalties_arc,
     })
@@ -2647,7 +2645,6 @@ pub fn fit_penalized_multinomial_formula(
         spec,
         design,
         class_levels,
-        y_one_hot,
         parametric_standardization,
         penalties_arc,
     } = penalized_multinomial_formula_parts(request)?;

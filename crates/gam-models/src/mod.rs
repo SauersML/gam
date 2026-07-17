@@ -94,7 +94,7 @@ pub mod marginal_slope_shared;
 pub mod multinomial;
 pub mod multinomial_posterior;
 pub(crate) mod multinomial_reml;
-pub use multinomial_reml::MultinomialLogitRowProgram;
+pub use multinomial_reml::{MultinomialFamily, MultinomialLogitRowProgram};
 pub mod outer_subsample;
 pub mod parameter_block;
 pub mod penalized_vector_glm;
