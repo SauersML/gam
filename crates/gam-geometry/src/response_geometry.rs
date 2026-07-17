@@ -343,11 +343,20 @@ impl ResponseManifold {
             Self::Poincare { curvature, .. } => {
                 crate::manifolds::poincare::log_map(base, value, *curvature)
             }
-            // ConstantCurvature implements RiemannianManifold::log_map directly.
-            Self::ConstantCurvature { .. }
-            | Self::Spd { .. }
-            | Self::Grassmann { .. }
-            | Self::Stiefel { .. } => self
+            // #2351: the constant-curvature response chart identifies its
+            // origin with the base point, so the logarithm evaluates in the
+            // base-centred frame: log_0(value − base). At the origin the
+            // Möbius denominator is identically 1, killing the off-origin
+            // κ>0 antipodal singularity that crashed prediction for
+            // ordinary sphere-patch data. This matches the criterion, which
+            // scores the same centred coordinates.
+            Self::ConstantCurvature { dim, kappa } => {
+                let chart = ConstantCurvature::new(*dim, *kappa);
+                let origin = Array1::<f64>::zeros(*dim);
+                let centred = &value.to_owned() - &base;
+                chart.log_map(origin.view(), centred.view())
+            }
+            Self::Spd { .. } | Self::Grassmann { .. } | Self::Stiefel { .. } => self
                 .riemannian()
                 .expect("riemannian response manifold")
                 .log_map(base, value),
@@ -364,10 +373,15 @@ impl ResponseManifold {
             Self::Poincare { curvature, .. } => {
                 crate::manifolds::poincare::exp_map(base, tangent, *curvature)
             }
-            Self::ConstantCurvature { .. }
-            | Self::Spd { .. }
-            | Self::Grassmann { .. }
-            | Self::Stiefel { .. } => self
+            // #2351: exact inverse of the centred logarithm above —
+            // exp_0(tangent) + base. Round-trips exactly with log_point.
+            Self::ConstantCurvature { dim, kappa } => {
+                let chart = ConstantCurvature::new(*dim, *kappa);
+                let origin = Array1::<f64>::zeros(*dim);
+                let centred = chart.exp_map(origin.view(), tangent)?;
+                Ok(centred + &base)
+            }
+            Self::Spd { .. } | Self::Grassmann { .. } | Self::Stiefel { .. } => self
                 .riemannian()
                 .expect("riemannian response manifold")
                 .exp_map(base, tangent),
@@ -683,8 +697,40 @@ pub fn dispatch_log_map(
     let manifold = ResponseManifold::parse(label, values.ncols())?;
     let base_point = match base {
         Some(b) => b.to_owned(),
-        None => response_frechet_mean(manifold, values, weights, 1.0e-12, 256)
-            .map_err(|err| err.to_string())?,
+        // #2351: the constant-curvature chart identifies its origin with the
+        // FLAT centroid — the same κ-independent base the curvature criterion
+        // profiled — so the default base here must be that centroid, not the
+        // Karcher mean (which re-entangles the base with the chart scale and
+        // diverges from the point the fit's κ̂ was estimated around).
+        None => match manifold {
+            ResponseManifold::ConstantCurvature { dim, .. } => {
+                let (n_rows, _) = values.dim();
+                if n_rows == 0 {
+                    return Err(
+                        "constant-curvature log map requires at least one response row".into(),
+                    );
+                }
+                let mut centroid = Array1::<f64>::zeros(dim);
+                match weights {
+                    Some(w) => {
+                        let normalized = crate::normalize_weights(n_rows, Some(w))
+                            .map_err(|_| "constant-curvature log map has invalid weights")?;
+                        for (row, &wi) in values.outer_iter().zip(normalized.iter()) {
+                            centroid.scaled_add(wi, &row);
+                        }
+                    }
+                    None => {
+                        for row in values.outer_iter() {
+                            centroid += &row;
+                        }
+                        centroid.mapv_inplace(|v| v / n_rows as f64);
+                    }
+                }
+                centroid
+            }
+            _ => response_frechet_mean(manifold, values, weights, 1.0e-12, 256)
+                .map_err(|err| err.to_string())?,
+        },
     };
     let tangent = response_log_map(manifold, values, base_point.view())?;
     Ok((tangent, base_point, manifold.canonical_label()))
@@ -1064,10 +1110,19 @@ pub struct ResponseCurvatureFit {
     /// conjugate radius of their geodesic spread (the cloud fills the sphere).
     /// In that case κ̂ / the CI upper end are NOT a resolved point estimate but a
     /// HONEST "curvature exceeds chart-resolvable range at this scale" flag — the
-    /// caller must report it as such and never as a silent `κ̂ = ci_hi`. The
-    /// hyperbolic side cannot rail this way (κ < 0 has no conjugate radius), so a
-    /// rail here always means strongly spherical relative to the spread.
+    /// caller must report it as such and never as a silent `κ̂ = ci_hi`.
     pub railed_at_resolution_limit: bool,
+    /// Twin of [`railed_at_resolution_limit`](Self::railed_at_resolution_limit)
+    /// for the HYPERBOLIC side (#2351): `true` when the κ̂ search converged ONTO
+    /// the lower chart-domain bound — the criterion is still improving as κ
+    /// decreases at the limit where the cloud fills the hyperbolic ball of its
+    /// own spread (the mean-centred chart-validity edge `1 + κ‖z_max‖² → 0⁺`,
+    /// where the conformal restoring force diverges linearly and beats the
+    /// log-log dispersion term, so the criterion genuinely runs away). κ̂ is
+    /// then an UPPER bound on κ, not a resolved point estimate; the caller must
+    /// report "curvature exceeds the chart-resolvable hyperbolic range at this
+    /// scale" and never quote a confident hyperbolic verdict off the rail.
+    pub railed_at_hyperbolic_resolution_limit: bool,
     /// `true` only when the SIGN of κ̂ is statistically resolved — i.e. the
     /// profile-likelihood CI excludes 0 (`profile_ci.verdict ≠ Flat`).
     ///
@@ -1130,15 +1185,14 @@ pub struct ResponseCurvatureFit {
 /// maximally curved relative to its spread" sentinel the rail check compares κ̂ to.
 fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64, f64) {
     let (n_rows, dim) = values.dim();
-    // ‖y_i‖² from the chart origin (governs the λ / hyperbolic-chart constraint).
-    let mut r2_max = 0.0_f64;
-    for row in values.outer_iter() {
-        let r2 = row.dot(&row);
-        if r2 > r2_max {
-            r2_max = r2;
-        }
-    }
-    // ‖y_i − μ‖² from the centroid (governs the spherical conjugate-radius cap).
+    // BOTH rails derive from the centroid-relative spread ‖y_i − μ‖² — the only
+    // translation-invariant "how spread is this cloud" quantity. The chart
+    // origin is IDENTIFIED with the cloud's flat centroid (the criterion
+    // evaluates on the mean-centred coordinates z_i = y_i − μ, #2351), so the
+    // hyperbolic chart-domain constraint 1 + κ‖z‖² > 0 is governed by the same
+    // spread as the spherical conjugate-radius cap. The previous ambient-origin
+    // radius made κ_min collapse to ≈ −1 for any unit-normalised cloud
+    // regardless of its shape — a pure-translation-sensitive verdict.
     let mut centroid = Array1::<f64>::zeros(dim.max(1));
     if n_rows > 0 && dim > 0 {
         for row in values.outer_iter() {
@@ -1157,13 +1211,13 @@ fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64, f64) {
         }
     }
     assert!(
-        r2_max > 0.0 && s2_max > 0.0,
-        "response κ bounds require a non-degenerate cloud: max ‖y‖²={r2_max}, max ‖y−μ‖²={s2_max}"
+        s2_max > 0.0,
+        "response κ bounds require a non-degenerate cloud: max ‖y−μ‖²={s2_max}"
     );
     // Stay one square-root-epsilon relative step inside both open singular
     // boundaries. This is derived from f64 resolution, not a tuning knob.
     let open_boundary = 1.0 - f64::EPSILON.sqrt();
-    let kappa_min = -open_boundary / r2_max;
+    let kappa_min = -open_boundary / s2_max;
     // Conjugate-radius cap: ρ_max = 2·max‖y_i − μ‖ is the κ=0 geodesic radius.
     let rho_max = 2.0 * s2_max.sqrt();
     let edge = open_boundary * std::f64::consts::PI / rho_max;
@@ -1256,8 +1310,19 @@ fn response_curvature_criterion_jet(
     let mut chart_volume_d1 = 0.0_f64;
     let mut chart_volume_d2 = 0.0_f64;
 
+    // #2351: the chart origin is IDENTIFIED with the flat centroid — every
+    // per-row quantity evaluates on the mean-centred coordinate z_i = y_i − μ.
+    // This is the translation-invariant model: y ↦ y + t leaves every z_i (and
+    // hence V_p, κ̂, the verdict, and both rail flags) exactly unchanged, while
+    // z ↦ dy is unit-Jacobian so the observed-measure likelihood is unaffected.
+    // (Möbius recentring w = (−μ)⊕_κ y does NOT achieve this: gyro-addition
+    // does not commute with Euclidean translation, and w is κ-dependent.)
+    // The centred distance collapses the Möbius denominator to 1, so the
+    // hyperbolic side has no off-origin antipodal singularity.
+    let origin = Array1::<f64>::zeros(dim);
     for row in values.outer_iter() {
-        let (r, r_d1, r_d2) = distance_kappa_jet(&chart, base.view(), row)?;
+        let centred = &row - &base;
+        let (r, r_d1, r_d2) = distance_kappa_jet(&chart, origin.view(), centred.view())?;
         dispersion += r * r;
         dispersion_d1 += 2.0 * r * r_d1;
         dispersion_d2 += 2.0 * (r_d1 * r_d1 + r * r_d2);
@@ -1281,8 +1346,10 @@ fn response_curvature_criterion_jet(
             ln_jac_d2 += exponent * (log_s_d2 * u_d1 * u_d1 + log_s_d1 * u_d2);
         }
 
-        // −d ln λ_y = d[ln(1+κ‖y‖²)−ln 2].
-        let q = row.dot(&row);
+        // −d ln λ_z = d[ln(1+κ‖z‖²)−ln 2], evaluated at the CENTRED coordinate
+        // (#2351): the κ-restoring force reads the cloud's spread, not its
+        // arbitrary ambient offset.
+        let q = centred.dot(&centred);
         let gauge = 1.0 + kappa * q;
         if !(gauge.is_finite() && gauge > 0.0) {
             return Err(ResponseGeometryError::NumericalGeometry(
@@ -1425,13 +1492,20 @@ pub fn fit_response_curvature(
     let mut a = kappa_min;
     let mut b = kappa_max;
     let mut iterations = 0_usize;
-    let (jet, railed_at_resolution_limit) = if lower.score >= 0.0 {
-        // V'(κ_min)≥0 is the exact lower-bound minimization KKT condition.
-        (lower, false)
+    let (jet, railed_at_resolution_limit, railed_at_hyperbolic_resolution_limit) = if lower.score
+        >= 0.0
+    {
+        // V'(κ_min) ≥ 0: the constrained minimum sits ON the hyperbolic
+        // chart-domain bound — the criterion is still improving as κ decreases
+        // past the limit where the cloud fills the hyperbolic ball of its own
+        // spread. Exactly symmetric to the spherical rail below (#2351): κ̂ is
+        // an UPPER bound on κ, not a resolved point estimate, and must be
+        // reported as railed rather than as a confident hyperbolic verdict.
+        (lower, false, true)
     } else if upper.score <= 0.0 {
         // V'(κ_max)≤0 means the criterion is still improving at the
         // spherical chart-resolution limit.
-        (upper, true)
+        (upper, true, false)
     } else {
         let mut current = flat_jet;
         while iterations < max_iter {
@@ -1472,7 +1546,7 @@ pub fn fit_response_curvature(
                 tolerance: tol,
             });
         }
-        (current, false)
+        (current, false, false)
     };
     let kappa_hat = jet.kappa;
     let v_p_hat = jet.value;
@@ -1522,6 +1596,7 @@ pub fn fit_response_curvature(
         kappa_r2,
         characteristic_radius: rho_max,
         railed_at_resolution_limit,
+        railed_at_hyperbolic_resolution_limit,
         sign_resolved,
         base,
         v_p_hat,
@@ -2226,6 +2301,37 @@ mod tests {
         for w in k_hats.windows(2) {
             assert!(w[1] > w[0] - 0.05, "κ̂ not monotone in κ⋆: {:?}", k_hats);
         }
+
+        // (e) TRANSLATION INVARIANCE (#2351): a rigid ambient translation is a
+        // no-op for the cloud's intrinsic shape, so κ̂, the verdict, the
+        // scale-free invariant, and both rail flags must be unchanged to
+        // numerical identity. This is the direct regression guard for the
+        // ambient-origin κ_min/conformal-term bug.
+        let values = synth_cloud(dim, 0.6, n, sigma, 0xC0FFEE ^ 4);
+        let fit = fit_response_curvature(values.view(), dim, 0.95, 1e-12, 256)
+            .expect("untranslated fit");
+        let shifted = &values + 10.0;
+        let fit_shifted = fit_response_curvature(shifted.view(), dim, 0.95, 1e-12, 256)
+            .expect("translated fit");
+        assert!(
+            (fit.kappa_hat - fit_shifted.kappa_hat).abs()
+                <= 1.0e-9 * (1.0 + fit.kappa_hat.abs()),
+            "κ̂ moved under pure translation: {} vs {}",
+            fit.kappa_hat,
+            fit_shifted.kappa_hat
+        );
+        assert_eq!(fit.profile_ci.verdict, fit_shifted.profile_ci.verdict);
+        assert!(
+            (fit.kappa_r2 - fit_shifted.kappa_r2).abs() <= 1.0e-9 * (1.0 + fit.kappa_r2.abs())
+        );
+        assert_eq!(
+            fit.railed_at_resolution_limit,
+            fit_shifted.railed_at_resolution_limit
+        );
+        assert_eq!(
+            fit.railed_at_hyperbolic_resolution_limit,
+            fit_shifted.railed_at_hyperbolic_resolution_limit
+        );
     }
 
     /// d = 1 carries REDUCED curvature information: the transverse volume
@@ -2264,14 +2370,25 @@ mod tests {
     /// edge, so the criterion itself must be defensive.
     #[test]
     fn response_curvature_criterion_rejects_boundary_probes() {
-        // A cloud with a known max radius R²; the hyperbolic edge is κ = −1/R².
+        // #2351: the chart evaluates on mean-centred coordinates, so the
+        // hyperbolic edge is κ = −1/max‖y−μ‖² (centroid-relative spread).
         let values = array![[0.5_f64, 0.0], [-0.4, 0.3], [0.1, -0.5]];
-        let r2_max = values
+        let centroid = {
+            let mut c = Array1::<f64>::zeros(2);
+            for row in values.outer_iter() {
+                c += &row;
+            }
+            c.mapv(|v| v / values.nrows() as f64)
+        };
+        let s2_max = values
             .outer_iter()
-            .map(|r| r.dot(&r))
+            .map(|r| {
+                let z = &r - &centroid;
+                z.dot(&z)
+            })
             .fold(0.0_f64, f64::max);
-        // Exactly on / past the hyperbolic edge: 1 + κ‖y‖² = 0 (or < 0).
-        let kappa_edge = -1.0 / r2_max;
+        // Exactly on / past the hyperbolic edge: 1 + κ‖y−μ‖² = 0 (or < 0).
+        let kappa_edge = -1.0 / s2_max;
         assert!(
             response_curvature_criterion(values.view(), 2, kappa_edge).is_err(),
             "criterion must reject the hyperbolic chart edge κ=−1/R²"
