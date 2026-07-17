@@ -5098,6 +5098,84 @@ fn survival_joint_exact_log_sigma_dh_matches_far_tail_third_derivative() {
     );
 }
 
+/// #2342 diagnostic (zz_measure): localize the far-tail dH NaN. The two
+/// `*_log_sigma_dh_matches_far_tail_third_derivative` gates return
+/// `Ok(Some(NaN))` at the `beta_log_sigma=701` fixture — the kernel builder's
+/// finiteness wall did NOT fire, so the stacks are representable and the NaN
+/// forms downstream in the jet composition. Print, per row: the dynamic
+/// h/q geometry, every kernel derivative stack, and the single-row-masked
+/// joint dH diagonal, so the owning row and channel identify themselves.
+#[test]
+fn zz_measure_2342_far_tail_dh_nan_localization() {
+    let family = survival_exact_newton_test_family();
+    let beta_time = array![0.2];
+    let beta_threshold = array![0.1 * crate::sigma_link::safe_exp(700.0)];
+    let beta_log_sigma = array![701.0_f64];
+    let states = survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+    let dynamic = family
+        .build_dynamic_geometry(&states)
+        .expect("dynamic geometry");
+    let d_flat = array![0.0, 0.0, 1.0];
+    for row in 0..family.n {
+        eprintln!(
+            "#2342 row {row}: h0={:+.6e} h1={:+.6e} hdot={:+.6e} q0={:+.6e} q1={:+.6e} qdot={:+.6e}",
+            dynamic.h_entry[row],
+            dynamic.h_exit[row],
+            dynamic.hdot_exit[row],
+            dynamic.q_entry[row],
+            dynamic.q_exit[row],
+            dynamic.qdot_exit[row],
+        );
+        let state = family.row_predictor_state(
+            dynamic.h_entry[row],
+            dynamic.h_exit[row],
+            dynamic.hdot_exit[row],
+            dynamic.q_entry[row],
+            dynamic.q_exit[row],
+            dynamic.qdot_exit[row],
+        );
+        match family.exact_row_kernel_rescaled(row, state, 0.0) {
+            Ok(Some(k)) => {
+                eprintln!(
+                    "#2342 row {row} entry-surv: log_s0={:+.3e} r0={:+.3e} dr0={:+.3e} ddr0={:+.3e} dddr0={:+.3e}",
+                    k.log_s0, k.r0, k.dr0, k.ddr0, k.dddr0
+                );
+                eprintln!(
+                    "#2342 row {row} exit-surv: log_s1={:+.3e} r1={:+.3e} dr1={:+.3e} ddr1={:+.3e} dddr1={:+.3e}",
+                    k.log_s1, k.r1, k.dr1, k.ddr1, k.dddr1
+                );
+                eprintln!(
+                    "#2342 row {row} exit-pdf: logphi1={:+.3e} d1={:+.3e} d2={:+.3e} d3={:+.3e} d4={:+.3e}",
+                    k.logphi1, k.dlogphi1, k.d2logphi1, k.d3logphi1, k.d4logphi1
+                );
+                eprintln!(
+                    "#2342 row {row} g/w: log_g={:+.3e} d1={:+.3e} d2={:+.3e} d3={:+.3e} d4={:+.3e} w={} d={}",
+                    k.log_g, k.d_log_g, k.d2_log_g, k.d3_log_g, k.d4_log_g, k.w, k.d
+                );
+            }
+            Ok(None) => eprintln!("#2342 row {row}: kernel skipped (zero weight)"),
+            Err(e) => eprintln!("#2342 row {row}: kernel ERROR: {e}"),
+        }
+        let mut mask = Array1::<f64>::zeros(family.n);
+        mask[row] = 1.0;
+        match family.exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
+            &d_flat,
+            &dynamic,
+            0.0,
+            Some(&mask),
+        ) {
+            Ok(Some(dh)) => eprintln!(
+                "#2342 row {row} dH diag: [0,0]={:+.6e} [1,1]={:+.6e} [2,2]={:+.6e}",
+                dh[[0, 0]],
+                dh[[1, 1]],
+                dh[[2, 2]]
+            ),
+            Ok(None) => eprintln!("#2342 row {row}: dH unavailable"),
+            Err(e) => eprintln!("#2342 row {row}: dH ERROR: {e}"),
+        }
+    }
+}
+
 #[test]
 fn joint_exact_newton_score_matches_loglikelihoodfd_near_fitted_non_probit_points() {
     let eps = 1e-6;
