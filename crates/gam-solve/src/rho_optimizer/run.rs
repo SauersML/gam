@@ -4184,6 +4184,7 @@ mod asymptote_rail_certify_tests {
             bounds: &bounds,
             terminal_beta: None,
             stationarity_bound: 1.0e-6,
+            objective_tol: 1.0e-5,
             context: "asymptote-rail psd test",
         };
         let minted = try_certify_asymptote_rail(&mut obj, &inputs_psd)

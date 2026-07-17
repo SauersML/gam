@@ -2059,9 +2059,22 @@ where
         )));
     }
 
-    // Re-certify the exact rho point and inner state that will be shipped.
-    // Seeds and nuisance refinements may initialize work, but they can never
-    // promote a different point under the optimizer's old certificate.
+    // Re-install the exact rho point and inner state that will be shipped, and
+    // verify it IS the certified optimum. Seeds and nuisance refinements may
+    // initialize work, but they can never promote a different point under the
+    // optimizer's old certificate.
+    //
+    // The identity check is BITWISE on ρ, not a re-judged gradient norm: the
+    // retained certificate is the analytic stationarity authority minted at
+    // `outer_result.rho` by the full certification machinery (noise-floor
+    // widenings, flatness probes, asymptote rails). In the deep-smoothing
+    // regime the analytic gradient is a noise instrument (|Pg| redraws across
+    // evaluations of the SAME point — the reproducibility floor exists because
+    // of it), so re-drawing it once here and comparing against the certified
+    // band refuses honest noise-band certificates with coin-flip probability
+    // while adding nothing to point-identity (which bit equality decides
+    // exactly). The evaluation itself is kept: it installs the inner state at
+    // the shipped point and supplies the shipped value/gradient fields.
     let (final_value, finalgrad, finalgrad_norm, stationarity_bound) = if final_rho.is_empty() {
         (outer_result.final_value, Array1::zeros(0), 0.0, reml_tol)
     } else {
@@ -2081,18 +2094,34 @@ where
             .max(f64::EPSILON);
         (value, gradient, projected, bound)
     };
+    let shipped_point_is_certified = final_rho.len() == outer_result.rho.len()
+        && final_rho
+            .iter()
+            .zip(outer_result.rho.iter())
+            .all(|(shipped, certified)| shipped.to_bits() == certified.to_bits());
     let certificate_valid = final_rho.is_empty()
         || (outer_result.converged
             && outer_result
                 .criterion_certificate
                 .as_ref()
                 .is_some_and(|certificate| certificate.certifies())
-            && finalgrad_norm.is_finite()
-            && finalgrad_norm <= stationarity_bound);
+            && shipped_point_is_certified
+            && finalgrad_norm.is_finite());
     if !certificate_valid {
         return Err(EstimationError::RemlDidNotConverge {
             context: "standard REML final shipped point".to_string(),
-            reason: "post-fit analytic projected-KKT certificate failed".to_string(),
+            reason: format!(
+                "post-fit certificate identity check failed: shipped rho {:?} vs \
+                 certified rho {:?} (converged={}, certifies={}, |Pg| at shipped point {:.3e})",
+                final_rho.to_vec(),
+                outer_result.rho.to_vec(),
+                outer_result.converged,
+                outer_result
+                    .criterion_certificate
+                    .as_ref()
+                    .is_some_and(|certificate| certificate.certifies()),
+                finalgrad_norm,
+            ),
             iterations: outer_result.iterations,
             final_value,
             projected_grad_norm: finalgrad_norm.is_finite().then_some(finalgrad_norm),
