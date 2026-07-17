@@ -807,7 +807,7 @@ pub fn blockwise_fit_from_parts(
         dispersion: gam_solve::model_types::Dispersion::UNIT,
         beta_covariance: None,
         beta_standard_errors: None,
-        beta_covariance_corrected: corrected_cov,
+        beta_covariance_corrected: corrected_cov.clone(),
         beta_standard_errors_corrected: corrected_se,
         beta_covariance_frequentist: None,
         coefficient_influence: None,
@@ -834,7 +834,10 @@ pub fn blockwise_fit_from_parts(
         outer_gradient_norm,
         standard_deviation: 1.0,
         covariance_conditional,
-        covariance_corrected: None,
+        // The result validation requires the inference-level corrected matrix to
+        // be mirrored at the top level (bitwise-equal), exactly as the standard
+        // lane publishes it.
+        covariance_corrected: corrected_cov,
         inference,
         fitted_link: FittedLinkState::Standard(None),
         geometry,
