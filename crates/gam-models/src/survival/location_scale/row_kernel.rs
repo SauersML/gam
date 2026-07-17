@@ -6,7 +6,7 @@ use gam_math::jet_scalar::{
     MappedOrder2Accumulator, OneSeedBatch, Order2AtomChannels, RuntimeJetScalar,
 };
 use gam_row_macros::row_atom;
-use wide::f64x4;
+use wide::{CmpEq, f64x4};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurvivalExactRowKernel {
@@ -1951,6 +1951,68 @@ fn pullback_from_channel_cache(
     }
 }
 
+/// The lanes whose packed outer-derivative `stack` is exactly zero in EVERY
+/// entry. The scalar [`sls_row_nll`] SKIPS composing such a term
+/// ([`stack_is_exactly_zero`]) — both to keep a `0·∞` far-tail product from
+/// manufacturing `NaN` and to leave the term a pristine `+0.0` constant. The
+/// SIMD batch shares one `compose_unary` across four lanes and so cannot branch
+/// per row; this mask lets it mirror the scalar skip lane-by-lane.
+///
+/// Returned as a `f64x4` predicate mask (all-ones lanes where the stack is
+/// NONzero, i.e. the term is ACTIVE), ready to drive [`f64x4::blend`]. A lane
+/// entry of `-0.0` counts as zero, exactly as `stack_is_exactly_zero`'s
+/// `*v == 0.0` does (`-0.0 == 0.0`), so the two paths agree on which rows are
+/// skipped.
+#[inline]
+fn active_stack_lane_mask(stack: &[f64x4; 5]) -> f64x4 {
+    let zero = f64x4::splat(0.0);
+    stack[0].cmp_ne(zero)
+        | stack[1].cmp_ne(zero)
+        | stack[2].cmp_ne(zero)
+        | stack[3].cmp_ne(zero)
+        | stack[4].cmp_ne(zero)
+}
+
+/// Blend a composed term with a sign-clean neutral on the lanes the scalar path
+/// skips, so the batch nll matches [`sls_row_nll`] to the bit on every lane.
+///
+/// `active` is [`active_stack_lane_mask`] (set where the term's stack is
+/// NONzero). On active lanes the raw `composed` channels survive — bit-identical
+/// to the scalar `term.compose_unary(stack)` for that row. On inactive lanes
+/// every channel becomes `neutral`:
+///
+/// - `+0.0` for the LEADING (`u0`) term, matching the scalar's assignment
+///   `nll = S::constant(0.0)` for a skipped first term.
+/// - `-0.0` for a term that is ADDED (`u1`, `g`), because `-0.0` is the
+///   sign-preserving additive identity: `x + (-0.0) == x` bit-for-bit for every
+///   `x` (including `±0.0`, `±∞`, `NaN`), so `nll.add(neutral) == nll` exactly on
+///   the skipped lanes — whereas a `+0.0` neutral would flip a running `-0.0`
+///   channel to `+0.0` and desynchronise from the scalar's skipped add.
+///
+/// The blend is bitwise, so a `0·∞ = NaN` produced on a skipped far-tail lane is
+/// discarded (never propagated), matching the scalar which never forms it.
+#[inline]
+fn select_active_term(
+    composed: OneSeedBatch<SLS_ROW_K>,
+    active: f64x4,
+    neutral: f64,
+) -> OneSeedBatch<SLS_ROW_K> {
+    let n = f64x4::splat(neutral);
+    let pick = |channel: f64x4| active.blend(channel, n);
+    let mut out = composed;
+    out.base.v = pick(out.base.v);
+    out.eps.v = pick(out.eps.v);
+    for i in 0..SLS_ROW_K {
+        out.base.g[i] = pick(out.base.g[i]);
+        out.eps.g[i] = pick(out.eps.g[i]);
+        for j in 0..SLS_ROW_K {
+            out.base.h[i][j] = pick(out.base.h[i][j]);
+            out.eps.h[i][j] = pick(out.eps.h[i][j]);
+        }
+    }
+    out
+}
+
 /// SIMD 4-rows-per-pass evaluation of [`sls_row_nll`] at the packed one-seed
 /// directional scalar, for a group of FOUR rows that share the SAME gating
 /// signature (`cens_on` = the censored term is active for every lane,
@@ -1965,12 +2027,25 @@ fn pullback_from_channel_cache(
 /// avoid `0·∞ = NaN` when an inactive branch's residual-distribution stack is
 /// non-finite. Batching rows that share a gating signature lets the batch compose
 /// a term ONLY when it is active for all four lanes — where the stack is
-/// guaranteed finite — and skip it entirely otherwise (no dummy `+0.0` add, so no
-/// `-0.0`/`+0.0` skew). Per-row/censoring/event weights are folded into each
+/// guaranteed finite. Per-row/censoring/event weights are folded into each
 /// `compose_unary` coefficient stack (pre-scale) via the shared
 /// [`sls_outer_plan`], exactly as the scalar `sls_row_nll` does — NOT applied as
 /// a post-composition scale, which would round the contracted third channel
 /// differently by 1 ulp — so composition is `to_bits`-identical per lane.
+///
+/// **Why the per-lane stack mask.** The `(cens, event)` signature is not the only
+/// gate the scalar applies: `sls_row_nll` ALSO skips a term whose outer stack is
+/// exactly zero ([`stack_is_exactly_zero`]) and leaves it a pristine `+0.0`
+/// constant. That case is common, not exotic — a row with no left truncation
+/// carries `S(entry) = 1`, so its ENTRY (`u0`) stack is exactly `[0,0,0,0,0]`
+/// even though the row weight is nonzero, and left-truncated and non-truncated
+/// rows freely share a `(cens, event)` group. Composing that zero stack forms
+/// `0·(negative jet channel) = -0.0` (or `0·∞ = NaN` on a far-tail row) where the
+/// scalar's skip yields `+0.0`. So each term is masked per lane via
+/// [`select_active_term`]: active lanes keep the raw composition, skipped lanes
+/// take the sign-clean neutral (`+0.0` for the assigned leading term, `-0.0` for
+/// an added term — the sign-preserving additive identity), reproducing the scalar
+/// bit-for-bit on every lane and never propagating a masked-out `NaN`.
 #[inline]
 fn sls_row_nll_onesseed_batch(
     vars: &[OneSeedBatch<SLS_ROW_K>; SLS_ROW_K],
@@ -1996,18 +2071,24 @@ fn sls_row_nll_onesseed_batch(
         std::array::from_fn(|order| f64x4::new(std::array::from_fn(|lane| per_lane[lane][order])))
     };
 
-    let mut nll = u0.compose_unary(pack(|plan| plan.u0));
+    // Leading term: the scalar ASSIGNS `nll = zero(u0)? const 0 : u0.compose(..)`,
+    // so skipped lanes take the `+0.0` neutral (matching `S::constant(0.0)`).
+    let u0_stack = pack(|plan| plan.u0);
+    let mut nll = select_active_term(u0.compose_unary(u0_stack), active_stack_lane_mask(&u0_stack), 0.0);
     // The scalar collapses the censored and event `u1` contributions into ONE
     // combined stack (`plan.u1`) and composes it once; mirror that. A
     // homogeneous group's `u1` term is active exactly when a censored or event
-    // term is active.
+    // term is active. Added terms take the `-0.0` neutral on skipped lanes so the
+    // add is a bit-exact no-op there (`x + (-0.0) == x`).
     if cens_on || event_on {
         let u1_stack = pack(|plan| plan.u1.expect("homogeneous group has an active u1 stack"));
-        nll = nll.add(&u1.compose_unary(u1_stack));
+        let term = select_active_term(u1.compose_unary(u1_stack), active_stack_lane_mask(&u1_stack), -0.0);
+        nll = nll.add(&term);
     }
     if event_on {
         let g_stack = pack(|plan| plan.g.expect("homogeneous group has an active g stack"));
-        nll = nll.add(&g.compose_unary(g_stack));
+        let term = select_active_term(g.compose_unary(g_stack), active_stack_lane_mask(&g_stack), -0.0);
+        nll = nll.add(&term);
     }
     nll
 }
