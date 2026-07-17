@@ -84,7 +84,7 @@ fn wahba_sphere_double_penalty_ridge_shrinks_primary_null_space() {
 
     // The ridge's principal direction must earn ~zero primary energy (it is a
     // genuine null-space direction of the primary).
-    let ridge_sym = (&ridge + &ridge.t()) * 0.5;
+    let ridge_sym = (ridge + &ridge.t()) * 0.5;
     let (evals, evecs) = ridge_sym
         .eigh(Side::Lower)
         .expect("ridge eigendecomposition");
