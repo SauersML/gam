@@ -2626,12 +2626,16 @@ fn try_tail_snap_to_rail(
     let mut decline: Option<String> = None;
     for (k, side) in &candidates {
         let verdict = match probe_tail_window(obj, rho, *k, *side, &tol)? {
-            Some(window) => match assess_coordinate(&window, &tol) {
+            (Some(window), rows) => match assess_coordinate(&window, &tol) {
                 AsymptoteVerdict::CertifiedAtAsymptote { .. }
                 | AsymptoteVerdict::OnTailNotYetEquivalent { .. } => None,
-                AsymptoteVerdict::NoAsymptote { reason } => Some(reason),
+                AsymptoteVerdict::NoAsymptote { reason } => {
+                    Some(format!("{reason}; probes: {rows}"))
+                }
             },
-            None => Some("no finite-difference-clean tail run".to_string()),
+            (None, rows) => Some(format!(
+                "no finite-difference-clean tail run; probes: {rows}"
+            )),
         };
         if let Some(reason) = verdict {
             decline = Some(format!("candidate k={k} tail unconfirmed: {reason}"));
@@ -2693,8 +2697,8 @@ fn build_and_assess_rail_coordinate(
     tol: &AsymptoteTolerances,
 ) -> Result<Option<RailCoordinate>, EstimationError> {
     let window = match probe_tail_window(obj, rho, coord, side, tol)? {
-        Some(window) => window,
-        None => return Ok(None),
+        (Some(window), _) => window,
+        (None, _) => return Ok(None),
     };
     match assess_coordinate(&window, tol) {
         AsymptoteVerdict::CertifiedAtAsymptote {
@@ -2719,14 +2723,16 @@ fn build_and_assess_rail_coordinate(
 /// [`build_and_assess_rail_coordinate`] and the certify-time tail snap), locate
 /// the longest finite-difference-clean constant-`ĉ` run, and return it as an
 /// assessment window (newest sample nearest `rho[coord]`). `None` when no clean
-/// run of at least [`MIN_TAIL_SAMPLES`] rows exists.
+/// run of at least [`MIN_TAIL_SAMPLES`] rows exists; the second element is a
+/// compact `(ρ, ∂V/∂ρ, ĉ)` dump of every probed row so a refused tail carries
+/// its own evidence into the decline note instead of an opaque verdict.
 fn probe_tail_window(
     obj: &mut dyn OuterObjective,
     rho: &Array1<f64>,
     coord: usize,
     side: AsymptoteSide,
     tol: &AsymptoteTolerances,
-) -> Result<Option<AsymptoteWindow>, EstimationError> {
+) -> Result<(Option<AsymptoteWindow>, String), EstimationError> {
     const PROBE_DELTA: f64 = 1.0;
     // Upper rail (ρ → +∞): step ρ DOWN into the tail. Lower rail: step UP.
     let sign = match side {
@@ -2751,8 +2757,13 @@ fn probe_tail_window(
         }
         rows.push((probe[coord], eval.gradient[coord], eval.inner_beta_hint));
     }
+    let rows_summary = rows
+        .iter()
+        .map(|(r, g, _)| format!("(ρ={r:.2}, g={g:.3e}, ĉ={:.3e})", side.tail_constant(*r, *g)))
+        .collect::<Vec<_>>()
+        .join(" ");
     if rows.len() < MIN_TAIL_SAMPLES {
-        return Ok(None);
+        return Ok((None, rows_summary));
     }
 
     // Per-row pencil constant ĉ and the element-clean predicate: ĉ above the
@@ -2796,7 +2807,7 @@ fn probe_tail_window(
     }
     let (a, b) = match best {
         Some(run) => run,
-        None => return Ok(None),
+        None => return Ok((None, rows_summary)),
     };
 
     // Build the window oldest → newest: newest (window `latest`) is the row
@@ -2818,7 +2829,7 @@ fn probe_tail_window(
         });
     }
 
-    Ok(Some(window))
+    Ok((Some(window), rows_summary))
 }
 
 /// Whether a run of pencil constants holds constant within the relative drift
