@@ -2108,11 +2108,15 @@ fn certify_outer_optimality_at_terminal_fidelity(
         }
         _ => None,
     };
-    if let Some((interior_projected_grad_norm, rails)) = rail_outcome {
+    if let Some((interior_projected_grad_norm, effective_interior_bound, rails)) = rail_outcome {
         let certificate = OuterCriterionCertificate {
             stationarity: OuterStationarityCertificate::AsymptoteRail {
                 interior_projected_grad_norm,
-                bound: stationarity_bound,
+                // The bound that admitted the interior: the raw stationarity
+                // bound, or the curvature-scaled flat-valley widening when the
+                // interior sub-block's Newton decrement is below the loop's
+                // cost resolution (shared judgment with the Inc 2c mint).
+                bound: effective_interior_bound,
                 rails,
             },
             hessian_psd: Some(true),
@@ -2486,21 +2490,33 @@ struct AsymptoteRailInputs<'a> {
 fn try_certify_asymptote_rail(
     obj: &mut dyn OuterObjective,
     inputs: &AsymptoteRailInputs<'_>,
-) -> Result<Option<(f64, Vec<RailCoordinate>)>, EstimationError> {
+) -> Result<Option<(f64, f64, Vec<RailCoordinate>)>, EstimationError> {
     let rho = inputs.rho;
     let projected_gradient = inputs.projected_gradient;
     let railed = inputs.railed;
-    // The interior (non-railed) coordinates must be gradient-stationary in their
-    // own right: the asymptote certificate speaks only to the railed directions,
-    // never rescues a still-descending interior.
-    let interior_projected_grad_norm = (0..projected_gradient.len())
+    // The interior (non-railed) coordinates must be stationary in their own
+    // right: the asymptote certificate speaks only to the railed directions,
+    // never rescues a still-descending interior. Judged by the SAME two-stage
+    // criterion as the Inc 2c at-point mint: the raw bound first, then the
+    // curvature-scaled flat-valley bound on the interior sub-block — a fit
+    // whose remaining interior Newton step would improve the cost by less
+    // than the loop's own cost resolution is at its interior optimum, and the
+    // residual gradient is the deep-λ instrument noise floor (evaluations
+    // beside a saturated rail share the rail's logdet noise).
+    let interior_indices: Vec<usize> = (0..projected_gradient.len())
         .filter(|k| !railed.contains(k))
-        .map(|k| projected_gradient[k] * projected_gradient[k])
-        .sum::<f64>()
-        .sqrt();
-    if !(interior_projected_grad_norm <= inputs.stationarity_bound) {
+        .collect();
+    let Some((interior_projected_grad_norm, effective_interior_bound)) =
+        certify_interior_stationarity(
+            projected_gradient,
+            inputs.hessian,
+            &interior_indices,
+            inputs.stationarity_bound,
+            inputs.objective_tol,
+        )
+    else {
         return Ok(None);
-    }
+    };
     // The interior sub-block (railed coordinates removed) must be admissible
     // curvature for a minimum. A rail-caused indefiniteness in the saturated
     // direction is expected and excluded; genuine interior negative curvature is
@@ -2556,10 +2572,63 @@ fn try_certify_asymptote_rail(
     }
 
     if all_certified && !rails.is_empty() {
-        Ok(Some((interior_projected_grad_norm, rails)))
+        Ok(Some((
+            interior_projected_grad_norm,
+            effective_interior_bound,
+            rails,
+        )))
     } else {
         Ok(None)
     }
+}
+
+/// Two-stage interior stationarity judgment shared by the Inc 1 railed mint
+/// and the Inc 2c at-point mint (#2348): the raw stationarity bound first,
+/// then the curvature-scaled flat-valley bound on the interior sub-block.
+///
+/// The second stage certifies a point whose full interior Newton step would
+/// improve the objective by less than `objective_tol` — the loop's own cost
+/// resolution — so the point is cost-indistinguishable from the interior
+/// optimum and the measured gradient is resolution noise, not slope. Returns
+/// `Some((interior_grad_norm, effective_bound))` when certified (the bound
+/// that admitted the norm: raw, or the curvature-scaled widening), `None`
+/// when real interior descent remains.
+pub(crate) fn certify_interior_stationarity(
+    gradient: &Array1<f64>,
+    hessian: &Array2<f64>,
+    interior_indices: &[usize],
+    stationarity_bound: f64,
+    objective_tol: f64,
+) -> Option<(f64, f64)> {
+    let interior_grad_norm = interior_indices
+        .iter()
+        .map(|&k| gradient[k] * gradient[k])
+        .sum::<f64>()
+        .sqrt();
+    if interior_grad_norm <= stationarity_bound {
+        return Some((interior_grad_norm, stationarity_bound));
+    }
+    let m = interior_indices.len();
+    let mut sub_h = Array2::<f64>::zeros((m, m));
+    let mut sub_g = Array1::<f64>::zeros(m);
+    for (i, &ri) in interior_indices.iter().enumerate() {
+        sub_g[i] = gradient[ri];
+        for (j, &rj) in interior_indices.iter().enumerate() {
+            sub_h[[i, j]] = hessian[[ri, rj]];
+        }
+    }
+    if let Some(predicted_decrease) = newton_predicted_decrease(&sub_h, &sub_g)
+        && predicted_decrease.is_finite()
+        && predicted_decrease > 0.0
+        && predicted_decrease <= objective_tol
+    {
+        let curvature_grad_bound =
+            interior_grad_norm * (objective_tol / predicted_decrease).sqrt();
+        if curvature_grad_bound.is_finite() && curvature_grad_bound >= interior_grad_norm {
+            return Some((interior_grad_norm, curvature_grad_bound));
+        }
+    }
+    None
 }
 
 /// Curvature-tie acceptance band for a certify-time tail-snap candidate
@@ -2813,42 +2882,26 @@ fn try_tail_snap_to_rail(
     // #2348 Inc 2c: every candidate's confirmed tail already extrapolates
     // BELOW the stationarity bound at the current point — the fit is
     // tail-stationary where it stands and the measured local gradient is
-    // instrument noise. Judge the interior with the same two-stage criterion
-    // the main certificate uses: the raw bound, then the curvature-scaled
-    // flat-valley bound on the interior SUB-BLOCK (the full-Hessian widening
-    // is unavailable here exactly because the noise-corrupted tail entry
-    // makes the full matrix non-PD).
+    // instrument noise. Judge the interior with the shared two-stage
+    // criterion (`certify_interior_stationarity`): the raw bound, then the
+    // curvature-scaled flat-valley bound on the interior SUB-BLOCK (the
+    // full-Hessian widening is unavailable here exactly because the
+    // noise-corrupted tail entry makes the full matrix non-PD).
     if at_point_rails.len() == candidates.len() {
-        if interior_grad_norm <= inputs.stationarity_bound {
+        if let Some((interior_projected_grad_norm, effective_interior_bound)) =
+            certify_interior_stationarity(
+                gradient,
+                hessian,
+                &interior_indices,
+                inputs.stationarity_bound,
+                inputs.objective_tol,
+            )
+        {
             return Ok(TailSnapOutcome::TailStationaryAtPoint {
                 rails: at_point_rails,
-                interior_projected_grad_norm: interior_grad_norm,
-                effective_interior_bound: inputs.stationarity_bound,
+                interior_projected_grad_norm,
+                effective_interior_bound,
             });
-        }
-        let m = interior_indices.len();
-        let mut sub_h = Array2::<f64>::zeros((m, m));
-        let mut sub_g = Array1::<f64>::zeros(m);
-        for (i, &ri) in interior_indices.iter().enumerate() {
-            sub_g[i] = gradient[ri];
-            for (j, &rj) in interior_indices.iter().enumerate() {
-                sub_h[[i, j]] = hessian[[ri, rj]];
-            }
-        }
-        if let Some(predicted_decrease) = newton_predicted_decrease(&sub_h, &sub_g)
-            && predicted_decrease.is_finite()
-            && predicted_decrease > 0.0
-            && predicted_decrease <= inputs.objective_tol
-        {
-            let curvature_grad_bound =
-                interior_grad_norm * (inputs.objective_tol / predicted_decrease).sqrt();
-            if curvature_grad_bound.is_finite() && curvature_grad_bound >= interior_grad_norm {
-                return Ok(TailSnapOutcome::TailStationaryAtPoint {
-                    rails: at_point_rails,
-                    interior_projected_grad_norm: interior_grad_norm,
-                    effective_interior_bound: curvature_grad_bound,
-                });
-            }
         }
         // Real interior descent remains: fall through to the reseed path so
         // one more optimizer pass polishes it.
@@ -4216,8 +4269,13 @@ mod asymptote_rail_certify_tests {
         };
         let minted = try_certify_asymptote_rail(&mut obj, &inputs_psd)
             .expect("certification must not error");
-        let (interior_norm, rails) = minted.expect("PSD interior + confirmed tail must mint");
+        let (interior_norm, effective_bound, rails) =
+            minted.expect("PSD interior + confirmed tail must mint");
         assert!(interior_norm <= 1.0e-6);
+        assert!(
+            effective_bound >= interior_norm,
+            "the admitting bound must cover the interior norm"
+        );
         assert_eq!(rails.len(), 1);
         assert_eq!(rails[0].index, 0);
 
