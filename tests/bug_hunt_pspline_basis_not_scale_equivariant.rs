@@ -66,8 +66,11 @@ fn pspline_design_and_penalty_are_scale_equivariant() {
 
     let base = build(1.0);
     let base_design = base.design.as_dense_ref().expect("dense design").to_owned();
-    assert!(!base.penalties.is_empty(), "expected at least one penalty");
-    let base_pen = base.penalties[0].clone();
+    assert!(
+        !base.active_penalties.is_empty(),
+        "expected at least one penalty"
+    );
+    let base_pen = base.active_penalties[0].matrix.clone();
 
     let mut worst_design = 0.0_f64;
     let mut worst_pen = 0.0_f64;
@@ -88,7 +91,7 @@ fn pspline_design_and_penalty_are_scale_equivariant() {
         let dd = (d - &base_design)
             .iter()
             .fold(0.0_f64, |m, v| m.max(v.abs()));
-        let pen = &r.penalties[0];
+        let pen = &r.active_penalties[0].matrix;
         assert_eq!(
             pen.dim(),
             base_pen.dim(),
