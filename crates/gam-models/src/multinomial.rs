@@ -4705,5 +4705,59 @@ mod reference_class_invariance_tests {
                 ),
             }
         }
+
+        // ── Round 4: the production JOINT evaluator at ρ* ──────────────────
+        //
+        // Round 3 exonerated the inner solver (warm-started values match cold
+        // to 2e-4), so the 12.574 offset lives in the OUTER evaluator's
+        // criterion convention. Call the same joint evaluator the outer loop
+        // uses, at the same checkpoint: its objective tells whether the outer
+        // value 268.740 is a criterion-normalization constant (e.g. raw-basis
+        // vs pulled-back joint logdet under the identifiability gauge — a
+        // ρ-independent shift, harmless to optimization), and its analytic
+        // gradient against the FD vector above is the per-coordinate
+        // obj↔grad-desync gate the issue asked for (suspect 1: rank-convention
+        // mismatch in the coalesced pseudo-logdet of the OVERLAPPING
+        // per-class family).
+        {
+            let fam = parts
+                .family
+                .clone()
+                .with_joint_initial_log_lambdas(rho_star.to_vec());
+            let empty_layout = crate::custom_family::CustomFamilyHyperLayout::new(
+                vec![Vec::new(); parts.blocks.len()],
+                vec![],
+                ndarray::Array1::zeros(0),
+            )
+            .expect("empty hyper layout");
+            match crate::custom_family::evaluate_custom_family_joint_hyper(
+                &fam,
+                &parts.blocks,
+                &probe_options,
+                &ndarray::Array1::zeros(0),
+                &empty_layout,
+                None,
+                crate::custom_family::EvalMode::ValueAndGradient,
+            ) {
+                Ok(joint) => {
+                    eprintln!(
+                        "#2349 joint-evaluator at rho*: objective={:.9e} (fixed-lambda LAML \
+                         2.561663540e2, refusal 2.687403e2) |analytic grad|={:.6e} grad={:?}",
+                        joint.objective,
+                        joint
+                            .gradient
+                            .iter()
+                            .map(|g| g * g)
+                            .sum::<f64>()
+                            .sqrt(),
+                        joint.gradient.as_slice().unwrap_or(&[])
+                    );
+                }
+                Err(e) => eprintln!(
+                    "#2349 joint-evaluator at rho*: REFUSED: {}",
+                    format!("{e}").chars().take(300).collect::<String>()
+                ),
+            }
+        }
     }
 }
