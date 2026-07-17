@@ -2074,6 +2074,11 @@ fn certify_outer_optimality_at_terminal_fidelity(
     // with outward pull (`grad_norm` above the stationarity bound) and an analytic
     // Hessian: a well-conditioned interior fit, or a coordinate merely resting near a
     // bound with a vanishing gradient, probes nothing and keeps its ordinary verdict.
+    let asymptote_objective_tol = config
+        .rel_cost_tolerance
+        .unwrap_or(config.tolerance * 1.0e-2)
+        .max(COST_STALL_REL_TOL_FLOOR)
+        * (1.0 + evaluation.cost.abs());
     let rail_outcome = match analytic_hessian.as_ref() {
         Some(hessian)
             if !certificate_railed.is_empty() && grad_norm > stationarity_bound =>
@@ -2088,6 +2093,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
                     bounds: &bounds,
                     terminal_beta: terminal_beta.as_ref(),
                     stationarity_bound,
+                    objective_tol: asymptote_objective_tol,
                     context,
                 },
             )?
@@ -2273,9 +2279,55 @@ fn certify_outer_optimality_at_terminal_fidelity(
                 bounds: &bounds,
                 terminal_beta: terminal_beta.as_ref(),
                 stationarity_bound,
+                objective_tol: asymptote_objective_tol,
                 context,
             },
         )? {
+            TailSnapOutcome::TailStationaryAtPoint {
+                rails,
+                interior_projected_grad_norm,
+                effective_interior_bound,
+            } => {
+                // #2348 Inc 2c: the confirmed tails extrapolate below the bound
+                // AT the checkpoint — mint the typed asymptote certificate for
+                // the point as it stands. `hessian_psd` is the interior
+                // sub-block verdict established before probing (the full
+                // matrix is expected non-PD from the noise-corrupted tail
+                // entry); the stored bound is the one that actually certified
+                // the interior (raw, or the sub-block curvature-scaled
+                // flat-valley bound).
+                let certificate = OuterCriterionCertificate {
+                    stationarity: OuterStationarityCertificate::AsymptoteRail {
+                        interior_projected_grad_norm,
+                        bound: effective_interior_bound,
+                        rails,
+                    },
+                    hessian_psd: Some(true),
+                    lambdas_railed: certificate_railed.clone(),
+                };
+                result.final_hessian = analytic_hessian;
+                result.criterion_certificate = Some(certificate.clone());
+                if !certificate.certifies() {
+                    result.converged = false;
+                    return Err(outer_nonconvergence_error(
+                        context,
+                        &certificate.summary(),
+                        result,
+                        Some(interior_projected_grad_norm),
+                        effective_interior_bound,
+                    ));
+                }
+                result.converged = true;
+                result.converged_via = Some(OuterConvergedVia::AsymptoteStationary {
+                    rails: certificate.stationarity.rails().len(),
+                });
+                log::info!(
+                    "[CERTIFICATE] {context}: tail-stationary at the checkpoint \
+                     (#2348 Inc 2c): {}",
+                    certificate.summary()
+                );
+                return Ok(certificate);
+            }
             TailSnapOutcome::Snapped(snapped) => {
                 let original_rho = result.rho.clone();
                 // The run-recorded first-order evidence describes the PRE-snap
@@ -2402,6 +2454,13 @@ struct AsymptoteRailInputs<'a> {
     bounds: &'a (Array1<f64>, Array1<f64>),
     terminal_beta: Option<&'a Array1<f64>>,
     stationarity_bound: f64,
+    /// The run's relative objective tolerance resolved at the certified cost —
+    /// the same flat-valley floor the cost-stall guard and the curvature-scaled
+    /// widening use. The tail-snap interior judgment applies the identical
+    /// Newton-decrement criterion on the interior SUB-BLOCK (the full-Hessian
+    /// widening is disabled exactly when a noise-corrupted tail entry makes the
+    /// full matrix non-PD).
+    objective_tol: f64,
     context: &'a str,
 }
 
@@ -2535,6 +2594,22 @@ const TAIL_SNAP_CURVATURE_BAND: (f64, f64) = (0.25, 4.0);
 /// it was not snapped (the decline evidence is otherwise invisible in a red
 /// test/fit).
 enum TailSnapOutcome {
+    /// Every candidate's confirmed tail EXTRAPOLATES to a gradient already
+    /// below the stationarity bound at the CURRENT point (#2348 Inc 2c): the
+    /// coordinate is tail-stationary where it stands, and the measured local
+    /// gradient is instrument noise (observed on the #2299 fixture: measured
+    /// |g|=1.04e-2 at ρ=26.56 vs the clean-band extrapolation ĉ·e^{−ρ} ≈
+    /// 1.9e-8, 100× below the bound). Mint the AsymptoteRail at this point —
+    /// no snap, no reseed. `interior_projected_grad_norm` and the
+    /// `effective_interior_bound` that certified it (the raw stationarity
+    /// bound, or the interior sub-block's curvature-scaled flat-valley bound —
+    /// the full-Hessian widening is disabled precisely because the noisy tail
+    /// entry makes the full matrix non-PD) ride along for the certificate.
+    TailStationaryAtPoint {
+        rails: Vec<RailCoordinate>,
+        interior_projected_grad_norm: f64,
+        effective_interior_bound: f64,
+    },
     /// Tails confirmed AND the interior is already gradient-stationary:
     /// re-certify the snapped point directly (the Inc 1 railed mint judges it).
     Snapped(Array1<f64>),
@@ -2546,6 +2621,17 @@ enum TailSnapOutcome {
     ConfirmedNeedsReseed(Array1<f64>),
     Declined(String),
 }
+
+/// Relative drift band for the tail-snap confirmation window, wider than the
+/// exp4 characterization band (1e-3). The snap's evidentiary strength comes
+/// from the EXTRAPOLATED-GAP margin, not the band tightness: a 1–2% spread in
+/// `ĉ` across the clean run moves the extrapolated remaining gradient
+/// `ĉ·e^{∓ρ}` by the same 1–2%, immaterial against the orders-of-magnitude
+/// margin the at-point/stationarity decisions demand — while the true tail on
+/// a REAL fixture still carries visible sub-percent curvature contamination at
+/// probe depth (measured on #2299: ĉ ∈ {6544, 6565, 6574} over three e-folds,
+/// drift 4.6e-3, against a wildly swinging noise region above).
+const TAIL_SNAP_DRIFT_REL: f64 = 1.0e-2;
 
 fn try_tail_snap_to_rail(
     obj: &mut dyn OuterObjective,
@@ -2622,13 +2708,45 @@ fn try_tail_snap_to_rail(
         .map(|b| b.dot(b).sqrt())
         .filter(|v| v.is_finite())
         .unwrap_or(0.0);
-    let tol = AsymptoteTolerances::exp4_rail_bands(ASYMPTOTE_ESTIMAND_REL_TOL * (1.0 + beta_norm));
+    let mut tol =
+        AsymptoteTolerances::exp4_rail_bands(ASYMPTOTE_ESTIMAND_REL_TOL * (1.0 + beta_norm));
+    tol.tail_drift_rel = TAIL_SNAP_DRIFT_REL;
     let mut decline: Option<String> = None;
+    // Rails for candidates whose confirmed tail extrapolates to an
+    // already-below-bound gradient at the CURRENT point; when every candidate
+    // qualifies, the point is minted where it stands (#2348 Inc 2c).
+    let mut at_point_rails: Vec<RailCoordinate> = Vec::new();
     for (k, side) in &candidates {
         let verdict = match probe_tail_window(obj, rho, *k, *side, &tol)? {
             (Some(window), rows) => match assess_coordinate(&window, &tol) {
-                AsymptoteVerdict::CertifiedAtAsymptote { .. }
-                | AsymptoteVerdict::OnTailNotYetEquivalent { .. } => None,
+                AsymptoteVerdict::CertifiedAtAsymptote {
+                    side: assessed_side,
+                    tail_constant,
+                    estimand_travel_bound,
+                    ..
+                } => {
+                    // Extrapolate the confirmed tail law to the current point:
+                    // the TRUE remaining gradient there, immune to the local
+                    // instrument noise the certificate measured.
+                    let extrapolated_gap = match assessed_side {
+                        AsymptoteSide::Upper => tail_constant * (-rho[*k]).exp(),
+                        AsymptoteSide::Lower => tail_constant * rho[*k].exp(),
+                    };
+                    if extrapolated_gap.is_finite()
+                        && extrapolated_gap <= inputs.stationarity_bound
+                    {
+                        at_point_rails.push(RailCoordinate {
+                            index: *k,
+                            side: assessed_side,
+                            tail_constant,
+                            value_gap: extrapolated_gap,
+                            estimand_travel_bound,
+                            noise_margin: tol.tail_noise_floor,
+                        });
+                    }
+                    None
+                }
+                AsymptoteVerdict::OnTailNotYetEquivalent { .. } => None,
                 AsymptoteVerdict::NoAsymptote { reason } => {
                     Some(format!("{reason}; probes: {rows}"))
                 }
@@ -2656,6 +2774,59 @@ fn try_tail_snap_to_rail(
         return Ok(TailSnapOutcome::Declined(reason));
     }
 
+    let interior_indices: Vec<usize> = (0..n)
+        .filter(|k| !inputs.railed.contains(k) && !candidates.iter().any(|(c, _)| c == k))
+        .collect();
+    let interior_grad_norm = interior_indices
+        .iter()
+        .map(|&k| gradient[k] * gradient[k])
+        .sum::<f64>()
+        .sqrt();
+
+    // #2348 Inc 2c: every candidate's confirmed tail already extrapolates
+    // BELOW the stationarity bound at the current point — the fit is
+    // tail-stationary where it stands and the measured local gradient is
+    // instrument noise. Judge the interior with the same two-stage criterion
+    // the main certificate uses: the raw bound, then the curvature-scaled
+    // flat-valley bound on the interior SUB-BLOCK (the full-Hessian widening
+    // is unavailable here exactly because the noise-corrupted tail entry
+    // makes the full matrix non-PD).
+    if at_point_rails.len() == candidates.len() {
+        if interior_grad_norm <= inputs.stationarity_bound {
+            return Ok(TailSnapOutcome::TailStationaryAtPoint {
+                rails: at_point_rails,
+                interior_projected_grad_norm: interior_grad_norm,
+                effective_interior_bound: inputs.stationarity_bound,
+            });
+        }
+        let m = interior_indices.len();
+        let mut sub_h = Array2::<f64>::zeros((m, m));
+        let mut sub_g = Array1::<f64>::zeros(m);
+        for (i, &ri) in interior_indices.iter().enumerate() {
+            sub_g[i] = gradient[ri];
+            for (j, &rj) in interior_indices.iter().enumerate() {
+                sub_h[[i, j]] = hessian[[ri, rj]];
+            }
+        }
+        if let Some(predicted_decrease) = newton_predicted_decrease(&sub_h, &sub_g)
+            && predicted_decrease.is_finite()
+            && predicted_decrease > 0.0
+            && predicted_decrease <= inputs.objective_tol
+        {
+            let curvature_grad_bound =
+                interior_grad_norm * (inputs.objective_tol / predicted_decrease).sqrt();
+            if curvature_grad_bound.is_finite() && curvature_grad_bound >= interior_grad_norm {
+                return Ok(TailSnapOutcome::TailStationaryAtPoint {
+                    rails: at_point_rails,
+                    interior_projected_grad_norm: interior_grad_norm,
+                    effective_interior_bound: curvature_grad_bound,
+                });
+            }
+        }
+        // Real interior descent remains: fall through to the reseed path so
+        // one more optimizer pass polishes it.
+    }
+
     let mut snapped = rho.clone();
     for (k, side) in &candidates {
         snapped[*k] = match side {
@@ -2672,11 +2843,6 @@ fn try_tail_snap_to_rail(
     // coordinate), so hand the runner a reseed point instead — one more
     // optimizer pass pins the snapped coordinate at its rail (box projection)
     // while the interior converges in its few remaining Newton steps.
-    let interior_grad_norm = (0..n)
-        .filter(|k| !inputs.railed.contains(k) && !candidates.iter().any(|(c, _)| c == k))
-        .map(|k| gradient[k] * gradient[k])
-        .sum::<f64>()
-        .sqrt();
     if interior_grad_norm <= inputs.stationarity_bound {
         Ok(TailSnapOutcome::Snapped(snapped))
     } else {
