@@ -382,6 +382,199 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         }
         Ok(rows)
     }
+
+    /// Exact directional derivative `D_u M` of the EXPECTED Fisher information
+    /// for the 3-block binomial location-scale wiggle family.
+    ///
+    /// The expected information is the bilinear form
+    ///
+    ///   M_ab = sum_i f_i (∇q_i)_a (∇q_i)_b,     f_i = expected q-information,
+    ///
+    /// which — unlike the observed Hessian — has NO `∂²q` curvature term. It is
+    /// therefore not the second derivative of any scalar, so its directional
+    /// derivative cannot be taken as the next symmetric channel of a jet
+    /// composition `φ∘q` with `φ''=f`, `φ'=0`: that identity injects a spurious
+    /// `f·q_ab·(∇q·u)` term (the `φ'` slot is zero only at the base point, not
+    /// off it), producing an O(1) analytic-vs-FD gap (gam#2353). Instead we
+    /// differentiate the bilinear form directly,
+    ///
+    ///   D_u M_ab = f1 (∇q·u) g_a g_b + f (g_a^u g_b + g_a g_b^u),
+    ///
+    /// with `g = ∇q` and `g^u = D_u ∇q`. This is the wiggle generalization of
+    /// the non-wiggle explicit formula (`expected_joint_information_directional_
+    /// from_designs`): `q_t,q_ls` carry the full warp gradient `m·q0_t, m·q0_ls`
+    /// and the wiggle block enters through `∂q/∂β_w[j] = B_j(q0)` with
+    /// `D_u B_j = B'_j(q0)·(∇q0·u)`.
+    pub(super) fn expected_first_directional_rows(
+        &self,
+        d_eta_t: &Array1<f64>,
+        d_eta_ls: &Array1<f64>,
+        u_w: ArrayView1<'_, f64>,
+    ) -> Result<BinomialWiggleFirstDirectionalRows, String> {
+        let n = self.family.y.len();
+        assert_eq!(d_eta_t.len(), n);
+        assert_eq!(d_eta_ls.len(), n);
+        let mut rows = BinomialWiggleFirstDirectionalRows::zeros(n);
+        for row in 0..n {
+            let (f, f1, _) = binomial_expected_q_information_derivatives(
+                self.family.weights[row],
+                self.core.mu[row],
+                self.core.dmu_dq[row],
+                self.core.d2mu_dq2[row],
+                self.core.d3mu_dq3[row],
+            );
+            // Row carries no expected information (weight 0 / saturated tail):
+            // every coefficient below is a multiple of f or f1, so leave the
+            // zero-initialized entries.
+            if f == 0.0 && f1 == 0.0 {
+                continue;
+            }
+            let q0g = nonwiggle_q_derivs(self.eta_t[row], self.core.sigma[row]);
+            let ud = nonwiggle_q_directional(q0g, d_eta_t[row], d_eta_ls[row]);
+            let warp = self.linear_basis_stack(row, self.beta_w.view(), Some(self.etaw[row]));
+            let m = 1.0 + warp[1];
+            let g2 = warp[2];
+            let dir = self.linear_basis_stack(row, u_w, None);
+            let s0_u = dir[0];
+            let s1_u = dir[1];
+            // Full warp gradient of q and its directional derivative along u.
+            let q_t = m * q0g.q_t;
+            let q_ls = m * q0g.q_ls;
+            let delta_q0 = ud.delta_q;
+            let delta_q = q_t * d_eta_t[row] + q_ls * d_eta_ls[row] + s0_u;
+            let delta_m = g2 * delta_q0 + s1_u;
+            let delta_q_t = delta_m * q0g.q_t + m * ud.delta_q_t;
+            let delta_q_ls = delta_m * q0g.q_ls + m * ud.delta_q_ls;
+            rows.coeff_tt[row] = f1 * delta_q * q_t * q_t + 2.0 * f * q_t * delta_q_t;
+            rows.coeff_tl[row] =
+                f1 * delta_q * q_t * q_ls + f * (delta_q_t * q_ls + q_t * delta_q_ls);
+            rows.coeff_ll[row] = f1 * delta_q * q_ls * q_ls + 2.0 * f * q_ls * delta_q_ls;
+            rows.coeff_tw_b[row] = f1 * delta_q * q_t + f * delta_q_t;
+            rows.coeff_tw_d[row] = f * q_t * delta_q0;
+            // coeff_tw_dd stays 0: the expected-info derivative has no B'' channel.
+            rows.coeff_lw_b[row] = f1 * delta_q * q_ls + f * delta_q_ls;
+            rows.coeff_lw_d[row] = f * q_ls * delta_q0;
+            rows.coeff_ww_bb[row] = f1 * delta_q;
+            rows.coeff_ww_bd[row] = f * delta_q0;
+        }
+        Ok(rows)
+    }
+
+    /// Exact second directional derivative `D_v D_u M` of the expected Fisher
+    /// information (companion to [`Self::expected_first_directional_rows`]).
+    ///
+    /// Differentiating `D_u M_ab = f1 (∇q·u) g_a g_b + f(g_a^u g_b + g_a g_b^u)`
+    /// once more along `v` gives
+    ///
+    ///   D_v D_u M_ab = f_uv g_a g_b
+    ///                + f_u (g_a^v g_b + g_a g_b^v) + f_v (g_a^u g_b + g_a g_b^u)
+    ///                + f (g_a^{uv} g_b + g_a^u g_b^v + g_a^v g_b^u + g_a g_b^{uv}),
+    ///
+    /// with `f_u = f1 (∇q·u)`, `f_uv = f2 (∇q·u)(∇q·v) + f1 D_v D_u q`, and the
+    /// gradient/curvature directional derivatives assembled from the q0 warp
+    /// geometry (`nonwiggle_q_derivs`/`nonwiggle_q_directional`) and the wiggle
+    /// basis derivative stack. As in the first-order case the `∂²q` symmetric
+    /// term never appears (gam#2353).
+    pub(super) fn expected_second_directional_rows(
+        &self,
+        d_eta_t_u: &Array1<f64>,
+        d_eta_ls_u: &Array1<f64>,
+        u_w: ArrayView1<'_, f64>,
+        d_eta_t_v: &Array1<f64>,
+        d_eta_ls_v: &Array1<f64>,
+        v_w: ArrayView1<'_, f64>,
+    ) -> Result<BinomialWiggleSecondDirectionalRows, String> {
+        let n = self.family.y.len();
+        assert_eq!(d_eta_t_u.len(), n);
+        assert_eq!(d_eta_ls_u.len(), n);
+        assert_eq!(d_eta_t_v.len(), n);
+        assert_eq!(d_eta_ls_v.len(), n);
+        let mut rows = BinomialWiggleSecondDirectionalRows::zeros(n);
+        for row in 0..n {
+            let (f, f1, f2) = binomial_expected_q_information_derivatives(
+                self.family.weights[row],
+                self.core.mu[row],
+                self.core.dmu_dq[row],
+                self.core.d2mu_dq2[row],
+                self.core.d3mu_dq3[row],
+            );
+            if f == 0.0 && f1 == 0.0 && f2 == 0.0 {
+                continue;
+            }
+            let q0g = nonwiggle_q_derivs(self.eta_t[row], self.core.sigma[row]);
+            let ud = nonwiggle_q_directional(q0g, d_eta_t_u[row], d_eta_ls_u[row]);
+            let vd = nonwiggle_q_directional(q0g, d_eta_t_v[row], d_eta_ls_v[row]);
+            let warp = self.linear_basis_stack(row, self.beta_w.view(), Some(self.etaw[row]));
+            let m = 1.0 + warp[1];
+            let g2 = warp[2];
+            let g3 = warp[3];
+            let du = self.linear_basis_stack(row, u_w, None);
+            let dv = self.linear_basis_stack(row, v_w, None);
+            let q_t = m * q0g.q_t;
+            let q_ls = m * q0g.q_ls;
+            let dq0u = ud.delta_q;
+            let dq0v = vd.delta_q;
+            // Second directional derivative of q0: D_v D_u q0 = (D_v q0_t) u_et
+            // + (D_v q0_ls) u_el.
+            let dq0uv = vd.delta_q_t * d_eta_t_u[row] + vd.delta_q_ls * d_eta_ls_u[row];
+            let dm_u = g2 * dq0u + du[1];
+            let dm_v = g2 * dq0v + dv[1];
+            let dqu = q_t * d_eta_t_u[row] + q_ls * d_eta_ls_u[row] + du[0];
+            let dqv = q_t * d_eta_t_v[row] + q_ls * d_eta_ls_v[row] + dv[0];
+            // D_v D_u q through the warp: D_v(dm_u)·q0-part is folded via dm_v
+            // acting on the u-direction q0 gradient.
+            let dquv = dm_v * (q0g.q_t * d_eta_t_u[row] + q0g.q_ls * d_eta_ls_u[row])
+                + m * dq0uv
+                + du[1] * dq0v;
+            // Gradient directional derivatives g^u, g^v (t and ls components).
+            let gu_t = dm_u * q0g.q_t + m * ud.delta_q_t;
+            let gu_ls = dm_u * q0g.q_ls + m * ud.delta_q_ls;
+            let gv_t = dm_v * q0g.q_t + m * vd.delta_q_t;
+            let gv_ls = dm_v * q0g.q_ls + m * vd.delta_q_ls;
+            // Second directional derivative of the warp slope m and of the q0
+            // gradient (third-order q0 geometry).
+            let dmu_v = g3 * dq0u * dq0v + g2 * dq0uv + du[2] * dq0v + dv[2] * dq0u;
+            let dtu_v = q0g.q_tl_ls * d_eta_ls_u[row] * d_eta_ls_v[row];
+            let dlsu_v = q0g.q_tl_ls
+                * (d_eta_t_u[row] * d_eta_ls_v[row] + d_eta_ls_u[row] * d_eta_t_v[row])
+                + q0g.q_ll_ls * d_eta_ls_u[row] * d_eta_ls_v[row];
+            let guv_t = dmu_v * q0g.q_t + dm_u * vd.delta_q_t + dm_v * ud.delta_q_t + m * dtu_v;
+            let guv_ls =
+                dmu_v * q0g.q_ls + dm_u * vd.delta_q_ls + dm_v * ud.delta_q_ls + m * dlsu_v;
+            let fu = f1 * dqu;
+            let fv = f1 * dqv;
+            let fuv = f2 * dqu * dqv + f1 * dquv;
+            rows.coeff_tt[row] = fuv * q_t * q_t
+                + 2.0 * fu * gv_t * q_t
+                + 2.0 * fv * gu_t * q_t
+                + f * (2.0 * guv_t * q_t + 2.0 * gu_t * gv_t);
+            rows.coeff_tl[row] = fuv * q_t * q_ls
+                + fu * (gv_t * q_ls + q_t * gv_ls)
+                + fv * (gu_t * q_ls + q_t * gu_ls)
+                + f * (guv_t * q_ls + gu_t * gv_ls + gv_t * gu_ls + q_t * guv_ls);
+            rows.coeff_ll[row] = fuv * q_ls * q_ls
+                + 2.0 * fu * gv_ls * q_ls
+                + 2.0 * fv * gu_ls * q_ls
+                + f * (2.0 * guv_ls * q_ls + 2.0 * gu_ls * gv_ls);
+            rows.coeff_tw_b[row] = fuv * q_t + fu * gv_t + fv * gu_t + f * guv_t;
+            rows.coeff_tw_d[row] = fu * q_t * dq0v
+                + fv * q_t * dq0u
+                + f * (gu_t * dq0v + gv_t * dq0u + q_t * dq0uv);
+            rows.coeff_tw_dd[row] = f * q_t * dq0u * dq0v;
+            // coeff_tw_d3 stays 0.
+            rows.coeff_lw_b[row] = fuv * q_ls + fu * gv_ls + fv * gu_ls + f * guv_ls;
+            rows.coeff_lw_d[row] = fu * q_ls * dq0v
+                + fv * q_ls * dq0u
+                + f * (gu_ls * dq0v + gv_ls * dq0u + q_ls * dq0uv);
+            rows.coeff_lw_dd[row] = f * q_ls * dq0u * dq0v;
+            // coeff_lw_d3 stays 0.
+            rows.coeff_ww_bb[row] = fuv;
+            rows.coeff_ww_bd[row] = fu * dq0v + fv * dq0u + f * dq0uv;
+            rows.coeff_ww_bdd[row] = f * dq0u * dq0v;
+            rows.coeff_ww_dd[row] = 2.0 * f * dq0u * dq0v;
+        }
+        Ok(rows)
+    }
 }
 
 #[derive(Clone)]
@@ -2628,12 +2821,7 @@ impl BinomialLocationScaleWiggleFamily {
         let (u_t, u_ls, u_w) = layout.split_three(d_beta_flat, "expected wiggle d_beta")?;
         let d_eta_t = fast_av(&x_t, &u_t);
         let d_eta_ls = fast_av(&x_ls, &u_ls);
-        let rows = program.first_directional_rows(
-            &d_eta_t,
-            &d_eta_ls,
-            u_w.view(),
-            BinomialWiggleRowOuter::ExpectedInformation,
-        )?;
+        let rows = program.expected_first_directional_rows(&d_eta_t, &d_eta_ls, u_w.view())?;
         Ok(Some(rows.assemble_dense(
             x_t.as_ref(),
             x_ls.as_ref(),
@@ -2659,14 +2847,13 @@ impl BinomialLocationScaleWiggleFamily {
         let d_eta_ls_u = fast_av(&x_ls, &u_ls);
         let d_eta_t_v = fast_av(&x_t, &v_t);
         let d_eta_ls_v = fast_av(&x_ls, &v_ls);
-        let rows = program.second_directional_rows(
+        let rows = program.expected_second_directional_rows(
             &d_eta_t_u,
             &d_eta_ls_u,
             u_w.view(),
             &d_eta_t_v,
             &d_eta_ls_v,
             v_w.view(),
-            BinomialWiggleRowOuter::ExpectedInformation,
         )?;
         Ok(Some(rows.assemble_dense(
             x_t.as_ref(),
