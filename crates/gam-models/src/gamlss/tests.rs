@@ -2545,6 +2545,24 @@ pub(crate) fn bls_wiggle_workspace_fixture() -> (
     Array2<f64>,
     Array2<f64>,
 ) {
+    bls_wiggle_workspace_fixture_with_link(InverseLink::Standard(StandardLink::Probit))
+}
+
+/// Link-parametrized variant of [`bls_wiggle_workspace_fixture`]. The expected
+/// Fisher information derivative machinery is link-agnostic (it consumes only
+/// `f, f1, f2` from the shared q-information kernel plus the warp geometry), so
+/// exercising a second link — e.g. logit — is an independent angle on the same
+/// assembly (gam#2353).
+pub(crate) fn bls_wiggle_workspace_fixture_with_link(
+    link_kind: InverseLink,
+) -> (
+    BinomialLocationScaleWiggleFamily,
+    Vec<ParameterBlockState>,
+    Vec<ParameterBlockSpec>,
+    Array2<f64>,
+    Array2<f64>,
+    Array2<f64>,
+) {
     let n = 10usize;
     let pt = 3usize;
     let pls = 2usize;
@@ -2571,7 +2589,7 @@ pub(crate) fn bls_wiggle_workspace_fixture() -> (
     let family = BinomialLocationScaleWiggleFamily {
         y,
         weights,
-        link_kind: InverseLink::Standard(StandardLink::Probit),
+        link_kind,
         threshold_design: Some(threshold_design.clone()),
         log_sigma_design: Some(log_sigma_design.clone()),
         wiggle_knots: knots,
@@ -2766,7 +2784,33 @@ pub(crate) fn binomial_location_scale_wiggle_workspace_dh_operator_finite_differ
 
 #[test]
 pub(crate) fn binomial_location_scale_wiggle_expected_info_derivatives_match_finite_difference() {
-    let (family, states, specs, xt, xls, xw_at_base) = bls_wiggle_workspace_fixture();
+    check_bls_wiggle_expected_info_derivatives_match_fd(bls_wiggle_workspace_fixture());
+}
+
+/// Same expected-info directional/second-directional FD acceptance gate on the
+/// LOGIT link — an independent angle on the link-agnostic derivative assembly.
+/// A regression of the gam#2353 spurious-curvature term would surface here too
+/// because logit changes every `f, f1, f2` yet reuses the identical warp
+/// geometry and coefficient assembly.
+#[test]
+pub(crate) fn binomial_location_scale_wiggle_expected_info_derivatives_match_finite_difference_logit()
+{
+    check_bls_wiggle_expected_info_derivatives_match_fd(bls_wiggle_workspace_fixture_with_link(
+        InverseLink::Standard(StandardLink::Logit),
+    ));
+}
+
+fn check_bls_wiggle_expected_info_derivatives_match_fd(
+    fixture: (
+        BinomialLocationScaleWiggleFamily,
+        Vec<ParameterBlockState>,
+        Vec<ParameterBlockSpec>,
+        Array2<f64>,
+        Array2<f64>,
+        Array2<f64>,
+    ),
+) {
+    let (family, states, specs, xt, xls, xw_at_base) = fixture;
     let p = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
     let pt = states[0].beta.len();
     let pls = states[1].beta.len();
