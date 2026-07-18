@@ -25,6 +25,7 @@ mod inner_strategy;
 pub mod jeffreys_subspace;
 pub mod outer_eval;
 pub mod penalty_logdet;
+pub mod reparameterized_inner;
 pub mod per_atom_efs;
 pub mod reml_outer_engine;
 mod rho_key;
