@@ -3109,7 +3109,7 @@ impl SaeManifoldTerm {
 #[cfg(test)]
 mod test_support {
     use super::{
-        ArrowFactorCache, DeflatedArrowSolver, SaeArrowVector, SaeCriterionError, SaeManifoldRho,
+        ArrowFactorCache, DeflatedArrowSolver, SaeArrowVector, SaeManifoldRho,
         ThetaAdjointDhChannel,
     };
     use ndarray::{Array1, s};
