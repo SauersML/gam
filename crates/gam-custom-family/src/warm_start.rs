@@ -969,11 +969,6 @@ pub(crate) struct CustomOuterState {
 }
 
 impl CustomOuterState {
-    #[cfg(test)]
-    pub(crate) fn new(warm_start: Option<ConstrainedWarmStart>) -> Self {
-        Self::new_with_cold_signal(warm_start, Arc::new(AtomicBool::new(false)))
-    }
-
     pub(crate) fn new_with_cold_signal(
         warm_start: Option<ConstrainedWarmStart>,
         force_cold_signal: Arc<AtomicBool>,
@@ -1210,4 +1205,20 @@ pub(crate) fn outer_eval_result_into_joint_hyper_owned_result(
 
 pub(crate) struct OwnedDenseHessianOperator {
     pub(crate) matrix: Array2<f64>,
+}
+
+#[cfg(test)]
+mod test_support {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use super::{ConstrainedWarmStart, CustomOuterState};
+
+    impl CustomOuterState {
+        /// Test-only constructor: a fresh private cold-reeval signal (#2349),
+        /// for tests that never exercise the stuck-stall pulse.
+        pub(crate) fn new(warm_start: Option<ConstrainedWarmStart>) -> Self {
+            Self::new_with_cold_signal(warm_start, Arc::new(AtomicBool::new(false)))
+        }
+    }
 }
