@@ -1549,6 +1549,16 @@ pub fn fit_response_curvature(
         (current, false, false)
     };
     let kappa_hat = jet.kappa;
+    // #2351: the hyperbolic rail flag must also fire on the BOUNDARY-LAYER
+    // interior optimum. Near the chart-domain edge the conformal restoring
+    // force diverges and can pin a nominally-interior stationary point a
+    // fraction of a percent inside κ_min (measured on isotropic unit-vector
+    // clouds: κ̂/κ_min ≈ 0.997 with p → 0). Dimensionlessly, κ̂ ≤ 0.99·κ_min
+    // means the fitted curvature says the cloud fills ≥ 99% of the hyperbolic
+    // ball of its own spread — the estimate is chart-limited, not resolved,
+    // regardless of whether the KKT condition binds exactly AT the bound.
+    let railed_at_hyperbolic_resolution_limit =
+        railed_at_hyperbolic_resolution_limit || kappa_hat <= 0.99 * kappa_min;
     let v_p_hat = jet.value;
     let base = jet.base.clone();
 
