@@ -18,6 +18,12 @@ gam <command> --help
 | `gam sample MODEL DATA [--out posterior.csv]` | Draw posterior coefficients. |
 | `gam generate MODEL DATA [--out generated.csv]` | Draw synthetic responses from a fitted model. |
 | `gam report MODEL [DATA] [OUT]` | Write a self-contained HTML report. |
+| `gam crosscoder --anchor L=F --block L=F --atoms N --harmonics N --out REPORT.json` | Fit a row-aligned manifold crosscoder across activation matrices and write a GAM-SAE report. |
+| `gam transformation-score MODEL DATA [--out scores.csv]` | Evaluate a fitted conditional transformation model at observed responses. |
+
+Every subcommand also accepts `--log-level off|error|warn|info|debug|trace`
+(default `warn`), and the shorthands `-v`/`-vv`/`-vvv` (increasing verbosity)
+and `-q` (quiet). `--log-level` wins if both are given.
 
 ## Fit
 
@@ -102,6 +108,41 @@ gam generate model.gam new.csv --n-draws 20 --seed 42 --out generated.csv
 `gam sample` defaults its output to `<model_stem>.posterior.csv` when
 `--out` is omitted. `gam generate` defaults to
 `<model_stem>.generated.csv`.
+
+## Transformation Score
+
+For a fitted `--transformation-normal` model, evaluate the latent score
+`h(y|x)` at observed responses (rather than predicting `y` itself):
+
+```bash
+gam transformation-score model.gam labelled.csv --out scores.csv
+```
+
+`--offset-column` and `--id-column` behave as in `predict`.
+
+## Crosscoder
+
+Fit a row-aligned manifold crosscoder across two or more activation
+matrices (e.g. matched-row hidden states from different model layers)
+and write a GAM-SAE report:
+
+```bash
+gam crosscoder \
+  --anchor base=layer0.npy \
+  --block  tuned=layer1.npy \
+  --atoms 8 --harmonics 4 \
+  --out crosscoder_report.json
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--anchor LABEL=FILE` | Named anchor activation matrix (2-D `.npy`, floating point). |
+| `--block LABEL=FILE` | Named non-anchor activation matrix, row-aligned with the anchor. Repeat once per additional layer. |
+| `--atoms N` | Number of shared manifold atoms. |
+| `--harmonics N` | Harmonic order of each periodic manifold atom. |
+| `--sparsity-strength`, `--smoothness`, `--max-iter`, `--learning-rate`, `--ridge-ext-coord`, `--ridge-beta`, `--random-state` | Overrides for the underlying Rust library defaults. |
+| `--outer-rho-search true|false` | Whether the unified REML outer-rho search runs. |
+| `--transport-grid-resolution N`, `--law-gap-tolerance VALUE` | Grid resolution and tolerance for classifying consecutive-layer transport. |
 
 ## Formula Notes
 
