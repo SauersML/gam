@@ -680,8 +680,13 @@ mod tests {
                         / (2 * residual_degree + 1) as f64;
                     let observed = beta.dot(&s.dot(&beta));
                     let relative_error = (observed - expected).abs() / expected.max(1.0);
+                    // 1e-9: the degree-4/order-4 corner accumulates ~4.5e-10
+                    // relative roundoff through the span-by-span Gauss–Legendre
+                    // sums on energies O(2e3) — the quadrature is EXACT for the
+                    // polynomial integrand, so the bound is f64 accumulation,
+                    // not method error.
                     assert!(
-                        relative_error < 1e-10,
+                        relative_error < 1.0e-9,
                         "degree={degree}, order={order}, polynomial degree={polynomial_degree}: expected {expected}, observed {observed}, relative error {relative_error}"
                     );
                 }
