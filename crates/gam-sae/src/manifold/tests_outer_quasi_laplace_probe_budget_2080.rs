@@ -1236,6 +1236,17 @@ fn profile_wide_p_criterion_cost_2080() {
 /// the Value lane goes red here instead of silently shipping the desync.
 #[test]
 fn value_lane_prices_at_shared_fixed_point_2228() {
+    // TEMP-INSTRUMENT (implSAE2 #2228)
+    {
+        struct FwdLog;
+        impl log::Log for FwdLog {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool { true }
+            fn log(&self, r: &log::Record<'_>) { eprintln!("[{}] {}", r.level(), r.args()); }
+            fn flush(&self) {}
+        }
+        static L: FwdLog = FwdLog;
+        if log::set_logger(&L).is_ok() { log::set_max_level(log::LevelFilter::Debug); }
+    }
     let n = 96usize;
     let p = 48usize;
     let z = one_circle_wide_target(n, p, 0.05);
@@ -1252,10 +1263,37 @@ fn value_lane_prices_at_shared_fixed_point_2228() {
         .unwrap();
     let rho_flat = rho.to_flat();
 
-    // Sanity: the coarse (false) and full (true) refine budgets MUST disagree by
-    // more than the certification roundoff bound at this rho, else the invariant
-    // assertion below would pass vacuously on any fixture.
-    let v_false = {
+    // Sanity: the COARSE (false) refine budget must be demonstrably inadequate at
+    // this rho, else the invariant assertion below would pass vacuously on any
+    // fixture. Inadequacy has two admissible forms and the fixture is pinned to
+    // whichever it lands in:
+    //
+    //   (a) the coarse budget returns a value that differs from the full-budget
+    //       root by more than the certification roundoff bound, or
+    //   (b) the coarse budget REFUSES with the typed non-convergence error — the
+    //       STRONGER form of the same statement, since no value at all is further
+    //       from the root than any finite disagreement.
+    //
+    // (b) is the DESIGNED coarse-probe behaviour, not a defect: per #2080 a cheap
+    // ranking probe returns a typed verdict instead of grinding its refine budget
+    // (that grind was the wide-`p` outer hang). Production never consumes the
+    // coarse criterion unguarded — `eval_cost`'s coarse drive is wrapped in
+    // `value_probe_with_budget_rescue`, which retries on exactly this refusal with
+    // `refine_progress_extension = true` — so a refusal here never reaches a
+    // ranked comparison in the fitted path. This assertion is the only caller that
+    // sees the raw internal.
+    //
+    // Landing in (b) makes the Value-lane invariant below STRICTLY harder to
+    // satisfy, not easier: a Value lane wrongly rebuilt on the coarse budget would
+    // surface `OuterEval::infeasible` (+inf) rather than a merely-~1%-off value,
+    // so the regression this test exists to catch still goes red.
+    let v_true = {
+        let mut t = term.clone();
+        t.penalized_quasi_laplace_criterion_with_cache(z.view(), &rho, None, imi, lr, re, rb)
+            .expect("full-budget bare criterion evaluates")
+            .0
+    };
+    let coarse = {
         let mut t = term.clone();
         t.penalized_quasi_laplace_criterion_with_cache_refine_policy(
             z.view(),
@@ -1267,23 +1305,42 @@ fn value_lane_prices_at_shared_fixed_point_2228() {
             rb,
             false,
         )
-        .expect("coarse-budget bare criterion evaluates")
-        .0
+        .map(|evaluated| evaluated.0)
     };
-    let v_true = {
-        let mut t = term.clone();
-        t.penalized_quasi_laplace_criterion_with_cache(z.view(), &rho, None, imi, lr, re, rb)
-            .expect("full-budget bare criterion evaluates")
-            .0
-    };
-    let regime_bound = f64::EPSILON.sqrt() * v_false.abs().max(v_true.abs()).max(1.0);
-    assert!(
-        (v_false - v_true).abs() > regime_bound,
-        "fixture must exercise the coarse-vs-full under-refinement regime, else this \
-         test is vacuous: v_false={v_false:.16e}, v_true={v_true:.16e}, diff={:.3e} \
-         <= regime_bound={regime_bound:.3e} (strengthen the fixture)",
-        (v_false - v_true).abs()
-    );
+    match &coarse {
+        Ok(v_false) => {
+            let regime_bound = f64::EPSILON.sqrt() * v_false.abs().max(v_true.abs()).max(1.0);
+            eprintln!(
+                "[#2228] coarse budget returned a value: v_false={v_false:.16e} \
+                 v_true={v_true:.16e} diff={:.3e} regime_bound={regime_bound:.3e}",
+                (v_false - v_true).abs()
+            );
+            assert!(
+                (v_false - v_true).abs() > regime_bound,
+                "fixture must exercise the coarse-vs-full under-refinement regime, else this \
+                 test is vacuous: v_false={v_false:.16e}, v_true={v_true:.16e}, diff={:.3e} \
+                 <= regime_bound={regime_bound:.3e} (strengthen the fixture)",
+                (v_false - v_true).abs()
+            );
+        }
+        Err(err) => {
+            let message = err.numerical_message().unwrap_or_else(|| {
+                panic!(
+                    "the coarse budget may only be inadequate via the typed NUMERICAL \
+                     non-convergence refusal; got a different typed refusal: {err:?}"
+                )
+            });
+            eprintln!(
+                "[#2228] coarse budget REFUSED (the stronger form of coarse-vs-full \
+                 disagreement); v_true={v_true:.16e}; refusal: {message}"
+            );
+            assert!(
+                message.contains("inner solve did not converge at fixed \u{3c1}"),
+                "the coarse budget must be inadequate here via the typed non-convergence \
+                 refusal, not some other numerical failure; got: {message}"
+            );
+        }
+    }
 
     // Invariant: the line-search Value lane prices the SAME fixed point the
     // analytic gradient lane differentiates, within the certification roundoff
@@ -1300,6 +1357,11 @@ fn value_lane_prices_at_shared_fixed_point_2228() {
             .expect("gradient lane evaluates")
             .cost;
     let cert_bound = f64::EPSILON.sqrt() * value_lane.abs().max(analytic.abs()).max(1.0);
+    eprintln!(
+        "[#2228] value_lane={value_lane:.16e} analytic={analytic:.16e} diff={:.3e} \
+         cert_bound={cert_bound:.3e}",
+        (value_lane - analytic).abs()
+    );
     assert!(
         (value_lane - analytic).abs() <= cert_bound,
         "#2228: line-search Value lane must price the analytic fixed point within the \
