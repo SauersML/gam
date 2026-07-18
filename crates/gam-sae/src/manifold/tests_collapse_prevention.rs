@@ -1795,6 +1795,35 @@ fn jeffreys_two_atom_term(n: usize, dec0: [f64; 3], dec1: [f64; 3]) -> SaeManifo
     SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap()
 }
 
+/// The production separation barrier's SMOOTH spectral floor
+/// `m(λ) = ε·softplus((λ + ε)/ε)` ([`SaeManifoldTerm::barrier_spectral_m`]),
+/// restated here in closed form so the references below price the same object
+/// the production value does.
+///
+/// This floor — NOT the hard `m(λ) = λ + ε` these references used to hard-code —
+/// is applied to every eigenvalue of the component matrix `F`. The two agree only
+/// in the asymptotic regime `(λ + ε)/ε ≫ 1`, and this K=2 softmax fixture is far
+/// from it: two softmax gates over n = 48/64 rows give `N_eff ≈ 12/16`, hence
+/// `ε_C = 2·√(2/N_eff) ≈ 0.80/0.69`, so `(λ + ε)/ε` sits at ≈1–3 where softplus is
+/// still strongly curved. Pricing these fixtures with the hard floor overstated the
+/// barrier by ≈2.03× (n=48, o=0.98) and ≈1.85× (n=64, o=0.93) — the historical
+/// references predate the smooth floor and were never re-derived.
+///
+/// What stays independent is the part that actually tests the assembly: the
+/// component's `F = [[1, r], [r, 1]]` has eigenvalues `1 ± r` in CLOSED FORM, and
+/// `r = q·o`, `ε_C` are rebuilt here from the realized routing rather than read
+/// back from production. Only the scalar floor is a shared definition.
+fn barrier_spectral_m_reference(lam: f64, eps: f64) -> f64 {
+    let x = (lam + eps) / eps;
+    if x >= 30.0 {
+        lam + eps
+    } else if x <= -30.0 {
+        eps * x.exp()
+    } else {
+        eps * x.exp().ln_1p()
+    }
+}
+
 /// Independently reconstruct the two-atom Jeffreys value from the realized
 /// routing. Returns `(value, q, eps)`, where `q` is the coactivation cosine and
 /// `eps` is the sampling-resolution shift.
@@ -1811,7 +1840,12 @@ fn two_atom_jeffreys_reference(term: &SaeManifoldTerm, overlap: f64) -> (f64, f6
     let q = cross / (e0 * e1).sqrt();
     let eps = 2.0 * (2.0 / e0.min(e1)).sqrt();
     let r = q * overlap;
-    let value = -0.5 * ((1.0 + r + eps).ln() + (1.0 - r + eps).ln() - 2.0 * (1.0 + eps).ln());
+    // `F = [[1, r], [r, 1]]` ⇒ closed-form eigenvalues `1 ± r`; the production
+    // value is `−½·Σ_i [ln m(λ_i) − ln m(1)]` under the smooth spectral floor.
+    let value = -0.5
+        * (barrier_spectral_m_reference(1.0 + r, eps).ln()
+            + barrier_spectral_m_reference(1.0 - r, eps).ln()
+            - 2.0 * barrier_spectral_m_reference(1.0, eps).ln());
     (value, q, eps)
 }
 
@@ -1895,8 +1929,9 @@ fn jeffreys_total_information_factorization_is_sample_size_invariant() {
     let r = q * overlap;
     for sample_mass in [1.0_f64, 7.0, 1.0e3, 1.0e6] {
         let total_information_value = -0.5
-            * ((sample_mass * (1.0 + r + eps)).ln() + (sample_mass * (1.0 - r + eps)).ln()
-                - 2.0 * (sample_mass * (1.0 + eps)).ln());
+            * ((sample_mass * barrier_spectral_m_reference(1.0 + r, eps)).ln()
+                + (sample_mass * barrier_spectral_m_reference(1.0 - r, eps)).ln()
+                - 2.0 * (sample_mass * barrier_spectral_m_reference(1.0, eps)).ln());
         assert!(
             (total_information_value - production).abs() <= 2.0e-12,
             "the common s·log(N_eff) factor must cancel: N_eff={sample_mass:e}, \
