@@ -394,13 +394,18 @@ pub(crate) const EFFECTIVE_DF_FLOOR: f64 = 1.0;
 ///    retry-stall / empty-`block_states` failure paths surface. The ceiling stays
 ///    a wide margin below that region.
 ///
-/// `15.0` (λ ≈ 3.3M) clears every legitimate REML optimum observed on the
-/// location-scale / dispersion / survival custom families while keeping a > 5 ρ
-/// unit guard below the ρ ≈ 20 breakdown region. The per-term `EFFECTIVE_DF_FLOOR`
-/// bound — not this uniform cap — is what protects a term from collapsing onto
-/// its unpenalized null space, so raising the uniform ceiling only frees the
-/// coordinates whose honest optimum was being clipped.
-pub(crate) const EFFECTIVE_DF_CEILING: f64 = 15.0;
+/// `12.0` (λ ≈ 163k) is the smallest raise that clears the #1561 mean-smooth
+/// optimum (ρ_μ ≈ 11.06 on the plain arm) with real headroom, and it matches the
+/// value the spatial exact-joint location-scale path already boxes ρ to
+/// (`location_scale_engine::EXACT_JOINT_RHO_BOUND`) — a regime that path fits
+/// stably. Pushing the uniform ceiling further (e.g. 15) let some delicate
+/// wiggle / real-data tp location-scale fits (gagurine, the spatial
+/// engine↔reference parity fixtures) explore a warm-start/inner-solve path where
+/// the joint PIRLS stopped converging, so 12 keeps the raise tight. The per-term
+/// `EFFECTIVE_DF_FLOOR` bound — not this uniform cap — is what protects a term
+/// from collapsing onto its unpenalized null space, so this only frees the
+/// coordinates whose honest optimum was being clipped at ρ = 10.
+pub(crate) const EFFECTIVE_DF_CEILING: f64 = 12.0;
 
 /// Unit-weight effective degrees of freedom of a single penalized term as a
 /// function of `ρ = log λ`, expressed through the design/penalty generalized
