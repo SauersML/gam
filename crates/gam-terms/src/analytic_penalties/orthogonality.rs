@@ -738,6 +738,20 @@ impl DecoderIncoherencePenalty {
         out
     }
 
+    /// Squared Frobenius norm `‖B_x‖²_F = Σ_{a,o} B_x[a,o]²` of atom `x`'s decoder
+    /// block. #2343: the decoder-incoherence penalty is normalized by the LIVE
+    /// `‖B_j‖²_F·‖B_k‖²_F` so the penalized coherence is homogeneous degree-0 in
+    /// each decoder radius (radial derivative ≡ 0 by Euler) — the normalizer is
+    /// differentiated analytically in `grad_target`, never frozen.
+    fn block_norm_sq(target: ArrayView1<'_, f64>, off: usize, m: usize, p_out: usize) -> f64 {
+        let mut s = 0.0;
+        for i in 0..(m * p_out) {
+            let v = target[off + i];
+            s += v * v;
+        }
+        s
+    }
+
     /// Shared kernel for the two curvature operators. Accumulates, per penalized
     /// atom pair `(j, k)`, the Gauss-Newton term `W·Σ_b dC[a,b]·B_k[b,o]` (and
     /// its `_k` transpose) always, and the residual term `W·Σ_b C[a,b]·V_k[b,o]`
@@ -769,8 +783,16 @@ impl DecoderIncoherencePenalty {
                 let off_k = offsets[k];
                 let m_j = self.block_sizes[j];
                 let m_k = self.block_sizes[k];
-                // Directional Gram derivative driving the Gauss-Newton term:
-                //   dC[a, b] = Σ_o (Vj[a, o]·Bk[b, o] + Bj[a, o]·Vk[b, o]).
+                // #2343 — curvature of the degree-0 normalized penalty
+                // `½·w·E/(N_j·N_k)`, whose gradient is `κ·(G_j − (E/N_j)B_j)` with
+                // `κ = w_pair/(N_j·N_k)`, `G_j[a,o]=Σ_b C[a,b]B_k[b,o]`, `E=‖C‖²_F`.
+                let nj = Self::block_norm_sq(target, off_j, m_j, p_out);
+                let nk = Self::block_norm_sq(target, off_k, m_k, p_out);
+                if !(nj > 0.0 && nk > 0.0) {
+                    continue;
+                }
+                let kappa = w_pair / (nj * nk);
+                // Directional cross-Gram derivative dC[a,b] = Σ_o (Vj·Bk + Bj·Vk).
                 let mut d_c = Array2::<f64>::zeros((m_j, m_k));
                 for a in 0..m_j {
                     for b in 0..m_k {
@@ -782,37 +804,92 @@ impl DecoderIncoherencePenalty {
                         d_c[[a, b]] = s;
                     }
                 }
-                // Cross-Gram C[a, b] = Σ_o Bj[a, o]·Bk[b, o] feeds the residual
-                // term; only materialized for the exact Hessian path.
-                let c = if include_residual {
-                    Some(Self::cross_gram(target, off_j, m_j, off_k, m_k, p_out))
-                } else {
-                    None
-                };
-                // out_j[a, o] += w · Σ_b ( dC[a, b]·Bk[b, o] + C[a, b]·Vk[b, o] )
-                for a in 0..m_j {
-                    for o in 0..p_out {
-                        let mut s = 0.0;
-                        for b in 0..m_k {
-                            s += d_c[[a, b]] * target[off_k + b * p_out + o];
-                            if let Some(c) = &c {
-                                s += c[[a, b]] * v[off_k + b * p_out + o];
+                if !include_residual {
+                    // PSD Gauss-Newton majorizer: the same directional-Gram Gram as
+                    // before, scaled by the LIVE κ (not the frozen weight). Dropping
+                    // the residual + normalizer-second-derivative terms keeps it PSD
+                    // (`κ·JᵀJ`, κ>0); see `accumulate_psd_majorizer_dense` for the
+                    // solver-contract note (#2343).
+                    for a in 0..m_j {
+                        for o in 0..p_out {
+                            let mut s = 0.0;
+                            for b in 0..m_k {
+                                s += d_c[[a, b]] * target[off_k + b * p_out + o];
                             }
+                            out[off_j + a * p_out + o] += kappa * s;
                         }
-                        out[off_j + a * p_out + o] += w_pair * s;
+                    }
+                    for b in 0..m_k {
+                        for o in 0..p_out {
+                            let mut s = 0.0;
+                            for a in 0..m_j {
+                                s += d_c[[a, b]] * target[off_j + a * p_out + o];
+                            }
+                            out[off_k + b * p_out + o] += kappa * s;
+                        }
+                    }
+                    continue;
+                }
+                // EXACT ∂²P·v of the quotient penalty (differentiates the analytic
+                // normalizer — no frozen-cache shortcut, #2343). With α=2⟨Bj,Vj⟩/Nj,
+                // β=2⟨Bk,Vk⟩/Nk, DE=2Σ C·dC:
+                //   (Hv)_j = κ[ DG_j − (α+β)G_j − (DE/Nj)Bj + (E/Nj)(2α+β)Bj − (E/Nj)Vj ]
+                // (and j↔k, with 2α+β → 2β+α). DG_j=Σ_b(dC·Bk + C·Vk).
+                let c = Self::cross_gram(target, off_j, m_j, off_k, m_k, p_out);
+                let mut e = 0.0;
+                let mut d_e = 0.0;
+                for a in 0..m_j {
+                    for b in 0..m_k {
+                        e += c[[a, b]] * c[[a, b]];
+                        d_e += 2.0 * c[[a, b]] * d_c[[a, b]];
                     }
                 }
-                // out_k[b, o] += w · Σ_a ( dC[a, b]·Bj[a, o] + C[a, b]·Vj[a, o] )
+                let mut bjvj = 0.0;
+                for i in 0..(m_j * p_out) {
+                    bjvj += target[off_j + i] * v[off_j + i];
+                }
+                let mut bkvk = 0.0;
+                for i in 0..(m_k * p_out) {
+                    bkvk += target[off_k + i] * v[off_k + i];
+                }
+                let alpha = 2.0 * bjvj / nj;
+                let beta = 2.0 * bkvk / nk;
+                let e_o_nj = e / nj;
+                let e_o_nk = e / nk;
+                let de_o_nj = d_e / nj;
+                let de_o_nk = d_e / nk;
+                for a in 0..m_j {
+                    for o in 0..p_out {
+                        let mut g_j = 0.0;
+                        let mut dg_j = 0.0;
+                        for b in 0..m_k {
+                            g_j += c[[a, b]] * target[off_k + b * p_out + o];
+                            dg_j += d_c[[a, b]] * target[off_k + b * p_out + o]
+                                + c[[a, b]] * v[off_k + b * p_out + o];
+                        }
+                        let bj = target[off_j + a * p_out + o];
+                        let vj = v[off_j + a * p_out + o];
+                        let hv = dg_j - (alpha + beta) * g_j - de_o_nj * bj
+                            + e_o_nj * (2.0 * alpha + beta) * bj
+                            - e_o_nj * vj;
+                        out[off_j + a * p_out + o] += kappa * hv;
+                    }
+                }
                 for b in 0..m_k {
                     for o in 0..p_out {
-                        let mut s = 0.0;
+                        let mut g_k = 0.0;
+                        let mut dg_k = 0.0;
                         for a in 0..m_j {
-                            s += d_c[[a, b]] * target[off_j + a * p_out + o];
-                            if let Some(c) = &c {
-                                s += c[[a, b]] * v[off_j + a * p_out + o];
-                            }
+                            g_k += c[[a, b]] * target[off_j + a * p_out + o];
+                            dg_k += d_c[[a, b]] * target[off_j + a * p_out + o]
+                                + c[[a, b]] * v[off_j + a * p_out + o];
                         }
-                        out[off_k + b * p_out + o] += w_pair * s;
+                        let bk = target[off_k + b * p_out + o];
+                        let vk = v[off_k + b * p_out + o];
+                        let hv = dg_k - (alpha + beta) * g_k - de_o_nk * bk
+                            + e_o_nk * (2.0 * beta + alpha) * bk
+                            - e_o_nk * vk;
+                        out[off_k + b * p_out + o] += kappa * hv;
                     }
                 }
             }
@@ -855,14 +932,26 @@ impl DecoderIncoherencePenalty {
         let weight = self.resolved_weight(rho);
         let p = self.p_out;
         for &(j, k, w_sym) in &self.pairs {
-            let w = w_sym * weight * scale;
-            if w == 0.0 {
-                continue;
-            }
             let off_j = offsets[j];
             let off_k = offsets[k];
             let m_j = self.block_sizes[j];
             let m_k = self.block_sizes[k];
+            // #2343 — LIVE per-pair coefficient κ = w·scale/(N_j·N_k). The
+            // Gauss-Newton scatter below is `κ·JᵀJ` (J = ∂C/∂B), which is PSD for
+            // any κ>0 — the solver's only hard requirement of this majorizer (a
+            // PSD curvature stand-in for the nonconvex penalty; the inner Newton
+            // never assumes it DOMINATES the exact Hessian, only that it is PSD,
+            // so dropping the quotient's indefinite normalizer-second-derivative
+            // terms — largest exactly in the collapse regime — is contract-safe).
+            let nj = Self::block_norm_sq(target, off_j, m_j, self.p_out);
+            let nk = Self::block_norm_sq(target, off_k, m_k, self.p_out);
+            if !(nj > 0.0 && nk > 0.0) {
+                continue;
+            }
+            let w = w_sym * weight * scale / (nj * nk);
+            if w == 0.0 {
+                continue;
+            }
             // Per-pair output Grams G_j = B_jᵀB_j and G_k = B_kᵀB_k (p × p), which
             // drive the within-block diagonal curvature of the partner atom.
             let mut g_j = vec![0.0_f64; p * p];
@@ -935,6 +1024,16 @@ impl AnalyticPenalty for DecoderIncoherencePenalty {
                 if w_pair == 0.0 {
                     continue;
                 }
+                // #2343 — degree-0 normalized coherence `‖C‖²_F/(N_j·N_k)`. When an
+                // atom's radius is exactly zero it has no direction to be coherent
+                // with, so the normalized penalty is undefined there and abstains
+                // (the interior amplitude barrier owns that collapse point); every
+                // reachable atom carries positive energy.
+                let nj = Self::block_norm_sq(target, offsets[j], self.block_sizes[j], self.p_out);
+                let nk = Self::block_norm_sq(target, offsets[k], self.block_sizes[k], self.p_out);
+                if !(nj > 0.0 && nk > 0.0) {
+                    continue;
+                }
                 let c = Self::cross_gram(
                     target,
                     offsets[j],
@@ -947,7 +1046,7 @@ impl AnalyticPenalty for DecoderIncoherencePenalty {
                 for &value in c.iter() {
                     frob_sq += value * value;
                 }
-                acc += w_pair * frob_sq;
+                acc += w_pair * frob_sq / (nj * nk);
             }
         }
         0.5 * self.resolved_weight(rho) * acc
@@ -970,25 +1069,42 @@ impl AnalyticPenalty for DecoderIncoherencePenalty {
                 let off_k = offsets[k];
                 let m_j = self.block_sizes[j];
                 let m_k = self.block_sizes[k];
+                let nj = Self::block_norm_sq(target, off_j, m_j, self.p_out);
+                let nk = Self::block_norm_sq(target, off_k, m_k, self.p_out);
+                if !(nj > 0.0 && nk > 0.0) {
+                    continue;
+                }
                 let c = Self::cross_gram(target, off_j, m_j, off_k, m_k, self.p_out);
-                // grad_j[a, o] += w · Σ_b C[a, b] · B_k[b, o]
+                let mut e = 0.0;
+                for &value in c.iter() {
+                    e += value * value;
+                }
+                // #2343 — degree-0 quotient gradient of `½·w·E/(N_j·N_k)`:
+                //   ∂P/∂B_j[a,o] = (w/(N_j N_k))·( Σ_b C[a,b]·B_k[b,o] − (E/N_j)·B_j[a,o] ).
+                // The `−(E/N_j)·B_j` term is the radial projection; by Euler's theorem
+                // (P homogeneous degree-0 in B_j) Σ_{a,o} B_j·∂P/∂B_j = w/(N_j N_k)·(E−E) = 0,
+                // i.e. the repulsion exerts NO radial (amplitude) force — it prices
+                // decoder DIRECTION only, and the interior amplitude barrier prices
+                // amplitude. This is what kills the #2343 inward collapse force.
+                let inv_j = w_pair / (nj * nk);
                 for a in 0..m_j {
                     for o in 0..self.p_out {
                         let mut s = 0.0;
                         for b in 0..m_k {
                             s += c[[a, b]] * target[off_k + b * self.p_out + o];
                         }
-                        grad[off_j + a * self.p_out + o] += w_pair * s;
+                        let radial = (e / nj) * target[off_j + a * self.p_out + o];
+                        grad[off_j + a * self.p_out + o] += inv_j * (s - radial);
                     }
                 }
-                // grad_k[b, o] += w · Σ_a C[a, b] · B_j[a, o]
                 for b in 0..m_k {
                     for o in 0..self.p_out {
                         let mut s = 0.0;
                         for a in 0..m_j {
                             s += c[[a, b]] * target[off_j + a * self.p_out + o];
                         }
-                        grad[off_k + b * self.p_out + o] += w_pair * s;
+                        let radial = (e / nk) * target[off_k + b * self.p_out + o];
+                        grad[off_k + b * self.p_out + o] += inv_j * (s - radial);
                     }
                 }
             }

@@ -2042,3 +2042,123 @@ fn unscaled_jeffreys_assembled_gradient_matches_penalized_objective_fd() {
          {worst_rel:.3e} at beta index {worst_idx}"
     );
 }
+
+/// #2343 — IN-SITU acceptance: at the decoder-collapse point the interior
+/// AMPLITUDE barrier is the sole meaningful radial (amplitude) force, and the
+/// decoder repulsion is inert against it. Two clauses pin the root cause:
+///
+///  (1) the repulsion's OWN in-situ radial force — measured through the exact
+///      assembled penalty (`live_decoder_repulsion_penalty`, frozen gate + LIVE
+///      norms) — is negligible relative to the amplitude barrier. With the
+///      normalizer live the coherence is homogeneous degree 0 in each decoder
+///      radius, so its radial gradient vanishes by Euler's theorem
+///      (`Σ_{a,o} B·∂P/∂B ≡ 0`); the pre-fix FROZEN normalizer instead left the
+///      term degree 2 in the live radius with a stale `1/‖B‖⁴` amplification that
+///      produced a `+2.57e7` INWARD radial force — `5×` the barrier's outward one.
+///
+///  (2) the NET radial β-gradient of the collapsing atom therefore equals the
+///      barrier's ANALYTIC `∂P_A/∂B = g_coef·B` (the only term that prices
+///      amplitude) to within the small common-mode residual of the other live
+///      terms (data-fit / separation), `~1e-8` relative here.
+///
+/// Scale note: being INSIDE the barrier's turn-on radius forces `u = ‖B‖²_F ≲ f =
+/// 1e-12·max_k‖B_k‖²_F`, i.e. `u ~ 1e-13`. In that regime the exact Euler
+/// cancellation `E − (E/N)·N` is amplified by `κ ∝ 1/N ~ 1e15`, so finite double
+/// precision caps the repulsion's residual radial force at `~1e-7` ABSOLUTE — still
+/// `~1e-14` of the barrier (`~2e7`) and physically inert. The MACHINE-precision
+/// degree-0 property at O(1) decoder scale is pinned separately by the green
+/// `decoder_incoherence_repulsion_is_radially_free_euler` gam-terms unit test; the
+/// in-situ bounds below are relative to the barrier, the scale-invariant quantity
+/// the pre-fix bug violated (repulsion/barrier `~5`, wrong sign).
+#[test]
+fn repulsion_is_radially_inert_net_radial_is_analytic_barrier_2343() {
+    use gam_terms::analytic_penalties::AnalyticPenalty;
+
+    let (term0, target0, _rho) = small_two_atom_periodic_term();
+    let mut term = term0.clone();
+    let p = term.output_dim();
+
+    // Atom 1's decoder = ε · atom 0's decoder: EXACTLY collinear (output-Gram
+    // cosine² = 1, the maximal-coherence worst case for a radial leak) and deep
+    // inside the amplitude barrier's turn-on radius (‖B_1‖²_F ≪ f).
+    let eps = 1.0e-7_f64;
+    let b0 = term.atoms[0].decoder_coefficients.clone();
+    term.atoms[1].decoder_coefficients = &b0 * eps;
+
+    // Zero target so the data-fit gradient on the ≈0 decoder is itself O(ε): the
+    // dominant radial force on atom 1's block is the collapse-prevention stack.
+    let target = Array2::<f64>::zeros(target0.raw_dim());
+    let rho = SaeManifoldRho::new((1.0e-4_f64).ln(), (1.0e-4_f64).ln(), vec![array![0.0], array![0.0]]);
+    let sys = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("assembly must succeed at the collapse point");
+
+    // The repulsion must actually be live on this pair, or both clauses are
+    // vacuous (this is exactly the configuration the pre-fix inward force hit).
+    let gate = term
+        .decoder_repulsion_gate
+        .clone()
+        .expect("#2343: the decoder repulsion gate must be ENGAGED on the collinear pair");
+    assert!(
+        gate.iter().any(|&(j, k, w)| (j, k) == (0, 1) && w > 0.0),
+        "#2343: pair (0,1) must carry positive repulsion weight; gate = {gate:?}"
+    );
+
+    let offsets = term.beta_offsets();
+    let off1 = offsets[1];
+    let b1 = term.atoms[1].decoder_coefficients.clone();
+    let u: f64 = b1.iter().map(|v| v * v).sum();
+    let s = u.sqrt();
+    assert!(s > 0.0, "collapsing atom must retain a radial direction");
+    assert_eq!(b1.ncols(), p, "decoder block must be M×p_out");
+    let dir: Vec<f64> = b1.iter().map(|v| v / s).collect();
+
+    // Analytic amplitude barrier at the SAME frozen turn-on radius — the scale
+    // both clauses measure against (it is what prices amplitude here).
+    let norm_sq: Vec<f64> = term
+        .atoms
+        .iter()
+        .map(|atom| atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>())
+        .collect();
+    let f = SaeManifoldTerm::barrier_norm_floor_sq(&norm_sq);
+    let mu = SAE_AMPLITUDE_BARRIER_STRENGTH;
+    assert!(u < f, "atom 1 must sit inside the barrier turn-on radius: u={u:e} f={f:e}");
+    let g_coef = -2.0 * mu * f / (u * (u + f));
+    let expected = g_coef * s; // barrier radial force (outward, < 0)
+    assert!(expected < 0.0, "barrier radial force must be outward");
+
+    // ---- Clause (1): the repulsion's own in-situ radial force ≪ barrier. ----
+    let rep = term
+        .live_decoder_repulsion_penalty()
+        .expect("#2343: live repulsion penalty must exist when the gate is engaged");
+    let beta = term.flatten_beta();
+    let rep_grad = rep.grad_target(beta.view(), Array1::<f64>::zeros(0).view());
+    let rep_radial: f64 = (0..b1.len()).map(|i| rep_grad[off1 + i] * dir[i]).sum();
+    let rep_rel = rep_radial.abs() / expected.abs();
+    assert!(
+        rep_rel <= 1.0e-9,
+        "#2343 clause (1): the live-normalized repulsion must be radially INERT — its \
+         own in-situ radial β-gradient on the collapsing atom must be negligible \
+         against the amplitude barrier (degree-0 homogeneity, Euler). Got \
+         {rep_radial:.3e} vs barrier {expected:.3e} (relative {rep_rel:e}); the pre-fix \
+         frozen normalizer made this +2.57e7, i.e. ~5× the barrier."
+    );
+
+    // ---- Clause (2): the NET radial equals the analytic amplitude barrier. ----
+    let radial: f64 = (0..b1.len()).map(|i| sys.gb[off1 + i] * dir[i]).sum();
+    assert!(
+        radial < 0.0,
+        "#2343 clause (2): the net radial force must be OUTWARD (negative): \
+         radial={radial:e} expected={expected:e}"
+    );
+    let rel = (radial - expected).abs() / expected.abs();
+    assert!(
+        rel <= 1.0e-6,
+        "#2343 clause (2): with the repulsion radially inert (clause 1), the net radial \
+         β-gradient must equal the amplitude barrier's analytic g_coef·‖B_1‖ alone, to \
+         within the ~1e-8 common-mode residual of the other live terms (data-fit / \
+         separation): measured {radial:.12e} vs analytic {expected:.12e} (relative gap \
+         {rel:e}). The pre-fix frozen-normalizer repulsion flipped this to +2.07e7 \
+         (INWARD) — an O(1) sign change, far above this bound."
+    );
+}

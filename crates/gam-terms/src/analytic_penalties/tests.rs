@@ -2030,6 +2030,58 @@ fn decoder_incoherence_value_grad_self_consistent_fd() {
 }
 
 #[test]
+fn decoder_incoherence_exact_hvp_matches_fd_of_grad() {
+    // #2343 — the exact quotient Hessian-vector product of the degree-0
+    // normalized penalty must equal the finite difference of the analytic
+    // gradient (the definition of Hv). Two atoms, M=2, p=3, off-collinear so
+    // every quotient term (normalizer 1st/2nd derivs, residual C·V) is active.
+    let p = 3usize;
+    let block_sizes = vec![2usize, 2usize];
+    let total: usize = block_sizes.iter().map(|m| m * p).sum();
+    let target = PsiSlice { range: 0..total, latent_dim: Some(total / p) };
+    let mut coact = Array2::<f64>::zeros((2, 2));
+    coact[[0, 1]] = 0.6;
+    coact[[1, 0]] = 0.6;
+    let pen = DecoderIncoherencePenalty::new(target, block_sizes, p, coact, 0.7, false).unwrap();
+    let t = array![0.5_f64, -0.3, 0.2, 0.8, -0.1, 0.4, -0.6, 0.7, 0.1, -0.2, 0.9, 0.3];
+    let v = array![0.2_f64, 0.5, -0.4, 0.3, 0.6, -0.1, 0.7, -0.2, -0.3, 0.15, -0.05, 0.25];
+    let rho = Array1::<f64>::zeros(0);
+    let analytic = pen.hvp(t.view(), rho.view(), v.view());
+    let h = 1e-6_f64;
+    let gp = pen.grad_target((&t + &(&v * h)).view(), rho.view());
+    let gm = pen.grad_target((&t - &(&v * h)).view(), rho.view());
+    let fd = (&gp - &gm) / (2.0 * h);
+    let worst = analytic.iter().zip(fd.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f64, f64::max);
+    assert!(worst <= 1.0e-5, "degree-0 exact hvp vs FD(grad) max abs error = {worst:.3e}");
+}
+
+#[test]
+fn decoder_incoherence_repulsion_is_radially_free_euler() {
+    // #2343 — the degree-0 penalty is homogeneous degree-0 in each decoder
+    // block, so by Euler's theorem the radial projection of its gradient onto
+    // that block vanishes identically: Σ_{a,o} B_x[a,o]·∂P/∂B_x[a,o] = 0. This
+    // is the property that makes the repulsion exert NO amplitude force (the
+    // #2343 collapse cure). Assert it at machine precision on a generic config.
+    let p = 3usize;
+    let block_sizes = vec![2usize, 2usize];
+    let total: usize = block_sizes.iter().map(|m| m * p).sum();
+    let target = PsiSlice { range: 0..total, latent_dim: Some(total / p) };
+    let mut coact = Array2::<f64>::zeros((2, 2));
+    coact[[0, 1]] = 0.55;
+    coact[[1, 0]] = 0.55;
+    let pen = DecoderIncoherencePenalty::new(target, block_sizes, p, coact, 1.3, false).unwrap();
+    let t = array![0.5_f64, -0.3, 0.2, 0.8, -0.1, 0.4, -0.6, 0.7, 0.1, -0.2, 0.9, 0.3];
+    let rho = Array1::<f64>::zeros(0);
+    let g = pen.grad_target(t.view(), rho.view());
+    // Block 0 = indices 0..6, block 1 = 6..12.
+    let radial0: f64 = (0..6).map(|i| t[i] * g[i]).sum();
+    let radial1: f64 = (6..12).map(|i| t[i] * g[i]).sum();
+    let scale = pen.value(t.view(), rho.view()).abs().max(1.0);
+    assert!(radial0.abs() <= 1.0e-12 * scale, "block-0 radial gradient = {radial0:.3e} (must be ~0 by Euler)");
+    assert!(radial1.abs() <= 1.0e-12 * scale, "block-1 radial gradient = {radial1:.3e} (must be ~0 by Euler)");
+}
+
+#[test]
 fn decoder_incoherence_heterogeneous_blocks_use_output_space_cross_gram() {
     let p = 3usize;
     let block_sizes = vec![2usize, 1usize];
@@ -2044,11 +2096,13 @@ fn decoder_incoherence_heterogeneous_blocks_use_output_space_cross_gram() {
     let pen = DecoderIncoherencePenalty::new(target, block_sizes, p, coact, 2.0, false).unwrap();
     // Stored decoder blocks are B0 = [[1,0,0], [0,2,0]] and
     // B1 = [[3,0,4]]. The output-space cross-Gram is B0·B1^T = [[3], [0]],
-    // so ||B0·B1^T||_F^2 = 9. The symmetrized coactivation is 0.4.
+    // so ||B0·B1^T||_F^2 = 9. #2343: the coherence is now normalized by the LIVE
+    // radii ||B0||_F^2 = 5 and ||B1||_F^2 = 25 (degree-0), so
+    // value = 0.5·weight(2.0)·coact(0.4)·9/(5·25) = 3.6/125 = 0.0288.
     let beta = array![1.0_f64, 0.0, 0.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0];
     let rho = Array1::<f64>::zeros(0);
     let value = pen.value(beta.view(), rho.view());
-    assert_abs_diff_eq!(value, 3.6, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(value, 0.0288, epsilon = 1.0e-12);
 }
 
 #[test]

@@ -466,6 +466,80 @@ fn zero_amplitude_interior_force_points_away_from_collapse_1026() {
     );
 }
 
+/// #2343 requirement 3 (sharper than "outward"): the live-normalized decoder
+/// repulsion is degree-0 in each decoder radius (Euler), so it exerts ZERO
+/// radial force in situ — the NET radial β-gradient at the collapse point is set
+/// by the interior amplitude barrier ALONE. We prove the repulsion's radial
+/// contribution is zero to machine precision by comparing two assemblies at the
+/// SAME collapsing norm: (A) atom 1 near-collinear with atom 0 (repulsion GATE
+/// ENGAGED) and (B) atom 1 on an orthogonal output channel (repulsion gate OFF).
+/// The amplitude barrier's radial force depends only on `‖B_1‖` (identical in A
+/// and B), so if the repulsion adds nothing radially the two net radial gradients
+/// must agree — the pre-fix frozen-normalizer repulsion made them differ by ~2.6e7.
+#[test]
+fn repulsion_is_radially_inert_barrier_sets_net_radial_2343() {
+    const M: usize = 3;
+    const P: usize = 3;
+    let eps = 1e-7_f64;
+
+    let coords0 = array![[0.05],[0.22],[0.55],[0.81],[0.34],[0.66],[0.12],[0.90]];
+    let coords1 = array![[0.15],[0.31],[0.64],[0.92],[0.47],[0.09],[0.73],[0.40]];
+    let n = coords0.nrows();
+    let target = Array2::<f64>::zeros((n, P));
+    let rho = SaeManifoldRho::new((1e-4_f64).ln(), (1e-4_f64).ln(), vec![Array1::<f64>::zeros(0); 2]);
+
+    // Shared real atom 0 on channel 0.
+    let mut dec0 = Array2::<f64>::zeros((M, P));
+    dec0[[1, 0]] = 1.0;
+    dec0[[2, 0]] = 1.0;
+
+    // Assemble at a given atom-1 collapsing decoder, returning the radial
+    // β-gradient along atom 1's own (unit) decoder direction.
+    let radial_at = |dec1: Array2<f64>| -> f64 {
+        let atom0 = circle_atom("real", &coords0, dec0.clone());
+        let atom1 = circle_atom("collapsing", &coords1, dec1.clone());
+        let logits = Array2::from_shape_fn((n, 2), |(i, k)| 0.3 + 0.1 * i as f64 - 0.05 * k as f64);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            vec![coords0.clone(), coords1.clone()],
+            vec![LatentManifold::Circle { period: 1.0 }, LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
+        ).unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
+        let sys = term.assemble_arrow_schur(target.view(), &rho, None).expect("assembly");
+        let atom1_start = M * P;
+        let mut dir = vec![0.0_f64; M * P];
+        for a in 0..M { for o in 0..P { dir[a * P + o] = dec1[[a, o]]; } }
+        let dnorm = (dir.iter().map(|v| v * v).sum::<f64>()).sqrt();
+        for v in dir.iter_mut() { *v /= dnorm; }
+        (0..M * P).map(|j| sys.gb[atom1_start + j] * dir[j]).sum()
+    };
+
+    // (A) collinear on channel 0 — repulsion engaged.
+    let mut dec1_collinear = Array2::<f64>::zeros((M, P));
+    dec1_collinear[[1, 0]] = eps;
+    dec1_collinear[[2, 0]] = eps;
+    // (B) orthogonal on channel 1, SAME norm — repulsion gate off.
+    let mut dec1_ortho = Array2::<f64>::zeros((M, P));
+    dec1_ortho[[1, 1]] = eps;
+    dec1_ortho[[2, 1]] = eps;
+
+    let radial_collinear = radial_at(dec1_collinear);
+    let radial_ortho = radial_at(dec1_ortho);
+
+    // Both must be strictly outward (barrier), and equal to each other to within
+    // the sub-barrier smoothness residual — i.e. the repulsion added ZERO radially.
+    assert!(radial_collinear < 0.0 && radial_ortho < 0.0, "both must be outward");
+    let denom = radial_ortho.abs().max(1.0);
+    let rel = (radial_collinear - radial_ortho).abs() / denom;
+    assert!(
+        rel <= 1.0e-5,
+        "#2343 req-3: repulsion must be radially INERT — collinear (repulsion on) net radial \
+         {radial_collinear:e} must equal orthogonal (repulsion off) net radial {radial_ortho:e} \
+         (barrier alone) to machine precision; relative gap = {rel:e} (pre-fix ~5x)."
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. Duplicate-decoder separating curvature.
 // ---------------------------------------------------------------------------

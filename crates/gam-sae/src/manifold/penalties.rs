@@ -283,7 +283,15 @@ impl SaeManifoldTerm {
                 // fraction of the primary separation-barrier strength
                 // (`decoder_repulsion_strength`), not an independent magic
                 // constant; at unit decoder scale it reduces to the historical `1e-3`.
-                let w = repulsion_strength * gate_value / (norm_sq[j] * norm_sq[k]);
+                // #2343 — pass the SHAPE strength `strength·gate` ONLY. The
+                // per-pair `1/(‖B_j‖²‖B_k‖²)` normalizer is now applied with the
+                // LIVE decoder norms INSIDE `DecoderIncoherencePenalty`
+                // (degree-0 ⇒ radial derivative ≡ 0 by Euler), instead of frozen
+                // here — a frozen normalizer left the penalty degree-2 in the
+                // live radius and produced an inward amplitude-collapse force
+                // (#2343 Finding 9). Scale-invariance (the #1610 intent) now holds
+                // ALONG the line search, not only at the freeze point.
+                let w = repulsion_strength * gate_value;
                 gate.push((j, k, w));
             }
         }
