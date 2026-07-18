@@ -86,6 +86,26 @@ fn fit_linear(n: usize) -> (f64, f64, f64) {
     (edf, max_abs_err, slope)
 }
 
+/// Fit `y ~ s(x)` on the given `(x, y)` rows and return the total EDF.
+fn fit_edf(xs: &[f64], ys: &[f64]) -> f64 {
+    let headers = ["x", "y"].into_iter().map(String::from).collect();
+    let rows: Vec<StringRecord> = xs
+        .iter()
+        .zip(ys.iter())
+        .map(|(&x, &y)| StringRecord::from(vec![x.to_string(), y.to_string()]))
+        .collect();
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode dataset");
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ s(x)", &ds, &cfg).expect("gam gaussian s(x) fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit");
+    };
+    fit.fit.edf_total().expect("gam reports total edf")
+}
+
 #[test]
 fn linear_data_recovers_line_not_flat_collapse() {
     init_parallelism();
@@ -134,4 +154,33 @@ fn linear_data_recovers_line_not_flat_collapse() {
             "n={n}: recovered slope {slope:.6} ≠ 1.0 (#2355)"
         );
     }
+}
+
+/// Complementary guard (opposite direction from the recovery test): the
+/// data-adaptive downgrade must NOT be so eager that it disables the select-out
+/// for a genuinely-UNSUPPORTED null space. On an under-determined smooth of a
+/// signal that carries neither a linear trend nor smooth structure, the
+/// null-space select-out must still fire and the whole smooth must collapse to
+/// the mean (EDF ≈ 1) — the #1266 irrelevant-covariate / #1392 `p > n` shrinkage
+/// behaviour the aggressive prior exists to provide. A regression that widened
+/// the gate into "always downgrade" would spuriously KEEP the null space here
+/// (EDF ≈ 2), which this test catches.
+#[test]
+fn unsupported_nullspace_is_still_selected_out() {
+    init_parallelism();
+
+    // Alternating ±1 on an evenly spaced axis: zero linear trend, no smooth
+    // structure the P-spline can resolve. n = 12 is under-determined (< 2·p).
+    let n = 12usize;
+    let xs: Vec<f64> = (0..n).map(|i| i as f64 * 0.5).collect();
+    let ys: Vec<f64> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+    let edf = fit_edf(&xs, &ys);
+    eprintln!("#2355 unsupported-nullspace guard: n={n} edf={edf:.4}");
+
+    assert!(
+        edf < 1.4,
+        "an unsupported null space must stay selected out (EDF≈1); got EDF={edf:.4} \
+         — the data-adaptive downgrade has become too eager and is keeping a \
+         spurious linear component (#1266/#1392 regression)"
+    );
 }
