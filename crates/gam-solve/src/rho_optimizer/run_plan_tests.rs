@@ -6695,3 +6695,136 @@ fn without_ownership_flag_bimodal_terminal_bind_fails() {
          installed={installed:.17e} final_value={final_value:.17e}",
     );
 }
+
+// ─── #2357 interior strict-saddle escape ──────────────────────────
+
+// A 2-D outer objective with a genuine interior saddle at ρ=(0,0) and a pair of
+// PSD minima at ρ=(0,±1):
+//
+//   f(ρ) = ½·ρ₀²  +  ¼·ρ₁⁴ − ½·ρ₁²
+//   ∇f    = (ρ₀,  ρ₁³ − ρ₁)
+//   H     = [[1, 0], [0, 3ρ₁² − 1]]
+//
+// At ρ=(0,0): ∇=0 (first-order stationary) but H=diag(1,−1) is INDEFINITE — a
+// strict saddle. The two minima ρ₁=±1 carry H=diag(1,2) (PSD) and f=−¼. A
+// gradient-only convergence gate that arrives at the saddle stops there; only
+// the certified negative-curvature escape reaches a minimum. This is the
+// synthetic distillation of the periodic-te() cold-start refusal in #2357.
+fn saddle_cost(rho: &Array1<f64>) -> f64 {
+    let r0 = rho[0];
+    let r1 = rho[1];
+    0.5 * r0 * r0 + 0.25 * r1 * r1 * r1 * r1 - 0.5 * r1 * r1
+}
+
+fn saddle_eval(rho: &Array1<f64>) -> OuterEval {
+    let r0 = rho[0];
+    let r1 = rho[1];
+    OuterEval {
+        cost: saddle_cost(rho),
+        gradient: array![r0, r1 * r1 * r1 - r1],
+        hessian: HessianValue::Dense(array![[1.0, 0.0], [0.0, 3.0 * r1 * r1 - 1.0]]),
+        inner_beta_hint: None,
+    }
+}
+
+fn saddle_problem() -> OuterProblem {
+    OuterProblem::new(2)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .with_initial_rho(array![0.0, 0.0])
+        .with_screen_initial_rho(false)
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        })
+}
+
+#[test]
+fn certify_mints_saddle_escape_reseed_at_interior_saddle() {
+    // Directly audit the saddle point: the certificate must refuse it for
+    // indefinite interior curvature AND publish a negative-curvature escape
+    // reseed strictly BELOW the saddle objective, moving along the indefinite
+    // axis rather than the positive-curvature one (#2357).
+    let problem = saddle_problem();
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), rho: &Array1<f64>| Ok(saddle_cost(rho)),
+        |_: &mut (), rho: &Array1<f64>| Ok(saddle_eval(rho)),
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let rejection = audit_stationary_point(&mut obj, array![0.0, 0.0], "saddle-escape #2357")
+        .expect_err("an interior strict saddle must be refused, not certified");
+    let result = &rejection.result;
+    let cert = result
+        .criterion_certificate
+        .as_ref()
+        .expect("refused certificate must be recorded");
+    assert!(
+        cert.is_stationary(),
+        "the gradient must clear the stationarity band at the saddle"
+    );
+    assert_eq!(
+        cert.hessian_psd,
+        Some(false),
+        "the saddle Hessian must read indefinite"
+    );
+    assert!(
+        cert.lambdas_railed.is_empty(),
+        "the saddle is interior, not railed"
+    );
+    let reseed = result
+        .saddle_escape_reseed
+        .as_ref()
+        .expect("a refused interior saddle must mint a negative-curvature escape reseed");
+    let saddle_f = saddle_cost(&array![0.0, 0.0]);
+    assert!(
+        saddle_cost(reseed) < saddle_f - 1e-9,
+        "escape reseed {reseed:?} (f={}) must strictly descend below the saddle f={saddle_f}",
+        saddle_cost(reseed),
+    );
+    assert!(
+        reseed[1].abs() > 1e-6,
+        "escape must step along the indefinite ρ₁ axis, not the PSD ρ₀ axis: {reseed:?}"
+    );
+}
+
+#[test]
+fn outer_search_escapes_interior_saddle_and_certifies_minimum() {
+    // Full pipeline: seeded AT the saddle, the outer search must escape via the
+    // one-shot negative-curvature reseed and certify a genuine PSD minimum at
+    // ρ₁=±1 — not refuse the whole fit at the saddle (#2357).
+    let problem = saddle_problem();
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), rho: &Array1<f64>| Ok(saddle_cost(rho)),
+        |_: &mut (), rho: &Array1<f64>| Ok(saddle_eval(rho)),
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let result = problem
+        .run(&mut obj, "saddle-escape pipeline #2357")
+        .expect("the outer search must escape the saddle and certify a minimum");
+    assert!(
+        result.converged,
+        "must converge at a minimum, not refuse at the saddle"
+    );
+    assert!(
+        (result.rho[1].abs() - 1.0).abs() < 1e-4,
+        "must land on a PSD minimum ρ₁=±1, got ρ={:?}",
+        result.rho,
+    );
+    assert!(
+        result.rho[0].abs() < 1e-4,
+        "ρ₀ must be 0 at the minimum: {:?}",
+        result.rho,
+    );
+    assert!(
+        result
+            .criterion_certificate
+            .as_ref()
+            .is_some_and(|c| c.certifies() && c.hessian_psd == Some(true)),
+        "the escaped minimum must carry a PSD certificate",
+    );
+}

@@ -191,6 +191,11 @@ pub(crate) fn run_outer_with_plan(
     // (#2348 Inc 2b). Consumed once, after the seed cascade, for a single
     // polishing retry pinned at the snapped rail point.
     let mut tail_snap_reseed_point: Option<Array1<f64>> = None;
+    // First negative-curvature escape reseed published by a refused
+    // certification whose interior reduced Hessian is a certified strict saddle
+    // (#2357). Consumed once, after the seed cascade, for a single retry seeded
+    // off the saddle ridge so the outer search descends to the true PSD minimum.
+    let mut saddle_escape_reseed_point: Option<Array1<f64>> = None;
     // A reactive domain-entry path is created inside a seed attempt only after
     // that objective's exact seed cost is non-finite. Already-feasible seeds
     // therefore stay on the zero-heavy-entry path.
@@ -379,6 +384,9 @@ pub(crate) fn run_outer_with_plan(
                     );
                     if tail_snap_reseed_point.is_none() {
                         tail_snap_reseed_point = checkpoint.tail_snap_reseed.clone();
+                    }
+                    if saddle_escape_reseed_point.is_none() {
+                        saddle_escape_reseed_point = checkpoint.saddle_escape_reseed.clone();
                     }
                     retain_best_outer_checkpoint(&mut best_checkpoint, checkpoint);
                     rejection_reasons.push((seed_idx, "certificate", error.to_string()));
@@ -1752,6 +1760,9 @@ pub(crate) fn run_outer_with_plan(
                         if tail_snap_reseed_point.is_none() {
                             tail_snap_reseed_point = checkpoint.tail_snap_reseed.clone();
                         }
+                        if saddle_escape_reseed_point.is_none() {
+                            saddle_escape_reseed_point = checkpoint.saddle_escape_reseed.clone();
+                        }
                         retain_best_outer_checkpoint(&mut best_checkpoint, checkpoint);
                         rejection_reasons.push((seed_idx, "certificate", error.to_string()));
                         continue 'seed_attempts;
@@ -1906,6 +1917,37 @@ pub(crate) fn run_outer_with_plan(
             Err(retry_error) => {
                 log::warn!(
                     "[OUTER] {context}: confirmed-tail reseed retry failed ({retry_error}); \
+                     falling through to the original exhaustion accounting"
+                );
+            }
+        }
+    }
+
+    // #2357 — saddle escape. A refused certification identified an interior
+    // strict saddle (first-order stationary, indefinite curvature, no rail) and
+    // published a negative-curvature escape point strictly below it. Retry ONCE
+    // seeded there: the outer search resumes off the saddle ridge and descends
+    // to the true PSD minimum — the deterministic form of the identical
+    // warm-started resume that converges where the cold run refuses. The retry
+    // pass runs with the reseed gate closed (`allow_tail_snap_reseed = false`),
+    // so it can never recurse; a failed retry falls back to the original
+    // exhaustion accounting.
+    if allow_tail_snap_reseed && let Some(reseed) = saddle_escape_reseed_point {
+        log::info!(
+            "[OUTER] {context}: retrying once from the negative-curvature saddle-escape \
+             reseed {reseed} (#2357)"
+        );
+        let mut retry_config = config.clone();
+        retry_config.initial_rho = Some(reseed);
+        retry_config.screen_initial_rho = false;
+        retry_config.seed_config.max_seeds = 1;
+        retry_config.seed_config.seed_budget = 1;
+        obj.reset();
+        match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
+            Ok(outcome) => return Ok(outcome),
+            Err(retry_error) => {
+                log::warn!(
+                    "[OUTER] {context}: saddle-escape reseed retry failed ({retry_error}); \
                      falling through to the original exhaustion accounting"
                 );
             }

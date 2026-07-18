@@ -1059,6 +1059,19 @@ pub struct OuterResult {
     /// Inc 1 railed mint then judges the result through the natural path with
     /// untouched evidence semantics.
     pub tail_snap_reseed: Option<Array1<f64>>,
+    /// Saddle-escape reseed point minted by a refused certification whose
+    /// interior reduced Hessian is a certified strict saddle — small projected
+    /// gradient, `hessian_psd = Some(false)`, no railed coordinate (#2357). A
+    /// gradient-only convergence gate (ARC's, or the cost-stall guard's) can
+    /// ARRIVE at such a saddle with its gradient already below tolerance and
+    /// stop, even though the certified negative-curvature eigendirection is a
+    /// strict descent direction the optimizer never took. This point is
+    /// `ρ + α·v` for the most-negative-curvature eigenvector `v`, stepped off
+    /// the saddle ridge to a strictly-lower objective; the plan runner reseeds
+    /// the outer search ONCE from it (reseed gate closed so it cannot recurse),
+    /// which lets the optimizer descend to the true PSD minimum exactly as an
+    /// identical warm-started resume does by hand.
+    pub saddle_escape_reseed: Option<Array1<f64>>,
 }
 
 impl OuterResult {
@@ -1085,6 +1098,7 @@ impl OuterResult {
             flat_noise_grad_bound: None,
             rho_uncertainty_diagnostic: None,
             tail_snap_reseed: None,
+            saddle_escape_reseed: None,
         }
     }
 
@@ -1368,6 +1382,141 @@ pub(crate) fn certificate_hessian_is_psd_off_railed(
         }
     }
     certificate_hessian_is_psd(&sub)
+}
+
+/// Escape point off a certified interior strict saddle (#2357).
+///
+/// A gradient-only outer convergence gate — ARC's own, or the cost-stall guard's
+/// — can ARRIVE at a point that is first-order stationary (`‖Pg‖ ≤ bound`) yet
+/// sits on genuinely indefinite interior curvature, and stop there because its
+/// gradient already cleared tolerance. The mandatory analytic certificate then
+/// refuses the point as `INDEFINITE CURVATURE AT INTERIOR OPTIMUM`. Such a point
+/// is a saddle, not a minimum: the most-negative-curvature eigenvector `v` of the
+/// reduced Hessian is a strict descent direction the optimizer never took. An
+/// identical warm-started resume escapes it trivially (its fresh cubic step moves
+/// off the ridge, which is why the resume converges where the cold run refuses);
+/// this reproduces that escape deterministically by stepping `ρ ± α·v` to a
+/// strictly-lower objective and handing the point back as a one-shot reseed.
+///
+/// Termination is guaranteed: along a direction of negative curvature
+/// `vᵀHv = λ_min < 0` at a near-stationary gradient,
+/// `f(ρ ± αv) = f(ρ) ± α(g·v) + ½α²λ_min + o(α²)` strictly decreases for small
+/// enough `α` once the sign is chosen so the first-order term is non-positive, so
+/// the finite backtracking below always finds a descending feasible point when
+/// one exists inside the box.
+///
+/// Returns `None` (no reseed; the ordinary refusal proceeds) when the Hessian
+/// carries no eigen-resolvable negative direction, or no bounded step along it
+/// clears the box projection with a strict objective decrease. Restores the
+/// objective's profiled inner state to `rho` before returning either way, so the
+/// refusal path that follows measures the checkpoint rather than the last probe.
+fn negative_curvature_escape_point(
+    obj: &mut dyn OuterObjective,
+    rho: &Array1<f64>,
+    gradient: &Array1<f64>,
+    hessian: &Array2<f64>,
+    baseline_cost: f64,
+    bounds: &(Array1<f64>, Array1<f64>),
+    context: &str,
+) -> Option<Array1<f64>> {
+    use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
+
+    let n = hessian.nrows();
+    if n == 0 || hessian.ncols() != n || hessian.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let (eigenvalues, eigenvectors) = match hessian.eigh(Side::Lower) {
+        Ok(pair) => pair,
+        Err(err) => {
+            log::warn!(
+                "[CERTIFICATE] {context}: saddle-escape eigendecomposition failed ({err}); \
+                 refusing at the checkpoint without a reseed"
+            );
+            return None;
+        }
+    };
+    // The SAME √ε·‖H‖ margin `certificate_hessian_is_psd` uses to separate a
+    // genuine negative eigenvalue from O(ε·‖H‖) assembly roundoff: only a truly
+    // negative direction — not a flat / near-semidefinite one — carries a descent
+    // the reseed can exploit.
+    let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
+    let neg_margin = f64::EPSILON.sqrt() * max_diag.max(1.0);
+    let mut min_idx = 0usize;
+    for k in 1..eigenvalues.len() {
+        if eigenvalues[k] < eigenvalues[min_idx] {
+            min_idx = k;
+        }
+    }
+    if !(eigenvalues[min_idx] < -neg_margin) {
+        return None;
+    }
+    let mut direction = eigenvectors.column(min_idx).to_owned();
+    let dir_norm = direction.dot(&direction).sqrt();
+    if !(dir_norm > 0.0) || !dir_norm.is_finite() {
+        return None;
+    }
+    direction.mapv_inplace(|v| v / dir_norm);
+    // First-order-consistent sign: move against the (tiny) gradient's projection
+    // onto `v` so the linear term never opposes the curvature descent. With a
+    // stationary gradient the tie is arbitrary; the opposite sign is tried below
+    // regardless, which also covers a `v` that projects straight out of the box.
+    let primary_sign = if gradient.dot(&direction) > 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    // One e-fold in log-λ is a macroscopic step across the saddle ridge; ARC then
+    // refines from wherever this lands, so the reseed only needs to leave the
+    // ridge, not solve the problem. Backtrack so the box-projected point still
+    // strictly descends.
+    const ESCAPE_STEP_SCALES: [f64; 5] = [1.0, 0.5, 0.25, 0.125, 0.0625];
+    // A strict-decrease floor at the objective's roundoff resolution: a reseed
+    // that only matches the checkpoint to roundoff is not a real escape.
+    let strict_floor = baseline_cost.abs().max(1.0) * (16.0 * f64::EPSILON);
+    let mut best: Option<(f64, Array1<f64>)> = None;
+    for sign in [primary_sign, -primary_sign] {
+        for &alpha in ESCAPE_STEP_SCALES.iter() {
+            let mut trial = rho.clone();
+            for i in 0..n {
+                trial[i] += sign * alpha * direction[i];
+            }
+            let trial = project_to_bounds(&trial, Some(bounds));
+            // A fully box-clamped trial that lands back on ρ probes nothing.
+            if outer_theta_bitwise_eq(&trial, rho) {
+                continue;
+            }
+            if let Ok(cost) = obj.eval_cost(&trial)
+                && cost.is_finite()
+                && cost < baseline_cost - strict_floor
+                && best.as_ref().is_none_or(|(c, _)| cost < *c)
+            {
+                best = Some((cost, trial));
+            }
+        }
+        if best.is_some() {
+            break;
+        }
+    }
+    // Restore the profiled inner state to the checkpoint ρ so the refusal path
+    // that follows measures the checkpoint, not the last probe.
+    if let Err(err) = obj.eval_cost(rho) {
+        log::warn!(
+            "[CERTIFICATE] {context}: failed to restore the objective to the checkpoint \
+             after saddle-escape probing: {err}"
+        );
+    }
+    best.map(|(cost, point)| {
+        log::info!(
+            "[CERTIFICATE] {context}: interior strict saddle (λ_min={:.3e} < 0, |Pg| within \
+             band); minting a negative-curvature escape reseed (objective {:.6e} → {:.6e}) for \
+             one retry (#2357)",
+            eigenvalues[min_idx],
+            baseline_cost,
+            cost,
+        );
+        point
+    })
 }
 
 /// Second-order predicted objective decrease of a safeguarded Newton step at a
@@ -2415,6 +2564,37 @@ fn certify_outer_optimality_at_terminal_fidelity(
     result.criterion_certificate = Some(certificate.clone());
     if !certificate.certifies() {
         result.converged = false;
+        // #2357 — saddle escape. The point is first-order stationary
+        // (`is_stationary`: ‖Pg‖ ≤ bound) yet its INTERIOR reduced Hessian is a
+        // certified strict saddle (`!curvature_admissible` with no railed
+        // coordinate to waive it). That is exactly the case a gradient-only
+        // convergence gate mis-accepts: it arrived with the gradient already
+        // below tolerance and stopped, leaving the certified negative-curvature
+        // eigendirection — a strict descent — untaken. Mint a one-shot reseed
+        // stepped off the ridge to a strictly-lower objective so the plan runner
+        // can re-descend to the true PSD minimum, exactly as an identical
+        // warm-started resume does by hand. Gated by `allow_tail_snap` (the same
+        // one-shot reseed gate the tail snap rides) so the retry pass — which
+        // runs with it `false` — can never recurse.
+        if allow_tail_snap
+            && certificate.is_stationary()
+            && !certificate.curvature_admissible()
+            && certificate.lambdas_railed.is_empty()
+            && let Some(hessian) = result.final_hessian.clone()
+            && let Some(gradient) = result.final_gradient.clone()
+        {
+            let saddle_rho = result.rho.clone();
+            let baseline_cost = result.final_value;
+            result.saddle_escape_reseed = negative_curvature_escape_point(
+                obj,
+                &saddle_rho,
+                &gradient,
+                &hessian,
+                baseline_cost,
+                &bounds,
+                context,
+            );
+        }
         // Carry the railed-mint and tail-snap decline evidence into the
         // refusal so a railed or budget-exhausted crawl explains which
         // certificate gate refused instead of failing silently.

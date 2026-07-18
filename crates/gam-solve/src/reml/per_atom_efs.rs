@@ -169,6 +169,7 @@ impl PerAtomEfsResult {
             converged_via: None,
             flat_noise_grad_bound: None,
             tail_snap_reseed: None,
+            saddle_escape_reseed: None,
         }
     }
 }
