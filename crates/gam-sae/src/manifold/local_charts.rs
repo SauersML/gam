@@ -70,7 +70,7 @@
 //! no float-order ambiguity: same input ⇒ bit-identical atlas run-to-run.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use gam_linalg::faer_ndarray::FaerSvd;
@@ -131,6 +131,23 @@ const PATCH_COUNT_COVERAGE_MULTIPLIER: f64 = 2.0;
 /// produces the overlaps a transition cocycle needs. `3` gives a robust overlap
 /// without the patches degenerating into the whole sample.
 const PATCH_SIZE_OVERLAP_MULTIPLIER: f64 = 3.0;
+
+/// Minimum fraction of the ambient rows that certified charts must cover for the
+/// atlas to be built at all. On real, noisy activations a handful of centers can
+/// land on unchartable neighborhoods (a locally rank-deficient blob, a sampling
+/// hole) and are dropped individually rather than aborting the whole atlas; but a
+/// sub-atlas whose surviving charts cover only a minority of the sample no longer
+/// describes the data it was asked to chart.
+///
+/// Half is the principled cut, not a tunable knob: at exactly one half the charted
+/// and omitted row sets are the same size, so below it the charted rows are the
+/// strict minority and any downstream seeding built on this atlas would be fit to a
+/// non-representative subsample — silently biasing the model toward whichever region
+/// happened to certify. A higher bar (e.g. 0.7) would reject usable atlases that
+/// merely shed a few boundary centers; a lower one (e.g. 0.3) would bless an atlas
+/// fit to a minority of the data. This is a covering property of the certified
+/// charts, not a statistical confidence statement.
+const MIN_ATLAS_ROW_COVERAGE: f64 = 0.5;
 
 /// Construction parameters for a [`LocalAtlas`].
 ///
@@ -212,6 +229,22 @@ pub enum LocalChartError {
     },
     /// The SVD backing a chart or a transition failed to converge.
     SvdFailure { center: usize, detail: String },
+    /// Individually chartable centers were dropped (see [`LocalAtlas::rejected_centers`]),
+    /// but the certified charts that remain cover fewer than [`MIN_ATLAS_ROW_COVERAGE`]
+    /// of the rows — the surviving sub-atlas describes only a minority of the sample,
+    /// so the build refuses rather than returning a partial atlas.
+    AtlasCoverageTooLow {
+        /// Number of centers that yielded a certified chart.
+        certified: usize,
+        /// Number of centers attempted.
+        requested: usize,
+        /// Rows lying in at least one certified chart.
+        covered_rows: usize,
+        /// Total ambient rows.
+        total_rows: usize,
+        /// The fraction floor that was not met.
+        min_row_coverage: f64,
+    },
 }
 
 impl fmt::Display for LocalChartError {
@@ -260,6 +293,18 @@ impl fmt::Display for LocalChartError {
                     "local_charts: SVD failed for patch at row {center}: {detail}"
                 )
             }
+            Self::AtlasCoverageTooLow {
+                certified,
+                requested,
+                covered_rows,
+                total_rows,
+                min_row_coverage,
+            } => write!(
+                f,
+                "local_charts: only {certified}/{requested} centers certified, covering \
+                 {covered_rows}/{total_rows} rows (below the {min_row_coverage:.2} floor); \
+                 the surviving charts describe a minority of the sample"
+            ),
         }
     }
 }
@@ -438,6 +483,32 @@ pub struct CoCollapseCandidate {
     pub transition_residual: f64,
 }
 
+/// A farthest-point center that could not be charted, kept as a diagnostic so a
+/// dropped center is recorded rather than silently vanishing.
+///
+/// One non-certifiable center no longer aborts the whole atlas (real activations
+/// have locally rank-deficient neighborhoods); the center is skipped, its typed
+/// reason retained here, and the build continues on the remaining centers. The
+/// atlas as a whole still refuses honestly — via [`LocalChartError::AtlasCoverageTooLow`]
+/// — when too much of the sample is left uncharted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RejectedCenter {
+    /// The farthest-point center row that failed to certify.
+    pub center: usize,
+    /// The typed per-center reason it was dropped (a [`LocalChartError::DegeneratePatch`],
+    /// [`LocalChartError::NonInjectiveChart`], or [`LocalChartError::SvdFailure`]).
+    pub reason: LocalChartError,
+}
+
+impl fmt::Display for RejectedCenter {
+    /// One user-facing line naming the dropped center and why, so a caller
+    /// surfacing the atlas renders a legible diagnostic rather than an opaque row
+    /// index — a dropped center should be something the user can see happened.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "dropped center at row {}: {}", self.center, self.reason)
+    }
+}
+
 /// A collection of overlapping injective local charts glued by a signed
 /// transition cocycle — the atlas-first manifold primitive (#2280).
 #[derive(Clone, Debug, PartialEq)]
@@ -447,6 +518,7 @@ pub struct LocalAtlas {
     patches: Vec<LocalPatch>,
     charts: Vec<LocalChart>,
     transitions: Vec<ChartTransition>,
+    rejected_centers: Vec<RejectedCenter>,
 }
 
 impl LocalAtlas {
@@ -488,13 +560,60 @@ impl LocalAtlas {
         let centers = farthest_point_landmarks(z, config.patch_count.max(1).min(n));
 
         // (2)+(3) one certified local-PCA chart per patch, on the largest
-        // neighborhood that certifies (see `certified_neighborhood_chart`).
+        // neighborhood that certifies (see `certified_neighborhood_chart`). A center
+        // whose neighborhood cannot certify at any admissible size is DROPPED with its
+        // typed reason rather than aborting the whole atlas — real activations have
+        // locally rank-deficient neighborhoods, and one such center should not blind the
+        // rest of the manifold. The honest whole-atlas refusal is deferred to the
+        // coverage gate below (and, when nothing certified at all, to the per-center
+        // reason itself, which is the true story in that case).
         let mut patches: Vec<LocalPatch> = Vec::with_capacity(centers.len());
         let mut charts: Vec<LocalChart> = Vec::with_capacity(centers.len());
+        let mut rejected_centers: Vec<RejectedCenter> = Vec::new();
         for &center in &centers {
-            let (members, chart) = certified_neighborhood_chart(z, center, patch_size, d)?;
-            patches.push(LocalPatch { center, members });
-            charts.push(chart);
+            match certified_neighborhood_chart(z, center, patch_size, d) {
+                Ok((members, chart)) => {
+                    patches.push(LocalPatch { center, members });
+                    charts.push(chart);
+                }
+                // Per-center failures (each carries its own `center`): drop this center
+                // and keep building. Any other variant is a global precondition already
+                // screened above and is propagated unchanged.
+                Err(
+                    reason @ (LocalChartError::DegeneratePatch { .. }
+                    | LocalChartError::NonInjectiveChart { .. }
+                    | LocalChartError::SvdFailure { .. }),
+                ) => rejected_centers.push(RejectedCenter { center, reason }),
+                Err(other) => return Err(other),
+            }
+        }
+
+        // Honest whole-atlas refusal. When NOTHING certified, the per-center reason is
+        // the true diagnosis (e.g. data that is `d`-degenerate everywhere), so surface
+        // it directly. When a partial atlas exists but its certified charts cover fewer
+        // than `MIN_ATLAS_ROW_COVERAGE` of the rows, the survivors describe a minority of
+        // the sample — refuse rather than return a misleadingly partial atlas.
+        if charts.is_empty() {
+            return Err(rejected_centers
+                .into_iter()
+                .next()
+                .map_or(LocalChartError::EmptyInput, |rejected| rejected.reason));
+        }
+        let covered_rows = {
+            let mut covered: BTreeSet<usize> = BTreeSet::new();
+            for patch in &patches {
+                covered.extend(patch.members.iter().copied());
+            }
+            covered.len()
+        };
+        if (covered_rows as f64) < MIN_ATLAS_ROW_COVERAGE * n as f64 {
+            return Err(LocalChartError::AtlasCoverageTooLow {
+                certified: charts.len(),
+                requested: centers.len(),
+                covered_rows,
+                total_rows: n,
+                min_row_coverage: MIN_ATLAS_ROW_COVERAGE,
+            });
         }
 
         // (4) orthogonal Procrustes transition per overlapping patch pair.
@@ -518,6 +637,7 @@ impl LocalAtlas {
             patches,
             charts,
             transitions,
+            rejected_centers,
         })
     }
 
@@ -555,6 +675,16 @@ impl LocalAtlas {
     #[must_use]
     pub fn chart_count(&self) -> usize {
         self.charts.len()
+    }
+
+    /// Centers that were dropped because their neighborhood could not certify a
+    /// chart at any admissible size. Empty on a clean build; non-empty records
+    /// which farthest-point centers the atlas skipped and why, so a caller sees the
+    /// dropped structure rather than a silent hole. Ordered by center-iteration
+    /// (deterministic).
+    #[must_use]
+    pub fn rejected_centers(&self) -> &[RejectedCenter] {
+        &self.rejected_centers
     }
 
     /// Numerically well-conditioned observed transition signs as
@@ -1449,6 +1579,134 @@ mod tests {
             ),
             "collinear data cannot yield a 2-chart; got {err}"
         );
+    }
+
+    /// A far, tightly collinear cluster placed alongside a healthy plane: FPS elects
+    /// a center inside it (it is the most isolated region), that center cannot chart
+    /// a 2-plane at any size — and the atlas DROPS it rather than aborting, keeping
+    /// the plane's charts. The dropped center is recorded, not silently swallowed.
+    #[test]
+    fn atlas_drops_a_degenerate_center_and_keeps_the_rest_2280() {
+        // Healthy bulk: a clean 12×12 embedded plane (144 rows).
+        let plane = embedded_plane(12, 12);
+        let plane_n = plane.nrows();
+        // A far collinear blob (25 rows > patch_size) along ambient axis 0, isolated
+        // at x ≈ 200, so a center inside it charts only its own rank-1 neighborhood.
+        let blob_n = 25usize;
+        let n = plane_n + blob_n;
+        let mut z = Array2::<f64>::zeros((n, 4));
+        for r in 0..plane_n {
+            for c in 0..4 {
+                z[[r, c]] = plane[[r, c]];
+            }
+        }
+        for t in 0..blob_n {
+            z[[plane_n + t, 0]] = 200.0 + 0.02 * t as f64;
+        }
+
+        let config = LocalAtlasConfig::balanced(n, 2);
+        let atlas =
+            LocalAtlas::build(z.view(), config).expect("a mostly-healthy sample must still build");
+
+        assert!(
+            !atlas.rejected_centers().is_empty(),
+            "the degenerate blob center must be recorded as dropped, not aborted"
+        );
+        for rejected in atlas.rejected_centers() {
+            assert!(
+                rejected.center >= plane_n,
+                "only blob rows ({plane_n}..) are unchartable; dropped center {} is on the plane",
+                rejected.center
+            );
+            assert!(
+                matches!(rejected.reason, LocalChartError::DegeneratePatch { .. }),
+                "a collinear neighborhood drops with DegeneratePatch; got {}",
+                rejected.reason
+            );
+        }
+        // The drop is user-visible: each dropped center renders a legible diagnostic
+        // line, not an opaque index buried in an internal list.
+        let rendered = format!("{}", atlas.rejected_centers()[0]);
+        assert!(
+            rendered.contains("dropped center at row")
+                && rendered.contains("does not span"),
+            "a dropped center must render a legible reason; got {rendered:?}"
+        );
+        assert!(
+            atlas.chart_count() >= 1,
+            "the plane's charts survive the dropped blob center"
+        );
+        // The certified charts still cover the plane bulk (well above the floor).
+        let covered: BTreeSet<usize> = atlas
+            .patches()
+            .iter()
+            .flat_map(|p| p.members.iter().copied())
+            .collect();
+        assert!(
+            covered.len() as f64 >= MIN_ATLAS_ROW_COVERAGE * n as f64,
+            "surviving charts must clear the coverage floor: {} of {n}",
+            covered.len()
+        );
+        // Bit-identical run-to-run, dropped centers included.
+        let again = LocalAtlas::build(z.view(), config).unwrap();
+        assert_eq!(atlas, again, "skip-and-continue must be deterministic");
+    }
+
+    /// The honest whole-atlas refusal: when the certified charts cover only a
+    /// minority of the sample (a tiny plane drowned by a large degenerate blob), the
+    /// build refuses with `AtlasCoverageTooLow` rather than returning a partial atlas
+    /// that silently omits most of the data.
+    #[test]
+    fn atlas_refuses_when_certified_coverage_falls_below_floor_2280() {
+        // Tiny healthy plane: 4×4 = 16 rows.
+        let plane = embedded_plane(4, 4);
+        let plane_n = plane.nrows();
+        // A large collinear blob (100 rows) far away along ambient axis 1: its centers
+        // cannot certify a 2-chart, so the survivors cover only the 16 plane rows.
+        let blob_n = 100usize;
+        let n = plane_n + blob_n;
+        let mut z = Array2::<f64>::zeros((n, 4));
+        for r in 0..plane_n {
+            for c in 0..4 {
+                z[[r, c]] = plane[[r, c]];
+            }
+        }
+        for t in 0..blob_n {
+            z[[plane_n + t, 0]] = 1000.0;
+            z[[plane_n + t, 1]] = t as f64;
+        }
+
+        let config = LocalAtlasConfig::balanced(n, 2);
+        let err = LocalAtlas::build(z.view(), config).unwrap_err();
+        match err {
+            LocalChartError::AtlasCoverageTooLow {
+                certified,
+                covered_rows,
+                total_rows,
+                ..
+            } => {
+                assert!(certified >= 1, "the plane still certified some charts");
+                assert!(
+                    (covered_rows as f64) < 0.5 * total_rows as f64,
+                    "coverage {covered_rows}/{total_rows} must be below the floor to refuse"
+                );
+            }
+            other => panic!("a minority-coverage sub-atlas must refuse via AtlasCoverageTooLow; got {other}"),
+        }
+    }
+
+    /// Regression guard: a clean sample drops nothing, so the new rejected-centers
+    /// bookkeeping leaves the happy path exactly as it was.
+    #[test]
+    fn clean_atlas_drops_no_centers_2280() {
+        let z = embedded_plane(10, 10);
+        let atlas =
+            LocalAtlas::build(z.view(), LocalAtlasConfig::balanced(z.nrows(), 2)).unwrap();
+        assert!(
+            atlas.rejected_centers().is_empty(),
+            "a clean plane certifies every center; nothing should be dropped"
+        );
+        assert!(atlas.chart_count() > 0, "a clean plane yields charts");
     }
 
     /// Determinism doctrine: the atlas is bit-identical run-to-run.
