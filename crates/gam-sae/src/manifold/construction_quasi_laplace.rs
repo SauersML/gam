@@ -334,11 +334,15 @@ impl SaeManifoldTerm {
             refine_progress_extension,
         )?;
         loss.criterion_gauge_deflated_directions = cache.gauge_deflated_directions;
-        let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
-            "SaeManifoldTerm::penalized_quasi_laplace_criterion: arrow_log_det_from_cache returned None \
-             (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
-                .to_string()
-        })?;
+        // #2330 Phase-2: rank the EXACT observed-information Laplace term ½log|A|
+        // (A = B + ΔC = ∇²_θθ L), not the majorizer surrogate ½log|B|. One
+        // eigendecomposition yields BOTH the joint log|A| and the coordinate-block
+        // log|A_tt|, applying the shared PD floor; an indefinite A (a majorizer
+        // saddle) returns the typed IndefiniteObservedInformation refusal, which
+        // makes saddle-ρ probe-infeasible (+inf) and steers the outer away until
+        // the #2336 accepted-lane saddle-escape lands.
+        let (log_det, log_det_tt) =
+            self.exact_observed_information_log_dets(rho, target, &cache)?;
 
         // 3. Smoothing-penalty Occam term `−½·Σ_k r_k·rank(S_k)·log λ_smooth`
         //    plus the profiled-frame evidence-dimension correction
@@ -428,7 +432,9 @@ impl SaeManifoldTerm {
             // owns both the rank-zero veto and the exact replacement
             // `0.5 log|H| - 0.5 log|H_tt| + rank_charge`; dense, streaming, and
             // criterion-as-atoms assembly therefore cannot drift apart.
-            let log_det_tt = coordinate_block_log_det(&cache)?;
+            // log_det (= log|A|) and log_det_tt (= log|A_tt|) are produced together
+            // above from the exact observed information; `coordinate_block_log_det`
+            // (the majorizer ½log|B_tt|) is no longer the ranked coordinate term.
             let quasi_laplace_complexity =
                 rank_adjusted_quasi_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
             loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam
@@ -4083,6 +4089,32 @@ impl SaeManifoldTerm {
                 // product of two √w-scaled jets, so √w·√w = w), so the correct single
                 // factor for this prior term is likewise full `w_row`. `None`
                 // weights ⇒ w_row = 1, bit-for-bit the historical derivative.
+                let w_row = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
+                -w_row * alpha * kappa * (kappa * t).sin()
+            }
+        }
+    }
+
+    /// #2330 Phase-2 — the EXACT (un-clamped) periodic-ARD curvature θ-derivative
+    /// for `A = B + ΔC`. `ard_majorized_hessian_derivative` differentiates the
+    /// PSD majorizer `w·max(α cos κt, 0)` (zero on the clamped half); the exact
+    /// prior Hessian `w·α cos κt` is signed, so its θ-derivative is
+    /// `∂/∂t[w·α cos κt] = −w·α κ sin κt` on BOTH branches. That is exactly
+    /// `∂B/∂θ_ard + ∂ΔC/∂θ_ard` (the majorizer half + the restored negative half),
+    /// i.e. the ARD leg of `∂A/∂θ`. Euclidean axes have constant curvature ⇒ 0.
+    pub(crate) fn ard_exact_hessian_derivative(
+        &self,
+        alpha: f64,
+        row: usize,
+        atom: usize,
+        axis: usize,
+    ) -> f64 {
+        let periods = self.assignment.coords[atom].effective_axis_periods();
+        match periods[axis] {
+            None => 0.0,
+            Some(period) => {
+                let kappa = std::f64::consts::TAU / period;
+                let t = self.assignment.coords[atom].row(row)[axis];
                 let w_row = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
                 -w_row * alpha * kappa * (kappa * t).sin()
             }

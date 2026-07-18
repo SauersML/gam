@@ -1201,7 +1201,7 @@ mod amortized_encoder_tests {
         use ndarray::{Array1, Array2, array, s};
         // This module does not `use super::*`; the arbiter is the first test here
         // to build a `SaeArrowVector`, call `.eigh` (FaerEigh), and name `Side`.
-        use super::{FaerEigh, SaeArrowVector, SaeCriterionError, Side};
+        use super::{FaerEigh, SaeArrowVector, SaeCriterionError, SaeManifoldTerm, Side};
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
         let mut rho_eval = rho.clone();
@@ -1268,24 +1268,29 @@ mod amortized_encoder_tests {
             "A spectrum: min_eig={min_eig:.6e} max_eig={max_eig:.6e} n_nonpos={n_nonpos}/{dim}"
         );
         let result = term.exact_observed_information_log_dets(&rho, target.view(), &cache);
-        let pd_floor = 1.0e-9 * max_eig.max(1.0);
-        if min_eig > pd_floor {
-            // A ≻ 0: a genuine exact-Laplace maximum. Refusal must NOT fire, and
-            // the strict-Cholesky logdet must equal Σ ln λ (both joint and tt).
+        // #2330 Phase-2: the value path classifies the spectrum three ways against
+        // the SHARED floor — kept (λ>floor, contributes ln λ), gauge quotient
+        // (|λ|≤floor, contributes 0), refused (λ<−floor). The arbiter mirrors
+        // that classification exactly, so a future gauge-null-PD A is judged
+        // correctly rather than binary PD-vs-refuse.
+        let floor = SaeManifoldTerm::SAE_EXACT_A_PD_FLOOR_REL * max_eig.max(1.0);
+        if min_eig >= -floor {
+            // PD on the gauge quotient (min_eig may be a gauge null in [−floor, floor]).
             let (log_a, log_a_tt) =
-                result.expect("A is positive definite so the log-dets must be Ok");
-            let eig_log_det: f64 = eigs.iter().map(|l| l.ln()).sum();
+                result.expect("A is PD on the quotient so the log-dets must be Ok");
+            let kept: f64 = eigs.iter().filter(|&&l| l > floor).map(|l| l.ln()).sum();
             assert!(
-                (log_a - eig_log_det).abs() <= 1.0e-9 * (1.0 + eig_log_det.abs()),
-                "log|A| strict-Cholesky path {log_a} != eigendecomposition oracle {eig_log_det}"
+                (log_a - kept).abs() <= 1.0e-9 * (1.0 + kept.abs()),
+                "log|A| kept-eigenvalue sum {log_a} != oracle {kept}"
             );
             let a_tt = sym.slice(s![..total_t, ..total_t]).to_owned();
             let (eigs_tt, _) = a_tt.eigh(Side::Lower).expect("A_tt eigendecomposition");
-            let eig_log_det_tt: f64 = eigs_tt.iter().map(|l| l.ln()).sum();
+            let max_tt = eigs_tt.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let floor_tt = SaeManifoldTerm::SAE_EXACT_A_PD_FLOOR_REL * max_tt.max(1.0);
+            let kept_tt: f64 = eigs_tt.iter().filter(|&&l| l > floor_tt).map(|l| l.ln()).sum();
             assert!(
-                (log_a_tt - eig_log_det_tt).abs() <= 1.0e-9 * (1.0 + eig_log_det_tt.abs()),
-                "log|A_tt| strict-Cholesky path {log_a_tt} != eigendecomposition oracle \
-                 {eig_log_det_tt}"
+                (log_a_tt - kept_tt).abs() <= 1.0e-9 * (1.0 + kept_tt.abs()),
+                "log|A_tt| kept-eigenvalue sum {log_a_tt} != oracle {kept_tt}"
             );
         } else {
             // A is non-PD: the typed refusal must fire on the joint block, and the

@@ -952,12 +952,19 @@ impl SaeManifoldTerm {
                     }
                 }
                 AssignmentMode::Softmax { .. } => {}
+                AssignmentMode::OrderedBetaBernoulli { .. } => {
+                    // #2330: the ordered-Beta–Bernoulli sparse ∂A/∂ρ_sparse is the
+                    // EXACT integrated-marginal logit Hessian (cross-row), supplied
+                    // by `dense_exact_a_ordered_bb_sparse_trace`, NOT a diagonal
+                    // majorizer operator this map can assemble. Emit nothing here
+                    // (the dense-A gradient adds that coordinate's trace directly)
+                    // rather than a wrong diagonal-only operator.
+                }
                 _ => {
                     return Err(
                         "penalty_curvature_operators_by_flat: rho carries a sparse log-strength \
-                         coordinate under a non-softmax assignment prior, whose ∂H/∂ρ_sparse \
-                         majorizer operator this map does not model; refusing to assemble a \
-                         silently-zero sparse operator"
+                         coordinate under an assignment prior whose ∂H/∂ρ_sparse operator this \
+                         map does not model; refusing to assemble a silently-zero sparse operator"
                             .to_string(),
                     );
                 }
@@ -1189,6 +1196,7 @@ impl SaeManifoldTerm {
         inv: &Array2<f64>,
         channel: ThetaAdjointDhChannel,
         skip_deflation_dk: bool,
+        exact_a: bool,
     ) -> Result<SaeArrowVector, String> {
         // #2330 — `skip_deflation_dk` drops the Daleckii–Krein deflation
         // correction, leaving the raw trace contraction. The split probe uses it
@@ -1344,12 +1352,21 @@ impl SaeManifoldTerm {
                                         _ => true,
                                     };
                                     if include {
-                                        dh += self.ard_majorized_hessian_derivative(
-                                            ard_precisions[atom][axis],
-                                            row,
-                                            atom,
-                                            axis,
-                                        );
+                                        dh += if exact_a {
+                                            self.ard_exact_hessian_derivative(
+                                                ard_precisions[atom][axis],
+                                                row,
+                                                atom,
+                                                axis,
+                                            )
+                                        } else {
+                                            self.ard_majorized_hessian_derivative(
+                                                ard_precisions[atom][axis],
+                                                row,
+                                                atom,
+                                                axis,
+                                            )
+                                        };
                                     }
                                 }
                             }
@@ -1742,12 +1759,14 @@ impl SaeManifoldTerm {
                 &g_i,
                 ThetaAdjointDhChannel::All,
                 false,
+                false,
             )?;
             let mut d_gamma_tt = self.logdet_theta_adjoint_dense(
                 rho,
                 cache,
                 &h_bd_i,
                 ThetaAdjointDhChannel::All,
+                false,
                 false,
             )?;
             if smooth_range.contains(&i) {
@@ -1763,12 +1782,14 @@ impl SaeManifoldTerm {
                     &g,
                     ThetaAdjointDhChannel::SoftmaxSparseMixed,
                     false,
+                    false,
                 )?;
                 let mixed_tt = self.logdet_theta_adjoint_dense(
                     rho,
                     cache,
                     &h_bd,
                     ThetaAdjointDhChannel::SoftmaxSparseMixed,
+                    false,
                     false,
                 )?;
                 d_gamma_joint.t += &mixed_joint.t;
@@ -1783,12 +1804,14 @@ impl SaeManifoldTerm {
                     &g,
                     ThetaAdjointDhChannel::ArdMixed { target_flat: i },
                     false,
+                    false,
                 )?;
                 let mixed_tt = self.logdet_theta_adjoint_dense(
                     rho,
                     cache,
                     &h_bd,
                     ThetaAdjointDhChannel::ArdMixed { target_flat: i },
+                    false,
                     false,
                 )?;
                 d_gamma_joint.t += &mixed_joint.t;
@@ -2104,6 +2127,20 @@ impl SaeManifoldTerm {
         // IFT cost from `O(P_ρ)` solves to one. `solve_exact_stationarity_is_self_adjoint_2080`
         // pins the self-adjointness this identity rests on.
         // The single adjoint solve `a = A⁺Γ` — the only solver-bound step. At
+        // #2330 Phase-2: on the dense direct-logdet route (no probe bundle, no
+        // matrix-free system) the ranked value is ½log|A|, so the logdet channels
+        // must be A-based. Overwrite the B-majorizer logdet_trace + Γ assembled
+        // above with the exact-A ones; explicit / occam / rank-charge-direct
+        // channels are majorizer-independent and stay. The matrix-free / bundle
+        // route keeps ½log|B| until Phase-2b (streaming signed-LDLᵀ A-factor).
+        if logdet_derivative_bundle.is_none() && matrix_free_system.is_none() {
+            let (exact_logdet_trace, exact_gamma) = self
+                .dense_exact_a_logdet_channels(target, rho, loss, cache)
+                .map_err(OuterGradientError::internal)?;
+            logdet_trace = exact_logdet_trace;
+            gamma = exact_gamma;
+        }
+
         // massive K (`matrix_free_system = Some`) it rides the reduced-Schur CG on
         // the reassembled undamped operator; otherwise the dense deflated arrow
         // solver. Both realize the same self-adjoint `A⁺` action.
@@ -2736,114 +2773,348 @@ impl SaeManifoldTerm {
             hessian.ncols()
         ))
     }
+
+    /// Shared PD-classification floor for the exact observed information
+    /// `A = B + ΔC` (#2330 / #2336). A converged inner mode is a genuine
+    /// exact-Laplace maximum iff every eigenvalue of `A` is `≥ −floor`, with
+    /// `floor = SAE_EXACT_A_PD_FLOOR_REL · max(max_eig, 1)`. The band
+    /// `[−floor, floor]` is the radial-gauge quotient null (an exact ρ-invariant
+    /// null of `A`, unit-pinned ⇒ `log 1 = 0`, `1/λ → 0`). #2330 ACCEPTS
+    /// `min_eig > −floor`; #2336's saddle-escape TRIGGERS on `min_eig < −floor` —
+    /// the same constant, so the two features cannot disagree in the band.
+    pub(crate) const SAE_EXACT_A_PD_FLOOR_REL: f64 = 1.0e-9;
+
+    /// #2330 Phase-2 — the EXACT observed-information Laplace log-determinants
+    /// `(log|A|, log|A_tt|)` at the converged fixed-θ̂ mode, `A = ∇²_θθ L = B + ΔC`.
+    /// One symmetric eigendecomposition per block; kept eigenvalues (`λ > floor`)
+    /// contribute `ln λ`, the gauge quotient (`|λ| ≤ floor`) contributes 0, and a
+    /// strictly negative eigenvalue (`λ < −floor`) is a saddle ⇒ typed
+    /// `IndefiniteObservedInformation` refusal. `A_tt` drops the β border.
+    pub(crate) fn exact_observed_information_log_dets(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+    ) -> Result<(f64, f64), SaeCriterionError> {
+        let total_t = cache.delta_t_len();
+        let a = self
+            .materialize_exact_hessian_dense(rho, target, cache)
+            .map_err(SaeCriterionError::Numerical)?;
+        let quotient_log_det =
+            |m: &Array2<f64>, block: &'static str| -> Result<f64, SaeCriterionError> {
+                let (eigs, _vecs) = m.eigh(Side::Lower).map_err(|e| {
+                    SaeCriterionError::Numerical(format!(
+                        "exact_observed_information_log_dets: {block} eigendecomposition failed: {e:?}"
+                    ))
+                })?;
+                let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let floor = Self::SAE_EXACT_A_PD_FLOOR_REL * max_eig.max(1.0);
+                let mut log_det = 0.0_f64;
+                for &lambda in eigs.iter() {
+                    if lambda < -floor {
+                        return Err(SaeCriterionError::IndefiniteObservedInformation { block });
+                    }
+                    if lambda > floor {
+                        log_det += lambda.ln();
+                    }
+                    // |lambda| <= floor: radial-gauge quotient null ⇒ log 1 = 0.
+                }
+                Ok(log_det)
+            };
+        let log_a = quotient_log_det(&a, "joint")?;
+        let a_tt = a.slice(s![..total_t, ..total_t]).to_owned();
+        let log_a_tt = quotient_log_det(&a_tt, "coordinate")?;
+        Ok((log_a, log_a_tt))
+    }
+
+    /// #2330 Phase-2 — the quotient pseudo-inverses `(A⁺, A_tt⁺)` used by the
+    /// exact-A outer-ρ gradient, from the SAME spectral classification the value
+    /// uses: `A⁺ = Σ_{λ>floor} (1/λ) uᵀu`, dropping the `|λ|≤floor` gauge null.
+    /// Both are returned as dense `dim×dim` operators (`A_tt⁺` has a zero β
+    /// border) so they can feed `logdet_theta_adjoint_dense`'s border indexing
+    /// exactly as `materialize_block_diag_t_inverse` does. Refuses an indefinite
+    /// `A` (`λ < −floor`): the gradient must never be assembled at a saddle.
+    pub(crate) fn materialize_exact_hessian_quotient_inverse(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        let total_t = cache.delta_t_len();
+        let dim = total_t + cache.k;
+        let a = self.materialize_exact_hessian_dense(rho, target, cache)?;
+        let pinv = |m: &Array2<f64>| -> Result<Array2<f64>, String> {
+            let (eigs, vecs) = m.eigh(Side::Lower).map_err(|e| {
+                format!("materialize_exact_hessian_quotient_inverse: eigh failed: {e:?}")
+            })?;
+            let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let floor = Self::SAE_EXACT_A_PD_FLOOR_REL * max_eig.max(1.0);
+            let mut w = Array1::<f64>::zeros(eigs.len());
+            for (idx, &lambda) in eigs.iter().enumerate() {
+                if lambda < -floor {
+                    return Err(format!(
+                        "materialize_exact_hessian_quotient_inverse: indefinite A \
+                         (λ={lambda:.3e}); the outer gradient must not be assembled at a saddle"
+                    ));
+                }
+                w[idx] = if lambda > floor { 1.0 / lambda } else { 0.0 };
+            }
+            Ok(vecs.dot(&Array2::from_diag(&w)).dot(&vecs.t()))
+        };
+        let a_pinv = pinv(&a)?;
+        let a_tt_block = a.slice(s![..total_t, ..total_t]).to_owned();
+        let a_tt_pinv_small = pinv(&a_tt_block)?;
+        let mut a_tt_pinv = Array2::<f64>::zeros((dim, dim));
+        a_tt_pinv
+            .slice_mut(s![..total_t, ..total_t])
+            .assign(&a_tt_pinv_small);
+        Ok((a_pinv, a_tt_pinv))
+    }
+
+    /// PATH C / #2330 — dense symmetric materialization of the EXACT stationarity
+    /// Hessian `A = ∇²_θθ L = B + ΔC` (`dim×dim`, `dim = total_t + k`), built
+    /// column by column via [`Self::apply_exact_hessian`] and symmetrized. The
+    /// small-dense (circle-mint) scale this route already pays for
+    /// [`Self::materialize_joint_inverse`]; shared by the observed-information
+    /// log-determinant (VALUE) and its `A⁻¹` selected inverse (GRADIENT) so both
+    /// factor one identical operator. `test_support`-scoped until Phase 2 wiring
+    /// (see [`Self::exact_observed_information_log_dets`]).
+    pub(crate) fn materialize_exact_hessian_dense(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+    ) -> Result<Array2<f64>, String> {
+        let total_t = cache.delta_t_len();
+        let k = cache.k;
+        let dim = total_t + k;
+        let mut a = Array2::<f64>::zeros((dim, dim));
+        let mut unit = SaeArrowVector {
+            t: Array1::<f64>::zeros(total_t),
+            beta: Array1::<f64>::zeros(k),
+        };
+        for col in 0..dim {
+            if col < total_t {
+                unit.t[col] = 1.0;
+            } else {
+                unit.beta[col - total_t] = 1.0;
+            }
+            let av = self.apply_exact_hessian(rho, target, cache, &unit)?;
+            if col < total_t {
+                unit.t[col] = 0.0;
+            } else {
+                unit.beta[col - total_t] = 0.0;
+            }
+            for r in 0..total_t {
+                a[[r, col]] = av.t[r];
+            }
+            for r in 0..k {
+                a[[total_t + r, col]] = av.beta[r];
+            }
+        }
+        // The matrix-free apply is symmetric only up to round-off; symmetrize
+        // so downstream Cholesky / selected-inverse factors see an exactly
+        // symmetric operand.
+        for r in 0..dim {
+            for c in (r + 1)..dim {
+                let avg = 0.5 * (a[[r, c]] + a[[c, r]]);
+                a[[r, c]] = avg;
+                a[[c, r]] = avg;
+            }
+        }
+        Ok(a)
+    }
+
+    /// #2330 Phase-2 — the A-based logdet gradient channels on the dense direct
+    /// route: the direct trace vector `logdet_trace_i = ½tr(A⁺ ∂A/∂ρ_i)
+    /// − ½tr(A_tt⁺ ∂A/∂ρ_i)` and the effective θ-adjoint
+    /// `Γ_eff = tr(A⁺ ∂A/∂θ) − tr(A_tt⁺ ∂A_tt/∂θ) + 2∇R` (fed to the unchanged
+    /// single-adjoint IFT collapse `a = A⁺Γ_eff`, `−½⟨a, g_ρ⟩`). `∂A/∂ρ_i =
+    /// ∂B/∂ρ_i (penalty_curvature_operators_by_flat) + ∂ΔC/∂ρ_i
+    /// (exact_stationarity_penalty_derivative_delta_by_flat)`, already exact. The
+    /// θ-adjoint rides `exact_a = true` (ARD clamp-free) with `skip_deflation_dk
+    /// = true` (the exact A carries only the ρ-invariant gauge null, handled by
+    /// the quotient pseudo-inverse — no B-style Daleckii–Krein correction).
+    ///
+    /// EXACT-MINUS-PATCH-D: the two `logdet_theta_adjoint_dense` calls emit
+    /// `∂B/∂θ + ∂ΔC_ard/∂θ` but NOT the residual-curvature / softmax-entropy legs
+    /// of `∂ΔC/∂θ` (Patch D). Until D lands, Γ_eff — hence the IFT correction — is
+    /// missing that term and the conservation bisection stays red by exactly it.
+    pub(crate) fn dense_exact_a_logdet_channels(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        loss: &SaeManifoldLoss,
+        cache: &ArrowFactorCache,
+    ) -> Result<(Array1<f64>, SaeArrowVector), String> {
+        let n_params = rho.to_flat().len();
+        let (a_pinv, a_tt_pinv) =
+            self.materialize_exact_hessian_quotient_inverse(rho, target, cache)?;
+        let m = self.penalty_curvature_operators_by_flat(rho, cache)?;
+        let d = self.exact_stationarity_penalty_derivative_delta_by_flat(rho, cache)?;
+        let frob = |x: &Array2<f64>, y: &Array2<f64>| -> f64 { (x * y).sum() };
+        let mut logdet_trace = Array1::<f64>::zeros(n_params);
+        for (&i, m_i) in m.iter() {
+            let da = match d.get(&i) {
+                Some(d_i) => m_i + d_i,
+                None => m_i.clone(),
+            };
+            // A_tt⁺ has a zero β border, so frobbing it against the full ∂A/∂ρ_i
+            // restricts to the t–t block automatically.
+            logdet_trace[i] = 0.5 * frob(&a_pinv, &da) - 0.5 * frob(&a_tt_pinv, &da);
+        }
+        // Ordered-Beta–Bernoulli sparse coordinate: its ∂A/∂ρ_sparse is the exact
+        // integrated-marginal logit Hessian (cross-row), absent from the operator
+        // map above (softmax-only). Add its ½log|A| trace directly.
+        if let Some(sparse) = rho.sparse_flat_index() {
+            if matches!(
+                self.assignment.mode,
+                AssignmentMode::OrderedBetaBernoulli { .. }
+            ) {
+                logdet_trace[sparse] = self
+                    .dense_exact_a_ordered_bb_sparse_trace(rho, cache, &a_pinv, &a_tt_pinv)?;
+            }
+        }
+        let mut gamma = self.logdet_theta_adjoint_dense(
+            rho,
+            cache,
+            &a_pinv,
+            ThetaAdjointDhChannel::All,
+            true,
+            true,
+        )?;
+        let gamma_tt = self.logdet_theta_adjoint_dense(
+            rho,
+            cache,
+            &a_tt_pinv,
+            ThetaAdjointDhChannel::All,
+            true,
+            true,
+        )?;
+        gamma.t -= &gamma_tt.t;
+        gamma.beta -= &gamma_tt.beta;
+        let rank_charge = self.production_rank_charge_derivative(target, rho, loss, cache)?;
+        gamma.t.scaled_add(2.0, &rank_charge.theta.t);
+        gamma.beta.scaled_add(2.0, &rank_charge.theta.beta);
+        Ok((logdet_trace, gamma))
+    }
+
+    /// #2330 — the ordered-Beta–Bernoulli (non-softmax) sparse-coordinate ½log|A|
+    /// trace `½[tr(A⁺ ∂A/∂ρ_sparse) − tr(A_tt⁺ ∂A/∂ρ_sparse)]`. For the
+    /// non-learnable prior `∂A/∂ρ_sparse` is the EXACT integrated-marginal logit
+    /// Hessian `H_obb` (linear-in-`weight` proof on the parent issue): its column
+    /// `H_obb·e_j = ΔC_obb·e_j (cross-row HVP) + hdiag[j]·e_j (majorizer diagonal)`.
+    /// The operator lives on logit t-slots only (no β border), so the coordinate
+    /// block reuses the same columns against `A_tt⁺`. Learnable α (nonlinear
+    /// concentration derivative) is refused, not silently mispriced.
+    pub(crate) fn dense_exact_a_ordered_bb_sparse_trace(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        a_pinv: &Array2<f64>,
+        a_tt_pinv: &Array2<f64>,
+    ) -> Result<f64, String> {
+        if self.assignment.effective_alpha_is_learnable() {
+            return Err(
+                "dense_exact_a_ordered_bb_sparse_trace: learnable-α ordered-Beta–Bernoulli \
+                 ∂A/∂ρ_sparse (nonlinear concentration derivative) is not yet modelled; refusing \
+                 rather than emitting a wrong sparse ½log|A| trace"
+                    .to_string(),
+            );
+        }
+        let k_atoms = self.k_atoms();
+        let n = self.n_obs();
+        let row_weights = self.row_loss_weights.as_deref();
+        // Global t-index of each (row, atom) logit slot in the cache layout.
+        let mut logit_gindex: Vec<Vec<Option<usize>>> = vec![vec![None; k_atoms]; n];
+        for row in 0..n {
+            let base = cache.row_offsets[row];
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            for (local, var) in vars.iter().enumerate() {
+                if let SaeLocalRowVar::Logit { atom } = *var {
+                    if atom < k_atoms {
+                        logit_gindex[row][atom] = Some(base + local);
+                    }
+                }
+            }
+        }
+        // ∂B/∂ρ_sparse: the majorizer's diagonal log-strength derivative on the
+        // logit slots — the SAME builder the B-majorizer trace uses.
+        let mut hdiag = crate::assignment::assignment_prior_log_strength_hdiag_weighted(
+            &self.assignment,
+            rho,
+            row_weights,
+        )?;
+        if hdiag.is_empty() {
+            // Inert / frozen prior: ∂B and ΔC are both zero.
+            return Ok(0.0);
+        }
+        let channels = ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
+            &self.assignment,
+            rho,
+            row_weights,
+        )?;
+        if let Some(ch) = channels.as_ref() {
+            for row in 0..n {
+                for atom in 0..k_atoms {
+                    let slot = row * k_atoms + atom;
+                    hdiag[slot] =
+                        super::construction_arrow_schur_assembly::ordered_beta_bernoulli_psd_majorized_hdiag(
+                            ch, row, k_atoms, atom, hdiag[slot],
+                        );
+                }
+            }
+        }
+        // ½[tr(A⁺ ∂A/∂ρ_sparse) − tr(A_tt⁺ ∂A/∂ρ_sparse)], column by column over
+        // the flat logit basis: ∂A/∂ρ_sparse·e_j = ΔC_obb·e_j + hdiag[j]·e_j.
+        let n_logits = n * k_atoms;
+        let mut e = Array1::<f64>::zeros(n_logits);
+        let mut tr_joint = 0.0_f64;
+        let mut tr_coord = 0.0_f64;
+        for jrow in 0..n {
+            for jatom in 0..k_atoms {
+                let Some(gj) = logit_gindex[jrow][jatom] else {
+                    continue;
+                };
+                let jflat = jrow * k_atoms + jatom;
+                e[jflat] = 1.0;
+                let dc = crate::assignment::ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
+                    &self.assignment,
+                    rho,
+                    row_weights,
+                    e.view(),
+                )?;
+                e[jflat] = 0.0;
+                for irow in 0..n {
+                    for iatom in 0..k_atoms {
+                        let val = dc[irow * k_atoms + iatom];
+                        if val == 0.0 {
+                            continue;
+                        }
+                        if let Some(gi) = logit_gindex[irow][iatom] {
+                            tr_joint += a_pinv[[gi, gj]] * val;
+                            tr_coord += a_tt_pinv[[gi, gj]] * val;
+                        }
+                    }
+                }
+                tr_joint += a_pinv[[gj, gj]] * hdiag[jflat];
+                tr_coord += a_tt_pinv[[gj, gj]] * hdiag[jflat];
+            }
+        }
+        Ok(0.5 * (tr_joint - tr_coord))
+    }
+
 }
 
 #[cfg(test)]
 mod test_support {
     use super::{
-        ArrowFactorCache, DeflatedArrowSolver, FaerCholesky, SaeArrowVector, SaeCriterionError,
-        SaeManifoldRho, Side, ThetaAdjointDhChannel,
+        ArrowFactorCache, DeflatedArrowSolver, SaeArrowVector, SaeCriterionError, SaeManifoldRho,
+        ThetaAdjointDhChannel,
     };
-    use ndarray::{Array1, Array2, ArrayView2, s};
+    use ndarray::{Array1, s};
 
     impl super::SaeManifoldTerm {
-        /// PATH C / #2330 — the EXACT observed-information Laplace log-determinants
-        /// `(log|A|, log|A_tt|)` at the converged fixed-θ̂ mode, where `A = ∇²_θθ L`
-        /// is the exact stationarity Hessian (`A = B + ΔC`,
-        /// `ΔC = apply_exact_hessian_minus_b`) — NOT the majorized inner-solver
-        /// surrogate `B`. `B` exists only to keep the inner Newton positive definite
-        /// (a solver device); the quantity the DENSE capability route ranks is the
-        /// observed-information Laplace term on the exact `A`, so its value,
-        /// gradient, and Hessian form one conservative currency (#2330).
-        ///
-        /// Phase 1 of the #2330 cutover: this and [`Self::materialize_exact_hessian_dense`]
-        /// live in `test_support` until the Phase 2 value+gradient wiring gives them
-        /// production callers (a `pub(crate)` fn with only a `#[cfg(test)]` caller
-        /// trips deny-warnings dead-code). The eigendecomposition arbiter exercises
-        /// them here.
-        ///
-        /// `A` is materialized densely (`dim×dim`, `dim = total_t + k`) column by
-        /// column via [`Self::apply_exact_hessian`] then factored with a STRICT
-        /// Cholesky. A Cholesky failure means `A` is indefinite: the converged inner
-        /// point is a saddle, not a maximum, so `½log|A|` is undefined and we refuse
-        /// [`SaeCriterionError::IndefiniteObservedInformation`] rather than rank a
-        /// non-maximum. `log|A_tt|` drops the `β` border.
-        pub(crate) fn exact_observed_information_log_dets(
-            &self,
-            rho: &SaeManifoldRho,
-            target: ArrayView2<'_, f64>,
-            cache: &ArrowFactorCache,
-        ) -> Result<(f64, f64), SaeCriterionError> {
-            let total_t = cache.delta_t_len();
-            let a = self
-                .materialize_exact_hessian_dense(rho, target, cache)
-                .map_err(SaeCriterionError::Numerical)?;
-            let cholesky_log_det =
-                |m: &Array2<f64>, block: &'static str| -> Result<f64, SaeCriterionError> {
-                    let factor = m
-                        .cholesky(Side::Lower)
-                        .map_err(|_| SaeCriterionError::IndefiniteObservedInformation { block })?;
-                    Ok(2.0 * factor.diag().iter().map(|d| d.ln()).sum::<f64>())
-                };
-            let log_a = cholesky_log_det(&a, "joint")?;
-            let a_tt = a.slice(s![..total_t, ..total_t]).to_owned();
-            let log_a_tt = cholesky_log_det(&a_tt, "coordinate")?;
-            Ok((log_a, log_a_tt))
-        }
-
-        /// PATH C / #2330 — dense symmetric materialization of the EXACT stationarity
-        /// Hessian `A = ∇²_θθ L = B + ΔC` (`dim×dim`, `dim = total_t + k`), built
-        /// column by column via [`Self::apply_exact_hessian`] and symmetrized. The
-        /// small-dense (circle-mint) scale this route already pays for
-        /// [`Self::materialize_joint_inverse`]; shared by the observed-information
-        /// log-determinant (VALUE) and its `A⁻¹` selected inverse (GRADIENT) so both
-        /// factor one identical operator. `test_support`-scoped until Phase 2 wiring
-        /// (see [`Self::exact_observed_information_log_dets`]).
-        pub(crate) fn materialize_exact_hessian_dense(
-            &self,
-            rho: &SaeManifoldRho,
-            target: ArrayView2<'_, f64>,
-            cache: &ArrowFactorCache,
-        ) -> Result<Array2<f64>, String> {
-            let total_t = cache.delta_t_len();
-            let k = cache.k;
-            let dim = total_t + k;
-            let mut a = Array2::<f64>::zeros((dim, dim));
-            let mut unit = SaeArrowVector {
-                t: Array1::<f64>::zeros(total_t),
-                beta: Array1::<f64>::zeros(k),
-            };
-            for col in 0..dim {
-                if col < total_t {
-                    unit.t[col] = 1.0;
-                } else {
-                    unit.beta[col - total_t] = 1.0;
-                }
-                let av = self.apply_exact_hessian(rho, target, cache, &unit)?;
-                if col < total_t {
-                    unit.t[col] = 0.0;
-                } else {
-                    unit.beta[col - total_t] = 0.0;
-                }
-                for r in 0..total_t {
-                    a[[r, col]] = av.t[r];
-                }
-                for r in 0..k {
-                    a[[total_t + r, col]] = av.beta[r];
-                }
-            }
-            // The matrix-free apply is symmetric only up to round-off; symmetrize
-            // so downstream Cholesky / selected-inverse factors see an exactly
-            // symmetric operand.
-            for r in 0..dim {
-                for c in (r + 1)..dim {
-                    let avg = 0.5 * (a[[r, c]] + a[[c, r]]);
-                    a[[r, c]] = avg;
-                    a[[c, r]] = avg;
-                }
-            }
-            Ok(a)
-        }
         /// PATH C (#2253) CH5 test-support — the max `|dense − production|` of the
         /// θ-adjoint reconstruction over the `(t, β)` blocks, for the joint
         /// (`inv = G`) and coordinate-block (`inv = h_bd`) legs. A failing FD gate
@@ -2860,12 +3131,13 @@ mod test_support {
             let g = self.materialize_joint_inverse(cache, &solver)?;
             let h_bd = self.materialize_block_diag_t_inverse(cache);
             let dense_joint =
-                self.logdet_theta_adjoint_dense(rho, cache, &g, ThetaAdjointDhChannel::All, false)?;
+                self.logdet_theta_adjoint_dense(rho, cache, &g, ThetaAdjointDhChannel::All, false, false)?;
             let dense_tt = self.logdet_theta_adjoint_dense(
                 rho,
                 cache,
                 &h_bd,
                 ThetaAdjointDhChannel::All,
+                false,
                 false,
             )?;
             let prod_joint = self.logdet_theta_adjoint(rho, cache, &solver)?;
@@ -2936,6 +3208,7 @@ mod test_support {
                         &g_c,
                         ThetaAdjointDhChannel::All,
                         skip_dk,
+                        false,
                     )?))
                 } else if smooth_range.contains(&c) {
                     Ok(Array1::<f64>::zeros(dim)) // smooth part-b is 0
@@ -2947,6 +3220,7 @@ mod test_support {
                     };
                     Ok(flatten(&self.logdet_theta_adjoint_dense(
                         rho, cache, &g, channel, skip_dk,
+                        false,
                     )?))
                 }
             };
