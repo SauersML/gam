@@ -7000,14 +7000,36 @@ impl<'a> RemlState<'a> {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
             )
         {
-            let shape = resolved_likelihood_scale
-                .gamma_shape()
-                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            // Estimate the shape at this solve's CONVERGED η, not at whatever
+            // value the inner solve happened to leave on `likelihood`. The
+            // λ-search runs with `refine_dispersion_at_converged_eta = false`
+            // (deliberately — re-profiling ν against each trial λ's residuals
+            // would couple the scale to λ and reward over-smoothing), so on a
+            // COLD start the resolved value is the shape measured at the
+            // half-converged warm-start η, whose leftover spread in μ inflates
+            // the Gamma deviance and biases ν DOWN by >2× (the same cold-start
+            // contamination `loop_driver`'s converged-η refresh loop documents).
+            // Freezing THAT value pins the entire outer criterion to a
+            // mis-specified dispersion: measured on `y ~ s(x)`, n=800, true
+            // ν=4, a warm cache froze ν=3.96 and converged while a cold one
+            // froze ν=1.22 and ground to max_iter at |Pg|=16.5 (#2361).
+            //
+            // This is one O(n) shape evaluation at an η the solve has already
+            // produced — no re-solve, and NOT a per-λ re-profile: the value is
+            // still captured once and held fixed for every subsequent ρ, so
+            // `F(ρ) = REML(ρ, ν_frozen)` stays stationary in ρ exactly as #1074
+            // requires. It only makes the captured ν the ML shape at a
+            // converged mean instead of at a half-converged one.
+            let shape = pirls::estimate_gamma_shape_from_eta(
+                self.y,
+                &pirls_result.final_eta.to_owned(),
+                self.weights,
+            )?;
             self.frozen_gamma_shape
                 .store(shape.to_bits(), Ordering::Relaxed);
             log::info!(
-                "[OUTER] gamma λ-search shape frozen at {shape:.6e} (#1074); \
-                 outer REML criterion now stationary in ρ"
+                "[OUTER] gamma λ-search shape frozen at {shape:.6e} (#1074/#2361, \
+                 measured at the converged η); outer REML criterion now stationary in ρ"
             );
         }
         // Under seed screening the inner solver is intentionally given a tiny

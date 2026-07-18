@@ -99,3 +99,85 @@ fn gamma_te_2d_outer_loop_converges_1074() {
          the optimizer railed lambda toward the over-smoothed corner",
     );
 }
+
+/// The #2361 guard: the λ-search shape freeze must capture ν at the solve's
+/// CONVERGED η, so a plain single-smooth Gamma fit converges from a COLD start.
+///
+/// Root cause (#2361): the λ-search runs every inner solve with
+/// `refine_dispersion_at_converged_eta = false` — deliberately, since
+/// re-profiling ν against each trial λ's residuals would couple the scale to λ
+/// and reward over-smoothing. #1074 then froze ν from the first converged
+/// non-screening solve. But with the refresh off, the value that solve leaves on
+/// `likelihood` is the shape measured at the half-converged warm-start η, whose
+/// leftover spread in μ inflates the Gamma deviance and biases ν DOWN by >2×
+/// (the same cold-start contamination `loop_driver`'s converged-η refresh loop
+/// documents). Freezing THAT pinned the whole outer criterion to a
+/// mis-specified dispersion.
+///
+/// Measured on this exact fit at c49433d6c, true ν = 4: a populated persistent
+/// warm-start cache made the first inner solve converge in ONE PIRLS iteration
+/// and froze ν = 3.96 (the fit converged); a cold cache made it take six and
+/// froze ν = 1.22, after which the outer REML ground through all 200 iterations
+/// and refused at |Pg| = 1.647e1 against a 1.193e-2 bound — an interior, PSD,
+/// non-railed point. So the fit converged or not according to whether the
+/// machine had fit this model before.
+///
+/// This guard runs the single-smooth Gamma fit and requires BOTH that the outer
+/// loop certifies (fit existence is the sealed convergence proof, SPEC 20) and
+/// that the recovered dispersion lands on the data's true conditional
+/// dispersion rather than the >3× deflated cold-start value.
+#[test]
+fn gamma_single_smooth_outer_loop_converges_from_cold_start_2361() {
+    init_parallelism();
+
+    // n = 800 on the unit interval with the smooth log-mean truth used by the
+    // Python surface smoke that surfaced this: eta(x) = 0.5 + 1.2 sin(2 pi x).
+    let mut rng = StdRng::seed_from_u64(20260718);
+    let u = Uniform::new(0.0_f64, 1.0).expect("uniform");
+    let rows: Vec<StringRecord> = (0..800)
+        .map(|_| {
+            let xi = u.sample(&mut rng);
+            let mu = (0.5 + 1.2 * (2.0 * PI * xi).sin()).exp();
+            let draw: f64 = Gamma::new(SHAPE, mu / SHAPE)
+                .expect("gamma")
+                .sample(&mut rng);
+            StringRecord::from(vec![xi.to_string(), draw.to_string()])
+        })
+        .collect();
+    let headers = ["x", "y"].into_iter().map(String::from).collect();
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode gamma dataset");
+
+    let cfg = FitConfig {
+        family: Some("gamma".to_string()),
+        ..FitConfig::default()
+    };
+
+    // Pre-fix on a cold machine this call FAILS outright: the outer loop burns
+    // its whole 200-iteration budget and returns RemlDidNotConverge.
+    let result = fit_from_formula("y ~ s(x)", &ds, &cfg)
+        .expect("#2361: plain single-smooth Gamma fit must certify a stationary outer optimum");
+
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for Gamma s(x)");
+    };
+
+    let phi_hat = fit
+        .fit
+        .dispersion_phi()
+        .expect("Gamma fit must retain a valid scalar response dispersion");
+    let shape_hat = 1.0 / phi_hat;
+    eprintln!(
+        "[#2361 guard] gamma s(x): outer_converged=certified grad_norm={:?} shape_hat={shape_hat:.4}",
+        fit.fit.outer_gradient_norm,
+    );
+
+    // The cold-start contamination deflated the shape to 1.22 against a truth of
+    // 4.0. A factor-of-1.5 band absorbs the finite-sample noise of this draw
+    // while still catching that >3x collapse.
+    assert!(
+        shape_hat > SHAPE / 1.5 && shape_hat < SHAPE * 1.5,
+        "#2361 regression: recovered Gamma shape nu_hat = {shape_hat:.4} is far from the \
+         true nu = {SHAPE:.1}; the lambda-search freeze captured a shape measured at a \
+         half-converged eta instead of the converged one",
+    );
+}
