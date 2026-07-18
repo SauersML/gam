@@ -2576,9 +2576,27 @@ impl SaeManifoldOuterObjective {
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 return Ok((f64::INFINITY, beta_hat));
             }
+            // #2336 — an indefinite exact `A` leaves the Laplace normaliser
+            // `½log|A|` UNDEFINED at this ρ, so this evaluation is INFEASIBLE, not
+            // defective. That is the same class `is_recoverable_value_probe_refusal`
+            // already maps to `+inf`, for the reason its #1782 note gives: the
+            // indefinite basin is adjacent to the PD optimum, so the outer solver
+            // must read `+∞` and steer back into the PD region rather than abort the
+            // whole fit. #2330 Phase-2a made `½log|A|` the ranked value, which is
+            // what made this reachable — the majorizer `B` was PD by construction and
+            // could never trip it. Escaping the saddle is the ACCEPTED lane's job
+            // (the #2336 terminal escape, upstream in the criterion); by the time a
+            // refusal surfaces here the escape is already exhausted, and a probe must
+            // stay probe-infeasible rather than grind.
             Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
-                let message = err.to_string();
-                return Err(message);
+                self.probe_telemetry.record_refusal_kind(&err.to_string());
+                log::debug!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
+                let loss = self.term.loss(self.target.view(), &rho)?;
+                let beta_hat = self.term.flatten_beta();
+                self.current_rho = rho;
+                self.last_loss = Some(loss);
+                self.probe_telemetry.infeasible_criterion_evals += 1;
+                return Ok((f64::INFINITY, beta_hat));
             }
             Err(SaeCriterionError::Numerical(message)) => return Err(message),
         };
@@ -3056,9 +3074,26 @@ impl SaeManifoldOuterObjective {
                     "infeasible penalized quasi-Laplace score",
                 ));
             }
+            // #2336 — an indefinite exact `A` leaves the Laplace normaliser
+            // `½log|A|` UNDEFINED at this ρ, so this evaluation is INFEASIBLE, not
+            // defective. That is the same class `is_recoverable_value_probe_refusal`
+            // already maps to `+inf`, for the reason its #1782 note gives: the
+            // indefinite basin is adjacent to the PD optimum, so the outer solver
+            // must read `+∞` and steer back into the PD region rather than abort the
+            // whole fit. #2330 Phase-2a made `½log|A|` the ranked value, which is
+            // what made this reachable — the majorizer `B` was PD by construction and
+            // could never trip it. Escaping the saddle is the ACCEPTED lane's job
+            // (the #2336 terminal escape, upstream in the criterion); by the time a
+            // refusal surfaces here the escape is already exhausted, and a probe must
+            // stay probe-infeasible rather than grind.
             Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
-                let err = err.to_string();
-                return Err(err);
+                self.probe_telemetry.record_refusal_kind(&err.to_string());
+                log::debug!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
+                self.probe_telemetry.infeasible_criterion_evals += 1;
+                self.current_rho = rho;
+                return Ok(infeasible_evaluation(
+                    "infeasible penalized quasi-Laplace score (indefinite exact A)",
+                ));
             }
             Err(SaeCriterionError::Numerical(err)) => return Err(err),
         };
@@ -4075,8 +4110,23 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     self.probe_telemetry.infeasible_criterion_evals += 1;
                     return Ok(OuterEval::infeasible(rho.len()));
                 }
+                // #2336 — an indefinite exact `A` leaves the Laplace normaliser
+                // `½log|A|` UNDEFINED at this ρ, so this evaluation is INFEASIBLE, not
+                // defective. That is the same class `is_recoverable_value_probe_refusal`
+                // already maps to `+inf`, for the reason its #1782 note gives: the
+                // indefinite basin is adjacent to the PD optimum, so the outer solver
+                // must read `+∞` and steer back into the PD region rather than abort the
+                // whole fit. #2330 Phase-2a made `½log|A|` the ranked value, which is
+                // what made this reachable — the majorizer `B` was PD by construction and
+                // could never trip it. Escaping the saddle is the ACCEPTED lane's job
+                // (the #2336 terminal escape, upstream in the criterion); by the time a
+                // refusal surfaces here the escape is already exhausted, and a probe must
+                // stay probe-infeasible rather than grind.
                 Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
-                    return Err(EstimationError::RemlOptimizationFailed(err.to_string()));
+                    self.probe_telemetry.record_refusal_kind(&err.to_string());
+                    log::debug!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
+                    self.probe_telemetry.infeasible_criterion_evals += 1;
+                    return Ok(OuterEval::infeasible(rho.len()));
                 }
                 Err(SaeCriterionError::Numerical(err)) => {
                     return Err(EstimationError::RemlOptimizationFailed(err));

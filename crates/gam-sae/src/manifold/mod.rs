@@ -298,6 +298,8 @@ mod tests_collateral_noncyclic_2234;
 
 #[cfg(test)]
 mod tests_schur_seed_refusal_1782;
+#[cfg(test)]
+mod tests_indefinite_a_refusal_2336;
 
 #[cfg(test)]
 mod tests_streaming_materialize_chunk_1801;
