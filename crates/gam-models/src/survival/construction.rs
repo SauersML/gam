@@ -4189,7 +4189,11 @@ mod tests {
                 .expect("build survival timewiggle");
 
         assert_eq!(build.penalties.len(), 3);
-        assert_eq!(build.nullspace_dims, vec![1, 2, 3]);
+        // Anchored I-spline value basis (#2306): the anchoring removes the
+        // constant direction, so the order-m roughness nullity is m−1 — the
+        // order-1 penalty is positive definite (nullity 0). The old [1, 2, 3]
+        // encoded the unanchored convention.
+        assert_eq!(build.nullspace_dims, vec![0, 1, 2]);
         assert!(build.ncols > 0);
     }
 
