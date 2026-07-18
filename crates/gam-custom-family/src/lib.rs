@@ -69,7 +69,7 @@ pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
 pub(crate) use std::any::Any;
 pub(crate) use std::cell::RefCell;
 pub(crate) use std::collections::BTreeMap;
-pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, Mutex, OnceLock};
 
 // --- descended carriers + the `CustomFamily` trait + fit options + ψ design --

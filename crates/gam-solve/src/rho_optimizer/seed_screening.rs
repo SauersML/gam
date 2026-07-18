@@ -50,6 +50,30 @@ pub struct InnerProgressFeedback {
     /// iter's inner Newton may need extra margin even when the
     /// previous solve converged in few iters.
     pub accept_rho: Arc<AtomicU64>,
+    /// #2349 — one-shot "re-evaluate COLD" pulse raised by the outer
+    /// cost-stall guard when it grants a STUCK-stall escape.
+    ///
+    /// A stuck stall means the outer objective has flatlined over the
+    /// no-improvement window while the projected gradient is still far above
+    /// the certified-stationary band — i.e. genuine feasible descent remains,
+    /// but the optimizer cannot see it. On a near-separating profiled fit the
+    /// cause is warm-start value HYSTERESIS: successive trial-ρ inner solves
+    /// are warm-started from the previous iterate's coefficient mode, and on a
+    /// near-flat inner ridge (vanishing softmax Fisher curvature at the simplex
+    /// boundary) two warm starts converge to different ridge points whose
+    /// Laplace `½log|H(β)|` — hence the profiled objective — differ by more
+    /// than the outer descent resolution. The optimizer's step-acceptance then
+    /// cannot distinguish real descent from that hysteresis and the loop grinds
+    /// to `max_iter` at a non-stationary point.
+    ///
+    /// Uncapping the inner cycle budget alone does NOT fix this (a fully
+    /// converged warm solve still lands on the warm-biased ridge point), so the
+    /// escape additionally asks the next outer evaluation(s) to re-solve the
+    /// inner problem COLD — trajectory-independent — restoring a consistent
+    /// objective surface the optimizer can descend. `false` = no pending
+    /// request. Only the custom-family joint path consumes it today; every
+    /// other path leaves it inert.
+    pub force_cold: Arc<AtomicBool>,
 }
 
 impl InnerProgressFeedback {

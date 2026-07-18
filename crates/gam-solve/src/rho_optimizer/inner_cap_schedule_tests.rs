@@ -58,6 +58,7 @@ fn snapshot_distinguishes_zero_residual_from_no_signal() {
         accept_rho: Arc::new(AtomicU64::new(
             crate::estimate::reml::outer_eval::IFT_RESIDUAL_NO_SIGNAL_BITS,
         )),
+        force_cold: Arc::new(AtomicBool::new(false)),
     };
 
     // Sentinel → no IFT signal (last_ift_residual = None).

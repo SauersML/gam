@@ -1422,8 +1422,13 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
                     // of its fixed point, leaving the cost and the analytic
                     // gradient inconsistent; an uncapped solve restores a
                     // trustworthy gradient the outer step can actually use.
+                    // #2349: raise the cold-reeval pulse alongside the uncap so
+                    // a warm-start-hysteresis stall on a near-separating fit
+                    // re-solves the next outer evaluations COLD (see the ARC arm
+                    // and the `force_cold` field doc for the full rationale).
                     if let Some(feedback) = self.outer_inner_cap.as_ref() {
                         feedback.cap.store(0, Ordering::Relaxed);
+                        feedback.force_cold.store(true, Ordering::Relaxed);
                     }
                     log::warn!(
                         "[OUTER] cost-stall STUCK (NOT a flat valley): REML objective improved \
@@ -1909,9 +1914,15 @@ impl OuterSecondOrderBridge<'_> {
                 // tolerance — a stuck stall, not a flat valley. Do not halt ARC.
                 // Uncap the inner PIRLS so the next solves run to full tolerance
                 // and the outer gradient becomes trustworthy (see the BFGS-side
-                // arm for the full rationale).
+                // arm for the full rationale). #2349: also raise the cold-reeval
+                // pulse — on a near-separating profiled fit the stall is
+                // warm-start value hysteresis, which an uncapped WARM solve does
+                // not cure (it re-converges to the same warm-biased ridge point);
+                // the next outer evaluations must re-solve COLD to hand the
+                // optimizer a trajectory-independent surface it can descend.
                 if let Some(feedback) = self.outer_inner_cap.as_ref() {
                     feedback.cap.store(0, Ordering::Relaxed);
+                    feedback.force_cold.store(true, Ordering::Relaxed);
                 }
                 log::warn!(
                     "[OUTER] ARC cost-stall STUCK (NOT a flat valley): REML objective improved \

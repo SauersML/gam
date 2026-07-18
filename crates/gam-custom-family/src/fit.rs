@@ -1122,6 +1122,14 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .clone()
         .unwrap_or_else(|| Arc::new(AtomicUsize::new(options.inner_max_cycles.max(1))));
     outer_inner_cap.store(options.inner_max_cycles.max(1), Ordering::Relaxed);
+    // #2349 — shared "re-evaluate COLD" pulse. The outer cost-stall guard raises
+    // it when it grants a STUCK-stall escape (a near-separating profiled fit
+    // whose warm-started trajectory carries value hysteresis on a near-flat
+    // inner ridge). The outer-eval closures below observe it, drop the warm
+    // cache, and re-solve the inner problem cold so ARC descends a consistent
+    // objective surface instead of grinding to `max_iter` at a non-stationary
+    // point.
+    let outer_force_cold = Arc::new(AtomicBool::new(false));
     let mut outer_options = options.clone();
     outer_options.screening_max_inner_iterations = Some(Arc::clone(&screening_cap));
     outer_options.outer_inner_max_iterations = Some(Arc::clone(&outer_inner_cap));
@@ -1177,6 +1185,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let n_obs = specs.first().map(|s| s.design.nrows()).unwrap_or(0);
     let p_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
     let problem = OuterProblem::new(n_rho)
+        .with_stuck_stall_cold_reeval_signal(Arc::clone(&outer_force_cold))
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
         .with_disable_fixed_point(multi_block_beta_dependent)
@@ -1309,6 +1318,18 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                       rho: &Array1<f64>,
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
+        // #2349: consume the cold-reeval pulse once per outer evaluation. When
+        // active (a near-separating warm-start-hysteresis stall the outer guard
+        // flagged), every inner solve in this evaluation drops the warm cache
+        // and runs cold + uncapped so ARC descends a trajectory-independent
+        // objective surface.
+        let force_cold = outer.take_force_cold();
+        if force_cold {
+            outer_options
+                .outer_inner_max_iterations
+                .as_ref()
+                .map(|cap| cap.store(0, Ordering::Relaxed));
+        }
         // Genuinely value-only fulfilment (#979). A `Value` request from an outer
         // cost, screening, or reactive-domain probe never consumes the outer
         // gradient. The inner solve in `EvalMode::ValueOnly` already produces the
@@ -1316,7 +1337,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // `outer.warm_cache`) with a zero-length gradient and skip the full
         // k²·n·p² coupled-joint LAML gradient assembly.
         if matches!(order, OuterEvalOrder::Value) {
-            let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
+            let warm_ref = if force_cold {
+                None
+            } else {
+                screened_outer_warm_start(outer.warm_cache.as_ref(), rho)
+            };
             return match outerobjectivegradienthessian_labeled(
                 family,
                 specs,
@@ -1363,7 +1388,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // consumed by certified fit assembly. A failed analytic probe must not
         // leave an older mode available for accidental substitution.
         outer.begin_terminal_evaluation();
-        let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
+        let warm_ref = if force_cold {
+            None
+        } else {
+            screened_outer_warm_start(outer.warm_cache.as_ref(), rho)
+        };
         let eval_result = match outerobjectivegradienthessian_labeled(
             family,
             specs,
@@ -1406,12 +1435,16 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     .map(|value| value * value)
                     .sum::<f64>()
                     .sqrt();
-                update_custom_outer_inner_cap_from_warm_start(
-                    &outer_options,
-                    &warm_start,
-                    Some(gradient_norm),
-                    &mut outer.initial_gradient_norm,
-                );
+                // #2349: keep the cap uncapped while the cold-reeval latch is
+                // active so cold solves reach their fixed point.
+                if !force_cold {
+                    update_custom_outer_inner_cap_from_warm_start(
+                        &outer_options,
+                        &warm_start,
+                        Some(gradient_norm),
+                        &mut outer.initial_gradient_norm,
+                    );
+                }
                 outer.warm_cache = Some(warm_start.clone());
                 store_persistent_custom_family_warm_start(
                     persistent_warm_start_key.as_deref(),
@@ -1469,14 +1502,31 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     };
 
     let mut obj = problem.build_objective_with_screening_proxy(
-        CustomOuterState::new(persistent_warm_start.clone())
-            .with_outer_derivative_pilot(family.outer_derivative_pilot_schedule()),
+        CustomOuterState::new_with_cold_signal(
+            persistent_warm_start.clone(),
+            Arc::clone(&outer_force_cold),
+        )
+        .with_outer_derivative_pilot(family.outer_derivative_pilot_schedule()),
         |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             // Always use warm cache when available — the previous inner solution
             // gives a much better starting point. This was previously disabled for
             // exact-Hessian families, forcing every inner solve to start from
             // scratch (5-10 Newton steps instead of 1-2 with warm start).
-            let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
+            //
+            // #2349: once the outer cost-stall guard has raised the cold-reeval
+            // pulse (near-separating warm-start hysteresis), drop the warm cache
+            // and run this probe cold + uncapped so the profiled objective is a
+            // consistent function of ρ.
+            let force_cold = outer.take_force_cold();
+            let warm_ref = if force_cold {
+                outer_options
+                    .outer_inner_max_iterations
+                    .as_ref()
+                    .map(|cap| cap.store(0, Ordering::Relaxed));
+                None
+            } else {
+                screened_outer_warm_start(outer.warm_cache.as_ref(), rho)
+            };
             match outerobjectivegradienthessian_labeled(
                 family,
                 specs,
@@ -1500,12 +1550,16 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     // value-only probe has no gradient, so the cap is driven
                     // purely by the converged cycle count (the gradient-norm
                     // near-optimum uncapping is handled by the main eval).
-                    update_custom_outer_inner_cap_from_warm_start(
-                        &outer_options,
-                        &eval.warm_start,
-                        None,
-                        &mut outer.initial_gradient_norm,
-                    );
+                    // #2349: while the cold-reeval latch is active, leave the cap
+                    // uncapped so every cold solve reaches its fixed point.
+                    if !force_cold {
+                        update_custom_outer_inner_cap_from_warm_start(
+                            &outer_options,
+                            &eval.warm_start,
+                            None,
+                            &mut outer.initial_gradient_norm,
+                        );
+                    }
                     outer.warm_cache = Some(eval.warm_start);
                     outer.last_error = None;
                     Ok(eval.objective)

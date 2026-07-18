@@ -521,6 +521,7 @@ fn terminal_fidelity_feedback(cap_value: usize) -> InnerProgressFeedback {
         last_converged: Arc::new(AtomicBool::new(false)),
         ift_residual: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
         accept_rho: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
+        force_cold: Arc::new(AtomicBool::new(false)),
     }
 }
 

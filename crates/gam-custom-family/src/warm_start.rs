@@ -952,10 +952,32 @@ pub(crate) struct CustomOuterState {
     pub(crate) last_error: Option<String>,
     pub(crate) initial_gradient_norm: Option<f64>,
     pub(crate) outer_derivative_pilot: Option<OuterDerivativePilotSchedule>,
+    /// #2349 — one-shot "re-evaluate COLD" pulse shared with the outer
+    /// cost-stall guard (via `OuterProblem::with_stuck_stall_cold_reeval_signal`).
+    /// The guard raises it when it grants a STUCK-stall escape; the outer-eval
+    /// closures observe it, drop the warm cache for that evaluation, and latch
+    /// [`Self::force_cold_latched`] so the remainder of the outer run stays on
+    /// the trajectory-independent COLD surface.
+    pub(crate) force_cold_signal: Arc<AtomicBool>,
+    /// Latched once the cold-reeval pulse has fired: every subsequent outer
+    /// evaluation re-solves the inner problem cold, so the profiled objective
+    /// ARC sees is a consistent function of ρ (no warm-start hysteresis) and the
+    /// optimizer can descend past the near-separating stall. Cleared on
+    /// [`Self::reset`] so each screened seed starts warm and re-latches only if
+    /// it stalls on its own.
+    pub(crate) force_cold_latched: bool,
 }
 
 impl CustomOuterState {
+    #[cfg(test)]
     pub(crate) fn new(warm_start: Option<ConstrainedWarmStart>) -> Self {
+        Self::new_with_cold_signal(warm_start, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub(crate) fn new_with_cold_signal(
+        warm_start: Option<ConstrainedWarmStart>,
+        force_cold_signal: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             warm_cache: warm_start.clone(),
             reset_warm_cache: warm_start,
@@ -963,7 +985,21 @@ impl CustomOuterState {
             last_error: None,
             initial_gradient_norm: None,
             outer_derivative_pilot: None,
+            force_cold_signal,
+            force_cold_latched: false,
         }
+    }
+
+    /// Observe the shared cold-reeval pulse (consuming it) and the sticky
+    /// latch: returns `true` when this and every following outer evaluation
+    /// must re-solve the inner problem COLD (#2349). The pulse is raised by the
+    /// outer cost-stall guard on a STUCK-stall escape; once seen it latches for
+    /// the remainder of the run so ARC descends a consistent surface.
+    pub(crate) fn take_force_cold(&mut self) -> bool {
+        if self.force_cold_signal.swap(false, Ordering::Relaxed) {
+            self.force_cold_latched = true;
+        }
+        self.force_cold_latched
     }
 
     pub(crate) fn with_outer_derivative_pilot(
@@ -994,6 +1030,9 @@ impl CustomOuterState {
     pub(crate) fn reset(&mut self) {
         self.warm_cache = self.reset_warm_cache.clone();
         self.terminal_mode = None;
+        // A fresh screened seed / retry starts warm again; it re-latches the
+        // cold path only if it hits its own stuck stall (#2349).
+        self.force_cold_latched = false;
     }
 
     /// Begin one derivative-bearing outer evaluation transaction.

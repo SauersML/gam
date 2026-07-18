@@ -15,7 +15,7 @@ use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
 use gam_problem::{SeedConfig, SeedRiskProfile};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Unscaled posterior covariance `H⁻¹` of the supplied Hessian.
@@ -327,6 +327,10 @@ fn reml_inner_progress_feedback(
         last_converged: Arc::clone(&state.last_inner_converged),
         ift_residual: Arc::clone(&state.last_ift_prediction_residual),
         accept_rho: Arc::clone(&state.last_pirls_accept_rho),
+        // The standard REML path does not consume the cold-reeval pulse
+        // (#2349); give it an inert, unshared flag so the guard's writes go
+        // nowhere and behavior is unchanged.
+        force_cold: Arc::new(AtomicBool::new(false)),
     }
 }
 

@@ -426,6 +426,45 @@ impl OuterProblem {
         self.outer_inner_cap = Some(feedback);
         self
     }
+
+    /// Wire a one-shot "re-evaluate the inner solve COLD" signal that the outer
+    /// cost-stall guard raises when it grants a STUCK-stall escape (#2349).
+    ///
+    /// A profiled objective whose inner solve is warm-started along the outer
+    /// trajectory can carry value HYSTERESIS on a near-flat inner ridge — the
+    /// multinomial simplex-boundary regime where the softmax Fisher weight
+    /// `diag(p) − ppᵀ` collapses is the motivating case: two warm starts
+    /// converge to different ridge points whose Laplace `½log|H(β)|`, hence the
+    /// profiled objective, differ by more than the outer descent resolution, so
+    /// the optimizer's step-acceptance cannot separate real descent from that
+    /// hysteresis and grinds to `max_iter` at a non-stationary point. Uncapping
+    /// the inner cycle budget does not cure it (a fully converged warm solve
+    /// still lands on the warm-biased ridge point); the objective must re-solve
+    /// COLD to see a consistent surface.
+    ///
+    /// The caller shares this `Arc<AtomicBool>` with its objective closure and
+    /// consults it there, re-solving the inner problem from a canonical seed
+    /// (dropping the warm cache) whenever the flag is raised. The signal rides
+    /// the internal inner-cap feedback channel, but its `cap` slot is a private
+    /// throwaway so wiring the signal never perturbs the caller's own inner-cap
+    /// scheduling (custom families hold their real inner cap separately).
+    /// Objectives that do not warm-start, or never near-separate, simply never
+    /// observe the flag raised.
+    pub fn with_stuck_stall_cold_reeval_signal(self, signal: Arc<AtomicBool>) -> Self {
+        self.with_outer_inner_cap(InnerProgressFeedback {
+            cap: Arc::new(AtomicUsize::new(0)),
+            accepted_iter: Arc::new(AtomicUsize::new(0)),
+            // `last_iters == 0` ⇒ `snapshot()` returns `None` ⇒ no cap-schedule
+            // adaptation is derived from this dummy; `last_converged == true`
+            // matches the `None` default of `inner_solve_converged`, so
+            // terminal-fidelity gating is byte-for-byte unchanged.
+            last_iters: Arc::new(AtomicUsize::new(0)),
+            last_converged: Arc::new(AtomicBool::new(true)),
+            ift_residual: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
+            accept_rho: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
+            force_cold: signal,
+        })
+    }
     pub fn with_operator_initial_trust_radius(mut self, radius: Option<f64>) -> Self {
         self.operator_initial_trust_radius = sanitized_operator_trust_restart_radius(radius);
         self
