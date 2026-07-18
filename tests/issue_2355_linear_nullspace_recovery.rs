@@ -113,21 +113,24 @@ fn linear_data_recovers_line_not_flat_collapse() {
     // The previously-collapsing regime (`n ∈ [5, 15]`, all under-determined with
     // the default `p = 8` basis) plus a couple of the already-correct
     // well-determined sizes as a non-regression guard.
-    // The previously silently-collapsing regime: sizes in the under-determined
-    // band (`n < 2·p`, `p = 8` ⇒ `n < 16`) that are still large enough to
-    // estimate the Gaussian scale (`n > nullity`). Every one of these took the
-    // aggressive null-space select-out and shipped a flat line at the response
-    // mean (EDF ≈ 1.08). The data-adaptive gate now recognises the fully-
-    // supported linear component and lets pure REML recover the slope.
+    // The previously-broken under-determined band (`n < 2·p`, `p ≈ 8` ⇒
+    // `n < 16`). Two independent defects conspired here on the trivially clean
+    // line:
+    //   * `n ∈ [9, 15]` (`n > p`): the aggressive null-space select-out prior
+    //     shipped a flat line at the response mean (EDF ≈ 1.08) — a silent wrong
+    //     answer. The data-adaptive gate now recognises the fully-supported
+    //     linear component and lets pure REML recover the slope.
+    //   * `n ∈ [5, 8]` (`n ≈ p`): the summed-penalty profiled-diagonal SEED
+    //     heuristic honestly refused this near-degenerate corner, and that
+    //     refusal was propagated as a fatal fit error instead of merely dropping
+    //     one seed candidate. It is now non-fatal, so the coupled 2-λ outer
+    //     search — which is perfectly well-posed here — recovers the line.
     //
-    // Scope notes (distinct, pre-existing regimes, NOT the silent-collapse bug
-    // this test guards): `n ≤ 8` is honestly refused by the seed-prepass
-    // closed-form REML at the `p > n` / `n ≈ nullity` corner, and the
-    // well-determined band `n ≥ 16` has an independent outer-stationarity
-    // certification flakiness near the `λ_null → 0` rail (#2348) — both return
-    // an explicit error, never a silent wrong answer, so neither is asserted
-    // here.
-    for n in [9usize, 10, 11, 12, 13, 14, 15] {
+    // Scope note: the well-determined band `n ≥ 16` has an independent
+    // outer-stationarity certification issue near the `λ_null → 0` rail (#2348)
+    // that returns an explicit error (never a silent wrong answer); it is out of
+    // scope for this test.
+    for n in [5usize, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
         let (edf, max_err, slope) = fit_linear(n);
         eprintln!("#2355 n={n}: edf={edf:.4} max|fitted-x|={max_err:.3e} slope={slope:.6}");
 

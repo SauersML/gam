@@ -971,8 +971,22 @@ where
                 //      the penalty pseudo-determinant nonseparable, so there is no
                 //      per-block "exact" cyclic closed form. The candidate is
                 //      admitted only after the true coupled REML cost scores it.
+                // A FAILED seed heuristic must never be fatal. The summed-penalty
+                // profiled-diagonal candidate solves a closed-form REML on the
+                // collapsed 1-D restriction; on a tiny / near-degenerate design
+                // (e.g. `n ≈ nullity` of the summed penalty, the `p ≥ n` corner
+                // reached by `y ~ s(x)` on very few rows, #2355) that closed form
+                // can honestly refuse. That refusal only means "this ONE seed is
+                // unavailable" — the generated-seed screen and the neutral/base
+                // anchors remain, and the outer optimizer is the sole authority on
+                // whether the fit certifies. Propagating the seed error with `?`
+                // instead killed the entire fit for a mere unavailable candidate.
+                // Treat an errored candidate as absent (`None`) so the search still
+                // runs from the surviving seeds.
                 let summed_diagonal = reml_state
-                    .analytic_gaussian_profiled_diagonal_rho((lo, hi))?
+                    .analytic_gaussian_profiled_diagonal_rho((lo, hi))
+                    .ok()
+                    .flatten()
                     .map(|rho_blocks| {
                         let mut seed = base.clone();
                         for (coord, &r) in seed.iter_mut().zip(rho_blocks.iter()) {
