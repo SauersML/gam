@@ -962,9 +962,9 @@ pub(crate) struct CustomOuterState {
     /// Latched once the cold-reeval pulse has fired: every subsequent outer
     /// evaluation re-solves the inner problem cold, so the profiled objective
     /// ARC sees is a consistent function of ρ (no warm-start hysteresis) and the
-    /// optimizer can descend past the near-separating stall. Cleared on
-    /// [`Self::reset`] so each screened seed starts warm and re-latches only if
-    /// it stalls on its own.
+    /// optimizer can descend past the near-separating stall. Survives
+    /// [`Self::reset`] on purpose — the terminal certificate must be measured on
+    /// the same cold surface the descent used (see `reset`).
     pub(crate) force_cold_latched: bool,
 }
 
@@ -1030,9 +1030,15 @@ impl CustomOuterState {
     pub(crate) fn reset(&mut self) {
         self.warm_cache = self.reset_warm_cache.clone();
         self.terminal_mode = None;
-        // A fresh screened seed / retry starts warm again; it re-latches the
-        // cold path only if it hits its own stuck stall (#2349).
-        self.force_cold_latched = false;
+        // #2349: the cold-reeval latch deliberately SURVIVES reset. `reset` runs
+        // between screened seeds/retries AND immediately before terminal
+        // certification (run.rs finalize/certify); clearing it there would
+        // re-evaluate `result.rho` WARM — reintroducing the very warm-start
+        // hysteresis whose descent found that point on the COLD surface, and the
+        // certificate would disagree with the trajectory that produced it. Once
+        // any evaluation has revealed the near-separating stall, the whole fit
+        // (all remaining seeds and the terminal certificate) stays on the
+        // consistent cold surface.
     }
 
     /// Begin one derivative-bearing outer evaluation transaction.
