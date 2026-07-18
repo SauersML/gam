@@ -331,7 +331,7 @@ fn fit_term_collection_on_realized_design(
     // term's signal lives in its penalty null space (#1271 single-penalty tp/ps,
     // #1266 double-penalty selection). Length-safe: only fires when the inner ρ
     // aligns 1:1 with the penalty blocks (see `relax_smoothing_rho_prior`).
-    base_fit_opts.rho_prior = relax_smoothing_rho_prior(options, design);
+    base_fit_opts.rho_prior = relax_smoothing_rho_prior(options, design, y, weights);
     let fitted = FittedTermCollection {
         fit: fit_gamwith_heuristic_lambdas(
             design.design.clone(),
@@ -2741,6 +2741,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 fn relax_smoothing_rho_prior(
     options: &FitOptions,
     design: &TermCollectionDesign,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
 ) -> gam_spec::RhoPrior {
     use gam_terms::basis::BasisMetadata;
     let base = &options.rho_prior;
@@ -3002,7 +3004,8 @@ fn relax_smoothing_rho_prior(
     };
     let per_coord = coords
         .iter()
-        .map(|info| {
+        .enumerate()
+        .map(|(coord_idx, info)| {
             let relax = info
                 .termname
                 .as_deref()
@@ -3050,7 +3053,29 @@ fn relax_smoothing_rho_prior(
             //     REML's own score (the sin-data linear trend → λ_null large) and a
             //     genuinely-supported one is not over-shrunk.
             if is_nullspace {
-                if underdetermined {
+                // The aggressive select-out prior is only ever justified when the
+                // data is INDIFFERENT to the null-space (polynomial) component —
+                // its steep `θ·e^{−ρ/2}` wall (θ ≈ 92, cost reaching ~1e8 at the
+                // ρ box edge) is a near-hard constraint that dominates the base
+                // REML criterion by many orders of magnitude, so it CANNOT be
+                // overridden by the likelihood once applied. The `n < 2·p`
+                // under-determined proxy alone is far too broad: a perfectly
+                // well-posed linear signal that lives ENTIRELY in the null space
+                // (e.g. `y = x` fit with `s(x)`, `p = 8`, any `n < 16`) is
+                // over-parameterised by that count yet strongly determines its
+                // null-space (slope) coefficient. Select-out there annihilates the
+                // true slope and silently ships a flat line (#2355). Before
+                // applying the select-out, verify the data does NOT clearly support
+                // this coordinate's null-space directions; if it does, fall back to
+                // the wide, weakly-informative degeneracy Normal (which supplies
+                // termination curvature without a directional select-out bias) so
+                // pure REML — matching mgcv `select=TRUE` — recovers the component.
+                // The check is conservative: it only downgrades when the null space
+                // is UNAMBIGUOUSLY supported, so a genuinely-unsupported null space
+                // (#1392 wine `p > n`) keeps its select-out byte-for-byte.
+                if underdetermined
+                    && !nullspace_directions_are_supported(design, coord_idx, y, weights)
+                {
                     nullspace_select_prior.clone()
                 } else {
                     nullspace_degeneracy_prior.clone()
@@ -3061,6 +3086,210 @@ fn relax_smoothing_rho_prior(
         })
         .collect::<Vec<_>>();
     gam_spec::RhoPrior::Independent(per_coord)
+}
+
+/// Fraction of the null-space-conditional response variance the null-space
+/// directions of `design.penalties[penalty_idx]` must explain before their
+/// smoothing coordinate is treated as data-SUPPORTED (and therefore exempt from
+/// the aggressive `nullspace_select_prior`). Deliberately high: only an
+/// unambiguously-supported null space is downgraded, so a genuinely-unsupported
+/// one (#1392) keeps its select-out.
+const NULLSPACE_SUPPORT_FRACTION_THRESHOLD: f64 = 0.5;
+
+/// Does the data clearly support the null-space (polynomial) component that the
+/// `DoublePenaltyNullspace` penalty `design.penalties[penalty_idx]` selects on?
+///
+/// The null-space ridge `S₂` penalizes exactly the bending-penalty null space
+/// (`{1, x}` for a 1-D P-spline; the affine trend for a thin-plate). Its RANGE
+/// spans those design directions `Z = X[:, col_range] · V₊(S₂)`. We ask whether
+/// `Z` explains a substantial fraction of the response variance that the
+/// *structurally-unpenalized* columns `C` (intercept + parametric fixed effects)
+/// leave unexplained — a weighted partial-`R²` of the null-space block:
+///
+/// ```text
+///   support = (RSS(y | C) − RSS(y | [C, Z])) / RSS(y | C).
+/// ```
+///
+/// This is a cheap, low-dimensional (`≤ |C| + rank(S₂)` columns, always
+/// well-posed even when `p > n`) evidence test that mirrors what mgcv's REML
+/// would conclude from the marginal likelihood: a null space carrying real
+/// signal (a slope, a linear trend) yields `support → 1`; an unsupported one
+/// yields `support → 0`. Returns `false` on any degeneracy (missing dense
+/// design, empty null space, vanishing residual variance) so the caller keeps
+/// the existing select-out behaviour whenever the test cannot be trusted.
+fn nullspace_directions_are_supported(
+    design: &TermCollectionDesign,
+    penalty_idx: usize,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> bool {
+    use gam_linalg::faer_ndarray::FaerEigh;
+
+    let Some(pen) = design.penalties.get(penalty_idx) else {
+        return false;
+    };
+    let col_range = pen.col_range.clone();
+    if col_range.is_empty() {
+        return false;
+    }
+    let x = design.design.to_dense();
+    let n = x.nrows();
+    if n == 0 || y.len() != n || weights.len() != n || x.ncols() < col_range.end {
+        return false;
+    }
+    // Response with the design's fixed affine channel removed (the fit sees
+    // `affine_offset + X·β`, so the estimable part of the response is
+    // `y − affine_offset`). Fall back to raw `y` if the channel is absent.
+    let mut resp = y.to_owned();
+    if design.affine_offset.len() == n {
+        resp -= &design.affine_offset;
+    }
+
+    // Null-space design directions `Z = X[:, col_range] · V₊(S₂)`, where `V₊`
+    // are the eigenvectors of the (PSD) ridge with strictly-positive eigenvalue.
+    let Ok((evals, evecs)) = pen.local.eigh(faer::Side::Lower) else {
+        return false;
+    };
+    let max_eig = evals.iter().cloned().fold(0.0_f64, |m, v| m.max(v));
+    if !(max_eig > 0.0) {
+        return false;
+    }
+    let tol = 1.0e-9 * max_eig;
+    let pos_cols: Vec<usize> = (0..evals.len()).filter(|&j| evals[j] > tol).collect();
+    if pos_cols.is_empty() {
+        return false;
+    }
+    let xblock = x.slice(s![.., col_range.clone()]);
+    let mut z = Array2::<f64>::zeros((n, pos_cols.len()));
+    for (out_j, &j) in pos_cols.iter().enumerate() {
+        let v = evecs.column(j);
+        // Guard against a col_range / local-matrix width disagreement.
+        if v.len() != xblock.ncols() {
+            return false;
+        }
+        z.column_mut(out_j).assign(&xblock.dot(&v));
+    }
+
+    // Structurally-unpenalized control columns `C`: intercept + parametric
+    // fixed-effect ranges. These are the directions that are always free, so the
+    // null-space block must EARN its keep beyond them (a linear covariate `x`
+    // must not let a collinear smooth's null space claim spurious support).
+    let mut control: Vec<usize> = design.intercept_range.clone().collect();
+    for (_, r) in &design.linear_ranges {
+        control.extend(r.clone());
+    }
+    control.retain(|&c| c < x.ncols());
+    let mut cmat = Array2::<f64>::zeros((n, control.len().max(1)));
+    if control.is_empty() {
+        // No explicit intercept column: control for the mean with a constant.
+        cmat.column_mut(0).fill(1.0);
+    } else {
+        for (out_j, &c) in control.iter().enumerate() {
+            cmat.column_mut(out_j).assign(&x.column(c));
+        }
+    }
+
+    let rss_c = weighted_regression_rss(cmat.view(), resp.view(), weights);
+    let Some(rss_c) = rss_c else { return false };
+    // If the controls already explain essentially all of the response, the null
+    // space cannot be "supported" in any meaningful sense — keep select-out.
+    let base_scale = weighted_total_ss(resp.view(), weights);
+    if !(rss_c > 1.0e-12 * base_scale.max(f64::MIN_POSITIVE)) {
+        return false;
+    }
+    let mut cz = Array2::<f64>::zeros((n, cmat.ncols() + z.ncols()));
+    cz.slice_mut(s![.., ..cmat.ncols()]).assign(&cmat);
+    cz.slice_mut(s![.., cmat.ncols()..]).assign(&z);
+    let Some(rss_cz) = weighted_regression_rss(cz.view(), resp.view(), weights) else {
+        return false;
+    };
+
+    let support = (rss_c - rss_cz) / rss_c;
+    support.is_finite() && support > NULLSPACE_SUPPORT_FRACTION_THRESHOLD
+}
+
+/// Weighted total sum of squares of `y` about its weighted mean, `Σ wᵢ(yᵢ − ȳ)²`.
+fn weighted_total_ss(y: ArrayView1<'_, f64>, w: ArrayView1<'_, f64>) -> f64 {
+    let mut sw = 0.0;
+    let mut swy = 0.0;
+    for (&yi, &wi) in y.iter().zip(w.iter()) {
+        if wi > 0.0 && yi.is_finite() {
+            sw += wi;
+            swy += wi * yi;
+        }
+    }
+    if sw <= 0.0 {
+        return 0.0;
+    }
+    let mean = swy / sw;
+    let mut ss = 0.0;
+    for (&yi, &wi) in y.iter().zip(w.iter()) {
+        if wi > 0.0 && yi.is_finite() {
+            ss += wi * (yi - mean) * (yi - mean);
+        }
+    }
+    ss
+}
+
+/// Weighted least-squares residual sum of squares of `y` on the columns of `d`,
+/// `min_b Σ wᵢ(yᵢ − dᵢ·b)²`, via ridge-stabilised normal equations
+/// `(DᵀWD + εI) b = DᵀW y`. The tiny relative ridge only regularises an exactly
+/// rank-deficient `D` (e.g. duplicated control columns); it does not perturb a
+/// well-posed low-dimensional solve enough to move the coarse support verdict.
+/// Returns `None` if the factorisation fails.
+fn weighted_regression_rss(
+    d: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+) -> Option<f64> {
+    use gam_linalg::faer_ndarray::FaerCholesky;
+
+    let m = d.ncols();
+    if m == 0 {
+        return Some(weighted_total_ss(y, w));
+    }
+    let mut gram = Array2::<f64>::zeros((m, m));
+    let mut rhs = Array1::<f64>::zeros(m);
+    for row in 0..d.nrows() {
+        let wi = w[row];
+        if !(wi > 0.0) || !y[row].is_finite() {
+            continue;
+        }
+        let dr = d.row(row);
+        for a in 0..m {
+            let wda = wi * dr[a];
+            rhs[a] += wda * y[row];
+            for b in a..m {
+                gram[[a, b]] += wda * dr[b];
+            }
+        }
+    }
+    for a in 0..m {
+        for b in (a + 1)..m {
+            gram[[b, a]] = gram[[a, b]];
+        }
+    }
+    let trace = (0..m).map(|i| gram[[i, i]]).sum::<f64>();
+    if !(trace > 0.0) {
+        return Some(weighted_total_ss(y, w));
+    }
+    let ridge = 1.0e-10 * trace / (m as f64);
+    for i in 0..m {
+        gram[[i, i]] += ridge;
+    }
+    let chol = gram.cholesky(faer::Side::Lower).ok()?;
+    let beta = chol.solvevec(&rhs);
+    let mut rss = 0.0;
+    for row in 0..d.nrows() {
+        let wi = w[row];
+        if !(wi > 0.0) || !y[row].is_finite() {
+            continue;
+        }
+        let fitted = d.row(row).dot(&beta);
+        let resid = y[row] - fitted;
+        rss += wi * resid * resid;
+    }
+    Some(rss)
 }
 
 /// Standard deviation of the wide, weakly-informative symmetric `Normal` prior
