@@ -747,7 +747,6 @@ fn solve_mode_with_penalty(
 
     // Nested σ curvature A_σ = −∂g_N/∂β_σ by central finite differences.
     let logdet_a_sigma = {
-        let base = sigma_gradient(rec, &prof, &beta_sigma, use_h);
         let mut a = Array2::<f64>::zeros((p_sigma, p_sigma));
         let scl = beta_sigma.iter().map(|v| v.abs()).fold(1.0f64, f64::max);
         let eps = 1e-6 * scl;
@@ -764,7 +763,6 @@ fn solve_mode_with_penalty(
                 a[[i, j]] = -(gp[i] - gm[i]) / (2.0 * eps);
             }
         }
-        let _ = base;
         // symmetrize
         let mut sym = Array2::<f64>::zeros((p_sigma, p_sigma));
         for i in 0..p_sigma {
