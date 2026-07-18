@@ -624,8 +624,8 @@ fn zz_measure_1561_mu_channel_oracle_lambda_sweep() {
 }
 
 // ===========================================================================
-// FOLLOW-UP (#1561): does the criterion's λ̂_μ move toward the oracle when σ is
-// CLAMPED at the truth? — testing the σ̂-feedback hypothesis.
+// #1561 sigma-clamp criterion probe: does the criterion's λ̂_μ move toward the
+// oracle when σ is CLAMPED at the truth? — testing the σ̂-feedback hypothesis.
 //
 // The sibling sweep proved joint-LAML picks λ̂_μ too LOW (μ under-smoothed) with
 // ~20-30% μ-RMSE recoverable, and that noisy 1/σ̂² weights don't move the ORACLE
