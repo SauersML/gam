@@ -375,6 +375,33 @@ pub(crate) fn wire_output_channels<F: CustomFamily + ?Sized>(
 /// indistinguishable from its null-space limit".
 pub(crate) const EFFECTIVE_DF_FLOOR: f64 = 1.0;
 
+/// Uniform ρ = log λ over-smoothing ceiling for the custom-family outer box, on
+/// top of which each term's per-coordinate [`EFFECTIVE_DF_FLOOR`] bound is
+/// tightened. Two forces bracket it:
+///
+///  * FROM BELOW — legitimate REML optima. A smooth mean over a genuinely smooth
+///    signal wants heavy shrinkage: the #1561 Gaussian location-scale `s(x,
+///    bs='tp')` mean over `sin(2πx)` has its REML optimum at ρ ≈ 11 (edf ≈ 15).
+///    The former `10.0` ceiling clipped exactly that — the μ coordinate railed at
+///    ρ = log λ = 10.0 = e¹⁰, the outer bound-projection zeroed its (still −3.5)
+///    gradient, and the fit certified a spurious constrained optimum at edf ≈ 19,
+///    leaving the mean under-smoothed (#1561/#2356). The ceiling MUST sit above
+///    the heavy-but-finite optima the data legitimately selects, matching the
+///    over-smoothing range the seed prepass itself already explores
+///    (`crate::estimate::RHO_BOUND`, optimizer.rs).
+///  * FROM ABOVE — numerical stability. Beyond λ ≈ 10⁹ (ρ ≈ 20.7) the profiled
+///    criterion goes dead-flat, ARC's quadratic model degrades, and the
+///    retry-stall / empty-`block_states` failure paths surface. The ceiling stays
+///    a wide margin below that region.
+///
+/// `15.0` (λ ≈ 3.3M) clears every legitimate REML optimum observed on the
+/// location-scale / dispersion / survival custom families while keeping a > 5 ρ
+/// unit guard below the ρ ≈ 20 breakdown region. The per-term `EFFECTIVE_DF_FLOOR`
+/// bound — not this uniform cap — is what protects a term from collapsing onto
+/// its unpenalized null space, so raising the uniform ceiling only frees the
+/// coordinates whose honest optimum was being clipped.
+pub(crate) const EFFECTIVE_DF_CEILING: f64 = 15.0;
+
 /// Unit-weight effective degrees of freedom of a single penalized term as a
 /// function of `ρ = log λ`, expressed through the design/penalty generalized
 /// eigenvalues `γ_j` on the penalty range space:
@@ -1164,11 +1191,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_problem_size(n_obs, p_total.max(1))
         .with_arc_initial_regularization(if n_obs > 0 { Some(0.25) } else { None })
         .with_operator_initial_trust_radius(if n_obs > 0 { Some(4.0) } else { None })
-        // Per-coordinate ρ box bounds. The uniform ceiling of 10 is the
-        // belt-and-suspenders cap: λ = exp(10) ≈ 22k is already extremely strong
-        // shrinkage, and the bound keeps the optimizer out of the dead-flat
+        // Per-coordinate ρ box bounds. The uniform ceiling
+        // [`EFFECTIVE_DF_CEILING`] keeps the optimizer out of the dead-flat
         // λ ≈ 10⁹ region where ARC's quadratic model breaks down, the retry-stall
-        // detector fires, and downstream empty-block_states crashes surface.
+        // detector fires, and downstream empty-block_states crashes surface —
+        // while sitting ABOVE the heavy-but-finite REML optima the data
+        // legitimately selects (the #1561/#2356 location-scale mean wants ρ ≈ 11;
+        // the former ρ ≤ 10 cap railed it into a spurious under-smoothed optimum).
         //
         // ON TOP of that uniform ceiling, each penalized term's UPPER bound is
         // tightened to the ρ at which its structural (unit-weight) effective df
@@ -1186,7 +1215,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // λ-upper-side dual of the #752 full-subspace logdet work.
         .with_bounds(
             Array1::<f64>::from_elem(n_rho, options.rho_lower_bound),
-            effective_df_floor_rho_upper_bounds(specs, &label_layout, n_rho, 10.0)?,
+            effective_df_floor_rho_upper_bounds(specs, &label_layout, n_rho, EFFECTIVE_DF_CEILING)?,
         );
     // Install the seed-screening cap only when initial-rho screening is
     // wanted. A caller that pins an already-identified `initial_rho` and
