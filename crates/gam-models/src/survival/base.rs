@@ -2588,12 +2588,18 @@ impl WorkingModelSurvival {
         rho: &Array1<f64>,
     ) -> Result<(f64, Array1<f64>), EstimationError> {
         use gam_problem::{EvalMode, PseudoLogdetMode};
-        use gam_solve::estimate::reml::assembly::{
-            InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
-        };
+        use gam_solve::estimate::reml::assembly::InnerAssembly;
         use gam_solve::estimate::reml::reml_outer_engine::{
-            DenseSpectralOperator, DispersionHandling, PenaltyLogdetDerivs,
+            DenseSpectralOperator, DispersionHandling,
         };
+        use gam_solve::estimate::reml::reparameterized_inner::{
+            RawInnerReparamContext, assemble_reparameterized_inner,
+        };
+        use gam_terms::construction::{
+            canonicalize_penalty_specs, precompute_reparam_invariant_from_canonical,
+            stable_reparameterizationwith_invariant,
+        };
+        use gam_terms::penalty_spec::PenaltySpec;
 
         let p = beta.len();
         let active_penalty_blocks: Vec<&PenaltyBlock> = self
@@ -2611,109 +2617,163 @@ impl WorkingModelSurvival {
         }
         let k_count = active_penalty_blocks.len();
 
-        // --- Hessian operator ---
+        // λ_k = e^{ρ_k}, in active-block (== ρ) order. Shared by the joint
+        // normalizer and the Wood reparameterization below.
+        let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+
+        // --- Raw penalized Hessian + its LAML logdet mode -------------------
+        // (unchanged: delayed entry → HardPseudo identified positive-subspace
+        // logdet; right-censored → historical Smooth full-spectrum convention).
+        // Orthogonal similarity preserves the spectrum exactly, so evaluating
+        // the SAME mode on the transformed H′ below keeps the HardPseudo mask and
+        // the active rank bit-identical to the raw frame (#2331 R3 tripwire).
         let h_dense = state.hessian.to_dense();
         let has_left_truncation = self
             .age_entry
             .iter()
             .any(|&t| t > ENTRY_AT_ORIGIN_THRESHOLD);
-        // Transformation-survival uses observed information in the LAML logdet.
-        // With delayed entry the likelihood contains +H(entry), so the observed
-        // NLL curvature includes a genuine negative
-        // -X_entry' diag(exp(eta_entry)) X_entry block. The shared smooth
-        // pseudo-logdet is a PSD-contract regularizer, not a licence to reward
-        // negative observed-curvature directions: a negative eigenvalue maps to
-        // a tiny positive regularized value and can make the outer smoothing
-        // objective prefer under-smoothed, nearly singular baselines. For the
-        // delayed-entry observed-information path, use the identified positive
-        // subspace logdet/pseudoinverse instead; right-censored fits keep the
-        // historical smooth full-spectrum convention.
         let hessian_logdet_mode = if has_left_truncation {
             PseudoLogdetMode::HardPseudo
         } else {
             PseudoLogdetMode::Smooth
         };
-        let hop = DenseSpectralOperator::from_symmetric_with_mode(&h_dense, hessian_logdet_mode)
-            .map_err(EstimationError::InvalidInput)?;
 
-        // --- Penalty coordinates via shared assembler helper ---
-        let block_descs: Vec<PenaltyBlockDesc> = self
-            .penalties
-            .blocks
+        // --- Raw per-block penalties, embedded p×p, in ρ order --------------
+        // Feeds the joint pseudo-logdet `log|Σ_k λ_k S_k|₊` (frame-invariant,
+        // computed INSIDE the reparam helper from these raw blocks — #2331 R7:
+        // value/det1/det2 from a single W-factor eigendecomposition, not a
+        // per-block sum; the survival stabilization ridge is a full-span block
+        // that overlaps the smoothing blocks, so the joint normalizer is the
+        // real objective, #2331 Finding 3a).
+        let s_k_embedded: Vec<Array2<f64>> = active_penalty_blocks
             .iter()
-            .filter(|b| b.lambda > 0.0)
-            .map(|b| PenaltyBlockDesc {
-                matrix: &b.matrix,
-                range_start: b.range.start,
-                range_end: b.range.end,
+            .map(|b| {
+                let mut s = Array2::<f64>::zeros((p, p));
+                let (rs, re) = (b.range.start, b.range.end);
+                s.slice_mut(ndarray::s![rs..re, rs..re]).assign(&b.matrix);
+                s
             })
             .collect();
-        let penalty_coords =
-            penalty_coords_from_blocks(&block_descs, p).map_err(EstimationError::InvalidInput)?;
 
-        // --- Penalty logdet derivatives (JOINT normalizer, #2331 Inc 0) ---
+        // --- Wood (2011) stable reparameterization at the outer LAML seam ---
+        // (#2331 Inc 2). Build the orthogonal Q_s from the SAME active penalty
+        // set, in ρ order, so `canonical_transformed[k] ↔ ρ[k]`.
         //
-        // The LAML prior normalizer is `log|S_λ|₊` with the SINGLE combined
-        // penalty `S_λ = Σ_k λ_k S_k` (λ_k = e^{ρ_k}), NOT the per-block sum
-        // `Σ_k log|λ_k S_k|₊`. The two coincide only when the blocks are disjoint;
-        // the survival stabilization ridge (fit_orchestration/fit.rs) is a
-        // FULL-SPAN block that overlaps every smoothing block, so the per-block
-        // convention was a real objective inconsistency (#2331 Finding 3a). The
-        // joint quantity also makes `det1[k] = λ_k·tr(S_λ⁺ S_k)` fractional, which
-        // the fused ρ-gradient consumes via the joint whitening `W_S`
-        // (cancellation-free at the over-smoothing rail). A single
-        // `PenaltyPseudologdet` eigendecomposition sources value, det1, and det2
-        // consistently (no per-block/joint mismatch, #2331 R7).
-        let penalty_logdet = if k_count > 0 {
-            let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
-            let s_k_embedded: Vec<Array2<f64>> = active_penalty_blocks
-                .iter()
-                .map(|b| {
-                    let mut s = Array2::<f64>::zeros((p, p));
-                    let (rs, re) = (b.range.start, b.range.end);
-                    s.slice_mut(ndarray::s![rs..re, rs..re]).assign(&b.matrix);
-                    s
-                })
-                .collect();
-            let pld = gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_components(
-                &s_k_embedded,
-                &lambdas,
-                0.0,
-            )
-            .map_err(EstimationError::InvalidInput)?;
-            let (first, second) = pld.rho_derivatives(&s_k_embedded, &lambdas);
-            PenaltyLogdetDerivs {
-                value: pld.value(),
-                first,
-                second: Some(second),
-            }
-        } else {
-            PenaltyLogdetDerivs {
-                value: 0.0,
-                first: Array1::zeros(0),
-                second: Some(Array2::zeros((0, 0))),
-            }
-        };
+        // λ-DEPENDENCE / recompute policy:
+        //   * `canonical_penalties` and `reparam_invariant` (the subspace split /
+        //     q_pen|q_null basis `qs_base`) depend ONLY on the penalty block
+        //     matrices+ranges — λ-INDEPENDENT, fixed across the whole outer loop
+        //     (a future WorkingModelSurvival cache can memoize them; see the cost
+        //     note in the Inc-2 handoff).
+        //   * `stable_reparameterizationwith_invariant` embeds λ = e^{ρ} into
+        //     `e_transformed` / `canonical_transformed`, so it MUST be recomputed
+        //     at every outer iterate. This is the only λ-dependent piece here.
+        //
+        // canonicalize_penalty_spec drops a block only when it is numerically
+        // rank-0; a λ>0 survival penalty (I-spline 2nd-difference, incl. the
+        // rank-deficient nullspace ones) is rank>0, so no active block drops. A
+        // drop would desync the transformed penalty coordinates from ρ, so we
+        // assert the count is preserved rather than let it slip silently.
+        let penalty_specs: Vec<PenaltySpec> = active_penalty_blocks
+            .iter()
+            .map(|b| PenaltySpec::Block {
+                local: b.matrix.clone(),
+                col_range: b.range.clone(),
+                prior_mean: gam_problem::CoefficientPriorMean::Zero,
+                structure_hint: None,
+                op: None,
+            })
+            .collect();
+        let nullspace_dims: Vec<usize> = active_penalty_blocks
+            .iter()
+            .map(|b| b.nullspace_dim)
+            .collect();
+        let (canonical_penalties, _canonical_nullspace) = canonicalize_penalty_specs(
+            &penalty_specs,
+            &nullspace_dims,
+            p,
+            "survival LAML seam-A reparameterization",
+        )
+        .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+        if canonical_penalties.len() != k_count {
+            return Err(EstimationError::InvalidInput(format!(
+                "survival LAML reparameterization dropped {} of {} active (λ>0) penalty \
+                 block(s) as numerically rank-0; cannot align transformed penalty \
+                 coordinates with ρ",
+                k_count - canonical_penalties.len(),
+                k_count
+            )));
+        }
+        let reparam_invariant =
+            precompute_reparam_invariant_from_canonical(&canonical_penalties, p)
+                .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+        let reparam = stable_reparameterizationwith_invariant(
+            &canonical_penalties,
+            &lambdas,
+            p,
+            &reparam_invariant,
+            // No shrinkage floor at this seam: any stabilization ridge is a
+            // real penalty block in `s_k_embedded`, and the helper (R5) rejects
+            // a nonzero ρ-independent shrinkage ridge on the ReparamResult.
+            None,
+        )
+        .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
 
-        // `penalty_term` is now the full quadratic βᵀSβ (WorkingState contract),
-        // which IS the unified evaluator's `penalty_quadratic` (#2301 defect B: it
-        // previously held the ½βᵀSβ energy and was doubled here).
-        let penalty_quadratic = state.penalty_term;
+        // --- Conjugate the raw inner solution into the Q_s frame ------------
+        // H′ = Q_sᵀ H Q_s, β̂′ = Q_sᵀ β̂, the joint logdet triple (value/det1/det2),
+        // and the SurvivalDerivProvider conjugated into the transformed frame.
+        // The provider is built on the RAW β̂ (it evaluates raw-frame family
+        // curvature); the helper wraps it so every consumed trace is invariant.
         let provider = SurvivalDerivProvider::new(self.clone(), beta.clone());
+        let ctx = RawInnerReparamContext {
+            hessian: &h_dense,
+            beta,
+            penalties_embedded: &s_k_embedded,
+            lambdas: &lambdas,
+        };
+        let reparam_inner = assemble_reparameterized_inner(
+            &ctx,
+            Some(Box::new(provider)),
+            &reparam,
+        )
+        .map_err(EstimationError::InvalidInput)?;
+
+        // Hessian operator on the TRANSFORMED H′ (spectrum, HardPseudo mask, and
+        // active rank identical to raw — see mode note above).
+        let hop = DenseSpectralOperator::from_symmetric_with_mode(
+            &reparam_inner.hessian_transformed,
+            hessian_logdet_mode,
+        )
+        .map_err(EstimationError::InvalidInput)?;
+
+        // Penalty coordinates: the per-block TRANSFORMED roots (Q_s frame), the
+        // single source of truth for penalty roots there. One coordinate per ρ
+        // block, in order (canonical_transformed is built root-by-root from the
+        // input penalties, so its order matches ρ). This is exactly the standard
+        // lane's `reparam_result.canonical_transformed → to_penalty_coordinate`
+        // path (gam-solve reml/objective.rs build_penalty_coords).
+        let penalty_coords = reparam
+            .canonical_transformed
+            .iter()
+            .map(|cp| cp.to_penalty_coordinate())
+            .collect::<Vec<_>>();
+
+        // `penalty_term` is the full quadratic βᵀSβ (WorkingState contract),
+        // which IS the unified evaluator's `penalty_quadratic` (#2301 defect B).
+        // It is a scalar and invariant under the orthogonal transform
+        // (β′ᵀS′β′ = βᵀSβ), so it carries over unchanged.
+        let penalty_quadratic = state.penalty_term;
 
         // #931 survival-LAML IFT envelope: attach the one-step Newton correction
-        // only when this state is actually a near-stationary inner solution.
-        // `unified_lamlobjective_and_rhogradient` is also used by algebraic
-        // fixed-beta objective tests; feeding a large non-stationary residual
-        // there makes the value a different surface. The re-converged shim
-        // polishes the inner mode to an absolute residual floor, so certified
-        // states still keep the envelope correction while arbitrary beta probes
-        // evaluate the documented LAML objective.
-        //
-        // The residual MUST be the active-set-projected stationarity vector, not
-        // raw `state.gradient`: a binding monotonicity constraint contributes a
-        // Lagrange-multiplier normal component (`r = A^T lambda`, lambda >= 0)
-        // that is not a stationarity residual.
+        // only when this state is actually a near-stationary inner solution. The
+        // residual MUST be the active-set-projected stationarity vector (a binding
+        // monotonicity constraint contributes r = Aᵀλ, λ≥0, which is not a
+        // stationarity residual). Project in the RAW frame (the constraint rows A
+        // live there), THEN rotate the projected residual into the Q_s frame:
+        // r_t = Q_sᵀ r_o — the penalized score rotates like β (β_t = Q_sᵀ β_o),
+        // exactly the standard lane's inner_kkt_residual_original_basis relation
+        // r_o = Q_s r_t, inverted here (raw→transformed) so the residual matches
+        // the transformed β̂′/H′ the assembly now carries.
         const SURVIVAL_LAML_IFT_RELATIVE_KKT_GATE: f64 = 1.0e-8;
         let kkt_residual = {
             let raw = state.gradient.clone();
@@ -2733,7 +2793,10 @@ impl WorkingModelSurvival {
             let projected_norm = array1_l2_norm(&projected);
             let relative_projected_norm = state.relative_gradient_norm(projected_norm);
             if relative_projected_norm <= SURVIVAL_LAML_IFT_RELATIVE_KKT_GATE {
-                Some(crate::model_types::ProjectedKktResidual::from_active_projected(projected))
+                let projected_transformed = reparam.qs.t().dot(&projected);
+                Some(crate::model_types::ProjectedKktResidual::from_active_projected(
+                    projected_transformed,
+                ))
             } else {
                 None
             }
@@ -2742,11 +2805,11 @@ impl WorkingModelSurvival {
         let result = InnerAssembly {
             log_likelihood: state.log_likelihood,
             penalty_quadratic,
-            beta: beta.clone(),
+            beta: reparam_inner.beta_transformed,
             n_observations: self.nrows(),
             hessian_op: std::sync::Arc::new(hop),
             penalty_coords,
-            penalty_logdet,
+            penalty_logdet: reparam_inner.penalty_logdet,
             dispersion: DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -2756,7 +2819,7 @@ impl WorkingModelSurvival {
             rho_prior: gam_problem::RhoPrior::Flat,
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
-            deriv_provider: Some(Box::new(provider)),
+            deriv_provider: reparam_inner.deriv_provider,
             firth: None,
             nullspace_dim: None,
             barrier_config: None,
@@ -2778,6 +2841,7 @@ impl WorkingModelSurvival {
         let gradient = result.gradient.unwrap_or_else(|| Array1::zeros(rho.len()));
         Ok((result.cost, gradient))
     }
+
 
     /// Self-contained ρ → (LAML value, analytic ρ-gradient) surface for the
     /// survival LAML objective.
@@ -6283,4 +6347,199 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn survival_laml_rho_gradient_invariant_under_injected_orthogonal_frame_at_the_rail() {
+        use gam_linalg::faer_ndarray::FaerEigh;
+        use gam_problem::{EvalMode, PseudoLogdetMode};
+        use gam_solve::estimate::reml::assembly::InnerAssembly;
+        use gam_solve::estimate::reml::reml_outer_engine::{
+            DenseSpectralOperator, DispersionHandling,
+        };
+        use gam_solve::estimate::reml::reparameterized_inner::{
+            RawInnerReparamContext, assemble_reparameterized_inner,
+        };
+        use gam_terms::construction::{
+            canonicalize_penalty_specs, precompute_reparam_invariant_from_canonical,
+            stable_reparameterizationwith_invariant,
+        };
+        use gam_terms::penalty_spec::PenaltySpec;
+
+        const RAIL_RHO0: f64 = 7.394829814011909;
+        const FREE_RHO1: f64 = -2.45;
+        // #2337 §2 per-coordinate decision margin. The invariance is exact in
+        // real arithmetic; only O(p·ε) conjugation round-off separates the two
+        // frames, far below the rail's O(0.1) free-coordinate |Pg|.
+        const DECISION_MARGIN: f64 = 1.0e-9;
+
+        let beta0 = array![-2.5_f64, 1.0];
+        let rho = array![RAIL_RHO0, FREE_RHO1];
+        let model = laml_rail_fd_test_model(RAIL_RHO0.exp(), FREE_RHO1.exp());
+
+        // Converge the inner mode at the railed ρ; extract the raw inner solution.
+        let (rail_model, beta_hat) = model
+            .reconverge_survival_inner_mode(rho.as_slice().expect("contiguous rho"), &beta0)
+            .expect("reconverge inner mode at the rail");
+        let state = rail_model
+            .update_state(&beta_hat)
+            .expect("inner state at the rail");
+        let p = beta_hat.len();
+        let h_dense = state.hessian.to_dense();
+        let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+
+        let active_blocks: Vec<&PenaltyBlock> = rail_model
+            .penalties
+            .blocks
+            .iter()
+            .filter(|b| b.lambda > 0.0)
+            .collect();
+        let s_k_embedded: Vec<Array2<f64>> = active_blocks
+            .iter()
+            .map(|b| {
+                let mut s = Array2::<f64>::zeros((p, p));
+                let (rs, re) = (b.range.start, b.range.end);
+                s.slice_mut(ndarray::s![rs..re, rs..re]).assign(&b.matrix);
+                s
+            })
+            .collect();
+        let penalty_specs: Vec<PenaltySpec> = active_blocks
+            .iter()
+            .map(|b| PenaltySpec::Block {
+                local: b.matrix.clone(),
+                col_range: b.range.clone(),
+                prior_mean: gam_problem::CoefficientPriorMean::Zero,
+                structure_hint: None,
+                op: None,
+            })
+            .collect();
+        let nullspace_dims: Vec<usize> = active_blocks.iter().map(|b| b.nullspace_dim).collect();
+        let (canonical, _) = canonicalize_penalty_specs(
+            &penalty_specs,
+            &nullspace_dims,
+            p,
+            "rail-stability gate reparameterization",
+        )
+        .expect("canonicalize rail penalties");
+        let invariant =
+            precompute_reparam_invariant_from_canonical(&canonical, p).expect("reparam invariant");
+        let reparam_prod =
+            stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &invariant, None)
+                .expect("production reparameterization");
+
+        let hessian_logdet_mode = if rail_model
+            .age_entry
+            .iter()
+            .any(|&t| t > ENTRY_AT_ORIGIN_THRESHOLD)
+        {
+            PseudoLogdetMode::HardPseudo
+        } else {
+            PseudoLogdetMode::Smooth
+        };
+
+        // Deterministic non-identity orthogonal G (eigenvectors of a fixed
+        // symmetric matrix — a genuine rotation, no RNG).
+        let g = {
+            let sym = Array2::<f64>::from_shape_fn((p, p), |(i, j)| {
+                (((i * j) as f64) * 0.37).sin() + (((i + j) as f64) * 0.11 + 1.0).cos()
+            });
+            let (_, evecs) = sym.eigh(faer::Side::Lower).expect("orthogonal factor from eigh");
+            evecs
+        };
+
+        // Assemble the transformed-frame objective for a given reparameterization
+        // and return the analytic ρ-gradient. Mirrors the post-helper body of
+        // `unified_lamlobjective_and_rhogradient`.
+        let grad_for_reparam = |reparam: &gam_terms::construction::ReparamResult| -> Array1<f64> {
+            let provider = SurvivalDerivProvider::new(rail_model.clone(), beta_hat.clone());
+            let ctx = RawInnerReparamContext {
+                hessian: &h_dense,
+                beta: &beta_hat,
+                penalties_embedded: &s_k_embedded,
+                lambdas: &lambdas,
+            };
+            let reparam_inner =
+                assemble_reparameterized_inner(&ctx, Some(Box::new(provider)), reparam)
+                    .expect("reparameterized inner assembly");
+            let hop = DenseSpectralOperator::from_symmetric_with_mode(
+                &reparam_inner.hessian_transformed,
+                hessian_logdet_mode,
+            )
+            .expect("transformed Hessian operator");
+            let penalty_coords = reparam
+                .canonical_transformed
+                .iter()
+                .map(|cp| cp.to_penalty_coordinate())
+                .collect::<Vec<_>>();
+            let result = InnerAssembly {
+                log_likelihood: state.log_likelihood,
+                penalty_quadratic: state.penalty_term,
+                beta: reparam_inner.beta_transformed,
+                n_observations: rail_model.nrows(),
+                hessian_op: std::sync::Arc::new(hop),
+                penalty_coords,
+                penalty_logdet: reparam_inner.penalty_logdet,
+                dispersion: DispersionHandling::Fixed {
+                    phi: 1.0,
+                    include_logdet_h: true,
+                    include_logdet_s: true,
+                },
+                rho_curvature_scale: 1.0,
+                rho_prior: gam_problem::RhoPrior::Flat,
+                hessian_logdet_correction: 0.0,
+                penalty_subspace_trace: None,
+                deriv_provider: reparam_inner.deriv_provider,
+                firth: None,
+                nullspace_dim: None,
+                barrier_config: None,
+                ext_coords: Vec::new(),
+                ext_coord_pair_fn: None,
+                rho_ext_pair_fn: None,
+                fixed_drift_deriv: None,
+                contracted_psi_second_order: None,
+                kkt_residual: None,
+                active_constraints: None,
+            }
+            .evaluate(
+                rho.as_slice().expect("contiguous rho"),
+                EvalMode::ValueAndGradient,
+                None,
+            )
+            .expect("transformed-frame LAML evaluate");
+            result.gradient.expect("analytic ρ-gradient present")
+        };
+
+        // Production frame Q_s.
+        let g_prod = grad_for_reparam(&reparam_prod);
+
+        // Injected frame Q_s·G: post-compose G into Q_s and rotate the per-block
+        // transformed roots by G so `penalty_coords` stay consistent with the
+        // rotated frame (root·G lives in the Q_s·G basis).
+        let mut reparam_conj = reparam_prod.clone();
+        reparam_conj.qs = reparam_prod.qs.dot(&g);
+        reparam_conj.canonical_transformed = reparam_prod
+            .canonical_transformed
+            .iter()
+            .map(|cp| {
+                let mut rotated = cp.clone();
+                rotated.root = cp.root.dot(&g);
+                rotated.local = rotated.root.t().dot(&rotated.root);
+                rotated
+            })
+            .collect();
+        let g_conj = grad_for_reparam(&reparam_conj);
+
+        for k in 0..rho.len() {
+            let drift = (g_prod[k] - g_conj[k]).abs();
+            assert!(
+                drift <= DECISION_MARGIN * (1.0 + g_prod[k].abs()),
+                "rail ρ-gradient not frame-invariant at coordinate {k}: \
+                 Q_s frame {} vs Q_s·G frame {} (drift {:.3e} > margin {:.3e})",
+                g_prod[k],
+                g_conj[k],
+                drift,
+                DECISION_MARGIN * (1.0 + g_prod[k].abs())
+            );
+        }
+    }
+
 }
