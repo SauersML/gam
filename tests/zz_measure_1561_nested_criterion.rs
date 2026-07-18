@@ -388,6 +388,21 @@ fn reconstruct(arm: &Arm) -> Reconstructed {
         panic!("expected a GaussianLocationScale fit");
     };
     let c = response_scale;
+    // Read the outer optimizer's OWN convergence certificate: does it think it
+    // reached a stationary point (small |g|), or did it stall on a flat valley
+    // with a large residual gradient? This distinguishes an analytic-gradient
+    // desync from a premature-termination bug.
+    let cert_summary = fit
+        .fit
+        .convergence_evidence()
+        .outer_certificate()
+        .map(|c| c.summary())
+        .unwrap_or_else(|| "<no outer certificate>".to_string());
+    eprintln!(
+        "[{}] OUTER CONVERGENCE CERTIFICATE: {cert_summary}  (outer_iters={})",
+        arm.label,
+        fit.fit.outer_iterations
+    );
     let loc = fit.fit.block_by_role(BlockRole::Location).expect("loc");
     let sca = fit.fit.block_by_role(BlockRole::Scale).expect("scale");
     let beta_mu = loc.beta.clone();
