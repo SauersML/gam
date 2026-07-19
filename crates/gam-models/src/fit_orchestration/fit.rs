@@ -189,6 +189,23 @@ const SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING: usize = 40;
 
 const SURVIVAL_TRANSFORMATION_PIRLS_MIN_STEP_SIZE: f64 = 1e-12;
 
+/// Bounded checkpoint reseeds for the survival-transformation outer search
+/// (#2373). The transformation LAML outer runs a gradient-only BFGS (it declares
+/// no analytic outer Hessian), and `opt::Bfgs`'s flat-valley `StallPolicy` gates
+/// its flat-stall exit on `‖g‖∞ ≤ tol·(1 + ‖ρ‖∞)`. In log-λ space a baseline
+/// penalty that rails near its box edge makes `‖ρ‖∞ ≈ 10`, so that factor
+/// inflates the stall gradient gate ~10×: BFGS reports "converged (flat/stalled)"
+/// at a checkpoint whose projected gradient still exceeds the UN-inflated
+/// terminal certificate bound, and the fit is refused with genuine (unexploited)
+/// interior descent still available. The refusal is arithmetically correct, so
+/// recovery is to keep optimizing: the accumulated inverse-Hessian metric that
+/// produced the sub-tolerance steps is the stall's cause, and a fresh-metric BFGS
+/// resume seeded AT the refused `rho_checkpoint` recovers the descent — exactly
+/// the resume the refusal message advertises. This bounds how many such
+/// fresh-metric resumes are attempted before the honest non-convergence is
+/// surfaced.
+const SURVIVAL_TRANSFORMATION_OUTER_STALL_RESTARTS: usize = 10;
+
 struct SurvivalLocationScaleProfile {
     fit: SurvivalLocationScaleTermFitResult,
     inverse_link: InverseLink,
@@ -1875,55 +1892,100 @@ fn optimize_survival_transformation_smoothing(
             }
         }
     }
-    let problem = OuterProblem::new(num_smoothing)
-        .with_gradient(Derivative::Analytic)
-        .with_hessian(gam_problem::DeclaredHessianForm::Unavailable)
-        .with_tolerance(1e-4)
-        .with_max_iter(120)
-        .with_bounds(lower, upper)
-        .with_initial_rho(seed_rho.clone())
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
     let context =
         format!("survival transformation smoothing-parameter selection (dim={num_smoothing})");
-    let mut obj = problem.build_objective(
-        (),
-        |_: &mut (), rho: &Array1<f64>| eval_at(rho).map(|(c, _)| c),
-        |_: &mut (), rho: &Array1<f64>| {
-            let (cost, gradient) = eval_at(rho)?;
-            Ok(OuterEval {
-                cost,
-                gradient,
-                hessian: HessianValue::Unavailable,
-                inner_beta_hint: None,
-            })
-        },
-        None::<fn(&mut ())>,
-        None::<
-            fn(
-                &mut (),
-                &Array1<f64>,
-            ) -> Result<gam_problem::EfsEval, gam_solve::estimate::EstimationError>,
-        >,
-    );
     // `OuterProblem::run` returns `Ok` only after its analytic projected-KKT
     // certificate accepts the selected rho. Exhaustion is
     // `EstimationError::RemlDidNotConverge`, whose rho checkpoint is preserved
     // in the error; a seed or best-so-far smoothing value is never promoted to
     // an estimator merely because a fixed-lambda inner solve was finite.
-    let result = problem
-        .run(&mut obj, &context)
-        .map_err(|error| error.to_string())?;
-    // Capture the OUTER convergence evidence before consuming `result.rho`:
-    // `run` certified the selected ρ, so `iterations` is the true outer count and
-    // `criterion_certificate` carries the analytic stationarity bound the fit
-    // assembly gate requires (#2301 defect D).
-    let outer_iterations = result.iterations;
-    let criterion_certificate = result.criterion_certificate;
-    let selected_rho = result.rho;
+    //
+    // #2373 checkpoint resume: the gradient-only BFGS can bail on `opt::Bfgs`'s
+    // flat-valley `StallPolicy`, whose gradient gate is inflated by `(1 + ‖ρ‖∞)`
+    // — in log-λ space, ~10× — so it stops at a checkpoint that the un-inflated
+    // terminal certificate then rejects with real interior descent still on the
+    // table. The remedy the refusal itself advertises is to resume from
+    // `rho_checkpoint` with a fresh inverse-Hessian metric (the accumulated
+    // metric that crawled to sub-tolerance steps is the stall's cause). Each
+    // resume rebuilds the problem seeded at the prior checkpoint; `eval_at`'s
+    // warm-β cache is reused across resumes so the inner solves stay warm.
+    // Bounded so a genuine wall surfaces the honest non-convergence rather than
+    // spinning. A `run` that certifies on the first pass takes exactly one
+    // iteration of this loop, bit-for-bit as before.
+    let mut current_seed = seed_rho.clone();
+    let mut carried_iterations = 0usize;
+    let mut resumes_remaining = SURVIVAL_TRANSFORMATION_OUTER_STALL_RESTARTS;
+    let (outer_iterations, criterion_certificate, selected_rho) = loop {
+        let problem = OuterProblem::new(num_smoothing)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(gam_problem::DeclaredHessianForm::Unavailable)
+            .with_tolerance(1e-4)
+            .with_max_iter(120)
+            .with_bounds(lower.clone(), upper.clone())
+            .with_initial_rho(current_seed.clone())
+            .with_seed_config(gam_problem::SeedConfig {
+                max_seeds: 1,
+                seed_budget: 1,
+                ..Default::default()
+            });
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), rho: &Array1<f64>| eval_at(rho).map(|(c, _)| c),
+            |_: &mut (), rho: &Array1<f64>| {
+                let (cost, gradient) = eval_at(rho)?;
+                Ok(OuterEval {
+                    cost,
+                    gradient,
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<
+                fn(
+                    &mut (),
+                    &Array1<f64>,
+                )
+                    -> Result<gam_problem::EfsEval, gam_solve::estimate::EstimationError>,
+            >,
+        );
+        match problem.run(&mut obj, &context) {
+            // `run` certified the selected ρ: `iterations` (plus any carried
+            // from earlier resumes) is the true outer count and
+            // `criterion_certificate` carries the analytic stationarity bound the
+            // fit assembly gate requires (#2301 defect D).
+            Ok(result) => {
+                break (
+                    result.iterations.saturating_add(carried_iterations),
+                    result.criterion_certificate,
+                    result.rho,
+                );
+            }
+            Err(error) => {
+                // A flat-valley StallPolicy bail leaves a resumable
+                // `rho_checkpoint`; restart from it with a fresh BFGS metric
+                // while the resume budget lasts. Any other failure, or a spent
+                // budget, surfaces the honest non-convergence unchanged.
+                if resumes_remaining > 0
+                    && let gam_solve::estimate::EstimationError::RemlDidNotConverge {
+                        rho_checkpoint,
+                        iterations,
+                        ..
+                    } = &error
+                    && rho_checkpoint.len() == num_smoothing
+                {
+                    log::info!(
+                        "[OUTER] {context}: resuming from refused checkpoint {rho_checkpoint:?}                          with a fresh BFGS metric ({resumes_remaining} resume(s) left)"
+                    );
+                    carried_iterations = carried_iterations.saturating_add(*iterations);
+                    resumes_remaining -= 1;
+                    current_seed = Array1::from_vec(rho_checkpoint.clone());
+                    continue;
+                }
+                return Err(error.to_string());
+            }
+        }
+    };
     if selected_rho.len() != num_smoothing {
         return Err(format!(
             "survival transformation smoothing selector returned {} coordinates for \
