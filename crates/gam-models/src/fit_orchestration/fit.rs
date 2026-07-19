@@ -2007,6 +2007,42 @@ fn optimize_survival_transformation_smoothing(
     }))
 }
 
+/// Conditional Bayesian covariance `Vb = H⁻¹` for a converged single-cause
+/// transformation/weibull survival fit (unit dispersion; #2373 defect C).
+///
+/// Returns `None` when the penalized Hessian is not SPD (or the inverse is
+/// non-finite), matching the location-scale reduced-parametric path's
+/// typed-absence semantics (`survival/location_scale/fit.rs`): predict then
+/// errors honestly on a covariance-requiring mode instead of consuming a
+/// fabricated matrix. The Hessian is already in the raw block coordinates β
+/// lives in (identity coefficient gauge), so the inverse needs no gauge lift.
+fn survival_conditional_covariance_from_penalized_hessian(
+    penalized_hessian: &Array2<f64>,
+) -> Option<Array2<f64>> {
+    use gam_linalg::faer_ndarray::FaerCholesky;
+
+    let p = penalized_hessian.nrows();
+    let identity = Array2::<f64>::eye(p);
+    let cov = match penalized_hessian.cholesky(faer::Side::Lower) {
+        Ok(chol) => chol.solve_mat(&identity),
+        Err(_) => return None,
+    };
+    if !cov.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    // Symmetrize away round-off so the persisted conditional covariance is
+    // exactly symmetric, as a covariance must be.
+    let mut symm = cov.clone();
+    for i in 0..p {
+        for j in (i + 1)..p {
+            let avg = 0.5 * (cov[[i, j]] + cov[[j, i]]);
+            symm[[i, j]] = avg;
+            symm[[j, i]] = avg;
+        }
+    }
+    Some(symm)
+}
+
 fn survival_unified_fit_result(
     beta: Array1<f64>,
     lambdas: Array1<f64>,
@@ -2081,6 +2117,28 @@ fn survival_unified_fit_result(
     assert_eq!(edf_by_block.len(), lambdas.len());
     assert_eq!(penalty_block_trace.len(), lambdas.len());
 
+    // #2373 defect C: a converged single-cause transformation/weibull survival
+    // fit carries the full observed-information penalized Hessian
+    // `H = X'W_H X + S(λ)` — the very matrix the EDF trace-solves above already
+    // factor — so the conditional Bayesian covariance `Vb = H⁻¹` (unit
+    // dispersion) is available and MUST be persisted. Without it `predict()`
+    // refuses every covariance-requiring mode with "fit result does not contain
+    // conditional covariance" (survival/predict.rs). The coefficient gauge here
+    // is the identity (`Gauge::identity(&[beta.len()])` below), so `H⁻¹` is
+    // already in the raw block coordinates β lives in — no gauge lift is needed
+    // (unlike the location-scale path's `lift_conditional_covariance`). Mirror
+    // that path's PD-failure semantics (survival/location_scale/fit.rs): an SPD
+    // Hessian yields the symmetrized inverse; a non-SPD one mints the fit with a
+    // typed-absent covariance so predict refuses honestly rather than consuming
+    // a fabricated nearby matrix.
+    let covariance_conditional =
+        survival_conditional_covariance_from_penalized_hessian(&penalized_hessian);
+    let beta_standard_errors = covariance_conditional.as_ref().map(|cov| {
+        Array1::from_iter((0..cov.nrows()).map(|i| cov[[i, i]].max(0.0).sqrt()))
+    });
+    let beta_covariance = covariance_conditional
+        .clone()
+        .map(gam_problem::dispersion_cov::PhiScaledCovariance::wrap);
     let penalized_hessian = gam_problem::dispersion_cov::UnscaledPrecision::wrap(penalized_hessian);
     let inference = gam_solve::estimate::FitInference {
         edf_by_block: edf_by_block.clone(),
@@ -2091,8 +2149,8 @@ fn survival_unified_fit_result(
         penalized_hessian: penalized_hessian.clone(),
         reparam_qs: None,
         dispersion: gam_solve::estimate::Dispersion::UNIT,
-        beta_covariance: None,
-        beta_standard_errors: None,
+        beta_covariance,
+        beta_standard_errors,
         beta_covariance_corrected: None,
         beta_standard_errors_corrected: None,
         beta_covariance_frequentist: None,
@@ -2131,7 +2189,7 @@ fn survival_unified_fit_result(
             .map(|certificate| certificate.stationarity.projected_norm())
             .or(Some(summary.lastgradient_norm)),
         standard_deviation: 1.0,
-        covariance_conditional: None,
+        covariance_conditional,
         covariance_corrected: None,
         inference: Some(inference),
         fitted_link: FittedLinkState::Standard(None),
