@@ -8139,12 +8139,27 @@ pub fn build_factor_smooth(
     let mut dense = Array2::<f64>::zeros((n, q));
     for i in 0..n {
         let bits = gam_data::canonical_level_bits(data[[i, group_col]]);
-        let level_idx = levels.iter().position(|b| *b == bits).ok_or_else(|| {
-            BasisError::InvalidInput(format!(
+        let Some(level_idx) = levels.iter().position(|b| *b == bits) else {
+            // Held-out-group contract (#2365): `bs="re"` is a genuine random
+            // effect, so in the frozen (predict/replay) context a row whose
+            // group is outside the training vocabulary carries NO fitted
+            // deviation — its row stays all-zero across every group block and
+            // the prediction is the population component, mirroring
+            // `build_random_effect_block`'s lenient `group_id = None` rows.
+            // `fs`/`sz` estimate a per-level deviation FUNCTION (an unseen
+            // level has no zero-deviation fallback that means "population"),
+            // and the fit path derives `levels` from this very data, so both
+            // stay strict.
+            if matches!(spec.flavour, FactorSmoothFlavour::Re)
+                && spec.group_frozen_levels.is_some()
+            {
+                continue;
+            }
+            return Err(BasisError::InvalidInput(format!(
                 "factor smooth term '{term_name}' saw an unseen grouping level at row {}",
                 i + 1
-            ))
-        })?;
+            )));
+        };
         let start = level_idx * p;
         dense
             .slice_mut(s![i, start..start + p])
@@ -9470,4 +9485,99 @@ pub fn build_smooth_design_withworkspace_unvalidated(
             })
         },
     })
+}
+
+#[cfg(test)]
+mod factor_smooth_heldout_group_tests {
+    use super::*;
+    use crate::basis::BasisWorkspace;
+    use ndarray::{Array1, array};
+
+    fn pinned_marginal() -> BSplineBasisSpec {
+        BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Provided(Array1::from(vec![
+                0.0, 0.0, 0.0, 0.0, 0.25, 0.6, 1.0, 1.0, 1.0, 1.0,
+            ])),
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: crate::basis::OneDimensionalBoundary::Open,
+            boundary_conditions: crate::basis::BSplineBoundaryConditions::default(),
+        }
+    }
+
+    fn factor_smooth_term(flavour: FactorSmoothFlavour, frozen: Option<Vec<u64>>) -> SmoothTermSpec {
+        SmoothTermSpec {
+            name: "fs_heldout".to_string(),
+            basis: SmoothBasisSpec::FactorSmooth {
+                spec: FactorSmoothSpec {
+                    continuous_cols: vec![0],
+                    group_col: 1,
+                    marginal: pinned_marginal(),
+                    flavour,
+                    group_frozen_levels: frozen,
+                    frozen_global_orthogonality: None,
+                },
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }
+    }
+
+    const FROZEN_01: [f64; 2] = [0.0, 1.0];
+
+    fn frozen_bits() -> Vec<u64> {
+        FROZEN_01.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// #2365: in the frozen (predict/replay) context, a `bs="re"` row whose
+    /// group is outside the training vocabulary must build with an all-zero
+    /// row — zero fitted deviation, population prediction — instead of
+    /// erroring before the random-effect operator can apply its held-out-group
+    /// contract.
+    #[test]
+    fn re_heldout_group_row_is_zero_deviation() {
+        let data = array![[0.1, 0.0], [0.5, 1.0], [0.9, 7.0]];
+        let term = factor_smooth_term(FactorSmoothFlavour::Re, Some(frozen_bits()));
+        let mut workspace = BasisWorkspace::default();
+        let build = build_single_local_smooth_term(data.view(), &term, &mut workspace)
+            .expect("a held-out group must not fail the bs=\"re\" design build");
+        let dense = build
+            .design
+            .try_to_dense_by_chunks("heldout test")
+            .expect("dense");
+        assert!(
+            dense.row(2).iter().all(|&v| v == 0.0),
+            "unseen-group row must carry zero deviation across every group block, got {:?}",
+            dense.row(2)
+        );
+        assert!(
+            dense.row(0).iter().any(|&v| v != 0.0) && dense.row(1).iter().any(|&v| v != 0.0),
+            "in-vocabulary rows must still populate their group blocks"
+        );
+    }
+
+    /// The `fs` flavour estimates a per-level deviation FUNCTION — an unseen
+    /// level has no zero-deviation population fallback — so the frozen-context
+    /// build must stay strict (#2102/#2137 must not regress through #2365).
+    #[test]
+    fn fs_heldout_group_stays_strict() {
+        let data = array![[0.1, 0.0], [0.5, 1.0], [0.9, 7.0]];
+        let term = factor_smooth_term(
+            FactorSmoothFlavour::Fs {
+                m_null_penalty_orders: vec![1],
+            },
+            Some(frozen_bits()),
+        );
+        let mut workspace = BasisWorkspace::default();
+        let err = match build_single_local_smooth_term(data.view(), &term, &mut workspace) {
+            Ok(_) => panic!("fs must reject an unseen grouping level"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("unseen grouping level"),
+            "fs unseen-level refusal must name the defect, got: {err}"
+        );
+    }
 }

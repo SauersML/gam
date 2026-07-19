@@ -2567,6 +2567,25 @@ impl FittedFamily {
     }
 }
 
+/// The grouping column of a random-slope factor smooth (`s(x, g, bs="re")`),
+/// unwrapped through `by=`/sum-to-zero wrappers (#2365). `None` for every
+/// other basis: only the `Re` flavour is a genuine random effect under the
+/// held-out-group contract — `fs`/`sz` estimate a per-level deviation
+/// function, so an unseen level has no zero-deviation population fallback and
+/// stays strict, exactly like a fixed categorical factor (#2102/#2137).
+fn re_factor_smooth_group_col(basis: &gam_terms::smooth::SmoothBasisSpec) -> Option<usize> {
+    use gam_terms::smooth::{FactorSmoothFlavour, SmoothBasisSpec};
+    match basis {
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            matches!(spec.flavour, FactorSmoothFlavour::Re).then_some(spec.group_col)
+        }
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => re_factor_smooth_group_col(inner),
+        SmoothBasisSpec::BySmooth { smooth, .. } => re_factor_smooth_group_col(smooth),
+        _ => None,
+    }
+}
+
 /// Recursively collect the feature columns of a smooth basis whose out-of-hull
 /// evaluation is bounded, so they can be exempted from the predict-time axis
 /// clip (see [`FittedModel::training_smooth_extrapolation_axes`]). Wrapper bases
@@ -4429,6 +4448,19 @@ impl FittedModel {
                     continue;
                 }
                 if let Some(name) = training_headers.get(term.feature_col) {
+                    out.insert(name.clone());
+                }
+            }
+            // The `s(x, g, bs="re")` spelling is a smooth term whose basis is
+            // `FactorSmooth { flavour: Re }`, not a `random_effect_terms`
+            // entry — without this arm its group column never entered the
+            // lenient whitelist and the schema encode rejected a held-out
+            // group before the design operator could apply its zero-deviation
+            // contract (#2365).
+            for term in &spec.smooth_terms {
+                if let Some(group_col) = re_factor_smooth_group_col(&term.basis)
+                    && let Some(name) = training_headers.get(group_col)
+                {
                     out.insert(name.clone());
                 }
             }
