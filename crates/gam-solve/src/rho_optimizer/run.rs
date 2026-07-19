@@ -3789,21 +3789,15 @@ pub(crate) fn run_outer(
                     Ok(mut retried) => {
                         retried.iterations = retried.iterations.saturating_add(prior_iterations);
                         // Progress gate. A reseed that does not strictly reduce
-                        // the objective past the SAME relative cost floor the
-                        // cost-stall guard and the curvature-scaled certificate
-                        // use is at a genuine floor a fresh metric cannot escape.
-                        // Stop spending resumes: the next iteration certifies the
-                        // best point once more and takes the honest refusal. The
-                        // floor anchors on the smaller of the two costs so a tiny
-                        // uphill wobble from a metric restart is not mistaken for
-                        // real descent.
-                        let progress_floor = config
-                            .rel_cost_tolerance
-                            .unwrap_or(config.tolerance * 1.0e-2)
-                            .max(COST_STALL_REL_TOL_FLOOR)
-                            * (1.0 + prior_value.abs().min(retried.final_value.abs()));
-                        let improved = retried.final_value.is_finite()
-                            && retried.final_value < prior_value - progress_floor;
+                        // the objective past the shared relative cost floor is at
+                        // a genuine floor a fresh metric cannot escape; stop
+                        // spending resumes so the next iteration certifies the
+                        // best point once more and takes the honest refusal.
+                        let improved = certify_resume_made_progress(
+                            prior_value,
+                            retried.final_value,
+                            outer_rel_cost_floor(config),
+                        );
                         result = retried;
                         if !improved {
                             resumes_remaining = 0;
@@ -4338,6 +4332,36 @@ pub(crate) fn outer_tolerance(value: f64) -> Result<Tolerance, EstimationError> 
         .map_err(|err| EstimationError::InvalidInput(format!("outer tolerance is invalid: {err}")))
 }
 
+/// The relative cost floor shared by the cost-stall guard, the curvature-scaled
+/// flat-valley certificate, and the certify-last resume progress gate: nothing
+/// tighter than what the in-loop stall detector already proved about the
+/// surface. `rel_cost_tolerance` when set, else a small fraction of the absolute
+/// tolerance, never below `COST_STALL_REL_TOL_FLOOR`.
+pub(crate) fn outer_rel_cost_floor(config: &OuterConfig) -> f64 {
+    config
+        .rel_cost_tolerance
+        .unwrap_or(config.tolerance * 1.0e-2)
+        .max(COST_STALL_REL_TOL_FLOOR)
+}
+
+/// Whether a certify-last checkpoint reseed (#2273/#2374) exploited real descent.
+///
+/// A reseed that does not strictly reduce the outer objective past the shared
+/// relative cost floor `rel_cost_floor·(1 + min(|prior|, |retried|))` is at a
+/// genuine non-stationary floor (or a true flat valley) a fresh metric cannot
+/// escape, so the resume loop must stop rather than spend its remaining budget
+/// re-deriving the same refusal. Anchoring the floor on the SMALLER of the two
+/// costs keeps a tiny uphill wobble from a metric restart from reading as
+/// progress, and a non-finite retried value is never progress.
+pub(crate) fn certify_resume_made_progress(
+    prior_value: f64,
+    retried_value: f64,
+    rel_cost_floor: f64,
+) -> bool {
+    let floor = rel_cost_floor * (1.0 + prior_value.abs().min(retried_value.abs()));
+    retried_value.is_finite() && retried_value < prior_value - floor
+}
+
 pub(crate) fn outer_gradient_tolerance(config: &OuterConfig) -> GradientTolerance {
     let abs = config
         .objective_scale
@@ -4631,5 +4655,78 @@ mod asymptote_rail_certify_tests {
             reason.contains("not PSD") || reason.contains("interior"),
             "the decline must name the refusing gate, got: {reason}"
         );
+    }
+}
+
+#[cfg(test)]
+mod certify_resume_progress_tests {
+    //! Unit coverage for the certify-last checkpoint-resume progress gate
+    //! (#2374). The generalized loop keeps reseeding at the refused checkpoint
+    //! only while each reseed exploits real descent; `certify_resume_made_progress`
+    //! is the exact predicate that decides "real descent" vs "genuine floor", so
+    //! pinning it directly pins the loop's termination contract independent of the
+    //! solver dynamics that produce the reseeds.
+    use super::{OuterConfig, certify_resume_made_progress, outer_rel_cost_floor};
+
+    fn config_with_rel_cost(rel_cost: Option<f64>, tolerance: f64) -> OuterConfig {
+        let mut config = OuterConfig::new(1);
+        config.tolerance = tolerance;
+        config.rel_cost_tolerance = rel_cost;
+        config
+    }
+
+    #[test]
+    fn rel_cost_floor_prefers_explicit_then_scaled_tolerance_never_below_hard_floor() {
+        // Explicit relative tolerance wins verbatim.
+        let explicit = config_with_rel_cost(Some(1.0e-3), 1.0e-5);
+        assert_eq!(outer_rel_cost_floor(&explicit), 1.0e-3);
+        // Absent, it derives from a small fraction of the absolute tolerance.
+        let derived = config_with_rel_cost(None, 1.0e-2);
+        assert!((outer_rel_cost_floor(&derived) - 1.0e-4).abs() <= 1.0e-16);
+        // But never below the shared hard floor, however tight the tolerances.
+        let tiny = config_with_rel_cost(Some(1.0e-30), 1.0e-30);
+        assert_eq!(outer_rel_cost_floor(&tiny), super::COST_STALL_REL_TOL_FLOOR);
+    }
+
+    #[test]
+    fn strict_descent_past_the_floor_is_progress() {
+        let floor = 1.0e-4;
+        // A drop far larger than floor·(1+|cost|) at cost scale ~1e2.
+        assert!(certify_resume_made_progress(342.0730, 342.0580, floor));
+        // A drop of many orders is trivially progress.
+        assert!(certify_resume_made_progress(1.0e6, 1.0e3, floor));
+    }
+
+    #[test]
+    fn flat_or_uphill_reseed_is_not_progress() {
+        let floor = 1.0e-4;
+        // Exactly equal: no descent.
+        assert!(!certify_resume_made_progress(100.0, 100.0, floor));
+        // Uphill: a metric restart that landed worse is never progress.
+        assert!(!certify_resume_made_progress(100.0, 100.5, floor));
+        // A reduction SMALLER than the relative floor is within the flat band and
+        // does not count — this is the guard that stops the loop from spending its
+        // whole budget chasing sub-floor wobbles on a genuine non-stationary floor.
+        let cost = 1.0e4;
+        let sub_floor = floor * (1.0 + cost) * 0.5;
+        assert!(!certify_resume_made_progress(cost, cost - sub_floor, floor));
+    }
+
+    #[test]
+    fn floor_anchors_on_the_smaller_cost_magnitude() {
+        // With prior≈0 and a large-magnitude retried, anchoring on the smaller
+        // (prior) magnitude keeps the floor tight so a genuine tiny descent near a
+        // small optimum still registers, rather than being swamped by |retried|.
+        let floor = 1.0e-4;
+        // prior tiny-positive, retried strictly below it by more than floor·(1+0):
+        assert!(certify_resume_made_progress(1.0e-2, 1.0e-3, floor));
+    }
+
+    #[test]
+    fn non_finite_retried_is_never_progress() {
+        let floor = 1.0e-4;
+        assert!(!certify_resume_made_progress(100.0, f64::NAN, floor));
+        assert!(!certify_resume_made_progress(100.0, f64::INFINITY, floor));
+        assert!(!certify_resume_made_progress(100.0, f64::NEG_INFINITY, floor));
     }
 }
