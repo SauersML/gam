@@ -434,10 +434,7 @@ fn rescale_covariance_coordinates(covariance: &mut Array2<f64>, factors: &[f64])
     }
 }
 
-fn rescale_precision_coordinates(
-    precision: &mut gam_problem::dispersion_cov::UnscaledPrecision,
-    factors: &[f64],
-) {
+fn rescale_precision_coordinates(precision: &mut Array2<f64>, factors: &[f64]) {
     let dimension = factors.len();
     assert_eq!(
         precision.dim(),
@@ -447,6 +444,24 @@ fn rescale_precision_coordinates(
     for i in 0..dimension {
         for j in 0..dimension {
             precision[[i, j]] /= factors[i] * factors[j];
+        }
+    }
+}
+
+/// Conjugate a coefficient-to-coefficient linear map (the influence matrix
+/// `F = H⁻¹X'WX`, the bias-correction Jacobian `A = I + H⁻¹S(λ̂)`) into raw
+/// coordinates: with `β_raw = D·β_internal`, `M_raw = D·M·D⁻¹`, which keeps
+/// traces (the EDF) invariant.
+fn rescale_influence_coordinates(matrix: &mut Array2<f64>, factors: &[f64]) {
+    let dimension = factors.len();
+    assert_eq!(
+        matrix.dim(),
+        (dimension, dimension),
+        "influence map must align with the remapped coefficient vector"
+    );
+    for i in 0..dimension {
+        for j in 0..dimension {
+            matrix[[i, j]] *= factors[i] / factors[j];
         }
     }
 }
@@ -466,19 +481,15 @@ mod standard_convergence_gate_tests {
     #[test]
     fn raw_coordinate_precision_is_the_inverse_congruence_of_covariance() {
         let mut covariance = array![[0.30, -0.10], [-0.10, 0.70]];
-        let mut precision =
-            gam_problem::dispersion_cov::UnscaledPrecision::wrap(array![[3.5, 0.5], [0.5, 1.5]]);
+        let mut precision = array![[3.5, 0.5], [0.5, 1.5]];
         let factors = [4.0, 1.0];
 
         rescale_covariance_coordinates(&mut covariance, &factors);
         rescale_precision_coordinates(&mut precision, &factors);
 
         assert_eq!(covariance, array![[4.8, -0.4], [-0.4, 0.7]]);
-        assert_eq!(
-            precision.as_array(),
-            &array![[0.21875, 0.125], [0.125, 1.5]]
-        );
-        let identity = precision.as_array().dot(&covariance);
+        assert_eq!(precision, array![[0.21875, 0.125], [0.125, 1.5]]);
+        let identity = precision.dot(&covariance);
         for i in 0..2 {
             for j in 0..2 {
                 let target = if i == j { 1.0 } else { 0.0 };
@@ -1399,10 +1410,64 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw(
     // precision copy at the producer boundary so the saved model has one
     // coordinate convention.
     if let Some(geometry) = result.fit.fit.geometry.as_mut() {
-        rescale_precision_coordinates(&mut geometry.penalized_hessian, &row_factors);
+        rescale_precision_coordinates(&mut geometry.penalized_hessian.0, &row_factors);
     }
     if let Some(inference) = result.fit.fit.inference.as_mut() {
-        rescale_precision_coordinates(&mut inference.penalized_hessian, &row_factors);
+        rescale_precision_coordinates(&mut inference.penalized_hessian.0, &row_factors);
+
+        // The inference block carries its own copies of every coefficient-frame
+        // covariance object, and `UnifiedFitResult::try_from_parts` re-runs on
+        // every saved-model load requiring the conditional/corrected copies to
+        // equal the top-level matrices exactly. Each copy must therefore ride
+        // the identical remap: a copy left in standardized units made every
+        // saved location-scale fit refuse to predict once the custom-family
+        // lane began publishing the corrected covariance (#2346).
+        if let Some(cov) = inference.beta_covariance.as_mut() {
+            rescale_covariance_coordinates(&mut cov.0, &row_factors);
+        }
+        if let Some(cov) = inference.beta_covariance_corrected.as_mut() {
+            rescale_covariance_coordinates(cov, &row_factors);
+        }
+        if let Some(cov) = inference.beta_covariance_frequentist.as_mut() {
+            rescale_covariance_coordinates(cov, &row_factors);
+        }
+        if let Some(correction) = inference.smoothing_correction.as_mut() {
+            rescale_covariance_coordinates(correction, &row_factors);
+        }
+        for se in [
+            inference.beta_standard_errors.as_mut(),
+            inference.beta_standard_errors_corrected.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for (value, &factor) in se.iter_mut().zip(row_factors.iter()) {
+                *value *= factor;
+            }
+        }
+        // X'WX is a precision-side quadratic form exactly like H.
+        if let Some(gram) = inference.weighted_gram.as_mut() {
+            rescale_precision_coordinates(gram, &row_factors);
+        }
+        if let Some(influence) = inference.coefficient_influence.as_mut() {
+            rescale_influence_coordinates(influence, &row_factors);
+        }
+        if let Some(jacobian) = inference.bias_correction_jacobian.as_mut() {
+            rescale_influence_coordinates(jacobian, &row_factors);
+        }
+        // b̂ = H⁻¹S(λ̂)β̂ is a coefficient-space vector: b̂_raw = D·b̂.
+        if let Some(bias) = inference.bias_correction_beta.as_mut() {
+            for (value, &factor) in bias.iter_mut().zip(row_factors.iter()) {
+                *value *= factor;
+            }
+        }
+        // `β_saved = Qs·θ` puts the rows of the stabilizing reparameterization
+        // in the saved coefficient frame: Qs_raw = D·Qs.
+        if let Some(qs) = inference.reparam_qs.as_mut() {
+            for (mut row, &factor) in qs.rows_mut().into_iter().zip(row_factors.iter()) {
+                row.mapv_inplace(|v| v * factor);
+            }
+        }
     }
 
     // The residual-scale summary `standard_deviation` is a response-units
