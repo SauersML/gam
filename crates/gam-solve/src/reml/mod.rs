@@ -784,6 +784,84 @@ mod tests {
         );
     }
 
+    /// #2379: the Gaussian profiled-diagonal seed helper honors its (validated)
+    /// ρ-box by CLAMPING into it — never silently swapping or escaping it. The
+    /// helper now takes an `OrderedRhoBounds`, so an inverted box is impossible
+    /// to hand it (refused upstream at construction); this pins that a valid box
+    /// with the upper bound below the natural profiled optimum clamps the emitted
+    /// seed to that upper bound rather than producing an out-of-box value.
+    #[test]
+    fn gaussian_profiled_diagonal_seed_clamps_into_its_validated_box() {
+        // A smooth-ish Gaussian-identity design whose profiled REML optimum for
+        // the summed penalty sits at a moderate, finite ρ.
+        let n = 40usize;
+        let y = Array1::from_iter((0..n).map(|i| {
+            let t = (i as f64 + 0.5) / n as f64;
+            (std::f64::consts::TAU * t).sin() + 0.05 * (i as f64 % 3.0 - 1.0)
+        }));
+        let w = Array1::<f64>::ones(n);
+        let mut x = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            let t = (i as f64 + 0.5) / n as f64;
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = t;
+            x[[i, 2]] = t * t;
+        }
+        let offset = Array1::<f64>::zeros(n);
+        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-10, false);
+        let p = x.ncols();
+        let canonical = vec![gam_terms::construction::CanonicalPenalty::from_dense_root(
+            array![[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            p,
+        )];
+        let state = RemlState::newwith_offset(
+            y.view(),
+            x,
+            w.view(),
+            offset.view(),
+            canonical,
+            p,
+            &cfg,
+            Some(vec![1]),
+            None,
+            None,
+        )
+        .expect("state");
+
+        // A wide, ordered box: the emitted seed is finite and inside it. Its
+        // value is the natural profiled ρ (nothing binds).
+        let wide = gam_problem::OrderedRhoBounds::new(-12.0, 12.0).unwrap();
+        let seed_wide = state
+            .analytic_gaussian_profiled_diagonal_rho(wide)
+            .expect("no error")
+            .expect("gaussian-identity profiled diagonal returns a seed");
+        let natural = seed_wide[0];
+        for &r in seed_wide.iter() {
+            assert!(r.is_finite(), "seed coordinate is finite");
+            assert!(
+                (-12.0..=12.0).contains(&r),
+                "seed {r} stays inside the wide box"
+            );
+        }
+
+        // A box whose UPPER bound is pinned strictly below the natural optimum:
+        // the profiled ρ must be clamped DOWN to that upper bound, proving the box
+        // is honored (a silent swap would instead have solved a different box).
+        // Derive the cap from the measured optimum so the assertion is robust to
+        // the exact fixture geometry; `cap_lo < cap_hi` and both are finite.
+        let cap_hi = natural - 2.0;
+        let cap_lo = natural - 10.0;
+        let capped = gam_problem::OrderedRhoBounds::new(cap_lo, cap_hi).unwrap();
+        let seed_capped = state
+            .analytic_gaussian_profiled_diagonal_rho(capped)
+            .expect("no error")
+            .expect("seed present");
+        assert!(
+            seed_capped.iter().all(|&r| (r - cap_hi).abs() < 1e-9),
+            "capped seed {seed_capped:?} clamps to the binding upper bound {cap_hi}"
+        );
+    }
+
     #[test]
     fn canonical_logit_firth_declines_exact_tk_hessian_when_row_pair_work_is_large() {
         let n = 2_000usize;
