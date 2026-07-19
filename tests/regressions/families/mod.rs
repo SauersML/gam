@@ -1,6 +1,7 @@
 mod apply_inverse_link_cloglog_deep_tail_precision;
 mod apply_inverse_link_probit_deep_tail_precision;
 mod bernoulli_marginal_slope_bug_hunt_1;
+mod beta_phi_lambda_search_freeze_2369;
 mod cloglog_integrated_large_sigma;
 mod cloglog_inverse_link_deep_tail_clamp_flattens;
 mod estimate_external_family_and_links;

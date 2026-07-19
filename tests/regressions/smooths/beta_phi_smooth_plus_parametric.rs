@@ -123,21 +123,29 @@ fn beta_smooth_plus_parametric_recovers_slope_and_precision() {
 
     // Slope of the parametric x1 term via a difference of predicted η at fixed
     // x2 (the intercept and the x2 smooth contribution cancel).
+    //
+    // Both grid rows go through ONE design build, and neither covariate column
+    // may be identically zero — the design builder rejects a parametric column
+    // of all zeros as a term that cannot carry a recoverable effect. So x1 is
+    // evaluated at ±1 (column [1, −1]) rather than at 1 and 0, and x2 is held at
+    // a fixed NON-zero value (column [0.5, 0.5]) whose smooth contribution
+    // cancels in the difference exactly as a held-at-zero one would.
     use gam::matrix::LinearOperator;
     use gam::smooth::build_term_collection_design;
     use ndarray::Array2;
     let col = ds.column_map();
     let i1 = col["x1"];
     let i2 = col["x2"];
-    let eta_at = |a: f64, b: f64| -> f64 {
-        let mut grid = Array2::<f64>::zeros((1, ds.headers.len()));
-        grid[[0, i1]] = a;
-        grid[[0, i2]] = b;
-        let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
-            .expect("rebuild design at grid point");
-        design.design.apply(&fit.fit.beta).to_vec()[0]
-    };
-    let b1_hat = eta_at(1.0, 0.0) - eta_at(0.0, 0.0);
+    let mut grid = Array2::<f64>::zeros((2, ds.headers.len()));
+    grid[[0, i1]] = 1.0;
+    grid[[1, i1]] = -1.0;
+    grid[[0, i2]] = 0.5;
+    grid[[1, i2]] = 0.5;
+    let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at grid points");
+    let eta = design.design.apply(&fit.fit.beta).to_vec();
+    // η(x1=1) − η(x1=−1) = 2·B1.
+    let b1_hat = 0.5 * (eta[0] - eta[1]);
 
     // The parametric slope must recover the truth. A φ frozen at the null
     // predictor attenuated this to ~0.63 with a smooth term present; the
