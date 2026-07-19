@@ -6889,3 +6889,91 @@ fn outer_search_escapes_interior_saddle_and_certifies_minimum() {
         "the escaped minimum must carry a PSD certificate",
     );
 }
+
+/// #2370: an inverted per-coordinate ρ-box (lower > upper) must surface as a
+/// typed `EstimationError::InvalidInput` from the outer runner, NOT panic in
+/// `project_to_bounds`' `f64::clamp(min, max)` (`min > max`) and escape as an
+/// opaque "panicked inside Rust boundary" `GamError` across the FFI. The
+/// custom-family effective-df ceiling once emitted an upper bound below
+/// `rho_lower_bound`, inverting the box; the runner now rejects any such box up
+/// front, before a seed is projected against it.
+#[test]
+fn inverted_rho_box_is_a_typed_error_not_a_clamp_panic_2370() {
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_initial_rho(array![0.0])
+        // lower (-10) strictly ABOVE upper (-11.855…): the exact inversion the
+        // effective-df ceiling produced for a binomial flexible_link fit.
+        .with_bounds(array![-10.0], array![-11.855421824787882])
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
+    let mut obj = problem.build_objective(
+        (),
+        move |_: &mut (), rho: &Array1<f64>| Ok(0.5 * rho[0] * rho[0]),
+        move |_: &mut (), rho: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: 0.5 * rho[0] * rho[0],
+                gradient: array![rho[0]],
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let err = problem
+        .run(&mut obj, "inverted rho box 2370")
+        .expect_err("inverted ρ-box must be rejected as a typed error, not panic");
+    match err {
+        EstimationError::InvalidInput(msg) => {
+            assert!(
+                msg.to_lowercase().contains("bound"),
+                "InvalidInput should name the bound problem, got: {msg}",
+            );
+        }
+        other => panic!("expected EstimationError::InvalidInput for an inverted box, got {other:?}"),
+    }
+}
+
+/// #2370 companion: a NON-inverted but touching box (lower == upper, a pinned
+/// coordinate) is legitimate and must NOT be rejected — the guard keys on strict
+/// inversion only, so a genuinely pinned λ still optimizes.
+#[test]
+fn pinned_equal_rho_bounds_are_accepted_2370() {
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_initial_rho(array![2.0])
+        .with_bounds(array![2.0], array![2.0])
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
+    let mut obj = problem.build_objective(
+        (),
+        move |_: &mut (), rho: &Array1<f64>| Ok(0.5 * rho[0] * rho[0]),
+        move |_: &mut (), rho: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: 0.5 * rho[0] * rho[0],
+                gradient: array![rho[0]],
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let result = problem
+        .run(&mut obj, "pinned rho box 2370")
+        .expect("a pinned (lower == upper) coordinate is a valid box");
+    assert!(
+        (result.rho[0] - 2.0).abs() < 1e-9,
+        "pinned coordinate must stay at its bound, got {:?}",
+        result.rho,
+    );
+}

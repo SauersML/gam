@@ -5955,6 +5955,117 @@ fn unit_weight_structural_edf_rejects_noncanonical_log_strengths() {
     }
 }
 
+/// #2370: the effective-df ceiling must never emit a per-coordinate upper bound
+/// below the ρ-box's real lower wall (`options.rho_lower_bound`). Before the
+/// fix the bisection/guard were anchored on `-EFFECTIVE_DF_CEILING = -12`, but
+/// the optimizer's lower wall is the independent default `-10`; a term whose
+/// edf=1 crossing ρ* fell in `(-12, -10)` got an upper bound at ρ* < -10,
+/// inverting the box and panicking in `project_to_bounds`' `f64::clamp(min, max)`
+/// with `min > max` across the FFI (the binomial `flexible_link=True` fit).
+///
+/// This constructs exactly that term: two range directions with generalized
+/// eigenvalues γ = 2e-5, so edf(ρ) = 2·γ/(γ+e^ρ) crosses 1 at
+/// ρ* = ln(γ) ≈ -10.82 ∈ (-12, -10). Anchoring on `-12` (the old proxy) still
+/// tightens below the real wall; anchoring on the true `-10` wall recognizes
+/// the floor is unenforceable there (edf(-10) ≈ 0.61 < 1) and keeps the uniform
+/// ceiling, so the emitted upper stays ≥ the lower bound.
+#[test]
+fn effective_df_ceiling_never_emits_upper_below_true_rho_lower_wall_2370() {
+    let gamma = 2.0e-5_f64;
+    // X = diag(√γ, √γ) ⇒ G = XᵀX = diag(γ, γ); with S = I₂ the generalized
+    // eigenvalues of (G, S) are exactly [γ, γ].
+    let x = Array2::from_diag(&array![gamma.sqrt(), gamma.sqrt()]);
+    let design = DesignMatrix::from(x);
+    let s = array![[1.0, 0.0], [0.0, 1.0]];
+    let penalty = PenaltyMatrix::Dense(s);
+
+    // Sanity on the crafted eigenstructure and the edf crossings that make this
+    // the exact (-12, -10) coupled-constant hazard.
+    let gammas = design_penalty_range_gammas(&design, &penalty)
+        .expect("full-rank 2×2 pair yields two generalized eigenvalues");
+    assert_eq!(gammas.len(), 2);
+    for &g in &gammas {
+        assert!((g - gamma).abs() < 1e-12, "γ must be {gamma}, got {g}");
+    }
+    let edf_at_neg10 = unit_weight_term_edf(&gammas, -10.0).expect("canonical ρ");
+    let edf_at_neg12 = unit_weight_term_edf(&gammas, -12.0).expect("canonical ρ");
+    assert!(
+        edf_at_neg10 < EFFECTIVE_DF_FLOOR,
+        "edf at the real lower wall (-10) must sit below the floor: {edf_at_neg10}",
+    );
+    assert!(
+        edf_at_neg12 > EFFECTIVE_DF_FLOOR,
+        "edf at the old -ceiling proxy (-12) must sit above the floor: {edf_at_neg12}",
+    );
+
+    let spec = ParameterBlockSpec {
+        name: "single_penalty_flex_wiggle".to_string(),
+        design,
+        offset: Array1::zeros(2),
+        penalties: vec![penalty],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let specs = vec![spec];
+    let layout = crate::penalty_labels::PenaltyLabelLayout {
+        penalty_counts: vec![1],
+        physical_to_outer: vec![Some(0)],
+        fixed_log_lambdas: vec![None],
+        initial_rho: array![0.0],
+        joint_specs: vec![],
+        joint_to_outer: vec![],
+    };
+
+    // The old proxy wall (-12): the crossing is admissible, so the upper bound is
+    // tightened to ρ* ≈ -10.82 — BELOW the real -10 wall. This is the inverted
+    // box that panicked.
+    let upper_old_proxy =
+        effective_df_floor_rho_upper_bounds(&specs, &layout, 1, EFFECTIVE_DF_CEILING, -12.0)
+            .expect("bound construction succeeds");
+    assert!(
+        upper_old_proxy[0] < -10.0,
+        "regression guard: the old -12 anchor tightens the upper below the real \
+         lower wall (got {}), which is exactly the inversion #2370 fixed",
+        upper_old_proxy[0],
+    );
+
+    // The true wall (-10): the floor is unenforceable at the real lower bound, so
+    // the uniform ceiling is retained and the box stays well-ordered.
+    let lower = -10.0_f64;
+    let upper_true_wall =
+        effective_df_floor_rho_upper_bounds(&specs, &layout, 1, EFFECTIVE_DF_CEILING, lower)
+            .expect("bound construction succeeds");
+    assert!(
+        upper_true_wall[0] >= lower,
+        "emitted upper bound {} must never fall below the ρ lower wall {lower}",
+        upper_true_wall[0],
+    );
+    assert!(
+        (upper_true_wall[0] - EFFECTIVE_DF_CEILING).abs() < 1e-12,
+        "floor unenforceable at the wall ⇒ keep the uniform ceiling {EFFECTIVE_DF_CEILING}, \
+         got {}",
+        upper_true_wall[0],
+    );
+
+    // A degenerate box (lower ≥ ceiling) is a typed error, not a silent inversion.
+    assert!(
+        effective_df_floor_rho_upper_bounds(
+            &specs,
+            &layout,
+            1,
+            EFFECTIVE_DF_CEILING,
+            EFFECTIVE_DF_CEILING,
+        )
+        .is_err(),
+        "lower == ceiling must be rejected as an empty/degenerate ρ-box",
+    );
+}
+
 /// gam#1854 / gam#1395: the multinomial Firth/Jeffreys separation fallback assembles
 /// the outer joint Hessian `H_unpen + S_λ + scale·H_Φ` and, for small systems
 /// (`total <= JOINT_LOGDET_GUARD_MAX_DIM`), realizes its `0.5·log|H|` Laplace term
