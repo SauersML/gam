@@ -3,7 +3,9 @@ use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve, SolveLstsq};
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerLinalgError, FaerSvd, array1_to_col_matmut};
 use gam_linalg::utils::{StableSolver, array_is_finite, boundary_hit_step_fraction};
-use gam_problem::{ConstraintSet, KhatriRaoConeConstraints, LinearInequalityConstraints};
+use gam_problem::{
+    ConstraintRowId, ConstraintSet, KhatriRaoConeConstraints, LinearInequalityConstraints,
+};
 use ndarray::{Array1, Array2, s};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -1187,43 +1189,69 @@ pub(crate) struct CompressedActiveWorkingSet {
     pub(crate) original_active_count: usize,
 }
 
-/// One tight active row expressed against its representative: `a_dep ≈ coeff · a_rep`.
+/// One dependent row of the WORKING SET expressed against its representative:
+/// `a_dep ≈ coeff · a_rep`.
 ///
 /// Recorded ONLY for exactly-parallel (positively-aligned scalar-multiple)
 /// dependents; a general-position dependent is dropped from the working set with
 /// NO entry and re-enters via the next feasibility scan (it never receives a
-/// distributed/phantom multiplier). `active_pos` is the DEPENDENT row's flat id
-/// (in the tight-set index space); the representative is identified by the index
-/// of the owning [`ReducedFace::dependence`] slot, which is aligned with
-/// [`ReducedFace::representatives`].
+/// distributed/phantom multiplier).
+///
+/// `active_pos` is an ACTIVE-SET POSITION: an index into the caller's `active`
+/// slice, so the original constraint id is `active[active_pos]` (see
+/// [`compress_active_working_set`], which seeds `groups` with exactly these
+/// positions). It is NOT a constraint-row id and NOT a coefficient index. The
+/// reduced-face op reports its dependents in constraint-row space instead and
+/// therefore uses its own [`ConstraintRowDependence`] — the two must not be
+/// interchanged.
 #[derive(Clone, Copy, Debug)]
 pub struct ActiveRowDependence {
     pub active_pos: usize,
     pub coeff: f64,
 }
 
+/// One tight row of a REDUCED FACE expressed against its representative:
+/// `a_dep ≈ coeff · a_rep`, with the dependent named in constraint-row space.
+///
+/// Same `(A)`-strict recording rule as [`ActiveRowDependence`], different index
+/// space: `row` is the dependent's [`ConstraintRowId`] in the reduced set's own
+/// row space. The representative is identified by the index of the owning
+/// [`ReducedFace::dependence`] slot, which is aligned with
+/// [`ReducedFace::representatives`].
+#[derive(Clone, Copy, Debug)]
+pub struct ConstraintRowDependence {
+    pub row: ConstraintRowId,
+    pub coeff: f64,
+}
+
 /// The result of reducing a tight active face to a minimal independent set — the
-/// shared output of the `ConstraintSet` reduced-face op (Dense arm = the
-/// ascending-index scan here; KhatriRaoCone / BlockDiagonal arms produce the same
+/// shared output of the `ConstraintSet` reduced-face op (Dense arm =
+/// [`dense_reduced_face`]; KhatriRaoCone / BlockDiagonal arms produce the same
 /// shape). Determinism: representatives are the lowest-flat-index row per
 /// independent direction, ascending, with no float tie-break.
+///
+/// INDEX SPACE: every id here is a [`ConstraintRowId`] in the reduced set's own
+/// constraint-row space (`0..nrows()`), addressing `values()` / `bound()` /
+/// `row_norm()`. It is NOT a coefficient index; to reach β coordinates go
+/// through [`gam_problem::ConstraintSet::row_column_support`].
 #[derive(Clone, Debug)]
 pub struct ReducedFace {
     /// Kept independent rows — the lowest-flat-index representative per direction,
-    /// ascending. Flat id space is `0..nrows` (Dense) / `slot*n + obs` (cone).
-    pub representatives: Vec<usize>,
+    /// ascending. Flat id space is `0..nrows` (Dense) / `slot*n + obs` (cone) /
+    /// the concatenation of the member row spaces (block-diagonal).
+    pub representatives: Vec<ConstraintRowId>,
     /// Per-representative parallel-dependent map, index-aligned with
     /// `representatives`. `dependence[i]` lists the exactly-parallel dependents of
     /// `representatives[i]` (empty when it has none); general-position dependents
     /// are absent (dropped, re-enter on the next feasibility scan).
-    pub dependence: Vec<Vec<ActiveRowDependence>>,
+    pub dependence: Vec<Vec<ConstraintRowDependence>>,
     /// The full tight set that was reduced, ascending flat ids.
-    pub tight_rows: Vec<usize>,
+    pub tight_rows: Vec<ConstraintRowId>,
 }
 
 /// Reduce the tight active face of a Khatri–Rao monotonicity cone to its minimal
 /// independent set — the `KhatriRaoCone` arm of the `ConstraintSet` reduced-face
-/// op (gam#2306; the Dense arm is [`rank_reduce_rows_pivoted_qr_with_dependence`]).
+/// op (gam#2306; the Dense arm is [`dense_reduced_face`]).
 ///
 /// A cone row `(slot, i)` has normal `e_{k} ⊗ ψ_i` (`k = coupled_rows[slot]`),
 /// so two normals' inner product is `δ_{slot,slot'}·(ψ_iᵀ ψ_{i'})`: cross-block
@@ -1235,7 +1263,7 @@ pub struct ReducedFace {
 /// Contract (matches the Dense arm): FULL rank cut (every dependent row is
 /// dropped from `representatives`, parallel OR general-position); the dependence
 /// map records `(A)`-strict — ONLY exactly-parallel dependents
-/// (`|cos(ψ_dep, ψ_rep)| ≥ 1 − 1e-9`) get an [`ActiveRowDependence`] against their
+/// (`|cos(ψ_dep, ψ_rep)| ≥ 1 − 1e-9`) get a [`ConstraintRowDependence`] against their
 /// single representative (`coeff = ψ_depᵀψ_rep / ‖ψ_rep‖²`, so `a_dep ≈ coeff·a_rep`);
 /// general-position drops get no entry and re-enter via the next feasibility
 /// scan. Representatives are the lowest-flat-index row per direction (ascending
@@ -1270,9 +1298,9 @@ pub fn khatri_rao_cone_reduced_face(
     // Exactly-parallel threshold, matching the Dense scan's ±1e-9 cosine band.
     const PARALLEL_COS_TOL: f64 = 1.0 - 1e-9;
 
-    let mut representatives: Vec<usize> = Vec::new();
-    let mut dependence: Vec<Vec<ActiveRowDependence>> = Vec::new();
-    let mut tight_rows: Vec<usize> = Vec::new();
+    let mut representatives: Vec<ConstraintRowId> = Vec::new();
+    let mut dependence: Vec<Vec<ConstraintRowDependence>> = Vec::new();
+    let mut tight_rows: Vec<ConstraintRowId> = Vec::new();
 
     for slot in 0..coupled.len() {
         // Tight obs in this block, ascending. A zero-norm ψ_i is a vacuous row
@@ -1285,7 +1313,7 @@ pub fn khatri_rao_cone_reduced_face(
             }
             let scaled_slack = values[slot * n + i] / norm_i;
             if scaled_slack <= membership_tol {
-                tight_rows.push(slot * n + i);
+                tight_rows.push(ConstraintRowId(slot * n + i));
                 tight_obs.push(i);
             }
         }
@@ -1311,7 +1339,7 @@ pub fn khatri_rao_cone_reduced_face(
                 resid.scaled_add(-proj, q);
             }
             let resid_norm = resid.dot(&resid).sqrt();
-            let flat = slot * n + i;
+            let flat = ConstraintRowId(slot * n + i);
             if resid_norm > rank_tol {
                 ortho_basis.push(&resid / resid_norm);
                 let out_idx = representatives.len();
@@ -1338,8 +1366,8 @@ pub fn khatri_rao_cone_reduced_face(
                 }
                 if best_abs_cos >= PARALLEL_COS_TOL {
                     if let Some((out_idx, coeff)) = best {
-                        dependence[out_idx].push(ActiveRowDependence {
-                            active_pos: flat,
+                        dependence[out_idx].push(ConstraintRowDependence {
+                            row: flat,
                             coeff,
                         });
                     }
@@ -1359,7 +1387,7 @@ pub fn khatri_rao_cone_reduced_face(
 /// `A x ≥ b` set at `beta` to a minimal independent set. Mirrors
 /// [`khatri_rao_cone_reduced_face`] exactly — ascending-index greedy MGS,
 /// `RANK_ALPHA·ε·max(n_tight,p)·max‖a‖` tolerance, (A)-strict parallel-only
-/// dependence (|cos| ≥ 1−1e-9, `coeff = a_depᵀa_rep/‖a_rep‖²`, `active_pos` = the
+/// dependence (|cos| ≥ 1−1e-9, `coeff = a_depᵀa_rep/‖a_rep‖²`, `row` = the
 /// dependent row's flat id) — so both carriers produce the same `ReducedFace`
 /// contract. Flat id = the constraint row index. A zero-norm row is vacuous
 /// (never a direction, never a representative).
@@ -1383,7 +1411,9 @@ pub fn dense_reduced_face(
     const RANK_ALPHA: f64 = 100.0;
     const PARALLEL_COS_TOL: f64 = 1.0 - 1e-9;
 
-    let mut tight_rows: Vec<usize> = Vec::new();
+    // The scan runs in raw row indices (they address `a` / `row_norms`); the
+    // ids are wrapped into constraint-row space once, at the return boundary.
+    let mut tight: Vec<usize> = Vec::new();
     for i in 0..n {
         let norm_i = row_norms[i];
         if norm_i <= 0.0 {
@@ -1391,30 +1421,30 @@ pub fn dense_reduced_face(
         }
         let scaled_slack = (a.row(i).dot(&beta) - b[i]) / norm_i;
         if scaled_slack <= membership_tol {
-            tight_rows.push(i);
+            tight.push(i);
         }
     }
 
-    let mut representatives: Vec<usize> = Vec::new();
-    let mut dependence: Vec<Vec<ActiveRowDependence>> = Vec::new();
-    if tight_rows.is_empty() {
+    let mut representatives: Vec<ConstraintRowId> = Vec::new();
+    let mut dependence: Vec<Vec<ConstraintRowDependence>> = Vec::new();
+    if tight.is_empty() {
         return Ok(ReducedFace {
             representatives,
             dependence,
-            tight_rows,
+            tight_rows: Vec::new(),
         });
     }
 
-    let max_norm = tight_rows
+    let max_norm = tight
         .iter()
         .map(|&i| row_norms[i])
         .fold(0.0_f64, f64::max);
-    let rank_tol = RANK_ALPHA * f64::EPSILON * (tight_rows.len().max(p).max(1) as f64) * max_norm;
+    let rank_tol = RANK_ALPHA * f64::EPSILON * (tight.len().max(p).max(1) as f64) * max_norm;
 
     let mut ortho_basis: Vec<Array1<f64>> = Vec::new();
     // Kept representatives: (row, a_row, index into `representatives`).
     let mut kept: Vec<(usize, Array1<f64>, usize)> = Vec::new();
-    for &i in &tight_rows {
+    for &i in &tight {
         let a_i = a.row(i).to_owned();
         let mut resid = a_i.clone();
         for q in &ortho_basis {
@@ -1425,7 +1455,7 @@ pub fn dense_reduced_face(
         if resid_norm > rank_tol {
             ortho_basis.push(&resid / resid_norm);
             let out_idx = representatives.len();
-            representatives.push(i);
+            representatives.push(ConstraintRowId(i));
             dependence.push(Vec::new());
             kept.push((i, a_i, out_idx));
         } else {
@@ -1449,8 +1479,8 @@ pub fn dense_reduced_face(
             }
             if best_abs_cos >= PARALLEL_COS_TOL {
                 if let Some((out_idx, coeff)) = best {
-                    dependence[out_idx].push(ActiveRowDependence {
-                        active_pos: i,
+                    dependence[out_idx].push(ConstraintRowDependence {
+                        row: ConstraintRowId(i),
                         coeff,
                     });
                 }
@@ -1461,8 +1491,28 @@ pub fn dense_reduced_face(
     Ok(ReducedFace {
         representatives,
         dependence,
-        tight_rows,
+        tight_rows: tight.into_iter().map(ConstraintRowId).collect(),
     })
+}
+
+/// Lift a MEMBER's constraint-row id into the JOINT block-diagonal row space.
+///
+/// Derivation: `ConstraintSet::BlockDiagonal` stacks its members' constraint
+/// ROWS in block order — `ConstraintSet::values` writes member `m`'s values into
+/// `out[off .. off + m.nrows()]`, and `bound` / `row_norm` decode a joint row by
+/// walking the same running `nrows()` sum (`block_for_row`). So the joint id of
+/// member row `local` is `local + Σ_{earlier m} m.nrows()`, which is what
+/// `row_offset` accumulates.
+///
+/// The offset is deliberately NOT `col_start`. That is the COEFFICIENT offset,
+/// and it advances by `ncols()`. Using one for the other is only invisible while
+/// every member is square (`nrows() == ncols()`); the moment a member constrains
+/// fewer rows than it has coefficients, the two sequences diverge and the ids
+/// silently name the wrong block. To go from these ids to β coordinates, use
+/// `ConstraintSet::row_column_support` — never arithmetic on the id.
+#[inline]
+fn lift_member_row(local: ConstraintRowId, row_offset: usize) -> ConstraintRowId {
+    ConstraintRowId(local.index() + row_offset)
 }
 
 /// The shared tight-face reduction op over the `ConstraintSet` carrier union.
@@ -1489,12 +1539,19 @@ impl ConstraintSetReducedFace for ConstraintSet {
                 khatri_rao_cone_reduced_face(cone, beta, membership_tol)
             }
             ConstraintSet::BlockDiagonal { blocks, .. } => {
-                // Compose per inner block over its disjoint column range; row ids
-                // are the concatenation of the member row ids in order, so each
-                // member's flat ids shift by the running member row count.
-                let mut representatives: Vec<usize> = Vec::new();
-                let mut dependence: Vec<Vec<ActiveRowDependence>> = Vec::new();
-                let mut tight_rows: Vec<usize> = Vec::new();
+                // Compose per inner block. TWO independent offsets are in play and
+                // they are NOT interchangeable:
+                //   * `block.col_start` slices β — COEFFICIENT space, advancing by
+                //     each member's `ncols()`;
+                //   * `row_offset` lifts the returned ids — CONSTRAINT-ROW space,
+                //     advancing by each member's `nrows()`.
+                // They coincide only when every member is a square carrier, which
+                // is why a mixed block (a constrained sub-basis alongside
+                // unconstrained intercept/covariate columns, `nrows() < ncols()`)
+                // is the case that separates them. See `lift_member_row`.
+                let mut representatives: Vec<ConstraintRowId> = Vec::new();
+                let mut dependence: Vec<Vec<ConstraintRowDependence>> = Vec::new();
+                let mut tight_rows: Vec<ConstraintRowId> = Vec::new();
                 let mut row_offset = 0usize;
                 for block in blocks {
                     let start = block.col_start;
@@ -1502,20 +1559,20 @@ impl ConstraintSetReducedFace for ConstraintSet {
                     let beta_block = beta.slice(ndarray::s![start..end]);
                     let sub = block.set.reduced_face(beta_block, membership_tol)?;
                     for r in sub.representatives {
-                        representatives.push(r + row_offset);
+                        representatives.push(lift_member_row(r, row_offset));
                     }
                     for deps in sub.dependence {
                         dependence.push(
                             deps.into_iter()
-                                .map(|d| ActiveRowDependence {
-                                    active_pos: d.active_pos + row_offset,
+                                .map(|d| ConstraintRowDependence {
+                                    row: lift_member_row(d.row, row_offset),
                                     coeff: d.coeff,
                                 })
                                 .collect(),
                         );
                     }
                     for t in sub.tight_rows {
-                        tight_rows.push(t + row_offset);
+                        tight_rows.push(lift_member_row(t, row_offset));
                     }
                     row_offset += block.set.nrows();
                 }
@@ -1603,9 +1660,9 @@ pub(crate) fn compress_active_working_set(
         groups_out.push(vec![pos]);
     }
 
-    // The parallel-dependent map (4th return) is consumed only by the shared
-    // `ReducedFace` op; the working-set release adjudicates whole representative
-    // groups, so it is not stored here.
+    // The parallel-dependent map (4th return) is in ACTIVE-SET-POSITION space,
+    // not the constraint-row space of the `ReducedFace` op; the working-set
+    // release adjudicates whole representative groups, so it is not stored here.
     let (a_out, b_out, groups_out, _) =
         rank_reduce_rows_pivoted_qr_with_dependence(a_out, b_out, groups_out);
 
@@ -3775,7 +3832,7 @@ pub fn solve_quadratic_with_linear_constraints(
 mod tests {
     use super::{
         ACTIVE_SET_INTERIOR_SEED_MARGIN, ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintSet,
-        ConstraintSetOps, ConstraintSetReducedFace, LinearInequalityConstraints,
+        ConstraintRowId, ConstraintSetOps, ConstraintSetReducedFace, LinearInequalityConstraints,
         active_set_boundary_hit_step_fraction, compute_constraint_kkt_diagnostics,
         constraint_set_rows_tight_at_point, fallback_projected_gradient_direction,
         khatri_rao_cone_reduced_face,
@@ -4534,13 +4591,13 @@ mod tests {
         // β = 0 ⇒ every Γ = 0 ⇒ every row tight.
         let beta = Array1::<f64>::zeros(2 * 2);
         let face = khatri_rao_cone_reduced_face(&cone, beta.view(), 1e-8).expect("reduce");
-        assert_eq!(face.tight_rows, vec![0, 1, 2]);
+        assert_eq!(face.tight_rows, rows(&[0, 1, 2]));
         // Rank 2: reps are the two independent directions at their lowest obs.
-        assert_eq!(face.representatives, vec![0, 1]);
+        assert_eq!(face.representatives, rows(&[0, 1]));
         assert_eq!(face.dependence.len(), 2);
         // ψ_2 (flat id 2) is parallel to representative ψ_0 (rep index 0), coeff 2.
         assert_eq!(face.dependence[0].len(), 1);
-        assert_eq!(face.dependence[0][0].active_pos, 2);
+        assert_eq!(face.dependence[0][0].row.index(), 2);
         assert!((face.dependence[0][0].coeff - 2.0).abs() < 1e-12);
         assert!(face.dependence[1].is_empty());
     }
@@ -4553,9 +4610,9 @@ mod tests {
             .expect("full-rank cone");
         let beta = Array1::<f64>::zeros(2 * 2);
         let face = khatri_rao_cone_reduced_face(&cone, beta.view(), 1e-8).expect("reduce");
-        assert_eq!(face.representatives, vec![0, 1]);
+        assert_eq!(face.representatives, rows(&[0, 1]));
         assert!(face.dependence.iter().all(|d| d.is_empty()));
-        assert_eq!(face.tight_rows, vec![0, 1]);
+        assert_eq!(face.tight_rows, rows(&[0, 1]));
     }
 
     /// A general-position dependent (in the span but parallel to no single rep)
@@ -4569,8 +4626,8 @@ mod tests {
             .expect("general-combo cone");
         let beta = Array1::<f64>::zeros(2 * 2);
         let face = khatri_rao_cone_reduced_face(&cone, beta.view(), 1e-8).expect("reduce");
-        assert_eq!(face.representatives, vec![0, 1]); // ψ_2 dropped
-        assert_eq!(face.tight_rows, vec![0, 1, 2]); // but still in the tight set
+        assert_eq!(face.representatives, rows(&[0, 1])); // ψ_2 dropped
+        assert_eq!(face.tight_rows, rows(&[0, 1, 2])); // but still in the tight set
         assert!(
             face.dependence.iter().all(|d| d.is_empty()),
             "a general-position drop must carry no distributed multiplier"
@@ -4588,9 +4645,9 @@ mod tests {
         let beta = Array1::<f64>::zeros(3 * 2);
         let face = khatri_rao_cone_reduced_face(&cone, beta.view(), 1e-8).expect("reduce");
         // Block 0 → flat 0,1; block 1 → flat 2,3 (slot*n+obs, n=2). All independent.
-        assert_eq!(face.representatives, vec![0, 1, 2, 3]);
+        assert_eq!(face.representatives, rows(&[0, 1, 2, 3]));
         assert!(face.dependence.iter().all(|d| d.is_empty()));
-        assert_eq!(face.tight_rows, vec![0, 1, 2, 3]);
+        assert_eq!(face.tight_rows, rows(&[0, 1, 2, 3]));
     }
 
     /// The Dense arm of the `ConstraintSet::reduced_face` dispatcher matches the
@@ -4606,12 +4663,115 @@ mod tests {
         );
         let beta = Array1::<f64>::zeros(2);
         let face = set.reduced_face(beta.view(), 1e-8).expect("reduce");
-        assert_eq!(face.tight_rows, vec![0, 1, 2]);
-        assert_eq!(face.representatives, vec![0, 1]);
+        assert_eq!(face.tight_rows, rows(&[0, 1, 2]));
+        assert_eq!(face.representatives, rows(&[0, 1]));
         assert_eq!(face.dependence[0].len(), 1);
-        assert_eq!(face.dependence[0][0].active_pos, 2);
+        assert_eq!(face.dependence[0][0].row.index(), 2);
         assert!((face.dependence[0][0].coeff - 2.0).abs() < 1e-12);
         assert!(face.dependence[1].is_empty());
+    }
+
+    /// Constraint-row ids for the `ReducedFace` assertions below.
+    fn rows(ids: &[usize]) -> Vec<ConstraintRowId> {
+        ids.iter().copied().map(ConstraintRowId).collect()
+    }
+
+    /// A block-diagonal set whose FIRST member constrains fewer rows than it has
+    /// coefficients — one `β₀ ≥ 0` row over a 3-wide block whose remaining two
+    /// coordinates are unconstrained (intercept / covariate columns) — followed
+    /// by a square 2×2 member at `col_start = 3`. This is the configuration that
+    /// separates the constraint-row offset (`nrows`: 1) from the coefficient
+    /// offset (`col_start`: 3); every pre-existing multi-block test used square
+    /// members, where the two coincide and nothing can be distinguished.
+    fn mixed_width_block_diagonal() -> ConstraintSet {
+        let narrow = gam_problem::PlacedConstraintBlock {
+            col_start: 0,
+            set: ConstraintSet::Dense(
+                LinearInequalityConstraints::new(
+                    array![[1.0_f64, 0.0, 0.0]],
+                    Array1::<f64>::zeros(1),
+                )
+                .expect("narrow block"),
+            ),
+        };
+        let square = gam_problem::PlacedConstraintBlock {
+            col_start: 3,
+            set: ConstraintSet::Dense(
+                LinearInequalityConstraints::new(
+                    array![[1.0_f64, 0.0], [2.0, 0.0]],
+                    Array1::<f64>::zeros(2),
+                )
+                .expect("square block"),
+            ),
+        };
+        ConstraintSet::block_diagonal(vec![narrow, square], 5).expect("block-diagonal")
+    }
+
+    /// Every id a mixed-width block-diagonal reduced face emits addresses the
+    /// JOINT CONSTRAINT-ROW space: it indexes `values()` and resolves through
+    /// `bound()` / `row_norm()` to the member row it came from, and the tight
+    /// rows really are tight there. This pins the id space that #2368 questioned
+    /// — the running-`nrows()` shift is the one consistent with the rest of the
+    /// `ConstraintSet` row API (`values` layout, `block_for_row` decoding).
+    #[test]
+    fn block_diagonal_reduced_face_row_ids_address_the_joint_constraint_row_space() {
+        let set = mixed_width_block_diagonal();
+        let beta = Array1::<f64>::zeros(5);
+        let values = set.values(beta.view()).expect("values");
+        let face = set.reduced_face(beta.view(), 1e-8).expect("reduce");
+
+        // Joint rows: block 0 contributes row 0; block 1 contributes rows 1, 2.
+        assert_eq!(set.nrows(), 3);
+        assert_eq!(face.tight_rows, rows(&[0, 1, 2]));
+        // Block 1's row 1 = 2·row 0, so it collapses onto joint representative 1.
+        assert_eq!(face.representatives, rows(&[0, 1]));
+        assert_eq!(face.dependence[1][0].row.index(), 2);
+
+        for id in &face.tight_rows {
+            let row = id.index();
+            assert!(row < set.nrows(), "id {row} outside the joint row space");
+            let norm = set.row_norm(row).expect("row norm resolves");
+            let bound = set.bound(row).expect("bound resolves");
+            assert!(
+                (values[row] - bound) / norm <= 1e-8,
+                "row {row} reported tight but has slack {}",
+                (values[row] - bound) / norm
+            );
+        }
+    }
+
+    /// The same face, read as COEFFICIENT positions, is wrong — which is exactly
+    /// why the ids are typed and why `row_column_support` exists.
+    ///
+    /// Block 1's representative is joint row 1, but it acts on β coordinate 3.
+    /// Coordinate 1 is block 0's second column: an UNCONSTRAINED coefficient
+    /// owned by a different block. A consumer that identified row ids with β
+    /// positions (to build a free/pinned mask) would pin the wrong coordinate in
+    /// the wrong block; the conversion recovers the right one.
+    #[test]
+    fn block_diagonal_reduced_face_row_ids_are_not_beta_coordinates() {
+        let set = mixed_width_block_diagonal();
+        let beta = Array1::<f64>::zeros(5);
+        let face = set.reduced_face(beta.view(), 1e-8).expect("reduce");
+
+        let block1_rep = face.representatives[1];
+        assert_eq!(block1_rep.index(), 1);
+        assert_eq!(
+            set.row_column_support(block1_rep).expect("support"),
+            vec![3],
+            "block 1's row acts on the joint column 3 (col_start 3 + local 0)"
+        );
+        // The naive identity map would have named coordinate 1, which lies in
+        // block 0's column range [0, 3) — a different block entirely.
+        assert!(block1_rep.index() < 3, "id 1 falls inside block 0's columns");
+
+        // Block 0's row is the one case where the two spaces agree; the
+        // conversion must still be the thing that says so.
+        assert_eq!(
+            set.row_column_support(face.representatives[0])
+                .expect("support"),
+            vec![0]
+        );
     }
 
     /// The BlockDiagonal arm composes member reductions and concatenates their
@@ -4634,10 +4794,10 @@ mod tests {
         let set = ConstraintSet::block_diagonal(vec![make(0), make(2)], 4).expect("block-diagonal");
         let beta = Array1::<f64>::zeros(4);
         let face = set.reduced_face(beta.view(), 1e-8).expect("reduce");
-        assert_eq!(face.tight_rows, vec![0, 1, 2, 3]);
-        assert_eq!(face.representatives, vec![0, 2]);
-        assert_eq!(face.dependence[0][0].active_pos, 1);
-        assert_eq!(face.dependence[1][0].active_pos, 3);
+        assert_eq!(face.tight_rows, rows(&[0, 1, 2, 3]));
+        assert_eq!(face.representatives, rows(&[0, 2]));
+        assert_eq!(face.dependence[0][0].row.index(), 1);
+        assert_eq!(face.dependence[1][0].row.index(), 3);
     }
 
     /// Deterministic PD Hessian with off-diagonal coupling so active-set

@@ -192,6 +192,22 @@ impl KhatriRaoConeConstraints {
         Ok(self.factor_row_norms[i])
     }
 
+    /// The coefficient columns row `row` acts on, ascending.
+    ///
+    /// Row `(slot, i)` has normal `e_k ⊗ ψ_i` with `k = coupled_rows[slot]`, and
+    /// [`Self::values`] reads exactly the block `β[k·p_cov .. (k+1)·p_cov]`, so
+    /// the support is `k·p_cov + j` over the columns `j` where `ψ_{i,j} ≠ 0`.
+    /// Every other coefficient has a structurally zero coefficient in this row.
+    pub fn row_column_support(&self, row: usize) -> Result<Vec<usize>, String> {
+        let (slot, i) = self.split_row_id(row)?;
+        let p_cov = self.factor.ncols();
+        let base = self.coupled_rows[slot] * p_cov;
+        Ok((0..p_cov)
+            .filter(|&j| self.factor[[i, j]] != 0.0)
+            .map(|j| base + j)
+            .collect())
+    }
+
     /// Per-row right-hand side (`0` for the homogeneous cone, shifted values
     /// after [`ConstraintSet::shifted_to_delta`]).
     pub fn bound(&self, row: usize) -> Result<f64, String> {
@@ -223,6 +239,34 @@ impl KhatriRaoConeConstraints {
     pub fn to_dense(&self) -> Result<LinearInequalityConstraints, String> {
         let all: Vec<usize> = (0..self.nrows()).collect();
         self.gather_rows(&all)
+    }
+}
+
+/// A row index in a [`ConstraintSet`]'s OWN constraint-row space — the space
+/// addressed by [`ConstraintSet::values`], [`ConstraintSet::bound`] and
+/// [`ConstraintSet::row_norm`], i.e. `0..nrows()`.
+///
+/// This is NOT a coefficient (β) index. The two spaces have different sizes
+/// (`nrows()` vs `ncols()`) and different meanings, and they coincide only in
+/// the special case of a square carrier whose row `r` is exactly the box
+/// `β_r ≥ 0`. A block-diagonal composition breaks that coincidence: its row ids
+/// are the CONCATENATION of the member row counts while its columns are the
+/// concatenation of the member column ranges, so as soon as one member has
+/// `nrows() < ncols()` (a monotone sub-basis alongside unconstrained intercept /
+/// covariate columns) row id `r` of a later block names a β coordinate owned by
+/// an EARLIER block. The newtype exists so that mistake cannot be made silently;
+/// to go from a row to the coefficients it acts on, call
+/// [`ConstraintSet::row_column_support`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConstraintRowId(pub usize);
+
+impl ConstraintRowId {
+    /// The raw index, for addressing a `values()` / `bound()` / `row_norm()`
+    /// result. Deliberately explicit: reach for this only when indexing
+    /// something that really is in constraint-row space.
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0
     }
 }
 
@@ -391,6 +435,52 @@ impl ConstraintSet {
             ConstraintSet::BlockDiagonal { blocks, .. } => {
                 let (block, local) = Self::block_for_row(blocks, row)?;
                 block.set.row_norm(local)
+            }
+        }
+    }
+
+    /// The coefficient (β) columns that constraint row `row` acts on, ascending
+    /// and in the JOINT column space of this set — the one and only sanctioned
+    /// route from constraint-row space to coefficient space.
+    ///
+    /// Needed because the two spaces are genuinely different (see
+    /// [`ConstraintRowId`]): a consumer building a free/pinned β mask from a
+    /// reduced face has row ids in hand and coefficient positions to fill, and
+    /// the identity map between them is valid only for a square box carrier.
+    /// The block-diagonal arm is where it visibly fails — row ids advance by
+    /// each member's `nrows()` while columns advance by its `ncols()`, so the
+    /// two run at different rates the moment any member constrains fewer rows
+    /// than it has coefficients.
+    pub fn row_column_support(&self, row: ConstraintRowId) -> Result<Vec<usize>, String> {
+        let row = row.index();
+        match self {
+            ConstraintSet::Dense(dense) => {
+                if row >= dense.a.nrows() {
+                    return Err(format!(
+                        "ConstraintSet: row {row} out of range ({} rows)",
+                        dense.a.nrows()
+                    ));
+                }
+                Ok(dense
+                    .a
+                    .row(row)
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, value)| **value != 0.0)
+                    .map(|(col, _)| col)
+                    .collect())
+            }
+            ConstraintSet::KhatriRaoCone(cone) => cone.row_column_support(row),
+            ConstraintSet::BlockDiagonal { blocks, .. } => {
+                let (block, local) = Self::block_for_row(blocks, row)?;
+                // The member reports support in ITS OWN column space; the joint
+                // offset is the block's `col_start`, which is independent of the
+                // row offset used to reach `local`.
+                let mut cols = block.set.row_column_support(ConstraintRowId(local))?;
+                for col in &mut cols {
+                    *col += block.col_start;
+                }
+                Ok(cols)
             }
         }
     }
@@ -586,6 +676,85 @@ mod tests {
         // Spot-check one functional exactly: slot 0 (A row 1), observation 1:
         // ψ = (2, −1), A_{1,:} = (1, 2) → 2·1 − 1·2 = 0.
         assert!((via_cone[1] - 0.0).abs() < 1e-15);
+    }
+
+    /// `row_column_support` is the sanctioned row → β conversion, so it must
+    /// agree with the explicit dense system row by row: the columns it names are
+    /// exactly the structurally nonzero entries of that row of `A`.
+    #[test]
+    fn cone_row_column_support_matches_the_dense_row_nonzeros() {
+        let cone = cone_fixture();
+        let set = ConstraintSet::KhatriRaoCone(cone.clone());
+        let dense = ConstraintSet::Dense(cone.to_dense().expect("dense"));
+        for row in 0..set.nrows() {
+            let via_cone = set
+                .row_column_support(ConstraintRowId(row))
+                .expect("cone support");
+            let via_dense = dense
+                .row_column_support(ConstraintRowId(row))
+                .expect("dense support");
+            assert_eq!(via_cone, via_dense, "row {row} support mismatch");
+        }
+        // Slot 0 carries coefficient row k = 1, so its columns are 1·p_cov + j.
+        // Observation 2 has ψ = (0, 3): the zero factor entry drops column 2.
+        assert_eq!(
+            set.row_column_support(ConstraintRowId(0)).expect("r0"),
+            vec![2, 3]
+        );
+        assert_eq!(
+            set.row_column_support(ConstraintRowId(2)).expect("r2"),
+            vec![3]
+        );
+        // Slot 1 carries coefficient row k = 2 → columns 4, 5.
+        assert_eq!(
+            set.row_column_support(ConstraintRowId(3)).expect("r3"),
+            vec![4, 5]
+        );
+    }
+
+    /// The block-diagonal arm offsets support by `col_start` while it decodes
+    /// the row by the running `nrows()`. When a member has `nrows() < ncols()`
+    /// the two run at different rates, and only the conversion tracks columns
+    /// correctly: joint row 1 belongs to the block starting at column 3.
+    #[test]
+    fn block_diagonal_row_column_support_uses_col_start_not_the_row_offset() {
+        let narrow = PlacedConstraintBlock {
+            col_start: 0,
+            set: ConstraintSet::Dense(
+                LinearInequalityConstraints::new(
+                    array![[1.0_f64, 0.0, 0.0]],
+                    Array1::<f64>::zeros(1),
+                )
+                .expect("narrow"),
+            ),
+        };
+        let square = PlacedConstraintBlock {
+            col_start: 3,
+            set: ConstraintSet::Dense(
+                LinearInequalityConstraints::new(
+                    array![[1.0_f64, 0.0], [0.0, 1.0]],
+                    Array1::<f64>::zeros(2),
+                )
+                .expect("square"),
+            ),
+        };
+        let set = ConstraintSet::block_diagonal(vec![narrow, square], 5).expect("joint");
+        assert_eq!(set.nrows(), 3);
+        assert_eq!(set.ncols(), 5);
+        assert_eq!(
+            set.row_column_support(ConstraintRowId(0)).expect("r0"),
+            vec![0]
+        );
+        // Row 1 is the second block's first row: column 3, NOT column 1.
+        assert_eq!(
+            set.row_column_support(ConstraintRowId(1)).expect("r1"),
+            vec![3]
+        );
+        assert_eq!(
+            set.row_column_support(ConstraintRowId(2)).expect("r2"),
+            vec![4]
+        );
+        assert!(set.row_column_support(ConstraintRowId(3)).is_err());
     }
 
     #[test]
