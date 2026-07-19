@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! lower = options.rho_lower_bound                        (default -10.0)
-//! upper = effective_df_floor_rho_upper_bounds(.., EFFECTIVE_DF_CEILING = 12.0, lower)
+//! upper = effective_df_floor_rho_upper_bounds(.., RhoBox { lower, ceiling })
 //! ```
 //!
 //! The upper-bound derivation used to bisect the `edf(ρ) = 1` crossing on
@@ -74,17 +74,19 @@ fn production_lower() -> f64 {
 
 /// Single call site for the bound derivation.
 ///
-/// `effective_df_floor_rho_upper_bounds` takes `ceiling` and `lower` as two
-/// ADJACENT `f64` parameters, so transposing them compiles silently and only
-/// shows up as a wrong answer. Every test below goes through this wrapper,
-/// which names both arguments, so the ordering is stated once.
+/// The two walls used to be adjacent bare `f64` parameters, so transposing
+/// them compiled silently and surfaced only as a wrong answer — a real earlier
+/// revision of this very file did exactly that. They now travel inside
+/// [`RhoBox`], whose per-wall newtypes make the transposition a type error and
+/// whose constructor validates the ordering once.
 fn upper_bounds_for(
     specs: &[ParameterBlockSpec],
     layout: &PenaltyLabelLayout,
     ceiling: f64,
     lower: f64,
 ) -> Result<Array1<f64>, CustomFamilyError> {
-    effective_df_floor_rho_upper_bounds(specs, layout, 1, ceiling, lower)
+    let rho_box = RhoBox::new(RhoLowerWall(lower), RhoCeiling(ceiling))?;
+    effective_df_floor_rho_upper_bounds(specs, layout, 1, rho_box)
 }
 
 #[test]
@@ -156,6 +158,35 @@ fn derived_upper_bound_never_inverts_the_box_across_the_crossing_range_2370() {
             upper[0],
         );
     }
+}
+
+#[test]
+fn the_rho_box_constructor_rejects_an_inverted_or_degenerate_pair_2370() {
+    let ceiling = EFFECTIVE_DF_CEILING;
+    // Inverted: floor above the ceiling.
+    let inverted = RhoBox::new(RhoLowerWall(13.0), RhoCeiling(ceiling))
+        .expect_err("an inverted pair must be rejected at construction");
+    let message = inverted.to_string();
+    assert!(
+        message.contains("13") && message.contains("12"),
+        "the refusal must name both offending walls, got: {message}"
+    );
+    // Degenerate: a collapsed single-point box admits no smoothing choice.
+    assert!(
+        RhoBox::new(RhoLowerWall(ceiling), RhoCeiling(ceiling)).is_err(),
+        "a collapsed single-point box must be rejected"
+    );
+    // Non-finite walls are rejected as admissible log-strengths.
+    assert!(
+        RhoBox::new(RhoLowerWall(f64::NAN), RhoCeiling(ceiling)).is_err(),
+        "a non-finite floor must be rejected"
+    );
+    // And the production pair is accepted, with the walls readable back in the
+    // order they were supplied.
+    let ok = RhoBox::new(RhoLowerWall(production_lower()), RhoCeiling(ceiling))
+        .expect("the production rho box must be valid");
+    assert_eq!(ok.lower(), production_lower());
+    assert_eq!(ok.ceiling(), ceiling);
 }
 
 #[test]

@@ -6061,9 +6061,10 @@ fn effective_df_ceiling_never_emits_upper_below_true_rho_lower_wall_2370() {
     // The old proxy wall (-12): the crossing is admissible, so the upper bound is
     // tightened to ρ* ≈ -10.82 — BELOW the real -10 wall. This is the inverted
     // box that panicked.
-    let upper_old_proxy =
-        effective_df_floor_rho_upper_bounds(&specs, &layout, 1, EFFECTIVE_DF_CEILING, -12.0)
-            .expect("bound construction succeeds");
+    let old_proxy_box = RhoBox::new(RhoLowerWall(-12.0), RhoCeiling(EFFECTIVE_DF_CEILING))
+        .expect("the old proxy box is well-ordered, just not the real wall");
+    let upper_old_proxy = effective_df_floor_rho_upper_bounds(&specs, &layout, 1, old_proxy_box)
+        .expect("bound construction succeeds");
     assert!(
         upper_old_proxy[0] < -10.0,
         "regression guard: the old -12 anchor tightens the upper below the real \
@@ -6074,9 +6075,10 @@ fn effective_df_ceiling_never_emits_upper_below_true_rho_lower_wall_2370() {
     // The true wall (-10): the floor is unenforceable at the real lower bound, so
     // the uniform ceiling is retained and the box stays well-ordered.
     let lower = -10.0_f64;
-    let upper_true_wall =
-        effective_df_floor_rho_upper_bounds(&specs, &layout, 1, EFFECTIVE_DF_CEILING, lower)
-            .expect("bound construction succeeds");
+    let true_wall_box = RhoBox::new(RhoLowerWall(lower), RhoCeiling(EFFECTIVE_DF_CEILING))
+        .expect("the production box is well-ordered");
+    let upper_true_wall = effective_df_floor_rho_upper_bounds(&specs, &layout, 1, true_wall_box)
+        .expect("bound construction succeeds");
     assert!(
         upper_true_wall[0] >= lower,
         "emitted upper bound {} must never fall below the ρ lower wall {lower}",
@@ -6089,14 +6091,13 @@ fn effective_df_ceiling_never_emits_upper_below_true_rho_lower_wall_2370() {
         upper_true_wall[0],
     );
 
-    // A degenerate box (lower ≥ ceiling) is a typed error, not a silent inversion.
+    // A degenerate box (lower >= ceiling) is a typed error, not a silent
+    // inversion. The check now lives in the `RhoBox` constructor, so the
+    // degenerate pair can no longer reach the derivation at all.
     assert!(
-        effective_df_floor_rho_upper_bounds(
-            &specs,
-            &layout,
-            1,
-            EFFECTIVE_DF_CEILING,
-            EFFECTIVE_DF_CEILING,
+        RhoBox::new(
+            RhoLowerWall(EFFECTIVE_DF_CEILING),
+            RhoCeiling(EFFECTIVE_DF_CEILING),
         )
         .is_err(),
         "lower == ceiling must be rejected as an empty/degenerate ρ-box",

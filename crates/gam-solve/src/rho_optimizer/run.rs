@@ -3921,6 +3921,27 @@ pub(crate) fn run_outer_uncertified(
                     bound_lo[i], bound_hi[i]
                 )));
             }
+
+            // Report a collapsed interval with BOTH walls. `outer_bounds` below
+            // is the backstop and rejects the same condition, but its message
+            // names only the coordinate. The panic this guard replaced printed
+            // `min = -10.0, max = -11.855421656441532`, and those two numbers
+            // are what made #2370 diagnosable from a bug report alone: they
+            // identify WHICH pair of independently-derived bounds drifted, and
+            // by how much. A typed error must not be a weaker diagnostic than
+            // the panic it replaced.
+            //
+            // Two tests constrain this string: `inverted_rho_box_is_a_typed_
+            // error_not_a_clamp_panic_2370` greps for the word "bound", and
+            // `the_inverted_box_refusal_carries_both_bound_values_2370` pins
+            // both numeric walls. Keep both when rewording.
+            if bound_lo[i] > bound_hi[i] {
+                return Err(EstimationError::InvalidInput(format!(
+                    "{context}: outer rho bounds are inverted at coordinate {i}: \
+                     lower bound {} exceeds upper bound {}",
+                    bound_lo[i], bound_hi[i]
+                )));
+            }
         }
         outer_bounds(&bound_lo, &bound_hi)
             .map_err(|err| EstimationError::InvalidInput(format!("{context}: {err}")))?;
@@ -4286,6 +4307,10 @@ pub(crate) fn run_per_atom_efs_if_frontier(
         crate::estimate::reml::per_atom_efs::run_per_atom_efs(obj, &seed, &pa_cfg, &topology)?;
     Ok(Some(result.into_outer_result(the_plan)))
 }
+
+#[cfg(test)]
+#[path = "inverted_rho_box_tests.rs"]
+mod inverted_rho_box_tests;
 
 pub(crate) fn outer_bounds(lo: &Array1<f64>, hi: &Array1<f64>) -> Result<Bounds, EstimationError> {
     Bounds::new(lo.clone(), hi.clone(), 1e-6).map_err(|err| {

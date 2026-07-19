@@ -415,6 +415,83 @@ pub(crate) const EFFECTIVE_DF_FLOOR: f64 = 1.0;
 /// the realized per-coordinate box, so "seed = ceiling" lands ON the wall.
 pub const EFFECTIVE_DF_CEILING: f64 = 12.0;
 
+/// The lower wall of the outer ρ box — the caller's
+/// [`BlockwiseFitOptions::rho_lower_bound`] (default `-10.0`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RhoLowerWall(pub(crate) f64);
+
+/// The uniform over-smoothing ceiling of the outer ρ box —
+/// [`EFFECTIVE_DF_CEILING`] (`12.0`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RhoCeiling(pub(crate) f64);
+
+/// The admissible outer ρ = log λ interval, carried as ONE validated value so
+/// its two walls can neither be transposed nor drift apart.
+///
+/// The walls are independently owned: the floor is the caller's
+/// `rho_lower_bound` (default `-10.0`) and the ceiling is
+/// [`EFFECTIVE_DF_CEILING`] (`12.0`). #2370 was precisely these two constants
+/// drifting apart — #2356 raised the ceiling `10 → 12` while the floor stayed
+/// at `-10`, opening a window in which the derived per-term upper bound could
+/// land *below* the floor and invert the box, whose `f64::clamp(min, max)`
+/// then panicked across the FFI boundary.
+///
+/// The follow-up hazard is the one this type closes. Passing the same two
+/// walls as adjacent bare `f64` parameters let a caller hand them over
+/// BACKWARDS with no compile error: the transposed call produced a
+/// plausible-looking typed error at runtime instead, and a real regression
+/// test was observed doing exactly that against the landed signature. Wrapping
+/// each wall in its own newtype makes the transposition a type error, and
+/// funnelling both through one checked constructor means the ordering
+/// invariant is established once rather than restated at every call site.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RhoBox {
+    lower: f64,
+    ceiling: f64,
+}
+
+impl RhoBox {
+    /// Build the box, rejecting a non-finite wall or an empty/inverted
+    /// interval. Both walls must be admissible log-strengths, and the floor
+    /// must lie STRICTLY below the ceiling: a collapsed single-point box
+    /// admits no smoothing choice, and an inverted one is the #2370 defect.
+    pub(crate) fn new(
+        RhoLowerWall(lower): RhoLowerWall,
+        RhoCeiling(ceiling): RhoCeiling,
+    ) -> Result<Self, CustomFamilyError> {
+        gam_problem::validate_log_strength(ceiling).map_err(|error| {
+            CustomFamilyError::InvalidInput {
+                context: "effective-DF rho ceiling",
+                reason: error.to_string(),
+            }
+        })?;
+        gam_problem::validate_log_strength(lower).map_err(|error| {
+            CustomFamilyError::InvalidInput {
+                context: "effective-DF rho lower bound",
+                reason: error.to_string(),
+            }
+        })?;
+        if !(lower < ceiling) {
+            return Err(CustomFamilyError::InvalidInput {
+                context: "effective-DF rho box",
+                reason: format!(
+                    "rho lower bound {lower} is not below the uniform ceiling {ceiling}; \
+                     the admissible ρ-box is empty or degenerate"
+                ),
+            });
+        }
+        Ok(Self { lower, ceiling })
+    }
+
+    pub(crate) fn lower(&self) -> f64 {
+        self.lower
+    }
+
+    pub(crate) fn ceiling(&self) -> f64 {
+        self.ceiling
+    }
+}
+
 /// Unit-weight effective degrees of freedom of a single penalized term as a
 /// function of `ρ = log λ`, expressed through the design/penalty generalized
 /// eigenvalues `γ_j` on the penalty range space:
@@ -657,15 +734,8 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
     specs: &[ParameterBlockSpec],
     layout: &PenaltyLabelLayout,
     n_rho: usize,
-    ceiling: f64,
-    lower: f64,
+    rho_box: RhoBox,
 ) -> Result<Array1<f64>, CustomFamilyError> {
-    gam_problem::validate_log_strength(ceiling).map_err(|error| {
-        CustomFamilyError::InvalidInput {
-            context: "effective-DF rho ceiling",
-            reason: error.to_string(),
-        }
-    })?;
     // The edf-floor tightening must be evaluated against the SAME lower wall the
     // optimizer will actually enforce (`options.rho_lower_bound`), not against a
     // `-ceiling` proxy. The two are independent constants and are NOT equal in
@@ -677,21 +747,12 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
     // `project_to_bounds` panics with `min > max` across the FFI boundary
     // (#2370). Anchoring every check on `lower` keeps the emitted upper bound
     // strictly above the floor by construction.
-    gam_problem::validate_log_strength(lower).map_err(|error| {
-        CustomFamilyError::InvalidInput {
-            context: "effective-DF rho lower bound",
-            reason: error.to_string(),
-        }
-    })?;
-    if !(lower < ceiling) {
-        return Err(CustomFamilyError::InvalidInput {
-            context: "effective-DF rho box",
-            reason: format!(
-                "rho lower bound {lower} is not below the uniform ceiling {ceiling}; \
-                 the admissible ρ-box is empty or degenerate"
-            ),
-        });
-    }
+    //
+    // Both walls arrive inside [`RhoBox`], which has already established that
+    // they are finite and correctly ordered, so this body can read them
+    // without re-validating and no caller can transpose them.
+    let ceiling = rho_box.ceiling();
+    let lower = rho_box.lower();
     let mut upper = Array1::<f64>::from_elem(n_rho, ceiling);
     let mut physical = 0usize;
     for spec in specs {
@@ -1216,6 +1277,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // the primary REML outer (solver/estimate.rs) for the custom-family path.
     let n_obs = specs.first().map(|s| s.design.nrows()).unwrap_or(0);
     let p_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    // Establish the ρ box once, validated, so its floor and ceiling reach both
+    // the optimizer bounds and the per-term tightening from a single source
+    // that cannot be transposed (#2370).
+    let rho_box = RhoBox::new(
+        RhoLowerWall(options.rho_lower_bound),
+        RhoCeiling(EFFECTIVE_DF_CEILING),
+    )?;
     let problem = OuterProblem::new(n_rho)
         .with_stuck_stall_cold_reeval_signal(Arc::clone(&outer_force_cold))
         .with_gradient(cap_gradient)
@@ -1260,14 +1328,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // converged β is unbiased (cf. the #747 solver-only ridge). This is the
         // λ-upper-side dual of the #752 full-subspace logdet work.
         .with_bounds(
-            Array1::<f64>::from_elem(n_rho, options.rho_lower_bound),
-            effective_df_floor_rho_upper_bounds(
-                specs,
-                &label_layout,
-                n_rho,
-                EFFECTIVE_DF_CEILING,
-                options.rho_lower_bound,
-            )?,
+            Array1::<f64>::from_elem(n_rho, rho_box.lower()),
+            effective_df_floor_rho_upper_bounds(specs, &label_layout, n_rho, rho_box)?,
         );
     // Install the seed-screening cap only when initial-rho screening is
     // wanted. A caller that pins an already-identified `initial_rho` and
