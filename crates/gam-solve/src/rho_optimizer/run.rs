@@ -3582,6 +3582,28 @@ pub enum OperatorTrustRegionStopReason {
 /// Do not wrap `run_outer` calls in try/catch with ad-hoc solver recovery.
 /// Callers should declare only the primary capability and, at most, whether
 /// automatic fallback is enabled at all.
+///
+/// Bound on the certify-last checkpoint-resume loop (#2273/#2374). When a
+/// solver CLAIMS convergence but the mandatory analytic certificate refuses,
+/// the loop re-runs the outer search seeded AT the refused checkpoint (with a
+/// fresh metric for gradient-only outers, since `final_hessian` is `None`)
+/// while each resume strictly reduces the objective — real descent the claim
+/// left unexploited. #2273 introduced this as a SINGLE retry for the
+/// stale-tolerance desync (one reseed re-anchors the in-loop tolerance to the
+/// terminal cost scale and certifies). #2374 generalized it to a
+/// progress-bounded loop: a gradient-only `opt::Bfgs` outer in log-λ space can
+/// exit its flat-valley `StallPolicy` at `‖g‖∞ ≤ tol·(1 + ‖ρ‖∞)` — a gate
+/// inflated ~10× by a railed coordinate — reporting `Ok(converged)` at a
+/// checkpoint whose projected gradient the un-inflated certificate correctly
+/// rejects, and a single fresh-metric reseed rarely lands the optimum in one
+/// hop (the transformation-survival LAML of #2373 needed two). This bound caps
+/// how many such reseeds are attempted before the honest non-convergence is
+/// surfaced; a fit that certifies on the first pass never enters the loop, and
+/// a reseed that fails to reduce the objective (a genuine non-stationary floor
+/// a fresh metric cannot escape) stops the loop immediately regardless of the
+/// remaining budget.
+const OUTER_CERTIFY_RESUME_BUDGET: usize = 12;
+
 pub(crate) fn run_outer(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
@@ -3667,7 +3689,6 @@ pub(crate) fn run_outer(
     // final objective-state installer, so the sealed terminal identity fit
     // assembly binds against IS the certified evidence — bitwise, by
     // construction, independent of basin multiplicity.
-    let claimed_converged = result.converged;
     let certify_diagnose_and_install = |obj: &mut dyn OuterObjective,
                                         result: &mut OuterResult|
      -> Result<OuterCriterionCertificate, EstimationError> {
@@ -3718,40 +3739,86 @@ pub(crate) fn run_outer(
         }
         certify_outer_optimality(obj, config, context, result)
     };
-    result.criterion_certificate = match certify_diagnose_and_install(obj, &mut result) {
-        Ok(certificate) => Some(certificate),
-        Err(refusal) if claimed_converged => {
-            let prior_iterations = result.iterations;
-            log::info!(
-                "[OUTER] {context}: solver convergence claim failed analytic \
-                     certification after {prior_iterations} iteration(s); re-running once \
-                     seeded at the refused checkpoint so the in-loop tolerance anchors to \
-                     the terminal cost scale (#2273 stale-tolerance desync)"
-            );
-            let mut retry_cfg = config.clone();
-            retry_cfg.initial_rho = Some(result.rho.clone());
-            retry_cfg.heuristic_lambdas = None;
-            retry_cfg.seed_config.max_seeds = 1;
-            retry_cfg.seed_config.seed_budget = 1;
-            retry_cfg.screen_initial_rho = false;
-            retry_cfg.operator_initial_trust_radius = result.operator_trust_radius;
-            retry_cfg.warm_start_outer_hessian = result.final_hessian.clone();
-            obj.reset();
-            match run_outer_uncertified(obj, &retry_cfg, context) {
-                Ok(mut retried) => {
-                    retried.iterations = retried.iterations.saturating_add(prior_iterations);
-                    result = retried;
-                    Some(certify_diagnose_and_install(obj, &mut result)?)
+    // Certify-last checkpoint-resume loop (#2273 stale-tolerance desync,
+    // generalized by #2374). A solver that CLAIMS convergence but fails the
+    // mandatory analytic certificate is re-run once per iteration seeded AT the
+    // refused checkpoint — re-anchoring the in-loop tolerance to the terminal
+    // cost scale and, for gradient-only outers (`final_hessian == None`),
+    // restarting `opt::Bfgs` with a fresh inverse-Hessian metric that breaks the
+    // flat-valley `StallPolicy` false stop the accumulated metric crawled into.
+    // Looping (rather than the original single retry) matters because that stall
+    // gate is inflated by `(1 + ‖ρ‖∞)` in log-λ space, so one fresh-metric
+    // reseed rarely lands the optimum in a single hop. The loop stops the moment
+    // certification passes; it also stops — regardless of remaining budget —
+    // when a reseed fails to strictly reduce the objective, because a point that
+    // a fresh-metric restart cannot improve is a genuine non-stationary floor
+    // (or a true flat valley), not an exploitable false stall, and further
+    // reseeds would only re-derive the same refusal. A result that never claimed
+    // convergence (e.g. a budget-exhausted `MaxIterationsReached`) is refused
+    // immediately with no reseed: its non-convergence is genuine.
+    let mut resumes_remaining = OUTER_CERTIFY_RESUME_BUDGET;
+    let certificate = loop {
+        let claimed_converged = result.converged;
+        match certify_diagnose_and_install(obj, &mut result) {
+            Ok(certificate) => break certificate,
+            Err(refusal) => {
+                if !claimed_converged || resumes_remaining == 0 {
+                    return Err(refusal);
                 }
-                // The retry could not even run (e.g. the checkpoint is a
-                // hard refusal wall for the objective): surface the
-                // ORIGINAL certification refusal, which carries the
-                // checkpoint evidence.
-                Err(_) => return Err(refusal),
+                resumes_remaining -= 1;
+                let prior_iterations = result.iterations;
+                let prior_value = result.final_value;
+                log::info!(
+                    "[OUTER] {context}: solver convergence claim failed analytic \
+                     certification after {prior_iterations} iteration(s); re-running \
+                     seeded at the refused checkpoint (final_value={prior_value:.6e}) so the \
+                     in-loop tolerance anchors to the terminal cost scale and a fresh metric \
+                     breaks any inflated flat-valley stall ({resumes_remaining} resume(s) left \
+                     after this one; #2273/#2374)"
+                );
+                let mut retry_cfg = config.clone();
+                retry_cfg.initial_rho = Some(result.rho.clone());
+                retry_cfg.heuristic_lambdas = None;
+                retry_cfg.seed_config.max_seeds = 1;
+                retry_cfg.seed_config.seed_budget = 1;
+                retry_cfg.screen_initial_rho = false;
+                retry_cfg.operator_initial_trust_radius = result.operator_trust_radius;
+                retry_cfg.warm_start_outer_hessian = result.final_hessian.clone();
+                obj.reset();
+                match run_outer_uncertified(obj, &retry_cfg, context) {
+                    Ok(mut retried) => {
+                        retried.iterations = retried.iterations.saturating_add(prior_iterations);
+                        // Progress gate. A reseed that does not strictly reduce
+                        // the objective past the SAME relative cost floor the
+                        // cost-stall guard and the curvature-scaled certificate
+                        // use is at a genuine floor a fresh metric cannot escape.
+                        // Stop spending resumes: the next iteration certifies the
+                        // best point once more and takes the honest refusal. The
+                        // floor anchors on the smaller of the two costs so a tiny
+                        // uphill wobble from a metric restart is not mistaken for
+                        // real descent.
+                        let progress_floor = config
+                            .rel_cost_tolerance
+                            .unwrap_or(config.tolerance * 1.0e-2)
+                            .max(COST_STALL_REL_TOL_FLOOR)
+                            * (1.0 + prior_value.abs().min(retried.final_value.abs()));
+                        let improved = retried.final_value.is_finite()
+                            && retried.final_value < prior_value - progress_floor;
+                        result = retried;
+                        if !improved {
+                            resumes_remaining = 0;
+                        }
+                    }
+                    // The reseed could not even run (e.g. the checkpoint is a
+                    // hard refusal wall for the objective): surface the
+                    // certification refusal from the point we started this
+                    // iteration at, which carries the checkpoint evidence.
+                    Err(_) => return Err(refusal),
+                }
             }
         }
-        Err(refusal) => return Err(refusal),
     };
+    result.criterion_certificate = Some(certificate);
     Ok(result)
 }
 
