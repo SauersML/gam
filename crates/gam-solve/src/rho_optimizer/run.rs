@@ -2153,11 +2153,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
         // The SAME relative cost floor the cost-stall guard used to declare the
         // criterion stalled (run_plan.rs), so certification asserts nothing
         // tighter than the loop already proved about this surface.
-        let objective_tol = config
-            .rel_cost_tolerance
-            .unwrap_or(config.tolerance * 1.0e-2)
-            .max(COST_STALL_REL_TOL_FLOOR)
-            * (1.0 + evaluation.cost.abs());
+        let objective_tol = outer_rel_cost_floor(config) * (1.0 + evaluation.cost.abs());
         let curvature_grad_bound =
             projected_grad_norm * (objective_tol / predicted_decrease).sqrt();
         if curvature_grad_bound.is_finite() && curvature_grad_bound > stationarity_bound {
@@ -3602,7 +3598,20 @@ pub enum OperatorTrustRegionStopReason {
 /// a reseed that fails to reduce the objective (a genuine non-stationary floor
 /// a fresh metric cannot escape) stops the loop immediately regardless of the
 /// remaining budget.
-const OUTER_CERTIFY_RESUME_BUDGET: usize = 12;
+const OUTER_CERTIFY_RESUME_BUDGET: usize = 16;
+
+/// Roundoff-relative scale below which a certify-last reseed's objective
+/// reduction is numerical noise rather than exploited descent (#2374). A
+/// fresh-metric BFGS restart seeded AT the refused checkpoint can only reduce
+/// the objective from that checkpoint, so `retried == prior` (to roundoff)
+/// means the restart found no descent — a genuine stationary floor — while a
+/// false flat-valley stall yields a reduction orders of magnitude above this
+/// scale. The progress gate MUST anchor on roundoff, not the much larger
+/// cost-stall relative floor: a flat valley crawls out in per-reseed steps far
+/// smaller than `rel_cost·(1 + |cost|)` (the transformation-survival LAML moves
+/// ~4e-5 relative per reseed), and gating on that coarser floor stops the crawl
+/// after a single hop and refuses a well-posed fit.
+const CERTIFY_RESUME_PROGRESS_REL: f64 = 32.0 * f64::EPSILON;
 
 pub(crate) fn run_outer(
     obj: &mut dyn OuterObjective,
@@ -3788,15 +3797,20 @@ pub(crate) fn run_outer(
                 match run_outer_uncertified(obj, &retry_cfg, context) {
                     Ok(mut retried) => {
                         retried.iterations = retried.iterations.saturating_add(prior_iterations);
-                        // Progress gate. A reseed that does not strictly reduce
-                        // the objective past the shared relative cost floor is at
-                        // a genuine floor a fresh metric cannot escape; stop
-                        // spending resumes so the next iteration certifies the
-                        // best point once more and takes the honest refusal.
+                        // Progress gate. A fresh-metric reseed seeded AT the
+                        // checkpoint can only descend from it, so a reduction at
+                        // roundoff scale means it found no descent — a genuine
+                        // stationary floor — while a false flat-valley stall
+                        // yields a reduction orders of magnitude larger. Gate on
+                        // roundoff (NOT the coarser cost-stall floor) so a valley
+                        // that crawls out in tiny per-reseed steps is not cut off
+                        // after one hop; stop only when a reseed truly stalls, so
+                        // the next iteration certifies the best point once more
+                        // and takes the honest refusal.
                         let improved = certify_resume_made_progress(
                             prior_value,
                             retried.final_value,
-                            outer_rel_cost_floor(config),
+                            CERTIFY_RESUME_PROGRESS_REL,
                         );
                         result = retried;
                         if !improved {
@@ -4666,13 +4680,17 @@ mod certify_resume_progress_tests {
     //! is the exact predicate that decides "real descent" vs "genuine floor", so
     //! pinning it directly pins the loop's termination contract independent of the
     //! solver dynamics that produce the reseeds.
-    use super::{OuterConfig, certify_resume_made_progress, outer_rel_cost_floor};
+    use super::{
+        CERTIFY_RESUME_PROGRESS_REL, OuterConfig, certify_resume_made_progress,
+        outer_rel_cost_floor,
+    };
 
     fn config_with_rel_cost(rel_cost: Option<f64>, tolerance: f64) -> OuterConfig {
-        let mut config = OuterConfig::default();
-        config.tolerance = tolerance;
-        config.rel_cost_tolerance = rel_cost;
-        config
+        OuterConfig {
+            tolerance,
+            rel_cost_tolerance: rel_cost,
+            ..OuterConfig::default()
+        }
     }
 
     #[test]
@@ -4688,11 +4706,13 @@ mod certify_resume_progress_tests {
         assert_eq!(outer_rel_cost_floor(&tiny), super::COST_STALL_REL_TOL_FLOOR);
     }
 
+    // ── Helper math (arbitrary floor) ────────────────────────────────────
+
     #[test]
     fn strict_descent_past_the_floor_is_progress() {
         let floor = 1.0e-4;
-        // A drop far larger than floor·(1+|cost|) at cost scale ~1e2.
-        assert!(certify_resume_made_progress(342.0730, 342.0580, floor));
+        // A drop far larger than floor·(1+|cost|)≈0.034 at cost scale ~1e2.
+        assert!(certify_resume_made_progress(342.0, 300.0, floor));
         // A drop of many orders is trivially progress.
         assert!(certify_resume_made_progress(1.0e6, 1.0e3, floor));
     }
@@ -4704,9 +4724,7 @@ mod certify_resume_progress_tests {
         assert!(!certify_resume_made_progress(100.0, 100.0, floor));
         // Uphill: a metric restart that landed worse is never progress.
         assert!(!certify_resume_made_progress(100.0, 100.5, floor));
-        // A reduction SMALLER than the relative floor is within the flat band and
-        // does not count — this is the guard that stops the loop from spending its
-        // whole budget chasing sub-floor wobbles on a genuine non-stationary floor.
+        // A reduction SMALLER than the passed floor is within the flat band.
         let cost = 1.0e4;
         let sub_floor = floor * (1.0 + cost) * 0.5;
         assert!(!certify_resume_made_progress(cost, cost - sub_floor, floor));
@@ -4728,5 +4746,40 @@ mod certify_resume_progress_tests {
         assert!(!certify_resume_made_progress(100.0, f64::NAN, floor));
         assert!(!certify_resume_made_progress(100.0, f64::INFINITY, floor));
         assert!(!certify_resume_made_progress(100.0, f64::NEG_INFINITY, floor));
+    }
+
+    // ── Production gate (roundoff floor) ─────────────────────────────────
+    //
+    // These pin the ACTUAL gate the loop runs (`CERTIFY_RESUME_PROGRESS_REL`),
+    // which must admit the tiny per-reseed descent a flat valley crawls out in
+    // and reject only numerical noise — the exact distinction the earlier
+    // cost-stall-floor gate got wrong (#2374: it stopped the survival LAML crawl
+    // after one hop and refused a well-posed fit).
+
+    #[test]
+    fn roundoff_gate_admits_the_tiny_flat_valley_crawl_step() {
+        let rel = CERTIFY_RESUME_PROGRESS_REL;
+        // The transformation-survival LAML moves ~4e-5 relative per reseed:
+        // cost 342.0730 → 342.0580 is ~4.4e-5 relative, far above roundoff.
+        assert!(certify_resume_made_progress(342.0730, 342.0580, rel));
+        // Even a 1e-6 relative step at cost ~455 (the two-smooth cohort scale)
+        // is real descent under the roundoff gate — the coarse cost-stall floor
+        // (~1e-6·456 ≈ 4.6e-4) would have wrongly rejected it.
+        assert!(certify_resume_made_progress(455.40, 455.40 - 5.0e-4, rel));
+    }
+
+    #[test]
+    fn roundoff_gate_rejects_noise_and_non_descent() {
+        let rel = CERTIFY_RESUME_PROGRESS_REL;
+        // A bitwise-identical reseed (genuine floor: BFGS found no descent from
+        // the checkpoint) is not progress.
+        assert!(!certify_resume_made_progress(455.40, 455.40, rel));
+        // A reduction at the roundoff scale is noise, not descent: a few ULPs at
+        // cost ~455 sits below CERTIFY_RESUME_PROGRESS_REL·(1+455).
+        let noise = 4.0 * f64::EPSILON * (1.0 + 455.40);
+        assert!(!certify_resume_made_progress(455.40, 455.40 - noise, rel));
+        // Uphill / non-finite are never progress.
+        assert!(!certify_resume_made_progress(455.40, 455.41, rel));
+        assert!(!certify_resume_made_progress(455.40, f64::NAN, rel));
     }
 }
