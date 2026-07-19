@@ -5012,6 +5012,13 @@ fn initial_rho_with_single_seed_budget_skips_expensive_screening() {
         .with_seed_config(seed_config)
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(initial_seed.clone())
+        // Declare a problem size whose estimated PSIS work trips the terminal
+        // rho-uncertainty diagnostic cost gate, so its 32 `eval_cost` samples do
+        // NOT run here. This test isolates the SEED-SCREENING accounting (screening
+        // is skipped: `screening_cap == 0` and `screening_calls == 0`); the
+        // post-certification uncertainty diagnostic is a separate phase and would
+        // otherwise contaminate the cost-call count it pins.
+        .with_problem_size(1_000_000, 1)
         .with_max_iter(1);
     let mut obj = problem.build_objective(
         (),
@@ -6479,14 +6486,17 @@ fn all_saturated_cached_rho_is_honored_as_seed() {
 }
 
 #[test]
-fn exact_final_cache_hit_skips_outer_validation() {
+fn exact_final_cache_hit_resumes_and_recertifies_without_resolving() {
     let (_d, session) = tmp_cache_session("final-skip");
     let payload = encode_iterate(&array![2.5], None, None, 0.25, 7).expect("encode");
     session.finalize(&payload, Some(0.25), Some(7));
 
     let seen: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
-    // The exact final cache hit short-circuits before any solver runs, so
-    // the declared derivatives only need to make a well-formed plan.
+    // An exact final cache hit seeds the solver AT the cached rho and re-runs
+    // certification of the CURRENT criterion (run.rs resume-and-recertify): the
+    // cache donates only the starting point, never the shipped value, so a stale
+    // or version-drifted cache can never change the outcome (#2363). These trivial
+    // derivatives make the recertify pass converge in a single step.
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
@@ -6516,14 +6526,33 @@ fn exact_final_cache_hit_skips_outer_validation() {
 
     let result = problem
         .run(&mut obj, "final-skip")
-        .expect("final exact hit should return cached outer result");
+        .expect("exact final cache hit must resume-and-recertify from the cached rho");
+    // Resumed FROM the cached rho (not the -3.0 initial): the recertify lands on
+    // the cached optimum.
     assert_eq!(result.rho, array![2.5]);
-    assert_eq!(result.final_value, 0.25);
-    assert_eq!(result.iterations, 7);
+    // The shipped value is the RECOMPUTED true objective at rho=2.5, which is
+    // (2.5-2.5)^2 = 0, NOT the fictional stored 0.25. Outcome-invariance: the
+    // cache donates the seed, the current criterion decides the value.
+    assert_eq!(result.final_value, 0.0);
     assert!(result.converged);
+    // Accelerator half AND proof the run RESUMED from the cached rho: the recertify
+    // must certify in ~0-1 outer iterations. The Hessian-free gradient solve here
+    // could not reach the 2.5 optimum from the -3.0 initial in a single step, so a
+    // bound of 1 is only reachable if the solver was SEEDED at the cached rho
+    // (screen_initial_rho = false). A regression that cold-solved from -3.0 on
+    // every cache hit would blow this bound -- skipping that work is the whole
+    // point of the cache -- and no other test would catch it.
+    assert!(
+        result.iterations <= 1,
+        "resume-at-cached-optimum must not cold-solve; got {} iterations",
+        result.iterations,
+    );
+    // The cache donates only the SEED: the resume path optimizes through the
+    // gradient objective, so `seen` (the cost_fn trace) legitimately stays empty.
     assert!(
         seen.lock().unwrap().is_empty(),
-        "exact final hit should not evaluate the outer objective"
+        "resume path uses the gradient objective, not cost_fn; saw {:?}",
+        *seen.lock().unwrap(),
     );
 }
 
