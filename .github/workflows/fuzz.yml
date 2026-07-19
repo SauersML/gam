@@ -20,7 +20,16 @@ jobs:
   fuzz:
     name: Fuzz vs mgcv
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # MUST exceed the trial budget below (`--max-total-seconds 3300` = 55 min)
+    # PLUS setup: apt/R/mgcv install, pip deps, and the release wheel build,
+    # which together run ~20-25 min on a cold hosted runner. At the previous
+    # 60 the job was cancelled at exactly 60:00 on EVERY run — measured
+    # 11:09:09 -> 12:09:24 on run 29684616297, and identically on the two runs
+    # before it — so the scoreboard never finished and only the handful of
+    # trials completed before the kill were ever uploaded. Keep this at least
+    # `max-total-seconds/60 + 30`; the two constants are coupled and must move
+    # together.
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v5
