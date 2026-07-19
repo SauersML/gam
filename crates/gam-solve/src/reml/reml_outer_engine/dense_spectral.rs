@@ -248,10 +248,17 @@ impl DenseSpectralOperator {
     ///
     /// where `g_j = g_factor[:, j] = √φ'(σ_j)·u_j` and `u_j = eigenvectors[:, j]`.
     /// The aggregate `Σ_j Σ_{i∈block} u_j[i]² = Σ_{i∈block} ‖U[i,:]‖² = width =
-    /// rank` holds only over the COMPLETE eigenbasis, so callers MUST gate on
-    /// `active_rank() == dim()` (no masked-out numerical null space); the
-    /// `first ≈ rank` gate at the call site is what certifies the block is a
-    /// proportional singleton whose det derivative is the integer rank.
+    /// rank` holds for ANY eigenbasis (the rows of the full orthogonal `U` are
+    /// unit-norm, mask or no mask), so this is valid under a masked numerical
+    /// null space too (`active_rank() < dim()`, `HardPseudo`): the `−rank`
+    /// distribution runs over the complete (unmasked) `eigenvectors`, while the
+    /// `+` trace reads `g_factor`, which is zeroed on the masked eigenpairs, so
+    /// the fused value is `trace_active − rank` — exactly the active-subspace
+    /// trace minus the integer rank the masked naive path pairs, and still
+    /// cancellation-free (the masked pairs add only the non-negative lump
+    /// `0 − Σ_{i∈block} u_j[i]²`). The `first ≈ rank` gate at the call site is
+    /// what certifies the block is a proportional singleton whose det derivative
+    /// is the integer rank.
     pub(crate) fn fused_logdet_gradient_minus_rank_full_block(
         &self,
         s_block: &Array2<f64>,
@@ -308,9 +315,14 @@ impl DenseSpectralOperator {
     /// rank-sized aggregate — exactly as in the full-rank fusion, of which this
     /// is the strict generalization (`P_{S_k} = P_block` when `width = rank`).
     ///
-    /// Callers gate on `active_rank() == dim()` (complete eigenbasis, so the
-    /// `Σ_j = rank` identity holds) and on the det derivative being the integer
-    /// rank (proportional singleton, so `−rank` is the exact det pairing).
+    /// The `Σ_j ‖Qᵀ u_j^blk‖² = tr(P_{S_k}) = rank` identity holds for ANY
+    /// eigenbasis (`Σ_j u_j u_jᵀ = I` over the complete, unmasked `eigenvectors`),
+    /// so this is valid under a masked numerical null space too
+    /// (`active_rank() < dim()`, `HardPseudo`): the `+` trace reads the masked
+    /// `g_factor`, so the fused value is the active-subspace trace minus the
+    /// integer rank, matching the masked naive pairing and cancellation-free.
+    /// Callers gate only on the det derivative being the integer rank
+    /// (proportional singleton, so `−rank` is the exact det pairing).
     pub(crate) fn fused_logdet_gradient_minus_rank_deficient_block(
         &self,
         s_block: &Array2<f64>,
@@ -401,6 +413,13 @@ impl DenseSpectralOperator {
     /// against the cost's own `det1[k]` and only trusts the fused value when they
     /// agree — the runtime self-consistency gate that keeps this off any lane
     /// whose `det1` is not this exact joint quantity.
+    ///
+    /// Valid under a masked numerical null space too (`active_rank() < dim()`,
+    /// `HardPseudo`): the weight sum runs over the complete (unmasked)
+    /// `eigenvectors`, so `Σ_j w_jk = det1[k]` still holds (and the
+    /// self-consistency gate still passes), while the `+` trace reads the masked
+    /// `g_factor`, giving `trace_active − det1[k]` — the masked naive pairing,
+    /// cancellation-free.
     pub(crate) fn fused_logdet_gradient_weighted_block(
         &self,
         s_block: &Array2<f64>,

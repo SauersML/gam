@@ -786,6 +786,211 @@ pub(crate) fn weighted_fused_kernel_coalesced_same_span_pair_beats_naive() {
     assert_weighted_fused_kernel_gate(&h, &[s0, s1], &lambdas, 0);
 }
 
+// ─── #2354: fused rank-deficient logdet-gradient matches a central difference
+// of the HardPseudo cost across a masked null space ───
+//
+// A ρ-dependent fixture `H(ρ) = M + exp(ρ)·S` whose masked eigenpair is STABLE
+// across ρ, so `log|H(ρ)|₊` is a smooth function of ρ and a valid
+// central-difference target. `M = I − (1−τ)·v vᵀ` has curvature `τ = 1e-12 ≪ ε`
+// along a single unit direction `v` and `1` elsewhere; `v = [1,1,1,0,0]/√3` is
+// the constant-on-block null vector of the 3-wide second-difference penalty
+// (`S v = 0`), so `H(ρ) v = M v = τ v` at EVERY ρ — the masked eigenpair never
+// moves, the active set is stable, and `v` carries full mass on the block
+// `[0..3]` (the masked/active completeness split is non-vacuous). This pins that
+// the fused rank-deficient reduction equals BOTH the masked naive
+// `trace_active − rank` AND the central difference of the actual HardPseudo cost
+// `log|H(ρ)|₊ − rank·ρ` (the singleton det derivative `∂_ρ log|exp(ρ)S|₊ = rank`).
+#[test]
+pub(crate) fn fused_rank_deficient_logdet_gradient_masked_null_matches_central_difference() {
+    let p = 5usize;
+    let width = 3usize;
+    // second_difference_penalty(3) = D2ᵀD2 with D2 = [1, -2, 1]: rank 1.
+    let rank = 1usize;
+    let mut s = Array2::<f64>::zeros((p, p));
+    s.slice_mut(ndarray::s![0..width, 0..width])
+        .assign(&second_difference_penalty(width));
+    let mut v = Array1::<f64>::zeros(p);
+    for value in v.iter_mut().take(width) {
+        *value = 1.0;
+    }
+    v /= (width as f64).sqrt();
+    let tau = 1.0e-12_f64;
+    // M = I − (1−τ)·v vᵀ (SPD: eigenvalue τ along v, 1 on v^⊥).
+    let mut m = Array2::<f64>::eye(p);
+    for i in 0..p {
+        for j in 0..p {
+            m[[i, j]] -= (1.0 - tau) * v[i] * v[j];
+        }
+    }
+    let h_at = |rho: f64| {
+        let mut h = m.clone();
+        h.scaled_add(rho.exp(), &s);
+        h
+    };
+    let op_at = |rho: f64| {
+        DenseSpectralOperator::from_symmetric_with_mode(&h_at(rho), PseudoLogdetMode::HardPseudo)
+            .expect("HardPseudo fixture")
+    };
+    // Cost with the singleton det subtracted: log|exp(ρ)S|₊ = rank·ρ + const.
+    let cost_at = |rho: f64| op_at(rho).logdet() - rank as f64 * rho;
+
+    let rho0 = std::f64::consts::LN_10; // λ₀ = 10, moderate (no deep-rail cancellation)
+    let lambda0 = rho0.exp();
+    let op = op_at(rho0);
+    assert_eq!(
+        op.active_rank(),
+        p - 1,
+        "exactly the v-direction is masked: active_rank={} dim={}",
+        op.active_rank(),
+        op.dim()
+    );
+    let masked_block_mass: f64 = (0..op.n_dim)
+        .filter(|&j| !op.active_mask[j])
+        .map(|j| (0..width).map(|i| op.eigenvectors[[i, j]].powi(2)).sum::<f64>())
+        .sum();
+    assert!(
+        masked_block_mass > 0.5,
+        "masked null direction must sit on the block: mass={masked_block_mass:.3e}"
+    );
+
+    let s_block = second_difference_penalty(width);
+    let fused = op.fused_logdet_gradient_minus_rank_deficient_block(&s_block, 0, width, lambda0);
+
+    // (1) Value identity with the masked naive `trace_active − rank`.
+    let naive = op.trace_logdet_block_local(&s_block, lambda0, 0, width) - rank as f64;
+    assert!(
+        (fused - naive).abs() <= 1e-10 * (1.0 + naive.abs()),
+        "masked fused {fused:.15e} vs masked naive {naive:.15e}"
+    );
+
+    // (2) Central-difference of the actual HardPseudo cost. The active set must
+    // stay stable across the stencil for the pseudo-logdet to be differentiable.
+    let hh = 1.0e-4_f64;
+    for probe in [rho0 - hh, rho0 + hh] {
+        assert_eq!(
+            op_at(probe).active_rank(),
+            p - 1,
+            "active set must stay stable across the FD stencil"
+        );
+    }
+    let fd = (cost_at(rho0 + hh) - cost_at(rho0 - hh)) / (2.0 * hh);
+    assert!(
+        (fused - fd).abs() <= 1e-6 * (1.0 + fd.abs()),
+        "masked fused {fused:.12e} vs central difference {fd:.12e}"
+    );
+}
+
+// ─── #2354: fused logdet-gradient reductions stay exact under a masked
+// numerical null space (active_rank() < dim(), HardPseudo) ───
+//
+// Deferred completeness sub-gap of #2331: the fused ρ-gradient reductions were
+// gated on `active_rank() == dim()`, routing every HardPseudo operator (a masked
+// `σ_j ≤ ε`, e.g. delayed-entry / left-truncation survival) back to the naive
+// `trace − det` backstop. They need no such gate. The `+` trace reads `g_factor`,
+// which is zeroed on the masked eigenpairs, so it is the active-subspace trace;
+// the `−det1[k]` share is distributed over the COMPLETE (unmasked) eigenbasis,
+// whose completeness identity (`Σ_j Σ_{i∈blk} u_j[i]² = width = rank` full-block,
+// `Σ_j ‖Qᵀ u_j^blk‖² = rank` deficient, `Σ_j w_jk = det1[k]` weighted) holds
+// mask-or-no-mask — the rows of the full orthogonal `U` are unit-norm either way.
+// So the fused value equals the active-subspace `trace_active − det1[k]` the
+// masked naive path forms. This pins that identity for all three fusion kernels
+// on a HardPseudo operator with a genuinely masked, block-supported null
+// direction (moderate spectrum, so the naive reference is itself accurate).
+#[test]
+pub(crate) fn fused_logdet_gradient_reductions_exact_under_masked_null_space() {
+    // Orthonormal eigenbasis U = Hadamard₄/2 (every column has full ±½ support,
+    // so the masked null direction overlaps any coordinate block).
+    let u = array![
+        [0.5_f64, 0.5, 0.5, 0.5],
+        [0.5, 0.5, -0.5, -0.5],
+        [0.5, -0.5, 0.5, -0.5],
+        [0.5, -0.5, -0.5, 0.5],
+    ];
+    let p = 4usize;
+    // One eigenvalue far below the mask floor ε = √eps·p ≈ 5.96e-8; the rest
+    // moderate (no over-smoothing rail, so the naive `trace − det` stays accurate
+    // and is a valid reference for the fused value).
+    let eig = [1.0e-12_f64, 2.5, 4.0, 7.0];
+    let mut ul = u.clone();
+    for j in 0..p {
+        for i in 0..p {
+            ul[[i, j]] *= eig[j];
+        }
+    }
+    let h = ul.dot(&u.t());
+    let op = DenseSpectralOperator::from_symmetric_with_mode(&h, PseudoLogdetMode::HardPseudo)
+        .expect("HardPseudo masked fixture");
+    assert!(
+        op.active_rank() < op.dim(),
+        "fixture must mask a numerical null space: active_rank={} dim={}",
+        op.active_rank(),
+        op.dim()
+    );
+    // The masked eigenpair must carry real mass on the penalty block [0..2],
+    // otherwise the completeness-vs-active split is vacuous.
+    let masked_block_mass: f64 = (0..op.n_dim)
+        .filter(|&j| !op.active_mask[j])
+        .map(|j| (0..2).map(|i| op.eigenvectors[[i, j]].powi(2)).sum::<f64>())
+        .sum();
+    assert!(
+        masked_block_mass > 1e-3,
+        "masked null direction must overlap the block: mass={masked_block_mass:.3e}"
+    );
+
+    let tol = |reference: f64| 1e-10 * (1.0 + reference.abs());
+
+    // (1) Full-rank square block: det derivative = integer rank = width.
+    let s_full = array![[1.5_f64, 0.4], [0.4, 2.2]];
+    let naive_full = op.trace_logdet_block_local(&s_full, 1.0, 0, 2) - 2.0;
+    let fused_full = op.fused_logdet_gradient_minus_rank_full_block(&s_full, 0, 2, 1.0);
+    assert!(
+        (fused_full - naive_full).abs() <= tol(naive_full),
+        "full-block fused {fused_full:.15e} vs masked naive {naive_full:.15e}"
+    );
+
+    // (2) Rank-deficient block: 3-wide second difference (rank 1), det = rank.
+    let s_def = second_difference_penalty(3);
+    let naive_def = op.trace_logdet_block_local(&s_def, 1.0, 0, 3) - 1.0;
+    let fused_def = op.fused_logdet_gradient_minus_rank_deficient_block(&s_def, 0, 3, 1.0);
+    assert!(
+        (fused_def - naive_def).abs() <= tol(naive_def),
+        "deficient fused {fused_def:.15e} vs masked naive {naive_def:.15e}"
+    );
+
+    // (3) Weighted (fractional det1) block: full-span second difference coupled
+    // with an identity ridge ⇒ det1[0] = λ₀·tr(S_λ⁺ S₀) is fractional.
+    let s0 = second_difference_penalty(p);
+    let s1 = Array2::<f64>::eye(p);
+    let lambdas = [1.0_f64, 0.1];
+    let mut s_lambda = Array2::<f64>::zeros((p, p));
+    s_lambda.scaled_add(lambdas[0], &s0);
+    s_lambda.scaled_add(lambdas[1], &s1);
+    let pld =
+        super::super::penalty_logdet::PenaltyPseudologdet::from_assembled(s_lambda, None)
+            .expect("joint penalty pseudologdet");
+    let ws = &pld.w_factor;
+    let (det1, _det2) = pld.rho_derivatives(&[s0.clone(), s1], &lambdas);
+    let det1_0 = det1[0];
+    assert!(
+        (det1_0 - det1_0.round()).abs() > 1e-6,
+        "weighted fixture det1[0]={det1_0:.6e} must be fractional"
+    );
+    let naive_w = op.trace_logdet_block_local(&s0, lambdas[0], 0, p) - det1_0;
+    let (fused_w, weight_sum) =
+        op.fused_logdet_gradient_weighted_block(&s0, 0, p, lambdas[0], ws);
+    // Completeness of the weight distribution survives the mask (Σ_j runs over
+    // the full eigenbasis), so the self-consistency gate the call site trusts
+    // still holds.
+    assert!(
+        (weight_sum - det1_0).abs() <= 1e-9 * (1.0 + det1_0.abs()),
+        "masked Σ_j w_jk {weight_sum:.12e} must still equal det1[0] {det1_0:.12e}"
+    );
+    assert!(
+        (fused_w - naive_w).abs() <= tol(naive_w),
+        "weighted fused {fused_w:.15e} vs masked naive {naive_w:.15e}"
+    );
+}
+
 // ─── R1: joint normalizer value differs from the per-block sum under overlap ──
 //
 // The #2331 cutover replaces the survival per-block `Σ_k log|λ_k S_k|₊` with the

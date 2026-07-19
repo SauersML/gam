@@ -953,16 +953,30 @@ pub fn reml_laml_evaluate(
     //     S_λ⁺ S_k u_j` from the joint whitening `W_S`
     //     (`fused_logdet_gradient_weighted_block`), trusted only when `Σ_j w_jk`
     //     reproduces the cost's `det1[k]`.
-    // Masked numerical null spaces (`active_rank() < dim()`) are left `None` and
-    // take the unmodified trace − det path below. The stochastic-SLQ branch is
-    // intentionally out of scope and unifies under #2331.
+    // A masked numerical null space (`active_rank() < dim()`, i.e. `HardPseudo`
+    // masking `σ_j ≤ ε`) needs no special handling here (#2354): the trace side
+    // reads `g_factor`, which is zeroed on the masked eigenpairs, so
+    // `Σ_j scale·s_term_j` is exactly the active-subspace trace the naive path
+    // also forms (`trace_logdet_block_local` reads the same `g_factor`); the
+    // `−det1[k]` distribution sums its per-eigenpair share over the COMPLETE
+    // (UNMASKED) eigenbasis, so the completeness identity `Σ_j share_j = det1[k]`
+    // (`Σ_j Σ_{i∈blk} u_j[i]² = width = rank` full-block; `Σ_j ‖Qᵀ u_j^blk‖² =
+    // rank` deficient; `Σ_j w_jk = λ_k·tr(S_λ⁺ S_k)` weighted) still holds — rows
+    // of the full orthogonal `U` are unit-norm regardless of the mask. Hence the
+    // fused value equals `trace_active − det1[k]` exactly and cancellation-free:
+    // the active pairs `scale·s_term_j − share_j` stay O(1/λ_k) as in the
+    // full-rank rail derivation, and each masked pair contributes only the
+    // non-negative lump `0 − share_j` (no large-minus-large).
+    // The stochastic-SLQ branch stays on the naive pairing at this seam and is
+    // instead fused inside its Hutchinson estimator via a common-random-numbers
+    // control variate (#2354, `stochastic_trace_control_variates`).
     let fused_logdet_minus_rank: Vec<Option<f64>> = if incl_logdet_h
         && incl_logdet_s
         && stochastic_trace_values.is_none()
         && projected_trace_values.is_none()
     {
         match hop.as_exact_dense_spectral() {
-            Some(ds) if ds.active_rank() == ds.dim() => {
+            Some(ds) => {
                 // Joint penalty whitening `W_S` (`W_S W_Sᵀ = S_λ⁺`,
                 // `S_λ = Σ_l λ_l S_l`) reconstructed from the penalty coordinates
                 // — needed ONLY when some coordinate carries a FRACTIONAL det
@@ -1062,7 +1076,7 @@ pub fn reml_laml_evaluate(
                     })
                     .collect()
             }
-            _ => vec![None; k],
+            None => vec![None; k],
         }
     } else {
         vec![None; k]
