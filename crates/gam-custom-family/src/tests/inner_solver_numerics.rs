@@ -6091,16 +6091,26 @@ fn effective_df_ceiling_never_emits_upper_below_true_rho_lower_wall_2370() {
         upper_true_wall[0],
     );
 
-    // A degenerate box (lower >= ceiling) is a typed error, not a silent
-    // inversion. The check now lives in the `RhoBox` constructor, so the
-    // degenerate pair can no longer reach the derivation at all.
+    // An INVERTED box (lower > ceiling) is a typed error, not a silent
+    // inversion. The check lives in the `RhoBox` constructor, so such a pair
+    // can no longer reach the derivation at all. `lower == ceiling` is NOT
+    // inverted — it is a legal pinned coordinate, accepted here and by the
+    // outer optimizer alike.
+    assert!(
+        RhoBox::new(
+            RhoLowerWall(EFFECTIVE_DF_CEILING + 1.0),
+            RhoCeiling(EFFECTIVE_DF_CEILING),
+        )
+        .is_err(),
+        "lower > ceiling must be rejected as an empty ρ-box",
+    );
     assert!(
         RhoBox::new(
             RhoLowerWall(EFFECTIVE_DF_CEILING),
             RhoCeiling(EFFECTIVE_DF_CEILING),
         )
-        .is_err(),
-        "lower == ceiling must be rejected as an empty/degenerate ρ-box",
+        .is_ok(),
+        "lower == ceiling is a pinned coordinate, which the outer optimizer accepts",
     );
 }
 

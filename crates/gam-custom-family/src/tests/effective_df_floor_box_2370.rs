@@ -161,7 +161,24 @@ fn derived_upper_bound_never_inverts_the_box_across_the_crossing_range_2370() {
 }
 
 #[test]
-fn the_rho_box_constructor_rejects_an_inverted_or_degenerate_pair_2370() {
+fn a_pinned_box_yields_a_well_ordered_single_point_box_2370() {
+    // The derivation needs no special case for a pinned box: no tightening is
+    // possible (the term keeps the uniform ceiling), so the emitted upper bound
+    // equals the floor and the box the optimizer receives is the single point
+    // the caller pinned — never inverted.
+    let pinned_at = EFFECTIVE_DF_CEILING;
+    let (specs, layout) = two_dir_term(0.0);
+    let upper = upper_bounds_for(&specs, &layout, pinned_at, pinned_at)
+        .expect("a pinned rho box must be accepted");
+    assert_eq!(
+        upper[0], pinned_at,
+        "a pinned box must emit its own wall as the upper bound, got {}",
+        upper[0],
+    );
+}
+
+#[test]
+fn the_rho_box_constructor_rejects_an_inverted_pair_but_accepts_a_pinned_one_2370() {
     let ceiling = EFFECTIVE_DF_CEILING;
     // Inverted: floor above the ceiling.
     let inverted = RhoBox::new(RhoLowerWall(13.0), RhoCeiling(ceiling))
@@ -171,11 +188,14 @@ fn the_rho_box_constructor_rejects_an_inverted_or_degenerate_pair_2370() {
         message.contains("13") && message.contains("12"),
         "the refusal must name both offending walls, got: {message}"
     );
-    // Degenerate: a collapsed single-point box admits no smoothing choice.
-    assert!(
-        RhoBox::new(RhoLowerWall(ceiling), RhoCeiling(ceiling)).is_err(),
-        "a collapsed single-point box must be rejected"
-    );
+    // A PINNED box (lower == ceiling) is legal, not degenerate: the caller has
+    // fixed λ. This mirrors the outer optimizer's
+    // `pinned_equal_rho_bounds_are_accepted_2370`; the two layers must agree on
+    // what the admissible set is, or they can drift apart exactly as the two
+    // #2370 constants did.
+    let pinned = RhoBox::new(RhoLowerWall(ceiling), RhoCeiling(ceiling))
+        .expect("a pinned rho box must be accepted, matching the outer optimizer");
+    assert_eq!(pinned.lower(), pinned.ceiling());
     // Non-finite walls are rejected as admissible log-strengths.
     assert!(
         RhoBox::new(RhoLowerWall(f64::NAN), RhoCeiling(ceiling)).is_err(),

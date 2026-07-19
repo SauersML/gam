@@ -451,10 +451,20 @@ pub(crate) struct RhoBox {
 }
 
 impl RhoBox {
-    /// Build the box, rejecting a non-finite wall or an empty/inverted
-    /// interval. Both walls must be admissible log-strengths, and the floor
-    /// must lie STRICTLY below the ceiling: a collapsed single-point box
-    /// admits no smoothing choice, and an inverted one is the #2370 defect.
+    /// Build the box, rejecting a non-finite wall or an inverted interval.
+    ///
+    /// The empty case is `lower > ceiling` and nothing else. A box with
+    /// `lower == ceiling` is a legal PINNED coordinate: the caller has fixed λ
+    /// rather than asked for an impossible range, and the derivation handles it
+    /// without a special case — no tightening is possible, so the term keeps the
+    /// uniform ceiling and the emitted box stays well-ordered.
+    ///
+    /// This deliberately matches the outer optimizer, which accepts a pinned
+    /// coordinate (`rho_optimizer::run_plan_tests::pinned_equal_rho_bounds_are_accepted_2370`).
+    /// Refusing here what the layer below accepts would be a cross-layer
+    /// contract split — the same class of defect as #2370 itself, one level up:
+    /// two independently-owned definitions of the same admissible set, free to
+    /// drift apart.
     pub(crate) fn new(
         RhoLowerWall(lower): RhoLowerWall,
         RhoCeiling(ceiling): RhoCeiling,
@@ -471,12 +481,12 @@ impl RhoBox {
                 reason: error.to_string(),
             }
         })?;
-        if !(lower < ceiling) {
+        if lower > ceiling {
             return Err(CustomFamilyError::InvalidInput {
                 context: "effective-DF rho box",
                 reason: format!(
-                    "rho lower bound {lower} is not below the uniform ceiling {ceiling}; \
-                     the admissible ρ-box is empty or degenerate"
+                    "rho lower bound {lower} exceeds the uniform ceiling {ceiling}; \
+                     the admissible ρ-box is empty"
                 ),
             });
         }
