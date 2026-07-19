@@ -4801,6 +4801,96 @@ mod tests {
     }
 
     #[test]
+    fn posterior_quadrature_keeps_cone_coordinates_feasible_and_unbiased() {
+        // Coordinate 0 is a structural monotone-I-spline baseline time
+        // coefficient the fit constrained to β_0 ≥ 0; coordinate 1 is an
+        // unconstrained covariate intercept. The covariance loads coordinate 0
+        // with a spread wider than β̂_0, so the untruncated √rank·σ sigma point
+        // steps β_0 below zero — the exact #2375 infeasible-node signature that
+        // manufactures a non-monotone RP baseline the plugin evaluator refuses.
+        let posterior_mean = ndarray::array![0.354, -8.30];
+        let covariance = ndarray::array![[0.2304, 0.30], [0.30, 0.9604]];
+
+        // Without the cone, the untruncated rule produces an infeasible node.
+        let mut min_cone0_unconstrained = f64::INFINITY;
+        for_each_survival_posterior_node(&posterior_mean, &covariance, &[], |node, _weight| {
+            min_cone0_unconstrained = min_cone0_unconstrained.min(node[0]);
+            Ok(())
+        })
+        .expect("unconstrained quadrature");
+        assert!(
+            min_cone0_unconstrained < 0.0,
+            "fixture must reproduce the infeasible-node bug (min β_0 = {min_cone0_unconstrained})"
+        );
+
+        // With the cone, every node stays feasible AND the rule stays unbiased
+        // (symmetric ± steps, unchanged weights → the posterior mean is exact).
+        let mut mean0 = 0.0_f64;
+        let mut mean1 = 0.0_f64;
+        let mut weight_sum = 0.0_f64;
+        let mut min_cone0 = f64::INFINITY;
+        for_each_survival_posterior_node(&posterior_mean, &covariance, &[0], |node, weight| {
+            assert!(
+                node[0] >= -1e-12,
+                "cone coordinate stepped below its β_0 ≥ 0 wall: {}",
+                node[0]
+            );
+            min_cone0 = min_cone0.min(node[0]);
+            mean0 += weight * node[0];
+            mean1 += weight * node[1];
+            weight_sum += weight;
+            Ok(())
+        })
+        .expect("cone-truncated quadrature");
+        assert!((weight_sum - 1.0).abs() <= 1e-12, "weights must sum to one");
+        assert!(
+            (mean0 - posterior_mean[0]).abs() <= 1e-12
+                && (mean1 - posterior_mean[1]).abs() <= 1e-12,
+            "cone truncation must leave the posterior mean unbiased (got [{mean0}, {mean1}])"
+        );
+
+        // Truncation shrinks — never inflates — the represented spread along the
+        // constrained coordinate (a truncated Gaussian has smaller variance).
+        let mut var0_unconstrained = 0.0_f64;
+        for_each_survival_posterior_node(&posterior_mean, &covariance, &[], |node, weight| {
+            var0_unconstrained += weight * (node[0] - posterior_mean[0]).powi(2);
+            Ok(())
+        })
+        .expect("unconstrained spread");
+        let mut var0_cone = 0.0_f64;
+        for_each_survival_posterior_node(&posterior_mean, &covariance, &[0], |node, weight| {
+            var0_cone += weight * (node[0] - posterior_mean[0]).powi(2);
+            Ok(())
+        })
+        .expect("cone spread");
+        assert!(
+            var0_cone <= var0_unconstrained + 1e-12 && var0_cone < var0_unconstrained,
+            "cone spread {var0_cone} must be strictly smaller than the untruncated {var0_unconstrained}"
+        );
+    }
+
+    #[test]
+    fn posterior_quadrature_cone_is_a_noop_far_from_the_wall() {
+        // When β̂ sits comfortably inside the cone (every √rank·σ node stays
+        // feasible), the fraction-to-boundary step never binds, so the cone rule
+        // must reproduce the untruncated covariance to full precision — the fix
+        // is inert on the healthy fits that dominate production.
+        let posterior_mean = ndarray::array![40.0, -0.2];
+        let covariance = ndarray::array![[0.9, 0.35], [0.35, 0.6]];
+        let mut recovered_var0 = 0.0_f64;
+        let mut recovered_cross = 0.0_f64;
+        for_each_survival_posterior_node(&posterior_mean, &covariance, &[0], |node, weight| {
+            recovered_var0 += weight * (node[0] - posterior_mean[0]).powi(2);
+            recovered_cross +=
+                weight * (node[0] - posterior_mean[0]) * (node[1] - posterior_mean[1]);
+            Ok(())
+        })
+        .expect("cone quadrature far from the wall");
+        assert!((recovered_var0 - covariance[[0, 0]]).abs() <= 1e-11);
+        assert!((recovered_cross - covariance[[0, 1]]).abs() <= 1e-11);
+    }
+
+    #[test]
     fn probit_survival_hazard_uses_density_over_survival() {
         let eta = 2.0;
         let eta_t = 0.3;
