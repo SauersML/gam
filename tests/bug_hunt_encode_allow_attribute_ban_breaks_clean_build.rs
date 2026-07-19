@@ -42,6 +42,20 @@
 //! `// without an #[allow(unused_variables)] suppression.` in
 //! `crates/gam-solve/src/gpu_kernels/sigma_cubature.rs`) is not flagged, exactly
 //! as `build.rs`'s `strip_file_lines` masking does.
+//!
+//! The check matches the whole *logical* attribute rather than the physical
+//! line. A Rust attribute may span lines, which separates the marker from the
+//! silencer keyword and defeats any per-line match — in both the inner and the
+//! outer form:
+//!
+//!     #![                    #[
+//!         allow(dead_code)       allow(dead_code)
+//!     ]                      ]
+//!
+//! `build.rs`'s `scan_for_banned_allow` is still per-line and therefore does
+//! NOT abort the build on these two forms (#2364); until that scanner is
+//! updated in lockstep, this test is the only enforcement point that catches
+//! them, so it must not be relaxed back to a per-line match.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -100,6 +114,50 @@ fn strip_line_comment(line: &str) -> &str {
         Some(idx) => &line[..idx],
         None => line,
     }
+}
+
+/// True when every `[` opened at or after the first attribute marker in `s` is
+/// also closed within `s`. A `false` result means the attribute continues onto
+/// the next physical line, so `s` is not yet the whole logical attribute.
+fn attr_brackets_balanced(s: &str) -> bool {
+    let Some(start) = s.find("#[").into_iter().chain(s.find("#![")).min() else {
+        return true;
+    };
+    let mut depth = 0i32;
+    for b in s[start..].bytes() {
+        match b {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth <= 0
+}
+
+/// The logical attribute beginning on `lines[idx]`: that line, plus each
+/// following line (joined by a single space) until the attribute's brackets
+/// balance. A Rust attribute may span physical lines, which puts the marker and
+/// the silencer keyword on different lines and defeats a per-line match:
+///
+///     #![
+///         allow(dead_code)
+///     ]
+///
+/// An attribute that closes on its own line splices to itself, so single-line
+/// detection is unchanged. Comment-stripped text in, comment-stripped text out.
+fn spliced_attribute(lines: &[&str], idx: usize) -> String {
+    let mut acc = String::from(lines[idx]);
+    if attr_brackets_balanced(&acc) {
+        return acc;
+    }
+    for follow in lines.iter().skip(idx + 1).take(64) {
+        acc.push(' ');
+        acc.push_str(follow.trim());
+        if attr_brackets_balanced(&acc) {
+            break;
+        }
+    }
+    acc
 }
 
 /// True if `code` carries an attribute-context lint silencer: `allow(` or
@@ -163,9 +221,13 @@ fn source_tree_has_no_lint_silencing_allow_or_expect_attributes() {
         if !content.contains("allow(") && !content.contains("expect(") {
             continue;
         }
+        let stripped: Vec<&str> = content.lines().map(strip_line_comment).collect();
         for (idx, line) in content.lines().enumerate() {
-            let code = strip_line_comment(line);
-            if line_has_silencer(code) {
+            // Match the whole logical attribute, not the physical line, so an
+            // attribute split across lines cannot carry the silencer keyword
+            // out of reach of the marker. Offenders are still reported at the
+            // marker's line.
+            if line_has_silencer(&spliced_attribute(&stripped, idx)) {
                 let rel = file
                     .strip_prefix(&root)
                     .unwrap_or(file)
