@@ -97,3 +97,38 @@ pub(crate) fn indefinite_exact_a_is_an_infeasible_probe_not_a_fatal_abort_2336()
         ),
     }
 }
+
+/// #2228 MEASUREMENT (zz_measure) — with the certify-at-best-seen fix (½λ²/scale-min
+/// keyed, band unchanged), run the criterion on ard_saddle_state. Ok ⇒ the best-seen
+/// certificate cleared the 1e-8 band and A is materialized at that certified mode
+/// (report min_eig — PD ⇒ genuine convergence, retires the #2336 escape). Err ⇒ the
+/// best-achievable ½λ²/scale plateaus above the band (a solver stall at a saddle-
+/// adjacent mode), honestly reported at the best-seen ‖g‖.
+#[test]
+fn zz_measure_best_seen_classification_2228() {
+    use super::{FaerEigh, Side};
+    let (mut term, target, rho) = ard_saddle_state();
+    let result = term.penalized_quasi_laplace_criterion_with_cache(
+        target.view(),
+        &rho,
+        None,
+        40,
+        0.4,
+        1.0e-6,
+        1.0e-6,
+    );
+    match result {
+        Ok((value, _, cache)) => {
+            let a = term
+                .materialize_exact_hessian_dense(&rho, target.view(), &cache)
+                .expect("materialize A at certified best-seen mode");
+            let (eigs, _) = a.eigh(Side::Lower).expect("A eigendecomposition");
+            let min_eig = eigs.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            eprintln!(
+                "2228-MEASURE: Ok(value={value:.9e}) certified; min_eig={min_eig:.6e} max_eig={max_eig:.6e}"
+            );
+        }
+        Err(err) => eprintln!("2228-MEASURE: Err({err:?}) => plateau above band (solver stall)"),
+    }
+}
