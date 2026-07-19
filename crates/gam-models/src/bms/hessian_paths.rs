@@ -1081,6 +1081,12 @@ pub(super) fn add_weighted_chunk_gradient<S: ndarray::Data<Elem = f64>>(
 /// selected CUDA. The current `gam-gpu` BLAS API erases backend errors into
 /// `Option::None`; at this boundary that value means the selected algorithm
 /// failed, never that a different CPU algorithm may be substituted.
+// Its production callers compile under `cfg(target_os = "linux")` (the CUDA
+// path); off-Linux the lib target has no caller and `-D dead-code` rejects it,
+// the break that has been failing the macOS and Windows wheel jobs. Gate to the
+// platforms that own the callers rather than suppressing the lint; the fixtures
+// that exercise it are gated to Linux alongside it.
+#[cfg(target_os = "linux")]
 pub(super) fn require_selected_cuda_gram_result<T>(
     operation: &str,
     rows: usize,
@@ -1278,7 +1284,10 @@ pub(super) fn add_weighted_chunk_gram<S: ndarray::Data<Elem = f64>>(
 //     independent of the per-cache cap so that two co-resident workspaces
 //     cannot together consume the whole budget.
 
+// The whole module exercises the Linux-only selected-CUDA fail-closed helper,
+// so it is gated with it; stacked attributes read as AND.
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 mod selected_cuda_gram_tests {
     use super::*;
 

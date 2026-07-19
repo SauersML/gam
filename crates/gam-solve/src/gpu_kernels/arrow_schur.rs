@@ -64,6 +64,13 @@ pub enum ArrowSchurGpuFailure {
 /// ordinary device decline. The existing GPU failure surface has a diagnostic
 /// string variant, so faults flow through it; only typed Auto/Off absence
 /// remains `Ok(None)` and may become `Unavailable` at a caller-specific gate.
+///
+/// Every call site sits inside a `cfg(target_os = "linux")` block (the CUDA
+/// backend compiles only there), so off-Linux this resolver has no callers and
+/// `-D dead-code` rejects it — which is what silently killed the Windows and
+/// macOS wheel jobs. Gate it to the platform that owns its callers rather than
+/// suppressing the lint.
+#[cfg(target_os = "linux")]
 fn resolve_runtime_for_device_path(
 ) -> Result<Option<&'static gam_gpu::GpuRuntime>, ArrowSchurGpuFailure> {
     gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy()).map_err(|error| {

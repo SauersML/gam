@@ -34,10 +34,17 @@
 //!   compiles and launches the all-branch NVRTC kernel, and leaves moments
 //!   device-resident for the consuming row kernel.
 
+// The branch classifier feeds only the CUDA dispatcher below, so off-Linux it
+// has no caller and `-D dead-code` rejects the whole module (the break that
+// has been failing the macOS/Windows wheel jobs). Gate it with its consumer.
+#[cfg(target_os = "linux")]
 pub(crate) mod branch;
 #[cfg(target_os = "linux")]
 pub(crate) mod device;
+// The host oracle exercises the Linux-only substrate items, so it is gated with
+// them; stacked attributes read as AND.
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 #[path = "host_substrate.rs"]
 mod tests_host_substrate;
 pub(crate) mod kernel_src;
@@ -51,6 +58,12 @@ use gam_gpu::gpu_error::GpuError;
 /// * Bernoulli flex Hessian: 9
 /// * BMS outer higher-derivative reuse: 21
 /// * Survival flex Hessian (with `D_uv` cross terms): 24
+// Consumed by the CUDA device dispatcher (`device`, Linux-only) and by the
+// host-substrate/ABI test oracles. Off-Linux the lib target has no caller, so
+// `-D dead-code` rejects it — the break that has been failing the macOS and
+// Windows wheel jobs. Gate to the platform that owns the callers instead of
+// suppressing the lint; the oracles that exercise it are gated alongside it.
+#[cfg(target_os = "linux")]
 pub(crate) const MAX_SUPPORTED_DEGREE: usize = 24;
 
 /// A single de-nested cubic-cell payload in the layout the device kernels
@@ -69,6 +82,12 @@ pub(crate) struct GpuDenestedCubicCell {
 
 /// Canonical branch classification encoded for the all-branch device kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Consumed by the CUDA device dispatcher (`device`, Linux-only) and by the
+// host-substrate/ABI test oracles. Off-Linux the lib target has no caller, so
+// `-D dead-code` rejects it — the break that has been failing the macOS and
+// Windows wheel jobs. Gate to the platform that owns the callers instead of
+// suppressing the lint; the oracles that exercise it are gated alongside it.
+#[cfg(target_os = "linux")]
 pub(crate) enum GpuCellBranchTag {
     /// `c_2 = c_3 = 0` and the interval is finite — closed-form `T_n`
     /// recurrence at the affine anchor.
@@ -84,6 +103,12 @@ pub(crate) enum GpuCellBranchTag {
 /// Typed per-cell status decoded from the device kernel ABI.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Consumed by the CUDA device dispatcher (`device`, Linux-only) and by the
+// host-substrate/ABI test oracles. Off-Linux the lib target has no caller, so
+// `-D dead-code` rejects it — the break that has been failing the macOS and
+// Windows wheel jobs. Gate to the platform that owns the callers instead of
+// suppressing the lint; the oracles that exercise it are gated alongside it.
+#[cfg(target_os = "linux")]
 pub(crate) enum CubicCellMomentStatus {
     Ok = 0,
     /// Finite cell with `right <= left`, or the canonical classifier rejected
@@ -118,6 +143,12 @@ impl CubicCellMomentStatus {
 /// Host-side input view for `try_build_cubic_cell_derivative_moments`.
 /// The substrate borrows cell data from the caller and owns branch
 /// classification so callers cannot drift from the kernel's tolerance.
+// Consumed by the CUDA device dispatcher (`device`, Linux-only) and by the
+// host-substrate/ABI test oracles. Off-Linux the lib target has no caller, so
+// `-D dead-code` rejects it — the break that has been failing the macOS and
+// Windows wheel jobs. Gate to the platform that owns the callers instead of
+// suppressing the lint; the oracles that exercise it are gated alongside it.
+#[cfg(target_os = "linux")]
 pub(crate) struct CubicCellDerivativeMomentHostView<'a> {
     pub cells: &'a [GpuDenestedCubicCell],
     pub max_degree: usize,
@@ -161,6 +192,7 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
 }
 
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 mod tests {
     use super::*;
 

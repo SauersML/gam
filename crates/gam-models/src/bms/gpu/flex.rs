@@ -43,6 +43,12 @@ pub fn require_row_primary_hessian_supported(n: usize, r: usize) -> Result<GpuDe
 /// consumer. Once policy has produced device-resident BMS FLEX state, a CUDA
 /// failure is an execution error; callers must not reinterpret it as permission
 /// to run a different CPU algorithm.
+// Its production callers compile under `cfg(target_os = "linux")` (the CUDA
+// path); off-Linux the lib target has no caller and `-D dead-code` rejects it,
+// the break that has been failing the macOS and Windows wheel jobs. Gate to the
+// platforms that own the callers rather than suppressing the lint; the fixtures
+// that exercise it are gated to Linux alongside it.
+#[cfg(target_os = "linux")]
 pub(crate) fn require_selected_gpu_result<T>(
     operation: &str,
     result: Result<T, GpuError>,
@@ -206,6 +212,9 @@ mod bms_flex_gpu_tests {
         assert_eq!(decision.kernel, GpuKernel::MarginalSlopeRows);
     }
 
+    // Exercises the Linux-only selected-GPU contract helper, so it is gated with
+    // it; stacked attributes read as AND.
+    #[cfg(target_os = "linux")]
     #[test]
     pub(crate) fn selected_gpu_errors_propagate_without_algorithm_substitution_932() {
         let error = require_selected_gpu_result::<()>(

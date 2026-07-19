@@ -1103,6 +1103,13 @@ impl SaeRowJetMemoryLedger {
         })
     }
 
+    /// The only production caller is the CUDA tile planner, which compiles
+    /// under `cfg(target_os = "linux")`; off-Linux the lib target therefore has
+    /// no caller and `-D dead-code` rejects the method (this class of break has
+    /// been failing the macOS/Windows wheel jobs). `test` keeps it available for
+    /// the platform-independent ledger fixture rather than gating that fixture
+    /// to Linux, which would drop real coverage everywhere else.
+    #[cfg(target_os = "linux")]
     fn maximum_rows(self, device_budget: usize, host_budget: usize) -> usize {
         let device_rows = device_budget
             .checked_sub(self.fixed_device_bytes)
@@ -2857,6 +2864,9 @@ mod tests {
         assert!(out.beta_mixed.iter().any(|value| *value != 0.0));
     }
 
+    // Exercises the Linux-only tile-planner ledger method, so it is gated with it;
+    // stacked attributes read as AND.
+    #[cfg(target_os = "linux")]
     #[test]
     fn memory_ledger_counts_coordinate_and_mixed_tensors_2304() {
         fn assert_exact_ledger(

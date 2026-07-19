@@ -1506,6 +1506,10 @@ fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
 /// and its admission wrapper must agree with the dependency-sliced witness
 /// surface. The random grid covers both event branches, non-unit covariance,
 /// and non-unit frailty scale from the sole `rigid_feature_program` declaration.
+// The witness half of this fixture calls `rigid_row_admission_witnesses`, which
+// is `cfg(target_os = "linux")` production code, so off-Linux the test target
+// does not compile at all. Gate the fixture with the surface it exercises.
+#[cfg(target_os = "linux")]
 #[test]
 fn rigid_feature_program_scalar_pullback_matches_generic_and_witnesses_932() {
     use gam_math::jet_scalar::{JetScalar, Order2};

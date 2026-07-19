@@ -680,6 +680,10 @@ mod tests {
     use super::*;
     use ndarray::Array2;
 
+    // Both callers are `cfg(target_os = "linux")` device-parity tests, so this
+    // admission helper is dead off-Linux and `-D dead-code` rejects the test
+    // target there (a wheel-blocking break class). Gate it with its callers.
+    #[cfg(target_os = "linux")]
     fn cuda_available_for_test(label: &str) -> bool {
         match gam_gpu::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
             Ok(Some(_)) => true,

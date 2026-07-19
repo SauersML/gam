@@ -338,10 +338,26 @@ impl RowPrimaryEvalCache {
     /// selected. Device selection is an algorithm commitment, so a caller
     /// must consume the resident value/gradient/Hessian channels instead of
     /// silently recomputing the canonical row program on CPU.
+    /// Whether this cache is device-resident. Structurally `false` off-Linux,
+    /// where the `Device` variant does not exist, so the rejection below reads
+    /// the same on every platform instead of cfg-ing the check away (which left
+    /// `operation` unused off-Linux and broke the macOS/Windows wheel builds
+    /// under `-D warnings`).
+    #[inline]
+    fn is_device_resident(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self, Self::Device(_))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     #[inline]
     pub(crate) fn reject_device_cpu_recompute(&self, operation: &str) -> Result<(), String> {
-        #[cfg(target_os = "linux")]
-        if matches!(self, Self::Device(_)) {
+        if self.is_device_resident() {
             return Err(format!(
                 "BMS {operation}: device-resident row evaluation selected; CPU row recomputation is forbidden"
             ));
