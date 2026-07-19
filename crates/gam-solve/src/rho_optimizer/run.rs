@@ -4669,7 +4669,7 @@ mod certify_resume_progress_tests {
     use super::{OuterConfig, certify_resume_made_progress, outer_rel_cost_floor};
 
     fn config_with_rel_cost(rel_cost: Option<f64>, tolerance: f64) -> OuterConfig {
-        let mut config = OuterConfig::new(1);
+        let mut config = OuterConfig::default();
         config.tolerance = tolerance;
         config.rel_cost_tolerance = rel_cost;
         config
