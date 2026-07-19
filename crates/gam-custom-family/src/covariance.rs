@@ -1276,6 +1276,52 @@ pub(crate) fn materialize_owned_terminal_unpenalized_hessian<
         return materialize_joint_hessian_source(&source, total, context);
     }
 
+    if states.len() != specs.len() {
+        return Err(format!(
+            "{context}: the certified terminal mode retained {} block states for {} parameter blocks",
+            states.len(),
+            specs.len(),
+        ));
+    }
+    // The coupled-Jeffreys recompute is attempted BEFORE requiring per-block
+    // working sets, because it derives the joint Hessian from the frozen block
+    // STATES alone and never consumes a working set (#2373). A coupled family
+    // that exposes an analytic joint gradient runs the joint-Newton accept path
+    // with `eval == None`, so its converged inner result retains NEITHER a joint
+    // workspace NOR terminal working sets — and the location-scale survival AFT
+    // family is exactly that shape. Gating this recompute behind the working-set
+    // unwrap (as before) made every such fit fail with "retained neither a joint
+    // Hessian workspace nor per-block working sets", even though the recompute
+    // it needs consumes only states. Working sets remain required for the
+    // uncoupled block-diagonal assembly below.
+    if specs.len() > 1 && !family.likelihood_blocks_uncoupled() {
+        // A coupled likelihood's joint Hessian carries cross-block curvature that
+        // the block-diagonal per-block working sets omit, so those working sets
+        // are not an admissible source here. Exact-Newton families whose mode
+        // curvature certificate ran retain a joint workspace (handled above), but
+        // that certificate is deliberately skipped for Jeffreys-armed families
+        // (their definiteness is certified on the joint Jeffreys subspace
+        // instead), so a Jeffreys-armed coupled family — every dispersion /
+        // location-scale GLM (gamma, NB, beta, tweedie) and the location-scale
+        // survival AFT path — reaches this branch. Recompute the exact joint
+        // likelihood Hessian at the FROZEN converged mode: a deterministic
+        // re-evaluation at fixed beta that cannot move the mode or perturb a
+        // stateful augmentation, and the exact same source
+        // `compute_joint_covariance_required` consumes. This restores terminal
+        // curvature ownership for coupled Jeffreys families that #979
+        // `da5fd654b` + #2298 `ab6752762` together left unable to assemble a
+        // terminal Hessian.
+        if let Some(hessian) =
+            exact_newton_joint_hessian_symmetrized(family, states, specs, total, context)?
+        {
+            return Ok(hessian);
+        }
+        return Err(format!(
+            "{context}: a coupled {}-block likelihood cannot derive its joint Hessian from block working sets, and the family exposes no exact joint Hessian to recompute at the certified mode",
+            specs.len(),
+        ));
+    }
+
     let working_sets = working_sets.ok_or_else(|| {
         format!(
             "{context}: the certified terminal mode retained neither a joint Hessian workspace nor per-block working sets"
@@ -1285,39 +1331,6 @@ pub(crate) fn materialize_owned_terminal_unpenalized_hessian<
         return Err(format!(
             "{context}: the certified terminal mode retained {} working sets for {} parameter blocks",
             working_sets.len(),
-            specs.len(),
-        ));
-    }
-    if states.len() != specs.len() {
-        return Err(format!(
-            "{context}: the certified terminal mode retained {} block states for {} parameter blocks",
-            states.len(),
-            specs.len(),
-        ));
-    }
-    if specs.len() > 1 && !family.likelihood_blocks_uncoupled() {
-        // A coupled likelihood's joint Hessian carries cross-block curvature that
-        // the block-diagonal per-block working sets omit, so those working sets
-        // are not an admissible source here. Exact-Newton families whose mode
-        // curvature certificate ran retain a joint workspace (handled above), but
-        // that certificate is deliberately skipped for Jeffreys-armed families
-        // (their definiteness is certified on the joint Jeffreys subspace
-        // instead), so a Jeffreys-armed coupled family — every dispersion /
-        // location-scale GLM (gamma, NB, beta, tweedie) — reaches this branch
-        // with only working sets. Recompute the exact joint likelihood Hessian at
-        // the FROZEN converged mode: a deterministic re-evaluation at fixed beta
-        // that cannot move the mode or perturb a stateful augmentation, and the
-        // exact same source `compute_joint_covariance_required` consumes. This
-        // restores terminal curvature ownership for coupled Jeffreys families
-        // that #979 `da5fd654b` + #2298 `ab6752762` together left unable to
-        // assemble a terminal Hessian.
-        if let Some(hessian) =
-            exact_newton_joint_hessian_symmetrized(family, states, specs, total, context)?
-        {
-            return Ok(hessian);
-        }
-        return Err(format!(
-            "{context}: a coupled {}-block likelihood cannot derive its joint Hessian from block working sets, and the family exposes no exact joint Hessian to recompute at the certified mode",
             specs.len(),
         ));
     }
