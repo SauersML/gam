@@ -1632,6 +1632,67 @@ impl CompressedActiveWorkingSet {
             })
             .map(|(_, group)| group.clone())
     }
+
+    /// True iff the active position `pos` is ENFORCED by this compressed face —
+    /// it is a representative or an exactly-parallel dependent of one, so its
+    /// half-space is carried by the enforced equality system. A general-position
+    /// active row that was rank-reduced out of the face belongs to no group and
+    /// is therefore NOT enforced (its violation cannot be closed by the current
+    /// KKT solve, and it cannot be re-added because it is already active).
+    fn position_enforced(&self, pos: usize) -> bool {
+        self.groups.iter().any(|group| group.contains(&pos))
+    }
+
+    /// Over-complete-face adjudication (#2378). `violated` is the normal (in any
+    /// scaling) of a constraint row that is ACTIVE yet was rank-reduced out of
+    /// the enforced representative face: it is linearly dependent on the
+    /// representatives, so the ordinary add/release transitions dead-end — it
+    /// can be neither re-added (already active) nor released (not a
+    /// representative). An over-complete face is inconsistent as EQUALITIES, so
+    /// the method must adjudicate it by an active-set EXCHANGE rather than
+    /// silently truncate it: release the representative the violated row is most
+    /// positively aligned with, freeing that dependent direction so the violated
+    /// row becomes an independent representative and binds on the next
+    /// iteration. Returns the FULL representative group (representative +
+    /// exactly-parallel dependents) to release, or `None` when no positively
+    /// aligned representative exists (the caller then defers to the exit gate).
+    /// Deterministic lowest-original-index tie-break.
+    fn over_complete_release_group(
+        &self,
+        violated: ndarray::ArrayView1<'_, f64>,
+        active: &[usize],
+    ) -> Option<Vec<usize>> {
+        let v_norm = violated.dot(&violated).sqrt();
+        if !(v_norm > 0.0) {
+            return None;
+        }
+        const COS_TIE_TOL: f64 = 1e-12;
+        let mut best: Option<(f64, (usize, usize), usize)> = None;
+        for (group_pos, group) in self.groups.iter().enumerate() {
+            let rep = self.constraints.a.row(group_pos);
+            let rep_norm = rep.dot(&rep).sqrt();
+            if !(rep_norm > 0.0) {
+                continue;
+            }
+            let cos = rep.dot(&violated) / (rep_norm * v_norm);
+            if cos <= 0.0 {
+                continue;
+            }
+            let first = group.first().copied().unwrap_or(usize::MAX);
+            let key = (active.get(first).copied().unwrap_or(usize::MAX), first);
+            let take = match &best {
+                None => true,
+                Some((best_cos, best_key, _)) => {
+                    cos > best_cos + COS_TIE_TOL
+                        || ((cos - best_cos).abs() <= COS_TIE_TOL && key < *best_key)
+                }
+            };
+            if take {
+                best = Some((cos, key, group_pos));
+            }
+        }
+        best.map(|(_, _, group_pos)| self.groups[group_pos].clone())
+    }
 }
 
 pub(crate) fn compress_active_working_set(
@@ -1792,45 +1853,60 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
         orig_to_out.insert(orig_idx, out_idx);
     }
 
+    // (A)-strict merge, matching the shared `dense_reduced_face` /
+    // `khatri_rao_cone_reduced_face` `ReducedFace` contract. A dropped row joins
+    // a representative's group — and receives a distributed multiplier — ONLY
+    // when it is exactly PARALLEL to that representative (the same half-space up
+    // to positive scale). A GENERAL-POSITION dependent — dependent only because
+    // more normals bind than the face dimension (e.g. three normals inside a 2-D
+    // coupled block) — is dropped outright with NO group entry and NO
+    // multiplier: it re-enters the working set via the next feasibility scan and
+    // is never conflated with a different half-space's dual (#979). The former
+    // `best_positive_align` merge folded such a row into whichever kept row it
+    // was most positively aligned with, silently truncating a general-position
+    // active row out of the enforced face and pinning the wrong vertex (#2378).
+    const PARALLEL_COS_TOL: f64 = 1.0 - 1e-9;
     for &dropped_idx in &dropped_orig {
         let dropped_row = a.row(dropped_idx);
         let dropped_norm = dropped_row.dot(&dropped_row).sqrt();
-        let mut best_positive_align = -1.0_f64;
-        let mut best_positive_target: Option<(usize, f64)> = None;
-        let mut best_abs_align = -1.0_f64;
-        let mut best_signed_target = (kept_orig[0], 1.0_f64);
+        let mut best_abs_cos = 0.0_f64;
+        let mut best_target: Option<(usize, f64)> = None;
         for &kept_idx in &kept_orig {
             let kept_row = a.row(kept_idx);
             let kept_norm = kept_row.dot(&kept_row).sqrt();
             let dot = kept_row.dot(&dropped_row);
-            let align = if kept_norm > 0.0 && dropped_norm > 0.0 {
+            let cos = if kept_norm > 0.0 && dropped_norm > 0.0 {
                 dot / (kept_norm * dropped_norm)
             } else {
-                dot
+                0.0
             };
             let coeff = if kept_norm > 0.0 {
                 dot / (kept_norm * kept_norm)
             } else {
                 0.0
             };
-            if align.abs() > best_abs_align {
-                best_abs_align = align.abs();
-                best_signed_target = (kept_idx, coeff);
-            }
-            if coeff > 0.0 && align > best_positive_align {
-                best_positive_align = align;
-                best_positive_target = Some((kept_idx, coeff));
+            if cos.abs() > best_abs_cos {
+                best_abs_cos = cos.abs();
+                best_target = Some((kept_idx, coeff));
             }
         }
-        let (best_target, coeff) = best_positive_target.unwrap_or(best_signed_target);
-        let &out_idx = orig_to_out
-            .get(&best_target)
-            .expect("merge target must be a kept row");
-        for &active_pos in &groups[dropped_idx] {
-            multiplier_dependence[out_idx].push(ActiveRowDependence { active_pos, coeff });
-        }
-        if coeff > 0.0 {
-            groups_out[out_idx].extend_from_slice(&groups[dropped_idx]);
+        // Only an exactly-parallel dependent is recorded; a general-position
+        // drop carries no phantom distributed dual. The group (whose whole-set
+        // release the working-set loop drives) additionally requires POSITIVE
+        // parallelism — same constraint up to positive scale — so an opposing
+        // (anti-parallel) tight row is never released together with it.
+        if best_abs_cos >= PARALLEL_COS_TOL {
+            if let Some((target, coeff)) = best_target {
+                let &out_idx = orig_to_out
+                    .get(&target)
+                    .expect("merge target must be a kept row");
+                for &active_pos in &groups[dropped_idx] {
+                    multiplier_dependence[out_idx].push(ActiveRowDependence { active_pos, coeff });
+                }
+                if coeff > 0.0 {
+                    groups_out[out_idx].extend_from_slice(&groups[dropped_idx]);
+                }
+            }
         }
     }
 
@@ -2339,14 +2415,53 @@ fn solve_newton_direction_with_linear_constraints_impl(
                 continue;
             }
             if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
-                // The worst-violating row is already in the active set —
-                // the KKT step failed to restore its feasibility, typically
-                // because a previous iteration's `alpha`-clip prevented the
-                // full residual closure. Fall through to the post-loop exit
-                // gate, which inspects the iterate's full KKT residuals and
-                // either tries the projected-gradient fallback or returns
-                // an explicit error. Both are correct outcomes; silently
-                // returning the infeasible direction is not.
+                // The worst-violating row is already active. Distinguish two
+                // cases by whether it is ENFORCED by the compressed face:
+                let worst_pos = active.iter().position(|&idx| idx == worst_row);
+                let enforced = worst_pos.is_some_and(|pos| compressed_working.position_enforced(pos));
+                if !enforced {
+                    // Over-complete face (#2378): the row is active but was
+                    // rank-reduced out of the enforced representative face (it is
+                    // linearly dependent on the reps). It can be neither re-added
+                    // (already active) nor released (not a representative), so the
+                    // plain add/release loop dead-ends here. Adjudicate by an
+                    // active-set EXCHANGE — release the representative it is most
+                    // aligned with so it becomes independent and binds next
+                    // iteration — instead of truncating it.
+                    if let Some(mut group) = compressed_working
+                        .over_complete_release_group(constraints.a.row(worst_row), &active)
+                    {
+                        group.sort_unstable_by(|a, b| b.cmp(a));
+                        let mut released = None;
+                        for active_pos in group {
+                            let idx = active.remove(active_pos);
+                            is_active[idx] = false;
+                            released = Some(idx);
+                        }
+                        log_active_set_transition(
+                            "release-over-complete-face",
+                            iteration,
+                            active.len(),
+                            released,
+                        );
+                        if !record_active_working_set(
+                            &mut visited_working_sets,
+                            &active,
+                            &x,
+                            iteration,
+                        ) {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                // Enforced-but-unclosed (an `alpha`-clip prevented the full
+                // residual closure) or no positively-aligned representative to
+                // exchange: fall through to the post-loop exit gate, which
+                // inspects the iterate's full KKT residuals and either tries the
+                // projected-gradient fallback or returns an explicit error. Both
+                // are correct outcomes; silently returning the infeasible
+                // direction is not.
                 break;
             }
             if compressed_working.groups.is_empty() {
@@ -3296,6 +3411,49 @@ fn solve_newton_direction_with_constraint_set_impl(
                 continue;
             }
             if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+                // The worst-violating row is already active. If it is not
+                // ENFORCED by the compressed face it was rank-reduced out as
+                // linearly dependent on the representatives — an over-complete
+                // face (#2378): three coupled-block normals bind but only two
+                // are independent, so the third is neither re-addable (already
+                // active) nor releasable (not a representative) and the loop
+                // dead-ends. Adjudicate it by an active-set EXCHANGE: release the
+                // representative it is most aligned with so it becomes an
+                // independent representative and binds next iteration.
+                let worst_pos = active.iter().position(|&idx| idx == worst_row);
+                let enforced =
+                    worst_pos.is_some_and(|pos| compressed_working.position_enforced(pos));
+                if !enforced {
+                    let violated_unit = ops.gather_unit_rows(&[worst_row])?;
+                    if let Some(mut group) = compressed_working
+                        .over_complete_release_group(violated_unit.a.row(0), &active)
+                    {
+                        group.sort_unstable_by(|a, b| b.cmp(a));
+                        let mut released = None;
+                        for active_pos in group {
+                            let idx = active.remove(active_pos);
+                            is_active[idx] = false;
+                            count_release += 1;
+                            released = Some(idx);
+                        }
+                        log_active_set_transition(
+                            "release-over-complete-face",
+                            iteration,
+                            active.len(),
+                            released,
+                        );
+                        if !record_active_working_set(
+                            &mut visited_working_sets,
+                            &active,
+                            &x,
+                            iteration,
+                        ) {
+                            ws_repeat_break = true;
+                            break;
+                        }
+                        continue;
+                    }
+                }
                 break;
             }
             if compressed_working.groups.is_empty() {

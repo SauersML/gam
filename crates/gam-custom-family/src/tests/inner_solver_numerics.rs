@@ -2865,7 +2865,12 @@ pub(crate) fn quadratic_linear_constraints_singular_kkt_uses_pseudoinverse_fallb
 
 #[test]
 pub(crate) fn rank_reduce_drops_exactly_dependent_row() {
-    // Row 3 = Row 1 + Row 2 exactly. Rank reduction should drop it.
+    // Row 3 = Row 1 + Row 2 exactly. Rank reduction should drop it. It is a
+    // GENERAL-POSITION dependent (cos = 1/√2 with each representative, parallel
+    // to neither), so under the (A)-strict `ReducedFace` contract it is dropped
+    // outright with NO group entry — it carries no phantom distributed dual and
+    // re-enters via the next feasibility scan (#2378). The former loose merge
+    // folded it into whichever kept row it was most positively aligned with.
     let a = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0],];
     let b = array![0.0, 0.0, 0.0];
     let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
@@ -2882,11 +2887,42 @@ pub(crate) fn rank_reduce_drops_exactly_dependent_row() {
         a_out.nrows()
     );
     assert_eq!(b_out.len(), 2);
-    // The third constraint id should have been merged into one of the first two rows.
+    // The general-position third row carries NO group entry: only the two
+    // independent representatives remain.
+    let total_constraint_ids: usize = member_constraint_ids_out.iter().map(|g| g.len()).sum();
+    assert_eq!(
+        total_constraint_ids, 2,
+        "a general-position dependent must be dropped, not merged into a group"
+    );
+}
+
+/// A parallel dependent (Row 3 = 2·Row 1) IS still folded into its
+/// representative's group under the (A)-strict contract — it is the same
+/// half-space up to positive scale, so its whole-group release is well defined.
+#[test]
+pub(crate) fn rank_reduce_merges_parallel_dependent_row() {
+    let a = array![[1.0, 0.0], [0.0, 1.0], [2.0, 0.0],];
+    let b = array![0.0, 0.0, 0.0];
+    let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
+    let (a_out, _b_out, member_constraint_ids_out, _) =
+        gam_solve::active_set::rank_reduce_rows_pivoted_qr_with_dependence(
+            a,
+            b,
+            member_constraint_ids,
+        );
+    assert_eq!(a_out.nrows(), 2, "rank is 2");
+    // Row 2 is parallel to row 0, so all three ids survive in the groups.
     let total_constraint_ids: usize = member_constraint_ids_out.iter().map(|g| g.len()).sum();
     assert_eq!(
         total_constraint_ids, 3,
-        "all original constraint ids must be preserved"
+        "an exactly-parallel dependent stays grouped with its representative"
+    );
+    // Its group holds both {0, 2}.
+    assert!(
+        member_constraint_ids_out
+            .iter()
+            .any(|g| g.contains(&0) && g.contains(&2)),
+        "parallel rows 0 and 2 share a group: {member_constraint_ids_out:?}"
     );
 }
 
@@ -2902,11 +2938,12 @@ pub(crate) fn rank_reduce_preserves_full_rank_matrix() {
             member_constraint_ids,
         );
     // All three rows are independent in R^2 (but we only have rank 2).
-    // The first two span R^2, so row 3 = row 1 + row 2 is dependent.
+    // The first two span R^2, so row 3 = row 1 + row 2 is dependent — and
+    // general-position (parallel to neither rep), so it is dropped with no group.
     assert_eq!(a_out.nrows(), 2);
     assert_eq!(b_out.len(), 2);
     let total_constraint_ids: usize = member_constraint_ids_out.iter().map(|g| g.len()).sum();
-    assert_eq!(total_constraint_ids, 3);
+    assert_eq!(total_constraint_ids, 2);
 }
 
 /// gam#1088 fail-loudly contract, constrained arm. A `NaN` in an exact-Newton
