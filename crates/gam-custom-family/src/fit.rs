@@ -658,6 +658,7 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
     layout: &PenaltyLabelLayout,
     n_rho: usize,
     ceiling: f64,
+    lower: f64,
 ) -> Result<Array1<f64>, CustomFamilyError> {
     gam_problem::validate_log_strength(ceiling).map_err(|error| {
         CustomFamilyError::InvalidInput {
@@ -665,12 +666,32 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
             reason: error.to_string(),
         }
     })?;
-    gam_problem::validate_log_strength(-ceiling).map_err(|error| {
+    // The edf-floor tightening must be evaluated against the SAME lower wall the
+    // optimizer will actually enforce (`options.rho_lower_bound`), not against a
+    // `-ceiling` proxy. The two are independent constants and are NOT equal in
+    // production: the uniform ceiling is `EFFECTIVE_DF_CEILING = 12` while the
+    // default `rho_lower_bound = -10`. Bisecting for / guarding the edf=1
+    // crossing against `-ceiling = -12` while the box floor sits at `-10` lets
+    // the crossing land in (-12, -10) and emits an upper bound BELOW the lower
+    // bound — an inverted ρ-box whose `f64::clamp(min, max)` in
+    // `project_to_bounds` panics with `min > max` across the FFI boundary
+    // (#2370). Anchoring every check on `lower` keeps the emitted upper bound
+    // strictly above the floor by construction.
+    gam_problem::validate_log_strength(lower).map_err(|error| {
         CustomFamilyError::InvalidInput {
             context: "effective-DF rho lower bound",
             reason: error.to_string(),
         }
     })?;
+    if !(lower < ceiling) {
+        return Err(CustomFamilyError::InvalidInput {
+            context: "effective-DF rho box",
+            reason: format!(
+                "rho lower bound {lower} is not below the uniform ceiling {ceiling}; \
+                 the admissible ρ-box is empty or degenerate"
+            ),
+        });
+    }
     let mut upper = Array1::<f64>::from_elem(n_rho, ceiling);
     let mut physical = 0usize;
     for spec in specs {
@@ -692,7 +713,7 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
             if !(edf_max > EFFECTIVE_DF_FLOOR) {
                 continue;
             }
-            // Bisect for ρ* with edf(ρ*) = floor on [−ceiling, ceiling]; edf is
+            // Bisect for ρ* with edf(ρ*) = floor on [lower, ceiling]; edf is
             // monotone decreasing in ρ. If edf at the ceiling still exceeds the
             // floor, the uniform ceiling already retains enough df — keep it.
             if unit_weight_term_edf(&gammas, ceiling)? >= EFFECTIVE_DF_FLOOR {
@@ -707,12 +728,14 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
             // rho-box before the data likelihood is even evaluated. This case
             // occurs for very weakly scaled range-space directions, including
             // dispersion location-scale smooths whose unit-weight generalized
-            // eigenvalues can put the edf=1 crossing just outside the default
-            // [-10, 10] rho box.
-            if unit_weight_term_edf(&gammas, -ceiling)? <= EFFECTIVE_DF_FLOOR {
+            // eigenvalues can put the edf=1 crossing just outside the `lower`
+            // wall of the rho box. Evaluating at `lower` (the real floor) rather
+            // than `-ceiling` guarantees the crossing bracketed below is strictly
+            // inside `(lower, ceiling)`, so the emitted upper stays above `lower`.
+            if unit_weight_term_edf(&gammas, lower)? <= EFFECTIVE_DF_FLOOR {
                 continue;
             }
-            let mut lo = -ceiling;
+            let mut lo = lower;
             let mut hi = ceiling;
             for _ in 0..64 {
                 let mid = 0.5 * (lo + hi);
@@ -724,9 +747,10 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
             }
             let rho_star = 0.5 * (lo + hi);
             // Tied coordinates: take the tightest (smallest) bound across terms,
-            // so every term sharing this λ retains at least the floor.
+            // so every term sharing this λ retains at least the floor. Guarding
+            // on `lower` keeps the emitted upper strictly above the box floor.
             let slot = &mut upper[outer];
-            if rho_star > -ceiling + 1e-6 && rho_star < *slot {
+            if rho_star > lower + 1e-6 && rho_star < *slot {
                 *slot = rho_star;
             }
         }
@@ -1237,7 +1261,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // λ-upper-side dual of the #752 full-subspace logdet work.
         .with_bounds(
             Array1::<f64>::from_elem(n_rho, options.rho_lower_bound),
-            effective_df_floor_rho_upper_bounds(specs, &label_layout, n_rho, EFFECTIVE_DF_CEILING)?,
+            effective_df_floor_rho_upper_bounds(
+                specs,
+                &label_layout,
+                n_rho,
+                EFFECTIVE_DF_CEILING,
+                options.rho_lower_bound,
+            )?,
         );
     // Install the seed-screening cap only when initial-rho screening is
     // wanted. A caller that pins an already-identified `initial_rho` and

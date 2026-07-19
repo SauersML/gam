@@ -3900,6 +3900,31 @@ pub(crate) fn run_outer_uncertified(
 ) -> Result<OuterResult, EstimationError> {
     let cap = primary_capability_for_config(obj.capability(), config, context);
     cap.validate_layout(context)?;
+    // #2370: reject a degenerate / inverted ρ-box up front, as a typed error.
+    // Every downstream stage — the per-atom EFS path below and
+    // `run_outer_with_plan` — projects seeds against these bounds with
+    // `f64::clamp`, whose `min > max` (or NaN) precondition panics *inside the
+    // Rust boundary* and surfaces as an opaque `GamError: ... panicked` across
+    // the FFI, violating the fail-loudly contract. The configured box can invert
+    // whenever an independently-derived upper bound drifts below the lower wall
+    // (e.g. the custom-family effective-df ceiling vs. `rho_lower_bound`).
+    // Validating the *effective* template here — the same one every consumer
+    // reads — turns any such inversion into `EstimationError::InvalidInput`
+    // regardless of how the bounds were constructed.
+    {
+        let (bound_lo, bound_hi) = outer_bounds_template(config, cap.n_params);
+        for i in 0..bound_lo.len() {
+            if !(bound_lo[i].is_finite() && bound_hi[i].is_finite()) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "{context}: outer rho bounds are non-finite at coordinate {i}: \
+                     lower={}, upper={}",
+                    bound_lo[i], bound_hi[i]
+                )));
+            }
+        }
+        outer_bounds(&bound_lo, &bound_hi)
+            .map_err(|err| EstimationError::InvalidInput(format!("{context}: {err}")))?;
+    }
     if let Some(initial_rho) = config.initial_rho.as_ref() {
         cap.theta_layout()
             .validate_point_len(initial_rho, "initial outer seed")
