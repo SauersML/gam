@@ -1839,7 +1839,27 @@ mod tests {
             mu[0],
             jet.mu
         );
-        let expected_z = eta[0] + (y[0] - jet.mu) / jet.d1;
+        // `mu` rounds to EXACTLY 1.0 here: 1 - e^-50 is not representable
+        // distinctly from 1 (e^-50 = 1.93e-22, machine epsilon = 2.2e-16). So
+        // reconstructing the residual as `y - jet.mu` CANCELS to zero and would
+        // claim z == eta — i.e. that this observation carries no information,
+        // which is precisely the tail-mass loss this test exists to catch.
+        //
+        // Production avoids that by rebuilding `y - mu` from the tail complement
+        // (`canonical_logit_working_response`: "mu may round to exactly zero or
+        // one while exp(-|eta|) and the score remain representable"), so the
+        // reference here must be built the same way:
+        //     tail = e^{-|eta|},  1 - mu = tail/(1+tail),  d1 = tail/(1+tail)^2
+        // hence for y = 1,  (y - mu)/d1 = 1 + tail  (= 51 at eta = 50).
+        let tail = (-eta[0].abs()).exp();
+        let one_minus_mu = tail / (1.0 + tail);
+        let expected_z = eta[0] + one_minus_mu / jet.d1;
+        assert!(
+            (expected_z - (eta[0] + 1.0 + tail)).abs() <= 1e-12,
+            "stable working-response reference disagrees with its closed form: {} vs {}",
+            expected_z,
+            eta[0] + 1.0 + tail
+        );
         assert!(
             (z[0] - expected_z).abs() < 1e-12,
             "pure logit PIRLS z should preserve the exact working response at eta={}; got {} vs {}",
@@ -1847,12 +1867,22 @@ mod tests {
             z[0],
             expected_z
         );
+        // Same cancellation trap as above, and here it defeated the assertion's
+        // own purpose: `y[0] - jet.mu` evaluates to 0 at this eta, so the check
+        // "the score carrier preserves y-mu" was satisfied by any implementation
+        // that ALSO lost the tail mass to zero — the exact regression the test is
+        // named for. The true residual is the stable complement, so compare
+        // against that:  w·(z-eta) = d1·(1+tail) = tail/(1+tail) = 1-mu.
         assert!(
-            (weights[0] * (z[0] - eta[0]) - (y[0] - jet.mu)).abs() < 1e-30,
+            (weights[0] * (z[0] - eta[0]) - one_minus_mu).abs() < 1e-30,
             "pure logit PIRLS score carrier should preserve y-mu at eta={}; got {} vs {}",
             eta[0],
             weights[0] * (z[0] - eta[0]),
-            y[0] - jet.mu
+            one_minus_mu
+        );
+        assert!(
+            one_minus_mu > 0.0,
+            "the tail residual must not be the cancelled zero this test guards against"
         );
     }
 

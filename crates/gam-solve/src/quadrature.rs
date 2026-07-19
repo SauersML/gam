@@ -6072,10 +6072,42 @@ mod tests {
         assert_eq!(probit.d2, -mu * pdf);
         assert_eq!(probit.d3, (mu * mu - 1.0) * pdf);
 
+        // eta = -710 is where the NAIVE `1/(1 + exp(-eta))` would overflow (`exp`
+        // tops out near +709.78, so `exp(710)` is `inf` and the naive quotient
+        // collapses to a flat zero jet). It is NOT where the logistic tail stops
+        // being representable: `exp(-710) = 4.476e-309` is a perfectly good
+        // subnormal, and the f64 tail survives to roughly eta = -745. The stable
+        // implementation returns that exact tail, and `canonicalzero` keeps it on
+        // purpose — "a nonzero subnormal is still a representable derivative and
+        // must survive: replacing it by zero creates an artificial constant tail
+        // and a kink at MIN_POSITIVE". Asserting zero here would have pinned the
+        // overflow artifact this function exists to avoid.
+        //
+        // At this eta, `t = exp(eta)` is far below machine epsilon, so `1 + t == 1`
+        // exactly and the whole jet collapses onto `t`:
+        //     mu = t/(1+t) = t,  d1 = mu(1-mu) = t,
+        //     d2 = d1(1-2mu)   = t,  d3 = d1(1-6mu+6mu^2) = t.
+        let tail = (-710.0_f64).exp();
+        assert!(
+            tail > 0.0 && tail < f64::MIN_POSITIVE,
+            "eta=-710 must sit in the subnormal tail, not underflow"
+        );
         let logit = component_point_jet(LinkComponent::Logit, -710.0);
-        assert_eq!(logit.1, 0.0);
-        assert_eq!(logit.2, 0.0);
-        assert_eq!(logit.3, 0.0);
+        assert_eq!(logit.0, tail);
+        assert_eq!(logit.1, tail);
+        assert_eq!(logit.2, tail);
+        assert_eq!(logit.3, tail);
+
+        // Only PAST the representable tail may the jet legitimately vanish.
+        assert_eq!(
+            (-750.0_f64).exp(),
+            0.0,
+            "eta=-750 must underflow f64 for this arm to mean anything"
+        );
+        let underflowed = component_point_jet(LinkComponent::Logit, -750.0);
+        assert_eq!(underflowed.1, 0.0);
+        assert_eq!(underflowed.2, 0.0);
+        assert_eq!(underflowed.3, 0.0);
     }
 
     #[test]
