@@ -14,7 +14,7 @@ use crate::estimate::smoothing_correction::AUTO_CUBATURE_MAX_EIGENVECTORS;
 use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
-use gam_problem::{SeedConfig, SeedRiskProfile};
+use gam_problem::{OrderedRhoBounds, SeedConfig, SeedRiskProfile};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -898,12 +898,19 @@ where
             // identifiable. Same machinery as the gam#1266 double-penalty rescue.
             let caller_seeded_rho = rho_warm_start.is_some_and(|h| h.len() == k);
             let prepass_seed: Option<Array1<f64>> = {
+                // Validate the seed ρ-box ONCE, at the boundary where it enters the
+                // seed machinery, and REFUSE an inverted/non-finite interval rather
+                // than silently reordering it (#2379). An inverted `[lo, hi]` means
+                // the ρ lower wall and the over-smoothing ceiling — two
+                // independently-owned constants — have drifted apart (the #2370
+                // disease); a swap here would make the optimizer solve a different,
+                // silently substituted box and still return a fitted model.
+                // `run_outer_uncertified` already enforces this contract at the outer
+                // entry; the prepass must not undercut it. Crucially the raw pair is
+                // validated BEFORE the `RHO_BOUND` widening below, so the widening
+                // can never silently un-invert a drifted box.
                 let bnds = reml_seed_config.bounds;
-                let (lo, hi_seed) = if bnds.0 <= bnds.1 {
-                    bnds
-                } else {
-                    (bnds.1, bnds.0)
-                };
+                let raw_bounds = OrderedRhoBounds::new(bnds.0, bnds.1)?;
                 // The criterion-ranked prepass evaluates the TRUE REML/LAML cost, so
                 // it is safe — and necessary — to let it explore the full
                 // over-smoothing range the outer optimizer itself can reach
@@ -923,7 +930,11 @@ where
                 // overfit origin. The seed is still only adopted when it strictly
                 // lowers the REML cost, so well-balanced and single-penalty fits are
                 // unaffected.
-                let hi = hi_seed.max(crate::estimate::RHO_BOUND);
+                // Widen only the upper (over-smoothing) bound to the full range the
+                // outer optimizer can reach. `with_upper_at_least` only ever *raises*
+                // `hi`, so the box stays ordered by construction (`RHO_BOUND` is a
+                // finite constant) — no re-validation needed.
+                let seed_bounds = raw_bounds.with_upper_at_least(crate::estimate::RHO_BOUND);
                 // risk_shift is the default seed bias when no caller warm-start is given;
                 // it is NOT applied on top of a caller-supplied rho seed.
                 let risk_shift: f64 = match reml_seed_config.risk_profile {
@@ -937,9 +948,9 @@ where
                 // it unless it is strictly better. Otherwise anchor the default
                 // risk-shift origin to the weight scale (issue #877).
                 let base = if let Some(h) = rho_warm_start.filter(|h| h.len() == k) {
-                    Array1::from_iter(h.iter().map(|&v| v.clamp(lo, hi)))
+                    Array1::from_iter(h.iter().map(|&v| seed_bounds.clamp(v)))
                 } else {
-                    Array1::from_elem(k, (risk_shift + weight_log_geom_mean).clamp(lo, hi))
+                    Array1::from_elem(k, seed_bounds.clamp(risk_shift + weight_log_geom_mean))
                 };
                 // #2069 / #1575: the analytic mgcv-style `initial.sp` seed
                 // replaces the banned log-λ grid prepass. One commensurate-
@@ -967,7 +978,7 @@ where
                 //
                 // The generated-seed screen (`generate_rho_candidates` +
                 // `rank_seeds_with_screening`) remains the multi-basin backstop.
-                let initial_sp = reml_state.analytic_initial_sp_rho(&base, (lo, hi));
+                let initial_sp = reml_state.analytic_initial_sp_rho(&base, seed_bounds);
                 //   2. The certified single-λ (diagonal) profiled optimum on the
                 //      SUMMED penalty `Σ_j S_j`, broadcast to a uniform per-block
                 //      ρ. This is an honest one-dimensional restriction of the
@@ -988,13 +999,13 @@ where
                 // Treat an errored candidate as absent (`None`) so the search still
                 // runs from the surviving seeds.
                 let summed_diagonal = reml_state
-                    .analytic_gaussian_profiled_diagonal_rho((lo, hi))
+                    .analytic_gaussian_profiled_diagonal_rho(seed_bounds)
                     .ok()
                     .flatten()
                     .map(|rho_blocks| {
                         let mut seed = base.clone();
                         for (coord, &r) in seed.iter_mut().zip(rho_blocks.iter()) {
-                            *coord = r.clamp(lo, hi);
+                            *coord = seed_bounds.clamp(r);
                         }
                         seed
                     });

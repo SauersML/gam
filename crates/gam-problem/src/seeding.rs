@@ -123,6 +123,88 @@ pub fn clamp_seed_rho_to_bounds(value: f64, bounds: (f64, f64)) -> f64 {
     value.clamp(lo, hi)
 }
 
+/// A validated, finite, ordered ρ (log-λ) seed interval `[lo, hi]`.
+///
+/// Every seed clamp in the outer-optimizer prepass and the candidate lattice
+/// derives a trial ρ and pins it into a single uniform box assembled from two
+/// *independently-owned* constants — the outer ρ lower wall
+/// (`options.rho_lower_bound`) and an over-smoothing ceiling (`RHO_BOUND` or an
+/// effective-df crossing). When those constants drift apart the interval inverts
+/// (`lo > hi`): the #2370 disease, where an edf-ceiling that used to equal
+/// `-rho_lower_bound` was moved by #2356 and the emitted upper bound dropped
+/// below the lower one. The historical response — *silently swapping* the pair
+/// (`normalize_seed_bounds`) — does not make the fit correct; it makes the
+/// optimizer solve a *different, silently substituted* box and return a model as
+/// if nothing were wrong. That is strictly worse than the panic it replaced: a
+/// panic is loud, a silently-wrong λ-box is not.
+///
+/// This type makes the inverted state unrepresentable. It is constructed only
+/// through [`OrderedRhoBounds::new`], which refuses an inverted or non-finite
+/// interval with the same typed [`EstimationError::InvalidInput`] the outer
+/// entry (`run_outer_uncertified`) now enforces (#2379 / #2370). Every downstream
+/// clamp then operates on an interval that is ordered *by construction*, so
+/// `f64::clamp`'s `min <= max` precondition can never be violated.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OrderedRhoBounds {
+    lo: f64,
+    hi: f64,
+}
+
+impl OrderedRhoBounds {
+    /// Validate and wrap a `[lo, hi]` ρ interval. Refuses (rather than silently
+    /// reorders) an inverted (`lo > hi`) or non-finite interval, naming both
+    /// endpoints. `lo == hi` is a valid degenerate single-point box.
+    pub fn new(lo: f64, hi: f64) -> Result<Self, crate::estimation_error::EstimationError> {
+        if !lo.is_finite() || !hi.is_finite() || lo > hi {
+            return Err(crate::estimation_error::EstimationError::InvalidInput(format!(
+                "seed ρ-box is inverted or non-finite: lower={lo}, upper={hi}; an \
+                 inverted box means the ρ lower wall and the over-smoothing ceiling \
+                 have drifted apart (cf. #2370) — refusing rather than silently \
+                 reordering the interval (#2379)"
+            )));
+        }
+        Ok(Self { lo, hi })
+    }
+
+    /// The (validated) lower endpoint.
+    #[inline]
+    pub fn lower(self) -> f64 {
+        self.lo
+    }
+
+    /// The (validated) upper endpoint.
+    #[inline]
+    pub fn upper(self) -> f64 {
+        self.hi
+    }
+
+    /// Clamp `value` into `[lo, hi]`. Infallible: the interval is ordered by
+    /// construction, so `f64::clamp`'s `min <= max` precondition always holds.
+    #[inline]
+    pub fn clamp(self, value: f64) -> f64 {
+        value.clamp(self.lo, self.hi)
+    }
+
+    /// Raise the upper endpoint to at least `floor`, preserving orderedness.
+    ///
+    /// The criterion-ranked prepass widens its over-smoothing bound to the full
+    /// range the outer optimizer can reach (`RHO_BOUND`) so a genuinely large λ
+    /// seed is not clipped to the seed band. This only ever *raises* `hi`, so the
+    /// interval stays valid by construction. A non-finite `floor` is ignored to
+    /// preserve the finiteness invariant (callers pass the finite `RHO_BOUND`).
+    #[inline]
+    pub fn with_upper_at_least(self, floor: f64) -> Self {
+        if floor.is_finite() && floor > self.hi {
+            Self {
+                lo: self.lo,
+                hi: floor,
+            }
+        } else {
+            self
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

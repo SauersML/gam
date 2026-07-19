@@ -1,4 +1,5 @@
 use super::*;
+use gam_problem::OrderedRhoBounds;
 use std::sync::RwLock;
 
 impl<'a> RemlState<'a> {
@@ -3874,7 +3875,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn analytic_initial_sp_rho(
         &self,
         base: &Array1<f64>,
-        bounds: (f64, f64),
+        bounds: OrderedRhoBounds,
     ) -> Option<Array1<f64>> {
         let n_pen = self.canonical_penalties.len();
         let n_rho = base.len().min(n_pen);
@@ -3886,11 +3887,8 @@ impl<'a> RemlState<'a> {
         if gram_diag.len() != self.p {
             return None;
         }
-        let (lo, hi) = if bounds.0 <= bounds.1 {
-            bounds
-        } else {
-            (bounds.1, bounds.0)
-        };
+        // `bounds` is ordered by construction (`OrderedRhoBounds`); no defensive
+        // swap — an inverted box was refused at the seed-prepass boundary (#2379).
         let mut rho = base.clone();
         for j in 0..n_rho {
             let pen = &self.canonical_penalties[j];
@@ -3907,7 +3905,7 @@ impl<'a> RemlState<'a> {
             if tr_s > 0.0 && tr_xwx > 0.0 && tr_xwx.is_finite() {
                 let rho_j = (tr_xwx / tr_s).ln();
                 if rho_j.is_finite() {
-                    rho[j] = rho_j.clamp(lo, hi);
+                    rho[j] = bounds.clamp(rho_j);
                 }
             }
         }
@@ -3928,7 +3926,7 @@ impl<'a> RemlState<'a> {
     /// unaffected.
     pub(crate) fn analytic_gaussian_profiled_diagonal_rho(
         &self,
-        bounds: (f64, f64),
+        bounds: OrderedRhoBounds,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
         if !reml_is_gaussian_identity(&self.config.likelihood) {
             return Ok(None);
@@ -3986,12 +3984,9 @@ impl<'a> RemlState<'a> {
                 "Gaussian profiled diagonal seed returned a non-finite rho".to_string(),
             ));
         }
-        let (lo, hi) = if bounds.0 <= bounds.1 {
-            bounds
-        } else {
-            (bounds.1, bounds.0)
-        };
-        Ok(Some(Array1::from_elem(k, result.rho.clamp(lo, hi))))
+        // `bounds` is ordered by construction (`OrderedRhoBounds`); no defensive
+        // swap — an inverted box was refused at the seed-prepass boundary (#2379).
+        Ok(Some(Array1::from_elem(k, bounds.clamp(result.rho))))
     }
 
     /// Returns the effective Hessian and the ridge value used (if any).
