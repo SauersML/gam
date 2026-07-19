@@ -795,19 +795,6 @@ impl SaeManifoldTerm {
         // factor failed and the loop kept extending via `saw_refine_progress`
         // from earlier rounds, accumulating minutes of wasted work (#1094).
         let mut consecutive_objective_stalls: usize = 0;
-        // #2228 — the ½λ²/scale-MINIMIZING iterate seen across the inner
-        // solve (captured in the polish, where the decrement is computed per
-        // step). ACCEPTANCE KEYS ON THE CERTIFICATE, NOT ‖g‖ — the ‖g‖-min
-        // and ½λ²/scale-min iterates DIFFER near an indefinite mode, and the
-        // stall acceptance is priced on ½λ²/scale, so that is the honest
-        // best-seen. Read ONLY at the terminal give-up exits (FINAL-GATE +
-        // the non-convergence refusals); the continuation never reads it, so
-        // the iterating trajectory is byte-identical (unlike the prior
-        // restore-in-polish variants). The band is UNCHANGED: the decrement
-        // certificate floors at ~ε (quadratic in g), 8 orders under the 1e-8
-        // band, so a plateau above the band is a solver stall — reported
-        // honestly at best-seen, never accepted past the band.
-        let mut best_seen: Option<(f64, f64, SaeManifoldMutableState)> = None;
         // #2228 Stage-2 / #2132 — whether the terminal exact-Newton polish
         // (`terminal_exact_newton_polish`) is armed for the NEXT objective-stall
         // plateau. Re-armed by any materially-descending refine round, so a
@@ -1272,7 +1259,6 @@ impl SaeManifoldTerm {
                             previous_loss_total.abs() + 1.0,
                             options,
                             64,
-                            &mut best_seen,
                         )? {
                             *criterion_fixed_point = false;
                             consecutive_objective_stalls = 0;
@@ -1315,56 +1301,14 @@ impl SaeManifoldTerm {
                             final_db.view(),
                         )
                         .max(0.0);
-                        let excursion_cert =
+                        let predicted_relative_decrease =
                             0.5 * newton_decrement_sq / final_objective_scale;
-                        // #2228 — the acceptance verdict keys on the BEST-SEEN
-                        // certificate, not the excursion the polish left. The
-                        // band is UNCHANGED; a best-seen plateau ABOVE it is a
-                        // solver stall, refused honestly below with the best-
-                        // seen ‖g‖. When best-seen clears the band we certify
-                        // THERE (restore + re-factor) — the continuation is
-                        // over, so nothing consumes the restore.
-                        let best_clears = best_seen
-                            .as_ref()
-                            .is_some_and(|(c, _, _)| {
-                                *c < excursion_cert
-                                    && *c <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
-                            });
-                        if best_clears {
-                            let (best_cert, best_g, best_state) =
-                                best_seen.as_ref().expect("best_clears gated on Some");
-                            let excursion = self.snapshot_mutable_state();
-                            self.restore_mutable_state(best_state)?;
-                            let refactored = self
-                                .assemble_arrow_schur(target, rho, registry)
-                                .ok()
-                                .and_then(|mut best_sys| {
-                                    self.factor_deflated_evidence_with_grad_norms(
-                                        &mut best_sys,
-                                        &lambda_smooth,
-                                        options,
-                                    )
-                                    .ok()
-                                });
-                            if let Some(best_factor) = refactored {
-                                log::debug!(
-                                    "SAE #2228 certify-at-best-seen: ‖g‖ {grad_norm:.6e} \
-                                     \u{2192} {best_g:.6e}, ½λ²/scale {excursion_cert:.6e} \
-                                     \u{2192} {best_cert:.6e} after {total_inner_iter} iters"
-                                );
-                                return Ok(best_factor.cache);
-                            }
-                            // Re-factor at best-seen failed: restore the
-                            // excursion so state + final_cache stay consistent,
-                            // then fall through to the honest refusal below.
-                            self.restore_mutable_state(&excursion)?;
-                        } else if excursion_cert
-                            <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
+                        if predicted_relative_decrease <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
                         {
                             log::debug!(
                                 "SAE inner final-gate decrement acceptance: ‖g‖={grad_norm:.6e} \
                                  (tol {grad_tolerance:.6e}) λ²={newton_decrement_sq:.6e} \
-                                 ½λ²/scale={excursion_cert:.6e} after \
+                                 ½λ²/scale={predicted_relative_decrease:.6e} after \
                                  {total_inner_iter} inner iterations"
                             );
                             return Ok(final_cache);
@@ -1373,28 +1317,6 @@ impl SaeManifoldTerm {
                     // Inner solve did not converge; the returned Err carries
                     // the non-convergence diagnostic (gradient /
                     // quotient-gradient norms and the tolerance) to the caller.
-                    // #2228 — report a CONSISTENT best-seen snapshot: recompute
-                    // BOTH norms at the best-seen state, never the best-seen raw
-                    // mixed with the excursion's stale quotient. Terminal give-up
-                    // path, so the restore has no downstream state to corrupt.
-                    let (grad_norm, quotient_grad_norm) = match best_seen.as_ref() {
-                        Some((_, _, best_state)) => {
-                            self.restore_mutable_state(best_state)?;
-                            match self.assemble_arrow_schur(target, rho, registry) {
-                                Ok(best_sys) => {
-                                    let g2 = Self::system_grad_norm_sq(&best_sys);
-                                    let q = self.quotient_gradient_norm_from_system(
-                                        &best_sys,
-                                        g2,
-                                        &lambda_smooth,
-                                    );
-                                    (g2.sqrt(), q)
-                                }
-                                Err(_) => (grad_norm, quotient_grad_norm),
-                            }
-                        }
-                        None => (grad_norm, quotient_grad_norm),
-                    };
                     return Err(format!(
                         "SaeManifoldTerm::penalized_quasi_laplace_criterion: inner solve did not converge at fixed ρ; \
                          neither the KKT gradient ‖g‖={grad_norm:.6e} nor the quotient KKT gradient \
@@ -1642,7 +1564,6 @@ impl SaeManifoldTerm {
                         // GMRES steps contract slower than pure quadratic, so
                         // the cap must not impersonate a convergence bound.
                         64,
-                        &mut best_seen,
                     )? {
                         *criterion_fixed_point = false;
                         consecutive_objective_stalls = 0;
@@ -1658,19 +1579,6 @@ impl SaeManifoldTerm {
                 // the extended progress budget indefinitely.
                 consecutive_objective_stalls += 1;
                 if consecutive_objective_stalls >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
-                    // #2228 — recompute the raw ‖g‖ at the best-seen state so the
-                    // reported residual is the best-seen iterate's, not the
-                    // excursion's. Terminal give-up path; restore is safe.
-                    let grad_norm = match best_seen.as_ref() {
-                        Some((_, _, best_state)) => {
-                            self.restore_mutable_state(best_state)?;
-                            match self.assemble_arrow_schur(target, rho, registry) {
-                                Ok(best_sys) => Self::system_grad_norm_sq(&best_sys).sqrt(),
-                                Err(_) => grad_norm,
-                            }
-                        }
-                        None => grad_norm,
-                    };
                     return Err(format!(
                         "SaeManifoldTerm::penalized_quasi_laplace_criterion: inner solve did not converge at fixed ρ; \
                          objective stalled for {consecutive_objective_stalls} consecutive refine \
@@ -1876,11 +1784,6 @@ impl SaeManifoldTerm {
         objective_scale: f64,
         options: &ArrowSolveOptions,
         max_steps: usize,
-        // #2228 — caller's cross-round best-seen accumulator, keyed on the
-        // ½λ²/scale certificate. Captured HERE because the polish is where the
-        // decrement is evaluated per step and where ‖g‖ walks up off the
-        // certificate-min iterate.
-        best_seen: &mut Option<(f64, f64, SaeManifoldMutableState)>,
     ) -> Result<bool, String> {
         let mut made_progress = false;
         let mut prev_grad_norm = f64::INFINITY;
@@ -1935,14 +1838,6 @@ impl SaeManifoldTerm {
                 factor.delta_beta.view(),
             )
             .max(0.0);
-            let cert = if objective_scale.is_finite() && objective_scale > 0.0 {
-                0.5 * decrement_sq / objective_scale
-            } else {
-                f64::INFINITY
-            };
-            if cert.is_finite() && best_seen.as_ref().is_none_or(|(c, _, _)| cert < *c) {
-                *best_seen = Some((cert, grad_norm, self.snapshot_mutable_state()));
-            }
             if !(grad_norm < prev_grad_norm) && !(decrement_sq < prev_decrement_sq) {
                 log::debug!(
                     "terminal Newton bail: no contraction in either currency \

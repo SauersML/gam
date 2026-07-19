@@ -521,18 +521,35 @@ mod fit_tests {
         // Tier-0 mean captured the +1 / -0.5 offsets it was given.
         assert!(report.tier0.mean.iter().all(|m| m.is_finite()));
         assert!(report.tier2.is_none(), "linear_bulk disables Tier-2");
+        // #2275 TRICHOTOMY, best-effort arm: K=6 over ~2 planted planes is over-complete,
+        // so the fit reaches its EV plateau (returns) while the spurious blocks keep the
+        // frame residual open. The honest verdict is `certified = false` with the open
+        // frame residual RECORDED (finite) — a returnable best-effort fit, not an error
+        // and not a false "certified". (The certified arm is exercised by the
+        // exactly-determined block-lane fits in `block_tests.rs`.)
         assert!(
-            report.tier1.convergence.frame_residual <= report.tier1.convergence.tolerance,
-            "every returned tiered fit must carry a closed frame certificate"
+            !report.tier1.convergence.certified,
+            "an over-complete linear-bulk fit is BEST-EFFORT (certified=false); got certified=true, frame_residual={} tol={}",
+            report.tier1.convergence.frame_residual,
+            report.tier1.convergence.tolerance
+        );
+        assert!(
+            report.tier1.convergence.frame_residual.is_finite(),
+            "the open frame residual must be recorded (finite) on a best-effort certificate"
         );
     }
 
     /// #2275: at `K ≫ intrinsic-rank` the frame-projector fixed point legitimately
     /// does not certify — ~`K − rank` blocks are structurally spurious and AuxK
     /// revival churns their frames every epoch, pinning `frame_residual` above
-    /// tolerance. Such an iterate must be refused before Tier-2 consumes it.
+    /// tolerance. The fit's OBJECTIVE (reconstruction EV / routing scale) still
+    /// reaches its achievable plateau, so the tiered driver RETURNS a Tier-1 fit
+    /// carrying a typed OPEN certificate (`certified = false`) and runs Tier-2 on its
+    /// residual — it does NOT collapse to `Err` and skip Tier-2 (the wrong contract
+    /// the #2023 checkpoint sweep installed and laundered green by inverting this
+    /// test; see the #2275 history on fba60f1f2/c21cc2c77).
     #[test]
-    fn tiered_refuses_open_certificate_at_k_gg_rank_2275() {
+    fn tiered_returns_best_effort_open_certificate_at_k_gg_rank_2275() {
         // Rank-1 planted structure (a single direction in cols 0,1) in P=8, fit with
         // K = G·b = 16 blocks of size b=1: ~15 blocks are structurally spurious.
         let n = 96usize;
@@ -548,17 +565,67 @@ mod fit_tests {
         config.tier1.aux_k = 4; // revival ON: spurious frames churn -> cannot certify
         config.tier1.max_epochs = 40;
 
-        fit_tiered(z.view(), &config)
-            .expect_err("Tier-2 must never consume an unconverged Tier-1 iterate");
+        // The objective plateaus, so the tiered fit RETURNS instead of erroring — that
+        // IS the #2275 acceptance criterion.
+        let report = fit_tiered(z.view(), &config)
+            .expect("#2275: best-effort tiered fit must RETURN at K ≫ rank, not error");
+
+        // Typed OPEN certificate: not certified, and the frame residual quantifies how
+        // open — while the objective residuals sit at their achievable plateau.
+        assert!(
+            !report.tier1.convergence.certified,
+            "K ≫ rank fit must carry an OPEN certificate; got certified=true              (frame_residual={}, tol={})",
+            report.tier1.convergence.frame_residual,
+            report.tier1.convergence.tolerance
+        );
+        assert!(
+            report.tier1.convergence.frame_residual > report.tier1.convergence.tolerance,
+            "an open certificate must report frame_residual above tolerance; got {} <= {}",
+            report.tier1.convergence.frame_residual,
+            report.tier1.convergence.tolerance
+        );
+        // Best-effort (arm 2) means the EV reached its achievable PLATEAU
+        // (captured-fraction stationarity), NOT that ev_residual closed to the absolute
+        // tolerance — at K >> rank it plateaus above tol just as the frame does. The
+        // residual is RECORDED (finite); "no tolerance softening" is pinned by the
+        // exact-tolerance assertion below.
+        assert!(
+            report.tier1.convergence.ev_residual.is_finite(),
+            "the plateaued objective residual must be recorded (finite); got {}",
+            report.tier1.convergence.ev_residual
+        );
+        assert!(
+            report.tier1.explained_variance.is_finite(),
+            "best-effort Tier-1 EV must be finite"
+        );
+        // Tier-2 RAN on the best-effort Tier-1 residual — the clobbered contract never
+        // reached it.
+        assert!(
+            report.tier2.is_some(),
+            "#2275: Tier-2 must run on the best-effort Tier-1 residual"
+        );
+        assert!(
+            report.explained_variance.is_finite(),
+            "composed EV must be finite on the best-effort path"
+        );
+        // No tolerance softening: the open certificate is measured against the SAME
+        // configured tolerance, unchanged.
+        assert_eq!(
+            report.tier1.convergence.tolerance, config.tier1.tolerance,
+            "#2275 must NOT soften tolerance; the open certificate uses the configured tol"
+        );
     }
 
-    /// #2275: the block entry returns typed nonconvergence with the configured
-    /// tolerance and open residual; it never mints an uncertified fit.
+    /// #2275: at `K ≫ intrinsic-rank` the block entry RETURNS the best-effort fit with
+    /// a typed OPEN certificate (`certified = false`, frame residual above tolerance,
+    /// objective residuals at their achievable plateau) — it does NOT collapse the
+    /// objective-converged iterate to `Err`. The convergence decision is the
+    /// gauge-invariant objective plateau, not an absolute floor on the frame
+    /// fixed-point residual that an over-complete frame cannot reach (#2023/#2275).
     #[test]
-    fn block_sparse_open_fixed_point_is_a_typed_error_2275() {
+    fn block_sparse_open_fixed_point_returns_open_certificate_2275() {
         use crate::sparse_dict::{
-            BlockSeedPolicy, BlockSparseConfig, BlockSparseFitError,
-            fit_block_sparse_dictionary_with_seed,
+            BlockSeedPolicy, BlockSparseConfig, fit_block_sparse_dictionary_with_seed,
         };
         let n = 96usize;
         let p = 8usize;
@@ -573,26 +640,30 @@ mod fit_tests {
         config.aux_k = 4;
         config.max_epochs = 40;
 
-        let err = fit_block_sparse_dictionary_with_seed(
+        let fit = fit_block_sparse_dictionary_with_seed(
             x.view(),
             &config,
             BlockSeedPolicy::FarthestPoint,
         )
-        .expect_err("Err-contract entry must reject the non-certified K ≫ rank fit");
-        match err {
-            BlockSparseFitError::NonConvergence {
-                frame_residual,
-                tolerance,
-                ..
-            } => {
-                assert_eq!(tolerance, config.tolerance);
-                assert!(
-                    frame_residual > tolerance,
-                    "the typed error must report the open frame residual"
-                );
-            }
-            other => panic!("expected NonConvergence, got {other:?}"),
-        }
+        .expect("#2275: the block entry must RETURN the objective-converged open fit");
+        let c = &fit.convergence;
+        assert!(
+            !c.certified,
+            "a K ≫ rank fit must carry an OPEN certificate (certified=false); got              certified=true (frame_residual={}, tol={})",
+            c.frame_residual, c.tolerance
+        );
+        assert!(
+            c.frame_residual > c.tolerance,
+            "an open certificate must report frame_residual above tolerance; got {} <= {}",
+            c.frame_residual, c.tolerance
+        );
+        assert!(
+            c.ev_residual.is_finite(),
+            "the plateaued objective residual must be recorded (finite); got {}",
+            c.ev_residual
+        );
+        // No tolerance softening: the certificate is measured against the configured tol.
+        assert_eq!(c.tolerance, config.tolerance, "#2275 must NOT soften tolerance");
     }
 
     /// Planted 6-circle + linear-bulk mixture (#2023 acceptance): the tiered fit
