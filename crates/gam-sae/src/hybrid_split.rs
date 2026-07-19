@@ -556,6 +556,26 @@ fn curved_refit_rss(
 /// eligible charts), the curved arm's minimized RSS is `≤` the linear arm's up to
 /// solver tolerance, so the argmin is a genuine nested min-vs-min dominance
 /// comparison, not a post-fit compression heuristic.
+/// Why [`build_atom_candidates`] declined to produce a linear/curved candidate
+/// pair. The distinction is load-bearing (#2362): only a genuine coordinate
+/// collapse is a #1777 rescue site; every other refusal means the slot cannot be
+/// adjudicated at all and must be left curved, NOT decoded through a
+/// target-dependent rescue image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomCandidateRefusal {
+    /// The atom's own coordinate collapsed to a single point (`s_tt ≈ 0`, the
+    /// rank-1 "chord-through-the-arc" fixed point). The caller recovers a fresh
+    /// linear image from the residual's top direction (#1026/#1777).
+    CoordinateCollapse,
+    /// The candidate pair could not be built or priced for any other reason:
+    /// too few rows / shape mismatch, a non-finite or negative assignment mass,
+    /// zero or non-finite design weight, an absent or misshaped curved basis,
+    /// an unusable dispersion / `n_obs`, a rank-charge factorization failure, or
+    /// a non-finite evidence score. NONE of these is a collapse: there is no
+    /// degenerate curve to rescue, so the slot stays curved (unadjudicated).
+    Unadjudicable,
+}
+
 fn build_atom_candidates(
     coords: ArrayView1<'_, f64>,
     assign: ArrayView1<'_, f64>,
@@ -569,11 +589,14 @@ fn build_atom_candidates(
     // row count; `dispersion_r` is its reconstruction φ̂ (the MP-edge noise floor).
     n_obs: usize,
     dispersion_r: f64,
-) -> Option<(
-    HybridAtomCandidate,
-    HybridAtomCandidate,
-    (f64, Array1<f64>, Array1<f64>),
-)> {
+) -> Result<
+    (
+        HybridAtomCandidate,
+        HybridAtomCandidate,
+        (f64, Array1<f64>, Array1<f64>),
+    ),
+    AtomCandidateRefusal,
+> {
     let n = coords.len();
     let p = decoded.ncols();
     if n < MIN_ROWS_FOR_LINEAR_FIT
@@ -583,7 +606,7 @@ fn build_atom_candidates(
         || target_resid.ncols() != p
         || p == 0
     {
-        return None;
+        return Err(AtomCandidateRefusal::Unadjudicable);
     }
 
     // The LINEAR candidate fits `a_k·(b₀ + (t − t̄)·b₁)` to the residual `y_resp`,
@@ -596,14 +619,14 @@ fn build_atom_candidates(
     for i in 0..n {
         let a = assign[i];
         if !(a.is_finite() && a >= 0.0) {
-            return None;
+            return Err(AtomCandidateRefusal::Unadjudicable);
         }
         let w = a * a;
         w_sum += w;
         t_bar += w * coords[i];
     }
     if !(w_sum > 0.0) {
-        return None;
+        return Err(AtomCandidateRefusal::Unadjudicable);
     }
     t_bar /= w_sum;
 
@@ -615,8 +638,14 @@ fn build_atom_candidates(
         let dt = coords[i] - t_bar;
         s_tt += assign[i] * assign[i] * dt * dt;
     }
+    // The atom's OWN coordinate has collapsed to a single point (the #1777
+    // rank-1 "chord-through-the-arc" co-collapse). This is the SOLE refusal the
+    // hybrid split rescues: the caller recovers a fresh linear image from the
+    // residual's top direction. Every OTHER refusal in this function is
+    // `Unadjudicable` (the candidate pair cannot be built or priced) and must
+    // NOT mint a target-dependent rescue image (#2362).
     if !(s_tt > 1e-12 * (1.0 + t_bar * t_bar)) {
-        return None;
+        return Err(AtomCandidateRefusal::CoordinateCollapse);
     }
 
     // Per-output-channel mass-weighted least squares for the line fit to the
@@ -662,8 +691,11 @@ fn build_atom_candidates(
     // "curved match-or-beats linear" floor. Without an evaluable basis and exact
     // decoder refit there is no comparable curved-model evidence, so refuse the
     // adjudication instead of substituting a different objective.
-    let curved_phi = curved_phi.filter(|phi| phi.nrows() == n)?;
-    let curved_rss = curved_refit_rss(curved_phi, assign, target_resid)?;
+    let curved_phi = curved_phi
+        .filter(|phi| phi.nrows() == n)
+        .ok_or(AtomCandidateRefusal::Unadjudicable)?;
+    let curved_rss = curved_refit_rss(curved_phi, assign, target_resid)
+        .ok_or(AtomCandidateRefusal::Unadjudicable)?;
 
     // Gaussian-reconstruction deviance: the residual objective `½ RSS` the
     // Laplace normalizer is added to. The curved arm pays `½·curved_rss` (how
@@ -681,7 +713,7 @@ fn build_atom_candidates(
     let linear_num_params = 2 * p;
 
     if !(w_sum > 0.0 && w_sum.is_finite() && s_tt.is_finite()) {
-        return None;
+        return Err(AtomCandidateRefusal::Unadjudicable);
     }
     let (linear_nle, curved_nle) = {
         // #16 DEMOTE currency swap: charge ½·d_eff·log(n_obs) (realised decoder rank,
@@ -692,7 +724,7 @@ fn build_atom_candidates(
         // (curve earns Tier-2 iff Δloss > ½·Δd_eff·log n) then falls out of the SAME
         // select_hybrid_atom NLE comparison — one currency, no separate margin.
         if n_obs == 0 || !(dispersion_r.is_finite() && dispersion_r > 0.0) {
-            return None;
+            return Err(AtomCandidateRefusal::Unadjudicable);
         }
         let n_obs_ln = (n_obs as f64).ln();
         let n_eff = w_sum; // effective sample size Σa² (MP-edge aspect)
@@ -714,9 +746,10 @@ fn build_atom_candidates(
             0.0,
             None,
         )
-        .ok()?;
+        .map_err(|_| AtomCandidateRefusal::Unadjudicable)?;
         // Curved arm: refit decoder B + Gram G=ΦᵀWΦ on the same residual.
-        let (_, b_curved, g_curved) = curved_refit_decoder(curved_phi, assign, target_resid)?;
+        let (_, b_curved, g_curved) = curved_refit_decoder(curved_phi, assign, target_resid)
+            .ok_or(AtomCandidateRefusal::Unadjudicable)?;
         let d_curved = crate::manifold::realised_rank_charge_dof(
             &g_curved,
             &b_curved,
@@ -726,7 +759,7 @@ fn build_atom_candidates(
             0.0,
             None,
         )
-        .ok()?;
+        .map_err(|_| AtomCandidateRefusal::Unadjudicable)?;
         // DEVIANCE, not raw SSE (#2124 units fix): the rank charge `½·d_eff·ln n`
         // is dimensionless, so trading it against the bare `½·RSS` makes the
         // linear↔curved decision depend on the response scale (exactly the
@@ -745,12 +778,12 @@ fn build_atom_candidates(
         )
     };
     if !(linear_nle.is_finite() && curved_nle.is_finite()) {
-        return None;
+        return Err(AtomCandidateRefusal::Unadjudicable);
     }
 
     let linear = HybridAtomCandidate::linear(linear_nle, linear_num_params);
     let curved = HybridAtomCandidate::curved(1, curved_nle, curved_num_params, fitted_turning);
-    Some((linear, curved, (t_bar, b0, b1)))
+    Ok((linear, curved, (t_bar, b0, b1)))
 }
 
 /// #1026 collapse rescue. When a `d = 1` atom's own coordinate has collapsed to a
@@ -1179,7 +1212,7 @@ where
             n_obs,
             dispersion_r,
         ) {
-            Some((linear, curved, (t_bar, b0, b1))) => {
+            Ok((linear, curved, (t_bar, b0, b1))) => {
                 // #1026 PER-ATOM EV-PRESERVATION gate. Collapsing this slot raises
                 // the full reconstruction SSR by `linear_rss − curved_rss`; if that
                 // is more than `SAE_HYBRID_COLLAPSE_MAX_EV_LOSS` of the fixed total
@@ -1247,7 +1280,13 @@ where
             // its residual's best linear axis at linear quality instead of the
             // collapsed-curve constant. `None` only when the residual itself is
             // degenerate — then there is genuinely nothing to recover and we skip.
-            None => match build_collapse_rescue_linear_image(
+            //
+            // #2362 — ONLY the typed coordinate-collapse refusal reaches this
+            // rescue. Any other refusal (`Unadjudicable`) means the slot could not
+            // be adjudicated at all — there is no degenerate curve to rescue, and
+            // minting a target-dependent rescue image there is exactly the
+            // misclassification #2362 removes. Such a slot is left curved (skip).
+            Err(AtomCandidateRefusal::CoordinateCollapse) => match build_collapse_rescue_linear_image(
                 atom_idx,
                 assign.view(),
                 target_resid.view(),
@@ -1271,6 +1310,9 @@ where
                 }
                 None => continue,
             },
+            // #2362 — non-collapse refusal: the slot cannot be adjudicated, so it
+            // keeps its curved decoder (no rescue image, no verdict entry).
+            Err(AtomCandidateRefusal::Unadjudicable) => continue,
         }
     }
 
@@ -1785,8 +1827,10 @@ mod tests {
                 coords.len(),
                 0.0,
             )
-            .is_none(),
-            "a degenerate coordinate span must be refused"
+                        .map(|_| ())
+            .unwrap_err()
+                == AtomCandidateRefusal::CoordinateCollapse,
+            "a degenerate coordinate span must be refused as a coordinate collapse (#2362)"
         );
     }
 }

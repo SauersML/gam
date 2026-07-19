@@ -1384,9 +1384,26 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
     // residual `y_resp` equals its own mass-scaled contribution `a_k·γ_k`. The
     // common-evidence selector (#1202) scores both candidates against that
     // residual, so the target is required.
-    let target = term
+    // A PHYSICAL target: the term's curved reconstruction plus a tiny smooth
+    // residual, so the term does NOT reconstruct it to machine zero. This is
+    // REQUIRED for the hybrid split to run at all. `compute_hybrid_split_report`
+    // derives the rank-charge noise floor as `phi_hat = ||target - full||^2/(n*p)`;
+    // with `target == full` (the exact self-reconstruction this fixture used to
+    // pass) that floor is EXACTLY 0, at which `build_atom_candidates` cannot price
+    // the evidence and refuses every atom as `Unadjudicable` (#2362) -> an empty
+    // report. A real fit never reconstructs its target to zero. The perturbation
+    // is orders of magnitude below either atom's own contribution, so the
+    // straight-vs-curved discrimination below is unchanged; it only lifts phi_hat
+    // off the degenerate zero.
+    let full = term
         .try_fitted_for_rho(&rho)
         .expect("post-straighten curved reconstruction assembles");
+    let mut target = full.clone();
+    for i in 0..target.nrows() {
+        for j in 0..target.ncols() {
+            target[[i, j]] += 1.0e-3 * (0.7 * (i as f64 + 1.0) + 1.3 * (j as f64 + 1.0)).sin();
+        }
+    }
 
     // Compute and install the real hybrid-split report (closed-form, no outer
     // fit — sidesteps #1051).
@@ -1410,12 +1427,20 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
         "a straight atom must collapse at least one slot to the linear tail"
     );
 
-    // EV(curved) = 1 exactly, since the target IS the curved reconstruction.
-    let ev_curved = reconstruction_explained_variance(target.view(), target.view())
-        .expect("self-reconstruction EV defined");
+    // EV of the ALL-CURVED reconstruction against the physical target. The
+    // perturbation is tiny, so the curved fit still explains essentially all of
+    // the target — but not tautologically 1. (The prior `EV(target, target)`
+    // measured SELF-EV, which is 1 for any input and only looked meaningful when
+    // `target == full`.) The dominance floor below compares the COLLAPSED
+    // reconstruction against THIS curved baseline; because collapsing the
+    // straightened slot replaces its constant curve with the best straight line to
+    // the same residual, it can only match or beat the curved fit.
+    let ev_curved = reconstruction_explained_variance(target.view(), full.view())
+        .expect("curved-reconstruction EV defined");
     assert!(
-        (ev_curved - 1.0).abs() < 1e-12,
-        "target = curved fit ⇒ EV(curved) = 1; got {ev_curved}"
+        ev_curved > 0.99,
+        "the curved fit must explain essentially all of the barely-perturbed \
+         target; got {ev_curved}"
     );
 
     // The collapsed dictionary (straight slot decoded by its line) must
@@ -1584,9 +1609,26 @@ pub(crate) fn topk_reconstruction_composes_with_hybrid_collapse() {
             term.atoms[0].decoder_coefficients[[basis_row, out_col]] = 0.0;
         }
     }
-    let target = term
+    // A PHYSICAL target: the term's curved reconstruction plus a tiny smooth
+    // residual, so the term does NOT reconstruct it to machine zero. This is
+    // REQUIRED for the hybrid split to run at all. `compute_hybrid_split_report`
+    // derives the rank-charge noise floor as `phi_hat = ||target - full||^2/(n*p)`;
+    // with `target == full` (the exact self-reconstruction this fixture used to
+    // pass) that floor is EXACTLY 0, at which `build_atom_candidates` cannot price
+    // the evidence and refuses every atom as `Unadjudicable` (#2362) -> an empty
+    // report. A real fit never reconstructs its target to zero. The perturbation
+    // is orders of magnitude below either atom's own contribution, so the
+    // straight-vs-curved discrimination below is unchanged; it only lifts phi_hat
+    // off the degenerate zero.
+    let full = term
         .try_fitted_for_rho(&rho)
         .expect("post-straighten curved reconstruction assembles");
+    let mut target = full.clone();
+    for i in 0..target.nrows() {
+        for j in 0..target.ncols() {
+            target[[i, j]] += 1.0e-3 * (0.7 * (i as f64 + 1.0) + 1.3 * (j as f64 + 1.0)).sin();
+        }
+    }
     let report = term
         .compute_hybrid_split_report(&rho, Some(target.view()))
         .expect("hybrid split report computes")
@@ -1665,9 +1707,26 @@ pub(crate) fn oos_linear_images_drive_collapsed_reconstruction() {
             term.atoms[0].decoder_coefficients[[basis_row, out_col]] = 0.0;
         }
     }
-    let target = term
+    // A PHYSICAL target: the term's curved reconstruction plus a tiny smooth
+    // residual, so the term does NOT reconstruct it to machine zero. This is
+    // REQUIRED for the hybrid split to run at all. `compute_hybrid_split_report`
+    // derives the rank-charge noise floor as `phi_hat = ||target - full||^2/(n*p)`;
+    // with `target == full` (the exact self-reconstruction this fixture used to
+    // pass) that floor is EXACTLY 0, at which `build_atom_candidates` cannot price
+    // the evidence and refuses every atom as `Unadjudicable` (#2362) -> an empty
+    // report. A real fit never reconstructs its target to zero. The perturbation
+    // is orders of magnitude below either atom's own contribution, so the
+    // straight-vs-curved discrimination below is unchanged; it only lifts phi_hat
+    // off the degenerate zero.
+    let full = term
         .try_fitted_for_rho(&rho)
         .expect("curved reconstruction assembles");
+    let mut target = full.clone();
+    for i in 0..target.nrows() {
+        for j in 0..target.ncols() {
+            target[[i, j]] += 1.0e-3 * (0.7 * (i as f64 + 1.0) + 1.3 * (j as f64 + 1.0)).sin();
+        }
+    }
     let report = term
         .compute_hybrid_split_report(&rho, Some(target.view()))
         .expect("hybrid split report computes")
