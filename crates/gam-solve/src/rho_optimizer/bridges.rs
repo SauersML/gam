@@ -2712,6 +2712,19 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                     "outer EFS eval failed: {err}"
                 )));
             }
+            // A REML/inner-solve failure is POINT-LOCAL evidence about this ρ —
+            // another seed can solve fine — so it must surface as recoverable:
+            // at seed evaluation the driver maps it to SeedRejected and the
+            // seed cascade tries the next candidate without spending the
+            // rejected slot's budget (#2367). Blanket-classifying it fatal
+            // turned one invalid startup seed into a whole-fit
+            // "Fatal outer-objective evaluation failure". Structural errors
+            // (dimension mismatches, invalid layouts) remain fatal below.
+            Err(err @ EstimationError::RemlOptimizationFailed(_)) => {
+                return Err(ObjectiveEvalError::recoverable(format!(
+                    "outer EFS eval failed: {err}"
+                )));
+            }
             Err(err) => return Err(into_objective_error("outer EFS eval failed", err)),
         };
         self.layout

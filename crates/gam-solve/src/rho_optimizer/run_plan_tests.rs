@@ -5393,7 +5393,21 @@ fn run_efs_skips_invalid_leading_seed_without_spending_budget() {
     let mut obj = problem.build_objective(
         (),
         |_: &mut (), _: &Array1<f64>| Ok(0.0),
-        |_: &mut (), theta: &Array1<f64>| Ok(OuterEval::infeasible(theta.len())),
+        // The contract under test is the seed SKIP, carried by the EFS closure
+        // below; the outer eval only has to let the run reach a terminal point.
+        // It previously returned `infeasible` everywhere, which today's analytic
+        // terminal certification rejects ("final-point value or gradient is
+        // non-finite"), masking the seed-budget assertion behind an unrelated
+        // refusal. Return a finite stationary eval so the run certifies and the
+        // assertion below actually observes which seed was used.
+        |_: &mut (), theta: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: 0.0,
+                gradient: Array1::zeros(theta.len()),
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
         None::<fn(&mut ())>,
         {
             let valid_seed = valid_seed.clone();
@@ -5416,7 +5430,24 @@ fn run_efs_skips_invalid_leading_seed_without_spending_budget() {
                 }
             })
         },
-    );
+    )
+    // The EFS run path now requires an analytic fixed-point certificate to
+    // certify stationarity (#1095/#2228); a bare closure objective predates it
+    // and refuses at the terminal point (this mock's outer eval is infeasible
+    // everywhere, deliberately — only the EFS closure carries the contract
+    // under test). Supply a fully-covered zero-update certificate — the valid
+    // seed's EFS step is already the fixed point (all-zero steps) — mirroring
+    // `run_efs_skips_global_cost_screening`. The seed-skip contract this test
+    // pins is unchanged: the invalid startup seed must be rejected WITHOUT
+    // consuming the single-seed budget, so the generated seed still runs.
+    .with_fixed_point_certificate(|_: &mut (), rho: &Array1<f64>| {
+        Ok(FixedPointCertificateEval {
+            cost: 0.0,
+            coordinates: (0..rho.len())
+                .map(|_| FixedPointCoordinateCertificate::covered(0.0, 1.0))
+                .collect(),
+        })
+    });
     let result = problem
         .run(&mut obj, "efs generated seed should remain reachable")
         .expect("invalid startup seeds should not consume the only EFS seed slot");
