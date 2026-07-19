@@ -1486,19 +1486,32 @@ pub(crate) fn compute_joint_covariance_required<F: CustomFamily + Clone + Send +
     if !options.compute_covariance {
         return Ok(None);
     }
-    compute_joint_covariance(
+    match compute_joint_covariance(
         family,
         specs,
         states,
         per_block_log_lambdas,
         options,
         preferred_unpenalized_hessian,
-    )
-    .map(Some)
-    .map_err(|e| CustomFamilyError::InvalidInput {
-        context: "compute_joint_covariance_required",
-        reason: format!("joint covariance computation failed: {e}"),
-    })
+    ) {
+        Ok(covariance) => Ok(Some(covariance)),
+        // A converged fit with a PSD penalized Hessian is a VALID fit even when
+        // the covariance cannot be factorized; escalating that into a whole-fit
+        // failure would discard usable coefficients and point predictions. When
+        // the consumer opted into best-effort covariance, downgrade to a typed
+        // absence (covariance `None`, reason logged) so the fit is still minted
+        // and inference simply reports itself unavailable (#2299).
+        Err(e) if options.covariance_best_effort => {
+            log::warn!(
+                "[custom-family covariance] joint covariance unavailable for a converged fit; minting the fit without it: {e}"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(CustomFamilyError::InvalidInput {
+            context: "compute_joint_covariance_required",
+            reason: format!("joint covariance computation failed: {e}"),
+        }),
+    }
 }
 
 /// Compute terminal coefficient geometry, with optional single-diagonal row

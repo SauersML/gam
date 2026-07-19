@@ -106,45 +106,103 @@ def test_ordinary_affine_design_exposes_model_offset_and_full_frame() -> None:
 
 
 def test_link_wiggle_affine_design_uses_joint_frame_and_exact_2141_index() -> None:
-    # Well-conditioned link-wiggle fit built to stay clear of the joint-Newton
-    # far-tail-curvature instability (#2342 disease family) that a heavy default
-    # warp hits:
-    #   * documented anchored form ``link(type=probit) + linkwiggle(...)`` on a
-    #     PROBIT base with a MINIMAL warp (degree=2, internal_knots=2) instead of
-    #     the default degree-3/8-knot warp -- few, low-order warp columns cannot
-    #     manufacture far-tail curvature garbage;
-    #   * a parametric mean (``y ~ x``) so the mean block is identifiable;
-    #   * bounded predictor: slope 0.9 over x in [-2, 2] plus a small offset keeps
-    #     |eta| <~ 2, so no observation sits in a saturated 0/1 tail;
-    #   * probit-matched truth, so the fitted warp is a mild penalized deviation
-    #     around zero rather than a large engaged warp.
-    # The offset-separation contract is still exercised via a known per-row
-    # offset. The ``s(x)`` + ``flexible_link=True`` joint-Newton blow-up lane is
-    # preserved in the red gate below.
-    rng = np.random.default_rng(7)
-    n = 1500
-    x = rng.uniform(-2.0, 2.0, n)
+    # Converging link-wiggle fit, taken verbatim from the GREEN
+    # ``bug_hunt_flexible_link_engages_and_predicts`` fixture that the module
+    # docstring names as the model to mirror: a probit-truth binomial with a
+    # ``link(type=flexible(logit))`` warp on a parametric mean. The warp engages
+    # (the logit base is misspecified for probit data) and the joint Newton
+    # solve certifies a stationary optimum, so the fit is minted and the exact
+    # affine design exists.
+    #
+    # The prior committed fixture asked for ``linkwiggle(degree=2, ...)``, which
+    # the parser rejects outright ("Spline degree 2 is too low for derivative
+    # order 3; need degree >= 3"), so it could never reach a single assertion.
+    # This fixture actually exercises the contract -- including the covariance
+    # blocks, which is the whole point of #2299: before the covariance wiring
+    # fix a converged link-wiggle fit returned ``covariance_conditional=None``
+    # (the ``_assert_affine_identity`` helper's ``conditional is not None``
+    # assertion is exactly the regression guard), so this test is red before the
+    # fix and green after.
+    #
+    # The model-offset-separation half of the contract cannot ride on a
+    # link-wiggle fit yet -- adding a model offset drives the joint solve
+    # non-stationary (#2358) -- so it is exercised on the ORDINARY frame in
+    # ``test_ordinary_affine_design_exposes_model_offset_and_full_frame`` and
+    # kept as an honest link-wiggle red gate below, rather than silently dropped.
+    rng = np.random.default_rng(11)
+    n = 2500
+    x = rng.uniform(-2.5, 2.5, n)
+    eta = -0.3 + 1.4 * x
+    # TRUE link = probit; the requested flexible(logit) base is misspecified, so
+    # the warp genuinely engages rather than sitting at zero.
+    probability = np.clip(norm.cdf(eta), 1e-4, 1.0 - 1e-4)
+    y = (rng.uniform(size=n) < probability).astype(float)
+    data = {"y": y, "x": x}
+
+    model = gamfit.fit(
+        data,
+        "y ~ x + link(type=flexible(logit))",
+        family="binomial",
+    )
+    affine = _assert_affine_identity(model, data, "link_wiggle_joint")
+
+    # The complete joint frame keeps the fitted Mean block IN the matrix (rather
+    # than folding the fitted base into the row offset), so the returned
+    # same-frame covariances carry mean variance and every Mean--wiggle cross
+    # term for external variance calculations. There is no model offset here, so
+    # the affine row offset is the zero vector; the offset-SEPARATION assertion
+    # lives on the ordinary frame and the link-wiggle red gate below.
+    assert affine.offset.shape == (n,)
+    np.testing.assert_allclose(affine.offset, 0.0, rtol=0.0, atol=0.0)
+
+    # The exact affine identity that ``_assert_affine_identity`` already checked
+    # (offset + [X, B(index)] @ [beta_mean, beta_w] == linear_predictor) can only
+    # hold if B is evaluated at the saved frozen #2141 index, so it pins the
+    # frozen-index behavior end to end. The covariance blocks the helper
+    # validated are the #2299 deliverable: a converged custom-family link-wiggle
+    # fit now carries its joint [Mean, LinkWiggle] covariance.
+    assert affine.covariance_conditional is not None
+    assert affine.covariance_conditional.shape == (
+        affine.coefficients.shape[0],
+        affine.coefficients.shape[0],
+    )
+
+
+def test_link_wiggle_affine_design_offset_separation_red_gate() -> None:
+    """RED GATE (#2358 link-wiggle + offset joint-Newton non-convergence).
+
+    The #2299 offset-SEPARATION contract for the link-wiggle joint frame: a
+    fitted link-wiggle predictor with a known per-row model offset must expose
+    that offset as ``affine.offset`` (never folded into the design), so external
+    variance/contrast math sees ``offset + [X, B] @ beta``. This is the
+    link-wiggle analogue of the green ordinary-frame offset assertion in
+    ``test_ordinary_affine_design_exposes_model_offset_and_full_frame``.
+
+    It fails today for a convergence-lane reason ORTHOGONAL to the design-matrix
+    contract: adding a model offset to the converging flexible-link fit above
+    drives the binomial mean link-wiggle joint solve non-stationary (outer
+    smoothing does not certify; |Pg| ~ 2.8e-2 vs bound ~ 6.3e-3), so no fit is
+    minted and the affine design cannot be built. See #2358 (the offset is a
+    manifestation; the same non-convergence reproduces with no offset for an
+    explicit ``linkwiggle(...)`` spec). When that lane converges this gate passes
+    unchanged -- the assertion is NOT weakened to match the broken path.
+    """
+    rng = np.random.default_rng(11)
+    n = 2500
+    x = rng.uniform(-2.5, 2.5, n)
     offset = rng.uniform(-0.15, 0.15, n)
-    eta = 0.9 * x + offset
-    probability = np.clip(norm.cdf(eta), 1e-3, 1.0 - 1e-3)
+    eta = -0.3 + 1.4 * x + offset
+    probability = np.clip(norm.cdf(eta), 1e-4, 1.0 - 1e-4)
     y = (rng.uniform(size=n) < probability).astype(float)
     data = {"y": y, "x": x, "offset": offset}
 
     model = gamfit.fit(
         data,
-        "y ~ x + link(type=probit) + linkwiggle(degree=2, internal_knots=2)",
+        "y ~ x + link(type=flexible(logit))",
         family="binomial",
         offset="offset",
     )
     affine = _assert_affine_identity(model, data, "link_wiggle_joint")
-
-    # The complete joint frame keeps the model offset separate and represents
-    # the fitted Mean block in the matrix. Treating the fitted base as a fixed
-    # row offset would discard its uncertainty and every Mean--wiggle cross
-    # term from external variance calculations. The exact affine identity above
-    # (offset + [X, B(index)] @ [beta_mean, beta_w] == linear_predictor) can
-    # only hold if B is evaluated at the saved frozen #2141 index, so this also
-    # pins the frozen-index behavior end to end.
     np.testing.assert_allclose(affine.offset, offset, rtol=0.0, atol=0.0)
 
 

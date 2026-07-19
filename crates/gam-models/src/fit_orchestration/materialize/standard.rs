@@ -303,7 +303,24 @@ pub(crate) fn materialize_standard<'a>(
             // `StandardBinomialWiggleConfig` doc + #320). Magic-by-default:
             // no caller-supplied options are required for the Python /
             // formula-DSL path.
-            refit_options: BlockwiseFitOptions::default(),
+            refit_options: BlockwiseFitOptions {
+                // The link-wiggle refit is a custom-family solve, and
+                // `BlockwiseFitOptions::default()` leaves `compute_covariance`
+                // OFF -- which makes `compute_joint_covariance_required` return
+                // `Ok(None)` and strands the saved model with no joint
+                // covariance at all. Every other custom-family consumer whose
+                // saved model has to serve inference (marginal-slope,
+                // multinomial, location-scale) turns it on explicitly. A fitted
+                // link-wiggle model owes external callers its
+                // `[Mean, LinkWiggle]` variance and mean--wiggle cross terms, so
+                // it must too (#2299). `covariance_best_effort` keeps a
+                // degenerate warp Hessian from converting a converged fit into a
+                // hard error: the fit is still minted, covariance is reported as
+                // a typed absence.
+                compute_covariance: true,
+                covariance_best_effort: true,
+                ..BlockwiseFitOptions::default()
+            },
         })
     });
 
