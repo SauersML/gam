@@ -1929,3 +1929,181 @@ pub(crate) fn joint_smoothing_correction(
     symmetrize_dense_in_place(&mut correction);
     Ok(Some((correction, ki)))
 }
+
+#[cfg(test)]
+mod best_effort_covariance_tests {
+    //! Pins the #2299 `covariance_best_effort` downgrade at its production seam.
+    //! A converged fit whose joint posterior precision `M = H + S_λ` is singular
+    //! cannot produce a Laplace covariance; `compute_joint_covariance_required`
+    //! must return that as a typed absence (`Ok(None)`) when the consumer opted
+    //! into best-effort, and as an error otherwise. This is exercised with a
+    //! genuinely singular `M` (not a marginal knife-edge) so the assertion is
+    //! deterministic and load-independent -- the marginal fit that reaches this
+    //! path from Python is nondeterministic (rayon-fold-order-sensitive at the
+    //! tolerance) and is guarded upstream by the gauge + REML anyway (#2299).
+    use super::*;
+    use ndarray::array;
+
+    #[derive(Clone)]
+    struct TrivialFamily;
+
+    impl CustomFamily for TrivialFamily {
+        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: vec![],
+            })
+        }
+    }
+
+    /// One 3-coefficient block whose unpenalized Hessian and penalty share the
+    /// null direction `e3`, so `M = H + S_λ` (at λ = e^0 = 1) is
+    /// `[[5, 0.2, 0], [0.2, 11, 0], [0, 0, 0]]` -- singular along `e3`, i.e. the
+    /// posterior is improper and no finite covariance exists.
+    fn singular_joint_fixture() -> (
+        Vec<ParameterBlockSpec>,
+        Vec<ParameterBlockState>,
+        Vec<Array1<f64>>,
+        Array2<f64>,
+    ) {
+        let s = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
+        let unpenalized = array![[4.0, 0.2, 0.0], [0.2, 9.0, 0.0], [0.0, 0.0, 0.0]];
+        let beta = array![1.0, -1.0, 3.0];
+        let spec = ParameterBlockSpec {
+            name: "degenerate".to_string(),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 3)),
+            )),
+            offset: Array1::zeros(1),
+            penalties: vec![PenaltyMatrix::Dense(s)],
+            nullspace_dims: vec![1],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(beta.clone()),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+        let state = ParameterBlockState {
+            beta,
+            eta: Array1::zeros(1),
+        };
+        (vec![spec], vec![state], vec![array![0.0]], unpenalized)
+    }
+
+    #[test]
+    fn best_effort_downgrades_singular_covariance_to_typed_absence() {
+        let (specs, states, per_block, unpenalized) = singular_joint_fixture();
+        let options = BlockwiseFitOptions {
+            compute_covariance: true,
+            covariance_best_effort: true,
+            ..BlockwiseFitOptions::default()
+        };
+        let result = compute_joint_covariance_required(
+            &TrivialFamily,
+            &specs,
+            &states,
+            &per_block,
+            &options,
+            Some(&unpenalized),
+        );
+        assert!(
+            matches!(result, Ok(None)),
+            "best-effort must downgrade an unfactorizable covariance to Ok(None); got {result:?}"
+        );
+    }
+
+    #[test]
+    fn covariance_required_without_best_effort_errors_on_singular() {
+        let (specs, states, per_block, unpenalized) = singular_joint_fixture();
+        let options = BlockwiseFitOptions {
+            compute_covariance: true,
+            covariance_best_effort: false,
+            ..BlockwiseFitOptions::default()
+        };
+        let result = compute_joint_covariance_required(
+            &TrivialFamily,
+            &specs,
+            &states,
+            &per_block,
+            &options,
+            Some(&unpenalized),
+        );
+        assert!(
+            result.is_err(),
+            "without best-effort a singular joint covariance must surface as an error; got {result:?}"
+        );
+    }
+
+    /// A comfortably positive-definite joint precision must yield a finite
+    /// covariance (the ordinary success path), so the singular-case tests above
+    /// are pinning the degenerate branch and not a blanket refusal.
+    #[test]
+    fn well_conditioned_covariance_is_computed() {
+        // M = H + S_lambda = diag(5, 11, 4): strictly PD, invertible.
+        let s = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]];
+        let unpenalized = array![[4.0, 0.0, 0.0], [0.0, 9.0, 0.0], [0.0, 0.0, 3.0]];
+        let beta = array![0.5, -0.5, 0.25];
+        let spec = ParameterBlockSpec {
+            name: "identified".to_string(),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 3)),
+            )),
+            offset: Array1::zeros(1),
+            penalties: vec![PenaltyMatrix::Dense(s)],
+            nullspace_dims: vec![0],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(beta.clone()),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+        let states = vec![ParameterBlockState {
+            beta,
+            eta: Array1::zeros(1),
+        }];
+        let options = BlockwiseFitOptions {
+            compute_covariance: true,
+            covariance_best_effort: true,
+            ..BlockwiseFitOptions::default()
+        };
+        let result = compute_joint_covariance_required(
+            &TrivialFamily,
+            &vec![spec],
+            &states,
+            &vec![array![0.0]],
+            &options,
+            Some(&unpenalized),
+        );
+        match result {
+            Ok(Some(cov)) => {
+                assert_eq!(cov.dim(), (3, 3));
+                assert!(cov.iter().all(|v| v.is_finite()));
+                // Σ = M⁻¹ = diag(1/5, 1/11, 1/4).
+                assert!((cov[[0, 0]] - 0.2).abs() < 1e-9);
+                assert!((cov[[2, 2]] - 0.25).abs() < 1e-9);
+            }
+            other => panic!("a PD joint precision must yield a finite covariance; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn covariance_disabled_returns_none_before_any_factorization() {
+        let (specs, states, per_block, unpenalized) = singular_joint_fixture();
+        let options = BlockwiseFitOptions {
+            compute_covariance: false,
+            covariance_best_effort: true,
+            ..BlockwiseFitOptions::default()
+        };
+        let result = compute_joint_covariance_required(
+            &TrivialFamily,
+            &specs,
+            &states,
+            &per_block,
+            &options,
+            Some(&unpenalized),
+        );
+        assert!(matches!(result, Ok(None)));
+    }
+}

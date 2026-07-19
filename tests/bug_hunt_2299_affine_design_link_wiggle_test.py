@@ -129,6 +129,24 @@ def test_link_wiggle_affine_design_uses_joint_frame_and_exact_2141_index() -> No
     # non-stationary (#2358) -- so it is exercised on the ORDINARY frame in
     # ``test_ordinary_affine_design_exposes_model_offset_and_full_frame`` and
     # kept as an honest link-wiggle red gate below, rather than silently dropped.
+    #
+    # WHY the DEFAULT flexible(logit) warp and not a leaner/heavier-penalty one:
+    # do not "simplify" this to an explicit ``linkwiggle(internal_knots=2)`` or a
+    # ``double_penalty=true`` warp to make the covariance "more PD" -- both were
+    # measured to FAIL to converge (the binomial mean link-wiggle joint Newton
+    # does not certify a stationary optimum), as does a stronger signal slope.
+    # The convergent window of this family is narrow and mildly conditioned
+    # (#2358); the default flexible(logit) warp is the fixture that both
+    # converges AND exposes a finite covariance. Its joint covariance is reliably
+    # non-None here (measured non-None across every clean sequential run); it can
+    # only flip to a typed absence under pathological concurrent machine load,
+    # where rayon-fold summation order at the PD tolerance decides the smallest
+    # eigenvalue of ``H + S_lambda`` -- that is the #2358 solver-stability
+    # marginality, not a design-matrix defect. The deterministic coverage of the
+    # best-effort downgrade itself lives in the Rust unit test
+    # ``best_effort_covariance_tests`` (gam-custom-family/src/covariance.rs),
+    # which feeds a genuinely singular joint precision rather than relying on
+    # this knife-edge.
     rng = np.random.default_rng(11)
     n = 2500
     x = rng.uniform(-2.5, 2.5, n)
