@@ -2,7 +2,8 @@ use ndarray::Array1;
 use std::collections::HashSet;
 
 pub use gam_problem::{SeedConfig, SeedRiskProfile};
-use gam_problem::{clamp_seed_rho_to_bounds, normalize_seed_bounds};
+use crate::estimate::EstimationError;
+use gam_problem::OrderedRhoBounds;
 
 fn add_seed_dedup(seeds: &mut Vec<Array1<f64>>, seen: &mut HashSet<Vec<u64>>, seed: Array1<f64>) {
     let key: Vec<u64> = seed.iter().map(|&v| v.to_bits()).collect();
@@ -23,7 +24,7 @@ fn spde_rho_triplet_from_log_tau_log_kappa_nu(
     log_tau: f64,
     log_kappa: f64,
     nu: f64,
-    bounds: (f64, f64),
+    bounds: OrderedRhoBounds,
 ) -> Option<Array1<f64>> {
     if !(nu.is_finite() && nu > 1.0) {
         return None;
@@ -31,16 +32,16 @@ fn spde_rho_triplet_from_log_tau_log_kappa_nu(
     let logc0 = 0.0;
     let logc1 = safe_ln_pos(nu)?;
     let logc2 = safe_ln_pos(0.5 * nu * (nu - 1.0))?;
-    let rho0 = clamp_seed_rho_to_bounds(log_tau + logc0 + 2.0 * nu * log_kappa, bounds);
-    let rho1 = clamp_seed_rho_to_bounds(log_tau + logc1 + 2.0 * (nu - 1.0) * log_kappa, bounds);
-    let rho2 = clamp_seed_rho_to_bounds(log_tau + logc2 + 2.0 * (nu - 2.0) * log_kappa, bounds);
+    let rho0 = bounds.clamp(log_tau + logc0 + 2.0 * nu * log_kappa);
+    let rho1 = bounds.clamp(log_tau + logc1 + 2.0 * (nu - 1.0) * log_kappa);
+    let rho2 = bounds.clamp(log_tau + logc2 + 2.0 * (nu - 2.0) * log_kappa);
     Some(Array1::from_vec(vec![rho0, rho1, rho2]))
 }
 
 fn add_spde_manifold_seeds(
     seeds: &mut Vec<Array1<f64>>,
     seen: &mut HashSet<Vec<u64>>,
-    bounds: (f64, f64),
+    bounds: OrderedRhoBounds,
     heuristic_rhos: Option<&[f64]>,
     primary: &Array1<f64>,
 ) {
@@ -104,18 +105,18 @@ fn add_spde_manifold_seeds(
 fn add_first_order_fallback_seeds(
     seeds: &mut Vec<Array1<f64>>,
     seen: &mut HashSet<Vec<u64>>,
-    bounds: (f64, f64),
+    bounds: OrderedRhoBounds,
     heuristic_rhos: Option<&[f64]>,
 ) {
     // Degenerate λ2 -> 0 fallback (first-order mass+tension):
     // λ0 = τ κ^2, λ1 = τ, λ2 ≈ 0.
-    let rho2_floor = bounds.0;
+    let rho2_floor = bounds.lower();
     let default_log_kappa = [-2.0, -1.0, 0.0, 1.0];
     let default_log_tau = [0.0, -2.0, 2.0];
     for &t in &default_log_tau {
         for &lk in &default_log_kappa {
-            let rho0 = clamp_seed_rho_to_bounds(t + 2.0 * lk, bounds);
-            let rho1 = clamp_seed_rho_to_bounds(t, bounds);
+            let rho0 = bounds.clamp(t + 2.0 * lk);
+            let rho1 = bounds.clamp(t);
             add_seed_dedup(seeds, seen, Array1::from_vec(vec![rho0, rho1, rho2_floor]));
         }
     }
@@ -130,8 +131,8 @@ fn add_first_order_fallback_seeds(
         if kappa2.is_finite() && kappa2 > 0.0 {
             let lk = 0.5 * kappa2.ln();
             let t = vals[1];
-            let rho0 = clamp_seed_rho_to_bounds(t + 2.0 * lk, bounds);
-            let rho1 = clamp_seed_rho_to_bounds(t, bounds);
+            let rho0 = bounds.clamp(t + 2.0 * lk);
+            let rho1 = bounds.clamp(t);
             add_seed_dedup(seeds, seen, Array1::from_vec(vec![rho0, rho1, rho2_floor]));
         }
     }
@@ -140,7 +141,7 @@ fn add_first_order_fallback_seeds(
 fn add_nu2_reverse_manifold_seeds(
     seeds: &mut Vec<Array1<f64>>,
     seen: &mut HashSet<Vec<u64>>,
-    bounds: (f64, f64),
+    bounds: OrderedRhoBounds,
     primary: &Array1<f64>,
 ) {
     if primary.len() != 3 {
@@ -153,9 +154,9 @@ fn add_nu2_reverse_manifold_seeds(
         for &log_kappa in &log_kappa_grid {
             // Continuous-order reverse map at nu=2:
             // lambda0 = tau * kappa^4, lambda1 = tau * 2*kappa^2, lambda2 = tau.
-            let rho2 = clamp_seed_rho_to_bounds(tau_rho, bounds);
-            let rho1 = clamp_seed_rho_to_bounds(tau_rho + ln_two + 2.0 * log_kappa, bounds);
-            let rho0 = clamp_seed_rho_to_bounds(tau_rho + 4.0 * log_kappa, bounds);
+            let rho2 = bounds.clamp(tau_rho);
+            let rho1 = bounds.clamp(tau_rho + ln_two + 2.0 * log_kappa);
+            let rho0 = bounds.clamp(tau_rho + 4.0 * log_kappa);
             add_seed_dedup(seeds, seen, Array1::from_vec(vec![rho0, rho1, rho2]));
         }
     }
@@ -197,17 +198,24 @@ pub fn generate_rho_candidates(
     num_penalties: usize,
     heuristic_rhos: Option<&[f64]>,
     config: &SeedConfig,
-) -> Vec<Array1<f64>> {
+) -> Result<Vec<Array1<f64>>, EstimationError> {
     let mut seeds = Vec::new();
     let mut seen: HashSet<Vec<u64>> = HashSet::new();
 
-    let bounds = normalize_seed_bounds(config.bounds);
+    // Validate the seed ρ-box ONCE, at the boundary where it enters the
+    // candidate lattice, and REFUSE an inverted/non-finite interval rather than
+    // silently reordering it (#2379). Every clamp below then operates on an
+    // interval that is ordered by construction. This is the same disease and the
+    // same cure as the outer-optimizer prepass: an inverted box means two
+    // independently-owned constants have drifted apart, and a swap would make the
+    // lattice explore a different, silently substituted box.
+    let bounds = OrderedRhoBounds::new(config.bounds.0, config.bounds.1)?;
     let max_seeds = config.max_seeds.max(1);
     let risk_shift = config.risk_profile.anchor_rho_shift();
 
     if num_penalties == 0 {
         add_seed_dedup(&mut seeds, &mut seen, Array1::<f64>::zeros(0));
-        return seeds;
+        return Ok(seeds);
     }
 
     // Prefer a full heuristic vector (length == k) as the primary anchor.
@@ -221,7 +229,7 @@ pub fn generate_rho_candidates(
                 h[num_smoothing..]
                     .iter()
                     .copied()
-                    .map(|v| clamp_seed_rho_to_bounds(v, bounds))
+                    .map(|v| bounds.clamp(v))
                     .collect()
             })
             .unwrap_or_else(|| vec![0.0; num_aux])
@@ -234,12 +242,12 @@ pub fn generate_rho_candidates(
                 vals[..num_smoothing]
                     .iter()
                     .copied()
-                    .map(|v| clamp_seed_rho_to_bounds(v, bounds))
+                    .map(|v| bounds.clamp(v))
                     .chain(
                         vals[num_smoothing..]
                             .iter()
                             .copied()
-                            .map(|v| clamp_seed_rho_to_bounds(v, bounds)),
+                            .map(|v| bounds.clamp(v)),
                     ),
             ))
         } else {
@@ -248,7 +256,7 @@ pub fn generate_rho_candidates(
     });
 
     let primary = heuristic_rhovec.clone().unwrap_or_else(|| {
-        Array1::<f64>::from_elem(num_penalties, clamp_seed_rho_to_bounds(risk_shift, bounds))
+        Array1::<f64>::from_elem(num_penalties, bounds.clamp(risk_shift))
     });
     add_seed_dedup(&mut seeds, &mut seen, primary.clone());
     // Always include neutral baseline independently of heuristic anchor.
@@ -262,7 +270,7 @@ pub fn generate_rho_candidates(
             add_seed_dedup(
                 &mut seeds,
                 &mut seen,
-                Array1::from_elem(num_penalties, bounds.1),
+                Array1::from_elem(num_penalties, bounds.upper()),
             );
         }
     }
@@ -287,7 +295,7 @@ pub fn generate_rho_candidates(
         add_seed_dedup(
             &mut spde_prefix_seeds,
             &mut spde_prefix_seen,
-            Array1::from_vec(vec![primary[0], primary[1], bounds.0]),
+            Array1::from_vec(vec![primary[0], primary[1], bounds.lower()]),
         );
         // Ensure a nu=2-consistent seed is always present before broader grids.
         add_nu2_reverse_manifold_seeds(
@@ -326,7 +334,7 @@ pub fn generate_rho_candidates(
         add_seed_dedup(
             &mut seeds,
             &mut seen,
-            Array1::from_elem(num_penalties, clamp_seed_rho_to_bounds(center, bounds)),
+            Array1::from_elem(num_penalties, bounds.clamp(center)),
         );
     }
 
@@ -357,31 +365,31 @@ pub fn generate_rho_candidates(
 
         let mut conflict_a = primary.clone();
         for &i in large_cluster {
-            conflict_a[i] = clamp_seed_rho_to_bounds(primary[i] + large_scale, bounds);
+            conflict_a[i] = bounds.clamp(primary[i] + large_scale);
         }
         for &i in small_cluster {
-            conflict_a[i] = clamp_seed_rho_to_bounds(primary[i] - small_scale, bounds);
+            conflict_a[i] = bounds.clamp(primary[i] - small_scale);
         }
         add_seed_dedup(&mut seeds, &mut seen, conflict_a);
 
         let mut conflict_b = primary.clone();
         for &i in large_cluster {
-            conflict_b[i] = clamp_seed_rho_to_bounds(primary[i] - large_scale, bounds);
+            conflict_b[i] = bounds.clamp(primary[i] - large_scale);
         }
         for &i in small_cluster {
-            conflict_b[i] = clamp_seed_rho_to_bounds(primary[i] + small_scale, bounds);
+            conflict_b[i] = bounds.clamp(primary[i] + small_scale);
         }
         add_seed_dedup(&mut seeds, &mut seen, conflict_b);
 
         let mut heavy_up = primary.clone();
         for &i in large_cluster {
-            heavy_up[i] = clamp_seed_rho_to_bounds(primary[i] + large_scale, bounds);
+            heavy_up[i] = bounds.clamp(primary[i] + large_scale);
         }
         add_seed_dedup(&mut seeds, &mut seen, heavy_up);
 
         let mut light_down = primary.clone();
         for &i in small_cluster {
-            light_down[i] = clamp_seed_rho_to_bounds(primary[i] - small_scale, bounds);
+            light_down[i] = bounds.clamp(primary[i] - small_scale);
         }
         add_seed_dedup(&mut seeds, &mut seen, light_down);
     } else {
@@ -390,7 +398,7 @@ pub fn generate_rho_candidates(
             let scale = step_base + 0.25 * primary[i].abs().min(8.0);
             for dir in [-1.0, 1.0] {
                 let mut s = primary.clone();
-                s[i] = clamp_seed_rho_to_bounds(primary[i] + dir * scale, bounds);
+                s[i] = bounds.clamp(primary[i] + dir * scale);
                 add_seed_dedup(&mut seeds, &mut seen, s);
             }
         }
@@ -399,13 +407,13 @@ pub fn generate_rho_candidates(
         for i in 0..pair_dims {
             for j in (i + 1)..pair_dims {
                 let mut s1 = primary.clone();
-                s1[i] = clamp_seed_rho_to_bounds(primary[i] + step_base, bounds);
-                s1[j] = clamp_seed_rho_to_bounds(primary[j] - step_base, bounds);
+                s1[i] = bounds.clamp(primary[i] + step_base);
+                s1[j] = bounds.clamp(primary[j] - step_base);
                 add_seed_dedup(&mut seeds, &mut seen, s1);
 
                 let mut s2 = primary.clone();
-                s2[i] = clamp_seed_rho_to_bounds(primary[i] - step_base, bounds);
-                s2[j] = clamp_seed_rho_to_bounds(primary[j] + step_base, bounds);
+                s2[i] = bounds.clamp(primary[i] - step_base);
+                s2[j] = bounds.clamp(primary[j] + step_base);
                 add_seed_dedup(&mut seeds, &mut seen, s2);
             }
         }
@@ -428,7 +436,7 @@ pub fn generate_rho_candidates(
     // optimizer SEE the lower-λ basin. Over-smoothed seeds remain present (and
     // earlier in the list) so PIRLS-separation startup stability is unchanged.
     for &shift in config.risk_profile.global_shifts() {
-        let swept = primary.mapv(|v| clamp_seed_rho_to_bounds(v + shift, bounds));
+        let swept = primary.mapv(|v| bounds.clamp(v + shift));
         add_seed_dedup(&mut seeds, &mut seen, swept);
     }
 
@@ -442,7 +450,7 @@ pub fn generate_rho_candidates(
     if let Some(probe_rho) = config.over_smoothing_probe_rho {
         let mut probe = primary.clone();
         for j in 0..num_smoothing {
-            probe[j] = clamp_seed_rho_to_bounds(probe_rho, bounds);
+            probe[j] = bounds.clamp(probe_rho);
         }
         add_seed_dedup(&mut seeds, &mut seen, probe);
     }
@@ -458,7 +466,7 @@ pub fn generate_rho_candidates(
             for i in 0..num_penalties {
                 let u = halton(t + 1, primes[i]); // (0,1)
                 let centered = 2.0 * u - 1.0; // (-1,1)
-                s[i] = clamp_seed_rho_to_bounds(primary[i] + amp * centered, bounds);
+                s[i] = bounds.clamp(primary[i] + amp * centered);
             }
             add_seed_dedup(&mut seeds, &mut seen, s);
         }
@@ -494,12 +502,41 @@ pub fn generate_rho_candidates(
         seeds.push(Array1::<f64>::zeros(num_penalties));
     }
 
-    seeds
+    Ok(seeds)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2379 (mechanism B): the candidate lattice REFUSES an inverted seed box
+    /// with a typed error rather than silently reordering it — the same contract
+    /// the outer-optimizer prepass now enforces. A future constant drift that
+    /// inverts `SeedConfig.bounds` fails loud here instead of quietly generating
+    /// a lattice over a different, substituted box.
+    #[test]
+    fn generate_rho_candidates_refuses_inverted_bounds() {
+        let cfg = SeedConfig {
+            bounds: (10.0, -10.0),
+            ..SeedConfig::default()
+        };
+        let err = generate_rho_candidates(3, None, &cfg)
+            .expect_err("an inverted seed box must be refused, not swapped");
+        assert!(
+            matches!(err, EstimationError::InvalidInput(_)),
+            "inverted seed box must be a typed InvalidInput, got {err:?}"
+        );
+    }
+
+    /// The ordered default box still produces a full lattice — the refusal never
+    /// fires on any real config (every `SeedConfig.bounds` in the tree is the
+    /// ordered constant `(-12.0, 12.0)`).
+    #[test]
+    fn generate_rho_candidates_accepts_ordered_bounds() {
+        let cfg = SeedConfig::default();
+        let seeds = generate_rho_candidates(3, None, &cfg).expect("ordered box is accepted");
+        assert!(!seeds.is_empty());
+    }
 
     #[test]
     fn uses_full_heuristicvector_as_primary_anchor() {
@@ -508,7 +545,7 @@ mod tests {
             ..SeedConfig::default()
         };
         let heur = [-2.0, 0.0, 2.0];
-        let seeds = generate_rho_candidates(3, Some(&heur), &cfg);
+        let seeds = generate_rho_candidates(3, Some(&heur), &cfg).expect("ordered seed bounds");
         assert!(!seeds.is_empty());
         let first = &seeds[0];
         assert_eq!(first.len(), 3);
@@ -525,7 +562,7 @@ mod tests {
             ..SeedConfig::default()
         };
         let heur = [-6.0, -5.0, -4.0, 0.0, 2.0, 4.0, -3.0, 0.0, 3.0, 5.0];
-        let seeds = generate_rho_candidates(10, Some(&heur), &cfg);
+        let seeds = generate_rho_candidates(10, Some(&heur), &cfg).expect("ordered seed bounds");
         assert!(seeds.len() <= 18);
         // Presence of at least one asymmetric cluster-conflict seed:
         // some coordinates increased while others decreased vs primary.
@@ -548,7 +585,7 @@ mod tests {
     #[test]
     fn includes_neutralzero_seed() {
         let cfg = SeedConfig::default();
-        let seeds = generate_rho_candidates(5, None, &cfg);
+        let seeds = generate_rho_candidates(5, None, &cfg).expect("ordered seed bounds");
         let haszero = seeds
             .iter()
             .any(|s| s.iter().all(|v| (*v - 0.0).abs() < 1e-12));
@@ -561,7 +598,7 @@ mod tests {
             risk_profile: SeedRiskProfile::GeneralizedLinear,
             ..SeedConfig::default()
         };
-        let seeds = generate_rho_candidates(3, None, &cfg);
+        let seeds = generate_rho_candidates(3, None, &cfg).expect("ordered seed bounds");
         let retreat = Array1::from_elem(3, cfg.bounds.1);
         let retreat_idx = seeds
             .iter()
@@ -576,7 +613,7 @@ mod tests {
     #[test]
     fn three_penalty_seeds_include_nu2_reverse_manifold_triplets() {
         let cfg = SeedConfig::default();
-        let seeds = generate_rho_candidates(3, None, &cfg);
+        let seeds = generate_rho_candidates(3, None, &cfg).expect("ordered seed bounds");
         let ln4 = 4.0_f64.ln();
         let has_nu2_manifold_seed = seeds
             .iter()
@@ -588,7 +625,7 @@ mod tests {
     fn three_penalty_seeds_include_general_spde_manifold_points() {
         let cfg = SeedConfig::default();
         let heur = [2.0, 10.0, 3.0];
-        let seeds = generate_rho_candidates(3, Some(&heur), &cfg);
+        let seeds = generate_rho_candidates(3, Some(&heur), &cfg).expect("ordered seed bounds");
         let has_non_nu2 = seeds.iter().any(|s| {
             // For nu=2, 2*rho1-rho0-rho2 = ln(4).
             // General nu manifold should include points away from ln(4).
@@ -603,7 +640,7 @@ mod tests {
             bounds: (-12.0, 12.0),
             ..SeedConfig::default()
         };
-        let seeds = generate_rho_candidates(3, None, &cfg);
+        let seeds = generate_rho_candidates(3, None, &cfg).expect("ordered seed bounds");
         let has_floor = seeds
             .iter()
             .any(|s| s.len() == 3 && (s[2] - (-12.0)).abs() < 1e-12);
@@ -621,7 +658,7 @@ mod tests {
             ..SeedConfig::default()
         };
         let heur = [0.0, 10.0_f64.ln(), 0.0, 0.0]; // rhos + SAS initials
-        let seeds = generate_rho_candidates(4, Some(&heur), &cfg);
+        let seeds = generate_rho_candidates(4, Some(&heur), &cfg).expect("ordered seed bounds");
         assert!(!seeds.is_empty());
         // EVERY seed must have the auxiliary dims pinned to 0.0.
         for (idx, seed) in seeds.iter().enumerate() {
@@ -651,14 +688,14 @@ mod tests {
             risk_profile: SeedRiskProfile::GeneralizedLinear,
             ..SeedConfig::default()
         };
-        let seeds_with_aux = generate_rho_candidates(3, None, &cfg);
+        let seeds_with_aux = generate_rho_candidates(3, None, &cfg).expect("ordered seed bounds");
         let cfg_no_aux = SeedConfig {
             num_auxiliary_trailing: 0,
             max_seeds: 32,
             risk_profile: SeedRiskProfile::GeneralizedLinear,
             ..SeedConfig::default()
         };
-        let seeds_without_aux = generate_rho_candidates(3, None, &cfg_no_aux);
+        let seeds_without_aux = generate_rho_candidates(3, None, &cfg_no_aux).expect("ordered seed bounds");
         // Aux pinning causes many seeds to collapse, so fewer unique seeds.
         assert!(seeds_with_aux.len() <= seeds_without_aux.len());
     }

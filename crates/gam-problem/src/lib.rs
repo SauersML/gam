@@ -126,9 +126,7 @@ pub use row_metric::{
     FisherFactorKind, MetricProvenance, RowMetric, WeightField, pack_probe_factors,
 };
 pub use schedule::{GumbelTemperatureSchedule, ScheduleKind, SearchStrategy};
-pub use seeding::{
-    OrderedRhoBounds, SeedConfig, SeedRiskProfile, clamp_seed_rho_to_bounds, normalize_seed_bounds,
-};
+pub use seeding::{OrderedRhoBounds, SeedConfig, SeedRiskProfile};
 pub use solver_contract::{
     DeclaredHessianForm, Derivative, EfsEval, FixedPointCertificateEval,
     FixedPointCoordinateCertificate, HessianMaterialization, HessianOperator, HessianValue,

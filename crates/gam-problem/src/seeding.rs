@@ -108,21 +108,6 @@ impl Default for SeedConfig {
     }
 }
 
-#[inline]
-pub fn normalize_seed_bounds(bounds: (f64, f64)) -> (f64, f64) {
-    if bounds.0 <= bounds.1 {
-        bounds
-    } else {
-        (bounds.1, bounds.0)
-    }
-}
-
-#[inline]
-pub fn clamp_seed_rho_to_bounds(value: f64, bounds: (f64, f64)) -> f64 {
-    let (lo, hi) = normalize_seed_bounds(bounds);
-    value.clamp(lo, hi)
-}
-
 /// A validated, finite, ordered ρ (log-λ) seed interval `[lo, hi]`.
 ///
 /// Every seed clamp in the outer-optimizer prepass and the candidate lattice
@@ -265,46 +250,6 @@ mod tests {
         assert!(SeedRiskProfile::GaussianLocationScale.uses_lowest_cost_keep_best());
         assert!(!SeedRiskProfile::GeneralizedLinear.uses_lowest_cost_keep_best());
         assert!(!SeedRiskProfile::Survival.uses_lowest_cost_keep_best());
-    }
-
-    // ── normalize_seed_bounds ─────────────────────────────────────────────────
-
-    #[test]
-    fn normalize_already_ordered_bounds_unchanged() {
-        assert_eq!(normalize_seed_bounds((-3.0, 5.0)), (-3.0, 5.0));
-    }
-
-    #[test]
-    fn normalize_reversed_bounds_swaps() {
-        assert_eq!(normalize_seed_bounds((5.0, -3.0)), (-3.0, 5.0));
-    }
-
-    #[test]
-    fn normalize_equal_bounds_unchanged() {
-        assert_eq!(normalize_seed_bounds((2.0, 2.0)), (2.0, 2.0));
-    }
-
-    // ── clamp_seed_rho_to_bounds ──────────────────────────────────────────────
-
-    #[test]
-    fn clamp_within_bounds_returns_value() {
-        assert_eq!(clamp_seed_rho_to_bounds(1.0, (-3.0, 5.0)), 1.0);
-    }
-
-    #[test]
-    fn clamp_below_lo_returns_lo() {
-        assert_eq!(clamp_seed_rho_to_bounds(-10.0, (-3.0, 5.0)), -3.0);
-    }
-
-    #[test]
-    fn clamp_above_hi_returns_hi() {
-        assert_eq!(clamp_seed_rho_to_bounds(100.0, (-3.0, 5.0)), 5.0);
-    }
-
-    #[test]
-    fn clamp_normalizes_reversed_bounds_before_clamping() {
-        // bounds (5, -3) normalizes to (-3, 5); 100 clamps to 5
-        assert_eq!(clamp_seed_rho_to_bounds(100.0, (5.0, -3.0)), 5.0);
     }
 
     // ── OrderedRhoBounds (#2379) ──────────────────────────────────────────────

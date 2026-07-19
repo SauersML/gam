@@ -112,7 +112,7 @@ pub(crate) fn run_outer_with_plan(
             cap.n_params,
             config.heuristic_lambdas.as_deref(),
             &config.seed_config,
-        );
+        )?;
         if generated.is_empty() {
             Vec::new()
         } else {
