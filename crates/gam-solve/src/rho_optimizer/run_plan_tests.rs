@@ -5554,17 +5554,28 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
         effective_seed_budget(4, Solver::HybridEfs, gam_problem::SeedRiskProfile::Survival,),
         1
     );
-    // #1575/#1074/#1426: Arc + GeneralizedLinear is floored to a single seed too
-    // (the initial.sp seed reaches the heavily-penalized GLM basin), regardless of
-    // the requested budget.
+    // #2376: Arc + a parsimonious profile (GeneralizedLinear / Survival) keeps
+    // the REQUESTED budget, so the #1373/#1575 promoted heavy interior seed at
+    // slot 1 stays reachable. Flooring these to 1 (the former #1575/#1074/#1426
+    // "the initial.sp seed reaches the heavily-penalized GLM basin" assumption)
+    // made the multi-start await gate's `seed_budget > 1` unsatisfiable and
+    // silently disabled the under-penalized-overshoot guard. The single-seed
+    // speed win for the common well-penalized case is now reclaimed at RUNTIME
+    // by `parsimony_second_seed_is_redundant`, not by capping the budget here.
     assert_eq!(
         effective_seed_budget(
             3,
             Solver::Arc,
             gam_problem::SeedRiskProfile::GeneralizedLinear,
         ),
-        1
+        3
     );
+    assert_eq!(
+        effective_seed_budget(3, Solver::Arc, gam_problem::SeedRiskProfile::Survival,),
+        3
+    );
+    // A caller that genuinely requests a single start still gets one: the
+    // parsimony second seed is only re-enabled when a budget ≥ 2 was asked for.
     assert_eq!(
         effective_seed_budget(
             1,
@@ -5573,16 +5584,23 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
         ),
         1
     );
-    assert_eq!(
-        effective_seed_budget(3, Solver::Arc, gam_problem::SeedRiskProfile::Survival,),
-        1
-    );
     // #1689/#1757: Arc + Gaussian is floored to a single seed (the analytic
     // initial.sp seed lands the correct basin, so the second full outer solve is
     // redundant), regardless of the requested budget.
     assert_eq!(
         effective_seed_budget(3, Solver::Arc, gam_problem::SeedRiskProfile::Gaussian),
         1
+    );
+    // GaussianLocationScale is NOT floored (it uses lowest-cost keep-best but
+    // its promoted-seed multi-start needs budget ≥ 2); it falls through to the
+    // requested budget, matching the behaviour before #2376.
+    assert_eq!(
+        effective_seed_budget(
+            3,
+            Solver::Arc,
+            gam_problem::SeedRiskProfile::GaussianLocationScale,
+        ),
+        3
     );
     assert_eq!(
         effective_seed_budget(3, Solver::Bfgs, gam_problem::SeedRiskProfile::Survival,),

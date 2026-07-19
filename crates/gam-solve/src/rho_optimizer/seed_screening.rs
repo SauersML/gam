@@ -172,12 +172,28 @@ pub(crate) fn effective_seed_budget(
     let requested_budget = requested_budget.max(1);
     match (solver, risk_profile) {
         (Solver::Efs | Solver::HybridEfs, _) => 1,
-        (Solver::Arc, gam_problem::SeedRiskProfile::Survival) => 1,
-        (
-            Solver::Arc,
-            gam_problem::SeedRiskProfile::Gaussian
-            | gam_problem::SeedRiskProfile::GeneralizedLinear,
-        ) => 1,
+        // #2376: the ARC parsimonious profiles (GeneralizedLinear + Survival)
+        // must keep the caller's requested budget so the #1373/#1575 promoted
+        // heavy interior seed at slot 1 stays reachable. Flooring these to 1
+        // made the multi-start await gate's `seed_budget > 1` unsatisfiable,
+        // silently disabling the under-penalized-overshoot guard on EVERY ARC
+        // binomial/survival fit (a coupled-constants regression: the #1689/#1757
+        // ARC single-seed floor overwrote the #1373 guard). The single-seed
+        // speed win for the common well-penalized case is NOT surrendered — it
+        // is reclaimed at RUNTIME by `parsimony_second_seed_is_redundant`, which
+        // breaks the multi-start after slot 0 whenever slot 0 converged to a
+        // curvature-pinned, well-penalized (ρ ≥ 0) optimum. Only the genuinely
+        // under-penalized / flat-valley / non-converged slot-0 outcomes — the
+        // exact regime the heavy seed exists to correct — pay for the second
+        // seed. `requested_budget == 1` still yields 1 (the caller asked for a
+        // single start), so this only re-enables parsimony when a budget was
+        // actually requested.
+        (Solver::Arc, profile) if profile.uses_parsimonious_keep_best() => requested_budget,
+        // ARC Gaussian keeps the #1689/#1757 single-seed floor: its analytic
+        // initial.sp seed lands the correct profiled-scale basin, so a second
+        // full outer solve is redundant. (GaussianLocationScale is not floored
+        // here — it falls through to the requested budget, as before.)
+        (Solver::Arc, gam_problem::SeedRiskProfile::Gaussian) => 1,
         _ => requested_budget,
     }
 }
