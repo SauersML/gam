@@ -4890,6 +4890,88 @@ mod tests {
         assert!((recovered_cross - covariance[[0, 1]]).abs() <= 1e-11);
     }
 
+    /// A cone coefficient sitting EXACTLY on its wall (`β̂_j = 0`) is the
+    /// ordinary state of an active box face, not an edge case: the fit's
+    /// `coefficient_lower_bounds` pins increments there routinely. The
+    /// fraction-to-boundary limit is then `0 / |f_j| = 0`, so every direction
+    /// that loads that coordinate collapses to the mean and contributes no
+    /// spread, while directions that do not load it keep the full `√rank` step.
+    ///
+    /// This is the one place the rule cannot represent the posterior it is
+    /// approximating: a truncated Gaussian at an active bound is ONE-SIDED and
+    /// carries real mass, but no symmetric `±` pair can express that. Reporting
+    /// zero spread there is the conservative feasible answer rather than a
+    /// fabricated one, and pinning it here means a future switch to an
+    /// asymmetric rule has to change this test deliberately instead of silently.
+    #[test]
+    fn posterior_quadrature_radius_collapses_on_an_active_bound() {
+        // Distinct eigenvalues so the PSD factor is axis-aligned and "the
+        // direction that loads the pinned coordinate" is unambiguous.
+        let posterior_mean = ndarray::array![0.0, 0.75];
+        let covariance = ndarray::array![[0.5, 0.0], [0.0, 0.2]];
+
+        let mut min_pinned = f64::INFINITY;
+        let mut max_pinned = f64::NEG_INFINITY;
+        let mut spread_unpinned = 0.0_f64;
+        for_each_survival_posterior_node(&posterior_mean, &covariance, &[0], |node, weight| {
+            min_pinned = min_pinned.min(node[0]);
+            max_pinned = max_pinned.max(node[0]);
+            spread_unpinned += weight * (node[1] - posterior_mean[1]).powi(2);
+            Ok(())
+        })
+        .expect("active-bound quadrature");
+
+        assert!(
+            min_pinned >= 0.0,
+            "an active bound must never be crossed, got {min_pinned}"
+        );
+        assert!(
+            max_pinned.abs() <= 1e-12,
+            "a direction loading an active-bound coordinate carries zero symmetric spread, \
+             but the coordinate reached {max_pinned}"
+        );
+        // The unconstrained coordinate is untouched: collapsing one direction
+        // must not collapse the whole rule.
+        assert!(
+            (spread_unpinned - covariance[[1, 1]]).abs() <= 1e-11,
+            "a coordinate outside the cone keeps its full spread, got {spread_unpinned} want {}",
+            covariance[[1, 1]]
+        );
+    }
+
+    /// Round-off guard for the `β̂_j.max(0.0)` clamp in the fraction-to-boundary
+    /// limit. A converged active-set coefficient can land a few ulps BELOW its
+    /// wall, and the unclamped ratio `β̂_j / |f_j|` would then be NEGATIVE — a
+    /// negative step that silently inverts the `±` geometry of that direction
+    /// instead of shrinking it. The clamp sends the limit to zero, so the pair
+    /// collapses onto `β̂` and truncation never drives a coordinate further
+    /// outside the cone than the fit already left it.
+    #[test]
+    fn posterior_quadrature_clamps_a_roundoff_negative_cone_coordinate() {
+        let roundoff_below_wall = -1e-15_f64;
+        let posterior_mean = ndarray::array![roundoff_below_wall, 0.75];
+        let covariance = ndarray::array![[0.5, 0.0], [0.0, 0.2]];
+
+        let mut nodes = Vec::new();
+        for_each_survival_posterior_node(&posterior_mean, &covariance, &[0], |node, _weight| {
+            nodes.push(node[0]);
+            Ok(())
+        })
+        .expect("round-off-negative cone quadrature");
+
+        for value in &nodes {
+            assert!(
+                *value >= roundoff_below_wall,
+                "truncation must never push a cone coordinate further below the wall than the \
+                 fit left it: node {value} < β̂ {roundoff_below_wall}"
+            );
+            assert!(
+                (*value - roundoff_below_wall).abs() <= 1e-12,
+                "a coordinate at the wall carries no spread, got {value}"
+            );
+        }
+    }
+
     #[test]
     fn probit_survival_hazard_uses_density_over_survival() {
         let eta = 2.0;
