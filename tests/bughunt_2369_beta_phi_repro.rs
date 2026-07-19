@@ -94,7 +94,10 @@ fn beta_pure_parametric_certifies() {
             let phi = fit.fit.likelihood_scale.fixed_phi();
             println!("y ~ x beta fit OK; phi = {phi:?}");
         }
-        Ok(other) => panic!("unexpected fit result variant: {other:?}"),
+        // `FitResult` does not implement `Debug`, so name the variant instead of
+        // formatting it — this file did not compile at all before, which took the
+        // whole `gam` integration-test target with it.
+        Ok(_) => panic!("unexpected fit result variant: expected FitResult::Standard"),
         Err(e) => panic!("y ~ x beta fit FAILED: {e}"),
     }
 }
