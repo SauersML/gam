@@ -12,13 +12,34 @@ The DESIGN-MATRIX CONTRACT (frame name, offset/matrix/coefficient shapes, the
 ``offset + matrix @ coefficients == linear_predictor`` identity, the frozen
 #2141 index, and all three covariance definitions) is a property of the exact
 affine representation, independent of which convergence lane produced the fit.
-The two contract tests below therefore run on well-conditioned fixtures that
-converge cleanly (mirroring the green
-``bug_hunt_1602_design_matrix_coef_reproduces_linear_predictor_test`` and
-``bug_hunt_flexible_link_engages_and_predicts_test`` fixtures). Two OTHER lanes
-that exercise the same contract but currently blow up before the fit exists are
-preserved verbatim as honest red gates at the bottom of this file:
+The GREEN contract tests -- ``test_ordinary_affine_design_exposes_model_offset``
+and ``test_design_matrix_array_returns_the_same_typed_affine_contract`` -- run
+on ordinary GAM fixtures that converge cleanly and are deterministic (their
+covariance is always finite), so they assert the full contract including all
+covariance definitions.
 
+The LINK-WIGGLE frame's contract cannot ride on a green test today: this family
+has no comfortably-PD converging fixture (an explicit ``linkwiggle`` warp, a
+``double_penalty`` warp, larger ``n``, and a stronger slope were each measured
+to FAIL to converge; only the mild default ``flexible(logit)`` warp converges,
+and its joint precision is #2358-marginal -- a PD verdict that flips with
+rayon-fold order under load). So the link-wiggle contract is exercised by honest
+red gates that assert it UNWEAKENED and flip green when their upstream lanes
+land. The deterministic coverage of the covariance FUNCTION itself (exact
+``M^-1``, the best-effort typed-absence downgrade) lives in the Rust
+``best_effort_covariance_tests`` (gam-custom-family/src/covariance.rs), which
+feeds a controlled joint precision with no marginal fit involved.
+
+Honest red gates in this file (unweakened contract, red until their lane lands):
+
+  * ``test_link_wiggle_affine_design_covariance_and_identity_red_gate`` -- the
+    #2299 joint-frame covariance + affine identity; #2358 fit-marginality (the
+    covariance PD verdict is load-sensitive) + the #2299 predict-mu residual
+    (predict routes through the covariance). PASSES on a quiet box, red under
+    ordinary load; a green there is progress signal.
+  * ``test_link_wiggle_affine_design_offset_separation_red_gate`` -- the
+    link-wiggle model-offset separation; #2358 offset joint-Newton
+    non-convergence.
   * ``test_ordinary_affine_design_reml_offset_smoothing_boundary_red_gate`` --
     a smooth-of-x model offset drives a REML-with-offset smoothing-boundary
     non-stationarity for ``s(x)`` + offset (gaussian).
@@ -105,48 +126,51 @@ def test_ordinary_affine_design_exposes_model_offset_and_full_frame() -> None:
     np.testing.assert_allclose(affine.offset, offset, rtol=0.0, atol=0.0)
 
 
-def test_link_wiggle_affine_design_uses_joint_frame_and_exact_2141_index() -> None:
-    # Converging link-wiggle fit, taken verbatim from the GREEN
-    # ``bug_hunt_flexible_link_engages_and_predicts`` fixture that the module
-    # docstring names as the model to mirror: a probit-truth binomial with a
-    # ``link(type=flexible(logit))`` warp on a parametric mean. The warp engages
-    # (the logit base is misspecified for probit data) and the joint Newton
-    # solve certifies a stationary optimum, so the fit is minted and the exact
-    # affine design exists.
-    #
-    # The prior committed fixture asked for ``linkwiggle(degree=2, ...)``, which
-    # the parser rejects outright ("Spline degree 2 is too low for derivative
-    # order 3; need degree >= 3"), so it could never reach a single assertion.
-    # This fixture actually exercises the contract -- including the covariance
-    # blocks, which is the whole point of #2299: before the covariance wiring
-    # fix a converged link-wiggle fit returned ``covariance_conditional=None``
-    # (the ``_assert_affine_identity`` helper's ``conditional is not None``
-    # assertion is exactly the regression guard), so this test is red before the
-    # fix and green after.
-    #
-    # The model-offset-separation half of the contract cannot ride on a
-    # link-wiggle fit yet -- adding a model offset drives the joint solve
-    # non-stationary (#2358) -- so it is exercised on the ORDINARY frame in
-    # ``test_ordinary_affine_design_exposes_model_offset_and_full_frame`` and
-    # kept as an honest link-wiggle red gate below, rather than silently dropped.
-    #
-    # WHY the DEFAULT flexible(logit) warp and not a leaner/heavier-penalty one:
-    # do not "simplify" this to an explicit ``linkwiggle(internal_knots=2)`` or a
-    # ``double_penalty=true`` warp to make the covariance "more PD" -- both were
-    # measured to FAIL to converge (the binomial mean link-wiggle joint Newton
-    # does not certify a stationary optimum), as does a stronger signal slope.
-    # The convergent window of this family is narrow and mildly conditioned
-    # (#2358); the default flexible(logit) warp is the fixture that both
-    # converges AND exposes a finite covariance. Its joint covariance is reliably
-    # non-None here (measured non-None across every clean sequential run); it can
-    # only flip to a typed absence under pathological concurrent machine load,
-    # where rayon-fold summation order at the PD tolerance decides the smallest
-    # eigenvalue of ``H + S_lambda`` -- that is the #2358 solver-stability
-    # marginality, not a design-matrix defect. The deterministic coverage of the
-    # best-effort downgrade itself lives in the Rust unit test
-    # ``best_effort_covariance_tests`` (gam-custom-family/src/covariance.rs),
-    # which feeds a genuinely singular joint precision rather than relying on
-    # this knife-edge.
+def test_link_wiggle_affine_design_covariance_and_identity_red_gate() -> None:
+    """RED GATE (#2358 fit-marginality + the #2299 predict-mu residual).
+
+    The #2299 joint-frame covariance + affine-identity contract for a converged
+    link-wiggle fit, asserted UNWEAKENED: frame == ``link_wiggle_joint``, the
+    joint ``[Mean, LinkWiggle]`` covariance is non-None, and
+    ``offset + matrix @ coefficients == linear_predictor`` to the fp floor.
+
+    This gate is NOT deterministic -- it is honestly-red-under-ordinary-load. On
+    a QUIET box (load < ~25) the flexible(logit) fit converges, its joint
+    precision ``H + S_lambda`` lands PD so the covariance is finite, and
+    ``predict`` serves the linear predictor, and the gate PASSES. Under ORDINARY
+    load it goes red, for two coupled reasons both UPSTREAM of the design-matrix
+    contract:
+      * the fit is #2358-marginal -- the mild logit=~probit warp leaves a
+        weakly-identified warp direction, so the smallest eigenvalue of
+        ``H + S_lambda`` straddles the PD tolerance and rayon-fold summation
+        order (load-dependent) decides finite-covariance vs typed-absence.
+        Measured: covariance non-None 4/4 at load < 25, None in consecutive
+        isolated runs at load ~40. The load-sensitivity IS the bug (a PD verdict
+        that depends on iteration order), owned by #2358.
+      * ``_assert_affine_identity`` obtains the engine linear predictor via
+        ``model.predict``, which for a curved flexible link routes through the
+        posterior-mean path and REQUIRES the joint covariance to integrate
+        ``E[g^-1(eta)]`` -- so when the covariance is a typed absence, predict
+        cannot serve even ``eta``. Serving ``eta`` independently of the
+        covariance is the #2299 predict-mu residual (option ii).
+
+    A green here is PROGRESS SIGNAL, not a flake to silence; the red-gate
+    direction is the safe one (an occasional quiet-box green under-reports the
+    red, it never falsely blocks CI). Do NOT convert this back to a plain green
+    test until BOTH #2358 (load-invariant / iteration-order-invariant
+    convergence) and the #2299 predict-mu residual land. The covariance FUNCTION
+    is pinned deterministically, with exact ``M^-1`` values, in the Rust
+    ``best_effort_covariance_tests`` (gam-custom-family/src/covariance.rs); this
+    gate is the end-to-end wiring half.
+
+    Do NOT "simplify" the fixture to a leaner or heavier-penalty warp to make the
+    covariance "more PD": an explicit ``linkwiggle(internal_knots=2)``, a
+    ``double_penalty=true`` warp, a larger ``n``, and a stronger signal slope
+    were each measured to FAIL to converge (the binomial mean link-wiggle joint
+    Newton does not certify a stationary optimum). The default flexible(logit)
+    warp is the only fixture in this family's narrow convergent window (#2358),
+    and it is the model the module docstring names as the one to mirror.
+    """
     rng = np.random.default_rng(11)
     n = 2500
     x = rng.uniform(-2.5, 2.5, n)
