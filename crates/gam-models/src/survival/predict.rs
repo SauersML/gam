@@ -527,7 +527,7 @@ fn select_survival_prediction_covariance<'a>(
 fn survival_prediction_posterior_factor(
     model: &SavedModel,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<(Array1<f64>, Array2<f64>), SurvivalPredictError> {
+) -> Result<(Array1<f64>, Array2<f64>, Vec<usize>), SurvivalPredictError> {
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     let inactive_tail = if require_saved_survival_likelihood_mode(model)?
         == SurvivalLikelihoodMode::MarginalSlope
@@ -564,9 +564,11 @@ fn survival_prediction_posterior_factor(
             ),
         });
     }
+    let cone_coords = survival_posterior_cone_coordinates(model, active_len)?;
     Ok((
         fit.beta.clone(),
         covariance.slice(s![..active_len, ..active_len]).to_owned(),
+        cone_coords,
     ))
 }
 
@@ -711,9 +713,35 @@ fn conditional_event_density(
 /// polynomial through total degree three in the active rank-`r` subspace, use
 /// the full covariance (including cross-block/cross-cause terms), and require
 /// no sampling seed or dimension-specific tuning constant.
+///
+/// `cone_coords` names the coefficient positions (indices into the active
+/// subspace `0..active_len`) that were constrained to the nonnegativity cone
+/// `β_j ≥ 0` when the fit was certified — the structural monotone-I-spline
+/// baseline time columns of a Royston-Parmar survival fit. The parameter space
+/// of such a model is the cone `C = {β_j ≥ 0 : j ∈ cone}`, so the Laplace
+/// posterior is `N(β̂, Vb)` **truncated to `C`**, not the untruncated Gaussian.
+/// Its quadrature nodes must lie in `C`; a node that pokes a structural time
+/// coefficient below zero manufactures a non-monotone baseline log-cumulative
+/// hazard whose derivative the plugin evaluator then (correctly) refuses
+/// (`royston_parmar_survival_hazard_components`, #2375). For each factor
+/// direction we therefore shrink the symmetric ±step to the largest value that
+/// keeps BOTH nodes feasible (the standard fraction-to-boundary rule):
+///
+/// ```text
+///   α_k = min( √rank,  min_{j ∈ cone, f_{j,k} ≠ 0}  β̂_j / |f_{j,k}| )
+///   nodes = β̂ ± α_k · f_{·,k},   weight 1/(2·rank)  (unchanged)
+/// ```
+///
+/// This keeps the rule symmetric about `β̂` (so it stays exact for linear
+/// functionals and leaves the posterior mean unbiased), keeps every node inside
+/// `C` by construction, and represents `(α_k/√rank)² · Vb` of the spread along
+/// a constrained direction — the right direction of travel, since a truncated
+/// Gaussian genuinely has smaller variance than its untruncated parent. Passing
+/// an empty `cone_coords` recovers the exact unconstrained rule verbatim.
 fn for_each_survival_posterior_node<F>(
     posterior_mean: &Array1<f64>,
     active_covariance: &Array2<f64>,
+    cone_coords: &[usize],
     mut consume: F,
 ) -> Result<(), SurvivalPredictError>
 where
@@ -739,9 +767,29 @@ where
     if rank == 0 {
         return consume(posterior_mean, 1.0);
     }
-    let scale = (rank as f64).sqrt();
+    let nominal_scale = (rank as f64).sqrt();
     let weight = 1.0 / (2 * rank) as f64;
     for column in 0..rank {
+        // Fraction-to-boundary step for the cone `{β_j ≥ 0 : j ∈ cone}`. Each
+        // symmetric node is `β̂ ± scale · f_{·,column}`; feasibility of both
+        // nodes at coordinate `j` requires `|scale · f_{j,column}| ≤ β̂_j`, i.e.
+        // `scale ≤ β̂_j / |f_{j,column}|`. `β̂_j` is clamped at 0 so a coordinate
+        // already numerically pinned at the wall collapses that direction's
+        // step to 0 rather than admitting an infeasible (negative-step) node.
+        let mut scale = nominal_scale;
+        for &j in cone_coords {
+            if j >= active_len {
+                continue;
+            }
+            let load = factorization.factor[[j, column]].abs();
+            if load == 0.0 {
+                continue;
+            }
+            let limit = posterior_mean[j].max(0.0) / load;
+            if limit < scale {
+                scale = limit;
+            }
+        }
         for sign in [-1.0_f64, 1.0_f64] {
             let mut node = posterior_mean.clone();
             for row in 0..active_len {
@@ -751,6 +799,86 @@ where
         }
     }
     Ok(())
+}
+
+/// Structural-monotonicity cone coordinates for a saved survival model's
+/// posterior quadrature — the coefficient positions the fit constrained to
+/// `β_j ≥ 0` (the leading I-spline baseline time columns, per cause).
+///
+/// Only the transformation (Royston-Parmar) family carries a *coordinate* cone:
+/// the fit realizes structural monotonicity as a per-coordinate lower-bound box
+/// `lb[j] = 0` over the leading `p_time_base + p_timewiggle` columns of every
+/// cause block (`fit_survival_transformation_model` /
+/// `fit_cause_specific_survival_transformation_custom`). Weibull carries a
+/// parametric `log t` baseline with no structural cone; marginal-slope enforces
+/// monotonicity with row-wise (not coordinate) constraints; location-scale and
+/// latent posteriors are not routed through this quadrature. In all those cases
+/// this returns an empty cone, recovering the untruncated quadrature verbatim.
+fn survival_posterior_cone_coordinates(
+    model: &SavedModel,
+    active_len: usize,
+) -> Result<Vec<usize>, SurvivalPredictError> {
+    if require_saved_survival_likelihood_mode(model)? != SurvivalLikelihoodMode::Transformation {
+        return Ok(Vec::new());
+    }
+    // Baseline I-spline width (time-independent: it is fixed by the saved knots
+    // / kept columns, not the evaluation times). The timewiggle arm saves the
+    // base basis as `None`, in which case the whole learned time block is the
+    // monotone wiggle tail counted separately below.
+    let time_cfg = load_survival_time_basis_config_from_model(model)
+        .map_err(|err| SurvivalPredictError::MissingFitMetadata {
+            reason: err.to_string(),
+        })?;
+    let p_time_base = if matches!(
+        time_cfg,
+        crate::survival::construction::SurvivalTimeBasisConfig::None
+    ) {
+        0
+    } else {
+        let dummy = Array1::from_elem(1, 1.0_f64);
+        build_survival_time_basis(&dummy, &dummy, time_cfg, None)
+            .map_err(|reason| SurvivalPredictError::MissingFitMetadata { reason })?
+            .x_exit_time
+            .ncols()
+    };
+
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let cause_count = model
+        .survival_cause_count
+        .unwrap_or(fit.blocks.len())
+        .max(1);
+    // Per-cause monotone timewiggle width (0 when the model carries none). The
+    // cone spans the leading `p_time_base + p_timewiggle` coefficients of each
+    // cause block — exactly the structural columns the fit lower-bounds at 0.
+    let per_cause_wiggle: Vec<usize> = if cause_count > 1 {
+        saved_cause_specific_timewiggles(model, &fit, cause_count)?
+            .iter()
+            .map(|w| w.as_ref().map_or(0, |runtime| runtime.beta.len()))
+            .collect()
+    } else {
+        vec![
+            model
+                .saved_baseline_time_wiggle()
+                .map_err(|err| SurvivalPredictError::MissingFitMetadata {
+                    reason: err.to_string(),
+                })?
+                .map_or(0, |runtime| runtime.beta.len()),
+        ]
+    };
+
+    let mut cone = Vec::new();
+    let mut cursor = 0usize;
+    for (cause, block) in fit.blocks.iter().enumerate() {
+        let block_len = block.beta.len();
+        let width = (p_time_base + per_cause_wiggle.get(cause).copied().unwrap_or(0)).min(block_len);
+        for j in cursor..cursor + width {
+            if j < active_len {
+                cone.push(j);
+            }
+        }
+        cursor += block_len;
+    }
+    Ok(cone)
 }
 
 fn posterior_standard_error_matrix(
@@ -883,7 +1011,7 @@ fn predict_survival_posterior_mean(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let (posterior_mean, active_covariance) =
+    let (posterior_mean, active_covariance, cone_coords) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
     let mut result = predict_survival(
         SurvivalPredictRequest {
@@ -907,7 +1035,7 @@ fn predict_survival_posterior_mean(
     let mut eta_mean = Array1::<f64>::zeros(n_rows);
     let mut eta_second = Array1::<f64>::zeros(n_rows);
 
-    for_each_survival_posterior_node(&posterior_mean, &active_covariance, |node, weight| {
+    for_each_survival_posterior_node(&posterior_mean, &active_covariance, &cone_coords, |node, weight| {
         let draw_model = saved_model_with_survival_coefficients(req.model, node)?;
         let draw = predict_survival(
             SurvivalPredictRequest {
@@ -1001,7 +1129,7 @@ fn predict_competing_risks_with_posterior(
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<CompetingRisksPredictResult, SurvivalPredictError> {
     let posterior_mean_estimand = req.estimand == SurvivalPredictEstimand::PosteriorMean;
-    let (posterior_mean, active_covariance) =
+    let (posterior_mean, active_covariance, cone_coords) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
     // The public posterior-mean point is always the conditional-posterior
     // estimand. A smoothing-corrected interval changes only its reported
@@ -1078,7 +1206,7 @@ fn predict_competing_risks_with_posterior(
         .map(|_| Array1::<f64>::zeros(n_rows))
         .collect::<Vec<_>>();
 
-    for_each_survival_posterior_node(&posterior_mean, &active_covariance, |node, weight| {
+    for_each_survival_posterior_node(&posterior_mean, &active_covariance, &cone_coords, |node, weight| {
         let draw_model = saved_model_with_survival_coefficients(req.model, node)?;
         let draw = predict_competing_risks_survival(
             SurvivalPredictRequest {
@@ -4618,7 +4746,7 @@ mod tests {
         let mut functional_second = 0.0_f64;
         let mut recovered_cross_covariance = 0.0_f64;
 
-        for_each_survival_posterior_node(&posterior_mean, &covariance, |node, weight| {
+        for_each_survival_posterior_node(&posterior_mean, &covariance, &[], |node, weight| {
             let functional = node[0] + 2.0 * node[1];
             functional_mean += weight * functional;
             functional_second += weight * functional * functional;
@@ -4653,7 +4781,7 @@ mod tests {
         let mut functional_second = 0.0_f64;
         let mut node_count = 0usize;
 
-        for_each_survival_posterior_node(&posterior_mean, &covariance, |node, weight| {
+        for_each_survival_posterior_node(&posterior_mean, &covariance, &[], |node, weight| {
             let functional = node[0].exp() + node[1].sin();
             functional_mean += weight * functional;
             functional_second += weight * functional * functional;
