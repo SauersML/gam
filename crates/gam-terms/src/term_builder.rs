@@ -5195,21 +5195,45 @@ mod tests {
         assert_eq!(seeded_length_scale, MaternLengthScale::auto());
 
         // (2) After the shared auto-init runs, the realized length-scale must
-        // land in the resolving regime: `max_range / sqrt(n)`, far below the
-        // data diameter. This is the seed the κ-optimizer starts REML from.
+        // land in the resolving regime, far below the data diameter. This is
+        // the seed the κ-optimizer starts REML from. Since #1731 the Matérn
+        // seed is density-adaptive (`auto_initial_length_scale_for_centers`
+        // with the requested center count) and since #2252 it uses the
+        // rotation-invariant covariance extent `sqrt(12·λ_max)` instead of the
+        // rotation-variant per-axis span, so the fitted basin is identical in
+        // every rotated frame. Pin bit-equality against that production seed.
         crate::smooth::auto_init_length_scale_in_basis(ds.values.view(), &mut basis);
-        let realized = match &basis {
-            SmoothBasisSpec::Matern { spec, .. } => spec
-                .length_scale
-                .resolved()
-                .expect("auto-init must resolve Matérn length scale"),
+        let (realized, requested_centers) = match &basis {
+            SmoothBasisSpec::Matern { spec, .. } => (
+                spec.length_scale
+                    .resolved()
+                    .expect("auto-init must resolve Matérn length scale"),
+                match &spec.center_strategy {
+                    CenterStrategy::FarthestPoint { num_centers }
+                    | CenterStrategy::EqualMass { num_centers }
+                    | CenterStrategy::EqualMassCovarRepresentative { num_centers }
+                    | CenterStrategy::KMeans { num_centers, .. } => *num_centers,
+                    CenterStrategy::Auto(inner) => match inner.as_ref() {
+                        CenterStrategy::FarthestPoint { num_centers }
+                        | CenterStrategy::EqualMass { num_centers }
+                        | CenterStrategy::EqualMassCovarRepresentative { num_centers }
+                        | CenterStrategy::KMeans { num_centers, .. } => *num_centers,
+                        other => panic!("unexpected inner center strategy: {other:?}"),
+                    },
+                    other => panic!("unexpected center strategy: {other:?}"),
+                },
+            ),
             other => panic!("expected Matern basis after auto-init, got {other:?}"),
         };
-        let expected = crate::smooth::auto_initial_length_scale(ds.values.view(), &feature_cols);
+        let expected = crate::smooth::auto_initial_length_scale_for_centers(
+            ds.values.view(),
+            &feature_cols,
+            requested_centers,
+        );
         assert!(
             (realized - expected).abs() <= 1e-12,
-            "auto-init must seed the wiggly-side length scale max_range/sqrt(n) \
-             (expected {expected}, got {realized})",
+            "auto-init must seed the density-adaptive rotation-invariant \
+             wiggly-side length scale (expected {expected}, got {realized})",
         );
 
         // Sanity: the resolving seed is well below the per-axis range (≈1.0).
@@ -7487,8 +7511,22 @@ mod tests {
         };
         assert!(matches!(spec.identifiability, BSplineIdentifiability::None));
 
+        // #2297: a two-sided anchor pins BOTH endpoint levels, which strips the
+        // interior level as well — the smooth owns no free level at all, so
+        // identifiability drops to `None` (drop-intercept/skip-centering), the
+        // same ownership rule as the one-sided case above. The former
+        // `WeightedSumToZero` expectation predates #2297 (2e90c51b7) and would
+        // double-constrain the anchored level.
         let two_sided = build("y ~ s(x, bc_left=anchored, bc_right=anchored, k=10)");
         let SmoothBasisSpec::BSpline1D { spec, .. } = &two_sided.smooth_terms[0].basis else {
+            panic!("expected one-dimensional B-spline");
+        };
+        assert!(matches!(spec.identifiability, BSplineIdentifiability::None));
+
+        // Control: an un-anchored smooth keeps the default weighted sum-to-zero
+        // constraint — #2297's anchor rule must not leak into plain smooths.
+        let plain = build("y ~ s(x, k=10)");
+        let SmoothBasisSpec::BSpline1D { spec, .. } = &plain.smooth_terms[0].basis else {
             panic!("expected one-dimensional B-spline");
         };
         assert!(matches!(

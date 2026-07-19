@@ -1424,11 +1424,16 @@ fn test_thin_plate_num_centers_is_exact_center_count() {
 #[test]
 fn test_build_thin_plate_basis_switches_to_lazy_design_for_large_blocks() {
     // The lazy switch fires when the projected dense materialization would
-    // exceed `ResourcePolicy::max_single_materialization_bytes` (1 GiB on
-    // `default_library`). For thin-plate `base_cols == k` exactly (the kernel
-    // constraint nullspace contributes `k - M` columns and the polynomial
-    // block adds the `M` back), so the trip wire is just `n · k · 8 > 1 GiB`,
-    // i.e. `n · k > 2^27`.
+    // exceed `ResourcePolicy::max_single_materialization_bytes`. That budget is
+    // RAM-derived on `default_library` (a governor share of the machine's
+    // available memory), so a default-policy build only trips it on small hosts —
+    // on a large box the same 1.14 GiB projection sits far below the budget and
+    // the design stays dense, which is correct behaviour, not a bug. To pin the
+    // lazy SWITCH itself machine-independently, inject an explicit 1 GiB cap
+    // through `BasisWorkspace::with_policy`. For thin-plate `base_cols == k`
+    // exactly (the kernel constraint nullspace contributes `k - M` columns and
+    // the polynomial block adds the `M` back), so the trip wire is just
+    // `n · k · 8 > 1 GiB`, i.e. `n · k > 2^27`.
     //
     // Drive that threshold with *many rows and few centers* rather than many
     // centers. The build's only non-trivial compute is the O(k^3)
@@ -1461,7 +1466,12 @@ fn test_build_thin_plate_basis_switches_to_lazy_design_for_large_blocks() {
         identifiability: SpatialIdentifiability::None,
         radial_reparam: Some(Array2::<f64>::eye(k - 2)),
     };
-    let result = build_thin_plate_basis(data.view(), &spec)
+    let policy = gam_runtime::resource::ResourcePolicy {
+        max_single_materialization_bytes: 1 << 30,
+        ..gam_runtime::resource::ResourcePolicy::default_library()
+    };
+    let mut workspace = BasisWorkspace::with_policy(policy);
+    let result = build_thin_plate_basiswithworkspace(data.view(), &spec, &mut workspace)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "large thin-plate basis", e));
     assert!(matches!(
         result.design,
