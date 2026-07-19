@@ -41,7 +41,7 @@ gam-test-support = { path = "../gam-test-support" }
 # `reml::objective` tests, `rand` for deterministic synthetic designs, and
 # `tempfile` for the cache-session round-trip tests. Versions track the root
 # workspace crate so the carved tests compile against the same APIs.
-num-dual = "0.13.6"
+num-dual = "0.14.1"
 rand = "0.10.1"
 rand_distr = "0.6.0"
 tempfile = "3.27.0"

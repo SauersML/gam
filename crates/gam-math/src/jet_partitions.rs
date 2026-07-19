@@ -51,7 +51,7 @@
 //!   strictly ≤ the old partition sum's error (see `tests`).
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use wide::{CmpGe, f64x4};
+use wide::f64x4;
 
 pub static COMPOSE_UNARY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static MUL_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -403,7 +403,7 @@ fn combine_powers(p1: &[f64], p2: &[f64], p3: &[f64], p4: &[f64], c: [f64; 4], o
         for (cv, pv) in [(v2, p2), (v3, p3), (v4, p4)] {
             let term = cv * load(pv);
             let t = s + term;
-            let big_s = s.abs().cmp_ge(term.abs());
+            let big_s = s.abs().simd_ge(term.abs());
             let lost = big_s.blend((s - t) + term, (term - t) + s);
             comp += lost;
             s = t;

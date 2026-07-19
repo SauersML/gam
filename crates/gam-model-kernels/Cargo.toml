@@ -20,4 +20,4 @@ libm = "0.2.16"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 opt.workspace = true
 smallvec = "1"
-wide = "0.7"
+wide = "1.5"

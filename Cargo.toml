@@ -68,7 +68,7 @@ resolver = "3"
 # audited source; the exact version keeps published manifests on the matching
 # non-yanked crates.io release after Cargo strips the git reference.
 opt = { version = "=0.5.15", git = "https://github.com/SauersML/opt.git", rev = "245c5d25e74f0bbc038cfb8aabbed3a9434cf9c9" }
-cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12000"] }
+cudarc = { version = "0.19.8", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12000"] }
 
 [lints.rust]
 warnings = "deny"
@@ -120,7 +120,7 @@ gam-sae = { path = "crates/gam-sae", version = "=0.3.149" }
 # `#[macro_export]` macros) so the integration tests under `tests/` keep their
 # `gam::test_support::*` / `gam::gam_binary!` paths unchanged.
 gam-test-support = { path = "crates/gam-test-support", version = "=0.3.149" }
-wide = "0.7"
+wide = "1.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cudarc.workspace = true
@@ -131,7 +131,7 @@ version = "0.9"
 default-features = false
 
 [dev-dependencies]
-num-dual = "0.13.6"
+num-dual = "0.14.1"
 autodiff = "0.7.0"
 ad_trait = "0.3.0"
 criterion = "0.8"

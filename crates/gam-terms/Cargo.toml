@@ -31,7 +31,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 smallvec = "1"
 statrs = "0.18.0"
-wide = "0.7"
+wide = "1.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cudarc.workspace = true
@@ -39,5 +39,5 @@ cudarc.workspace = true
 [dev-dependencies]
 approx = "0.5.1"
 gam-test-support = { path = "../gam-test-support" }
-num-dual = "0.13.6"
+num-dual = "0.14.1"
 rand = "0.10.1"

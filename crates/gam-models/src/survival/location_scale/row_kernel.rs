@@ -6,7 +6,7 @@ use gam_math::jet_scalar::{
     MappedOrder2Accumulator, OneSeedBatch, Order2AtomChannels, RuntimeJetScalar,
 };
 use gam_row_macros::row_atom;
-use wide::{CmpNe, f64x4};
+use wide::f64x4;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurvivalExactRowKernel {
@@ -1966,11 +1966,11 @@ fn pullback_from_channel_cache(
 #[inline]
 fn active_stack_lane_mask(stack: &[f64x4; 5]) -> f64x4 {
     let zero = f64x4::splat(0.0);
-    stack[0].cmp_ne(zero)
-        | stack[1].cmp_ne(zero)
-        | stack[2].cmp_ne(zero)
-        | stack[3].cmp_ne(zero)
-        | stack[4].cmp_ne(zero)
+    stack[0].simd_ne(zero)
+        | stack[1].simd_ne(zero)
+        | stack[2].simd_ne(zero)
+        | stack[3].simd_ne(zero)
+        | stack[4].simd_ne(zero)
 }
 
 /// Blend a composed term with a sign-clean neutral on the lanes the scalar path
