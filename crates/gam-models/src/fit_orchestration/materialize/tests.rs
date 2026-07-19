@@ -2466,6 +2466,177 @@ fn reference_gaussian_wiggle(
     result
 }
 
+/// #2386: predict on a saved Gaussian location-scale fit revalidates through
+/// `UnifiedFitResult::try_from_parts`, which requires the inference-block
+/// covariance copies to be **bitwise equal** to their top-level twins. The
+/// raw-units remap therefore must move every copy through the identical
+/// congruence — a copy left in standardized units made every location-scale
+/// predict refuse with "inference corrected covariance must match top-level
+/// covariance_corrected" once #2346 began publishing the corrected matrix.
+#[test]
+fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_equal_2386() {
+    // A response in the hundreds so the standardization factor `s` is far from
+    // 1 and the raw remap is a strong, unmistakable congruence (D ≠ I).
+    let n = 48usize;
+    let mut records: Vec<csv::StringRecord> = Vec::with_capacity(n);
+    for i in 0..n {
+        let x = -2.0 + 4.0 * (i as f64) / ((n - 1) as f64);
+        let y = 140.0 * (0.7 * x + 0.3 * (1.3 * x).sin());
+        records.push(csv::StringRecord::from(vec![
+            format!("{y:.17e}"),
+            format!("{x:.17e}"),
+        ]));
+    }
+    let data =
+        gam_data::encode_recordswith_inferred_schema(vec!["y".to_string(), "x".to_string()], records)
+            .expect("encode scaled gaussian location-scale dataset");
+    let config = FitConfig {
+        family: Some("gaussian".to_string()),
+        noise_formula: Some("1".to_string()),
+        ..FitConfig::default()
+    };
+    let materialized =
+        materialize("y ~ x", &data, &config).expect("gaussian location-scale materialization");
+    let FitRequest::GaussianLocationScale(request) = materialized.request else {
+        panic!("expected a Gaussian location-scale request");
+    };
+    let GaussianLocationScaleFitRequest {
+        data: req_data,
+        spec,
+        options,
+        kappa_options,
+        ..
+    } = request;
+
+    // Fit in *standardized* units (the engine's internal state before the raw
+    // remap) so the remap under test is applied exactly once, by this test.
+    let mut spec = spec;
+    let s = standardize_gaussian_spec_like_engine(&mut spec);
+    assert!(
+        (s - 1.0).abs() > 10.0,
+        "fixture response scale must make the remap non-trivial, got s={s}"
+    );
+    let fit = fit_gaussian_location_scale_terms(req_data, spec, &options, &kappa_options)
+        .expect("standardized gaussian location-scale terms fit");
+    let mut result = GaussianLocationScaleFitResult {
+        fit,
+        wiggle_knots: None,
+        wiggle_degree: None,
+        beta_link_wiggle: None,
+        response_scale: 1.0,
+    };
+
+    // Install the #2346-shaped covariance state: the corrected matrix mirrored
+    // bitwise at the inference level and the top level, exactly as the
+    // custom-family assembly publishes it, plus a conditional-copy pair.
+    let p = result.fit.fit.beta.len();
+    assert!(p > 0, "joint coefficient vector must be non-empty");
+    let mut corrected = Array2::<f64>::zeros((p, p));
+    for i in 0..p {
+        for j in 0..p {
+            corrected[[i, j]] = if i == j {
+                1.5 + i as f64
+            } else {
+                0.25 / (1.0 + (i as f64 - j as f64).abs())
+            };
+        }
+    }
+    let conditional = corrected.mapv(|v| 0.5 * v);
+    result.fit.fit.covariance_conditional = Some(conditional.clone());
+    result.fit.fit.covariance_corrected = Some(corrected.clone());
+    {
+        let inference = result
+            .fit
+            .fit
+            .inference
+            .as_mut()
+            .expect("terms fit must carry an inference block");
+        inference.beta_covariance = Some(conditional.clone().into());
+        inference.beta_covariance_corrected = Some(corrected.clone());
+        inference.beta_standard_errors_corrected =
+            Some(corrected.diag().mapv(|v| v.max(0.0).sqrt()));
+        inference.smoothing_correction = Some(&corrected - &conditional);
+        inference.smoothing_correction_method = Some(
+            gam_solve::model_types::SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                active_rank: 1,
+                rho_dimension: 1,
+            },
+        );
+    }
+
+    rescale_gaussian_location_scale_to_raw(&mut result, s);
+
+    let fit = &result.fit.fit;
+    let top_conditional = fit
+        .covariance_conditional
+        .as_ref()
+        .expect("top-level conditional covariance survives the remap");
+    let top_corrected = fit
+        .covariance_corrected
+        .as_ref()
+        .expect("top-level corrected covariance survives the remap");
+    let inference = fit.inference.as_ref().expect("inference block survives");
+
+    // The remap must actually have moved the matrices (non-identity D)...
+    assert!(
+        (top_corrected[[0, 0]] - corrected[[0, 0]]).abs() > 1e-12,
+        "remap with s={s} must rescale the corrected covariance"
+    );
+    // ...and every inference copy must land bitwise on its top-level twin,
+    // which is exactly what the predict-time revalidation requires.
+    assert_eq!(
+        inference
+            .beta_covariance
+            .as_ref()
+            .expect("inference conditional copy survives")
+            .as_array(),
+        top_conditional,
+        "inference conditional covariance must ride the raw remap bitwise (#2386)"
+    );
+    assert_eq!(
+        inference
+            .beta_covariance_corrected
+            .as_ref()
+            .expect("inference corrected copy survives"),
+        top_corrected,
+        "inference corrected covariance must ride the raw remap bitwise (#2386)"
+    );
+    // The corrected decomposition Vp = Vb + C must keep holding in raw units:
+    // both sides ride the same congruence, so their difference is the remapped
+    // correction matrix.
+    let correction = inference
+        .smoothing_correction
+        .as_ref()
+        .expect("correction matrix survives");
+    let recomposed = top_conditional + correction;
+    for i in 0..p {
+        for j in 0..p {
+            let expected = top_corrected[[i, j]];
+            assert!(
+                (recomposed[[i, j]] - expected).abs() <= 1e-12 * (1.0 + expected.abs()),
+                "Vp = Vb + C must survive the remap at ({i},{j}): {} vs {expected}",
+                recomposed[[i, j]]
+            );
+        }
+    }
+    // Corrected SEs are the remapped per-coordinate scale of the corrected
+    // diagonal: se_raw_i = f_i * se_i with f_i > 0, so se_raw_i^2 must equal
+    // the corrected diagonal exactly up to float regrouping.
+    let se = inference
+        .beta_standard_errors_corrected
+        .as_ref()
+        .expect("corrected SEs survive");
+    assert_eq!(se.len(), p);
+    for i in 0..p {
+        let expected = top_corrected[[i, i]].max(0.0).sqrt();
+        assert!(
+            (se[i] - expected).abs() <= 1e-12 * (1.0 + expected.abs()),
+            "corrected SE {i} must track the remapped corrected diagonal: {} vs {expected}",
+            se[i]
+        );
+    }
+}
+
 #[test]
 fn gaussian_location_scale_engine_matches_reference_flow() {
     let data = gaussian_location_scale_dataset();
