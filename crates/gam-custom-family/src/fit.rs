@@ -405,7 +405,15 @@ pub(crate) const EFFECTIVE_DF_FLOOR: f64 = 1.0;
 /// `EFFECTIVE_DF_FLOOR` bound — not this uniform cap — is what protects a term
 /// from collapsing onto its unpenalized null space, so this only frees the
 /// coordinates whose honest optimum was being clipped at ρ = 10.
-pub(crate) const EFFECTIVE_DF_CEILING: f64 = 12.0;
+///
+/// Exported `pub` because regimes that PIN a coordinate at the strong-smoothing
+/// wall seed from it (the survival parametric-AFT time-warp seed, #2356): a
+/// wall-pinning seed must move WITH the ceiling, or a ceiling raise strands it
+/// interior and re-opens the flat-ridge crawl the seed exists to kill. Seeding
+/// AT this ceiling is exact even when a term's realized upper bound is tighter
+/// (the `EFFECTIVE_DF_FLOOR` tightening): `run_plan` projects every seed onto
+/// the realized per-coordinate box, so "seed = ceiling" lands ON the wall.
+pub const EFFECTIVE_DF_CEILING: f64 = 12.0;
 
 /// Unit-weight effective degrees of freedom of a single penalized term as a
 /// function of `ρ = log λ`, expressed through the design/penalty generalized

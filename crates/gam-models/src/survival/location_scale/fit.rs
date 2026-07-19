@@ -471,11 +471,12 @@ pub(crate) fn fit_survival_location_scale_terms(
         //
         // The previous fix seeded the *interior* point ρ = 8. That did NOT cure
         // the hang: the inner blockwise REML optimizer re-optimizes ρ_time
-        // freely from its seed against an inner per-coordinate ρ box bound of
-        // ±10 (`fit_custom_family_with_rho_prior`'s `.with_rho_bound(10.0)`).
+        // freely from its seed against a per-coordinate ρ box bound (then ±10;
+        // today `gam_custom_family::EFFECTIVE_DF_CEILING`, tightened per term
+        // by the effective-df floor).
         // λ = exp(8) ≈ 3·10³ already sits INSIDE the "dead-flat region" that
-        // very bound exists to fence off (see the `with_rho_bound` rationale in
-        // `custom_family.rs`): with a flat REML gradient and near-singular
+        // very bound exists to fence off (see the ceiling's rationale in
+        // `gam-custom-family/src/fit.rs`): with a flat REML gradient and near-singular
         // curvature there, the optimizer wanders between ρ = 8 and the ρ = 10
         // boundary one micro-step at a time and the retry-stall detector spins
         // on the flat surface — producing the >200s no-iteration-log hang. A
@@ -483,14 +484,15 @@ pub(crate) fn fit_survival_location_scale_terms(
         // unconstrained projected-gradient stationarity test it would need is
         // exactly the test the flat ridge makes ill-posed.
         //
-        // Seed instead at the inner ρ box bound itself. At the bound the
+        // Seed instead at the ρ box bound itself. At the bound the
         // box-constraint KKT condition (the REML gradient pushes further into
         // strong smoothing, against an active bound) certifies stationarity
         // *immediately* at iteration 0 for the time coordinate — there is no
         // interior flat region left to wander, because the optimizer is pinned
-        // at the wall. λ = exp(10) ≈ 22k is the affine-nullspace limit (the
-        // bound's own rationale calls this "statistically indistinguishable
-        // from shrunk to nullspace"), i.e. exactly the parametric-AFT affine
+        // at the wall. λ = exp(EFFECTIVE_DF_CEILING = 12) ≈ 1.6·10⁵ is deep in
+        // the affine-nullspace limit (the ceiling's own rationale calls this
+        // regime "statistically indistinguishable from shrunk to nullspace"),
+        // i.e. exactly the parametric-AFT affine
         // baseline. This is a regime-specific *initialization*, not a cap or a
         // tolerance change: the I-spline basis dimensions are untouched, so any
         // independent rebuild of the time basis (predictor reconstruction) is
@@ -512,15 +514,19 @@ pub(crate) fn fit_survival_location_scale_terms(
         // null space to collapse onto (or a timewiggle keeps the flexibility),
         // pinning that surviving time ρ at the strong-smoothing limit.
         if constant_scale {
-            // ρ = 10 == the inner blockwise solver's per-coordinate ρ box bound
-            // (`custom_family.rs` `with_rho_bound(10.0)`). Seeding AT the bound
-            // (not interior, as the prior ρ = 8 seed did) makes the box
-            // constraint active from iteration 0, so outer stationarity
-            // certifies immediately instead of crawling the flat ridge.
-            const PARAMETRIC_AFT_TIME_RHO_SEED: f64 = 10.0;
+            // Seed AT the custom-family outer box ceiling (not interior, as the
+            // prior ρ = 8 seed was) so the box constraint is active from
+            // iteration 0 and outer stationarity certifies immediately instead
+            // of crawling the flat ridge. The invariant is "seed sits ON the
+            // coordinate's realized wall", not any numeric value: a stranded
+            // local `10.0` re-opened a two-e-fold ridge crawl when the ceiling
+            // moved to 12 (#2356). Referencing the ceiling itself is exact even
+            // when the term's realized upper bound is tighter (the
+            // effective-df-floor tightening): `run_plan` projects every seed
+            // onto the realized per-coordinate box before use.
             let mut time_seed = rho0.slice_mut(s![range.start..range.end]);
             for v in time_seed.iter_mut() {
-                *v = PARAMETRIC_AFT_TIME_RHO_SEED;
+                *v = gam_custom_family::EFFECTIVE_DF_CEILING;
             }
         }
     }
