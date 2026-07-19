@@ -42,7 +42,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python deps
-        run: pip install --upgrade pip "maturin>=1.7,<2" numpy pandas scikit-learn lifelines
+        run: pip install --upgrade pip "maturin>=1.7,<2" numpy pandas pyarrow scikit-learn lifelines
 
       - name: Build and install gamfit (maturin)
         # `bench/fuzz_vs_mgcv.py` imports the project's own `gamfit` Python
