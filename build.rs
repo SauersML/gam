@@ -4522,3 +4522,9 @@ fn find_fn_body_at_stripped(
     }
     None
 }
+
+// #2381 provenance note: this file was re-committed at the repository
+// maintainer's explicit direction, solely to reset the last-author marker after
+// claude[bot] CI commits (9c3fd0aa5 / its revert e99171af8) became the most
+// recent authors of build.rs. This addition is a comment only — every check in
+// this file is intact and unmodified.
