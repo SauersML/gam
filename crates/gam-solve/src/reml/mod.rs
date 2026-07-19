@@ -5515,6 +5515,25 @@ pub(crate) struct RemlState<'a> {
     /// `k` at the converged η. Reset on `reset_surface`.
     pub(crate) frozen_gamma_shape: Arc<AtomicU64>,
 
+    /// Beta-regression precision `phi` frozen for the smoothing-parameter (λ)
+    /// search (#2369), bit-packed `f64` (`f64::to_bits`). `0` (the default)
+    /// signals "not yet frozen". On the first non-screening λ-search inner solve
+    /// of an estimated-φ Beta fit, the seed's converged-η Pearson `phî` is
+    /// captured once and stored here; every subsequent λ-search evaluation pins
+    /// the inner solve to this value via
+    /// `GlmLikelihoodSpec::with_beta_phi_frozen_for_search`, so the REML
+    /// criterion `F(ρ) = REML(ρ, φ_frozen)` is a stationary function of ρ. With
+    /// `phi` estimated the inner solver re-derives it from each warm-start η, and
+    /// because the Beta precision does not factor out of the digamma mean score
+    /// `∂ℓ/∂β = φ·Σ xᵢ(y*ᵢ − μ*ᵢ)`, a `phi` swinging with η makes both β̂(ρ) and
+    /// the REML data-fit / log-det terms jump with ρ while the analytic outer
+    /// gradient holds `phi` fixed — the projected gradient floors above tolerance
+    /// and the optimizer refuses ("NOT STATIONARY"), the family-unusable #2369
+    /// signature, identical to the sibling Gamma/Tweedie/NB drift. The single
+    /// final reported fit still Pearson-refreshes `phi` at the converged η. Reset
+    /// on `reset_surface`.
+    pub(crate) frozen_beta_phi: Arc<AtomicU64>,
+
     /// Last observed IFT-prediction residual (`‖β_converged − β_predicted‖
     /// / ‖β_converged‖`) from the most recent non-screening solve where
     /// the predictor was actually consumed. Bit-packed `f64` (low 64

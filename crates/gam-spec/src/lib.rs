@@ -1868,6 +1868,19 @@ pub enum LikelihoodScaleMetadata {
     /// from the working residuals after each mean fit and refreshed across outer
     /// iterations, exactly like the Gamma shape (issue #567).
     EstimatedBetaPhi { phi: f64 },
+    /// Beta-regression precision `phi` held FIXED for the duration of the
+    /// smoothing-parameter (λ) search (#2369). Identical role to
+    /// `EstimatedBetaPhi` in every weight / variance / covariance expression
+    /// (`Var(y) = mu(1-mu)/(1+phi)`, the digamma mean score reads `phi` through
+    /// the same `Beta { phi }` family variant), but the inner solver's
+    /// per-solve Pearson refresh is gated off (its guard is
+    /// `beta_phi_is_estimated()`, which `FixedBetaPhi` does not satisfy). The
+    /// fixed/estimated split mirrors `FixedGammaShape` vs `EstimatedGammaShape`
+    /// and `FixedNegBinTheta` vs `EstimatedNegBinTheta`. This is a *transient*
+    /// λ-search form produced only by
+    /// `with_beta_phi_frozen_for_search`; the single final reported fit
+    /// Pearson-refreshes `phi` at the converged η and records `EstimatedBetaPhi`.
+    FixedBetaPhi { phi: f64 },
     /// Tweedie exponential-dispersion `phi` estimated jointly with the mean
     /// model. `Var(y) = phi · mu^p` with `phi` a genuine free parameter (unlike
     /// Binomial/Poisson, where `phi ≡ 1`). Estimated by the Pearson moment
@@ -1914,6 +1927,7 @@ impl LikelihoodScaleMetadata {
         match self {
             Self::FixedDispersion { phi }
             | Self::EstimatedBetaPhi { phi }
+            | Self::FixedBetaPhi { phi }
             | Self::EstimatedTweediePhi { phi } => Some(phi),
             Self::FixedGammaShape { shape } | Self::EstimatedGammaShape { shape } => {
                 Some(1.0 / shape)
@@ -2349,7 +2363,25 @@ impl GlmLikelihoodSpec {
                     estimated: true,
                 })
             }
-            (ResponseFamily::Beta { .. }, _) => Err(mismatch("matching EstimatedBetaPhi metadata")),
+            // The λ-search freeze form (#2369). Same mirror invariant as the
+            // estimated arm — the frozen `phi` is written onto BOTH the family
+            // variant and the metadata by `with_beta_phi_frozen_for_search` —
+            // but `estimated: false` so the inner per-solve Pearson refresh is
+            // gated off and `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ.
+            (ResponseFamily::Beta { phi }, Metadata::FixedBetaPhi { phi: metadata_phi }) => {
+                if phi.to_bits() != metadata_phi.to_bits() {
+                    return Err(InvalidLikelihoodScale::new(format!(
+                        "Beta family precision {phi:?} disagrees with frozen metadata precision {metadata_phi:?}"
+                    )));
+                }
+                Ok(Resolved::BetaPrecision {
+                    precision: positive(*phi, "Beta precision")?,
+                    estimated: false,
+                })
+            }
+            (ResponseFamily::Beta { .. }, _) => {
+                Err(mismatch("matching EstimatedBetaPhi or FixedBetaPhi metadata"))
+            }
 
             (
                 ResponseFamily::NegativeBinomial {
@@ -2756,6 +2788,47 @@ impl GlmLikelihoodSpec {
             && self.scale.gamma_shape_is_estimated()
         {
             self.scale = LikelihoodScaleMetadata::FixedGammaShape { shape };
+        }
+        self
+    }
+
+    /// Produce a copy of this spec with the Beta-regression precision `phi`
+    /// PINNED at `phi` for the duration of the smoothing-parameter (λ) search
+    /// (#2369). Converts an `EstimatedBetaPhi` scale into the
+    /// statistically-identical `FixedBetaPhi` form, which gates off the
+    /// per-inner-solve Pearson refresh in
+    /// `GamWorkingModel::update_with_curvature` (its guard is
+    /// `beta_phi_is_estimated()`, which `FixedBetaPhi` does not satisfy) while
+    /// leaving every weight / deviance / mean-score / log-likelihood expression
+    /// unchanged (they read `phi` through the `Beta { phi }` family variant and
+    /// `fixed_phi()`, which `FixedBetaPhi` answers identically). Both the family
+    /// variant and the metadata are set to the frozen value so the
+    /// `resolved_scale` mirror invariant holds.
+    ///
+    /// Rationale: with `phi` estimated, the inner solver re-derives it from each
+    /// outer iterate's *warm-start* η via the Pearson moment estimator
+    /// `1+phî = Σw / Σ w·(y−μ)²/(μ(1−μ))`. Unlike a canonical-link GLM the Beta
+    /// precision does NOT factor out of the mean: the β score is
+    /// `∂ℓ/∂β = phi·Σ xᵢ(y*ᵢ − μ*ᵢ)` with `μ*ᵢ = ψ(μᵢφ) − ψ((1−μᵢ)φ)`, so a
+    /// `phi` that swings with the warm-start η makes BOTH the mean fit β̂(ρ) and
+    /// the REML data-fit / log-det terms jump with ρ. The analytic outer
+    /// gradient holds `phi` fixed, so it can never agree with the realized
+    /// cost's `phi(ρ)` motion: the projected gradient floors above tolerance and
+    /// the outer optimizer refuses ("NOT STATIONARY"), exactly as the sibling
+    /// Gamma-shape (#1074), Tweedie-φ (#1477) and NB-θ (#1082) freezes document.
+    /// Holding `phi` fixed across the λ-search makes `F(ρ) = REML(ρ, φ_frozen)`
+    /// a genuine stationary function of ρ. `phi` is still Pearson-refreshed at
+    /// the single final reported fit (the
+    /// `refine_dispersion_at_converged_eta = true` accept-fit), so the reported
+    /// precision / SEs remain the converged-η estimate. No-op for non-Beta
+    /// families and for an already-fixed `phi`.
+    #[inline]
+    pub fn with_beta_phi_frozen_for_search(mut self, phi: f64) -> Self {
+        if let ResponseFamily::Beta { phi: family_phi } = &mut self.spec.response
+            && self.scale.beta_phi_is_estimated()
+        {
+            *family_phi = phi;
+            self.scale = LikelihoodScaleMetadata::FixedBetaPhi { phi };
         }
         self
     }

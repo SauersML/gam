@@ -4140,6 +4140,7 @@ impl<'a> RemlState<'a> {
             frozen_negbin_theta: Arc::new(AtomicU64::new(0)),
             frozen_tweedie_phi: Arc::new(AtomicU64::new(0)),
             frozen_gamma_shape: Arc::new(AtomicU64::new(0)),
+            frozen_beta_phi: Arc::new(AtomicU64::new(0)),
             last_ift_prediction_residual: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             last_pirls_accept_rho: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             ift_cached_factor: RwLock::new(None),
@@ -4245,6 +4246,10 @@ impl<'a> RemlState<'a> {
         // seed fit on the PREVIOUS design; re-freeze it from the new surface's
         // own seed. `0` = "not yet frozen".
         self.frozen_gamma_shape.store(0, Ordering::Relaxed);
+        // The λ-search frozen Beta φ (#2369) is likewise computed from the seed
+        // fit on the PREVIOUS design; re-freeze it from the new surface's own
+        // seed. `0` = "not yet frozen".
+        self.frozen_beta_phi.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -6756,6 +6761,46 @@ impl<'a> RemlState<'a> {
                         .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
                 }
             }
+            // Beta λ-search precision freeze (#2369). Same drift mechanism as the
+            // NB θ / Tweedie φ / Gamma shape freezes above, and the same
+            // stalled-outer symptom: with φ estimated, the inner solver
+            // re-derives it by the Pearson moment estimator from each outer
+            // iterate's warm-start η. The Beta precision does not factor out of
+            // the digamma mean score (`∂ℓ/∂β = φ·Σ xᵢ(y*ᵢ − μ*ᵢ)`), so a φ that
+            // swings with η moves BOTH the mean fit β̂(ρ) and the REML data-fit /
+            // log-det terms with ρ; the analytic outer gradient holds φ fixed and
+            // can never match that motion, the projected gradient floors above
+            // tolerance, and the optimizer refuses ("NOT STATIONARY") for EVERY
+            // fit — the family-unusable #2369 signature. Pin every λ-search inner
+            // solve to the first converged solve's Pearson φ so
+            // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
+            // at the single final reported fit. No effect on non-Beta or
+            // user-fixed-φ specs.
+            if matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::BetaPrecision {
+                    estimated: true,
+                    ..
+                }
+            ) {
+                let frozen_bits = self.frozen_beta_phi.load(Ordering::Relaxed);
+                if frozen_bits != 0 {
+                    let frozen_phi = f64::from_bits(frozen_bits);
+                    if !(frozen_phi.is_finite() && frozen_phi > 0.0) {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "frozen Beta precision is invalid: {frozen_phi:?}"
+                        )));
+                    }
+                    pirls_config.likelihood = pirls_config
+                        .likelihood
+                        .clone()
+                        .with_beta_phi_frozen_for_search(frozen_phi);
+                    pirls_config
+                        .likelihood
+                        .resolved_scale()
+                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+                }
+            }
             // Levenberg-Marquardt damping warm-start. Read the cached
             // λ from the previous successful PIRLS solve at this
             // surface (0 = no hint), and seed the inner solver. The
@@ -7029,6 +7074,53 @@ impl<'a> RemlState<'a> {
                 .store(shape.to_bits(), Ordering::Relaxed);
             log::info!(
                 "[OUTER] gamma λ-search shape frozen at {shape:.6e} (#1074/#2361, \
+                 measured at the converged η); outer REML criterion now stationary in ρ"
+            );
+        }
+        // Capture the data-driven Beta precision `phi` from the first converged
+        // non-screening λ-search solve and freeze it for the rest of the search
+        // (#2369), exactly as for the NB θ / Tweedie φ / Gamma shape above.
+        // Measure `phi` at this solve's CONVERGED η, not at whatever value the
+        // per-solve moment lock left on `likelihood`: the λ-search runs with
+        // `refine_dispersion_at_converged_eta = false`, so on a COLD start the
+        // resolved value is the Pearson φ measured at the half-converged
+        // warm-start η — at the null predictor (μ ≈ 0.5) the residuals capture
+        // the full MARGINAL spread of y instead of its conditional spread, so
+        // that φ is far too small (the #2369 sibling "frozen at the null
+        // predictor" mean-attenuation bug). Freezing THAT value would pin the
+        // whole outer criterion to a mis-specified dispersion. This is one O(n)
+        // Pearson evaluation at an η the solve has already produced — no
+        // re-solve, and NOT a per-λ re-profile: the value is captured once and
+        // held fixed for every subsequent ρ, so `F(ρ) = REML(ρ, φ_frozen)` stays
+        // stationary in ρ exactly as #2369 requires. The single final reported
+        // fit still Pearson-refreshes φ at its own converged η.
+        if !in_screening
+            && matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::BetaPrecision {
+                    estimated: true,
+                    ..
+                }
+            )
+            && self.frozen_beta_phi.load(Ordering::Relaxed) == 0
+            && matches!(
+                pirls_result.status,
+                pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
+            )
+        {
+            let phi = pirls::estimate_beta_phi_from_eta(
+                self.y,
+                &pirls_result.final_eta.to_owned(),
+                self.weights,
+            )?;
+            if !(phi.is_finite() && phi > 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "converged-η Beta precision freeze produced an invalid φ: {phi:?}"
+                )));
+            }
+            self.frozen_beta_phi.store(phi.to_bits(), Ordering::Relaxed);
+            log::info!(
+                "[OUTER] beta λ-search precision frozen at {phi:.6e} (#2369, \
                  measured at the converged η); outer REML criterion now stationary in ρ"
             );
         }

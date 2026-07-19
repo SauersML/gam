@@ -1701,6 +1701,7 @@ fn validate_likelihood_scale_estimation(
         LikelihoodScaleMetadata::ProfiledGaussian | LikelihoodScaleMetadata::Unspecified => Ok(()),
         LikelihoodScaleMetadata::FixedDispersion { phi }
         | LikelihoodScaleMetadata::EstimatedBetaPhi { phi }
+        | LikelihoodScaleMetadata::FixedBetaPhi { phi }
         | LikelihoodScaleMetadata::EstimatedTweediePhi { phi } => {
             ensure_finite_scalar_estimation("fit_result.likelihood_scale.phi", phi)?;
             if phi > 0.0 {
