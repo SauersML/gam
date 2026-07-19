@@ -3304,7 +3304,66 @@ impl SaeManifoldTerm {
             // is diagnostic ONLY (no state change), so healthy fits are byte-unchanged;
             // it lets the structure search / operator see the mode the two-width test
             // catches without the false-positive reseed that regressed live fits.
-            let ev_degenerate = ev.is_finite() && ev <= ev_floor && out_energy_ratio <= ev_floor;
+            let base_degenerate = ev.is_finite() && ev <= ev_floor && out_energy_ratio <= ev_floor;
+            // #2362 Face B — STRUCTURAL co-collapse the achieved-EV / output-energy
+            // pair is blind to. The inner solve AMPLITUDE-COMPENSATES tiny decoders
+            // (a_i grows as the decoder norm shrinks), so the reconstruction keeps
+            // O(1) output energy even when every decoder has collapsed onto a shared
+            // low-dimensional OUTPUT subspace: `out_energy_ratio` never reaches the
+            // null floor, so the co-vanished test misses it (the k3 fixture in
+            // `decoder_norm_guard_reseeds_all_atoms_on_total_co_collapse_k3`: rank-1
+            // constant decoders, `events: []`). Detect it from the DECODERS. With `Q`
+            // an orthonormal basis of the union decoder output span (rank `R_dec`),
+            // the BEST reconstruction achievable WITHIN that span — amplitude-free —
+            // captures `reach = ||Q^T T_c||_F^2 / ss_tot` of the centered target
+            // variance. When the atoms have piled onto a shared subspace
+            // (`R_dec < K`) whose capture is no better than a RANDOM output subspace
+            // of the same dimension (`reach <= R_dec / p`), the dictionary is
+            // structurally co-collapsed however much output energy amplitude
+            // compensation manufactures. Scale-free (relative SVD cutoff),
+            // amplitude-free (subspace projection), and pairing-free (a UNION rank,
+            // not the pairwise coherence that false-fired on healthy correlated K>=2
+            // fits): a healthy overcomplete fit whose union span is RICH keeps
+            // `reach` well above `R_dec / p` and never trips it
+            // (`manifold_beats_linear_joint_streaming_1026`: 8 atoms on a 2-D ring,
+            // `R_dec` ~ 2, reach ~ 0.9, null 0.2).
+            let frames_sc = (0..k)
+                .map(|atom| crate::manifold::certificate::certificate_output_frame(self, atom))
+                .collect::<Result<Vec<_>, String>>()?;
+            let r_dec_sc = union_output_frame_rank(&frames_sc, p);
+            let structural_degenerate = if r_dec_sc == 0 || r_dec_sc >= k || p == 0 {
+                false
+            } else {
+                let owned_stats;
+                let stats = match target_col_stats {
+                    Some(stats) => stats,
+                    None => {
+                        owned_stats = TargetCenteredColStats::compute(target);
+                        &owned_stats
+                    }
+                };
+                if !(stats.ss_tot > 0.0) {
+                    false
+                } else {
+                    let q = union_output_frame_basis(&frames_sc, p);
+                    let qc = q.ncols();
+                    let n_rows = target.nrows();
+                    let mut in_span = 0.0_f64;
+                    for row in 0..n_rows {
+                        for c in 0..qc {
+                            let mut proj = 0.0_f64;
+                            for out in 0..p {
+                                proj += q[[out, c]] * (target[[row, out]] - stats.col_means[out]);
+                            }
+                            in_span += proj * proj;
+                        }
+                    }
+                    let ceiling = in_span / stats.ss_tot;
+                    let random_subspace_null = r_dec_sc as f64 / p as f64;
+                    ceiling <= random_subspace_null
+                }
+            };
+            let ev_degenerate = base_degenerate || structural_degenerate;
             if !ev_degenerate
                 && let Some((j, kk, coherence)) = self.structural_coherence_collapse_detected()?
             {
@@ -8241,6 +8300,57 @@ fn union_output_frame_rank(frames: &[Array2<f64>], p: usize) -> usize {
     }
     let tol = crate::frames::SAE_FRAME_RANK_CUTOFF * max_sv;
     sv.iter().filter(|&&v| v > tol).count().min(p)
+}
+
+/// #2362 Face B — orthonormal basis `Q` (`p x R_dec`) of the union decoder output
+/// span: the column-space companion to [`union_output_frame_rank`]. Same stacked
+/// decoder output frames and the same RELATIVE singular-value cutoff, but returns
+/// the retained LEFT singular vectors so a caller can PROJECT the target onto the
+/// realized output subspace (the amplitude-free reach ceiling), not merely count
+/// its dimension. Returns a `p x 0` matrix when the dictionary has no usable output
+/// frame (the caller then reads no structural collapse).
+fn union_output_frame_basis(frames: &[Array2<f64>], p: usize) -> Array2<f64> {
+    let total_cols: usize = frames.iter().map(|q| q.ncols()).sum();
+    if p == 0 || total_cols == 0 {
+        return Array2::<f64>::zeros((p, 0));
+    }
+    let mut stacked = Array2::<f64>::zeros((p, total_cols));
+    let mut col = 0usize;
+    for q in frames {
+        let m = q.ncols();
+        if m == 0 {
+            continue;
+        }
+        if q.nrows() != p {
+            return Array2::<f64>::zeros((p, 0));
+        }
+        for qc in 0..m {
+            for row in 0..p {
+                stacked[[row, col + qc]] = q[[row, qc]];
+            }
+        }
+        col += m;
+    }
+    let (u_opt, sv, _) = match stacked.svd(true, false) {
+        Ok(factors) => factors,
+        Err(_) => return Array2::<f64>::zeros((p, 0)),
+    };
+    let Some(u) = u_opt else {
+        return Array2::<f64>::zeros((p, 0));
+    };
+    let max_sv = sv.iter().copied().fold(0.0_f64, f64::max);
+    if !(max_sv > 0.0) {
+        return Array2::<f64>::zeros((p, 0));
+    }
+    let tol = crate::frames::SAE_FRAME_RANK_CUTOFF * max_sv;
+    let rank = sv.iter().filter(|&&v| v > tol).count().min(p).min(u.ncols());
+    let mut basis = Array2::<f64>::zeros((p, rank));
+    for c in 0..rank {
+        for row in 0..p {
+            basis[[row, c]] = u[[row, c]];
+        }
+    }
+    basis
 }
 
 #[cfg(test)]
