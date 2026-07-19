@@ -161,7 +161,31 @@ fn invalid_gpu_request(operation: &'static str, reason: &'static str) -> ! {
     panic!("GPU operation '{operation}' received invalid input: {reason}");
 }
 
+/// Policy-explicit variant of [`decline_gpu`] for the `_with_policy` entry
+/// points on platforms without the CUDA backend: the CALLER's policy — not the
+/// process-global one — owns the Required contract at that boundary, so a
+/// caller-passed `Required` must fail loudly here instead of silently falling
+/// back to CPU while `decline_gpu` consults an unrelated global. Only compiled
+/// off-Linux because every Linux path consumes the policy through
+/// `route_through_gpu_with_policy` before any decline.
+#[cfg(not(target_os = "linux"))]
+#[inline]
+#[track_caller]
+fn decline_gpu_with_policy<T>(
+    operation: &'static str,
+    reason: &'static str,
+    gpu_policy: GpuPolicy,
+) -> Option<T> {
+    if gpu_policy == GpuPolicy::Required {
+        // SAFETY: this legacy `Option` hook has no typed error channel and
+        // `None` explicitly authorizes CPU execution, which Required forbids.
+        panic!("gpu=required operation '{operation}' cannot execute on the GPU: {reason}");
+    }
+    None
+}
+
 /// A malformed device result is an execution fault, never an Auto decline.
+#[cfg(target_os = "linux")]
 #[inline]
 #[track_caller]
 fn invalid_gpu_result(operation: &'static str, reason: &'static str) -> ! {
@@ -174,6 +198,7 @@ fn invalid_gpu_result(operation: &'static str, reason: &'static str) -> ! {
 /// `None` for an execution failure, but absence and profitability were already
 /// settled before the attempt. A post-admission `None` is therefore a fault
 /// under every policy and must not be laundered into a CPU fallback.
+#[cfg(target_os = "linux")]
 #[inline]
 #[track_caller]
 fn complete_gpu_attempt<T>(operation: &'static str, result: Option<T>) -> T {
@@ -452,9 +477,10 @@ pub fn try_fast_abt_strided_batched_with_policy(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        return decline_gpu(
+        return decline_gpu_with_policy(
             "batched A·Bᵀ",
             "the CUDA backend is not compiled on this platform",
+            gpu_policy,
         );
     }
     #[cfg(target_os = "linux")]
@@ -1143,9 +1169,10 @@ pub fn try_cholesky_batched_lower_inplace_with_policy(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        return decline_gpu(
+        return decline_gpu_with_policy(
             "batched Cholesky factorization",
             "the CUDA backend is not compiled on this platform",
+            gpu_policy,
         );
     }
     #[cfg(target_os = "linux")]
