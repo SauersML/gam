@@ -5126,6 +5126,111 @@ mod tests {
         assert!((projected[1] - point[1]).abs() < 1e-8);
     }
 
+    /// #2378 regression, independent oracle. The operator strict-interior
+    /// projection onto an OVER-COMPLETE cone face (three of a 2-D block's four
+    /// half-spaces try to bind — rank 2) must not merely land on *a* feasible
+    /// point; it must be the correct Euclidean projection. The former loose
+    /// rank-reduction truncated the true binding extreme (row 2) out of the
+    /// enforced face and refused the fit; a regression in the over-complete-face
+    /// exchange would release the wrong representative and land on a different
+    /// feasible vertex. Both are caught by matching the dense oracle over the
+    /// same materialized rows AND by pinning which pair binds ({1,2}, not {1,3}).
+    #[test]
+    fn operator_projection_adjudicates_the_over_complete_face_2378() {
+        let cone = small_cone();
+        let set = ConstraintSet::KhatriRaoCone(cone.clone());
+        // The #2378 witness point: coupled block 1 = coords[2..4] = (-1, -0.5)
+        // is over-complete; block 2 is left feasible.
+        let point = array![0.4_f64, -0.2, -1.0, -0.5, 0.3, 0.05];
+        let projected = project_point_strictly_into_feasible_constraint_set(&point, &set)
+            .expect("operator projection must certify the over-complete-face vertex");
+
+        // Ground-truth oracle: the SAME projection over the dense materialization
+        // of the cone rows, through the independent dense arm.
+        let dense = ConstraintSet::Dense(cone.to_dense().expect("dense oracle"));
+        let dense_proj = project_point_strictly_into_feasible_constraint_set(&point, &dense)
+            .expect("dense projection oracle");
+        for j in 0..point.len() {
+            assert!(
+                (projected[j] - dense_proj[j]).abs() < 1e-7,
+                "operator projection diverged from the dense oracle at {j}: \
+                 op={:.9e} dense={:.9e}",
+                projected[j],
+                dense_proj[j]
+            );
+        }
+
+        // The correct binding pair is block-1 rows {1,2} (flat ids 1 and 2 in
+        // slot 0). Row 2 — the extreme the old code truncated — must be TIGHT,
+        // not violated. Rows are `slot*n + obs`, n = 4 Ψ rows, coupled slot 0.
+        let values = set.values(projected.view()).expect("values");
+        let scaled = |row: usize| values[row] / set.row_norm(row).expect("norm");
+        // Rows 1 and 2 bind at (near) the strict-interior margin floor…
+        for row in [1usize, 2] {
+            assert!(
+                scaled(row) < ACTIVE_SET_INTERIOR_SEED_MARGIN + 1e-7,
+                "block-1 row {row} should bind, scaled slack {:.3e}",
+                scaled(row)
+            );
+        }
+        // …while rows 0 and 3 stay strictly slacker than the binding pair.
+        for row in [0usize, 3] {
+            assert!(
+                scaled(row) > scaled(2) + 1e-9,
+                "non-binding row {row} (slack {:.3e}) must exceed the binding \
+                 row 2 (slack {:.3e})",
+                scaled(row),
+                scaled(2)
+            );
+        }
+    }
+
+    /// #2378 regression at the QP level (non-identity Hessian): the operator
+    /// active-set loop's over-complete-face exchange must reach the same
+    /// constrained minimizer as the dense oracle when a coupled block is loaded
+    /// so that three of its half-spaces contend at the optimum.
+    #[test]
+    fn operator_cone_qp_over_complete_face_matches_dense_oracle_2378() {
+        let cone = small_cone();
+        let set = ConstraintSet::KhatriRaoCone(cone.clone());
+        let dense = cone.to_dense().expect("dense oracle");
+        let p = set.ncols();
+        let hessian = coupled_pd_hessian(p);
+        // Drive block-1's unconstrained optimum deep into the infeasible corner
+        // where the extreme Ψ rows 1 and 2 both contend (the over-complete face),
+        // and pin block-2 with its own mild load.
+        let rhs = array![0.3_f64, -0.1, -2.5, -1.2, -0.4, 0.2];
+        let beta_start = array![0.0_f64, 0.0, 1.0, 0.1, 1.0, 0.1];
+
+        let (beta_op, _active_op) =
+            solve_quadratic_with_constraint_set(&hessian, &rhs, &beta_start, &set, None)
+                .expect("operator QP solve over an over-complete face");
+        let (beta_dense, _active_dense) =
+            solve_quadratic_with_linear_constraints(&hessian, &rhs, &beta_start, &dense, None)
+                .expect("dense QP oracle");
+
+        for j in 0..p {
+            assert!(
+                (beta_op[j] - beta_dense[j]).abs() < 1e-7,
+                "operator/dense coefficient {j} mismatch: {} vs {}",
+                beta_op[j],
+                beta_dense[j]
+            );
+        }
+        // The operator answer is feasible on the full factored cone.
+        let values = set.values(beta_op.view()).expect("values");
+        for row in 0..set.nrows() {
+            let norm = set.row_norm(row).expect("norm");
+            if norm > 0.0 {
+                assert!(
+                    values[row] / norm >= -ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
+                    "row {row} violated at the operator optimum: {:.3e}",
+                    values[row] / norm
+                );
+            }
+        }
+    }
+
     #[test]
     fn operator_cone_does_not_materialize_a_whole_tight_face() {
         // All 4,096 observation rows describe the same half-space.  At the
