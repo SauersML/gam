@@ -6943,6 +6943,150 @@ fn certify_mints_saddle_escape_reseed_at_interior_saddle() {
     );
 }
 
+// #2155 — the SAME double-well saddle in (ρ₀, ρ₁), plus a third coordinate ρ₂
+// pulled by a constant negative gradient onto the +rho_bound box rail. At the
+// railed point the FULL Hessian is diag(1, −1, 0), but the load-bearing verdict
+// is on the REDUCED (off-railed) sub-block diag(1, −1) over {ρ₀, ρ₁}, which is
+// indefinite. This is the flexible-link binomial-wiggle failure genus (#2155):
+// a genuine interior saddle in the free directions while a smoothing coordinate
+// rails, where the #2357 escape used to be waived by the mere presence of a
+// rail (`lambdas_railed.is_empty()`), so the fit was refused despite a real,
+// box-feasible descent along ρ₁ that holds ρ₂ fixed on its rail.
+fn railed_saddle_cost(rho: &Array1<f64>) -> f64 {
+    let r0 = rho[0];
+    let r1 = rho[1];
+    let r2 = rho[2];
+    0.5 * r0 * r0 + 0.25 * r1 * r1 * r1 * r1 - 0.5 * r1 * r1 - 0.3 * r2
+}
+
+fn railed_saddle_eval(rho: &Array1<f64>) -> OuterEval {
+    let r0 = rho[0];
+    let r1 = rho[1];
+    OuterEval {
+        cost: railed_saddle_cost(rho),
+        // ∂/∂ρ₂ = −0.3: a constant outward pull that drives ρ₂ to the +rho_bound
+        // rail and keeps it there. ρ₂ carries zero curvature, so the full Hessian
+        // is only semidefinite; the indefinite direction lives entirely in the
+        // un-railed {ρ₀, ρ₁} block.
+        gradient: array![r0, r1 * r1 * r1 - r1, -0.3],
+        hessian: HessianValue::Dense(array![
+            [1.0, 0.0, 0.0],
+            [0.0, 3.0 * r1 * r1 - 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ]),
+        inner_beta_hint: None,
+    }
+}
+
+fn railed_saddle_problem() -> OuterProblem {
+    // Default box is ±rho_bound = ±30, so ρ₂ = 30 sits exactly on the upper rail.
+    OuterProblem::new(3)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .with_initial_rho(array![0.0, 0.0, 30.0])
+        .with_screen_initial_rho(false)
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        })
+}
+
+#[test]
+fn certify_mints_saddle_escape_reseed_at_railed_saddle_2155() {
+    // A saddle whose indefinite curvature is confined to the free (un-railed)
+    // directions must STILL be refused and STILL publish a negative-curvature
+    // escape reseed — one that steps along the interior indefinite axis (ρ₁)
+    // while holding the railed coordinate (ρ₂) fixed on its bound (#2155).
+    let problem = railed_saddle_problem();
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), rho: &Array1<f64>| Ok(railed_saddle_cost(rho)),
+        |_: &mut (), rho: &Array1<f64>| Ok(railed_saddle_eval(rho)),
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let rejection =
+        audit_stationary_point(&mut obj, array![0.0, 0.0, 30.0], "railed-saddle-escape #2155")
+            .expect_err("a railed strict saddle in the free directions must be refused");
+    let result = &rejection.result;
+    let cert = result
+        .criterion_certificate
+        .as_ref()
+        .expect("refused certificate must be recorded");
+    assert!(
+        cert.is_stationary(),
+        "the interior gradient must clear the stationarity band at the railed saddle"
+    );
+    assert_eq!(
+        cert.hessian_psd,
+        Some(false),
+        "the REDUCED (off-railed) Hessian must read indefinite"
+    );
+    assert!(
+        cert.lambdas_railed.contains(&2),
+        "ρ₂ must be recorded as railed: {:?}",
+        cert.lambdas_railed
+    );
+    let reseed = result.saddle_escape_reseed.as_ref().expect(
+        "a refused railed saddle with an indefinite reduced Hessian must mint a reseed (#2155)",
+    );
+    let saddle_f = railed_saddle_cost(&array![0.0, 0.0, 30.0]);
+    assert!(
+        railed_saddle_cost(reseed) < saddle_f - 1e-9,
+        "escape reseed {reseed:?} (f={}) must strictly descend below the saddle f={saddle_f}",
+        railed_saddle_cost(reseed),
+    );
+    assert!(
+        reseed[1].abs() > 1e-6,
+        "escape must step along the free indefinite ρ₁ axis: {reseed:?}"
+    );
+    assert!(
+        (reseed[2] - 30.0).abs() < 1e-12,
+        "escape must hold the railed ρ₂ fixed on its bound: {reseed:?}"
+    );
+}
+
+#[test]
+fn outer_search_escapes_railed_saddle_and_certifies_minimum_2155() {
+    // Full pipeline: seeded at the railed saddle, the outer search must escape
+    // via the one-shot reseed and certify a genuine reduced-PSD minimum at
+    // ρ₁=±1 with ρ₂ still on its rail — not refuse at the saddle (#2155).
+    let problem = railed_saddle_problem();
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), rho: &Array1<f64>| Ok(railed_saddle_cost(rho)),
+        |_: &mut (), rho: &Array1<f64>| Ok(railed_saddle_eval(rho)),
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let result = problem
+        .run(&mut obj, "railed-saddle-escape pipeline #2155")
+        .expect("the outer search must escape the railed saddle and certify a minimum");
+    assert!(
+        result.converged,
+        "must converge at a reduced-PSD minimum, not refuse at the railed saddle: rho={:?}",
+        result.rho
+    );
+    assert!(
+        (result.rho[1].abs() - 1.0).abs() < 1e-4,
+        "must land on the free-direction minimum ρ₁=±1, got ρ={:?}",
+        result.rho,
+    );
+    assert!(
+        (result.rho[2] - 30.0).abs() < 1e-4,
+        "ρ₂ must remain on its rail at the minimum: {:?}",
+        result.rho,
+    );
+    assert!(
+        result
+            .criterion_certificate
+            .as_ref()
+            .is_some_and(|c| c.certifies() && c.hessian_psd == Some(true)),
+        "the escaped minimum must carry a reduced-PSD certificate",
+    );
+}
+
 #[test]
 fn outer_search_escapes_interior_saddle_and_certifies_minimum() {
     // Full pipeline: seeded AT the saddle, the outer search must escape via the

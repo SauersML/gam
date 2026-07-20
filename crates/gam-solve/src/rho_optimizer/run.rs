@@ -1423,15 +1423,20 @@ pub(crate) fn certificate_hessian_is_psd_off_railed(
     certificate_hessian_is_psd(&sub)
 }
 
-/// Escape point off a certified interior strict saddle (#2357).
+/// Escape point off a certified strict saddle in the free (un-railed) subspace
+/// (#2357, generalised to the box-constrained case in #2155).
 ///
 /// A gradient-only outer convergence gate — ARC's own, or the cost-stall guard's
 /// — can ARRIVE at a point that is first-order stationary (`‖Pg‖ ≤ bound`) yet
-/// sits on genuinely indefinite interior curvature, and stop there because its
-/// gradient already cleared tolerance. The mandatory analytic certificate then
-/// refuses the point as `INDEFINITE CURVATURE AT INTERIOR OPTIMUM`. Such a point
-/// is a saddle, not a minimum: the most-negative-curvature eigenvector `v` of the
-/// reduced Hessian is a strict descent direction the optimizer never took. An
+/// sits on genuinely indefinite curvature in its INTERIOR (un-railed) directions,
+/// and stop there because its gradient already cleared tolerance. The mandatory
+/// analytic certificate then refuses the point as `INDEFINITE CURVATURE AT
+/// INTERIOR OPTIMUM` — a verdict `certificate_hessian_is_psd_off_railed` reaches
+/// on the reduced Hessian restricted to the un-railed coordinates, so it fires
+/// whether or not some other coordinate happens to be railed. Such a point is a
+/// saddle, not a minimum: the most-negative-curvature eigenvector `v` of that
+/// reduced Hessian is a strict, box-feasible descent direction the optimizer
+/// never took. An
 /// identical warm-started resume escapes it trivially (its fresh cubic step moves
 /// off the ridge, which is why the resume converges where the cold run refuses);
 /// this reproduces that escape deterministically by stepping `ρ ± α·v` to a
@@ -1454,6 +1459,7 @@ fn negative_curvature_escape_point(
     rho: &Array1<f64>,
     gradient: &Array1<f64>,
     hessian: &Array2<f64>,
+    railed: &[usize],
     baseline_cost: f64,
     bounds: &(Array1<f64>, Array1<f64>),
     context: &str,
@@ -1465,7 +1471,32 @@ fn negative_curvature_escape_point(
     if n == 0 || hessian.ncols() != n || hessian.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    let (eigenvalues, eigenvectors) = match hessian.eigh(Side::Lower) {
+    // The escape direction lives in the INTERIOR (un-railed) subspace — the exact
+    // reduced Hessian / critical cone that `certificate_hessian_is_psd_off_railed`
+    // judges for the PSD verdict. A coordinate railed at a box bound with an
+    // outward KKT gradient is already at its constrained optimum; its curvature is
+    // the flat/indefinite infinite-smoothing plateau (λ ~ 1e13) and carries no
+    // feasible descent. Including it would let the step chase that spurious
+    // direction and simply re-rail. Restricting to the un-railed block yields a
+    // feasible descent that holds every rail fixed, so the escape generalises from
+    // the fully-interior saddle to a box-constrained one whose free-direction
+    // reduced Hessian is indefinite (#2357 → #2155). With no rail this is exactly
+    // the full-Hessian eigenproblem as before.
+    let railed_set: std::collections::BTreeSet<usize> = railed.iter().copied().collect();
+    let interior: Vec<usize> = (0..n).filter(|k| !railed_set.contains(k)).collect();
+    if interior.is_empty() {
+        // Every coordinate is railed: there is no feasible interior direction and
+        // the rail KKT signs are the whole certificate.
+        return None;
+    }
+    let m = interior.len();
+    let mut sub = Array2::<f64>::zeros((m, m));
+    for (i, &ri) in interior.iter().enumerate() {
+        for (j, &rj) in interior.iter().enumerate() {
+            sub[[i, j]] = hessian[[ri, rj]];
+        }
+    }
+    let (eigenvalues, eigenvectors) = match sub.eigh(Side::Lower) {
         Ok(pair) => pair,
         Err(err) => {
             log::warn!(
@@ -1478,8 +1509,11 @@ fn negative_curvature_escape_point(
     // The SAME √ε·‖H‖ margin `certificate_hessian_is_psd` uses to separate a
     // genuine negative eigenvalue from O(ε·‖H‖) assembly roundoff: only a truly
     // negative direction — not a flat / near-semidefinite one — carries a descent
-    // the reseed can exploit.
-    let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
+    // the reseed can exploit. Measured on the interior sub-block's diagonal so the
+    // threshold matches the reduced PSD verdict exactly.
+    let max_diag = interior
+        .iter()
+        .fold(0.0_f64, |acc, &j| acc.max(hessian[[j, j]].abs()));
     let neg_margin = f64::EPSILON.sqrt() * max_diag.max(1.0);
     let mut min_idx = 0usize;
     for k in 1..eigenvalues.len() {
@@ -1490,12 +1524,17 @@ fn negative_curvature_escape_point(
     if !(eigenvalues[min_idx] < -neg_margin) {
         return None;
     }
-    let mut direction = eigenvectors.column(min_idx).to_owned();
-    let dir_norm = direction.dot(&direction).sqrt();
+    let v_sub = eigenvectors.column(min_idx);
+    let dir_norm = v_sub.dot(&v_sub).sqrt();
     if !(dir_norm > 0.0) || !dir_norm.is_finite() {
         return None;
     }
-    direction.mapv_inplace(|v| v / dir_norm);
+    // Lift the interior eigenvector into the full ρ space, exactly zero on every
+    // railed coordinate so the backtracking step below holds all rails fixed.
+    let mut direction = Array1::<f64>::zeros(n);
+    for (i, &ri) in interior.iter().enumerate() {
+        direction[ri] = v_sub[i] / dir_norm;
+    }
     // First-order-consistent sign: move against the (tiny) gradient's projection
     // onto `v` so the linear term never opposes the curvature descent. With a
     // stationary gradient the tie is arbitrary; the opposite sign is tried below
@@ -2601,8 +2640,11 @@ fn certify_outer_optimality_at_terminal_fidelity(
         result.converged = false;
         // #2357 — saddle escape. The point is first-order stationary
         // (`is_stationary`: ‖Pg‖ ≤ bound) yet its INTERIOR reduced Hessian is a
-        // certified strict saddle (`!curvature_admissible` with no railed
-        // coordinate to waive it). That is exactly the case a gradient-only
+        // certified strict saddle (`!curvature_admissible`). A railed coordinate
+        // no longer waives this: `curvature_admissible` already reads the
+        // off-railed reduced Hessian, and the escape descends only the free
+        // (un-railed) directions while holding every rail fixed (#2155). That is
+        // exactly the case a gradient-only
         // convergence gate mis-accepts: it arrived with the gradient already
         // below tolerance and stopped, leaving the certified negative-curvature
         // eigendirection — a strict descent — untaken. Mint a one-shot reseed
@@ -2614,17 +2656,21 @@ fn certify_outer_optimality_at_terminal_fidelity(
         if allow_tail_snap
             && certificate.is_stationary()
             && !certificate.curvature_admissible()
-            && certificate.lambdas_railed.is_empty()
             && let Some(hessian) = result.final_hessian.clone()
             && let Some(gradient) = result.final_gradient.clone()
         {
             let saddle_rho = result.rho.clone();
             let baseline_cost = result.final_value;
+            // `curvature_admissible()` is `false` exactly when the REDUCED
+            // (off-railed) Hessian is indefinite, so a railed coordinate no
+            // longer waives the escape: it is passed through and held fixed while
+            // the step descends the free-direction saddle (#2155).
             result.saddle_escape_reseed = negative_curvature_escape_point(
                 obj,
                 &saddle_rho,
                 &gradient,
                 &hessian,
+                &certificate.lambdas_railed,
                 baseline_cost,
                 &bounds,
                 context,
