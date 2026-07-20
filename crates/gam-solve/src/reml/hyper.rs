@@ -49,6 +49,7 @@ pub(crate) fn directional_curvature_weights(
 // without depending on the estimate module's private helpers.
 
 #[derive(Clone, Copy)]
+#[derive(Debug)]
 pub(crate) struct LinkBinomialAux {
     /// dℓ_i/dμ_i = w_i (y_i/μ_i − (1−y_i)/(1−μ_i))
     pub(crate) a1: f64,
@@ -67,6 +68,7 @@ pub(crate) fn link_binomial_aux(
     yi: f64,
     wi: f64,
     mu: f64,
+    omm: f64,
 ) -> Result<LinkBinomialAux, EstimationError> {
     if !(wi.is_finite() && wi >= 0.0) {
         return Err(EstimationError::PirlsRowGeometryUnrepresentable {
@@ -76,7 +78,15 @@ pub(crate) fn link_binomial_aux(
             value: wi,
         });
     }
-    if !(mu.is_finite() && mu > 0.0 && mu < 1.0) {
+    // `mu` may sit on a saturated boundary (0 or 1); `omm` is the stable
+    // complement `1 - mu` evaluated directly from `eta`. Reject only genuinely
+    // malformed values here and decide saturation via the finiteness of the
+    // likelihood jet below.
+    if !(mu.is_finite()
+        && (0.0..=1.0).contains(&mu)
+        && omm.is_finite()
+        && (0.0..=1.0).contains(&omm))
+    {
         return Err(EstimationError::PirlsRowGeometryUnrepresentable {
             row,
             quantity: "outer binomial mean",
@@ -84,15 +94,28 @@ pub(crate) fn link_binomial_aux(
             value: mu,
         });
     }
-    let one_minusmu = 1.0 - mu;
-    let a1 = wi * (yi / mu - (1.0 - yi) / one_minusmu);
-    let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / (one_minusmu * one_minusmu));
+    // dℓ/dμ = w (y/μ − (1−y)/(1−μ)) and d²ℓ/dμ² reconstructed from the stable
+    // complement. The guards drop the opposite-tail term when the response sits
+    // exactly on a boundary, so a *consistent* saturated observation keeps finite
+    // derivatives even as its denominator underflows (`(1−y)/omm` with `y == 1`,
+    // or `y/μ` with `y == 0`, is `0`, not `0/0`). An *inconsistent* saturated
+    // observation leaves the surviving tail as `±inf` — a `−inf` log-likelihood —
+    // and is refused by the finiteness check below.
+    let hi = if yi >= 1.0 { 0.0 } else { (1.0 - yi) / omm };
+    let lo = if yi <= 0.0 { 0.0 } else { yi / mu };
+    let hi2 = if yi >= 1.0 { 0.0 } else { (1.0 - yi) / (omm * omm) };
+    let lo2 = if yi <= 0.0 { 0.0 } else { yi / (mu * mu) };
+    let a1 = wi * (lo - hi);
+    let a2 = wi * (-lo2 - hi2);
     let out = LinkBinomialAux {
         a1,
         a2,
-        variance: mu * one_minusmu,
+        variance: mu * omm,
         variancemu_scale: 1.0 - 2.0 * mu,
     };
+    // A consistent saturated row keeps finite a1/a2 with `variance -> 0` (the row
+    // is perfectly predicted); the caller contributes zero Fisher weight for it,
+    // the analytic `eta -> ±inf` limit. An inconsistent one is refused here.
     if !(out.a1.is_finite() && out.a2.is_finite() && out.variance.is_finite()) {
         return Err(EstimationError::PirlsRowGeometryUnrepresentable {
             row,
@@ -2931,7 +2954,29 @@ impl<'a> RemlState<'a> {
             let d1 = jets.jet.d1;
             let yi = self.y[i];
             let wi = self.weights[i];
-            let aux = link_binomial_aux(i, eta_i, yi, wi, mu)?;
+            // Stable complement `1 - mu` carried directly from `eta` so a
+            // saturating SAS row keeps the outer likelihood jet exact instead of
+            // being refused; beta-logistic has no closed form wired yet.
+            let omm = if is_beta_logistic {
+                1.0 - mu
+            } else {
+                crate::mixture_link::sas_link_complement(
+                    eta_i,
+                    sas_state.epsilon,
+                    sas_state.log_delta,
+                    mu,
+                )
+            };
+            let aux = link_binomial_aux(i, eta_i, yi, wi, mu, omm)?;
+
+            // A fully saturated, consistent row (`variance -> 0`) is perfectly
+            // predicted and contributes zero Fisher weight to every link-parameter
+            // coordinate — the analytic `eta -> ±inf` limit, mirroring the
+            // zero-weight PIRLS row. Its `du`/`dw` entries stay at their zero
+            // initialization and it adds nothing to the direct likelihood term.
+            if !(aux.variance > 0.0) {
+                continue;
+            }
 
             for j in 0..aux_dim {
                 let dj = if j == 0 {
@@ -3107,7 +3152,17 @@ impl<'a> RemlState<'a> {
             let d1 = jet.d1;
             let yi = self.y[i];
             let wi = self.weights[i];
-            let aux = link_binomial_aux(i, eta_i, yi, wi, mu)?;
+            // Mixture links have no closed-form tail complement wired; the naive
+            // complement stays interior except when every component saturates, and
+            // there the zero-weight guard below is the correct limit.
+            let omm = 1.0 - mu;
+            let aux = link_binomial_aux(i, eta_i, yi, wi, mu, omm)?;
+
+            // Fully saturated consistent row (`variance -> 0`): zero Fisher weight,
+            // no contribution (the analytic `eta -> ±inf` limit).
+            if !(aux.variance > 0.0) {
+                continue;
+            }
 
             for j in 0..aux_dim {
                 let dj = mix_partials[j];

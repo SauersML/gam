@@ -1243,12 +1243,12 @@ pub(crate) fn inverse_link_complement_for_inverse_link(
 ) -> f64 {
     let raw = match link {
         InverseLink::Standard(link_fn) => standard_link_complement(*link_fn, eta, mu),
+        InverseLink::Sas(state) => sas_link_complement(eta, state.epsilon, state.log_delta, mu),
         // No cancellation-free closed form wired for these yet; the naive
         // complement leaves their saturation behaviour exactly as it was.
-        InverseLink::LatentCLogLog(_)
-        | InverseLink::Sas(_)
-        | InverseLink::BetaLogistic(_)
-        | InverseLink::Mixture(_) => 1.0 - mu,
+        InverseLink::LatentCLogLog(_) | InverseLink::BetaLogistic(_) | InverseLink::Mixture(_) => {
+            1.0 - mu
+        }
     };
     if raw.is_nan() {
         raw
@@ -1311,6 +1311,28 @@ fn standard_link_complement(link: StandardLink, eta: f64, mu: f64) -> f64 {
         // exact enough for these here.
         StandardLink::Logit | StandardLink::Identity | StandardLink::Log => 1.0 - mu,
     }
+}
+
+/// Cancellation-free `1 - mu` for the SAS inverse link. `mu = Phi(z)` with
+/// `z = sinh(tanh_bound(delta*asinh(eta) + epsilon, SAS_U_CLAMP))`, so the exact
+/// complement is `Phi(-z)`, mirroring the `sas_inverse_link_mu_d1` forward map.
+/// `Phi(-z)` keeps the tiny upper-tail mass that `1 - Phi(z)` cancels; it
+/// underflows to `0` only once the row is genuinely fully saturated (`z` at the
+/// `SAS_U_CLAMP` sinh scale), which is the correct value there. `Phi(-z)` is
+/// always in `[0, 1]`, so no clamp is needed.
+#[inline]
+pub(crate) fn sas_link_complement(eta: f64, epsilon: f64, log_delta: f64, mu: f64) -> f64 {
+    let eta = match finite_inverse_link_eta("SAS inverse link complement", eta) {
+        Ok(value) => value,
+        Err(_) => return 1.0 - mu,
+    };
+    let delta = sas_delta_from_raw_log_delta(log_delta);
+    if epsilon.abs() < 1e-12 && (delta - 1.0).abs() < 1e-12 {
+        return standard_link_complement(StandardLink::Probit, eta, mu);
+    }
+    let u_raw = delta * eta.asinh() + epsilon;
+    let u = tanh_bound(u_raw, SAS_U_CLAMP);
+    normal_cdf(-u.sinh())
 }
 
 fn link_function_mu_d1(link: LinkFunction, eta: f64) -> Result<(f64, f64), EstimationError> {

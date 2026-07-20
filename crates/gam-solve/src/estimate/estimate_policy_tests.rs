@@ -12,7 +12,9 @@ use super::prefit::{
 };
 use super::reml::hyper::link_binomial_aux;
 use super::*;
-use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
+use crate::mixture_link::{
+    sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials, sas_link_complement,
+};
 use gam_linalg::utils::StableSolver;
 use gam_problem::{
     InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, SeedRiskProfile, StandardLink,
@@ -1148,7 +1150,7 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
             )
             .expect("finite SAS eta");
             let mu = jets.jet.mu;
-            let aux = link_binomial_aux(i, eta[i], y[i], w[i].max(0.0), mu)
+            let aux = link_binomial_aux(i, eta[i], y[i], w[i].max(0.0), mu, 1.0 - mu)
                 .expect("finite binomial row geometry");
             let d1 = jets.jet.d1;
             let dmu = jets.djet_depsilon.mu;
@@ -1175,7 +1177,7 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
                 .expect("finite SAS eta");
                 let mu = jets.jet.mu;
                 let d1 = jets.jet.d1;
-                let aux = link_binomial_aux(i, eta[i], y[i], w[i].max(0.0), mu)
+                let aux = link_binomial_aux(i, eta[i], y[i], w[i].max(0.0), mu, 1.0 - mu)
                     .expect("finite binomial row geometry");
                 aux.a1 * d1
             })
@@ -1210,7 +1212,7 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
-            let aux = link_binomial_aux(i, eta[i], y[i], w[i].max(0.0), mu)
+            let aux = link_binomial_aux(i, eta[i], y[i], w[i].max(0.0), mu, 1.0 - mu)
                 .expect("finite binomial row geometry");
             -(aux.a2 * d1 * d1 + aux.a1 * d2)
         })
@@ -1417,7 +1419,7 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
             .expect("finite SAS eta");
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
-            let aux = link_binomial_aux(i, eta[i], y[i], w[i].max(0.0), mu)
+            let aux = link_binomial_aux(i, eta[i], y[i], w[i].max(0.0), mu, 1.0 - mu)
                 .expect("finite binomial row geometry");
             u[i] = aux.a1 * d1;
         }
@@ -1443,7 +1445,7 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
         let mu = jets.jet.mu;
         let d1 = jets.jet.d1;
         let d2 = jets.jet.d2;
-        let aux = link_binomial_aux(i, eta0[i], y[i], w[i].max(0.0), mu)
+        let aux = link_binomial_aux(i, eta0[i], y[i], w[i].max(0.0), mu, 1.0 - mu)
             .expect("finite binomial row geometry");
         neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
     }
@@ -1595,7 +1597,7 @@ fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
         let mu = jets.jet.mu;
         let d1 = jets.jet.d1;
         let d2 = jets.jet.d2;
-        let aux = link_binomial_aux(i, eta0[i], y[i], w[i].max(0.0), mu)
+        let aux = link_binomial_aux(i, eta0[i], y[i], w[i].max(0.0), mu, 1.0 - mu)
             .expect("finite binomial row geometry");
         neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
     }
@@ -1620,34 +1622,63 @@ fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
     );
 }
 
+// The outer-REML binomial jet carries the stable complement `1 - mu` for SAS
+// links so a saturating row is not refused. A consistent fully-saturated row
+// (the complement itself underflows) has finite a1/a2 with variance -> 0, the
+// zero-Fisher-weight limit; an inconsistent one is a typed refusal.
 #[test]
-fn link_binomial_aux_stay_finite_for_saturated_sas_probabilities() {
-    let saturated_cases = [
-        (
-            -30.0,
-            0.0,
-            sas_inverse_link_jetwith_param_partials(-30.0, 0.0, 12.0)
-                .expect("finite SAS eta")
-                .jet
-                .mu,
-        ),
-        (
-            30.0,
-            1.0,
-            sas_inverse_link_jetwith_param_partials(30.0, 0.0, 12.0)
-                .expect("finite SAS eta")
-                .jet
-                .mu,
-        ),
-    ];
-    for (row, (eta, yi, mu)) in saturated_cases.into_iter().enumerate() {
-        let aux = link_binomial_aux(row, eta, yi, 1.0, mu)
-            .expect("saturated SAS row remains representable");
-        assert!(aux.a1.is_finite(), "a1 must be finite for yi={yi} mu={mu}");
-        assert!(aux.a2.is_finite(), "a2 must be finite for yi={yi} mu={mu}");
+fn link_binomial_aux_carries_sas_complement_and_zero_weights_saturated_rows() {
+    let aux_at = |eta: f64, yi: f64, eps: f64, log_delta: f64| {
+        let mu = sas_inverse_link_jetwith_param_partials(eta, eps, log_delta)
+            .expect("finite SAS eta")
+            .jet
+            .mu;
+        let omm = sas_link_complement(eta, eps, log_delta, mu);
+        (mu, omm, link_binomial_aux(0, eta, yi, 1.0, mu, omm))
+    };
+
+    // Representable complement (probit-reduced SAS, delta=1, eps=0): `mu` rounds to
+    // exactly 1.0 at eta=10 but `1 - mu = Phi(-10) ≈ 7.6e-24` is a representable
+    // tail, so the carried complement keeps the variance strictly positive and the
+    // likelihood derivative cancellation-free.
+    let (mu, omm, res) = aux_at(10.0, 1.0, 0.0, 0.0);
+    let aux = res.expect("representable-complement SAS row must be representable");
+    assert_eq!(mu, 1.0, "mu rounds to 1.0 at eta=10 (probit-reduced SAS)");
+    assert!(
+        omm > 0.0 && aux.variance > 0.0,
+        "carried complement keeps variance positive; omm={omm} variance={}",
+        aux.variance
+    );
+    assert!(aux.a1.is_finite() && aux.a2.is_finite());
+
+    // Fully saturated CONSISTENT rows: the complement underflows to 0 (u clamps to
+    // SAS_U_CLAMP, z=sinh(50)≈2.6e21, Phi(-z)=0). The row is perfectly predicted —
+    // a1/a2 stay finite and variance is 0 (the caller contributes zero Fisher
+    // weight, the analytic eta -> ±inf limit).
+    for (eta, yi) in [(30.0, 1.0), (-30.0, 0.0)] {
+        let (_, _, res) = aux_at(eta, yi, 0.0, 12.0);
+        let aux = res.expect("consistent saturated SAS row must be representable");
         assert!(
-            aux.variance.is_finite() && aux.variance > 0.0,
-            "variance must be finite and positive for yi={yi} mu={mu}"
+            aux.a1.is_finite() && aux.a2.is_finite(),
+            "consistent saturated a1/a2 must be finite at eta={eta}"
+        );
+        assert!(
+            aux.variance.is_finite() && aux.variance >= 0.0,
+            "consistent saturated variance must be finite and >= 0 at eta={eta}; got {}",
+            aux.variance
+        );
+    }
+
+    // Fully saturated INCONSISTENT rows (response off the predicted boundary):
+    // -inf log-likelihood, a typed refusal — never silently zero-weighted.
+    for (eta, yi) in [(30.0, 0.0), (-30.0, 1.0)] {
+        let (_, _, res) = aux_at(eta, yi, 0.0, 12.0);
+        assert!(
+            matches!(
+                res,
+                Err(EstimationError::PirlsRowGeometryUnrepresentable { .. })
+            ),
+            "inconsistent saturated SAS row must be a typed refusal at eta={eta}; got {res:?}"
         );
     }
 }
