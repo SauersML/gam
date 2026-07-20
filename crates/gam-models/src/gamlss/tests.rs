@@ -9622,20 +9622,32 @@ fn zz2155_pilot(
 /// the public fixed-log-λ entry, re-freeze at the refit η̂, until the frozen
 /// index is a fixed point. Returns
 /// `(penalized_objective, deviance, beta_eta, beta_w, eta_hat, cycles)`.
-#[allow(clippy::too_many_arguments)]
-fn zz2155_fixed_lambda_freeze_refit(
-    y: &Array1<f64>,
-    x: &Array1<f64>,
-    link: &InverseLink,
-    knots: &Array1<f64>,
+struct Zz2155Problem {
+    y: Array1<f64>,
+    x: Array1<f64>,
+    link: InverseLink,
+    knots: Array1<f64>,
     degree: usize,
-    wiggle_template: &ParameterBlockInput,
-    rho_w: &Array1<f64>,
-    eta0: &Array1<f64>,
-    beta_eta0: &Array1<f64>,
-    beta_w0: Option<&Array1<f64>>,
-) -> Result<(f64, f64, Array1<f64>, Array1<f64>, Array1<f64>, usize), String> {
+    wiggle_template: ParameterBlockInput,
+}
+
+impl Zz2155Problem {
+    fn solve_fixed_lambda_freeze_refit(
+        &self,
+        rho_w: &Array1<f64>,
+        eta0: &Array1<f64>,
+        beta_eta0: &Array1<f64>,
+        beta_w0: Option<&Array1<f64>>,
+    ) -> Result<(f64, f64, Array1<f64>, Array1<f64>, Array1<f64>, usize), String> {
     use std::sync::Arc;
+    let (y, x, link, knots, degree, wiggle_template) = (
+        &self.y,
+        &self.x,
+        &self.link,
+        &self.knots,
+        self.degree,
+        &self.wiggle_template,
+    );
     let n = y.len();
     let mut x_dense = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
@@ -9729,6 +9741,7 @@ fn zz2155_fixed_lambda_freeze_refit(
         frozen_eta = eta_hat;
     }
     Err("freeze-refit did not reach a fixed point in 60 cycles".to_string())
+    }
 }
 
 /// Map cold-direct vs warp-penalty-continuation modes for a base link across a
@@ -9752,6 +9765,14 @@ fn zz2155_mode_geography_for_link(label: &str, link: InverseLink) {
         &[1, 2, 3],
     )
     .expect("wiggle basis selection");
+    let problem = Zz2155Problem {
+        y: y.clone(),
+        x: x.clone(),
+        link: link.clone(),
+        knots: selected.knots.clone(),
+        degree: selected.degree,
+        wiggle_template: selected.block.clone(),
+    };
     let k_w = selected.block.penalties.len();
     eprintln!(
         "[zz2155:{label}] wiggle: {} coefficients, {k_w} penalties, nullspace {:?}",
@@ -9765,18 +9786,7 @@ fn zz2155_mode_geography_for_link(label: &str, link: InverseLink) {
     for rho_center in [0.0_f64, 2.0] {
         let rho = Array1::from_elem(k_w, rho_center);
         // (a) production-shaped cold seed: pilot β, β_w = 0, straight to λ.
-        let cold = zz2155_fixed_lambda_freeze_refit(
-            &y,
-            &x,
-            &link,
-            &selected.knots,
-            selected.degree,
-            &selected.block,
-            &rho,
-            &pilot_eta,
-            &pilot_beta,
-            None,
-        );
+        let cold = problem.solve_fixed_lambda_freeze_refit(&rho, &pilot_eta, &pilot_beta, None);
         // (b) warp-penalty continuation: descend τ ∈ {8, 5, 3, 1.5, 0.5, 0}
         // added to every wiggle log-λ, warm-chaining (β, η̂) down the ladder.
         let mut carried: Option<(Array1<f64>, Array1<f64>, Array1<f64>)> = None;
@@ -9788,13 +9798,7 @@ fn zz2155_mode_geography_for_link(label: &str, link: InverseLink) {
                 Some((be, bw, eh)) => (eh.clone(), be.clone(), Some(bw.clone())),
                 None => (pilot_eta.clone(), pilot_beta.clone(), None),
             };
-            cont = zz2155_fixed_lambda_freeze_refit(
-                &y,
-                &x,
-                &link,
-                &selected.knots,
-                selected.degree,
-                &selected.block,
+            cont = problem.solve_fixed_lambda_freeze_refit(
                 &rho_tau,
                 &eta_seed,
                 &beta_eta_seed,
