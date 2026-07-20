@@ -213,6 +213,35 @@ where
     }
 }
 
+/// Symmetric fraction-to-boundary factor for a realized displacement of a
+/// `β ≥ 0` cone-constrained coefficient block (#2390, pattern from #2375).
+///
+/// Returns the largest `α ∈ [0, 1]` such that BOTH `β̂ + α·d` and `β̂ − α·d`
+/// stay in the cone:
+///
+/// ```text
+///   α = min( 1,  min_{j : d_j ≠ 0}  max(β̂_j, 0) / |d_j| )
+/// ```
+///
+/// Depending only on `|d_j|` makes the factor sign-symmetric (`α(d) = α(−d)`),
+/// so a symmetric quadrature rule displaced by `α·d` stays symmetric about `β̂`
+/// and the posterior mean of every linear functional is exactly unbiased. A
+/// coordinate already pinned at its wall (`β̂_j ≤ 0` from round-off, with
+/// `d_j ≠ 0`) collapses the displacement to zero rather than admitting an
+/// infeasible vector — the same convention as the #2375 survival cubature rule.
+pub(crate) fn symmetric_cone_fraction_to_boundary(
+    beta: ArrayView1<'_, f64>,
+    displacement: ArrayView1<'_, f64>,
+) -> f64 {
+    let mut alpha = 1.0_f64;
+    for (b, d) in beta.iter().zip(displacement.iter()) {
+        if *d != 0.0 {
+            alpha = alpha.min(b.max(0.0) / d.abs());
+        }
+    }
+    alpha
+}
+
 // Exact response moments must stay in the original Gaussian coordinates:
 // [h, threshold, log_sigma] for non-wiggle predictions, with a nested
 // conditional Gaussian over the scalar link-wiggle contribution when present.
@@ -324,10 +353,31 @@ pub(crate) fn exact_survival_response_moments_row(
             "survival response-moment projected covariance",
             |x, z| {
                 let mut cond_mean = beta_w.to_owned();
+                let mut displacement = Array1::<f64>::zeros(pw);
                 for j in 0..pw {
                     for (col, &latent) in z.iter().enumerate() {
-                        cond_mean[j] += regression[[j, col]] * latent;
+                        displacement[j] += regression[[j, col]] * latent;
                     }
+                }
+                // #2390 (#2385 instance, pattern from #2375): `cond_mean` is a
+                // REALIZED coefficient vector for the cone-constrained
+                // link-wiggle block (`β_w ≥ 0`, the structural monotone
+                // I-spline warp the fit certified). A cone coordinate pinned at
+                // its wall has `β̂_w,j = 0` exactly, so an unconstrained
+                // conditional displacement manufactures a warp the model does
+                // not admit. Scale the displacement by the symmetric
+                // fraction-to-boundary factor so every realized vector stays in
+                // the cone; the factor depends only on `|d_j|`, so `α(z) =
+                // α(−z)` and the rule stays symmetric about `β̂` (the posterior
+                // mean of linear functionals stays exactly unbiased). An
+                // interior `β̂` with modest spread yields `α = 1`, recovering
+                // the unconstrained rule verbatim.
+                let alpha = symmetric_cone_fraction_to_boundary(
+                    beta_w.view(),
+                    displacement.view(),
+                );
+                for j in 0..pw {
+                    cond_mean[j] += alpha * displacement[j];
                 }
                 let q0 = survival_q0_from_eta(x[1], x[2]);
                 let q0_arr = Array1::from_vec(vec![q0]);

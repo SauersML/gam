@@ -8465,3 +8465,58 @@ fn reduced_parametric_aft_stopping_criterion_is_weight_scale_invariant() {
         "log-sigma must be weight-scale invariant: w=1 -> {ls1:.9}, w=500 -> {ls500:.9}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2390 (#2385 instance 1): the symmetric cone fraction-to-boundary rule that
+// keeps every realized link-wiggle conditional-mean vector inside the β ≥ 0
+// cone during exact response-moment integration.
+// ---------------------------------------------------------------------------
+
+/// Interior coefficients far from every wall admit the full displacement: the
+/// unconstrained rule is recovered verbatim (α = 1).
+#[test]
+pub(crate) fn cone_fraction_to_boundary_is_identity_in_the_interior_2390() {
+    let beta = array![2.0, 3.0, 1.5];
+    let d = array![0.5, -1.0, 0.75];
+    let alpha =
+        super::moments::symmetric_cone_fraction_to_boundary(beta.view(), d.view());
+    assert_eq!(alpha, 1.0, "interior β̂ with sub-wall displacement must keep α = 1");
+}
+
+/// A coordinate pinned exactly at its wall with a nonzero displacement
+/// collapses the whole displacement: no realized vector may leave the cone.
+#[test]
+pub(crate) fn cone_fraction_to_boundary_freezes_pinned_wall_coordinates_2390() {
+    let beta = array![1.0, 0.0, 2.0];
+    let d = array![0.3, 0.2, -0.1];
+    let alpha =
+        super::moments::symmetric_cone_fraction_to_boundary(beta.view(), d.view());
+    assert_eq!(alpha, 0.0, "a pinned cone coordinate with |d| > 0 must freeze the step");
+    // Round-off guard: a slightly negative β̂ (numerical wall overshoot) is
+    // clamped to the wall, never allowed to licence a negative-direction step.
+    let beta_neg = array![1.0, -1.0e-14, 2.0];
+    let alpha_neg =
+        super::moments::symmetric_cone_fraction_to_boundary(beta_neg.view(), d.view());
+    assert_eq!(alpha_neg, 0.0);
+}
+
+/// The factor depends only on |d|: α(d) = α(−d), so symmetric quadrature
+/// nodes stay symmetric about β̂ and linear functionals stay unbiased; and the
+/// clipped vectors β̂ ± α·d are feasible componentwise.
+#[test]
+pub(crate) fn cone_fraction_to_boundary_is_sign_symmetric_and_feasible_2390() {
+    let beta = array![0.25, 1.0, 0.05, 3.0];
+    let d = array![0.5, -0.4, 0.2, 0.0];
+    let alpha =
+        super::moments::symmetric_cone_fraction_to_boundary(beta.view(), d.view());
+    let alpha_flip = super::moments::symmetric_cone_fraction_to_boundary(
+        beta.view(),
+        d.mapv(|v| -v).view(),
+    );
+    assert_eq!(alpha, alpha_flip, "α must be invariant to the displacement sign");
+    // Tightest wall here is β̂[2]/|d[2]| = 0.05/0.2 = 0.25.
+    assert!((alpha - 0.25).abs() < 1e-15, "α must bind at the tightest wall, got {alpha}");
+    for (b, dv) in beta.iter().zip(d.iter()) {
+        assert!(b + alpha * dv >= 0.0 && b - alpha * dv >= 0.0, "both ± nodes must stay in the cone");
+    }
+}
