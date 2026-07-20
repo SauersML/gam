@@ -2040,7 +2040,8 @@ fn optimize_survival_transformation_smoothing(
                     && rho_checkpoint.len() == num_smoothing
                 {
                     log::info!(
-                        "[OUTER] {context}: resuming from refused checkpoint {rho_checkpoint:?}                          with a fresh BFGS metric ({resumes_remaining} resume(s) left)"
+                        "[OUTER] {context}: resuming from refused checkpoint {rho_checkpoint:?} \
+                         with a fresh BFGS metric ({resumes_remaining} resume(s) left)"
                     );
                     carried_iterations = carried_iterations.saturating_add(*iterations);
                     resumes_remaining -= 1;
