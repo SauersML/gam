@@ -4848,6 +4848,12 @@ pub(crate) fn binomial_location_scalewiggle_family_exposes_joint_psi_hook_surfac
     );
 }
 
+// The joint-psi hook surface is a family-level derivative property evaluated at
+// a fixed set of coefficients, so it is exercised at explicitly-built
+// block_states (as the binomial-wiggle sibling does), not at a minted fit. A
+// minted fit is neither needed nor obtainable here: certification-ownership does
+// not return a non-stationary best-effort fit, and one cold outer step on this
+// deliberately tiny fixture is never stationary.
 #[test]
 pub(crate) fn gaussian_location_scale_family_exposes_joint_psi_hook_surface() {
     let n = 10usize;
@@ -4892,16 +4898,25 @@ pub(crate) fn gaussian_location_scale_family_exposes_joint_psi_hook_surface() {
         .build_blocks(&rho, &mean_design, &noise_design, None, None)
         .expect("build blocks");
     let family = builder.build_family(&mean_design, &noise_design);
-    let fit = fit_custom_family(
-        &family,
-        &blocks,
-        &BlockwiseFitOptions {
-            use_remlobjective: true,
-            outer_max_iter: 1,
-            ..BlockwiseFitOptions::default()
-        },
-    )
-    .expect("fit gaussian family for joint psi hooks");
+    // The joint-psi hook surface is exercised at explicit coefficients, not at a
+    // minted fit: build each block's state from its penalty-geometry seed so the
+    // family exposes its psi score / Hessian / mixed-drift hooks without asking
+    // the outer optimizer to certify a (deliberately tiny) fixture.
+    let mut block_states = Vec::<ParameterBlockState>::with_capacity(blocks.len());
+    for spec in blocks.iter() {
+        let beta = spec
+            .initial_beta
+            .clone()
+            .unwrap_or_else(|| Array1::zeros(spec.design.ncols()));
+        let (design, offset) = family
+            .block_geometry(&block_states, spec)
+            .expect("hook fixture block geometry");
+        let eta = design.matrixvectormultiply(&beta) + &offset;
+        block_states.push(ParameterBlockState { beta, eta });
+    }
+    family
+        .evaluate(&block_states)
+        .expect("hook fixture state should evaluate");
     let derivative_blocks = builder
         .build_psiderivative_blocks(
             data.view(),
@@ -4913,7 +4928,7 @@ pub(crate) fn gaussian_location_scale_family_exposes_joint_psi_hook_surface() {
         .expect("psi derivative blocks");
     assert_joint_psi_hook_surface(
         &family,
-        &fit.block_states,
+        &block_states,
         &blocks,
         &derivative_blocks,
         0.2,
@@ -5034,19 +5049,42 @@ pub(crate) fn binomial_location_scale_terms_reject_datarow_mismatch_early() {
     assert!(err.contains("data row count must match response length"));
 }
 
+// "Fit finitely" requires an interior REML optimum to certify. Linear, noiseless
+// data drives both Matern smooths to lambda -> +inf (a rail that cannot certify a
+// stationary interior optimum), so the fixture must carry genuine mean curvature
+// (finite mean lambda) and genuine heteroscedasticity (finite log-sigma lambda),
+// with deterministic Gaussian residuals, so each block has an interior optimum.
 #[test]
 pub(crate) fn gaussian_location_scale_termswith_matern_spatial_blocks_fit_finitely() {
-    let n = 32usize;
+    let n = 48usize;
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
         let t = i as f64 / (n as f64 - 1.0);
         data[[i, 0]] = t;
         data[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
     }
+    // Deterministic LCG -> uniform(0,1); probit gives standard-normal draws
+    // (same generator idiom as the homoscedastic #365 fixture).
+    let mut lcg: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next_unit = || {
+        lcg = lcg
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let bits = (lcg >> 11) as f64 / ((1u64 << 53) as f64);
+        bits.clamp(1.0e-6, 1.0 - 1.0e-6)
+    };
     let y = Array1::from_iter((0..n).map(|i| {
         let x0 = data[[i, 0]];
         let x1 = data[[i, 1]];
-        0.5 * x0 - 0.25 * x1 + 0.1
+        // Mean with genuine curvature over the domain (one full sine period in
+        // x0 plus an x1 tilt) — a Matern smooth with correlation 0.35 has real
+        // structure to fit, so its lambda stays finite/interior.
+        let true_mean = 0.6 * (2.0 * std::f64::consts::PI * x0).sin() + 0.2 * x1;
+        // Heteroscedastic scale that rises across the domain so the log-sigma
+        // Matern block has genuine signal and its lambda stays finite too.
+        let true_log_sigma = -0.9 + 1.0 * x0;
+        let z = standard_normal_quantile(next_unit()).expect("finite probit draw");
+        true_mean + true_log_sigma.exp() * z
     }));
     let weights = Array1::from_elem(n, 1.0);
     let spec = GaussianLocationScaleTermSpec {
@@ -5057,10 +5095,21 @@ pub(crate) fn gaussian_location_scale_termswith_matern_spatial_blocks_fit_finite
         mean_offset: Array1::zeros(n),
         log_sigma_offset: Array1::zeros(n),
     };
+    // Production-sized outer budget: with genuine interior signal the REML
+    // optimum is a real stationary point, so give the outer enough iterations to
+    // reach and certify it (this is not budget-inflation to chase a saturated
+    // rail — the honest optimum here is interior).
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 48,
+        inner_tol: 1e-4,
+        outer_max_iter: 60,
+        outer_tol: 1e-4,
+        ..BlockwiseFitOptions::default()
+    };
     let fit = fit_gaussian_location_scale_terms(
         data.view(),
         spec,
-        &spatial_fit_smoke_options(),
+        &options,
         &spatial_kappa_options(),
     )
     .expect("gaussian location-scale spatial fit");
