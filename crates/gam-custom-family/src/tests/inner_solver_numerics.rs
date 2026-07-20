@@ -609,6 +609,78 @@ pub(crate) fn outergradient_matches_finite_difference_for_one_block() {
     );
 }
 
+/// #2366 confirming gate: the outer gradient must match finite differences of
+/// the outer objective when the inner mode sits on an ACTIVE inequality face.
+///
+/// Fixture geometry: 2 coefficients, quadratic likelihood with unconstrained
+/// optimum at `(1.0, −0.5)`, elementwise box `β ≥ 0`, and a COUPLING penalty
+/// `S = [[2,−1],[−1,2]]`. The constrained mode pins `β₂ = 0` (strict
+/// multiplier) while `β₁ = 1/(1+2λ) > 0` moves with ρ — so the true mode
+/// sensitivity `∂β̂/∂ρ` lives in the face `{v : v₂ = 0}`, but a full-Hessian
+/// IFT solve `−H⁻¹(∂S_λ/∂ρ)β̂` has nonzero mass on the pinned coordinate
+/// through the off-diagonal coupling `(Sβ̂)₂ = −λβ̂₁ ≠ 0`. Any envelope term
+/// contracting the (nonzero, `= C_Aᵀμ`) inner KKT gradient against that
+/// off-face mode response manufactures a fictitious gradient component that
+/// finite differences of the actual objective do not contain — the exact
+/// mechanism behind the #2298 transformation arm certifying `|Pg| = 0.398`
+/// at a genuine cost minimum.
+#[test]
+pub(crate) fn outergradient_matches_finite_difference_with_active_inequality_face_2366() {
+    let spec = ParameterBlockSpec {
+        name: "cone".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::eye(2))),
+        offset: Array1::zeros(2),
+        penalties: vec![PenaltyMatrix::Dense(array![[2.0, -1.0], [-1.0, 2.0]])],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.2],
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        ridge_floor: 1e-10,
+        ..BlockwiseFitOptions::default()
+    };
+    let penalty_counts = vec![1usize];
+    let family = TwoCoefConstrainedExactFamily {
+        target: array![1.0, -0.5],
+    };
+    let rho = array![0.2];
+
+    let eval_at = |r: f64| {
+        outerobjective_andgradient(
+            &family,
+            std::slice::from_ref(&spec),
+            &options,
+            &penalty_counts,
+            &array![r],
+            None,
+        )
+    };
+
+    let (f0, g0, _) = eval_at(rho[0]).expect("objective/gradient at rho");
+    assert!(f0.is_finite());
+
+    let h = 1e-5;
+    let (fp, _, _) = eval_at(rho[0] + h).expect("objective at rho+h");
+    let (fm, _, _) = eval_at(rho[0] - h).expect("objective at rho-h");
+    let gfd = (fp - fm) / (2.0 * h);
+    let rel = (g0[0] - gfd).abs() / gfd.abs().max(1e-8);
+
+    assert!(
+        rel < 5e-3,
+        "#2366: outer gradient must match FD on an active inequality face: \
+         analytic={} fd={} rel={} (a fictitious component here is the \
+         full-Hessian IFT leaking through the pinned coordinate)",
+        g0[0],
+        gfd,
+        rel
+    );
+}
+
 #[test]
 pub(crate) fn outergradient_prefers_joint_exact_pathwhen_available() {
     let spec = ParameterBlockSpec {

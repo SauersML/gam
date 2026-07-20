@@ -4043,6 +4043,54 @@ impl CustomFamily for OneBlockConstrainedExactFamily {
     }
 }
 
+/// #2366 fixture: two coefficients, quadratic likelihood `−½‖β − target‖²`,
+/// elementwise box `β ≥ 0`. With `target = (1.0, −0.5)` the unconstrained
+/// optimum violates the box, so the constrained mode pins `β₂ = 0` with a
+/// strictly positive multiplier while `β₁` stays free — the minimal geometry
+/// where a coupling penalty (off-diagonal `S`) pushes the full-Hessian IFT
+/// mode response off the active face.
+#[derive(Clone)]
+pub(crate) struct TwoCoefConstrainedExactFamily {
+    pub(crate) target: Array1<f64>,
+}
+
+impl CustomFamily for TwoCoefConstrainedExactFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta = &block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta;
+        if beta.len() != 2 || self.target.len() != 2 {
+            return Err("TwoCoefConstrainedExactFamily expects exactly 2 coefficients".to_string());
+        }
+        let resid = &self.target - beta;
+        let ll = -0.5 * resid.dot(&resid);
+        Ok(FamilyEvaluation {
+            log_likelihood: ll,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: resid.clone(),
+                hessian: SymmetricMatrix::Dense(Array2::eye(2)),
+            }],
+        })
+    }
+
+    fn block_linear_constraints(
+        &self,
+        _: &[ParameterBlockState],
+        block_idx: usize,
+        block_spec: &ParameterBlockSpec,
+    ) -> Result<Option<ConstraintSet>, String> {
+        assert!(!block_spec.name.is_empty());
+        if block_idx != 0 {
+            return Ok(None);
+        }
+        Ok(Some(ConstraintSet::Dense(LinearInequalityConstraints {
+            a: Array2::eye(2),
+            b: Array1::zeros(2),
+        })))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct OneBlockConstrainedNaNHessianFamily;
 
