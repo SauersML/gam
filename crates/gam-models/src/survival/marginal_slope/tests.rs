@@ -5,6 +5,10 @@ use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
 use approx::assert_relative_eq;
 use faer::sparse::{SparseColMat, Triplet};
 use gam_linalg::matrix::{DenseDesignMatrix, SymmetricMatrix};
+// Trait import for the `.value()` calls in the linux-gated #932 pullback test —
+// on other targets that test is compiled out and the import would be dead.
+#[cfg(target_os = "linux")]
+use gam_math::nested_dual::JetField;
 use ndarray::array;
 
 /// Local scalar closeness assertion used throughout this module's exactness
