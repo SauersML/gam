@@ -8009,3 +8009,95 @@ fn test_duchon_radial_jets_t_equals_phi_rr_minus_q_over_r2() {
         );
     }
 }
+
+/// #2372 instrument: decompose the frozen dim1/power1 Duchon log-κ penalty
+/// mismatch (analytic ≈ 0 vs FD = 0.47, rel_err ≈ 1.0) by block structure.
+/// The `_no_ident` sibling PASSES, so the defect lives in the identifiability
+/// -transform handling of the derivative path; this prints per-block norms of
+/// the forward FD and the analytic derivative (kernel block, trend/poly block,
+/// cross block) plus the forward penalty scale at ls·e^{∓ε}, localizing
+/// whether the missing mass is a normalizer-scale effect (same block, ~300×
+/// scale) or a dropped trend/restriction term (mass in poly/cross blocks).
+#[test]
+fn zz_measure_2372_duchon_frozen_block_decomposition() {
+    let n = 80usize;
+    let mut data = ndarray::Array2::<f64>::zeros((n, 1));
+    for i in 0..n {
+        data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+    }
+    let mut spec = DuchonBasisSpec {
+        radial_reparam: None,
+        periodic: None,
+        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+        length_scale: Some(1.0),
+        power: 1.0,
+        nullspace_order: DuchonNullspaceOrder::Linear,
+        identifiability: SpatialIdentifiability::default(),
+        aniso_log_scales: None,
+        operator_penalties: DuchonOperatorPenaltySpec::default(),
+        boundary: OneDimensionalBoundary::Open,
+    };
+    let base = build_duchon_basis(data.view(), &spec)
+        .unwrap_or_else(|e| panic!("base build failed: {e:?}"));
+    let z_frozen = match &base.metadata {
+        BasisMetadata::Duchon {
+            identifiability_transform,
+            ..
+        } => identifiability_transform.clone(),
+        _ => expected_duchon_metadata(),
+    };
+    let centers = match &base.metadata {
+        BasisMetadata::Duchon { centers, .. } => centers.clone(),
+        _ => expected_duchon_metadata_for_centers(),
+    };
+    let kernel_cols = centers.nrows();
+    spec.center_strategy = CenterStrategy::UserProvided(centers);
+    spec.identifiability = match z_frozen {
+        Some(z) => SpatialIdentifiability::FrozenTransform { transform: z },
+        None => SpatialIdentifiability::None,
+    };
+    let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
+        .unwrap_or_else(|e| panic!("analytic derivative failed: {e:?}"));
+    let eps: f64 = 1e-5;
+    let mut spec_plus = spec.clone();
+    let mut spec_minus = spec.clone();
+    spec_plus.length_scale = Some(1.0 / eps.exp());
+    spec_minus.length_scale = Some(1.0 / (-eps).exp());
+    let plus = build_duchon_basis(data.view(), &spec_plus)
+        .unwrap_or_else(|e| panic!("plus build failed: {e:?}"));
+    let minus = build_duchon_basis(data.view(), &spec_minus)
+        .unwrap_or_else(|e| panic!("minus build failed: {e:?}"));
+    let block_norms = |m: &ndarray::Array2<f64>, label: &str| {
+        let p = m.nrows();
+        let kb = kernel_cols.min(p);
+        let f2 = |sl: ndarray::ArrayView2<f64>| sl.iter().map(|v| v * v).sum::<f64>().sqrt();
+        eprintln!(
+            "[zz2372:{label}] dim={p} kernel_block={:.4e} poly_block={:.4e} cross={:.4e} total={:.4e}",
+            f2(m.slice(ndarray::s![..kb, ..kb])),
+            f2(m.slice(ndarray::s![kb.., kb..])),
+            f2(m.slice(ndarray::s![..kb, kb..])),
+            f2(m.view()),
+        );
+    };
+    for idx in 0..derivative.first.penalties_derivative.len() {
+        let s_plus = &plus.active_penalties[idx].matrix;
+        let s_minus = &minus.active_penalties[idx].matrix;
+        let fd = (s_plus - s_minus) / (2.0 * eps);
+        eprintln!(
+            "[zz2372:penalty{idx}] |S(+eps)|={:.6e} |S(-eps)|={:.6e} |S(0) fwd base|={:.6e}",
+            s_plus.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            s_minus.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            base.active_penalties[idx]
+                .matrix
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt(),
+        );
+        block_norms(&fd, &format!("penalty{idx}:FD"));
+        block_norms(
+            &derivative.first.penalties_derivative[idx],
+            &format!("penalty{idx}:analytic"),
+        );
+    }
+}

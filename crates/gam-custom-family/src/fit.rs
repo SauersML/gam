@@ -855,8 +855,12 @@ pub(crate) fn bind_certified_custom_family_terminal_mode(
     {
         return Err(CustomFamilyError::InvalidInput {
             context: "fit_custom_family terminal theta identity",
-            reason: "terminal coefficient mode does not bitwise match the certified outer hyperparameter vector"
-                .to_string(),
+            reason: format!(
+                "terminal coefficient mode does not bitwise match the certified outer \
+                 hyperparameter vector: terminal.theta={:?} vs certified.rho={:?}",
+                terminal.theta.as_slice().unwrap_or(&[]),
+                certified_outer.rho().as_slice().unwrap_or(&[]),
+            ),
         });
     }
     if terminal.objective.to_bits() != certified_outer.final_value().to_bits() {
@@ -1615,6 +1619,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         CustomOuterState::new_with_cold_signal(
             persistent_warm_start.clone(),
             Arc::clone(&outer_force_cold),
+        )
+        .with_inner_cap(
+            Arc::clone(&outer_inner_cap),
+            options.inner_max_cycles.max(1),
         )
         .with_outer_derivative_pilot(family.outer_derivative_pilot_schedule()),
         |outer: &mut CustomOuterState, rho: &Array1<f64>| {
