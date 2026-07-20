@@ -3355,6 +3355,9 @@ mod row_kernel_tests {
         gam_gpu::numerics_host::log_ndtr_and_mills(x)
     }
 
+    // Sole consumer is the `cfg(all(test, target_os = "linux"))` device-test
+    // module below; off-Linux this would be dead code under `-D warnings`.
+    #[cfg(target_os = "linux")]
     pub(crate) fn host_log_ndtr_mills_curvature(x: f64) -> (f64, f64, f64) {
         gam_gpu::numerics_host::log_ndtr_mills_curvature(x)
     }
