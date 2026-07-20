@@ -681,6 +681,82 @@ pub(crate) fn outergradient_matches_finite_difference_with_active_inequality_fac
     );
 }
 
+/// #2366 increment 2: the SAME active-face gradient truth on the JOINT-EXACT
+/// multi-block path. Increment 1 (`..._with_active_inequality_face_2366`)
+/// exonerated the per-block/ExactNewton envelope; the #2298 transformation arm
+/// certifies |Pg| = 0.398 on a path that assembles the outer gradient from the
+/// family's JOINT Hessian across blocks. Fixture: two 1-coefficient blocks,
+/// joint likelihood curvature [[1, c], [c, 1]] (c = 0.4), target (1.0, -0.5),
+/// box beta >= 0 on both blocks. The constrained mode pins block 1 at 0 with a
+/// STRICT multiplier (mu = c*(beta0 - 1) + 0.5 > 0 for beta0 < 1), while
+/// block 0 moves with both rho coordinates through the coupling. A full-joint
+/// -H^-1 (dS/drho) beta mode response has nonzero mass on the pinned block, so
+/// any envelope contraction that ignores the active face manufactures a
+/// gradient component finite differences of the actual objective do not have.
+#[test]
+pub(crate) fn outergradient_matches_finite_difference_on_active_face_joint_exact_2366() {
+    let spec_for = |name: &str, seed_log_lambda: f64| ParameterBlockSpec {
+        name: name.to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![seed_log_lambda],
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let specs = vec![spec_for("face_a", 0.2), spec_for("face_b", -0.1)];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        ridge_floor: 1e-10,
+        ..BlockwiseFitOptions::default()
+    };
+    let penalty_counts = vec![1usize, 1];
+    let family = TwoBlockJointActiveFaceFamily {
+        coupling: 0.4,
+        target: array![1.0, -0.5],
+    };
+
+    let eval_at = |r0: f64, r1: f64| {
+        outerobjective_andgradient(
+            &family,
+            &specs,
+            &options,
+            &penalty_counts,
+            &array![r0, r1],
+            None,
+        )
+    };
+
+    let rho = [0.2_f64, -0.1];
+    let (f0, g0, _) = eval_at(rho[0], rho[1]).expect("objective/gradient at rho");
+    assert!(f0.is_finite());
+
+    let h = 1e-5;
+    for k in 0..2 {
+        let mut p = rho;
+        p[k] += h;
+        let mut m = rho;
+        m[k] -= h;
+        let (fp, _, _) = eval_at(p[0], p[1]).expect("objective at rho+h");
+        let (fm, _, _) = eval_at(m[0], m[1]).expect("objective at rho-h");
+        let gfd = (fp - fm) / (2.0 * h);
+        let rel = (g0[k] - gfd).abs() / gfd.abs().max(1e-8);
+        assert!(
+            rel < 5e-3,
+            "#2366 joint-exact active face, coordinate {k}: analytic={} fd={} rel={} \
+             (a fictitious component here is the joint-exact assembly ignoring the \
+             active inequality face)",
+            g0[k],
+            gfd,
+            rel
+        );
+    }
+}
+
 #[test]
 pub(crate) fn outergradient_prefers_joint_exact_pathwhen_available() {
     let spec = ParameterBlockSpec {
