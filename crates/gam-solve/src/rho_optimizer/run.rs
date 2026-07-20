@@ -3008,6 +3008,7 @@ const TAIL_SNAP_CURVATURE_BAND: (f64, f64) = (0.25, 4.0);
 /// carried into the refusal summary so a budget-exhausted crawl explains WHY
 /// it was not snapped (the decline evidence is otherwise invisible in a red
 /// test/fit).
+#[derive(Debug)]
 enum TailSnapOutcome {
     /// Every candidate's confirmed tail EXTRAPOLATES to a gradient already
     /// below the stationarity bound at the CURRENT point (#2348 Inc 2c): the
@@ -3196,6 +3197,74 @@ fn try_tail_snap_to_rail(
         if let Some(reason) = verdict {
             decline = Some(format!("candidate k={k} tail unconfirmed: {reason}"));
             break;
+        }
+    }
+    // #2349 round 7: a multi-coordinate rail face. When a candidate's OWN
+    // one-dimensional tail law fails and several candidates ride out together,
+    // the marginal law is the wrong object — overlapping penalties share range
+    // space, so a lone coordinate's gradient saturates once the others
+    // dominate the shared term (the measured #2349 ladder swept ĉ₀ across 8
+    // orders of magnitude). The scalar section along the joint face direction
+    // has the ordinary exponential tail; certify THAT with the same
+    // discipline, and mint every face coordinate from the joint law.
+    if decline.is_some() && candidates.len() >= 2 {
+        let (window, joint_rows) =
+            probe_joint_tail_window(obj, rho, &candidates, &tol, (lower, upper))?;
+        match window.as_ref().map(|w| assess_coordinate(w, &tol)) {
+            Some(AsymptoteVerdict::CertifiedAtAsymptote {
+                tail_constant,
+                estimand_travel_bound,
+                ..
+            }) => {
+                // Extrapolate the joint law back to the checkpoint: the true
+                // remaining directional gradient there, immune to the local
+                // instrument noise. All face gradients share one sign
+                // structure along the face, so the joint gap bounds each
+                // coordinate's own remaining gradient.
+                let r0 = candidates
+                    .iter()
+                    .map(|(k, side)| match side {
+                        AsymptoteSide::Upper => rho[*k],
+                        AsymptoteSide::Lower => -rho[*k],
+                    })
+                    .sum::<f64>()
+                    / candidates.len() as f64;
+                let joint_gap = tail_constant * (-r0).exp();
+                if joint_gap.is_finite() && joint_gap <= inputs.stationarity_bound {
+                    at_point_rails = candidates
+                        .iter()
+                        .map(|(k, side)| RailCoordinate {
+                            index: *k,
+                            side: *side,
+                            tail_constant,
+                            value_gap: joint_gap,
+                            estimand_travel_bound,
+                            noise_margin: tol.tail_noise_floor,
+                        })
+                        .collect();
+                }
+                decline = None;
+            }
+            Some(AsymptoteVerdict::OnTailNotYetEquivalent { .. }) => {
+                // Confirmed on the joint tail; travel not yet settled — the
+                // face snaps/reseeds below exactly as a confirmed single
+                // candidate would.
+                decline = None;
+            }
+            Some(AsymptoteVerdict::NoAsymptote { reason }) => {
+                decline = Some(format!(
+                    "{}; joint {}-coordinate face unconfirmed: {reason}; joint probes: {joint_rows}",
+                    decline.take().unwrap_or_default(),
+                    candidates.len(),
+                ));
+            }
+            None => {
+                decline = Some(format!(
+                    "{}; joint {}-coordinate face: no finite-difference-clean run; joint probes: {joint_rows}",
+                    decline.take().unwrap_or_default(),
+                    candidates.len(),
+                ));
+            }
         }
     }
     // The probes warm-started the inner solve away from the checkpoint; every
@@ -3445,6 +3514,169 @@ fn probe_tail_window(
         });
     }
 
+    Ok((Some(window), rows_summary))
+}
+
+/// Probe a JOINT multi-coordinate rail face (#2349 round 7 / #2348): step every
+/// face coordinate one e-fold toward the interior TOGETHER and assess the
+/// directional gradient along the outward face direction against the same
+/// exponential tail law, noise floor, and drift band as the single-coordinate
+/// window.
+///
+/// Why a joint law exists where the per-coordinate laws fail: for OVERLAPPING
+/// penalties (e.g. the multinomial per-class family's coalesced pseudo-logdet
+/// `½log|Σ_s λ_s M_s|₊`) several λs ride to ∞ on one face and share range
+/// space. Moving ONE coordinate down leaves the shared term dominated by the
+/// others, so that coordinate's own gradient saturates and its per-probe pencil
+/// constant `ĉ_k = |g_k|e^{ρ_k}` sweeps orders of magnitude — measured on the
+/// #2349 checkpoint: ĉ₀ spanning 4.5e2 → 1.0e-6 over the ladder, an honest
+/// refusal of a law that genuinely does not hold marginally. Along the face
+/// direction `u` (`u_k = +1` toward an upper rail, `−1` toward a lower rail)
+/// the shared term moves coherently and the scalar objective section
+/// `t ↦ V(ρ + t·u)` has the ordinary one-dimensional exponential tail; its
+/// pencil constant is assessed with the pseudo-coordinate `r = mean_k(u_k ρ_k)`
+/// and the directional derivative `g_u = Σ_{k∈face} u_k g_k = dV/dt`.
+///
+/// The window it returns speaks the [`assess_coordinate`] conventions
+/// verbatim: on a genuine face `g_u < 0` at every interior probe (descent runs
+/// outward), so the verdict side is `Upper` in the pseudo-coordinate
+/// regardless of the mix of physical sides, and `ĉ = −e^{r}·g_u` recovers the
+/// joint tail constant. Per-coordinate rails minted from it keep their own
+/// physical [`AsymptoteSide`].
+fn probe_joint_tail_window(
+    obj: &mut dyn OuterObjective,
+    rho: &Array1<f64>,
+    face: &[(usize, AsymptoteSide)],
+    tol: &AsymptoteTolerances,
+    bounds: (&Array1<f64>, &Array1<f64>),
+) -> Result<(Option<AsymptoteWindow>, String), EstimationError> {
+    const PROBE_DELTA: f64 = 1.0;
+    const PROBE_DOMAIN_MARGIN: f64 = 1.0e-6;
+    let (lower, upper) = bounds;
+    // Outward unit direction of the face; probes step INWARD (−u).
+    let direction: Vec<(usize, f64)> = face
+        .iter()
+        .map(|(k, side)| {
+            (
+                *k,
+                match side {
+                    AsymptoteSide::Upper => 1.0,
+                    AsymptoteSide::Lower => -1.0,
+                },
+            )
+        })
+        .collect();
+    let r0 = direction
+        .iter()
+        .map(|(k, u)| u * rho[*k])
+        .sum::<f64>()
+        / direction.len() as f64;
+    let mut rows: Vec<(f64, f64, Option<Array1<f64>>)> = Vec::new();
+    for j in 1..=ASYMPTOTE_PROBE_COUNT {
+        let step = (j as f64) * PROBE_DELTA;
+        let mut probe = rho.clone();
+        let mut in_domain = true;
+        for (k, u) in &direction {
+            let stepped = rho[*k] - u * step;
+            if stepped <= lower[*k] + PROBE_DOMAIN_MARGIN
+                || stepped >= upper[*k] - PROBE_DOMAIN_MARGIN
+            {
+                in_domain = false;
+                break;
+            }
+            probe[*k] = stepped;
+        }
+        if !in_domain {
+            break;
+        }
+        let eval = match obj.eval_with_order(&probe, OuterEvalOrder::ValueAndGradient) {
+            Ok(eval) => eval,
+            Err(_) => break,
+        };
+        if !eval.cost.is_finite() {
+            break;
+        }
+        let mut g_u = 0.0;
+        let mut finite = true;
+        for (k, u) in &direction {
+            match eval.gradient.get(*k) {
+                Some(g) if g.is_finite() => g_u += u * g,
+                _ => {
+                    finite = false;
+                    break;
+                }
+            }
+        }
+        if !finite {
+            break;
+        }
+        rows.push((r0 - step, g_u, eval.inner_beta_hint));
+    }
+    let rows_summary = rows
+        .iter()
+        .map(|(r, g, _)| {
+            format!(
+                "(r={r:.2}, dV/dt={g:.3e}, ĉ={:.3e})",
+                AsymptoteSide::Upper.tail_constant(*r, *g)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if rows.len() < MIN_TAIL_SAMPLES {
+        return Ok((None, rows_summary));
+    }
+    let constants: Vec<f64> = rows
+        .iter()
+        .map(|(r, g, _)| AsymptoteSide::Upper.tail_constant(*r, *g))
+        .collect();
+    let element_clean: Vec<bool> = rows
+        .iter()
+        .zip(&constants)
+        .map(|((_, g, _), c)| {
+            c.is_finite() && *c > tol.tail_noise_floor && g.abs() > tol.interior_grad_tol
+        })
+        .collect();
+    let mut best: Option<(usize, usize)> = None;
+    for a in 0..rows.len() {
+        if !element_clean[a] {
+            continue;
+        }
+        for b in a..rows.len() {
+            if !element_clean[b] {
+                break;
+            }
+            if b - a + 1 < MIN_TAIL_SAMPLES {
+                continue;
+            }
+            if !run_drift_within_band(&constants[a..=b], tol.tail_drift_rel) {
+                continue;
+            }
+            let len = b - a + 1;
+            match best {
+                Some((ba, bb)) if bb - ba + 1 >= len => {}
+                _ => best = Some((a, b)),
+            }
+        }
+    }
+    let (a, b) = match best {
+        Some(run) => run,
+        None => return Ok((None, rows_summary)),
+    };
+    let mut window = AsymptoteWindow::with_capacity(b - a + 1);
+    for r in (a..=b).rev() {
+        let (rho_r, grad_r, beta_r) = &rows[r];
+        let coef_step_norm = match (beta_r, rows.get(r + 1).map(|row| &row.2)) {
+            (Some(cur), Some(Some(farther))) if cur.len() == farther.len() => {
+                (cur - farther).iter().map(|v| v * v).sum::<f64>().sqrt()
+            }
+            _ => 0.0,
+        };
+        window.push(AsymptoteSample {
+            rho: *rho_r,
+            grad: *grad_r,
+            coef_step_norm,
+        });
+    }
     Ok((Some(window), rows_summary))
 }
 
@@ -4865,6 +5097,185 @@ mod asymptote_rail_certify_tests {
             Some(false),
             "a genuine interior saddle dwarfs the bound-scale floor and refuses"
         );
+    }
+
+    /// Joint-face objective `V(ρ) = c·e^{−(ρ₀+ρ₁)/2}` — the algebraic skeleton
+    /// of an OVERLAPPING-penalty λ→∞ face (the coalesced pseudo-logdet's
+    /// shared range space couples the two coordinates, so each marginal
+    /// gradient `g_k = −(c/2)e^{−(ρ₀+ρ₁)/2}` decays in the JOINT coordinate
+    /// only). Along either single coordinate the pencil constant
+    /// `ĉ_k = |g_k|e^{ρ_k}` sweeps a factor `e^{1/2}` per e-fold — far outside
+    /// any drift band — while along the face direction it is exactly constant.
+    fn joint_face_objective(c: f64, a: f64) -> impl OuterObjective {
+        let problem = OuterProblem::new(2).with_gradient(Derivative::Analytic);
+        problem.build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| Ok(c * (-(rho[0] + rho[1]) / 2.0).exp()),
+            move |_: &mut (), rho: &Array1<f64>| {
+                let v = c * (-(rho[0] + rho[1]) / 2.0).exp();
+                Ok(OuterEval {
+                    cost: v,
+                    gradient: array![-0.5 * v, -0.5 * v],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: Some(array![a * (-(rho[0] + rho[1]) / 2.0).exp()]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        )
+    }
+
+    /// #2349 round 7: the joint multi-coordinate rail face. The marginal
+    /// single-coordinate tail law honestly fails on an overlapping-penalty
+    /// face (measured on the multinomial checkpoint: ĉ₀ swept 8 orders of
+    /// magnitude), so tail-snap must fall back to the joint face direction,
+    /// certify the one-dimensional joint law there, and snap the whole face.
+    #[test]
+    fn joint_face_tail_certifies_where_single_coordinate_law_drifts_2349() {
+        let c = 1.2 * (7.5_f64).exp();
+        let rho = array![8.0, 7.0];
+        let tol = {
+            let mut t = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
+            t.tail_drift_rel = TAIL_SNAP_DRIFT_REL;
+            t
+        };
+        let bounds = (Array1::from_elem(2, -12.0), Array1::from_elem(2, 12.0));
+
+        // The marginal law must genuinely fail first — otherwise this test
+        // would pass vacuously with the joint path never exercised.
+        let mut obj = joint_face_objective(c, 1.0e-9);
+        let (single_window, _) = probe_tail_window(
+            &mut obj,
+            &rho,
+            0,
+            AsymptoteSide::Upper,
+            &tol,
+            (bounds.0[0], bounds.1[0]),
+        )
+        .expect("single-coordinate probing must not error");
+        assert!(
+            single_window.is_none(),
+            "the marginal pencil constant drifts e^(1/2) per e-fold and must not \
+             produce a finite-difference-clean run"
+        );
+
+        // The joint window recovers the exact face constant.
+        let (joint_window, _) = probe_joint_tail_window(
+            &mut obj,
+            &rho,
+            &[(0, AsymptoteSide::Upper), (1, AsymptoteSide::Upper)],
+            &tol,
+            (&bounds.0, &bounds.1),
+        )
+        .expect("joint probing must not error");
+        let window = joint_window.expect("the joint face law is exactly exponential");
+        match assess_coordinate(&window, &tol) {
+            AsymptoteVerdict::CertifiedAtAsymptote { tail_constant, .. } => {
+                assert!(
+                    (tail_constant - c).abs() / c < 1.0e-6,
+                    "joint pencil constant must recover c: got {tail_constant}, want {c}"
+                );
+            }
+            other => panic!("joint face must certify, got {other:?}"),
+        }
+
+        // End-to-end: tail-snap declines the marginal law, falls back to the
+        // joint face, and snaps BOTH coordinates to their upper rails.
+        let g = -0.5 * c * (-7.5_f64).exp();
+        let gradient = array![g, g];
+        let hessian = array![[g.abs(), 0.0], [0.0, g.abs()]];
+        let outcome = try_tail_snap_to_rail(
+            &mut obj,
+            &AsymptoteRailInputs {
+                rho: &rho,
+                projected_gradient: &gradient,
+                railed: &[],
+                hessian: &hessian,
+                bounds: &bounds,
+                terminal_beta: None,
+                stationarity_bound: 1.0e-3,
+                objective_tol: 1.0e-8,
+                context: "joint-face guard test",
+            },
+        )
+        .expect("tail snap must not error");
+        match outcome {
+            TailSnapOutcome::Snapped(snapped) | TailSnapOutcome::ConfirmedNeedsReseed(snapped) => {
+                assert_eq!(
+                    snapped,
+                    array![12.0, 12.0],
+                    "both face coordinates must snap to their upper rails"
+                );
+            }
+            other => panic!(
+                "the joint face must confirm and snap (Snapped/ConfirmedNeedsReseed), got {other:?}"
+            ),
+        }
+    }
+
+    /// A pair of super-bound coordinates that do NOT share a face (independent
+    /// laws with strongly drifting joint section) must still decline — the
+    /// joint fallback cannot manufacture a certificate where no joint law
+    /// holds.
+    #[test]
+    fn joint_face_fallback_refuses_a_non_face_2349() {
+        // V = c₀·e^{−ρ₀} + drift·ρ₀·e^{−ρ₀} + c₁·e^{−2ρ₁}: coordinate 0's own
+        // law is corrupted by the drift term and coordinate 1 decays at a
+        // DIFFERENT exponential rate, so neither the marginals nor the joint
+        // direction carry a constant pencil.
+        let problem = OuterProblem::new(2).with_gradient(Derivative::Analytic);
+        let (c0, drift, c1) = (3.0e3, 2.0e3, 5.0e2);
+        let mut obj = problem.build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| {
+                Ok((c0 + drift * rho[0]) * (-rho[0]).exp() + c1 * (-2.0 * rho[1]).exp())
+            },
+            move |_: &mut (), rho: &Array1<f64>| {
+                let e0 = (-rho[0]).exp();
+                let e1 = (-2.0 * rho[1]).exp();
+                Ok(OuterEval {
+                    cost: (c0 + drift * rho[0]) * e0 + c1 * e1,
+                    gradient: array![
+                        drift * e0 - (c0 + drift * rho[0]) * e0,
+                        -2.0 * c1 * e1
+                    ],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: Some(array![1.0e-9 * e0]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let rho = array![8.0, 7.0];
+        let g0 = drift * (-8.0_f64).exp() - (c0 + drift * 8.0) * (-8.0_f64).exp();
+        let g1 = -2.0 * c1 * (-14.0_f64).exp();
+        let gradient = array![g0, g1];
+        let hessian = array![[g0.abs(), 0.0], [0.0, g1.abs()]];
+        let bounds = (Array1::from_elem(2, -12.0), Array1::from_elem(2, 12.0));
+        let outcome = try_tail_snap_to_rail(
+            &mut obj,
+            &AsymptoteRailInputs {
+                rho: &rho,
+                projected_gradient: &gradient,
+                railed: &[],
+                hessian: &hessian,
+                bounds: &bounds,
+                terminal_beta: None,
+                stationarity_bound: 1.0e-9,
+                objective_tol: 1.0e-8,
+                context: "non-face guard test",
+            },
+        )
+        .expect("tail snap must not error");
+        match outcome {
+            TailSnapOutcome::Declined(reason) => {
+                assert!(
+                    reason.contains("joint 2-coordinate face"),
+                    "the decline must carry the joint-face evidence, got: {reason}"
+                );
+            }
+            other => panic!("a non-face must decline, got {other:?}"),
+        }
     }
 
     /// #2388: the tail-probe ladder must never step the probed coordinate
