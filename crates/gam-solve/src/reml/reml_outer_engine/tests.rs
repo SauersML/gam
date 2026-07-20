@@ -743,8 +743,16 @@ fn small_data_hessian(p: usize) -> Array2<f64> {
 pub(crate) fn weighted_fused_kernel_rank_deficient_target_beats_naive() {
     let p = 6usize;
     let s0 = second_difference_penalty(p); // rank-deficient target
-    let s1 = Array2::<f64>::eye(p); // small full-span coupling ⇒ det1[0] fractional
-    let lambdas = [1.0e6_f64, 1.0e-1];
+    let s1 = Array2::<f64>::eye(p); // full-span coupling ⇒ det1[0] fractional
+    // The coupling must be strong enough for a genuinely fractional det1[0]:
+    // `det1[0] = rank − Σᵢ λ₁/(λ₀μᵢ + λ₁)` over S₀'s nonzero eigenvalues μᵢ, so
+    // the fractional part is ≈ (λ₁/λ₀)·Σ 1/μᵢ. It must clear the harness's
+    // 1e-6 near-integer guard while keeping the cancellation ratio ≥ 1e4
+    // (fraction ≲ rank/1e4) — a window the old λ₁ = 0.1 missed entirely
+    // (fraction ≈ 3e-7, below the guard: the fixture never reached the joint
+    // regime it exists to pin). λ₁ = 20 puts the fraction at ~7e-5, well
+    // inside both bounds.
+    let lambdas = [1.0e6_f64, 20.0];
     let mut h = small_data_hessian(p);
     h.scaled_add(lambdas[0], &s0);
     h.scaled_add(lambdas[1], &s1);
@@ -760,7 +768,11 @@ pub(crate) fn weighted_fused_kernel_full_span_ridge_overlap_beats_naive() {
     let block = second_difference_penalty(4);
     s0.slice_mut(ndarray::s![0..4, 0..4]).assign(&block);
     let ridge = Array2::<f64>::eye(p);
-    let lambdas = [1.0e6_f64, 1.0e-2];
+    // Same fractional-window arithmetic as the rank-deficient fixture above:
+    // the old λ₁ = 1e-2 left det1[0]'s fractional part at ~1e-8 — far below the
+    // 1e-6 near-integer guard, so the fixture self-refused from birth. λ₁ = 50
+    // puts the fraction at ~3.5e-5 with a cancellation ratio ~6e4.
+    let lambdas = [1.0e6_f64, 50.0];
     let mut h = small_data_hessian(p);
     h.scaled_add(lambdas[0], &s0);
     h.scaled_add(lambdas[1], &ridge);
