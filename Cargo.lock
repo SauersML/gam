@@ -3153,7 +3153,7 @@ dependencies = [
 
 [[package]]
 name = "gam-pyffi"
-version = "0.1.257"
+version = "0.1.258"
 dependencies = [
  "arrow",
  "csv",
