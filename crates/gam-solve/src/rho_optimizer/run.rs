@@ -2370,11 +2370,44 @@ fn certify_outer_optimality_at_terminal_fidelity(
     // refusal summary (mirroring the tail-snap decline note), so a railed
     // non-mint names the gate that refused instead of failing silently.
     let mut asymptote_rail_note: Option<String> = None;
+    let mut probes_ran = rail_outcome.is_some();
     if let Some(outcome) = rail_outcome {
         match outcome {
             Err(reason) => asymptote_rail_note = Some(reason),
             Ok(minted) => {
                 let (interior_projected_grad_norm, effective_interior_bound, rails) = minted;
+                // The tail probes were derivative-bearing evaluations at probe
+                // ρ's, so the EVALUATOR-side terminal-mode carrier now owns the
+                // last probe, not the checkpoint (#2155 regression: every
+                // custom-family at-point mint then failed the bitwise terminal
+                // theta identity at fit assembly). Re-evaluate at the minted
+                // point and ship ITS numbers as the terminal facts: the same
+                // evaluation sets the evaluator carrier, so the optimizer
+                // certificate and the owned mode are bitwise-identical by
+                // construction. The certified stationarity facts (interior
+                // norms, rails) remain the judged ones.
+                let restored = obj
+                    .eval_with_order(&result.rho, OuterEvalOrder::ValueAndGradient)
+                    .map_err(|err| {
+                        EstimationError::RemlOptimizationFailed(format!(
+                            "{context}: failed to re-own the certified point after \
+                             asymptote-rail probing: {err}"
+                        ))
+                    })?;
+                result.final_value = restored.cost;
+                let restored_projected = project_gradient_vector(
+                    &result.rho,
+                    &restored.gradient,
+                    Some(&rail_projection_bounds),
+                );
+                result.final_grad_norm = Some(
+                    restored_projected
+                        .iter()
+                        .map(|v| v * v)
+                        .sum::<f64>()
+                        .sqrt(),
+                );
+                result.final_gradient = Some(restored.gradient);
                 let certificate = OuterCriterionCertificate {
                     stationarity: OuterStationarityCertificate::AsymptoteRail {
                         interior_projected_grad_norm,
@@ -2549,6 +2582,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
         && grad_norm > stationarity_bound
         && let Some(hessian) = analytic_hessian.as_ref()
     {
+        probes_ran = true;
         match try_tail_snap_to_rail(
             obj,
             &AsymptoteRailInputs {
@@ -2576,6 +2610,38 @@ fn certify_outer_optimality_at_terminal_fidelity(
                 // entry); the stored bound is the one that actually certified
                 // the interior (raw, or the sub-block curvature-scaled
                 // flat-valley bound).
+                //
+                // Re-own the minted point first: the tail probes were
+                // derivative-bearing evaluations at probe ρ's, so the
+                // evaluator-side terminal-mode carrier owns the last probe —
+                // shipping the pre-probe terminal numbers then fails the
+                // bitwise terminal theta identity at custom-family fit
+                // assembly (the #2155 all-links regression). One fresh
+                // evaluation at the checkpoint sets the carrier AND supplies
+                // the terminal facts, so both sides are bitwise-identical by
+                // construction.
+                let restored = obj
+                    .eval_with_order(&result.rho, OuterEvalOrder::ValueAndGradient)
+                    .map_err(|err| {
+                        EstimationError::RemlOptimizationFailed(format!(
+                            "{context}: failed to re-own the certified point after \
+                             tail-snap probing: {err}"
+                        ))
+                    })?;
+                result.final_value = restored.cost;
+                let restored_projected = project_gradient_vector(
+                    &result.rho,
+                    &restored.gradient,
+                    Some(&rail_projection_bounds),
+                );
+                result.final_grad_norm = Some(
+                    restored_projected
+                        .iter()
+                        .map(|v| v * v)
+                        .sum::<f64>()
+                        .sqrt(),
+                );
+                result.final_gradient = Some(restored.gradient);
                 let certificate = OuterCriterionCertificate {
                     stationarity: OuterStationarityCertificate::AsymptoteRail {
                         interior_projected_grad_norm,
@@ -2733,6 +2799,39 @@ fn certify_outer_optimality_at_terminal_fidelity(
         ));
     }
 
+    // #2155 regression, the LAST carrier-stealing path: the rail-mint and
+    // tail-snap attempts probe with derivative-bearing evaluations, and the
+    // ORDINARY certificate can still certify after a declined attempt (e.g. a
+    // KKT-railed projection whose raw gradient norm sits above the bound), so
+    // this success would ship pre-probe terminal numbers while the evaluator's
+    // terminal-mode carrier owns the last probe — refusing the bitwise theta
+    // identity at custom-family fit assembly. Re-own the certified point with
+    // one fresh evaluation and ship ITS numbers; the mint branches re-own for
+    // themselves before their early returns, and the judged stationarity facts
+    // above remain the measured pre-probe ones.
+    if probes_ran {
+        let restored = obj
+            .eval_with_order(&result.rho, OuterEvalOrder::ValueAndGradient)
+            .map_err(|err| {
+                EstimationError::RemlOptimizationFailed(format!(
+                    "{context}: failed to re-own the certified point after                      rail/tail probing: {err}"
+                ))
+            })?;
+        result.final_value = restored.cost;
+        let restored_projected = project_gradient_vector(
+            &result.rho,
+            &restored.gradient,
+            Some(&rail_projection_bounds),
+        );
+        result.final_grad_norm = Some(
+            restored_projected
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt(),
+        );
+        result.final_gradient = Some(restored.gradient);
+    }
     result.converged = true;
     // #2235/#2241 — record WHICH certificate concluded this run. A
     // Fellner–Schall model-state fixed point was pre-stamped by the runner and
@@ -3207,6 +3306,16 @@ fn try_tail_snap_to_rail(
     // orders of magnitude). The scalar section along the joint face direction
     // has the ordinary exponential tail; certify THAT with the same
     // discipline, and mint every face coordinate from the joint law.
+    // A face confirmed through the JOINT fallback snaps as a WAYPOINT, never a
+    // candidate optimum: the joint law certifies the direction of the optimum,
+    // but individual face coordinates can hold interior optima once the others
+    // sit railed (measured on the #2349 fixture: after snapping the 5-face,
+    // coordinate 0's own gradient crossed zero near ρ₀ ≈ 7.5 — 4.5 e-folds
+    // inside its snapped rail — while V dropped 3.86 from the checkpoint). The
+    // reseed retry re-descends from the snapped point with the rails free to
+    // hold or relax; a direct re-certification there would refuse exactly that
+    // relaxation.
+    let mut joint_face_confirmed = false;
     if decline.is_some() && candidates.len() >= 2 {
         let (window, joint_rows) =
             probe_joint_tail_window(obj, rho, &candidates, &tol, (lower, upper))?;
@@ -3243,20 +3352,37 @@ fn try_tail_snap_to_rail(
                         })
                         .collect();
                 }
+                joint_face_confirmed = true;
                 decline = None;
             }
             Some(AsymptoteVerdict::OnTailNotYetEquivalent { .. }) => {
                 // Confirmed on the joint tail; travel not yet settled — the
                 // face snaps/reseeds below exactly as a confirmed single
                 // candidate would.
+                joint_face_confirmed = true;
                 decline = None;
             }
             Some(AsymptoteVerdict::NoAsymptote { reason }) => {
-                decline = Some(format!(
-                    "{}; joint {}-coordinate face unconfirmed: {reason}; joint probes: {joint_rows}",
-                    decline.take().unwrap_or_default(),
+                // A returned window IS the law: it exists only when a
+                // drift-band-clean, above-noise-floor, uniformly-positive
+                // pencil-constant run of MIN_TAIL_SAMPLES was found, so the
+                // only `NoAsymptote` reachable from it is the estimand
+                // contraction gate — the β-steps in the retained (deep
+                // interior) rows still move, i.e. the checkpoint is genuinely
+                // NOT at the face limit yet (measured on the #2349 checkpoint:
+                // ĉ settled to 34.2 over the last four probes while the crawl
+                // was still travelling). That is the same state as
+                // `OnTailNotYetEquivalent`: the law says WHERE the optimum is;
+                // the snap below re-solves and re-certifies at the face with
+                // the full rail discipline, granting nothing by itself.
+                log::info!(
+                    "[CERTIFICATE] joint {}-coordinate face: pencil-constant run \
+                     confirmed but estimand not settled at the checkpoint \
+                     ({reason}); snapping the face for re-certification",
                     candidates.len(),
-                ));
+                );
+                joint_face_confirmed = true;
+                decline = None;
             }
             None => {
                 decline = Some(format!(
@@ -3334,7 +3460,7 @@ fn try_tail_snap_to_rail(
     // coordinate), so hand the runner a reseed point instead — one more
     // optimizer pass pins the snapped coordinate at its rail (box projection)
     // while the interior converges in its few remaining Newton steps.
-    if interior_grad_norm <= inputs.stationarity_bound {
+    if interior_grad_norm <= inputs.stationarity_bound && !joint_face_confirmed {
         Ok(TailSnapOutcome::Snapped(snapped))
     } else {
         Ok(TailSnapOutcome::ConfirmedNeedsReseed(snapped))
@@ -4138,6 +4264,24 @@ pub(crate) fn run_outer(
                 // then dropped.
                 let saddle_escape_reseed = result.saddle_escape_reseed.take();
                 let resume_from_saddle_escape = saddle_escape_reseed.is_some();
+                // #2348 Inc 2b, completed (#2349 round 8): a confirmed-tail
+                // snap that needs a re-descent publishes the snapped face as
+                // `tail_snap_reseed` — previously minted and then DROPPED
+                // (declared, set, never consumed), so every ConfirmedNeedsReseed
+                // outcome fell through to the plain refusal. The joint tail law
+                // is first-order evidence of WHERE the optimum is, so the retry
+                // is warranted regardless of the solver's convergence claim,
+                // exactly like the saddle-escape reseed (measured on the #2349
+                // fixture: the face snap descends 3.86 with |Pg| dropping
+                // 2.05 → 0.35; the retry lets over-snapped coordinates relax
+                // back to their interior optima while the rest hold the rail).
+                let tail_snap_reseed = if resume_from_saddle_escape {
+                    result.tail_snap_reseed.take();
+                    None
+                } else {
+                    result.tail_snap_reseed.take()
+                };
+                let resume_from_tail_snap = tail_snap_reseed.is_some();
                 // A published reseed means the refused point IS first-order
                 // stationary (the escape mint gate requires `is_stationary`), so
                 // it is a genuine saddle escapable regardless of whether the
@@ -4148,7 +4292,7 @@ pub(crate) fn run_outer(
                 // stale-tolerance resume, which reseeds AT the refused checkpoint,
                 // still requires a genuine convergence claim (a budget-exhausted
                 // non-stationary iterate has no desync to remove).
-                if (!claimed_converged && !resume_from_saddle_escape)
+                if (!claimed_converged && !resume_from_saddle_escape && !resume_from_tail_snap)
                     || resumes_remaining == 0
                     || (resume_from_saddle_escape && saddle_escapes_remaining == 0)
                 {
@@ -4175,23 +4319,32 @@ pub(crate) fn run_outer(
                      ({resumes_remaining} resume(s) left after this one; #2273/#2374/#2155)",
                     if resume_from_saddle_escape {
                         "off the negative-curvature saddle ridge"
+                    } else if resume_from_tail_snap {
+                        "at the confirmed-tail snapped face"
                     } else {
                         "at the refused checkpoint"
                     }
                 );
                 let mut retry_cfg = config.clone();
-                retry_cfg.initial_rho =
-                    Some(saddle_escape_reseed.unwrap_or_else(|| result.rho.clone()));
+                retry_cfg.initial_rho = Some(
+                    saddle_escape_reseed
+                        .or(tail_snap_reseed)
+                        .unwrap_or_else(|| result.rho.clone()),
+                );
                 retry_cfg.heuristic_lambdas = None;
                 retry_cfg.seed_config.max_seeds = 1;
                 retry_cfg.seed_config.seed_budget = 1;
                 retry_cfg.screen_initial_rho = false;
-                retry_cfg.operator_initial_trust_radius = if resume_from_saddle_escape {
+                // Both reseed kinds land at a genuinely different point, so the
+                // refused checkpoint's metric (trust radius, outer Hessian)
+                // must not be transferred into the restart.
+                let fresh_metric = resume_from_saddle_escape || resume_from_tail_snap;
+                retry_cfg.operator_initial_trust_radius = if fresh_metric {
                     None
                 } else {
                     result.operator_trust_radius
                 };
-                retry_cfg.warm_start_outer_hessian = if resume_from_saddle_escape {
+                retry_cfg.warm_start_outer_hessian = if fresh_metric {
                     None
                 } else {
                     result.final_hessian.clone()
@@ -5210,6 +5363,67 @@ mod asymptote_rail_certify_tests {
             other => panic!(
                 "the joint face must confirm and snap (Snapped/ConfirmedNeedsReseed), got {other:?}"
             ),
+        }
+    }
+
+    /// #2349 e2e shape: the joint pencil-constant run confirms (measured on
+    /// the multinomial checkpoint: ĉ settling 62.7 → … → 34.2) while the
+    /// coefficient steps in the retained deep-interior rows are NOT yet
+    /// geometrically contracting — the crawl was cut mid-travel. A confirmed
+    /// law with an unsettled estimand must SNAP the face for re-certification
+    /// (the single-coordinate `OnTailNotYetEquivalent` semantics), not
+    /// decline.
+    #[test]
+    fn joint_face_with_unsettled_estimand_snaps_for_recertification_2349() {
+        let c = 1.2 * (7.5_f64).exp();
+        // Non-contracting coefficient hints: constant per-probe steps (β moves
+        // linearly in r), so coef_step_ratio has q = 1 and the estimand gate
+        // refuses while the pencil constant is exact.
+        let problem = OuterProblem::new(2).with_gradient(Derivative::Analytic);
+        let mut obj = problem.build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| Ok(c * (-(rho[0] + rho[1]) / 2.0).exp()),
+            move |_: &mut (), rho: &Array1<f64>| {
+                let v = c * (-(rho[0] + rho[1]) / 2.0).exp();
+                Ok(OuterEval {
+                    cost: v,
+                    gradient: array![-0.5 * v, -0.5 * v],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: Some(array![0.1 * (rho[0] + rho[1])]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let rho = array![8.0, 7.0];
+        let g = -0.5 * c * (-7.5_f64).exp();
+        let gradient = array![g, g];
+        let hessian = array![[g.abs(), 0.0], [0.0, g.abs()]];
+        let bounds = (Array1::from_elem(2, -12.0), Array1::from_elem(2, 12.0));
+        let outcome = try_tail_snap_to_rail(
+            &mut obj,
+            &AsymptoteRailInputs {
+                rho: &rho,
+                projected_gradient: &gradient,
+                railed: &[],
+                hessian: &hessian,
+                bounds: &bounds,
+                terminal_beta: None,
+                stationarity_bound: 1.0e-3,
+                objective_tol: 1.0e-8,
+                context: "joint-face unsettled-estimand guard test",
+            },
+        )
+        .expect("tail snap must not error");
+        match outcome {
+            TailSnapOutcome::Snapped(snapped) | TailSnapOutcome::ConfirmedNeedsReseed(snapped) => {
+                assert_eq!(
+                    snapped,
+                    array![12.0, 12.0],
+                    "a confirmed joint law with unsettled estimand must snap the face"
+                );
+            }
+            other => panic!("expected a face snap, got {other:?}"),
         }
     }
 

@@ -951,6 +951,15 @@ pub(crate) struct CustomOuterState {
     pub(crate) terminal_mode: Option<CustomFamilyTerminalMode>,
     pub(crate) last_error: Option<String>,
     pub(crate) initial_gradient_norm: Option<f64>,
+    /// The warm-trajectory-adaptive inner cycle cap shared with the outer-eval
+    /// closures, plus the full cold budget it starts from. `reset()` restores
+    /// the full budget: a reset objective evaluates a fresh seed — possibly a
+    /// distant reseed (a snapped rail face, a saddle escape) whose cold inner
+    /// solve needs the whole budget — and the adaptation re-tightens on its
+    /// own as warm evaluations resume. Leaving the previous trajectory's
+    /// tightened cap in place starved the #2349 face-reseed retry at 4 cycles.
+    pub(crate) inner_cap: Option<Arc<AtomicUsize>>,
+    pub(crate) inner_cap_full: usize,
     pub(crate) outer_derivative_pilot: Option<OuterDerivativePilotSchedule>,
     /// #2349 — one-shot "re-evaluate COLD" pulse shared with the outer
     /// cost-stall guard (via `OuterProblem::with_stuck_stall_cold_reeval_signal`).
@@ -979,10 +988,20 @@ impl CustomOuterState {
             terminal_mode: None,
             last_error: None,
             initial_gradient_norm: None,
+            inner_cap: None,
+            inner_cap_full: 0,
             outer_derivative_pilot: None,
             force_cold_signal,
             force_cold_latched: false,
         }
+    }
+
+    /// Share the warm-adaptive inner cycle cap so [`Self::reset`] can restore
+    /// its full cold budget between seeds/retries.
+    pub(crate) fn with_inner_cap(mut self, cap: Arc<AtomicUsize>, full: usize) -> Self {
+        self.inner_cap = Some(cap);
+        self.inner_cap_full = full;
+        self
     }
 
     /// Observe the shared cold-reeval pulse (consuming it) and the sticky
@@ -1025,6 +1044,9 @@ impl CustomOuterState {
     pub(crate) fn reset(&mut self) {
         self.warm_cache = self.reset_warm_cache.clone();
         self.terminal_mode = None;
+        if let Some(cap) = &self.inner_cap {
+            cap.store(self.inner_cap_full, Ordering::Relaxed);
+        }
         // #2349: the cold-reeval latch deliberately SURVIVES reset. `reset` runs
         // between screened seeds/retries AND immediately before terminal
         // certification (run.rs finalize/certify); clearing it there would
