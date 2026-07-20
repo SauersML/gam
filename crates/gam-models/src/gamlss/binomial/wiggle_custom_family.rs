@@ -416,12 +416,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let (u_t, u_ls, uw) = beta_layout.split_three(d_beta_flat, "wiggle joint d_beta")?;
         let d_eta_t = fast_av(&x_t, &u_t);
         let d_eta_ls = fast_av(&x_ls, &u_ls);
-        let rows = program.first_directional_rows(
-            &d_eta_t,
-            &d_eta_ls,
-            uw.view(),
-            BinomialWiggleRowOuter::Observed,
-        )?;
+        let rows = program.first_directional_rows(&d_eta_t, &d_eta_ls, uw.view())?;
         Ok(Some(rows.assemble_dense(
             x_t.as_ref(),
             x_ls.as_ref(),
@@ -455,7 +450,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             &d_eta_t_v,
             &d_eta_ls_v,
             v_w.view(),
-            BinomialWiggleRowOuter::Observed,
         )?;
         Ok(Some(rows.assemble_dense(
             x_t.as_ref(),

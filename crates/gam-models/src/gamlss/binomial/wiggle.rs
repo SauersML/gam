@@ -26,6 +26,29 @@ pub(crate) struct BinomialLocationScaleWiggleRowProgram<'a> {
     pub(super) basis_derivatives: Vec<Array2<f64>>,
 }
 
+/// Which outer scalar the canonical row program composes onto `q(β)`.
+///
+/// `Observed` composes the negative-log-likelihood derivative tower
+/// `[0, φ', φ'', φ''', φ'''']`; because that IS the derivative stack of a
+/// genuine scalar `φ∘q`, *every* jet channel of the composition — value,
+/// gradient, Hessian, and the third/fourth channels read by the directional
+/// lowerings — is an exact derivative of the observed penalized objective.
+///
+/// `ExpectedInformation` composes the *pseudo*-stack `[0, 0, f, f₁, f₂]`
+/// (`f` = expected q-information, `f₁,f₂` its q-derivatives). Its **order-2**
+/// channel `f·q_a·q_b` is exactly the Fisher information `M_ab = Σ f_i
+/// (∇q_i)_a (∇q_i)_b`, which is what [`Self::order2_rows`] extracts. It is,
+/// however, **NOT the second derivative of any scalar** — `M` has no `∂²q`
+/// curvature term — so reading the next symmetric jet channel of this
+/// composition to get `D_u M` injects a spurious `f·q_ab·(∇q·u)` term (the
+/// `φ'` slot is zero only at the base point, not off it). That was the O(1)
+/// analytic-vs-FD defect of gam#2353. The expected-information directional
+/// derivatives must therefore be assembled by differentiating the bilinear
+/// form directly ([`Self::expected_first_directional_rows`] /
+/// [`Self::expected_second_directional_rows`]), and this variant is valid
+/// ONLY for the order-2 build — the directional jet lowerings
+/// ([`Self::first_directional_rows`]/[`Self::second_directional_rows`]) are
+/// `Observed`-only by construction and do not accept it.
 #[derive(Clone, Copy)]
 pub(super) enum BinomialWiggleRowOuter {
     Observed,
@@ -251,14 +274,21 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         Ok(rows)
     }
 
+    /// Typed-probe lowering of the observed joint-Hessian directional
+    /// derivative `D H[u]`. This reads the *third* symmetric jet channel of a
+    /// `φ∘q` composition, so it is exact ONLY for a genuine scalar outer —
+    /// hence the hard-wired [`BinomialWiggleRowOuter::Observed`]. The expected
+    /// Fisher information is not the Hessian of a scalar and must never be
+    /// routed here (gam#2353); its directional derivative is assembled by
+    /// [`Self::expected_first_directional_rows`].
     pub(super) fn first_directional_rows(
         &self,
         d_eta_t: &Array1<f64>,
         d_eta_ls: &Array1<f64>,
         u_w: ArrayView1<'_, f64>,
-        outer: BinomialWiggleRowOuter,
     ) -> Result<BinomialWiggleFirstDirectionalRows, String> {
         use gam_math::jet_scalar::OneSeed;
+        let outer = BinomialWiggleRowOuter::Observed;
 
         let n = self.family.y.len();
         assert_eq!(d_eta_t.len(), n);
@@ -298,6 +328,11 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         Ok(rows)
     }
 
+    /// Typed-probe lowering of the observed joint-Hessian second directional
+    /// derivative `D² H[u, v]`. Reads the *fourth* symmetric jet channel of a
+    /// `φ∘q` composition and is exact only for a genuine scalar outer — hence
+    /// the hard-wired [`BinomialWiggleRowOuter::Observed`]. See the enum docs
+    /// and [`Self::expected_second_directional_rows`] (gam#2353).
     pub(super) fn second_directional_rows(
         &self,
         d_eta_t_u: &Array1<f64>,
@@ -306,9 +341,9 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         d_eta_t_v: &Array1<f64>,
         d_eta_ls_v: &Array1<f64>,
         v_w: ArrayView1<'_, f64>,
-        outer: BinomialWiggleRowOuter,
     ) -> Result<BinomialWiggleSecondDirectionalRows, String> {
         use gam_math::jet_scalar::TwoSeed;
+        let outer = BinomialWiggleRowOuter::Observed;
 
         let n = self.family.y.len();
         assert_eq!(d_eta_t_u.len(), n);
@@ -3163,12 +3198,7 @@ impl BinomialLocationScaleWiggleFamily {
             coeff_lw_dd,
             coeff_ww_bb,
             coeff_ww_bd,
-        } = program.first_directional_rows(
-            &d_eta_t,
-            &d_eta_ls,
-            uw.view(),
-            BinomialWiggleRowOuter::Observed,
-        )?;
+        } = program.first_directional_rows(&d_eta_t, &d_eta_ls, uw.view())?;
 
         let basis: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[0].clone());
         let basis_d1: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[1].clone());
@@ -3255,7 +3285,6 @@ impl BinomialLocationScaleWiggleFamily {
             &d_eta_t_v,
             &d_eta_ls_v,
             v_w.view(),
-            BinomialWiggleRowOuter::Observed,
         )?;
 
         let basis: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[0].clone());

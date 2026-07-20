@@ -2883,6 +2883,122 @@ fn check_bls_wiggle_expected_info_derivatives_match_fd(
     assert_close_matrix(&analytic_second, &fd_second, 2e-7, "wiggle expected d2I");
 }
 
+/// gam#2353 — high-curvature different angle on the expected-info directional
+/// derivative. Amplifying the warp coefficients makes the warp curvature
+/// `g₂ = Σ_j β_wj B''_j(q₀)` — and hence the `∂²q` term of the joint geometry
+/// — large. The expected Fisher information `M_ab = Σ_i f_i (∇q_i)_a (∇q_i)_b`
+/// has NO such curvature term, so its exact directional derivative must stay
+/// curvature-free. Had the assembly regressed to the observed-Hessian jet
+/// composition (`φ''=f`, `φ'=0`, read the next symmetric channel), the spurious
+/// `f·q_ab·(∇q·u)` term would scale with this amplified curvature and blow the
+/// gate by orders of magnitude — the original defect was 3.065e-1 against a
+/// 2e-7 bound. Distinct base point, distinct magnitude regime, and distinct
+/// direction from the shipped fixture tests above.
+#[test]
+pub(crate) fn binomial_location_scale_wiggle_expected_info_directional_high_curvature_excludes_spurious_term()
+{
+    let (family, mut states, specs, xt, xls, _xw) = bls_wiggle_workspace_fixture();
+    let pt = states[0].beta.len();
+    let pls = states[1].beta.len();
+    let pw = states[2].beta.len();
+    let p = pt + pls + pw;
+
+    // Amplify the warp so its curvature (the ∂²q channel) is large, then
+    // refresh η_w so the fixture stays self-consistent. q₀ depends only on the
+    // unchanged threshold/scale blocks, so scaling β_w scales g₂ identically.
+    let scale = 5.0;
+    states[2].beta.mapv_inplace(|b| b * scale);
+    let q0 = Array1::from_iter(states[0].eta.iter().zip(states[1].eta.iter()).map(
+        |(&eta_t_i, &eta_ls_i)| {
+            binomial_location_scale_q0(eta_t_i, exp_sigma_from_eta_scalar(eta_ls_i))
+        },
+    ));
+    states[2].eta = family
+        .wiggle_design(q0.view())
+        .expect("high-curvature wiggle basis")
+        .dot(&states[2].beta);
+
+    // Teeth 1: the warp curvature is genuinely active at this base point.
+    let basis_dd = monotone_wiggle_basis_with_derivative_order(
+        q0.view(),
+        &family.wiggle_knots,
+        family.wiggle_degree,
+        2,
+    )
+    .expect("B'' stack");
+    let warp_curvature = basis_dd.dot(&states[2].beta);
+    let max_curvature = warp_curvature.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+    assert!(
+        max_curvature > 1e-3,
+        "high-curvature fixture must exercise the ∂²q channel; max|g2|={max_curvature:.3e}"
+    );
+
+    // Wiggle-heavy probe direction to maximally excite the (∇q·u) factor of the
+    // would-be spurious curvature term.
+    let u = Array1::from_shape_fn(p, |i| {
+        0.05 * ((i + 1) as f64).cos() + if i >= pt + pls { 0.06 } else { 0.0 }
+    });
+
+    // Teeth 2: the OBSERVED joint-Hessian directional derivative — which does
+    // legitimately carry the `∂²q·(∇q·u)` curvature — differs from the
+    // expected-information directional by an O(1) amount here. So the FD
+    // agreement below is a genuine exclusion of that curvature, not a
+    // near-zero coincidence.
+    let observed_dir = family
+        .exact_newton_joint_hessian_directional_derivative(&states, &u)
+        .expect("observed dH")
+        .expect("observed dH present");
+    let expected_dir = family
+        .joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, &u)
+        .expect("expected dI")
+        .expect("expected dI present");
+    let curvature_gap = (&observed_dir - &expected_dir)
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()));
+    assert!(
+        curvature_gap > 1e-3,
+        "observed vs expected directional must differ materially (curvature active); gap={curvature_gap:.3e}"
+    );
+
+    // The gate: exact analytic expected-info directional == central FD of the
+    // expected information itself, at the amplified curvature.
+    let eps = 1e-5;
+    let perturb = |direction_scale: f64| -> Vec<ParameterBlockState> {
+        let mut out = states.clone();
+        for j in 0..pt {
+            out[0].beta[j] += direction_scale * u[j];
+        }
+        for j in 0..pls {
+            out[1].beta[j] += direction_scale * u[pt + j];
+        }
+        for j in 0..pw {
+            out[2].beta[j] += direction_scale * u[pt + pls + j];
+        }
+        out[0].eta = xt.dot(&out[0].beta);
+        out[1].eta = xls.dot(&out[1].beta);
+        let q0p = Array1::from_iter(out[0].eta.iter().zip(out[1].eta.iter()).map(
+            |(&eta_t_i, &eta_ls_i)| {
+                binomial_location_scale_q0(eta_t_i, exp_sigma_from_eta_scalar(eta_ls_i))
+            },
+        ));
+        out[2].eta = family
+            .wiggle_design(q0p.view())
+            .expect("perturbed high-curvature basis")
+            .dot(&out[2].beta);
+        out
+    };
+    let m_plus = family
+        .joint_jeffreys_information_with_specs(&perturb(eps), &specs)
+        .expect("M+")
+        .expect("M+ present");
+    let m_minus = family
+        .joint_jeffreys_information_with_specs(&perturb(-eps), &specs)
+        .expect("M-")
+        .expect("M- present");
+    let fd = (&m_plus - &m_minus) / (2.0 * eps);
+    assert_close_matrix(&expected_dir, &fd, 5e-7, "high-curvature wiggle expected dI");
+}
+
 #[test]
 pub(crate) fn binomial_location_scale_wiggle_workspace_d2h_operator_matches_dense() {
     let (family, states, specs, _xt, _xls, _xw) = bls_wiggle_workspace_fixture();
