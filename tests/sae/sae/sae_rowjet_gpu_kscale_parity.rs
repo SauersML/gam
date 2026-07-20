@@ -56,6 +56,9 @@ fn fixture(n: usize) -> Vec<SaeSoftmaxRowJetInput> {
         .collect()
 }
 
+// Only the linux-gated device-parity arm below consumes this; on other targets
+// the helper would be dead code under `-D warnings`.
+#[cfg(target_os = "linux")]
 fn maximum_channel_error(
     left: &gam::terms::sae::gpu_kernels::sae_rowjet::SaeRowJetChannels,
     right: &gam::terms::sae::gpu_kernels::sae_rowjet::SaeRowJetChannels,
