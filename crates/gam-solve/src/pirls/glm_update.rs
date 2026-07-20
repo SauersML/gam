@@ -32,7 +32,12 @@ fn certify_bernoulli_row(
         })
     } else {
         let jet = standard_inverse_link_jet(inverse_link, eta)?;
-        let geometry = bernoulli_geometry_from_jet(row, eta, y, prior_weight, jet)?;
+        let omm = crate::mixture_link::inverse_link_complement_for_inverse_link(
+            inverse_link,
+            eta,
+            jet.mu,
+        );
+        let geometry = bernoulli_geometry_from_jet(row, eta, y, prior_weight, jet, omm)?;
         Ok(CertifiedBernoulliRow { geometry, jet })
     }
 }
@@ -300,7 +305,11 @@ pub fn update_glmvectors_integrated_for_link(
                 d2: jet.d2,
                 d3: jet.d3,
             };
-            let geometry = bernoulli_geometry_from_jet(i, eta[i], y[i], priorweights[i], jet)?;
+            // Integrated mean has no closed-form tail complement; the naive
+            // complement stays interior except at se -> 0, where the saturation
+            // handling in `bernoulli_geometry_from_jet` is the correct limit.
+            let omm = 1.0 - jet.mu;
+            let geometry = bernoulli_geometry_from_jet(i, eta[i], y[i], priorweights[i], jet, omm)?;
             Ok(CertifiedBernoulliRow { geometry, jet })
         })
         .collect();

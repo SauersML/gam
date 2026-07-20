@@ -140,10 +140,21 @@ fn unrepresentable_bernoulli(
 
 /// Compute working IRLS geometry for a single Bernoulli observation.
 ///
-/// The returned quantities are exact values of one smooth inverse-link
-/// surface.  If the response variance, score carrier, or Fisher-weight jet is
-/// not representable, the row is refused instead of being replaced with zero
-/// curvature or a projected working response.
+/// The returned quantities are exact values of one smooth inverse-link surface.
+/// `omm` is the stable complement `1 - mu` evaluated directly from `eta` (see
+/// [`crate::mixture_link::inverse_link_complement_for_inverse_link`]): once `mu`
+/// rounds to exactly `1.0` in f64 — which happens far inside the tail for the
+/// noncanonical links — the naive `1.0 - mu` is a hard zero, and both the
+/// Bernoulli variance `mu(1-mu)` and the working residual `y - mu` collapse. The
+/// carried complement keeps them exact so a saturating cloglog/probit row can
+/// proceed instead of being refused.
+///
+/// Once the complement itself underflows to zero the observation is predicted
+/// with certainty. A *consistent* saturated row (`y == 1` at `mu == 1`, or
+/// `y == 0` at `mu == 0`) is the analytic `eta -> ±inf` limit of the weight
+/// formula `d1^2/(mu(1-mu)) -> 0`, so it becomes a zero-weight row — exactly the
+/// output of the `priorweight == 0` branch. An *inconsistent* saturated row has
+/// `-inf` log-likelihood and stays a typed refusal.
 #[inline]
 pub(crate) fn bernoulli_geometry_from_jet(
     row: usize,
@@ -151,6 +162,7 @@ pub(crate) fn bernoulli_geometry_from_jet(
     y: f64,
     priorweight: f64,
     jet: MixtureInverseLinkJet,
+    omm: f64,
 ) -> Result<WorkingBernoulliGeometry, EstimationError> {
     if !(priorweight.is_finite() && priorweight >= 0.0) {
         return Err(unrepresentable_bernoulli(
@@ -160,13 +172,17 @@ pub(crate) fn bernoulli_geometry_from_jet(
             priorweight,
         ));
     }
+    // The jet may legitimately saturate (`mu` at a boundary, `d1 == 0`); reject
+    // only genuinely malformed values here and decide saturation below.
     if !(jet.mu.is_finite()
-        && jet.mu > 0.0
-        && jet.mu < 1.0
+        && jet.mu >= 0.0
+        && jet.mu <= 1.0
         && jet.d1.is_finite()
-        && jet.d1 > 0.0
+        && jet.d1 >= 0.0
         && jet.d2.is_finite()
-        && jet.d3.is_finite())
+        && jet.d3.is_finite()
+        && omm.is_finite()
+        && (0.0..=1.0).contains(&omm))
     {
         return Err(unrepresentable_bernoulli(
             row,
@@ -176,10 +192,6 @@ pub(crate) fn bernoulli_geometry_from_jet(
         ));
     }
     let mu = jet.mu;
-    let v = mu * (1.0 - mu);
-    if !(v.is_finite() && v > 0.0) {
-        return Err(unrepresentable_bernoulli(row, "Bernoulli variance", eta, v));
-    }
     if priorweight == 0.0 {
         return Ok(WorkingBernoulliGeometry {
             mu,
@@ -188,6 +200,33 @@ pub(crate) fn bernoulli_geometry_from_jet(
             c: 0.0,
             d: 0.0,
         });
+    }
+    // Variance carried through the stable complement: `v = mu * (1 - mu)` with the
+    // exact tail complement rather than `1.0 - mu`.
+    let v = mu * omm;
+    // Saturated row: no representable positive Fisher information. `v` has
+    // underflowed to zero (the complement itself is gone) or the inverse-link
+    // density `d1` vanished — the observation is predicted with certainty.
+    if !(v > 0.0) || jet.d1 == 0.0 {
+        // Consistent iff the response sits on the saturated boundary, so the
+        // residual `y - mu` is zero in the limit.
+        let consistent = if mu >= 0.5 { y == 1.0 } else { y == 0.0 };
+        if consistent {
+            // Analytic limit of the Fisher weight as eta -> ±inf: weight -> 0.
+            return Ok(WorkingBernoulliGeometry {
+                mu,
+                weight: 0.0,
+                z: eta,
+                c: 0.0,
+                d: 0.0,
+            });
+        }
+        return Err(unrepresentable_bernoulli(
+            row,
+            "saturated Bernoulli row inconsistent with response",
+            eta,
+            y,
+        ));
     }
     let n0 = jet.d1 * jet.d1;
     let fisher = n0 / v;
@@ -216,21 +255,28 @@ pub(crate) fn bernoulli_geometry_from_jet(
     Ok(WorkingBernoulliGeometry {
         mu,
         weight,
-        z: bernoulli_exact_working_response(row, eta, y, mu, jet.d1)?,
+        z: bernoulli_exact_working_response(row, eta, y, mu, omm, jet.d1)?,
         c,
         d,
     })
 }
 
+/// Working response `z = eta + (y - mu)/mu'` with the residual reconstructed
+/// from the stable complement to avoid tail cancellation. Near the upper
+/// boundary (`mu -> 1`) `y - mu = (y - 1) + (1 - mu) = (y - 1) + omm`; near the
+/// lower boundary (`mu -> 0`) `mu` is itself the small, exactly-evaluated value,
+/// so `y - mu` is already accurate.
 #[inline]
 pub(crate) fn bernoulli_exact_working_response(
     row: usize,
     eta: f64,
     y: f64,
     mu: f64,
+    omm: f64,
     dmu_deta: f64,
 ) -> Result<f64, EstimationError> {
-    let z = eta + (y - mu) / dmu_deta;
+    let residual = if mu >= 0.5 { (y - 1.0) + omm } else { y - mu };
+    let z = eta + residual / dmu_deta;
     if z.is_finite() {
         Ok(z)
     } else {

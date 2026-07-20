@@ -1766,6 +1766,7 @@ mod tests {
                     d2: jet.d2,
                     d3: jet.d3,
                 },
+                1.0 - jet.mean,
             )
             .expect("integrated Bernoulli row geometry must be representable");
             assert_relative_eq!(
@@ -1886,11 +1887,16 @@ mod tests {
         );
     }
 
+    /// Below full saturation the noncanonical links carry the exact tail
+    /// complement `1 - mu` (option 3): `mu` has already rounded to `1.0`, but the
+    /// weight `d1^2/(mu(1-mu))` and the working score stay representable, so the
+    /// row proceeds instead of being refused. (cloglog `eta = 5`, probit
+    /// `eta = 10` are both past the point `mu` rounds to `1.0`.)
     #[test]
-    pub(crate) fn noncanonical_binomial_working_state_clamps_saturating_standard_links() {
-        for link in [StandardLink::Probit, StandardLink::CLogLog] {
+    pub(crate) fn noncanonical_binomial_carries_tail_complement_below_saturation() {
+        for (link, eta_val) in [(StandardLink::CLogLog, 5.0), (StandardLink::Probit, 10.0)] {
             let y = array![1.0];
-            let eta = array![30.0];
+            let eta = array![eta_val];
             let priorweights = array![1.0];
             let inverse_link = InverseLink::Standard(link);
             let mut mu = Array1::zeros(1);
@@ -1907,22 +1913,105 @@ mod tests {
                 &mut z,
                 None,
             )
-            .expect("noncanonical binomial working state");
+            .expect("tail-complement row must be representable");
 
-            assert!(
-                mu[0] > 0.0 && mu[0] < 1.0,
-                "{link:?} working mu must stay inside (0,1) before variance evaluation; got {}",
-                mu[0]
+            assert_eq!(
+                mu[0], 1.0,
+                "{link:?} at eta={eta_val} is past where mu rounds to 1.0"
             );
             assert!(
                 weights[0].is_finite() && weights[0] > 0.0,
-                "{link:?} working weight must remain positive finite at saturated eta; got {}",
+                "{link:?} working weight must stay positive finite via the carried complement; got {}",
                 weights[0]
             );
             assert!(
                 z[0].is_finite(),
-                "{link:?} working response must remain finite at saturated eta; got {}",
+                "{link:?} working response must remain finite; got {}",
                 z[0]
+            );
+            // The working score X^T W (z - eta) is the whole point of carrying the
+            // complement: it stays representable and positive rather than
+            // collapsing to zero (or the row being refused outright).
+            let score = weights[0] * (z[0] - eta[0]);
+            assert!(
+                score.is_finite() && score > 0.0,
+                "{link:?} working score must stay positive finite; got {score}"
+            );
+        }
+    }
+
+    /// A fully saturated row (`mu == 1.0`, complement underflowed) that is
+    /// *consistent* with its response (`y == 1`) is the analytic `eta -> inf`
+    /// limit of the weight formula: a zero-weight row, exactly what the
+    /// `priorweight == 0` branch returns.
+    #[test]
+    pub(crate) fn saturated_consistent_binomial_row_is_zero_weight() {
+        for (link, eta_val) in [(StandardLink::CLogLog, 30.0), (StandardLink::Probit, 40.0)] {
+            let y = array![1.0];
+            let eta = array![eta_val];
+            let priorweights = array![1.0];
+            let inverse_link = InverseLink::Standard(link);
+            let mut mu = Array1::zeros(1);
+            let mut weights = Array1::zeros(1);
+            let mut z = Array1::zeros(1);
+
+            update_glmvectors(
+                y.view(),
+                &eta,
+                &inverse_link,
+                priorweights.view(),
+                &mut mu,
+                &mut weights,
+                &mut z,
+                None,
+            )
+            .expect("consistent saturated row must be representable");
+
+            assert_eq!(mu[0], 1.0, "{link:?} saturated mu");
+            assert_eq!(
+                weights[0], 0.0,
+                "{link:?} consistent saturated row must be zero-weight; got {}",
+                weights[0]
+            );
+            assert_eq!(
+                z[0], eta[0],
+                "{link:?} zero-weight working response is eta; got {}",
+                z[0]
+            );
+        }
+    }
+
+    /// A fully saturated row that is *inconsistent* with its response (`y == 0`
+    /// while `mu == 1.0`) has `-inf` log-likelihood and must stay a typed
+    /// refusal — never silently zero-weighted.
+    #[test]
+    pub(crate) fn saturated_inconsistent_binomial_row_is_refused() {
+        for (link, eta_val) in [(StandardLink::CLogLog, 30.0), (StandardLink::Probit, 40.0)] {
+            let y = array![0.0];
+            let eta = array![eta_val];
+            let priorweights = array![1.0];
+            let inverse_link = InverseLink::Standard(link);
+            let mut mu = Array1::zeros(1);
+            let mut weights = Array1::zeros(1);
+            let mut z = Array1::zeros(1);
+
+            let result = update_glmvectors(
+                y.view(),
+                &eta,
+                &inverse_link,
+                priorweights.view(),
+                &mut mu,
+                &mut weights,
+                &mut z,
+                None,
+            );
+
+            assert!(
+                matches!(
+                    result,
+                    Err(EstimationError::PirlsRowGeometryUnrepresentable { .. })
+                ),
+                "{link:?} inconsistent saturated row must be a typed refusal; got {result:?}"
             );
         }
     }

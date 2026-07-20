@@ -1222,6 +1222,97 @@ pub fn inverse_link_mu_d1_for_inverse_link(
     }
 }
 
+/// Stable complement `1 - mu(eta)` for a Bernoulli inverse link, evaluated
+/// directly from `eta` rather than as `1.0 - mu`.
+///
+/// The forward `mu` rounds to exactly `1.0` in f64 far inside the tail — cloglog
+/// at `eta ≈ 3.62`, probit at `eta ≈ 8.29` — after which the naive `1.0 - mu` is
+/// a hard zero even though the true complement is a representable quantity down
+/// to `~1e-300`. Both the Bernoulli variance `mu(1-mu)` and the working residual
+/// `y - mu` depend on that complement, so recovering it exactly is what lets a
+/// saturating cloglog/probit row proceed instead of being refused. This mirrors
+/// the tail-complement already carried on the canonical logit path.
+///
+/// Each link with a cancellation-free closed form for `1 - mu` uses it; links
+/// without one fall back to `1.0 - mu` (unchanged behaviour). The complement is
+/// clamped into `[0, 1]` only against round-off just past the boundary.
+pub(crate) fn inverse_link_complement_for_inverse_link(
+    link: &InverseLink,
+    eta: f64,
+    mu: f64,
+) -> f64 {
+    let raw = match link {
+        InverseLink::Standard(link_fn) => standard_link_complement(*link_fn, eta, mu),
+        // No cancellation-free closed form wired for these yet; the naive
+        // complement leaves their saturation behaviour exactly as it was.
+        InverseLink::LatentCLogLog(_)
+        | InverseLink::Sas(_)
+        | InverseLink::BetaLogistic(_)
+        | InverseLink::Mixture(_) => 1.0 - mu,
+    };
+    if raw.is_nan() {
+        raw
+    } else {
+        raw.clamp(0.0, 1.0)
+    }
+}
+
+/// Cancellation-free `1 - mu(eta)` for the standard Bernoulli links.
+#[inline]
+fn standard_link_complement(link: StandardLink, eta: f64, mu: f64) -> f64 {
+    match link {
+        StandardLink::Probit => {
+            // 1 - Phi(eta) = Phi(-eta); the reflected CDF keeps the tiny upper-tail
+            // mass that `1 - Phi(eta)` cancels away.
+            if eta.is_nan() {
+                f64::NAN
+            } else if eta == f64::INFINITY {
+                0.0
+            } else if eta == f64::NEG_INFINITY {
+                1.0
+            } else {
+                normal_cdf(-eta)
+            }
+        }
+        StandardLink::CLogLog => {
+            // mu = 1 - exp(-exp(eta))  =>  1 - mu = exp(-exp(eta)).
+            if eta.is_nan() {
+                f64::NAN
+            } else {
+                let t = eta.exp();
+                if !t.is_finite() { 0.0 } else { (-t).exp() }
+            }
+        }
+        StandardLink::LogLog => {
+            // mu = exp(-exp(-eta))  =>  1 - mu = -expm1(-exp(-eta)).
+            if eta.is_nan() {
+                f64::NAN
+            } else {
+                let r = (-eta).exp();
+                if !r.is_finite() { 1.0 } else { -(-r).exp_m1() }
+            }
+        }
+        StandardLink::Cauchit => {
+            // mu = 1/2 + atan(eta)/pi  =>  1 - mu = 1/2 - atan(eta)/pi. For eta > 0
+            // this cancels toward zero; atan(1/eta) = pi/2 - atan(eta) exactly, so
+            // 1 - mu = atan(1/eta)/pi with no loss.
+            if eta.is_nan() {
+                f64::NAN
+            } else if !eta.is_finite() {
+                if eta > 0.0 { 0.0 } else { 1.0 }
+            } else if eta > 0.0 {
+                (1.0 / eta).atan() / std::f64::consts::PI
+            } else {
+                0.5 - eta.atan() / std::f64::consts::PI
+            }
+        }
+        // Logit carries its own tail complement on the canonical path; identity
+        // and log are not Bernoulli-variance links. The naive complement is
+        // exact enough for these here.
+        StandardLink::Logit | StandardLink::Identity | StandardLink::Log => 1.0 - mu,
+    }
+}
+
 fn link_function_mu_d1(link: LinkFunction, eta: f64) -> Result<(f64, f64), EstimationError> {
     match link {
         LinkFunction::Identity => Ok((eta, 1.0)),
