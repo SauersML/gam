@@ -228,8 +228,22 @@ pub(crate) fn bernoulli_geometry_from_jet(
             y,
         ));
     }
-    let n0 = jet.d1 * jet.d1;
-    let fisher = n0 / v;
+    // Fisher weight and its eta-derivatives in a pair-then-multiply factoring that
+    // stays representable through the saturating band where `d1^2` underflows
+    // before the division (cloglog `eta` 5.9-6.61, probit ~24-27): each `mu'`
+    // factor is paired with one variance factor before multiplying. With
+    // `a = mu'/mu` and `b = mu'/(1-mu)`,
+    //   W   = mu'^2 / (mu (1-mu)) = a b,
+    //   a'  = mu''/mu   - a^2,          b'  = mu''/(1-mu)   + b^2,
+    //   a'' = mu'''/mu   - (mu''/mu) a   - 2 a a',
+    //   b'' = mu'''/(1-mu) + (mu''/(1-mu)) b + 2 b b',
+    //   W' = a'b + a b',    W'' = a''b + 2 a'b' + a b''.
+    // This is exactly the quotient `d/deta[mu'^2/(mu(1-mu))]` reassociated so that
+    // no intermediate underflows while both `mu'` and the stable complement remain
+    // representable; `v = mu * omm` above is used only for the saturation test.
+    let a = jet.d1 / mu;
+    let b = jet.d1 / omm;
+    let fisher = a * b;
     let weight = priorweight * fisher;
     if !(fisher.is_finite() && fisher > 0.0 && weight.is_finite() && weight > 0.0) {
         return Err(unrepresentable_bernoulli(
@@ -239,13 +253,12 @@ pub(crate) fn bernoulli_geometry_from_jet(
             weight,
         ));
     }
-    let v1 = jet.d1 * (1.0 - 2.0 * mu);
-    let v2 = jet.d2 * (1.0 - 2.0 * mu) - 2.0 * jet.d1 * jet.d1;
-    let n1 = 2.0 * jet.d1 * jet.d2;
-    let n2 = 2.0 * (jet.d2 * jet.d2 + jet.d1 * jet.d3);
-    let numer1 = n1 * v - n0 * v1;
-    let c = priorweight * numer1 / (v * v);
-    let d = priorweight * ((n2 * v - n0 * v2) / (v * v) - 2.0 * numer1 * v1 / (v * v * v));
+    let a1 = jet.d2 / mu - a * a;
+    let b1 = jet.d2 / omm + b * b;
+    let a2 = jet.d3 / mu - (jet.d2 / mu) * a - 2.0 * a * a1;
+    let b2 = jet.d3 / omm + (jet.d2 / omm) * b + 2.0 * b * b1;
+    let c = priorweight * (a1 * b + a * b1);
+    let d = priorweight * (a2 * b + 2.0 * a1 * b1 + a * b2);
     if !c.is_finite() {
         return Err(unrepresentable_bernoulli(row, "dW/deta", eta, c));
     }

@@ -2016,6 +2016,64 @@ mod tests {
         }
     }
 
+    /// The stable Fisher-weight curvature `c = dW/deta`, `d = d2W/deta2` matches
+    /// central finite differences of the weight through the saturating band where
+    /// the naive `d1^2/v` form divides by an underflowed variance (cloglog
+    /// `eta` 5.9-6.61, probit ~24-27). Each probe rebuilds the inverse-link jet
+    /// and the stable complement from scratch — the working cache is never frozen
+    /// across the difference stencil. The pair-then-multiply factoring keeps `c`
+    /// and `d` finite and nonzero where the naive quotient would be `0/0`.
+    #[test]
+    pub(crate) fn noncanonical_binomial_curvature_matches_central_fd_through_saturation() {
+        let weight_c_d = |link: StandardLink, eta: f64| -> (f64, f64, f64) {
+            let inverse_link = InverseLink::Standard(link);
+            let jet = crate::mixture_link::inverse_link_jet_for_inverse_link(&inverse_link, eta)
+                .expect("inverse-link jet must evaluate");
+            let omm = crate::mixture_link::inverse_link_complement_for_inverse_link(
+                &inverse_link,
+                eta,
+                jet.mu,
+            );
+            let geometry = bernoulli_geometry_from_jet(0, eta, 1.0, 1.0, jet, omm)
+                .expect("saturating-band row must be representable");
+            (geometry.weight, geometry.c, geometry.d)
+        };
+        // (link, eta, fd step): a regime-1 point then the regime-2 band where the
+        // naive `d1^2/(mu(1-mu))` and its `v^2`/`v^3` curvature denominators
+        // underflow. Steps are sized to the local scale of the super-exponential
+        // weight so central differences stay well inside float precision.
+        for (link, eta, h) in [
+            (StandardLink::CLogLog, 5.0, 3e-5),
+            (StandardLink::CLogLog, 6.0, 3e-5),
+            (StandardLink::CLogLog, 6.3, 3e-5),
+            (StandardLink::Probit, 12.0, 1e-4),
+            (StandardLink::Probit, 25.0, 1e-4),
+        ] {
+            let (w0, c, d) = weight_c_d(link, eta);
+            assert!(
+                w0 > 0.0 && c.is_finite() && d.is_finite() && c != 0.0 && d != 0.0,
+                "{link:?} eta={eta}: weight/curvature must be representable and nonzero; \
+                 W={w0} c={c} d={d}"
+            );
+            let (wp, _, _) = weight_c_d(link, eta + h);
+            let (wm, _, _) = weight_c_d(link, eta - h);
+            let c_fd = (wp - wm) / (2.0 * h);
+            let d_fd = (wp - 2.0 * w0 + wm) / (h * h);
+            let rel_c = (c - c_fd).abs() / c.abs();
+            let rel_d = (d - d_fd).abs() / d.abs();
+            assert!(
+                rel_c <= 5e-3,
+                "{link:?} eta={eta}: dW/deta vs central FD rel err {rel_c:.2e} \
+                 (analytic {c:.3e}, fd {c_fd:.3e})"
+            );
+            assert!(
+                rel_d <= 5e-3,
+                "{link:?} eta={eta}: d2W/deta2 vs central FD rel err {rel_d:.2e} \
+                 (analytic {d:.3e}, fd {d_fd:.3e})"
+            );
+        }
+    }
+
     #[test]
     pub(crate) fn gamma_log_deviance_uses_gamma_formula() {
         let y = array![2.0, 5.0];
