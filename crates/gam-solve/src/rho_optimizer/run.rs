@@ -3661,6 +3661,12 @@ pub enum OperatorTrustRegionStopReason {
 /// remaining budget.
 const OUTER_CERTIFY_RESUME_BUDGET: usize = 16;
 
+/// Max interior strict-saddle escape resumes (#2357/#2155). A genuine saddle is
+/// cleared in one escape; the small cap keeps a pathological non-convergent
+/// objective (e.g. a bimodal inner solve, #2363) from re-escaping a family of
+/// shallow saddles until the general resume budget is spent.
+const OUTER_SADDLE_ESCAPE_BUDGET: usize = 3;
+
 /// Roundoff-relative scale below which a certify-last reseed's objective
 /// reduction is numerical noise rather than exploited descent (#2374). A
 /// fresh-metric BFGS restart seeded AT the refused checkpoint can only reduce
@@ -3827,6 +3833,11 @@ pub(crate) fn run_outer(
     // convergence (e.g. a budget-exhausted `MaxIterationsReached`) is refused
     // immediately with no reseed: its non-convergence is genuine.
     let mut resumes_remaining = OUTER_CERTIFY_RESUME_BUDGET;
+    // Interior strict-saddle escapes are bounded separately and tightly: a real
+    // saddle is cleared in one hop, so a handful of attempts is ample, while a
+    // non-convergent bimodal-inner grind (#2155/#2363) is cut off well before it
+    // exhausts the general resume budget (#2357).
+    let mut saddle_escapes_remaining: usize = OUTER_SADDLE_ESCAPE_BUDGET;
     let certificate = loop {
         let claimed_converged = result.converged;
         match certify_diagnose_and_install(obj, &mut result) {
@@ -3863,10 +3874,22 @@ pub(crate) fn run_outer(
                 // non-stationary iterate has no desync to remove).
                 if (!claimed_converged && !resume_from_saddle_escape)
                     || resumes_remaining == 0
+                    || (resume_from_saddle_escape && saddle_escapes_remaining == 0)
                 {
                     return Err(refusal);
                 }
                 resumes_remaining -= 1;
+                if resume_from_saddle_escape {
+                    // Genuine strict saddles are cleared in one escape (the fresh
+                    // ARC step off the ridge descends straight to the PSD
+                    // minimum). A SMALL cap stops a pathological objective — e.g. a
+                    // bimodal inner solve whose warm re-descent keeps reporting a
+                    // phantom improvement that the cold certificate cannot
+                    // reproduce (#2155 / #2363) — from burning the whole resume
+                    // budget re-escaping a family of shallow saddles that never
+                    // certifies. Past the cap the honest refusal is taken.
+                    saddle_escapes_remaining -= 1;
+                }
                 let prior_iterations = result.iterations;
                 let prior_value = result.final_value;
                 log::info!(
