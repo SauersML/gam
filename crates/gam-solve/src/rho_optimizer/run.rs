@@ -1423,6 +1423,43 @@ pub(crate) fn certificate_hessian_is_psd_off_railed(
     certificate_hessian_is_psd(&sub)
 }
 
+/// Interior-PSD verdict judged ABOVE the per-coordinate gradient-residue noise
+/// floor (#2349): PSD of `H + diag(|g|)` restricted to the un-excluded
+/// coordinates.
+///
+/// The assembled ρ-Hessian's tail entries carry the #2298 trace-pair
+/// cancellation residue: when the `λ²V_λλ` pair cancels to roundoff, the
+/// surviving diagonal entry is `λV_λ = g_k` — gradient magnitude, corrupted
+/// sign (the same tie signature the tail-snap candidate band keys on).
+/// Measured on the #2349 multinomial checkpoint: the sole interior coordinate
+/// had `g₁ = −1.0228e-3`, `H₁₁ = −1.0216e-3` (ratio 0.999), and that single
+/// sub-resolution entry was the entire `interior Hessian sub-block not PSD`
+/// refusal — the full 6×6 spectrum was `[−1.02e-3, 0.135, …, 0.904]`.
+///
+/// The residue is `O(|g_k|)`, and every coordinate judged here has already
+/// passed gradient stationarity (`|g_k|` at or below the stationarity bound),
+/// so flooring the diagonal by `|g_k|` bounds the judgment at exactly the
+/// instrument's resolution: it can absorb only negative curvature whose
+/// exploitable improvement (`≲ g²/2|H|`, sub-resolution by construction at a
+/// stationary point) is below the run's own cost tolerance, and can never mask
+/// a genuine interior saddle (`λ_min ≪ −bound` dwarfs the bound-scale floor —
+/// the #2357 trace's saddle had `λ_min ≈ −0.5` against `|g| ≈ 1e-3`).
+pub(crate) fn certificate_hessian_is_psd_off_railed_above_gradient_floor(
+    hessian: &Array2<f64>,
+    excluded: &[usize],
+    gradient: &Array1<f64>,
+) -> Option<bool> {
+    let n = hessian.nrows();
+    if gradient.len() != n {
+        return certificate_hessian_is_psd_off_railed(hessian, excluded);
+    }
+    let mut floored = hessian.clone();
+    for k in 0..n {
+        floored[[k, k]] += gradient[k].abs();
+    }
+    certificate_hessian_is_psd_off_railed(&floored, excluded)
+}
+
 /// Escape point off a certified strict saddle in the free (un-railed) subspace
 /// (#2357, generalised to the box-constrained case in #2155).
 ///
@@ -2802,7 +2839,12 @@ fn try_certify_asymptote_rail(
     // curvature for a minimum. A rail-caused indefiniteness in the saturated
     // direction is expected and excluded; genuine interior negative curvature is
     // not, and refuses the certificate.
-    if certificate_hessian_is_psd_off_railed(inputs.hessian, railed) != Some(true) {
+    if certificate_hessian_is_psd_off_railed_above_gradient_floor(
+        inputs.hessian,
+        railed,
+        projected_gradient,
+    ) != Some(true)
+    {
         return Ok(Err("interior Hessian sub-block is not PSD".to_string()));
     }
     let beta_norm = inputs
@@ -3092,7 +3134,9 @@ fn try_tail_snap_to_rail(
         .copied()
         .chain(candidates.iter().map(|(k, _)| *k))
         .collect();
-    if certificate_hessian_is_psd_off_railed(hessian, &excluded) != Some(true) {
+    if certificate_hessian_is_psd_off_railed_above_gradient_floor(hessian, &excluded, gradient)
+        != Some(true)
+    {
         return Ok(TailSnapOutcome::Declined(
             "interior Hessian sub-block not PSD".to_string(),
         ));
@@ -4784,6 +4828,42 @@ mod asymptote_rail_certify_tests {
         assert!(
             verdict.is_err(),
             "a drifting ĉ must not certify a tail, got {verdict:?}",
+        );
+    }
+
+    /// #2349: the interior-PSD gate must judge curvature above the
+    /// gradient-residue noise floor. Fixture = the measured multinomial
+    /// checkpoint shape: excluded tail candidates {0}, interior coordinate 1
+    /// gradient-stationary (|g| = 1.0228e-3) with the corrupted tie-signature
+    /// diagonal H₁₁ = −1.0216e-3 ≈ −|g₁| (the #2298 trace-pair residue — the
+    /// entire measured 6×6 spectrum was PSD except this one sub-resolution
+    /// entry). The raw gate refuses on the residue; the floored gate
+    /// certifies; a GENUINE interior saddle (λ_min = −0.5 against the same
+    /// tiny gradient) still refuses under the floor.
+    #[test]
+    fn interior_psd_gate_floors_tail_residue_but_keeps_genuine_saddles_2349() {
+        let hessian = array![[0.2828, 0.0004], [0.0004, -1.0216e-3]];
+        let gradient = array![-1.057, -1.0228e-3];
+        let excluded = [0usize];
+        assert_eq!(
+            certificate_hessian_is_psd_off_railed(&hessian, &excluded),
+            Some(false),
+            "raw gate must see the corrupted sub-resolution entry as indefinite"
+        );
+        assert_eq!(
+            certificate_hessian_is_psd_off_railed_above_gradient_floor(
+                &hessian, &excluded, &gradient
+            ),
+            Some(true),
+            "the gradient floor must absorb the O(|g|) trace-pair residue"
+        );
+        let saddle = array![[0.2828, 0.0004], [0.0004, -0.5]];
+        assert_eq!(
+            certificate_hessian_is_psd_off_railed_above_gradient_floor(
+                &saddle, &excluded, &gradient
+            ),
+            Some(false),
+            "a genuine interior saddle dwarfs the bound-scale floor and refuses"
         );
     }
 
