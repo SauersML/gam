@@ -650,6 +650,34 @@ impl CostStallGuard {
         if self.no_improve_streak < self.window {
             return CostStallVerdict::Continue;
         }
+        // #2357: the finite window can fill while the recorded BEST is a
+        // certified strict saddle — the guard tracks `best_hessian_psd` but the
+        // finite-stall path never consulted it, so the stall halted at a
+        // low-cost pass-through iterate whose curvature had not settled
+        // (cold periodic-te() repro: window fills on three oscillating evals
+        // near ρ₂≈10.7, halts to an earlier ρ₂≈5.4 point with hessian_psd=NO,
+        // and the analytic certificate then refuses with INDEFINITE CURVATURE
+        // AT INTERIOR OPTIMUM — while re-running warm from that very
+        // checkpoint converges in a few more iterations). A strict saddle has
+        // a certified local escape direction, so refuse the stall and return
+        // control to cubic regularization exactly as the infeasible-run path
+        // already does; the escape budget bounds consecutive fruitless
+        // refusals so a surface that genuinely floors at a saddle still halts
+        // (converged=false) after the budget instead of looping.
+        if self.best_hessian_psd == Some(false) && self.stuck_escapes < STUCK_STALL_MAX_ESCAPES {
+            self.stuck_escapes = self.stuck_escapes.saturating_add(1);
+            self.no_improve_streak = 0;
+            log::warn!(
+                "[OUTER] ARC cost-stall window filled at a strict-saddle incumbent \
+                 (hessian_psd=NO at best-so-far, value={:.6e}): refusing to certify the \
+                 saddle and returning control to cubic regularization to exploit the \
+                 negative curvature (escape {}/{}).",
+                self.best_value,
+                self.stuck_escapes,
+                STUCK_STALL_MAX_ESCAPES,
+            );
+            return CostStallVerdict::Continue;
+        }
         self.publish_stall(rho, value, grad_norm)
     }
 

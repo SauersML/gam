@@ -2259,6 +2259,78 @@ fn analytic_route_unavailable_hessian_is_fatal() {
     }
 }
 
+/// #2357 — the finite cost-stall window must not certify a strict-saddle
+/// incumbent. Cold periodic-te() trace: the window fills on three oscillating
+/// evals near ρ₂≈10.7 while the recorded BEST is an earlier, lower-cost
+/// pass-through point (ρ₂≈5.4) whose reduced Hessian is NOT PSD; the guard
+/// certified that saddle `Converged`, the downstream analytic certificate then
+/// refused with INDEFINITE CURVATURE AT INTERIOR OPTIMUM, and the fit died —
+/// even though warm-resuming from the very same checkpoint converges in a few
+/// more iterations. The guard already refuses a strict-saddle incumbent on the
+/// INFEASIBLE-run path; this pins the same refusal on the finite path: the
+/// window filling at a `hessian_psd = Some(false)` best yields `Continue`
+/// (escape granted, streak reset) so cubic regularization keeps exploiting the
+/// negative curvature, and once a PSD improving iterate replaces the saddle as
+/// best, the next filled window certifies THAT point.
+#[test]
+fn finite_cost_stall_refuses_to_certify_strict_saddle_incumbent_2357() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
+
+    // Best-so-far: low cost, gradient inside the certification band, but a
+    // certified strict saddle (the #2357 eval#5 analogue at ρ₂≈5.4).
+    let saddle_rho = array![5.4];
+    let verdict = guard.observe_second_order(&saddle_rho, 100.0, 5.0e-4, true, Some(false));
+    assert!(matches!(verdict, CostStallVerdict::Continue));
+
+    // Three no-improvement evals (the ρ₂≈10.7 oscillation) fill the window.
+    // Pre-fix this certified the SADDLE as Converged; the strict-saddle refusal
+    // must instead grant an escape and keep descending.
+    let osc_rho = array![10.7];
+    for k in 0..3 {
+        let verdict = guard.observe_second_order(&osc_rho, 100.5, 5.0e-4, true, Some(true));
+        assert!(
+            matches!(verdict, CostStallVerdict::Continue),
+            "window fill #{k} at a strict-saddle incumbent must refuse the stall, \
+             not certify the saddle"
+        );
+    }
+    // The saddle may be published as a best-so-far SNAPSHOT for budget-recovery
+    // (#1371), but it must never be stamped `converged = true`: a strict-saddle
+    // incumbent is exactly what #2357 forbids certifying.
+    if let Some(snapshot) = exit.lock().unwrap().as_ref() {
+        assert!(
+            !snapshot.converged,
+            "a strict-saddle incumbent may be a recovery snapshot but must never \
+             be published as a converged optimum"
+        );
+    }
+
+    // The continued descent finds a better, PSD iterate (the warm-resume
+    // outcome): it becomes best, and the next filled window certifies it.
+    let settled_rho = array![6.1];
+    let verdict = guard.observe_second_order(&settled_rho, 99.0, 4.0e-4, true, Some(true));
+    assert!(matches!(verdict, CostStallVerdict::Continue));
+    let mut last = CostStallVerdict::Continue;
+    for _ in 0..3 {
+        last = guard.observe_second_order(&osc_rho, 100.5, 5.0e-4, true, Some(true));
+    }
+    assert!(
+        matches!(last, CostStallVerdict::Converged),
+        "a PSD best inside the certification band must certify once the window refills"
+    );
+    let published = exit
+        .lock()
+        .unwrap()
+        .take()
+        .expect("converged stall must publish the best checkpoint");
+    assert!(published.converged);
+    assert_eq!(
+        published.rho, settled_rho,
+        "the certified checkpoint must be the PSD best, not the saddle or the oscillation point"
+    );
+}
+
 /// #1237 — On a near-separable multinomial fit the outer REML criterion
 /// decreases monotonically as λ→0, so several log-λ directions slam to the
 /// lower box bound and the ARC outer loop cycles to `max_iter` without ever
