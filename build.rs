@@ -2016,14 +2016,18 @@ fn scan_for_dead_cfg_gates(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf
         if !content.contains("cfg(") {
             return;
         }
+        let stripped_lines: Vec<String> = content.lines().map(strip_strings_and_comments).collect();
         for (idx, line) in content.lines().enumerate() {
-            let stripped = strip_strings_and_comments(line);
+            let stripped = stripped_lines.get(idx).map(String::as_str).unwrap_or(line);
             // Both `#[cfg(any())]` and the crate-/module-level `#![cfg(any())]`
             // inner form are dead-by-construction gates; match either.
-            if !line_has_attr_marker(&stripped) {
+            if !line_has_attr_marker(stripped) {
                 continue;
             }
-            if line_has_empty_cfg_gate(&stripped) {
+            // `cfg(any(` / `))]` can split across lines, separating the
+            // empty-parens close from the marker; splice before testing.
+            let spliced = spliced_attribute_line(&stripped_lines, idx);
+            if line_has_empty_cfg_gate(&spliced) {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }
@@ -2066,6 +2070,11 @@ fn scan_for_feature_cfg_gates(
             if !line_has_attr_marker(stripped) {
                 continue;
             }
+            // `cfg(` / `feature = "..."` / `)]` can split across lines,
+            // separating the predicate from the marker; splice before
+            // testing so the split form cannot evade the ban.
+            let spliced = spliced_attribute_line(&stripped_lines, idx);
+            let stripped = spliced.as_str();
             if !(stripped.contains("cfg(") || stripped.contains("cfg_attr(")) {
                 continue;
             }
@@ -2411,6 +2420,56 @@ fn is_exempt_test_submodule_name(name: &str) -> bool {
 /// quoted inside `"..."` or `//` text does not register.
 fn line_has_attr_marker(s: &str) -> bool {
     s.contains("#[") || s.contains("#![")
+}
+
+/// True when every `[` opened at or after the first attribute marker in `s`
+/// is also closed within `s`. `false` means the attribute continues onto a
+/// following physical line — the marker and a later keyword (`allow(`,
+/// `feature`, ...) are on different lines and a single-line match on `s`
+/// alone cannot see both.
+fn attr_brackets_balanced(s: &str) -> bool {
+    let Some(start) = s.find("#[").into_iter().chain(s.find("#![")).min() else {
+        return true;
+    };
+    let mut depth = 0i32;
+    for b in s[start..].bytes() {
+        match b {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth <= 0
+}
+
+/// The logical attribute beginning at `lines[idx]`: that (already
+/// string/comment-stripped) line, plus each following stripped line joined
+/// by a single space, until the attribute's brackets balance (capped at 64
+/// continuation lines). A Rust attribute may span physical lines:
+///
+///     #[cfg(
+///         feature = "zzz"
+///     )]
+///
+/// which separates the `#[`/`#![` marker from a keyword that only appears on
+/// a continuation line and defeats any per-line test. An attribute that
+/// closes on its own line splices to itself, so single-line callers are
+/// unaffected. Every scanner that tests a marker line for a keyword
+/// (`allow(`/`expect(`, an empty `cfg(any())`, a `feature = "..."`
+/// predicate) MUST splice first so a split attribute cannot evade it (#2364).
+fn spliced_attribute_line(lines: &[String], idx: usize) -> String {
+    let mut acc = lines.get(idx).cloned().unwrap_or_default();
+    if attr_brackets_balanced(&acc) {
+        return acc;
+    }
+    for follow in lines.iter().skip(idx + 1).take(64) {
+        acc.push(' ');
+        acc.push_str(follow.trim());
+        if attr_brackets_balanced(&acc) {
+            break;
+        }
+    }
+    acc
 }
 
 /// True when `stripped` contains `cfg(any(...))` or `cfg(all(...))` with
@@ -3265,6 +3324,17 @@ fn scan_for_banned_allow(
             if !line_has_attr_marker(code) {
                 continue;
             }
+            // An attribute may span physical lines, separating the marker
+            // from the silencer keyword — in both the inner and the outer
+            // form — and defeating a same-line match:
+            //   #![                    #[
+            //       allow(dead_code)       allow(dead_code)
+            //   ]                      ]
+            // Splice in continuation lines until the brackets balance before
+            // testing, so the split form is caught too (#2364). Offenders
+            // still attribute to the marker's line below.
+            let spliced = spliced_attribute_line(&stripped_lines, idx);
+            let code = spliced.as_str();
             for silencer in SILENCERS {
                 let mut search_from = 0usize;
                 while let Some(rel_idx) = code[search_from..].find(silencer) {
