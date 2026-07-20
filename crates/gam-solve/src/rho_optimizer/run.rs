@@ -2789,7 +2789,7 @@ fn try_certify_asymptote_rail(
             AsymptoteSide::Lower
         };
         probed_any = true;
-        match build_and_assess_rail_coordinate(obj, rho, k, side, &tol)? {
+        match build_and_assess_rail_coordinate(obj, rho, k, side, &tol, (lower[k], upper[k]))? {
             Ok(rail) => rails.push(rail),
             Err(reason) => {
                 decline = Some(reason);
@@ -3066,7 +3066,7 @@ fn try_tail_snap_to_rail(
     // qualifies, the point is minted where it stands (#2348 Inc 2c).
     let mut at_point_rails: Vec<RailCoordinate> = Vec::new();
     for (k, side) in &candidates {
-        let verdict = match probe_tail_window(obj, rho, *k, *side, &tol)? {
+        let verdict = match probe_tail_window(obj, rho, *k, *side, &tol, (lower[*k], upper[*k]))? {
             (Some(window), rows) => match assess_coordinate(&window, &tol) {
                 AsymptoteVerdict::CertifiedAtAsymptote {
                     side: assessed_side,
@@ -3193,8 +3193,9 @@ fn build_and_assess_rail_coordinate(
     coord: usize,
     side: AsymptoteSide,
     tol: &AsymptoteTolerances,
+    domain: (f64, f64),
 ) -> Result<Result<RailCoordinate, String>, EstimationError> {
-    let window = match probe_tail_window(obj, rho, coord, side, tol)? {
+    let window = match probe_tail_window(obj, rho, coord, side, tol, domain)? {
         (Some(window), _) => window,
         (None, rows) => {
             return Ok(Err(format!(
@@ -3234,8 +3235,18 @@ fn probe_tail_window(
     coord: usize,
     side: AsymptoteSide,
     tol: &AsymptoteTolerances,
+    domain: (f64, f64),
 ) -> Result<(Option<AsymptoteWindow>, String), EstimationError> {
     const PROBE_DELTA: f64 = 1.0;
+    // Strictly-inside guard for probes against the probed coordinate's own box
+    // interval (#2388). The ρ-gradient assembly freezes any coordinate at (or
+    // within 1e-8 of) its recorded upper bound to the #197 KKT projection — a
+    // literal 0.0 — so a probe at or past a box bound samples the frozen-axis
+    // convention, not the criterion's tail: a fabricated hard-zero tail that
+    // the drift band can never confirm. Out-of-box points are outside the
+    // λ-selection domain altogether; they are not evidence for or against a
+    // tail, so the ladder stops at the last strictly-in-domain probe.
+    const PROBE_DOMAIN_MARGIN: f64 = 1.0e-6;
     // Upper rail (ρ → +∞): step ρ DOWN into the tail. Lower rail: step UP.
     let sign = match side {
         AsymptoteSide::Upper => -1.0,
@@ -3245,8 +3256,12 @@ fn probe_tail_window(
     // increasing r steps further into the interior (larger |grad|).
     let mut rows: Vec<(f64, f64, Option<Array1<f64>>)> = Vec::new();
     for j in 1..=ASYMPTOTE_PROBE_COUNT {
+        let stepped = rho[coord] + sign * (j as f64) * PROBE_DELTA;
+        if stepped <= domain.0 + PROBE_DOMAIN_MARGIN || stepped >= domain.1 - PROBE_DOMAIN_MARGIN {
+            break;
+        }
         let mut probe = rho.clone();
-        probe[coord] = rho[coord] + sign * (j as f64) * PROBE_DELTA;
+        probe[coord] = stepped;
         let eval = match obj.eval_with_order(&probe, OuterEvalOrder::ValueAndGradient) {
             Ok(eval) => eval,
             // A failed probe is not evidence against a tail; stop probing and
@@ -4617,9 +4632,16 @@ mod asymptote_rail_certify_tests {
         let mut obj = upper_tail_objective(6723.0, 1.0, 0.0);
         let rho = array![29.9];
         let tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
-        let rail = build_and_assess_rail_coordinate(&mut obj, &rho, 0, AsymptoteSide::Upper, &tol)
-            .expect("probing the tail-law objective must not error")
-            .expect("an exact exponential tail must certify a rail");
+        let rail = build_and_assess_rail_coordinate(
+            &mut obj,
+            &rho,
+            0,
+            AsymptoteSide::Upper,
+            &tol,
+            (f64::NEG_INFINITY, f64::INFINITY),
+        )
+        .expect("probing the tail-law objective must not error")
+        .expect("an exact exponential tail must certify a rail");
         assert_eq!(rail.index, 0);
         assert_eq!(rail.side, AsymptoteSide::Upper);
         assert!(
@@ -4638,12 +4660,83 @@ mod asymptote_rail_certify_tests {
         let mut obj = upper_tail_objective(6723.0, 1.0, 3000.0);
         let rho = array![29.9];
         let tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
-        let verdict =
-            build_and_assess_rail_coordinate(&mut obj, &rho, 0, AsymptoteSide::Upper, &tol)
-                .expect("probing must not error");
+        let verdict = build_and_assess_rail_coordinate(
+            &mut obj,
+            &rho,
+            0,
+            AsymptoteSide::Upper,
+            &tol,
+            (f64::NEG_INFINITY, f64::INFINITY),
+        )
+        .expect("probing must not error");
         assert!(
             verdict.is_err(),
             "a drifting ĉ must not certify a tail, got {verdict:?}",
+        );
+    }
+
+    /// #2388: the tail-probe ladder must never step the probed coordinate
+    /// outside its own box interval. Past a box bound the ρ-gradient assembly
+    /// reports the #197 frozen-axis projection — a literal `0.0` — so an
+    /// out-of-box probe fabricates a hard-zero tail row (`1.531e0 → 0.000e0` in
+    /// one e-fold in the #2388 evidence) that the drift band can never confirm,
+    /// and the fit refuses. The ladder must stop at the last strictly-in-domain
+    /// probe, and the in-domain rows alone must still confirm an exact tail.
+    #[test]
+    fn tail_probe_ladder_never_leaves_the_coordinate_box_2388() {
+        let c = 6723.0_f64;
+        // Deep enough that the in-domain ladder keeps a healthy-gradient run
+        // (probes at |g| below the interior floor are rightly judged unclean),
+        // shallow enough that the 18-probe ladder would cross it without the
+        // domain clip.
+        let box_lower = 12.0_f64;
+        let probed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+        let probed_in_eval = std::sync::Arc::clone(&probed);
+        let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
+        let mut obj = problem.build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| Ok((c * (-rho[0]).exp()).abs()),
+            move |_: &mut (), rho: &Array1<f64>| {
+                let r = rho[0];
+                probed_in_eval.lock().expect("probe log").push(r);
+                // Below the box the assembly's frozen-axis convention reports a
+                // fabricated zero gradient — exactly the #2388 evidence shape.
+                let grad = if r <= box_lower + 1.0e-8 {
+                    0.0
+                } else {
+                    -c * (-r).exp()
+                };
+                Ok(OuterEval {
+                    cost: (c * (-r).exp()).abs(),
+                    gradient: array![grad],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: Some(array![(-r).exp()]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let rho = array![29.9];
+        let tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
+        let rail = build_and_assess_rail_coordinate(
+            &mut obj,
+            &rho,
+            0,
+            AsymptoteSide::Upper,
+            &tol,
+            (box_lower, 30.0),
+        )
+        .expect("probing must not error")
+        .expect("the in-domain rows alone must certify the exact tail");
+        assert!(
+            (rail.tail_constant - c).abs() / c < 1.0e-6,
+            "recovered ĉ={} should equal c={c}",
+            rail.tail_constant,
+        );
+        let seen = probed.lock().expect("probe log").clone();
+        assert!(
+            !seen.is_empty() && seen.iter().all(|&r| r > box_lower),
+            "no probe may leave the λ-selection domain (lower bound {box_lower}): {seen:?}",
         );
     }
 
