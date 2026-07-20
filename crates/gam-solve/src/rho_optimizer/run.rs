@@ -3832,28 +3832,71 @@ pub(crate) fn run_outer(
         match certify_diagnose_and_install(obj, &mut result) {
             Ok(certificate) => break certificate,
             Err(refusal) => {
-                if !claimed_converged || resumes_remaining == 0 {
+                // #2357/#2155 — interior strict-saddle escape. When the refusal
+                // is a first-order-stationary point whose reduced (off-railed)
+                // Hessian is indefinite, the certificate publishes a
+                // negative-curvature reseed stepped strictly BELOW the saddle
+                // (`negative_curvature_escape_point`). Reseeding the resume at the
+                // refused checkpoint itself would re-descend straight back to that
+                // zero-gradient saddle — the #2273/#2374 stale-tolerance resume
+                // anchors the tolerance and breaks flat-valley stalls, but it
+                // cannot break a genuine saddle. Seed at the escape point instead,
+                // off the ridge, and start from a FRESH outer metric so the
+                // saddle's indefinite curvature is not transferred into the
+                // restart. This is the run_outer-level consumer of the reseed that
+                // the multistart-loop consumer (`run_outer_with_plan`) mints only
+                // when a per-seed claim is already stationary; the terminal
+                // certificate is where stationarity is reached for the binomial
+                // link-wiggle families, so without this the reseed was minted and
+                // then dropped.
+                let saddle_escape_reseed = result.saddle_escape_reseed.take();
+                let resume_from_saddle_escape = saddle_escape_reseed.is_some();
+                // A published reseed means the refused point IS first-order
+                // stationary (the escape mint gate requires `is_stationary`), so
+                // it is a genuine saddle escapable regardless of whether the
+                // solver "claimed" convergence: for exact-Hessian link-wiggle
+                // families the terminal certificate — not the in-loop gate — is
+                // where stationarity is first reached, so they arrive here with
+                // `converged == false` yet stationary. The #2273/#2374
+                // stale-tolerance resume, which reseeds AT the refused checkpoint,
+                // still requires a genuine convergence claim (a budget-exhausted
+                // non-stationary iterate has no desync to remove).
+                if (!claimed_converged && !resume_from_saddle_escape)
+                    || resumes_remaining == 0
+                {
                     return Err(refusal);
                 }
                 resumes_remaining -= 1;
                 let prior_iterations = result.iterations;
                 let prior_value = result.final_value;
                 log::info!(
-                    "[OUTER] {context}: solver convergence claim failed analytic \
-                     certification after {prior_iterations} iteration(s); re-running \
-                     seeded at the refused checkpoint (final_value={prior_value:.6e}) so the \
-                     in-loop tolerance anchors to the terminal cost scale and a fresh metric \
-                     breaks any inflated flat-valley stall ({resumes_remaining} resume(s) left \
-                     after this one; #2273/#2374)"
+                    "[OUTER] {context}: analytic certification refused after \
+                     {prior_iterations} iteration(s) (final_value={prior_value:.6e}); re-running \
+                     seeded {} so the in-loop tolerance anchors to the terminal cost scale \
+                     ({resumes_remaining} resume(s) left after this one; #2273/#2374/#2155)",
+                    if resume_from_saddle_escape {
+                        "off the negative-curvature saddle ridge"
+                    } else {
+                        "at the refused checkpoint"
+                    }
                 );
                 let mut retry_cfg = config.clone();
-                retry_cfg.initial_rho = Some(result.rho.clone());
+                retry_cfg.initial_rho =
+                    Some(saddle_escape_reseed.unwrap_or_else(|| result.rho.clone()));
                 retry_cfg.heuristic_lambdas = None;
                 retry_cfg.seed_config.max_seeds = 1;
                 retry_cfg.seed_config.seed_budget = 1;
                 retry_cfg.screen_initial_rho = false;
-                retry_cfg.operator_initial_trust_radius = result.operator_trust_radius;
-                retry_cfg.warm_start_outer_hessian = result.final_hessian.clone();
+                retry_cfg.operator_initial_trust_radius = if resume_from_saddle_escape {
+                    None
+                } else {
+                    result.operator_trust_radius
+                };
+                retry_cfg.warm_start_outer_hessian = if resume_from_saddle_escape {
+                    None
+                } else {
+                    result.final_hessian.clone()
+                };
                 obj.reset();
                 match run_outer_uncertified(obj, &retry_cfg, context) {
                     Ok(mut retried) => {
