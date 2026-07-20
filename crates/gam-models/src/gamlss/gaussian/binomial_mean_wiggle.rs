@@ -816,7 +816,27 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                 .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
             let row_ll =
                 binomial_location_scale_log_likelihood(yi, wi, q, &self.link_kind, jet.mu)?;
-            let (m1, m2, _) = binomial_neglog_q_derivatives_dispatch(
+            // The objective and its gradient stay EXACT: `row_ll` is the true
+            // NLL and `m1` its exact q-space score. The working *curvature*,
+            // however, is the EXPECTED Fisher information
+            //   f = w·(μ'(q))² / (μ(1−μ)) ≥ 0,
+            // NOT the observed second derivative
+            //   m2 = −(ℓ''(μ)·μ'² + ℓ'(μ)·μ'').
+            // For a non-canonical binomial link (cauchit / loglog / …) the
+            // observed `m2` can go NEGATIVE at a row whose fitted probability
+            // disagrees with its response — cauchit at q≈1.248 with y=0 gives
+            // m2=−0.23 — because the ℓ'·μ'' term is unbounded below there. That
+            // is a genuine property of the observed Hessian, not an
+            // unrepresentable row, so keying representability off `m2 > 0`
+            // wrongly refused every such link (gam#2155). Fisher scoring uses the
+            // expected information, which is ≥ 0 for every interior μ, so the
+            // per-block working weight `X'WX` is PSD by construction and the
+            // inner solve and the outer REML `log|X'WX + S|` term are
+            // well-defined for every binomial link. This mirrors the
+            // location-scale sibling's expected-information choice
+            // (gam#1020 / gam#2353); the fixed point (score = 0) is identical to
+            // the observed-Newton one, only the iteration geometry changes.
+            let (m1, _, _) = binomial_neglog_q_derivatives_dispatch(
                 yi,
                 wi,
                 q,
@@ -826,12 +846,14 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                 jet.d3,
                 &self.link_kind,
             );
-            for (quantity, value, positive) in [
+            let (fisher, _, _) =
+                binomial_expected_q_information_derivatives(wi, jet.mu, jet.d1, jet.d2, jet.d3);
+            for (quantity, value, nonnegative) in [
                 ("binomial mean-wiggle row log likelihood", row_ll, false),
                 ("binomial mean-wiggle q score", m1, false),
-                ("binomial mean-wiggle q curvature", m2, true),
+                ("binomial mean-wiggle expected q information", fisher, true),
             ] {
-                if !value.is_finite() || (positive && value <= 0.0) {
+                if !value.is_finite() || (nonnegative && value < 0.0) {
                     return Err(GamlssError::RowGeometryUnrepresentable {
                         row: i,
                         quantity,
@@ -841,10 +863,12 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                     .into());
                 }
             }
-            let (z_eta_i, w_eta_i) = if slope == 0.0 {
+            // η block working geometry — dead when the warp slope vanishes or the
+            // row carries no expected information (saturated μ).
+            let (z_eta_i, w_eta_i) = if slope == 0.0 || fisher == 0.0 {
                 (eta[i], 0.0)
             } else {
-                let weight = m2 * slope * slope;
+                let weight = fisher * slope * slope;
                 if !weight.is_finite() || weight <= 0.0 {
                     return Err(GamlssError::RowGeometryUnrepresentable {
                         row: i,
@@ -854,7 +878,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                     }
                     .into());
                 }
-                let response = eta[i] - m1 / (m2 * slope);
+                let response = eta[i] - m1 / (fisher * slope);
                 if !response.is_finite() {
                     return Err(GamlssError::RowGeometryUnrepresentable {
                         row: i,
@@ -866,17 +890,24 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                 }
                 (response, weight)
             };
-            let z_wiggle_i = etaw[i] - m1 / m2;
-            if !z_wiggle_i.is_finite() {
-                return Err(GamlssError::RowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "binomial mean-wiggle wiggle working response",
-                    eta: etaw[i],
-                    value: z_wiggle_i,
+            // wiggle block working geometry — dead when the row carries no
+            // expected information.
+            let (z_wiggle_i, w_wiggle_i) = if fisher == 0.0 {
+                (etaw[i], 0.0)
+            } else {
+                let z_wiggle_i = etaw[i] - m1 / fisher;
+                if !z_wiggle_i.is_finite() {
+                    return Err(GamlssError::RowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "binomial mean-wiggle wiggle working response",
+                        eta: etaw[i],
+                        value: z_wiggle_i,
+                    }
+                    .into());
                 }
-                .into());
-            }
-            rows.push((row_ll, z_eta_i, w_eta_i, z_wiggle_i, m2));
+                (z_wiggle_i, fisher)
+            };
+            rows.push((row_ll, z_eta_i, w_eta_i, z_wiggle_i, w_wiggle_i));
         }
 
         let mut ll = 0.0;
