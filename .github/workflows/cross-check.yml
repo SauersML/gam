@@ -1,0 +1,51 @@
+name: Non-Linux cross-check
+
+# #2377: every wheel platform except Linux was silently broken for three
+# releases because no CI job COMPILES a non-Linux target between releases —
+# `-D warnings` breaks in `cfg(target_os = "linux")` neighbourhoods (unused
+# imports/variables on the non-Linux side of the cfg) only surfaced inside the
+# release wheel matrix, whose failure skipped the upload while the run looked
+# green. This job cross-checks the workspace for a Windows target on every
+# push to main, so a non-Linux `-D warnings` break fails loudly the moment it
+# lands instead of at the next release.
+#
+# windows-gnu is deliberate: it exercises the not-linux side of every
+# `cfg(target_os = "linux")` split with a toolchain that cross-installs on the
+# ubuntu runner in seconds. `cargo check` needs no linker for rlib targets, so
+# mingw is only needed for build scripts — installed anyway for safety.
+# gam-pyffi is excluded ONLY because checking pyo3 for a foreign target needs a
+# cross Python interpreter config; the release wheel matrix (which builds
+# pyffi natively per-OS) keeps covering it, and every `cfg(target_os)`
+# neighbourhood that broke historically lives in the engine crates this job
+# does cover.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: cross-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-gnu-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mingw + Windows target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+          rustup target add x86_64-pc-windows-gnu
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cross-check workspace (deny warnings)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+          RUSTFLAGS: "-D warnings"
+          CARGO_INCREMENTAL: "0"
+        run: |
+          cargo check --workspace --exclude gam-pyffi --all-targets --target x86_64-pc-windows-gnu
