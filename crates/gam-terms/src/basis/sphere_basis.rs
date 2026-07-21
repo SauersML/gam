@@ -2452,10 +2452,10 @@ pub(crate) fn fill_periodic_duchon_kernel_psi_matrices(
     length_scale: f64,
     p_order: usize,
     s_order: usize,
-    coeffs: &DuchonPartialFractionCoeffs,
 ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), BasisError> {
     let n = rows.nrows();
     let k = centers.nrows();
+    let kappa = 1.0 / length_scale.max(1e-300);
     let mut kernel = Array2::<f64>::zeros((n, k));
     let mut kernel_psi = Array2::<f64>::zeros((n, k));
     let mut kernel_psi_psi = Array2::<f64>::zeros((n, k));
@@ -2463,11 +2463,15 @@ pub(crate) fn fill_periodic_duchon_kernel_psi_matrices(
         let x = wrap_to_period(rows[[i, 0]], left, period);
         for j in 0..k {
             let r = periodic_distance_1d(x, centers[[j, 0]], period);
-            let core =
-                duchon_radial_core_psi_triplet(r, length_scale, p_order, s_order, 1, coeffs)?;
-            kernel[[i, j]] = core.phi.value;
-            kernel_psi[[i, j]] = core.phi.psi;
-            kernel_psi_psi[[i, j]] = core.phi.psi_psi;
+            // Log-κ jet of the SAME exact circular periodization the forward
+            // periodic Duchon design uses (gam#2372): the ψ-derivatives of the
+            // wrapped-distance line kernel are not the derivatives of the true
+            // (PSD) periodic kernel, so the derivative path must periodize too.
+            let (value, psi, psi_psi) =
+                periodic_hybrid_duchon_kernel_psi_triplet(r, kappa, p_order, s_order, period)?;
+            kernel[[i, j]] = value;
+            kernel_psi[[i, j]] = psi;
+            kernel_psi_psi[[i, j]] = psi_psi;
         }
     }
     Ok((kernel, kernel_psi, kernel_psi_psi))
@@ -2541,7 +2545,6 @@ pub(crate) fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
             length_scale,
             p_order,
             s_order,
-            &coeffs,
         )?;
     let kernel_amp = duchon_kernel_amplification(
         centers.view(),
@@ -2581,7 +2584,6 @@ pub(crate) fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
             length_scale,
             p_order,
             s_order,
-            &coeffs,
         )?;
     let omega = kernel_gauge.restrict_penalty(&center_kernel);
     let omega_psi = kernel_gauge.restrict_penalty(&center_kernel_psi);
