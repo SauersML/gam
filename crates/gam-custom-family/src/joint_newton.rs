@@ -4543,6 +4543,45 @@ pub(crate) fn constrained_stationary_certificate_decision(
     }
 }
 
+/// gam#2358: a CONSTRAINED joint-Newton iterate is at a numerical fixed point of
+/// the penalized objective when no representable step can decrease that objective
+/// — `|Δobjective|` has reached its machine-eps floor with an exact local
+/// quadratic model — and the accepted step is small at the scale-aware
+/// stationarity tolerance `step_tol`.
+///
+/// The accepted step is deliberately NOT required to reach its OWN machine-eps
+/// floor (`64·eps·|β|`). On a flat / gauge-drift constrained surface — the
+/// coupled mean/log-σ/monotone-wiggle location-scale seed is the canonical case —
+/// the accepted joint-Newton step floors a HAIR above `64·eps·|β|` every cycle
+/// (objective-flat gauge drift accumulating extra rounding through the active-set
+/// QP + backtracking line search), so an eps-step gate never latches even though
+/// the OBJECTIVE is already at its eps floor and the iterate is a genuine
+/// constrained KKT point. Once no representable step lowers the objective, the
+/// accepted step's magnitude is irrelevant to convergence, so gate on the
+/// objective floor and require the step merely `≤ step_tol`. This mirrors the
+/// unconstrained model-stationary certificate, which already gates on `step_tol`
+/// rather than the eps floor for exactly this reason.
+///
+/// Safety (why this cannot certify a non-converged iterate): a still-DESCENDING
+/// iterate has `|Δobjective| > objective_floor` and fails immediately; a
+/// non-exact local model (`scalar_model_relerr > 1e-3`) fails; and the caller
+/// additionally requires `hpen_nullity == 0` (H_pen full rank ⇒ the residual is a
+/// genuine active-constraint multiplier, not an H-null defect) and
+/// `linearized_rel ≥ 0.5` (the feasible Newton step leaves the residual, so it is
+/// constraint-normal multiplier mass, not resolvable descent) before accepting.
+pub(crate) fn constrained_numerical_fixed_point_reached(
+    objective_change: f64,
+    objective_floor: f64,
+    scalar_model_relerr: f64,
+    accepted_step_inf: f64,
+    step_tol: f64,
+) -> bool {
+    objective_change <= objective_floor
+        && scalar_model_relerr <= 1e-3
+        && accepted_step_inf.is_finite()
+        && accepted_step_inf <= step_tol
+}
+
 /// True iff the recent KKT-residual tail (`history`, oldest→newest) shows STEADY
 /// geometric descent: every consecutive pair strictly decreased by at least the
 /// factor `(1 - min_drop)` over the whole window.
@@ -4649,5 +4688,105 @@ mod penalized_hessian_rank_tests {
             "the diagonal witness has no step on the zero-RHS strong modes; delta={:?}",
             step.delta,
         );
+    }
+}
+
+#[cfg(test)]
+mod constrained_numerical_fixed_point_tests {
+    use super::constrained_numerical_fixed_point_reached;
+
+    // Reproduces the gam#2358 gaussian/binomial location-scale monotone-wiggle
+    // seed numerics: the OBJECTIVE has reached its machine-eps floor with an exact
+    // local quadratic model, but the accepted step floors a HAIR above its own
+    // eps floor `64·eps·|β|` (gauge drift through the active-set QP + line search)
+    // — well below the scale-aware `step_tol`. The fixed-point predicate MUST fire
+    // (the old code additionally demanded `accepted_step_inf ≤ 64·eps·|β|`, which
+    // this iterate never reaches, so a genuine constrained KKT point was refused
+    // and the fit aborted at the seed).
+    #[test]
+    fn accepts_objective_eps_floor_with_gauge_drift_step_above_eps_step_floor_2358() {
+        // Measured on the failing gaussian reference-flow seed.
+        let objective_change = 1.421e-13;
+        let objective_floor = 1.10e-12; // 64*eps*(1+|obj|), |obj| ~ 76.5
+        let scalar_model_relerr = 9.425e-13;
+        let accepted_step_inf = 7.994e-14; // 1.69x the eps step floor 4.73e-14 ...
+        let step_tol = 4.328e-11; // ... but 540x BELOW step_tol
+        assert!(
+            constrained_numerical_fixed_point_reached(
+                objective_change,
+                objective_floor,
+                scalar_model_relerr,
+                accepted_step_inf,
+                step_tol,
+            ),
+            "a constrained KKT point whose objective is at its machine-eps floor must be \
+             recognised as a numerical fixed point even though the accepted step floors a \
+             hair above 64*eps*|β| (gauge drift), so long as it is <= step_tol"
+        );
+    }
+
+    // The strict machine-eps step floor is a SUBSET: an iterate at both floors is
+    // (still) a fixed point.
+    #[test]
+    fn accepts_when_step_also_at_eps_floor() {
+        assert!(constrained_numerical_fixed_point_reached(
+            1e-14, 1e-12, 1e-10, 4.0e-14, 4.3e-11,
+        ));
+    }
+
+    // A still-DESCENDING iterate — |Δobjective| ABOVE the machine-eps objective
+    // floor — must NOT be certified, however tiny its accepted step. This is the
+    // guard that keeps a genuinely non-converged solve from being accepted early.
+    #[test]
+    fn rejects_when_objective_still_descending_above_eps_floor() {
+        let objective_floor = 1.10e-12;
+        // |Δobjective| = 3.7e-1 (a big descent step, the early cycles of the seed
+        // solve): far above the eps objective floor ⇒ NOT a fixed point.
+        assert!(!constrained_numerical_fixed_point_reached(
+            3.7e-1,
+            objective_floor,
+            1e-12,
+            8e-14,
+            4.3e-11,
+        ));
+        // Even a near-eps but strictly-above descent still fails.
+        assert!(!constrained_numerical_fixed_point_reached(
+            2.0e-12,
+            objective_floor,
+            1e-12,
+            8e-14,
+            4.3e-11,
+        ));
+    }
+
+    // A large accepted step (still moving meaningfully, above step_tol) is not a
+    // fixed point regardless of a transiently-flat objective.
+    #[test]
+    fn rejects_when_accepted_step_exceeds_step_tol() {
+        assert!(!constrained_numerical_fixed_point_reached(
+            1e-13, 1.10e-12, 1e-12, 1e-6, 4.3e-11,
+        ));
+    }
+
+    // An inexact local quadratic model (scalar_model_relerr above 1e-3) means the
+    // Hessian/gradient are not trustworthy at this β, so "objective flat" is not a
+    // reliable fixed-point signal.
+    #[test]
+    fn rejects_when_local_model_is_inexact() {
+        assert!(!constrained_numerical_fixed_point_reached(
+            1e-13, 1.10e-12, 1e-2, 8e-14, 4.3e-11,
+        ));
+    }
+
+    // A non-finite accepted step (diverged) is never a fixed point.
+    #[test]
+    fn rejects_non_finite_step() {
+        assert!(!constrained_numerical_fixed_point_reached(
+            1e-13,
+            1.10e-12,
+            1e-12,
+            f64::INFINITY,
+            4.3e-11,
+        ));
     }
 }

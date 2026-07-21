@@ -5573,11 +5573,48 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         .max(1.0);
                     let fixed_point_floor = 64.0 * f64::EPSILON * beta_scale;
                     let objective_floor = 64.0 * f64::EPSILON * (1.0 + lastobjective.abs());
-                    let at_numerical_fixed_point = accepted_step_inf.is_finite()
-                        && accepted_step_inf <= fixed_point_floor
-                        && objective_change <= objective_floor
-                        && scalar_model_relerr <= 1e-3;
-                    if any_block_constrained && at_numerical_fixed_point {
+                    // `step_at_eps_floor` records whether the accepted step also reached
+                    // its OWN machine-eps floor, used only to label the log line with
+                    // which stationarity witness fired (strict eps step vs the gam#2358
+                    // objective-eps / gauge-drift-step path below).
+                    let step_at_eps_floor =
+                        accepted_step_inf.is_finite() && accepted_step_inf <= fixed_point_floor;
+                    // gam#2358: the constrained fixed-point certificate must not
+                    // additionally require the accepted STEP to reach its own machine-eps
+                    // floor `64·eps·|β|`. On a FLAT / gauge-drift constrained surface (the
+                    // coupled mean/log-σ/wiggle location-scale seed: `y ~ x`, noise `1`,
+                    // degree-3 monotone link wiggle) the joint Newton reaches a genuine
+                    // constrained KKT point — 4 active I-spline `γ≥0` rows, H_pen full
+                    // rank (nullity 0), the residual (≈10) a real active-constraint
+                    // Lagrange multiplier — with the OBJECTIVE already at its eps floor
+                    // (|Δobj|=1.4e-13 ≤ objective_floor=1.1e-12) and an exact model, but
+                    // the accepted step floors a HAIR above `64·eps·|β|` (7.99e-14 vs
+                    // 4.73e-14, ×1.69) EVERY cycle and `step_at_eps_floor` never latches,
+                    // so the iterate is refused as a phantom multiplier — fatally at the
+                    // seed. The step floors above `64·eps·|β|` precisely because it is
+                    // objective-flat gauge drift through the active-set QP + line search
+                    // (extra rounding beyond a single β update); it is irrelevant to
+                    // convergence once the objective is at its eps floor. Gate on
+                    // `objective_at_numerical_floor` and require the accepted step merely
+                    // small (`≤ step_tol`, the scale-aware stationarity gate the candidate
+                    // conditions above already established), NOT at its eps floor. This is
+                    // the exact treatment the UNCONSTRAINED model-stationary certificate
+                    // below already applies. Safety is unchanged: a still-DESCENDING
+                    // iterate has `|Δobj| > objective_floor` (fails the eps objective
+                    // floor) and never reaches here; an H-null/rank-deficient defect fails
+                    // the `hpen_nullity == 0` gate below (deferred to the range-space
+                    // certificate); and `linearized_rel ≥ 0.5` (candidacy) proves the
+                    // residual is constraint-normal multiplier mass, not resolvable
+                    // descent — so nothing genuinely non-converged is certified.
+                    let constrained_numerical_fixed_point =
+                        crate::joint_newton::constrained_numerical_fixed_point_reached(
+                            objective_change,
+                            objective_floor,
+                            scalar_model_relerr,
+                            accepted_step_inf,
+                            step_tol,
+                        );
+                    if any_block_constrained && constrained_numerical_fixed_point {
                         // Materialize H_pen = H + S(λ) (+ model ridge) and count its
                         // numerical null space at the shared rank tolerance: nullity == 0
                         // ⇒ the stuck residual is NOT an H-null/rank-deficient defect
@@ -5609,12 +5646,23 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         .unwrap_or(None);
                         if hpen_nullity == Some(0) {
                             log::info!(
-                                "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained fixed-point certificate:                                  accepted_step_inf={:.3e} ≤ {:.3e} and |Δobjective|={:.3e} ≤ {:.3e} (numerical fixed point),                                  scalar_relerr={:.3e}, linearized_rel={:.3e}; H_pen has no numerical null space so the                                  residual={:.3e} is an active-constraint Lagrange multiplier (the QP under-identified the                                  binding rows), projected out of the KKT residual by the active-constraint-aware IFT                                  correction before the envelope gradient — the iterate is a constrained KKT point",
+                                "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained fixed-point certificate ({}): \
+                                 |Δobjective|={:.3e} ≤ objective_floor={:.3e} (objective at machine-eps floor), accepted_step_inf={:.3e} (eps_floor={:.3e}, step_tol={:.3e}), \
+                                 scalar_relerr={:.3e}, linearized_rel={:.3e}; H_pen has no numerical null space so the \
+                                 residual={:.3e} is an active-constraint Lagrange multiplier (the QP under-identified the \
+                                 binding rows), projected out of the KKT residual by the active-constraint-aware IFT \
+                                 correction before the envelope gradient — the iterate is a constrained KKT point",
                                 cycle,
-                                accepted_step_inf,
-                                fixed_point_floor,
+                                if step_at_eps_floor {
+                                    "machine-eps step + objective fixed point"
+                                } else {
+                                    "objective-eps fixed point, gauge-drift step (gam#2358)"
+                                },
                                 objective_change,
                                 objective_floor,
+                                accepted_step_inf,
+                                fixed_point_floor,
+                                step_tol,
                                 scalar_model_relerr,
                                 linearized_rel,
                                 residual,
