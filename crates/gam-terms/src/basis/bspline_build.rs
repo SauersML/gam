@@ -2185,11 +2185,15 @@ fn restrict_penalty_candidates(
 /// chart.
 ///
 /// The rebuild is METRIC-CONSISTENT (`rebuild_metric_consistent_ridge`): the
-/// raw ridge is the function-space block `G Z (ZᵀGZ)⁻¹ ZᵀG` (penalizing
-/// `∫(null component of f)²`, SPEC rule 5), and its congruence transform still
-/// acts as the constrained-chart Gram on `null(S_c)`, so the rebuilt block is
-/// the constrained-chart function-space ridge — not a coefficient-space
-/// projector that would change under basis rescaling. The rebuilt ridge's
+/// raw ridge `G Z (ZᵀGZ)⁻¹ ZᵀG` carries the function metric's action on the null
+/// space through the congruence (`R_c v = G_c v` for `v ∈ null(S_c)`), and the
+/// rebuilt block is the constrained-chart COMPLEMENTARY metric ridge
+/// `N (Nᵀ G_c N) Nᵀ` (`N = null(S_c)`): its range is exactly `null(S_c)`, so
+/// `S_c · R = 0` (a second REML coordinate that shrinks ONLY the null space,
+/// #2372), while it still charges each null direction its function `L²` energy
+/// (SPEC rule 5) — unlike a raw coefficient-space projector, which would change
+/// under basis rescaling, or the raw projector `G_c N (Nᵀ G_c N)⁻¹ Nᵀ G_c`, whose
+/// range `span(G_c N)` leaks into `range(S_c)` and re-penalizes curvature. The rebuilt ridge's
 /// `normalization_scale` is reset to `1.0`; the subsequent
 /// `renormalize_constrained_penalty_candidates` pass folds in its unit-Frobenius
 /// scale just as for every other constrained block.
@@ -2650,6 +2654,7 @@ fn constructive_ridge_from_null_metric_action(
     w: &Array2<f64>,
     context: &str,
 ) -> Result<ConstructiveQuadratic, BasisError> {
+    // `M = NᵀW = Nᵀ G_c N` is the function metric restricted to `null(S_c)`.
     let c_raw = n.t().dot(w);
     let (c_sym, evals, evecs) = spectral_summary(&c_raw)?;
     let tol = generalized_spectral_tolerance(&evals, &c_sym);
@@ -2658,12 +2663,21 @@ fn constructive_ridge_from_null_metric_action(
             "{context}: null-function metric is not strictly positive definite; eigenvalue {invalid:.6e} is at or below tolerance {tol:.6e}"
         );
     }
-    let mut metric_columns = w.dot(&evecs);
+    // The double-penalty ridge is `R = N M Nᵀ`, NOT the metric projector
+    // `W M⁻¹ Wᵀ = G_c N (Nᵀ G_c N)⁻¹ Nᵀ G_c`. Both weight the null directions by the
+    // function metric `M`, but `R`'s range is `span(N) = null(S_c)` (so `S_c·R = 0`
+    // exactly — spectral complementarity: the ridge shrinks ONLY the primary's null
+    // space and never re-penalizes curvature), whereas the projector's range is
+    // `span(G_c N) ⊄ null(S_c)`, which leaks into `range(S_c)` and couples the two
+    // REML coordinates (#2372: the projector gave `‖S_c·R‖_F ≈ 0.05–0.15`). With
+    // `M = V Λ Vᵀ`, `R = (N V Λ^{1/2})(N V Λ^{1/2})ᵀ`, so the energy factor columns
+    // are `N V Λ^{1/2}`.
+    let mut metric_columns = n.dot(&evecs);
     for (mut column, &eigenvalue) in metric_columns
         .axis_iter_mut(Axis(1))
         .zip(evals.iter())
     {
-        column /= eigenvalue.sqrt();
+        column *= eigenvalue.sqrt();
     }
     ConstructiveQuadratic::from_energy_factor(metric_columns.t().to_owned(), context)
 }
@@ -2878,11 +2892,18 @@ pub fn function_space_nullspace_shrinkage(
 /// `null(S)`) and any injective transform `M` applied as the congruences
 /// `S_c = MᵀSM`, `R_c = MᵀRM`, the identity `R_c v = (MᵀGM) v` holds for every
 /// `v ∈ null(S_c)`: `Mv ∈ null(S)` (PSD `S`), and the G-orthogonal projector
-/// underlying `R` fixes null vectors. So the correct constrained-chart ridge
-/// `G_c N (NᵀG_cN)⁻¹ NᵀG_c` is computable from `(S_c, R_c)` alone — no Gram
-/// needs to travel with the candidate:
+/// underlying `R` fixes null vectors. So the constrained-chart null-function
+/// metric `M = Nᵀ G_c N` is computable from `(S_c, R_c)` alone — no Gram needs to
+/// travel with the candidate:
 ///
-///   `N = null(S_c)`,  `W = R_c N (= G_c N)`,  `ridge = W (NᵀW)⁻¹ Wᵀ`.
+///   `N = null(S_c)`,  `W = R_c N (= G_c N)`,  `ridge = N (NᵀW) Nᵀ`.
+///
+/// The ridge is `N M Nᵀ` (`M = Nᵀ G_c N`), NOT the metric projector
+/// `W (NᵀW)⁻¹ Wᵀ = G_c N (Nᵀ G_c N)⁻¹ Nᵀ G_c`: both weight the null directions by
+/// `M`, but only `N M Nᵀ` keeps `range(ridge) = null(S_c)`, so `S_c·ridge = 0`
+/// exactly (spectral complementarity — the ridge is a second REML coordinate that
+/// shrinks ONLY the primary's null space, never re-penalizing curvature). The
+/// projector's range `span(G_c N)` leaks into `range(S_c)` (#2372).
 ///
 /// The structural null space is revealed from the authoritative energy factor
 /// `A_c` (`S_c=A_cᵀA_c`) with rank-revealing QR, rather than recovered from
@@ -3470,10 +3491,36 @@ mod function_space_null_shrinkage_tests {
         let rebuilt = rebuild_metric_consistent_ridge(&restricted_primary, &restricted_ridge)
             .expect("metric rebuild")
             .expect("surviving null direction");
-        let direct = function_space_nullspace_shrinkage(&penalty_t, &gram_t)
-            .expect("direct constrained ridge")
+
+        // #2372: the rebuilt ridge is the constrained-chart COMPLEMENTARY metric
+        // ridge `N M Nᵀ` (`M = Nᵀ G_c N`), NOT the metric projector
+        // `G_c N (Nᵀ G_c N)⁻¹ Nᵀ G_c` that `function_space_nullspace_shrinkage`
+        // produces raw (whose range `span(G_c N)` leaks into `range(S_c)`). It must
+        // satisfy the two defining invariants of a double-penalty null-space ridge:
+        //   (1) spectral complementarity `S_c · R = 0` — the ridge is a SEPARATE
+        //       REML coordinate that shrinks ONLY the primary's null space and never
+        //       re-penalizes curvature; and
+        //   (2) metric consistency `vᵀ R v = vᵀ G_c v` for every `v ∈ null(S_c)` —
+        //       it still charges each null direction its exact function `L²` energy.
+        let sc_r = penalty_t.dot(rebuilt.dense());
+        let sc_r_norm = sc_r.iter().map(|value| value * value).sum::<f64>().sqrt();
+        assert!(
+            sc_r_norm < 1.0e-9,
+            "rebuilt ridge must be spectrally complementary to S_c; got ‖S_c·R‖_F = {sc_r_norm:e}"
+        );
+        let null_basis = generalized_nullspace_basis(&penalty_t, &gram_t, "test constrained null")
+            .expect("generalized null solve")
             .expect("surviving null direction");
-        assert!(max_abs_difference(rebuilt.dense(), &direct) < 2.0e-10);
+        for column in null_basis.columns() {
+            let v = column.to_owned();
+            let ridge_energy = v.dot(&rebuilt.dense().dot(&v));
+            let metric_energy = v.dot(&gram_t.dot(&v));
+            assert!(
+                (ridge_energy - metric_energy).abs() < 1.0e-10 * (1.0 + metric_energy.abs()),
+                "on null(S_c) the ridge must charge the function-metric energy; \
+                 got ridge={ridge_energy:e} vs metric={metric_energy:e}"
+            );
+        }
     }
 
     #[test]
