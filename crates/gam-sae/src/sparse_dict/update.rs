@@ -856,6 +856,16 @@ fn hutchinson_gram_edof(
         }
         let result = cg_solve(&matvec, &z, residual_tolerance, cap);
         if result.stop != CgStop::Converged {
+            // The Lanczos condition estimate is the diagnostic that explains a
+            // stalled Hutchinson probe (failure path only — never logged on
+            // the converged hot path).
+            log::warn!(
+                "sparse-dict Hutchinson trace probe {probe} CG non-convergence: \
+                 kappa_hat={:?} iterations={} residual={:.3e}",
+                result.kappa_hat,
+                result.iterations,
+                result.relative_residual,
+            );
             return Err(SparseDictionaryError::TraceNonConvergence {
                 rho,
                 probe,
