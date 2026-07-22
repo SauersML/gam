@@ -7007,14 +7007,35 @@ impl<'a> RemlState<'a> {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
             )
         {
-            let phi = resolved_likelihood_scale
-                .tweedie_phi()
-                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            // #2363 (the #2361 class, Tweedie instance): estimate φ at this
+            // solve's CONVERGED η, not at whatever value the inner solve
+            // happened to leave on the resolved scale. The resolved value was
+            // measured at the warm-start seed η, so it is warm-cache
+            // path-dependent: a cold machine freezes the φ of a half-converged
+            // mean (measured on the #2363 fixture: cold froze φ≈2.26 vs the
+            // converged-η value) and the entire outer criterion inherits the
+            // mis-specified dispersion. One O(n) Pearson evaluation at an η
+            // the solve already produced — still captured once and held fixed
+            // for every subsequent ρ, exactly as #1477 requires.
+            let p = match reml_spec(&self.config.likelihood).response {
+                ResponseFamily::Tweedie { p } => p,
+                other => {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "tweedie λ-search freeze reached with non-Tweedie response {other:?}"
+                    )));
+                }
+            };
+            let phi = pirls::estimate_tweedie_phi_from_eta(
+                self.y,
+                &pirls_result.final_eta.to_owned(),
+                self.weights,
+                p,
+            )?;
             self.frozen_tweedie_phi
                 .store(phi.to_bits(), Ordering::Relaxed);
             log::info!(
-                "[OUTER] tweedie λ-search φ frozen at {phi:.6e} (#1477); \
-                 outer LAML criterion now stationary in ρ"
+                "[OUTER] tweedie λ-search φ frozen at {phi:.6e} (#1477/#2363, \
+                 measured at the converged η); outer LAML criterion now stationary in ρ"
             );
         }
         // Capture the data-driven Gamma shape `k = 1/φ` from the first converged
