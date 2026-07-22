@@ -1239,6 +1239,16 @@ impl SaeManifoldTerm {
             }
             _ => (0.0, 0.0),
         };
+        // #2330 — ordered-Beta--Bernoulli gate flag + inverse temperature for the
+        // OBB gate-logit factor below (the softmax factor is inert for OBB).
+        let patchd_is_obb = matches!(
+            self.assignment.mode,
+            AssignmentMode::OrderedBetaBernoulli { .. }
+        );
+        let patchd_obb_inv_tau = match self.assignment.mode {
+            AssignmentMode::OrderedBetaBernoulli { temperature, .. } => 1.0 / temperature,
+            _ => 0.0,
+        };
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
@@ -1312,9 +1322,26 @@ impl SaeManifoldTerm {
                                     SaeLocalRowVar::Coord { atom: atom_b, .. },
                                 ) => {
                                     sae_dot(jets.first(a), jets.first(b))
-                                        * Self::softmax_data_weight_product_logit_factor(
+                                        * (Self::softmax_data_weight_product_logit_factor(
                                             a_soft, atom_a, atom_b, atom_w, inv_tau,
-                                        )
+                                        ) + if patchd_is_obb
+                                            && atom_w == atom_a
+                                            && atom_w == atom_b
+                                        {
+                                            // #2330 — ordered-Beta--Bernoulli gate
+                                            // gradient of the GN curvature. `B[a,b] ∝
+                                            // gate^2`, so `∂B/∂ℓ_w = 2·(gate'/gate)·B =
+                                            // 2(1-gate)/τ·B`. Same-atom only: the OBB
+                                            // gates are INDEPENDENT per atom, so the
+                                            // cross-atom derivative is exactly zero
+                                            // (unlike softmax's shared normalization).
+                                            // The softmax factor above is 0 here
+                                            // (`inv_tau` is 0 for non-softmax modes), so
+                                            // the softmax path is bitwise unchanged.
+                                            2.0 * (1.0 - a_soft[atom_w]) * patchd_obb_inv_tau
+                                        } else {
+                                            0.0
+                                        })
                                 }
                                 _ => {
                                     sae_dot(jets.second(a, w), jets.first(b))
