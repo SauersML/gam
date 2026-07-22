@@ -5229,6 +5229,146 @@ mod patterned_order2_perf_tests {
             hand_fused_ns / compiled_ns,
         );
     }
+
+    /// #932 release speed gate for the SLS contracted third/fourth towers: the
+    /// specialized directional seedings production consumes (`OneSeed<9>` for
+    /// `contracted_third`, `TwoSeed<9>` for `contracted_fourth`, both through
+    /// the single-source [`sls_row_nll`]) must beat the generic dense tower
+    /// instantiations of the SAME expression (`Tower3<9>` / `Tower4<9>` plus
+    /// dense contraction — the former generic-jet oracle path production never
+    /// materializes). No hand-derived third/fourth tower ever existed for this
+    /// family, so — as in the multinomial / cause-specific / rigid-contracted
+    /// release cells — the honest fail-closed baseline is the generic AD
+    /// tower, and the emitted `hand_over_production` token carries
+    /// `generic_tower_ns / production_ns` for the MSI release harness to fail
+    /// closed on any cell `<= 1`.
+    #[test]
+    fn release_measure_sls_contracted_towers_vs_generic_tower_932() {
+        use gam_math::jet_scalar::{OneSeed, TwoSeed};
+        use gam_math::jet_tower::{Tower3, Tower4};
+        use std::time::Instant;
+
+        let (p, kernel) = fixture();
+        let dir_u: [f64; SLS_ROW_K] = [0.7, -1.3, 0.4, 0.6, -0.5, 0.9, -0.2, 0.3, -0.8];
+        let dir_v: [f64; SLS_ROW_K] = [-0.4, 0.6, 1.1, -0.2, 0.8, -0.7, 0.5, -0.9, 0.1];
+
+        // Parity pins on the exact benchmarked inputs: the specialized
+        // contractions must equal the dense towers' contractions.
+        let one_vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| OneSeed::seed_direction(p[a], a, dir_u[a]));
+        let third = sls_row_nll(&one_vars, &kernel)
+            .expect("specialized third")
+            .contracted_third();
+        let two_vars: [TwoSeed<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| TwoSeed::seed(p[a], a, dir_u[a], dir_v[a]));
+        let fourth = sls_row_nll(&two_vars, &kernel)
+            .expect("specialized fourth")
+            .contracted_fourth();
+        let t3_vars: [Tower3<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| Tower3::variable(p[a], a));
+        let dense3 = sls_row_nll(&t3_vars, &kernel).expect("dense Tower3");
+        let t4_vars: [Tower4<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| Tower4::variable(p[a], a));
+        let dense4 = sls_row_nll(&t4_vars, &kernel).expect("dense Tower4");
+        let dense_fourth = dense4.fourth_contracted(&dir_u, &dir_v);
+        for a in 0..SLS_ROW_K {
+            for b in 0..SLS_ROW_K {
+                let mut dense_third_ab = 0.0;
+                for c in 0..SLS_ROW_K {
+                    dense_third_ab += dense3.t3[a][b][c] * dir_u[c];
+                }
+                let band = 1e-11 * third[a][b].abs().max(dense_third_ab.abs()).max(1.0);
+                assert!(
+                    (third[a][b] - dense_third_ab).abs() <= band,
+                    "third[{a}][{b}]: specialized {:+.15e} vs dense {dense_third_ab:+.15e}",
+                    third[a][b],
+                );
+                let band = 1e-11 * fourth[a][b].abs().max(dense_fourth[a][b].abs()).max(1.0);
+                assert!(
+                    (fourth[a][b] - dense_fourth[a][b]).abs() <= band,
+                    "fourth[{a}][{b}]: specialized {:+.15e} vs dense {:+.15e}",
+                    fourth[a][b],
+                    dense_fourth[a][b],
+                );
+            }
+        }
+
+        // Feedback-coupled timing barrier (no `std::hint::black_box`), same
+        // recurrence as the compiled-vs-hand gate above.
+        fn best_ns<F: FnMut(f64) -> f64>(iterations: usize, base: f64, mut evaluate: F) -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let mut checksum = 0.0_f64;
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    checksum += evaluate(base + checksum * 1e-18);
+                }
+                assert!(
+                    checksum.is_finite(),
+                    "SLS contracted release-measure checksum must stay finite"
+                );
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            best * 1e9 / iterations as f64
+        }
+
+        let iterations = 100_000usize;
+        let third_production_ns = best_ns(iterations, p[0], |p0| {
+            let mut perturbed = p;
+            perturbed[0] = p0;
+            let vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] =
+                std::array::from_fn(|a| OneSeed::seed_direction(perturbed[a], a, dir_u[a]));
+            let t = sls_row_nll(&vars, &kernel)
+                .expect("specialized third")
+                .contracted_third();
+            t[0][0] + t[8][8]
+        });
+        let third_generic_ns = best_ns(iterations, p[0], |p0| {
+            let mut perturbed = p;
+            perturbed[0] = p0;
+            let vars: [Tower3<SLS_ROW_K>; SLS_ROW_K] =
+                std::array::from_fn(|a| Tower3::variable(perturbed[a], a));
+            let dense = sls_row_nll(&vars, &kernel).expect("dense Tower3");
+            let mut t00 = 0.0;
+            let mut t88 = 0.0;
+            for c in 0..SLS_ROW_K {
+                t00 += dense.t3[0][0][c] * dir_u[c];
+                t88 += dense.t3[8][8][c] * dir_u[c];
+            }
+            t00 + t88
+        });
+        eprintln!(
+            "SLS-CONTRACTED-932 order=3 production={third_production_ns:.2} ns/row \
+             generic_tower={third_generic_ns:.2} ns/row hand_over_production={:.6}",
+            third_generic_ns / third_production_ns,
+        );
+
+        let fourth_production_ns = best_ns(iterations, p[0], |p0| {
+            let mut perturbed = p;
+            perturbed[0] = p0;
+            let vars: [TwoSeed<SLS_ROW_K>; SLS_ROW_K] =
+                std::array::from_fn(|a| TwoSeed::seed(perturbed[a], a, dir_u[a], dir_v[a]));
+            let t = sls_row_nll(&vars, &kernel)
+                .expect("specialized fourth")
+                .contracted_fourth();
+            t[0][0] + t[8][8]
+        });
+        let fourth_generic_ns = best_ns(iterations, p[0], |p0| {
+            let mut perturbed = p;
+            perturbed[0] = p0;
+            let vars: [Tower4<SLS_ROW_K>; SLS_ROW_K] =
+                std::array::from_fn(|a| Tower4::variable(perturbed[a], a));
+            let t = sls_row_nll(&vars, &kernel)
+                .expect("dense Tower4")
+                .fourth_contracted(&dir_u, &dir_v);
+            t[0][0] + t[8][8]
+        });
+        eprintln!(
+            "SLS-CONTRACTED-932 order=4 production={fourth_production_ns:.2} ns/row \
+             generic_tower={fourth_generic_ns:.2} ns/row hand_over_production={:.6}",
+            fourth_generic_ns / fourth_production_ns,
+        );
+    }
 }
 
 #[cfg(test)]
