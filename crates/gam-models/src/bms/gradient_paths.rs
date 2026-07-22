@@ -2895,11 +2895,87 @@ mod jet_tower_oracle_tests {
         }
     }
 
-    // NOTE: the hand-vs-jet timing microbench (`bench_rigid_vgh_jet_vs_hand`)
-    // was removed — `#[ignore]`d timing benches are banned by `build.rs`, and
-    // the kernel's *correctness* against the hand chain is already pinned by the
-    // non-ignored `rigid_bernoulli_row_kernel_matches_hand_chain_witness` above.
-    // Timing belongs in `bench/`, not in a `#[test]`.
+    /// #932 release speed gate for the rigid Bernoulli row: the shipped jet
+    /// value/grad/Hessian kernel must beat the original hand chain it replaced
+    /// (reconstructed verbatim above as [`hand_rigid_vgh`]). One measured cell
+    /// per outcome branch; emits the harness-parsed `hand_over_production`
+    /// token that the MSI release harness fails closed on whenever any cell is
+    /// `<= 1`. (This supersedes the removed `#[ignore]`d microbench — release
+    /// gates are plain non-ignored tests, same as the other `release_measure`
+    /// cells.)
+    #[test]
+    fn release_measure_rigid_bernoulli_vgh_vs_hand_chain_932() {
+        use std::time::Instant;
+
+        // (eta, g, z, y, w): one ordinary interior row per outcome branch —
+        // y=1 and y=0 are distinct live sign branches of the Mills-ratio
+        // kernel, so each is its own measured cell.
+        let cases = [
+            (0.3_f64, 0.2_f64, 0.4_f64, 1.0_f64, 1.0_f64),
+            (-0.7, -0.5, -1.1, 0.0, 0.8),
+        ];
+        let probit_scale = 0.8;
+
+        // Feedback-coupled timing barrier (no `std::hint::black_box`): each
+        // iteration nudges the log-slope primary by a negligible multiple of
+        // the running checksum, and the checksum folds value, gradient, and
+        // Hessian channels, so the pure row call can be neither hoisted nor
+        // dropped while the measured regime stays bit-adjacent to the fixture.
+        fn best_ns<F>(iterations: usize, base_g: f64, evaluate: F) -> f64
+        where
+            F: Fn(f64) -> (f64, [f64; 2], [[f64; 2]; 2]),
+        {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let mut checksum = 0.0_f64;
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    let (value, gradient, hessian) = evaluate(base_g + checksum * 1e-18);
+                    checksum += value + gradient[0] + hessian[0][0];
+                }
+                assert!(
+                    checksum.is_finite(),
+                    "rigid Bernoulli release-measure checksum must stay finite"
+                );
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            best * 1e9 / iterations as f64
+        }
+
+        let iterations = 2_000_000usize;
+        for &(eta, g, z, y, w) in &cases {
+            let marginal = bernoulli_marginal_link_map(
+                &InverseLink::Standard(gam_problem::StandardLink::Probit),
+                eta,
+            )
+            .expect("link map");
+
+            // Parity pin on the exact benchmarked inputs (the full-grid check
+            // is `rigid_bernoulli_row_kernel_matches_hand_chain_witness`).
+            let (jet_value, ..) =
+                rigid_standard_normal_row_kernel(marginal, g, z, y, w, probit_scale)
+                    .expect("jet kernel");
+            let (hand_value, ..) = hand_rigid_vgh(marginal, g, z, y, w, probit_scale);
+            let band = 1e-12 + 1e-9 * jet_value.abs().max(hand_value.abs());
+            assert!(
+                (jet_value - hand_value).abs() <= band,
+                "y={y:.0} value: jet {jet_value:+.15e} vs hand {hand_value:+.15e}"
+            );
+
+            let production_ns = best_ns(iterations, g, |perturbed_g| {
+                rigid_standard_normal_row_kernel(marginal, perturbed_g, z, y, w, probit_scale)
+                    .expect("jet kernel")
+            });
+            let hand_ns = best_ns(iterations, g, |perturbed_g| {
+                hand_rigid_vgh(marginal, perturbed_g, z, y, w, probit_scale)
+            });
+            eprintln!(
+                "RIGID-BERNOULLI-VGH-932 y={y:.0} production={production_ns:.2} ns/row \
+                 hand={hand_ns:.2} ns/row hand_over_production={:.6}",
+                hand_ns / production_ns,
+            );
+        }
+    }
 }
 
 #[cfg(test)]
