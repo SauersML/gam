@@ -708,26 +708,49 @@ fn run(shape: Shape) -> Result<(), String> {
 
     let mut term_for_criterion = fixture.term.clone();
     let start = Instant::now();
-    let (criterion, loss) = term_for_criterion
-        .penalized_quasi_laplace_criterion(
-            fixture.target.view(),
-            &fixture.rho,
-            None,
-            INNER_MAX_ITER,
-            LEARNING_RATE,
-            RIDGE_EXT_COORD,
-            RIDGE_BETA,
-        )
-        .map_err(|error| format!("penalized quasi-Laplace criterion evaluation failed: {error}"))?;
-    print_stage(
-        &fixture.shape,
-        "criterion_eval",
-        ms(start),
-        &format!(
-            "criterion={criterion:.12e} loss_total={:.12e}",
-            loss.total()
+    // An indefinite exact-A refusal at the seed ρ is the #2336 infeasible-probe
+    // outcome, not a harness failure: the production outer objective maps this
+    // exact refusal to +inf and steers away (outer_objective's
+    // infeasible_criterion_evals accounting), and the K=1-circle fixtures here
+    // sit at precisely the marginally-indefinite nonzero-residual class that
+    // triggers it. Report the stage as infeasible with its timing (still a
+    // valid measurement) and continue to outer_fit, which tolerates the same ρ.
+    match term_for_criterion.penalized_quasi_laplace_criterion(
+        fixture.target.view(),
+        &fixture.rho,
+        None,
+        INNER_MAX_ITER,
+        LEARNING_RATE,
+        RIDGE_EXT_COORD,
+        RIDGE_BETA,
+    ) {
+        Ok((criterion, loss)) => print_stage(
+            &fixture.shape,
+            "criterion_eval",
+            ms(start),
+            &format!(
+                "criterion={criterion:.12e} loss_total={:.12e}",
+                loss.total()
+            ),
         ),
-    );
+        Err(gam::terms::sae::manifold::SaeCriterionError::IndefiniteObservedInformation {
+            block,
+        }) => print_stage(
+            &fixture.shape,
+            "criterion_eval",
+            ms(start),
+            &format!(
+                "status=infeasible reason=\"indefinite exact-A at converged mode ({block} block)\" \
+                 (outer objective prices this rho as +inf and steers away)"
+            ),
+        ),
+        Err(error) => {
+            return Err(format!(
+                "penalized quasi-Laplace criterion evaluation failed: {error}"
+            )
+            .into());
+        }
+    }
 
     let init_rho_flat = fixture.rho.to_flat();
     let n_params = init_rho_flat.len();
