@@ -6,7 +6,8 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::manifold::SaeManifoldRho;
 use gam_solve::evidence::{HybridAtomCandidate, HybridAtomChoice, select_hybrid_atom};
 use gam_terms::analytic_penalties::{
-    AnalyticPenalty, OrderedBetaBernoulliHessianDiagThirdChannels, OrderedBetaBernoulliPenalty,
+    AnalyticPenalty, OrderedBetaBernoulliHessianDiagThirdChannels,
+    OrderedBetaBernoulliLogitAdjointData, OrderedBetaBernoulliPenalty,
     SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight,
 };
 use gam_terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
@@ -1474,6 +1475,37 @@ fn ordered_beta_bernoulli_prior_penalty(
 /// term. The stationarity IFT must nevertheless invert the exact scalar
 /// Hessian, so `A - B` is applied here analytically and matrix-free. No dense
 /// `N K × N K` matrix or persistent low-rank carrier is constructed.
+/// #2330 Patch D — the ordered-Beta--Bernoulli prior structural data the exact-A
+/// θ-adjoint contracts for `∂ΔC_obb/∂ℓ` (see
+/// `OrderedBetaBernoulliPenalty::logit_theta_adjoint_data`). `None` when the mode
+/// is not ordered-Beta--Bernoulli or routing is frozen (the prior curvature is
+/// then ρ/θ-inert). The cache-layout contraction lives in gam-sae.
+pub(crate) fn ordered_beta_bernoulli_logit_adjoint_data_weighted(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+    row_weights: Option<&[f64]>,
+) -> Result<Option<OrderedBetaBernoulliLogitAdjointData>, String> {
+    assignment.validate_rho_domain(rho)?;
+    let AssignmentMode::OrderedBetaBernoulli {
+        temperature, alpha, ..
+    } = assignment.mode
+    else {
+        return Ok(None);
+    };
+    if assignment.routing_is_frozen() {
+        return Ok(None);
+    }
+    for row in 0..assignment.n_obs() {
+        validate_finite_logits(assignment.logits.row(row), row)?;
+    }
+    let (penalty, rho_view) =
+        ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights)?;
+    let target = flat_logits(assignment.logits.view());
+    Ok(Some(
+        penalty.logit_theta_adjoint_data(target.view(), rho_view.view()),
+    ))
+}
+
 pub(crate) fn ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,

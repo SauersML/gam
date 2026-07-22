@@ -317,6 +317,60 @@ impl OrderedBetaBernoulliPenalty {
         }
     }
 
+    /// #2330 Patch D — the structural data the exact-A θ-adjoint needs to
+    /// contract the ordered-Beta--Bernoulli prior curvature `∂ΔC_obb/∂ℓ_w`
+    /// against a joint pseudo-inverse in the SAE cache layout. `ΔC_obb` (per
+    /// column `k`) is `weight·S'_k·uuᵀ + diag(min(D_i, 0))` with
+    /// `u_i = w_i·z_i(1−z_i)/τ`, `D_i = weight·S_k·w_i·curv_i`,
+    /// `curv_i = z_i(1−z_i)(1−2z_i)/τ²`. Its logit derivative needs the column
+    /// integrated-marginal score and its first TWO M-derivatives
+    /// `S_k, S'_k, S''_k` (the third is `−ψ₂(M+a)+ψ₂(N−M+1)`), plus the concrete
+    /// gates `z` and the row weights — everything except the cache-layout
+    /// contraction, which the caller owns. Fixed/ungated columns are flagged so
+    /// the caller drops them exactly as every other channel does.
+    #[must_use]
+    pub fn logit_theta_adjoint_data(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> OrderedBetaBernoulliLogitAdjointData {
+        let alpha = self.resolved_alpha(rho);
+        let a_col = self.column_beta_shapes(alpha);
+        let z = self.concrete_logits(target);
+        let (columns, n_eff) = self.marginal_columns(z.view(), a_col.view());
+        let n = z.len() / self.k_max;
+        let mut score = vec![0.0_f64; self.k_max];
+        let mut score_derivative = vec![0.0_f64; self.k_max];
+        let mut score_second = vec![0.0_f64; self.k_max];
+        let mut column_fixed = vec![false; self.k_max];
+        for k in 0..self.k_max {
+            if self.column_is_fixed(k) {
+                column_fixed[k] = true;
+                continue;
+            }
+            let column = columns[k];
+            let active_arg = column.mass + column.a;
+            let inactive_arg = n_eff - column.mass + 1.0;
+            score[k] = column.score;
+            score_derivative[k] = column.score_derivative;
+            // d³L/dM³ = −ψ₂(M+a) + ψ₂(N−M+1).
+            score_second[k] = -tetragamma(active_arg) + tetragamma(inactive_arg);
+        }
+        let row_weight = (0..n).map(|row| self.row_weight(row)).collect();
+        OrderedBetaBernoulliLogitAdjointData {
+            k_max: self.k_max,
+            n,
+            weight: self.weight,
+            tau: self.tau,
+            z: z.to_vec(),
+            row_weight,
+            score,
+            score_derivative,
+            score_second,
+            column_fixed,
+        }
+    }
+
     /// `d²L / (d rho d ell_ik)` for the learnable concentration.
     #[must_use]
     pub fn log_alpha_target_mixed_derivative(
@@ -378,6 +432,29 @@ impl OrderedBetaBernoulliPenalty {
         }
         out
     }
+}
+
+/// #2330 Patch D — ordered-Beta--Bernoulli prior curvature `∂ΔC_obb/∂ℓ`
+/// structural data for the exact-A θ-adjoint (see
+/// [`OrderedBetaBernoulliPenalty::logit_theta_adjoint_data`]). Per-column
+/// integrated-marginal score and its first two M-derivatives, the concrete
+/// gates, and the row weights; the caller forms the cache-layout contraction.
+#[derive(Debug, Clone)]
+pub struct OrderedBetaBernoulliLogitAdjointData {
+    pub k_max: usize,
+    pub n: usize,
+    pub weight: f64,
+    pub tau: f64,
+    /// Concrete gates `z_i = σ(ℓ_i/τ)`, flat `n·k_max` (row-major).
+    pub z: Vec<f64>,
+    /// Row design weights (length `n`).
+    pub row_weight: Vec<f64>,
+    /// Column integrated-marginal `dL/dM`, `d²L/dM²`, `d³L/dM³`.
+    pub score: Vec<f64>,
+    pub score_derivative: Vec<f64>,
+    pub score_second: Vec<f64>,
+    /// Fixed/ungated columns (dropped by the caller).
+    pub column_fixed: Vec<bool>,
 }
 
 /// Third-derivative channels for the row-major `(N, K)` assignment-logit block.
