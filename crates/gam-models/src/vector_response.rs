@@ -723,13 +723,11 @@ impl MultinomialLogitLikelihood {
                 response_row[class] = y[[row, class]];
             }
             let program = self.row_program(row, &eta_row, &response_row)?;
-            negative_log_likelihood += program
-                .value_gradient_hessian_dispatch_into(
-                    &mut probabilities,
-                    &mut gradient_nll,
-                    &mut hessian_row,
-                )
-                .map_err(EstimationError::InvalidInput)?;
+            negative_log_likelihood += program.value_gradient_hessian_into(
+                &mut probabilities,
+                &mut gradient_nll,
+                &mut hessian_row,
+            );
             for axis in 0..m {
                 gradient_log_likelihood[[row, axis]] = -gradient_nll[axis];
                 for other in 0..m {

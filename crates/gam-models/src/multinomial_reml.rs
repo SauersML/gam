@@ -88,6 +88,7 @@ fn multinomial_stable_shift(eta: &[f64]) -> f64 {
 /// The returned `(shift, log_centered_denominator)` keeps scalar likelihood
 /// lowerings in the same cancellation-free coordinates without repeating the
 /// exponential pass.
+#[inline(always)]
 pub(crate) fn multinomial_logit_probabilities_into(
     eta: &[f64],
     probabilities: &mut [f64],
@@ -260,7 +261,7 @@ impl<'row> MultinomialLogitRowProgram<'row> {
     /// returned shift and centered log-denominator use the same representation as
     /// [`Self::eval_expression`]; no probability clamp or alternate tail policy
     /// exists anywhere in the live likelihood.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn probabilities_into(&self, probabilities: &mut [f64]) -> (f64, f64) {
         assert_eq!(probabilities.len(), self.response.len());
         multinomial_logit_probabilities_into(self.eta, probabilities)
@@ -294,7 +295,9 @@ impl<'row> MultinomialLogitRowProgram<'row> {
 
     /// Structure-compiled value/gradient lowering of the semantic row. The
     /// gradient is the NLL gradient; callers needing the log-likelihood negate
-    /// both channels.
+    /// both channels. `inline(always)` so the const-hinted V/G/H shapes see
+    /// through to the normalization loops.
+    #[inline(always)]
     pub(crate) fn value_gradient_into(
         &self,
         probabilities: &mut [f64],
@@ -324,13 +327,47 @@ impl<'row> MultinomialLogitRowProgram<'row> {
     /// Structure-compiled value/gradient/Hessian lowering of the semantic row.
     /// `gradient` is the NLL gradient and `hessian` is row-major. Both are
     /// mechanically determined by the normalized masses produced above.
+    ///
+    /// Small class counts route through const-hinted instantiations of the
+    /// SAME body ([`Self::value_gradient_hessian_shaped`]): the release cell
+    /// showed the dynamic-length codegen losing ~15% to the fully unrolled
+    /// generic jet tower at `M ≤ 3` purely on loop/bounds overhead, so the
+    /// one structure-compiled formula is monomorphized at the shapes where
+    /// that overhead is a measurable fraction of the row cost. There is no
+    /// second formula and no alternate lowering — only a compile-time trip
+    /// count for the identical arithmetic.
     pub(crate) fn value_gradient_hessian_into(
         &self,
         probabilities: &mut [f64],
         gradient: &mut [f64],
         hessian: &mut [f64],
     ) -> f64 {
-        let active_classes = self.eta.len();
+        match self.eta.len() {
+            1 => self.value_gradient_hessian_shaped::<1>(probabilities, gradient, hessian),
+            2 => self.value_gradient_hessian_shaped::<2>(probabilities, gradient, hessian),
+            3 => self.value_gradient_hessian_shaped::<3>(probabilities, gradient, hessian),
+            4 => self.value_gradient_hessian_shaped::<4>(probabilities, gradient, hessian),
+            _ => self.value_gradient_hessian_shaped::<0>(probabilities, gradient, hessian),
+        }
+    }
+
+    /// The single V/G/H body behind [`Self::value_gradient_hessian_into`].
+    /// `M_HINT = 0` is the runtime-length instantiation; a nonzero hint pins
+    /// `active_classes` to a compile-time constant (checked, then used as the
+    /// trip count) so the loops unroll and the bounds checks vanish.
+    #[inline(always)]
+    fn value_gradient_hessian_shaped<const M_HINT: usize>(
+        &self,
+        probabilities: &mut [f64],
+        gradient: &mut [f64],
+        hessian: &mut [f64],
+    ) -> f64 {
+        let active_classes = if M_HINT == 0 {
+            self.eta.len()
+        } else {
+            assert_eq!(self.eta.len(), M_HINT);
+            M_HINT
+        };
         assert_eq!(gradient.len(), active_classes);
         assert_eq!(hessian.len(), active_classes * active_classes);
         let value = self.value_gradient_into(probabilities, gradient);
@@ -347,53 +384,6 @@ impl<'row> MultinomialLogitRowProgram<'row> {
             }
         }
         value
-    }
-
-    /// Measured-crossover V/G/H dispatch: the single-source semantic row has
-    /// two exact lowerings — the fully monomorphized `Order2<M>` jet of
-    /// [`Self::eval_expression`] (fastest at small class counts, where its
-    /// unrolled fixed-arity algebra beats slice-indexed code) and the
-    /// structure-compiled softmax lowering
-    /// ([`Self::value_gradient_hessian_into`], fastest at larger `M`, where
-    /// the jet's `O(M³)` compose cost loses to the `O(M²)` closed form). The
-    /// crossover sits between `M = 3` and `M = 4` on every acceptance host;
-    /// `release_measure_multinomial_specialized_vs_generic_tower_932` measures
-    /// BOTH lowerings at `M ∈ {2, 3, 4, 8}` and fails closed if this dispatch
-    /// ever stops picking the faster one, so the boundary is pinned by
-    /// measurement rather than asserted.
-    ///
-    /// `probabilities` is pure SCRATCH here: the jet arms never touch it and
-    /// the compiled arm overwrites it, so its contents are unspecified on
-    /// return. Callers needing the normalized masses use
-    /// [`Self::probabilities_into`].
-    pub(crate) fn value_gradient_hessian_dispatch_into(
-        &self,
-        probabilities: &mut [f64],
-        gradient: &mut [f64],
-        hessian: &mut [f64],
-    ) -> Result<f64, String> {
-        fn tower_arm<const M: usize>(
-            program: &MultinomialLogitRowProgram<'_>,
-            gradient: &mut [f64],
-            hessian: &mut [f64],
-        ) -> Result<f64, String> {
-            let (value, tower_gradient, tower_hessian) =
-                gam_math::jet_tower::program_row_kernel::<M, _>(program, 0)?;
-            gradient[..M].copy_from_slice(&tower_gradient);
-            for (row, tower_row) in tower_hessian.iter().enumerate() {
-                hessian[row * M..(row + 1) * M].copy_from_slice(tower_row);
-            }
-            Ok(value)
-        }
-        let active_classes = self.eta.len();
-        assert_eq!(gradient.len(), active_classes);
-        assert_eq!(hessian.len(), active_classes * active_classes);
-        match active_classes {
-            1 => tower_arm::<1>(self, gradient, hessian),
-            2 => tower_arm::<2>(self, gradient, hessian),
-            3 => tower_arm::<3>(self, gradient, hessian),
-            _ => Ok(self.value_gradient_hessian_into(probabilities, gradient, hessian)),
-        }
     }
 }
 
@@ -3276,18 +3266,17 @@ mod tests {
             }
         }
 
-        /// #932 release speed gate for the multinomial-logit row. Production is
-        /// the measured-crossover dispatch
-        /// ([`MultinomialLogitRowProgram::value_gradient_hessian_dispatch_into`]):
-        /// the monomorphized `Order2<M>` jet tower at small class counts, the
-        /// structure-compiled softmax lowering above the crossover (#932
-        /// removed this family's `cfg(test)` hand restatement, so these two
-        /// exact lowerings of the single-source row are the only candidates).
-        /// At each measured width the dispatch is timed against the lowering
-        /// it did NOT select; the emitted `hand_over_production` token
-        /// (rejected-lowering time over production time) therefore fails
-        /// closed — `<= 1` on the MSI release harness — whenever the dispatch
-        /// boundary stops picking the faster lowering on either side.
+        /// #932 release speed gate for the multinomial-logit row. Production
+        /// is the structure-compiled softmax lowering
+        /// ([`MultinomialLogitRowProgram::value_gradient_hessian_into`], with
+        /// const-hinted small-`M` shapes of its single body), timed against
+        /// the generic gam-math forward-mode jet tower
+        /// ([`program_row_kernel`]) — the naive automatic-differentiation
+        /// baseline the retained specialization must beat, since #932 removed
+        /// this family's `cfg(test)` hand restatement. Emits the
+        /// harness-parsed `hand_over_production` token (generic-tower time
+        /// over production time) per active-class width; the MSI release
+        /// harness fails closed whenever any measured cell is `<= 1`.
         ///
         /// The batch of distinct rows supplies genuine per-row input variation, so
         /// the optimizer cannot hoist the pure row call out of the sweep, and the
@@ -3375,22 +3364,6 @@ mod tests {
                 let mut production_sweep = || {
                     let mut checksum = 0.0_f64;
                     for program in &programs {
-                        let value = program
-                            .value_gradient_hessian_dispatch_into(
-                                &mut probabilities,
-                                &mut gradient,
-                                &mut hessian,
-                            )
-                            .expect("dispatch kernel");
-                        checksum += value + gradient[0] + hessian[0];
-                    }
-                    checksum
-                };
-                let production_secs = best_secs(&mut production_sweep);
-
-                let mut specialized_sweep = || {
-                    let mut checksum = 0.0_f64;
-                    for program in &programs {
                         let value = program.value_gradient_hessian_into(
                             &mut probabilities,
                             &mut gradient,
@@ -3400,7 +3373,7 @@ mod tests {
                     }
                     checksum
                 };
-                let specialized_secs = best_secs(&mut specialized_sweep);
+                let production_secs = best_secs(&mut production_sweep);
 
                 let mut tower_sweep = || {
                     let mut checksum = 0.0_f64;
@@ -3414,17 +3387,11 @@ mod tests {
                 let tower_secs = best_secs(&mut tower_sweep);
 
                 let production_ns = production_secs * 1e9 / ROWS as f64;
-                let specialized_ns = specialized_secs * 1e9 / ROWS as f64;
                 let tower_ns = tower_secs * 1e9 / ROWS as f64;
-                // The dispatch selects the jet tower for M <= 3 and the
-                // structure-compiled softmax above; the rejected lowering at
-                // this width is the fail-closed baseline.
-                let rejected_ns = if M <= 3 { specialized_ns } else { tower_ns };
                 eprintln!(
                     "MULTINOMIAL-RELEASE-932 M={M} rows={ROWS} production_ns={production_ns:.3} \
-                     specialized_ns={specialized_ns:.3} generic_tower_ns={tower_ns:.3} \
-                     hand_over_production={:.6}",
-                    rejected_ns / production_ns,
+                     generic_tower_ns={tower_ns:.3} hand_over_production={:.6}",
+                    tower_ns / production_ns,
                 );
             }
 
