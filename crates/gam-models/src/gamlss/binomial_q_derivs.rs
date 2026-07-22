@@ -919,4 +919,84 @@ mod tests {
         }
         assert_eq!(f1, 1.0, "ℓ'(1)=y/μ=1 at y=1,μ=1");
     }
+
+    /// #932 release speed gate justifying the closed-form dispatch order: on
+    /// the canonical logit link the non-abstracted closed-form stack (the
+    /// dispatch winner, i.e. production) must beat the generic `Tower4<1>`
+    /// μ-jet composition it out-dispatches. This is the inverse orientation of
+    /// the other release cells — production here IS the hand schedule and the
+    /// jet is the generic fallback that only serves links with no closed form
+    /// — so a red cell would mean the dispatch priority is wrong and the jet
+    /// should be production. Emits the harness-parsed `hand_over_production`
+    /// token (`generic_jet_ns / closed_form_ns`); the MSI release harness
+    /// fails closed on any cell `<= 1`.
+    #[test]
+    fn release_measure_binomial_q_closed_forms_vs_generic_jet_932() {
+        use std::time::Instant;
+
+        let y = 0.7_f64;
+        let w = 1.3_f64;
+        let q0 = -0.6_f64;
+
+        // Parity pin on the exact benchmarked inputs (the grid check is
+        // `logit_closed_form_agrees_with_generic_jet_path` above).
+        let (mu, d1, d2, d3, d4) = logit_jet(q0);
+        let closed = binomial_neglog_q_derivatives_logit_closed_form(y, w, q0);
+        let closed_m4 = binomial_neglog_q_fourth_derivative_logit_closed_form(y, w, q0);
+        let jet = binomial_neglog_q_derivatives_from_jet(y, w, mu, d1, d2, d3);
+        let jet_m4 = binomial_neglog_q_fourth_derivative_from_jet(y, w, mu, d1, d2, d3, d4);
+        let close = |label: &str, a: f64, b: f64| {
+            let band = 1e-12 + 1e-9 * a.abs().max(b.abs());
+            assert!(
+                (a - b).abs() <= band,
+                "{label}: closed {a:+.15e} vs jet {b:+.15e}"
+            );
+        };
+        close("m1", closed.0, jet.0);
+        close("m2", closed.1, jet.1);
+        close("m3", closed.2, jet.2);
+        close("m4", closed_m4, jet_m4);
+
+        // Feedback-coupled timing barrier (no `std::hint::black_box`): the
+        // latent coordinate is nudged by a negligible multiple of the running
+        // checksum, so the pure tower call can be neither hoisted nor dropped
+        // while the measured regime stays bit-adjacent to the fixture.
+        fn best_ns<F: FnMut(f64) -> f64>(iterations: usize, base_q: f64, mut evaluate: F) -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let mut checksum = 0.0_f64;
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    checksum += evaluate(base_q + checksum * 1e-18);
+                }
+                assert!(
+                    checksum.is_finite(),
+                    "binomial q-dispatch release-measure checksum must stay finite"
+                );
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            best * 1e9 / iterations as f64
+        }
+
+        let iterations = 2_000_000usize;
+        let closed_ns = best_ns(iterations, q0, |q| {
+            let (m1, m2, m3) = binomial_neglog_q_derivatives_logit_closed_form(y, w, q);
+            let m4 = binomial_neglog_q_fourth_derivative_logit_closed_form(y, w, q);
+            m1 + m2 + m3 + m4
+        });
+        let jet_ns = best_ns(iterations, q0, |q| {
+            let (jet_mu, jet_d1, jet_d2, jet_d3, jet_d4) = logit_jet(q);
+            let (m1, m2, m3) =
+                binomial_neglog_q_derivatives_from_jet(y, w, jet_mu, jet_d1, jet_d2, jet_d3);
+            let m4 = binomial_neglog_q_fourth_derivative_from_jet(
+                y, w, jet_mu, jet_d1, jet_d2, jet_d3, jet_d4,
+            );
+            m1 + m2 + m3 + m4
+        });
+        eprintln!(
+            "BINOMIAL-Q-DISPATCH-932 link=logit production_closed={closed_ns:.2} ns/row \
+             generic_jet={jet_ns:.2} ns/row hand_over_production={:.6}",
+            jet_ns / closed_ns,
+        );
+    }
 }
