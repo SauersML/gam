@@ -1219,18 +1219,17 @@ fn profile_wide_p_criterion_cost_2080() {
     }
 }
 
-/// #2080 OWNER wide-p per-eval localizer (uncommitted profiling instrument).
-/// Splits a single K=1 criterion evaluation into: (A) the damped inner (t,β)
-/// Newton solve, (M) the dense exact-A materialization column-by-column, (E) the
-/// full exact observed-information log-dets (M + two dense `eigh`), and the
-/// residual refine-loop remainder = full − A − E. Runs the wide tail p∈{16..96}
-/// the standard profiler leaves to the owner, so the cubic-in-p term is localized
-/// in ONE run.
+/// #2080 wide-p per-eval localizer (zz_measure diagnostics). Splits a single
+/// K=1 criterion evaluation into: (A) the damped inner (t,β) Newton solve,
+/// (M) the dense exact-A materialization column-by-column, (E) the full exact
+/// observed-information log-dets (M + two dense `eigh`), and the residual
+/// refine-loop remainder = full − A − E, so the cubic-in-p term is localized
+/// in ONE run. The in-suite sweep stops at p=32 to stay affordable (`#[ignore]`
+/// is banned; widen the sweep locally when hunting the tail).
 #[test]
-#[ignore = "owner profiling instrument for #2080; run explicitly"]
-fn profile_wide_p_criterion_cost_localizer_2080_owner() {
+fn zz_measure_wide_p_criterion_cost_localizer_2080() {
     let harmonics = 2usize; // m = 5 basis columns per atom
-    for &p in &[16usize, 32, 48, 64, 96] {
+    for &p in &[16usize, 32] {
         let n = 96usize;
         let z = one_circle_wide_target(n, p, 0.05);
         let (term, seed_dispersion) = two_circle_periodic_term(z.view(), 1, harmonics);
@@ -1260,14 +1259,14 @@ fn profile_wide_p_criterion_cost_localizer_2080_owner() {
 
         // Phase M: dense exact-A materialization (dim column matvecs).
         let m0 = std::time::Instant::now();
-        let _a_dense = tb
+        let a_dense = tb
             .materialize_exact_hessian_dense(&rho, z.view(), &cache)
             .expect("materialize A");
         let dt_m = m0.elapsed().as_secs_f64();
 
         // Phase E: full exact observed-information log-dets (materialize + 2 eigh).
         let e0 = std::time::Instant::now();
-        let _ = tb
+        let log_dets = tb
             .exact_observed_information_log_dets(&rho, z.view(), &cache)
             .expect("observed-information log-dets");
         let dt_e = e0.elapsed().as_secs_f64();
@@ -1275,9 +1274,10 @@ fn profile_wide_p_criterion_cost_localizer_2080_owner() {
         let dt_eigh = (dt_e - dt_m).max(0.0);
         let dt_refine = (dt_full - dt_a - dt_e).max(0.0);
         eprintln!(
-            "[#2080 localize] p={p:>3} beta_dim={beta_dim:>4} dim={dim:>4} | \
-             inner_A={dt_a:8.3}s | refine_rest={dt_refine:8.3}s | materialize_M={dt_m:8.3}s | \
-             eigh_E-M={dt_eigh:8.3}s | full={dt_full:8.3}s"
+            "[#2080 localize] p={p:>3} beta_dim={beta_dim:>4} dim={dim:>4} a_dim={} \
+             log_dets={log_dets:?} | inner_A={dt_a:8.3}s | refine_rest={dt_refine:8.3}s | \
+             materialize_M={dt_m:8.3}s | eigh_E-M={dt_eigh:8.3}s | full={dt_full:8.3}s",
+            a_dense.nrows(),
         );
     }
 }
