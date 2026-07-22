@@ -1152,9 +1152,10 @@ pub fn run_linear_reml_schedule(
     }
     // Warm start at the caller's shared ridge; from here ρ is REML-selected.
     let mut rho = config.decoder_ridge as f64;
-    // The caller's seed ridge is the interior anchor: an edof trace solve that
-    // fails only AFTER the schedule has driven ρ strictly below it is the #2275
-    // ρ-boundary (below), not a genuine numerical failure.
+    // The caller's seed ridge is the interior anchor for the #2275 ρ-boundary
+    // diagnosis (see the trace-failure arm below): a trace solve that fails only
+    // AFTER Fellner–Schall has driven ρ STRICTLY below it is on the descent to the
+    // identifiability edge, not an interior numerical failure.
     let initial_ridge = rho;
     let mut fit = run_linear_fast_kernel(x, config, rho)?;
     let tol = reml_schedule_rho_log_tol(config.tolerance);
@@ -1171,17 +1172,38 @@ pub fn run_linear_reml_schedule(
         ) {
             Ok(stats) => stats,
             Err(SparseDictionaryError::TraceNonConvergence { .. }) if rho < initial_ridge => {
-                // #2275 OUTER boundary. The Fellner–Schall schedule has driven the
-                // shared ridge strictly below the seed toward the zero boundary
-                // (for a near-perfect over-complete fit σ² → 0, so ρ_new → 0). At
-                // that boundary the over-complete code Gram A = CᵀC is
-                // rank-deficient and A+ρI is too ill-conditioned for the
-                // Hutchinson trace CG — the ρ-space image of the same open frame:
-                // the evidence has no interior fixed point, it wants ρ → 0. Return
-                // the last resolvable inner fit as a best-effort OPEN certificate
-                // rather than hard-erroring. `rho < initial_ridge` scopes this to
-                // the descent-to-boundary; a trace failure at or above the seed
-                // ridge is a genuine numerical error and still propagates.
+                // #2275 OUTER ρ-BOUNDARY — a DERIVED identifiability-edge diagnosis,
+                // not a rescue of a failed solve.
+                //
+                // The Fellner–Schall step is ρ_new = γ·σ² / ‖penalty‖ with
+                // σ² = RSS / (N·P − γ). For an over-complete fit (K ≫ intrinsic
+                // rank) the atoms interpolate, so RSS → 0 ⇒ σ² → 0 ⇒ ρ_new → 0:
+                // the FS recursion on a rank-deficient design has NO interior fixed
+                // point, it monotonically drives ρ to the zero boundary. That is a
+                // property of the evidence on this data, not a transient.
+                //
+                // The edof γ = tr(A(A+ρI)⁻¹) of the code Gram A = CᵀC is estimated
+                // by a Hutchinson trace CG. Over-complete ⇒ A is rank-deficient
+                // (λ_min = 0), so cond(A+ρI) ≈ λ_max/ρ → ∞ as ρ → 0 and the CG,
+                // which needs ≈ √cond iterations, cannot converge within its cap
+                // once ρ ≲ λ_max / cap². So the trace becoming UNRESOLVABLE below
+                // the seed ridge is the exact numerical signature of ρ having
+                // reached the identifiability edge — the ρ-space image of the same
+                // open frame the inner arm reports.
+                //
+                // best-effort OPEN is the honest classification here: the fit's
+                // OBJECTIVE quantities are already converged (the inner run at this
+                // ρ RETURNED — EV, decoder and routing residuals are all recorded);
+                // the only thing that cannot be resolved is the edof trace, which is
+                // a ρ-SELECTION diagnostic, not part of the reconstruction. There is
+                // no interior ρ fixed point to certify, so we return the last
+                // resolvable fit as open (certified = false, outer residual left at
+                // ∞) instead of hard-erroring a converged reconstruction.
+                //
+                // `rho < initial_ridge` scopes this strictly to the descent to the
+                // boundary; a trace failure AT OR ABOVE the seed ridge is off the
+                // boundary (interior ρ) and remains a genuine numerical error that
+                // still propagates.
                 return Ok(schedule_fit_from_iterate(
                     fit,
                     false,
