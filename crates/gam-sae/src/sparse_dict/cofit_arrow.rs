@@ -114,6 +114,35 @@ pub fn cofit_linear_via_arrow(
     gamma: f32,
     config: &ArrowCofitConfig,
 ) -> Result<ArrowCofitReport, String> {
+    let (term, rho) = build_linear_cofit_term(target, decoder, blocks, codes, gamma, config)?;
+
+    let (reconstructed, explained_variance) = fit_to_idempotent_reentry_and_read_back(
+        term,
+        rho,
+        target,
+        config,
+        "cofit_linear_via_arrow",
+    )?;
+
+    Ok(ArrowCofitReport {
+        reconstructed,
+        explained_variance,
+        n_curved_atoms: 0,
+        curved_charge: 0.0,
+    })
+}
+
+/// Assemble the frozen-support linear-atom term + its cold ARD seed from a block
+/// routing, WITHOUT running the joint solve. Shared by [`cofit_linear_via_arrow`]
+/// and the idempotence gate so the test drives the exact production term.
+fn build_linear_cofit_term(
+    target: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    blocks: ArrayView2<'_, u32>,
+    codes: ArrayView3<'_, f32>,
+    gamma: f32,
+    config: &ArrowCofitConfig,
+) -> Result<(SaeManifoldTerm, SaeManifoldRho), String> {
     require_fitting_iteration("cofit_linear_via_arrow", config.max_iter)?;
     let (n, k_active) = blocks.dim();
     let b = codes.shape()[2];
@@ -186,40 +215,13 @@ pub fn cofit_linear_via_arrow(
         AssignmentMode::top_k_support(k_support),
     )?;
 
-    let mut term = SaeManifoldTerm::new(atoms, assignment)?;
-    term.set_guards_enabled(false);
-    let mut rho = SaeManifoldRho::new(
+    let term = SaeManifoldTerm::new(atoms, assignment)?;
+    let rho = SaeManifoldRho::new(
         config.log_lambda_sparse,
         config.log_lambda_smooth,
         (0..g).map(|_| Array1::<f64>::zeros(b)).collect(),
     );
-
-    let target_f64 = target.mapv(|v| v as f64);
-    let outcome = term.run_joint_fit_arrow_schur_for_quasi_laplace(
-        target_f64.view(),
-        &mut rho,
-        None,
-        config.max_iter,
-        config.step_size,
-        config.ridge_ext_coord,
-        config.ridge_beta,
-    )?;
-    require_idempotent_fixed_point(
-        outcome.fixed_point,
-        "cofit_linear_via_arrow",
-        config.max_iter,
-    )?;
-
-    let recon_f64 = term.try_fitted_for_rho(&rho)?;
-    let reconstructed = recon_f64.mapv(|v| v as f32);
-    let explained_variance = explained_variance_from_reconstruction(target, reconstructed.view())?;
-
-    Ok(ArrowCofitReport {
-        reconstructed,
-        explained_variance,
-        n_curved_atoms: 0,
-        curved_charge: 0.0,
-    })
+    Ok((term, rho))
 }
 
 /// Build one linear (degree-1 monomial) atom for block `gi`: basis `Φ = [1, t₁,…,t_b]`
@@ -461,8 +463,7 @@ pub fn cofit_composed_via_arrow(
         AssignmentMode::top_k_support(k_support),
     )?;
 
-    let mut term = SaeManifoldTerm::new(atoms, assignment)?;
-    term.set_guards_enabled(false);
+    let term = SaeManifoldTerm::new(atoms, assignment)?;
     // Per-atom ARD log-precision vectors sized to each atom's latent dim (b for a
     // linear atom, 1 for a curved atom).
     let log_ard: Vec<Array1<f64>> = (0..g)
@@ -474,27 +475,15 @@ pub fn cofit_composed_via_arrow(
             }
         })
         .collect();
-    let mut rho = SaeManifoldRho::new(config.log_lambda_sparse, config.log_lambda_smooth, log_ard);
+    let rho = SaeManifoldRho::new(config.log_lambda_sparse, config.log_lambda_smooth, log_ard);
 
-    let target_f64 = target.mapv(|v| v as f64);
-    let outcome = term.run_joint_fit_arrow_schur_for_quasi_laplace(
-        target_f64.view(),
-        &mut rho,
-        None,
-        config.max_iter,
-        config.step_size,
-        config.ridge_ext_coord,
-        config.ridge_beta,
-    )?;
-    require_idempotent_fixed_point(
-        outcome.fixed_point,
+    let (reconstructed, explained_variance) = fit_to_idempotent_reentry_and_read_back(
+        term,
+        rho,
+        target,
+        config,
         "cofit_composed_via_arrow",
-        config.max_iter,
     )?;
-
-    let recon_f64 = term.try_fitted_for_rho(&rho)?;
-    let reconstructed = recon_f64.mapv(|v| v as f32);
-    let explained_variance = explained_variance_from_reconstruction(target, reconstructed.view())?;
 
     Ok(ArrowCofitReport {
         reconstructed,
@@ -502,6 +491,68 @@ pub fn cofit_composed_via_arrow(
         n_curved_atoms,
         curved_charge,
     })
+}
+
+/// Run the deterministic arrow-Schur joint solve to a GENUINE idempotent fixed
+/// point, then read back the composed reconstruction and its explained variance.
+///
+/// A single joint fit descends from the cold routing seed to the penalized
+/// optimum, so its FIRST pass necessarily moves state: the entry block sweep
+/// commits the seed→optimum decrease, and the Newton walk shrinks the
+/// block-decoder seed under the ARD/ridge penalties.
+/// [`SaeManifoldTerm::run_joint_fit_arrow_schur_for_quasi_laplace`] snapshots the
+/// entry model and certifies `fixed_point` only when a WHOLE pass recurs it
+/// unchanged, so that first descending pass can never be idempotent — the cause
+/// of the `#2023` linear/composed cofit refusals: the callers demanded ONE cold
+/// pass be its own fixed point and never re-entered.
+///
+/// Re-enter the solve from the converged state (the term retains its fitted
+/// model across calls, so each re-entry warm-starts where the last left off)
+/// until one full pass moves nothing: that no-op recurrence IS the fixed-point
+/// certificate the evidence adjoint requires, and it is re-verified by the
+/// solver on every re-entry — NOT an early-exit shortcut that assumes
+/// convergence. At fixed ρ the inner (t, β) solve is objective-monotone and
+/// bounded below, so the re-entries converge; a settled problem certifies on the
+/// very next pass. The bound is a loud failure floor: a structurally open
+/// (over-complete) routing that can never settle exhausts it and surfaces the
+/// same `require_idempotent_fixed_point` refusal instead of spinning.
+fn fit_to_idempotent_reentry_and_read_back(
+    mut term: SaeManifoldTerm,
+    mut rho: SaeManifoldRho,
+    target: ArrayView2<'_, f32>,
+    config: &ArrowCofitConfig,
+    entry: &str,
+) -> Result<(Array2<f32>, f64), String> {
+    // Frozen support, fixed routing: the co-fit lane runs the joint solve
+    // guard-free, exactly as the single-pass callers did.
+    term.set_guards_enabled(false);
+    // A converged inner solve recurs on the immediately following pass; the extra
+    // headroom only covers a cold pass that exhausts `max_iter` before reaching
+    // the inner optimum and needs a second descending pass to finish.
+    const MAX_REENTRIES: usize = 8;
+    let target_f64 = target.mapv(|v| v as f64);
+    let mut certified = false;
+    for _ in 0..MAX_REENTRIES {
+        let outcome = term.run_joint_fit_arrow_schur_for_quasi_laplace(
+            target_f64.view(),
+            &mut rho,
+            None,
+            config.max_iter,
+            config.step_size,
+            config.ridge_ext_coord,
+            config.ridge_beta,
+        )?;
+        if outcome.fixed_point {
+            certified = true;
+            break;
+        }
+    }
+    require_idempotent_fixed_point(certified, entry, config.max_iter)?;
+
+    let recon_f64 = term.try_fitted_for_rho(&rho)?;
+    let reconstructed = recon_f64.mapv(|v| v as f32);
+    let explained_variance = explained_variance_from_reconstruction(target, reconstructed.view())?;
+    Ok((reconstructed, explained_variance))
 }
 
 fn require_idempotent_fixed_point(
@@ -641,6 +692,99 @@ mod tests {
             tol
         );
         assert_eq!(arrow.reconstructed.dim(), (n, p));
+    }
+
+    /// #2023 5a idempotence gate — the root cause of the linear/composed cofit
+    /// refusals, pinned. A single joint pass from the cold block-decoder seed
+    /// descends the penalized objective, so it MOVES state and cannot certify
+    /// itself as an idempotent fixed point (the old callers demanded exactly
+    /// that ONE cold pass be its own fixed point, and refused). Re-entering the
+    /// converged state is a genuine no-op: the solver certifies `fixed_point` and
+    /// the fitted reconstruction does not move. This is the term-level evidence
+    /// behind [`fit_to_idempotent_reentry_and_read_back`].
+    #[test]
+    fn arrow_linear_cofit_second_pass_is_a_noop_2023() {
+        let (p, b, n_blocks) = (8usize, 2usize, 3usize);
+        let n = 120usize;
+        let mut x = Array2::<f32>::zeros((n, p));
+        let mut s = 0x2023_5a02u64;
+        for i in 0..n {
+            for d in 0..n_blocks {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let amp = ((s >> 33) as f64 / (1u64 << 31) as f64 - 1.0) as f32;
+                x[[i, 2 * d]] += amp;
+                x[[i, 2 * d + 1]] += 0.5 * amp;
+            }
+        }
+        let mut config = BlockSparseConfig::new(n_blocks, b);
+        config.block_topk = n_blocks;
+        config.max_epochs = 60;
+        config.aux_k = 2;
+        let fit = fit_block_sparse_dictionary(x.view(), &config)
+            .expect("block-sparse linear fit must converge on planted structure");
+
+        let cofit = ArrowCofitConfig::default();
+        let (mut term, mut rho) = build_linear_cofit_term(
+            x.view(),
+            fit.decoder.view(),
+            fit.blocks.view(),
+            fit.codes.view(),
+            fit.gamma,
+            &cofit,
+        )
+        .expect("build the frozen-support linear cofit term");
+        term.set_guards_enabled(false);
+        let target = x.mapv(|v| v as f64);
+
+        let joint_pass = |term: &mut SaeManifoldTerm, rho: &mut SaeManifoldRho| {
+            term.run_joint_fit_arrow_schur_for_quasi_laplace(
+                target.view(),
+                rho,
+                None,
+                cofit.max_iter,
+                cofit.step_size,
+                cofit.ridge_ext_coord,
+                cofit.ridge_beta,
+            )
+            .expect("arrow-Schur joint pass runs")
+        };
+
+        // Cold pass: descends from the seed, so it is not its own fixed point.
+        let first = joint_pass(&mut term, &mut rho);
+        assert!(
+            !first.fixed_point,
+            "the cold descending pass cannot be its own idempotent fixed point"
+        );
+
+        // Re-enter until the converged inner solve certifies (the production loop).
+        let mut certified = first.fixed_point;
+        for _ in 0..7 {
+            if certified {
+                break;
+            }
+            certified = joint_pass(&mut term, &mut rho).fixed_point;
+        }
+        assert!(
+            certified,
+            "the linear cofit must reach a certified idempotent fixed point on re-entry"
+        );
+        let recon_converged = term
+            .try_fitted_for_rho(&rho)
+            .expect("readback at the fixed point");
+
+        // A further pass over the already-cofit tier is a genuine no-op.
+        let extra = joint_pass(&mut term, &mut rho);
+        assert!(
+            extra.fixed_point,
+            "a second cofit pass over the already-cofit linear tier must stay an idempotent no-op"
+        );
+        let recon_extra = term
+            .try_fitted_for_rho(&rho)
+            .expect("readback after the no-op re-entry");
+        assert_eq!(
+            recon_converged, recon_extra,
+            "the idempotent re-entry must not move the fitted reconstruction"
+        );
     }
 
     /// Orthonormal-per-block decoder with a planted overlap, mirroring the fixture
