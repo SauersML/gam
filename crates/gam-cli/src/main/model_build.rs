@@ -253,7 +253,20 @@ pub(crate) fn core_saved_fit_result(
             // artifact.
             used_device: false,
             outer_iterations: summary.iterations,
-            outer_converged: matches!(summary.pirls_status, gam::pirls::PirlsStatus::Converged),
+            // `UnifiedFitResult::try_from_parts` gates the INNER coefficient
+            // mode on `pirls_status.is_certified_minimum()` (Converged OR the
+            // plateau-rescued StalledAtValidMinimum — see its doc comment:
+            // "deliberately broader than `is_converged`"). This flag is the
+            // OUTER gate `try_from_parts` checks separately
+            // (`if !parts.outer_converged`); deriving it from the strict
+            // Converged-only `is_converged()` check made that outer gate
+            // reject any saved fit whose inner mode was legitimately
+            // certified via StalledAtValidMinimum, even though the inner
+            // gate right above it already accepted that exact status —
+            // panicking `core_saved_fit_result`'s `.expect(...)` for a fit
+            // that was fully certified and successfully saved in the first
+            // place. Use the same broader predicate so both gates agree.
+            outer_converged: summary.pirls_status.is_certified_minimum(),
             outer_gradient_norm: Some(summary.finalgrad_norm),
             standard_deviation,
             covariance_conditional,
@@ -344,8 +357,11 @@ impl SavedFitSummary {
             // a single "StalledAtValidMinimum" bucket, silently relabeling
             // genuinely broken fits as healthy for any downstream consumer that
             // gates on status. The bool is itself just a projection of this
-            // field (`outer_converged == matches!(status, Converged)`), so the
-            // status is strictly more informative.
+            // field (`outer_converged == status.is_certified_minimum()`, matching
+            // `UnifiedFitResult::try_from_parts`'s own inner-mode gate — NOT the
+            // narrower `is_converged()`, which would wrongly reject a persisted
+            // StalledAtValidMinimum fit on reload; see `core_saved_fit_result`),
+            // so the status is strictly more informative.
             pirls_status: fit.convergence_evidence().inner_status(),
             deviance: fit.deviance,
             stable_penalty_term,
@@ -550,6 +566,168 @@ mod tests {
                 .outer_certificate()
                 .is_some(),
             "compacted saved fit dropped the outer stationarity certificate"
+        );
+    }
+
+    /// Same live-fit shape as `location_scale_fit_with_outer_certificate`, but
+    /// with the inner mode `StalledAtValidMinimum` instead of `Converged` — a
+    /// plateau-rescued fit `UnifiedFitResult::try_from_parts` itself already
+    /// accepts via `pirls_status.is_certified_minimum()`.
+    fn location_scale_fit_stalled_at_valid_minimum() -> UnifiedFitResult {
+        let certificate = gam::estimate::OuterCriterionCertificate {
+            stationarity: gam::estimate::OuterStationarityCertificate::AnalyticGradient {
+                grad_norm: 1e-8,
+                projected_grad_norm: 1e-8,
+                bound: 1e-4,
+            },
+            hessian_psd: Some(true),
+            lambdas_railed: Vec::new(),
+        };
+        UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
+            blocks: vec![gam::estimate::FittedBlock {
+                beta: Array1::from_vec(vec![0.5, -0.25]),
+                role: gam::estimate::BlockRole::Mean,
+                edf: 2.0,
+                lambdas: Array1::from_vec(vec![1.0]),
+            }],
+            log_lambdas: Array1::zeros(1),
+            lambdas: Array1::from_vec(vec![1.0]),
+            likelihood_family: None,
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            used_device: false,
+            outer_iterations: 1,
+            outer_converged: true,
+            outer_gradient_norm: Some(1e-8),
+            standard_deviation: 1.0,
+            covariance_conditional: None,
+            covariance_corrected: None,
+            inference: None,
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: gam::pirls::PirlsStatus::StalledAtValidMinimum,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: gam::estimate::FitArtifacts {
+                criterion_certificate: Some(certificate),
+                ..Default::default()
+            },
+            inner_cycles: 0,
+        })
+        .expect("StalledAtValidMinimum is a certified inner mode; fixture must build")
+    }
+
+    /// Regression: `core_saved_fit_result` used to derive the OUTER
+    /// `try_from_parts` gate (`outer_converged`) from the strict
+    /// `matches!(pirls_status, Converged)` check instead of the same
+    /// `is_certified_minimum()` predicate the INNER gate already uses. A
+    /// `StalledAtValidMinimum` fit — already accepted by the inner gate right
+    /// next to it — then failed the OUTER gate on the exact same status,
+    /// panicking the reload/re-save path (`.expect("core_saved_fit_result
+    /// called with invalid fit metrics")`) for a fit that was fully certified
+    /// and successfully saved in the first place.
+    #[test]
+    fn compact_saved_fit_survives_stalled_at_valid_minimum_status() {
+        let fit = location_scale_fit_stalled_at_valid_minimum();
+        assert_eq!(fit.convergence_evidence().inner_status(), gam::pirls::PirlsStatus::StalledAtValidMinimum);
+
+        let summary =
+            SavedFitSummary::from_blockwise_fit(&fit).expect("saved summary builds from live fit");
+        assert_eq!(
+            summary.pirls_status,
+            gam::pirls::PirlsStatus::StalledAtValidMinimum,
+            "SavedFitSummary must persist the real inner status, not a collapsed bool"
+        );
+
+        // Before the fix this call panicked inside `core_saved_fit_result`'s
+        // `.expect(...)`, because `outer_converged` was derived from the
+        // strict Converged-only check and came out `false` for this status.
+        let reconstructed = compact_saved_multiblock_fit_result(
+            fit.blocks.clone(),
+            fit.lambdas.clone(),
+            1.0,
+            fit.covariance_conditional.clone(),
+            fit.covariance_corrected.clone(),
+            fit.geometry.clone(),
+            summary,
+        );
+        assert_eq!(
+            reconstructed.convergence_evidence().inner_status(),
+            gam::pirls::PirlsStatus::StalledAtValidMinimum,
+            "reconstructed fit must preserve the StalledAtValidMinimum status"
+        );
+        assert!(
+            reconstructed
+                .convergence_evidence()
+                .outer_certificate()
+                .is_some(),
+            "reconstructed fit must preserve the outer stationarity certificate"
+        );
+    }
+
+    /// Negative control for the fix above: a genuinely non-certified inner
+    /// status (`MaxIterationsReached` — the inner loop ran out without a
+    /// usable mode, not a plateau rescue) must still be REJECTED by
+    /// `try_from_parts`'s inner-mode gate. The fix broadens the OUTER gate to
+    /// match `is_certified_minimum()`; it must not also broaden — or bypass —
+    /// the separate INNER gate that rejects genuinely broken fits.
+    #[test]
+    fn max_iterations_reached_status_is_still_rejected() {
+        let certificate = gam::estimate::OuterCriterionCertificate {
+            stationarity: gam::estimate::OuterStationarityCertificate::AnalyticGradient {
+                grad_norm: 1e-8,
+                projected_grad_norm: 1e-8,
+                bound: 1e-4,
+            },
+            hessian_psd: Some(true),
+            lambdas_railed: Vec::new(),
+        };
+        let result = UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
+            blocks: vec![gam::estimate::FittedBlock {
+                beta: Array1::from_vec(vec![0.5, -0.25]),
+                role: gam::estimate::BlockRole::Mean,
+                edf: 2.0,
+                lambdas: Array1::from_vec(vec![1.0]),
+            }],
+            log_lambdas: Array1::zeros(1),
+            lambdas: Array1::from_vec(vec![1.0]),
+            likelihood_family: None,
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            used_device: false,
+            outer_iterations: 1,
+            outer_converged: true,
+            outer_gradient_norm: Some(1e-8),
+            standard_deviation: 1.0,
+            covariance_conditional: None,
+            covariance_corrected: None,
+            inference: None,
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: gam::pirls::PirlsStatus::MaxIterationsReached,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: gam::estimate::FitArtifacts {
+                criterion_certificate: Some(certificate),
+                ..Default::default()
+            },
+            inner_cycles: 0,
+        });
+        assert!(
+            result.is_err(),
+            "a genuinely non-certified inner status (MaxIterationsReached) must still be rejected"
         );
     }
 }
