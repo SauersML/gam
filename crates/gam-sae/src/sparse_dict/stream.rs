@@ -724,10 +724,13 @@ mod stream_tests {
         );
 
         let ev_stream = routed_ev(x.view(), &stream_decoder, s, &config);
+        // Same routed-EV functional on both arms: the one-shot EV is computed
+        // fresh from its returned decoder (the iterate no longer carries a
+        // cached EV -- the cache was the stale-gap defect #2023 removed).
+        let ev_one_shot = routed_ev(x.view(), &one_shot.decoder, one_shot.active, &config);
         assert!(
-            (ev_stream - one_shot.explained_variance).abs() < 1.0e-3,
-            "streamed EV {ev_stream} must match one-shot EV {} within 1e-3",
-            one_shot.explained_variance
+            (ev_stream - ev_one_shot).abs() < 1.0e-3,
+            "streamed EV {ev_stream} must match one-shot EV {ev_one_shot} within 1e-3",
         );
         assert!(
             ev_stream > 0.9,
