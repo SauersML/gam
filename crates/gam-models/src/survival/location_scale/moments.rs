@@ -242,6 +242,52 @@ pub(crate) fn symmetric_cone_fraction_to_boundary(
     alpha
 }
 
+/// `[0, ∞)`-truncated Gaussian expectation of a fallible pair integrand
+/// (#2390 layer 2): `E[f(w) | w ≥ 0]` for `w ~ N(mean, sd²)`.
+///
+/// The feasible image of the monotone I-spline cone under a non-negative
+/// basis row is exactly `w ≥ 0`, so the scalar link-wiggle integral must not
+/// spend mass on `w < 0` — predictor values no feasible model produces. The
+/// integral is computed through the truncated CDF map
+/// `w(u) = mean + sd·Φ⁻¹(Φ(−mean/sd) + u·(1 − Φ(−mean/sd)))`, `u ∈ (0, 1)`:
+/// the wall becomes the `u = 0` endpoint, the mapped integrand is smooth on
+/// the open interval, and fixed-node Gauss–Legendre converges spectrally.
+/// Far in the interior (`mean ≫ sd`) the truncated mass underflows and this
+/// is the plain Gaussian expectation.
+pub(crate) fn truncated_nonnegative_normal_expectation_pair(
+    mean: f64,
+    sd: f64,
+    f: impl Fn(f64) -> Result<(f64, f64), String>,
+) -> Result<(f64, f64), String> {
+    if !(sd > 0.0) || !sd.is_finite() {
+        return f(mean.max(0.0));
+    }
+    let p0 = gam_math::probability::normal_cdf(-mean / sd);
+    let retained = 1.0 - p0;
+    if retained <= 1.0e-300 {
+        // The unconstrained Gaussian sits essentially entirely below the wall;
+        // the truncated law concentrates at the wall itself.
+        return f(0.0);
+    }
+    let (nodes, weights) = gam_math::special::gauss_legendre(32);
+    let mut first = 0.0;
+    let mut second = 0.0;
+    for (t, wgt) in nodes.iter().zip(weights.iter()) {
+        let u = 0.5 * (t + 1.0);
+        let q = (p0 + u * retained).clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON);
+        let z = gam_math::probability::standard_normal_quantile(q)
+            .map_err(|e| format!("truncated-normal quantile at q={q}: {e}"))?;
+        let w = (mean + sd * z).max(0.0);
+        let (f1, f2) = f(w)?;
+        // Gauss–Legendre on [-1,1] carries a Jacobian ½ into u-space; the
+        // CDF map's own Jacobian is absorbed by construction (du IS the
+        // truncated probability measure).
+        first += 0.5 * wgt * f1;
+        second += 0.5 * wgt * f2;
+    }
+    Ok((first, second))
+}
+
 // Exact response moments must stay in the original Gaussian coordinates:
 // [h, threshold, log_sigma] for non-wiggle predictions, with a nested
 // conditional Gaussian over the scalar link-wiggle contribution when present.
@@ -397,13 +443,19 @@ pub(crate) fn exact_survival_response_moments_row(
                 let b = basis.row(0).to_owned();
                 let w_mean = b.dot(&cond_mean);
                 let w_var = b.dot(&cov_cond.dot(&b)).max(0.0);
-                crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
-                    quadctx,
-                    [x[0] + q0 + w_mean],
-                    [[w_var]],
-                    21,
-                    |eta| {
-                        let p = inverse_link_survival_prob_checked(&input.inverse_link, eta[0])?;
+                // #2390 layer 2: the wiggle contribution's feasible image is
+                // exactly `w ≥ 0` (non-negative I-spline basis row against the
+                // β_w ≥ 0 cone), so the scalar integral runs over the
+                // `[0, ∞)`-truncated conditional Gaussian — never over
+                // predictor values no feasible model produces.
+                truncated_nonnegative_normal_expectation_pair(
+                    w_mean,
+                    w_var.sqrt(),
+                    |w| {
+                        let p = inverse_link_survival_prob_checked(
+                            &input.inverse_link,
+                            x[0] + q0 + w,
+                        )?;
                         Ok((p, p * p))
                     },
                 )

@@ -8520,3 +8520,44 @@ pub(crate) fn cone_fraction_to_boundary_is_sign_symmetric_and_feasible_2390() {
         assert!(b + alpha * dv >= 0.0 && b - alpha * dv >= 0.0, "both ± nodes must stay in the cone");
     }
 }
+
+/// #2390 layer 2: the `[0,∞)`-truncated Gaussian expectation matches the
+/// closed-form truncated-normal moments (E[w | w ≥ 0] = μ + σ·φ(α)/(1−Φ(α)),
+/// α = −μ/σ), normalizes the measure exactly, and degenerates to the wall
+/// when the unconstrained mass sits entirely below it.
+#[test]
+pub(crate) fn truncated_nonnegative_normal_expectation_matches_closed_form_2390() {
+    use gam_math::probability::normal_cdf;
+    let phi = |x: f64| (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    // Measure normalization: a constant integrand integrates to itself.
+    let (one, four) = super::moments::truncated_nonnegative_normal_expectation_pair(
+        0.3, 0.7, |_| Ok((1.0, 4.0)),
+    )
+    .expect("constant integrand");
+    assert!((one - 1.0).abs() < 1e-12 && (four - 4.0).abs() < 1e-12);
+    // First moment against the closed form, at a wall-adjacent mean.
+    for &(mu, sd) in &[(0.3_f64, 0.7_f64), (0.0, 1.3), (2.5, 0.5), (-0.4, 0.8)] {
+        let alpha = -mu / sd;
+        let expected = mu + sd * phi(alpha) / (1.0 - normal_cdf(alpha));
+        let (m1, _) = super::moments::truncated_nonnegative_normal_expectation_pair(
+            mu, sd, |w| Ok((w, w * w)),
+        )
+        .expect("identity integrand");
+        assert!(
+            (m1 - expected).abs() < 1e-9 * expected.abs().max(1.0),
+            "E[w | w>=0] mismatch at mu={mu} sd={sd}: got {m1}, want {expected}"
+        );
+    }
+    // Interior limit: truncation underflows and the plain mean is recovered.
+    let (m1, _) = super::moments::truncated_nonnegative_normal_expectation_pair(
+        50.0, 1.0, |w| Ok((w, w * w)),
+    )
+    .expect("interior integrand");
+    assert!((m1 - 50.0).abs() < 1e-9);
+    // All mass below the wall: the truncated law concentrates at the wall.
+    let (m1, m2) = super::moments::truncated_nonnegative_normal_expectation_pair(
+        -1.0e6, 1.0e-3, |w| Ok((w, 1.0 + w)),
+    )
+    .expect("wall integrand");
+    assert!(m1 == 0.0 && m2 == 1.0);
+}
