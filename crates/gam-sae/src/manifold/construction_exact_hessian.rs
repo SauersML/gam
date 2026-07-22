@@ -1189,6 +1189,199 @@ impl SaeManifoldTerm {
     /// production builder's inner loop for exactly that config; the softmax
     /// diagonal `assignment_prior_hdiag_derivative_entry` is 0 for softmax and is
     /// omitted here for the same reason.
+    /// #2330 Patch D — the t--β residual-curvature second-derivative leg
+    /// `⟨error_metric, ∂²(gate_kβ·φ_mβ)/∂θ_a∂θ_w⟩` (term-2 of `∂ΔC_tβ[a,β]/∂θ_w`;
+    /// the term-1 `⟨jets.first(w), jets.beta_deriv(a,β)⟩` is added inline). The
+    /// border channel `β = (atom kβ, basis mβ, output-vector)` gives
+    /// `∂f_out/∂β = gate_kβ·φ_mβ·output_out`, so this leg is
+    /// `eo · g_kβ^{(l)} · ∂^{2−l}φ_mβ` with `eo = Σ_out error_metric[out]·output[out]`,
+    /// `l` the number of LOGIT derivatives among `{a,w}`, on the coord axes of the
+    /// rest; nonzero only when `a,w` both touch `kβ`. `l≥1` uses the ordered-BB
+    /// logistic-gate derivatives; skipped for other modes (softmax follow-on).
+    #[allow(clippy::too_many_arguments)]
+    fn patchd_residual_third_leg_beta(
+        &self,
+        row: usize,
+        a_var: SaeLocalRowVar,
+        w_var: SaeLocalRowVar,
+        ch: &SaeBorderChannel,
+        error_metric: &[f64],
+        sqrt_w: f64,
+        assignments: &Array1<f64>,
+        second_jets: &[Array4<f64>],
+        is_obb: bool,
+        inv_tau: f64,
+    ) -> f64 {
+        let classify = |v: SaeLocalRowVar| -> (usize, Option<usize>) {
+            match v {
+                SaeLocalRowVar::Coord { atom, axis } => (atom, Some(axis)),
+                SaeLocalRowVar::Logit { atom } => (atom, None),
+            }
+        };
+        let (ka, aa) = classify(a_var);
+        let (kw, aw) = classify(w_var);
+        if ka != ch.atom || kw != ch.atom {
+            return 0.0;
+        }
+        let atom_idx = ch.atom;
+        let m = ch.basis_col;
+        let mut coord_axes: Vec<usize> = Vec::with_capacity(2);
+        let mut logit_count = 0usize;
+        for opt in [aa, aw] {
+            match opt {
+                Some(axis) => coord_axes.push(axis),
+                None => logit_count += 1,
+            }
+        }
+        if logit_count > 0 && !is_obb {
+            return 0.0;
+        }
+        let atom = &self.atoms[atom_idx];
+        // ∂^{2−l}φ_m over the coord axes.
+        let phi = match coord_axes.len() {
+            2 => second_jets[atom_idx][[row, m, coord_axes[0], coord_axes[1]]],
+            1 => atom.basis_jacobian[[row, m, coord_axes[0]]],
+            _ => atom.basis_values[[row, m]],
+        };
+        let s = assignments[atom_idx];
+        let gate_factor = match logit_count {
+            0 => s,
+            1 => s * (1.0 - s) * inv_tau,
+            _ => s * (1.0 - s) * (1.0 - 2.0 * s) * inv_tau * inv_tau,
+        };
+        // eo = Σ_out error_metric[out]·output[out] (the channel's output weighting).
+        let p = error_metric.len().min(ch.output.len());
+        let mut eo = 0.0_f64;
+        for out in 0..p {
+            eo += error_metric[out] * ch.output[out];
+        }
+        sqrt_w * gate_factor * phi * eo
+    }
+
+    /// #2330 Patch D — the exact-A residual-curvature THIRD-derivative leg
+    /// `⟨error_metric, ∂³f_{a,b,w}⟩`, the second half of `∂ΔC_tt[a,b]/∂θ_w`
+    /// (the first half `⟨∂error_metric/∂θ_w, ∂²f⟩ = ⟨jets.first(w), jets.second(a,b)⟩`
+    /// is added inline as term 1a). The data fit is `½rᵀMr` so its residual
+    /// curvature is `⟨M r, ∂²f⟩`; differentiating the SECOND-jet factor gives this
+    /// leg. For the per-atom gated decoder `f_out = Σ_k g_k(ℓ_k)·Σ_m B_k[m,out]·φ_m(x_k)`,
+    /// `∂³f` is nonzero only when `a,b,w` all touch ONE atom `k` (each summand
+    /// depends only on that atom's `(x_k, ℓ_k)` — exact for ordered-Beta–Bernoulli
+    /// where `g_k` depends on `ℓ_k` alone). It then factors as `g_k^{(l)} · Σ_m
+    /// B_k[m,out]·∂^{c}φ_m` where `l` = number of LOGIT derivatives among `{a,b,w}`
+    /// and `c = 3−l` = number of COORD derivatives (over their axes). The `l=0`
+    /// coord³ leg uses the plain gate value and holds for ANY mode; the `l≥1` legs
+    /// use the ordered-Beta–Bernoulli logistic-gate derivatives and are skipped
+    /// (returns 0) for other modes — softmax's cross-atom gate third-order is a
+    /// separate follow-on. `error_metric` already carries one `√w·M`; this leg
+    /// carries the other `√w`, matching the `⟨error_metric, jets.second⟩`
+    /// convention exactly.
+    #[allow(clippy::too_many_arguments)]
+    fn patchd_residual_third_leg(
+        &self,
+        row: usize,
+        a_var: SaeLocalRowVar,
+        b_var: SaeLocalRowVar,
+        w_var: SaeLocalRowVar,
+        error_metric: &[f64],
+        sqrt_w: f64,
+        assignments: &Array1<f64>,
+        second_jets: &[Array4<f64>],
+        third_jets: Option<&[Option<ndarray::Array5<f64>>]>,
+        is_obb: bool,
+        inv_tau: f64,
+    ) -> f64 {
+        // Classify each var as (atom, Some(axis)) for a coordinate or
+        // (atom, None) for a logit; all three must share ONE atom.
+        let classify = |v: SaeLocalRowVar| -> (usize, Option<usize>) {
+            match v {
+                SaeLocalRowVar::Coord { atom, axis } => (atom, Some(axis)),
+                SaeLocalRowVar::Logit { atom } => (atom, None),
+            }
+        };
+        let (ka, aa) = classify(a_var);
+        let (kb, ab) = classify(b_var);
+        let (kw, aw) = classify(w_var);
+        if ka != kb || ka != kw {
+            return 0.0;
+        }
+        let atom_idx = ka;
+        // Collect coord axes; count logit derivatives.
+        let mut coord_axes: Vec<usize> = Vec::with_capacity(3);
+        let mut logit_count = 0usize;
+        for opt in [aa, ab, aw] {
+            match opt {
+                Some(axis) => coord_axes.push(axis),
+                None => logit_count += 1,
+            }
+        }
+        if logit_count > 0 && !is_obb {
+            // Non-OBB gate third-order (softmax cross-atom) is a follow-on;
+            // the l==0 basis third jet still applies to any mode.
+            return 0.0;
+        }
+        let atom = &self.atoms[atom_idx];
+        let basis = atom.basis_size();
+        let decoder = &atom.decoder_coefficients; // (basis, out)
+        let p = error_metric.len();
+        // D_c[out] = Σ_m B[m,out] · ∂^c φ_m over the collected coord axes.
+        let mut d_c = vec![0.0_f64; p];
+        match coord_axes.len() {
+            3 => {
+                let Some(tj) = third_jets.and_then(|t| t[atom_idx].as_ref()) else {
+                    return 0.0; // no analytic third jet for this atom
+                };
+                let (a0, a1, a2) = (coord_axes[0], coord_axes[1], coord_axes[2]);
+                for m in 0..basis {
+                    let phi3 = tj[[row, m, a0, a1, a2]];
+                    for out in 0..p {
+                        d_c[out] += decoder[[m, out]] * phi3;
+                    }
+                }
+            }
+            2 => {
+                let sj = &second_jets[atom_idx];
+                let (a0, a1) = (coord_axes[0], coord_axes[1]);
+                for m in 0..basis {
+                    let phi2 = sj[[row, m, a0, a1]];
+                    for out in 0..p {
+                        d_c[out] += decoder[[m, out]] * phi2;
+                    }
+                }
+            }
+            1 => {
+                let a0 = coord_axes[0];
+                for m in 0..basis {
+                    let phi1 = atom.basis_jacobian[[row, m, a0]];
+                    for out in 0..p {
+                        d_c[out] += decoder[[m, out]] * phi1;
+                    }
+                }
+            }
+            _ => {
+                for m in 0..basis {
+                    let phi0 = atom.basis_values[[row, m]];
+                    for out in 0..p {
+                        d_c[out] += decoder[[m, out]] * phi0;
+                    }
+                }
+            }
+        }
+        // Gate factor g^{(l)}: l logit derivatives of the atom's gate. For OBB
+        // g = σ(ℓ/τ): g0=s, g1=s(1−s)/τ, g2=s(1−s)(1−2s)/τ², g3=s(1−s)(1−6s+6s²)/τ³.
+        let s = assignments[atom_idx];
+        let gate_factor = match logit_count {
+            0 => s,
+            1 => s * (1.0 - s) * inv_tau,
+            2 => s * (1.0 - s) * (1.0 - 2.0 * s) * inv_tau * inv_tau,
+            _ => s * (1.0 - s) * (1.0 - 6.0 * s + 6.0 * s * s) * inv_tau * inv_tau * inv_tau,
+        };
+        let mut acc = 0.0_f64;
+        for out in 0..p {
+            acc += error_metric[out] * d_c[out];
+        }
+        sqrt_w * gate_factor * acc
+    }
+
     fn logdet_theta_adjoint_dense(
         &self,
         rho: &SaeManifoldRho,
@@ -1197,6 +1390,11 @@ impl SaeManifoldTerm {
         channel: ThetaAdjointDhChannel,
         skip_deflation_dk: bool,
         exact_a: bool,
+        // #2330 Patch D — the data target, required ONLY for the exact-A
+        // residual-curvature third-derivative leg `⟨error_metric, ∂³f⟩`. `None`
+        // reproduces the pre-Patch-D behaviour exactly (the leg is skipped), so
+        // every non-exact-A caller passes `None`.
+        residual_target: Option<ArrayView2<'_, f64>>,
     ) -> Result<SaeArrowVector, String> {
         // #2330 — `skip_deflation_dk` drops the Daleckii–Krein deflation
         // correction, leaving the raw trace contraction. The split probe uses it
@@ -1239,6 +1437,36 @@ impl SaeManifoldTerm {
             }
             _ => (0.0, 0.0),
         };
+        // #2330 Patch D residual-curvature leg setup. Active only on the exact-A
+        // route with a target: builds `∂³f` from raw basis jets + gate
+        // derivatives (see `patchd_residual_third_leg`).
+        let patchd_residual = exact_a.then_some(residual_target).flatten();
+        let patchd_third_jets = if patchd_residual.is_some() {
+            Some(self.atom_third_jets()?)
+        } else {
+            None
+        };
+        let patchd_is_obb = matches!(
+            self.assignment.mode,
+            AssignmentMode::OrderedBetaBernoulli { .. }
+        );
+        // #2330 Patch D channel-2 — ordered-BB prior curvature θ-adjoint data
+        // (cross-row; contracted after the row loop). Only for the exact-A
+        // full-channel route.
+        let patchd_obb_adjoint = if patchd_residual.is_some() && patchd_is_obb {
+            crate::assignment::ordered_beta_bernoulli_logit_adjoint_data_weighted(
+                &self.assignment,
+                rho,
+                self.row_loss_weights.as_deref(),
+            )?
+        } else {
+            None
+        };
+        let patchd_obb_inv_tau = match self.assignment.mode {
+            AssignmentMode::OrderedBetaBernoulli { temperature, .. } => 1.0 / temperature,
+            _ => 0.0,
+        };
+        let p_out = self.output_dim();
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
@@ -1268,6 +1496,37 @@ impl SaeManifoldTerm {
                 .expect("softmax assignments row must be contiguous");
             let m_log_mean = softmax_majorizer_log_mean(a_soft);
             let w_row = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
+            // #2330 Patch D — per-row `error_metric = √w·M·r` in output space,
+            // built EXACTLY as `apply_exact_hessian_minus_b` builds the object it
+            // contracts ΔC against (√w residual, then whitening metric applied).
+            let patchd_error_metric: Option<Vec<f64>> = patchd_residual.map(|tgt| {
+                let sqrt_w = w_row.sqrt();
+                let active_atoms = self
+                    .last_row_layout
+                    .as_ref()
+                    .map(|layout| layout.active_atoms[row].as_slice());
+                let mut fitted = vec![0.0_f64; p_out];
+                let mut decoded = vec![0.0_f64; p_out];
+                for k in 0..k_atoms {
+                    if active_atoms.is_some_and(|active| active.binary_search(&k).is_err()) {
+                        continue;
+                    }
+                    self.atoms[k].fill_decoded_row(row, &mut decoded);
+                    let a_k = assignments[k];
+                    for out in 0..p_out {
+                        fitted[out] += a_k * decoded[out];
+                    }
+                }
+                let mut err = Array1::<f64>::zeros(p_out);
+                for out in 0..p_out {
+                    err[out] = sqrt_w * (fitted[out] - tgt[[row, out]]);
+                }
+                match self.row_metric.as_ref() {
+                    Some(metric) if whiten_row_jets => metric.apply_metric_row(row, err.view()),
+                    _ => err.to_vec(),
+                }
+            });
+            let patchd_sqrt_w = w_row.sqrt();
             // #2308 — per-row spectral/gauge deflation the criterion factor applied.
             // It is FROZEN at the fixed stratum (the radial-gauge / ARD-inactive-half
             // null is ρ-invariant), so contracting the DEFLATED inverse `inv` and
@@ -1312,15 +1571,65 @@ impl SaeManifoldTerm {
                                     SaeLocalRowVar::Coord { atom: atom_b, .. },
                                 ) => {
                                     sae_dot(jets.first(a), jets.first(b))
-                                        * Self::softmax_data_weight_product_logit_factor(
+                                        * (Self::softmax_data_weight_product_logit_factor(
                                             a_soft, atom_a, atom_b, atom_w, inv_tau,
-                                        )
+                                        ) + if patchd_is_obb
+                                            && atom_w == atom_a
+                                            && atom_w == atom_b
+                                        {
+                                            // #2330 — ordered-Beta--Bernoulli gate
+                                            // gradient of the GN curvature. `B[a,b]`
+                                            // carries `gate^2`, so
+                                            // `dB/dl_w = 2*(gate'/gate)*B = 2(1-gate)/tau*B`.
+                                            // Same-atom only: the OBB gates are
+                                            // INDEPENDENT per atom, so the cross-atom
+                                            // derivative is exactly zero (unlike
+                                            // softmax's shared normalization). The
+                                            // softmax factor above is 0 here (`inv_tau`
+                                            // is 0 for non-softmax modes), so the softmax
+                                            // path is bitwise unchanged.
+                                            2.0 * (1.0 - a_soft[atom_w]) * patchd_obb_inv_tau
+                                        } else {
+                                            0.0
+                                        })
                                 }
                                 _ => {
                                     sae_dot(jets.second(a, w), jets.first(b))
                                         + sae_dot(jets.first(a), jets.second(b, w))
                                 }
                             };
+                        }
+                        if let Some(em) = patchd_error_metric.as_ref() {
+                            dh += self.patchd_residual_third_leg(
+                                row,
+                                jets.vars[a],
+                                jets.vars[b],
+                                jets.vars[w],
+                                em,
+                                patchd_sqrt_w,
+                                &assignments,
+                                &second_jets,
+                                patchd_third_jets.as_deref(),
+                                patchd_is_obb,
+                                patchd_obb_inv_tau,
+                            );
+                        }
+                        if want_data && exact_a {
+                            // #2330 Patch D (1a) — `A = B + ΔC` carries the residual
+                            // curvature `ΔC_tt[a,b] = ⟨error_metric, ∂²f_ab⟩` that the
+                            // Gauss-Newton assembly drops, and that block moves with
+                            // `θ_w` too:
+                            //   `∂ΔC_tt[a,b]/∂θ_w = ⟨∂error_metric/∂θ_w, ∂²f_ab⟩`
+                            //                      `+ ⟨error_metric, ∂³f_abw⟩`.
+                            // `∂error_metric/∂θ_w = √w·M·∂f/∂θ_w`, which in THIS
+                            // function's jet convention is exactly `jets.first(w)`:
+                            // every jet carries one `√w` and (under whitening) one
+                            // metric factor `L`, so a plain dot of two jets
+                            // reconstitutes the `w`-weighted `M`-inner product the
+                            // assembly uses. Only the FIRST leg lands here; the
+                            // third-jet leg `⟨error_metric, ∂³f_abw⟩` needs a jet
+                            // channel `SaeRowJets` does not expose.
+                            dh += sae_dot(jets.first(w), jets.second(a, b));
                         }
                         if want_entropy {
                             if let (
@@ -1388,8 +1697,30 @@ impl SaeManifoldTerm {
                 if want_data {
                     for a in 0..q {
                         for (beta_pos, ch) in border.iter().enumerate() {
-                            let dh = sae_dot(jets.second(a, w), jets.beta(beta_pos))
-                                + sae_dot(jets.first(a), jets.beta_deriv(w, beta_pos));
+                            // #2330 Patch D (1a), t--beta leg: `ΔC_tβ[a,β] =
+                            // ⟨error_metric, ∂²f_aβ⟩` moves with `θ_w` through the
+                            // residual exactly as the t--t block does.
+                            let mut dh = sae_dot(jets.second(a, w), jets.beta(beta_pos))
+                                + sae_dot(jets.first(a), jets.beta_deriv(w, beta_pos))
+                                + if exact_a {
+                                    sae_dot(jets.first(w), jets.beta_deriv(a, beta_pos))
+                                } else {
+                                    0.0
+                                };
+                            if let Some(em) = patchd_error_metric.as_ref() {
+                                dh += self.patchd_residual_third_leg_beta(
+                                    row,
+                                    jets.vars[a],
+                                    jets.vars[w],
+                                    ch,
+                                    em,
+                                    patchd_sqrt_w,
+                                    &assignments,
+                                    &second_jets,
+                                    patchd_is_obb,
+                                    patchd_obb_inv_tau,
+                                );
+                            }
                             gamma += 2.0 * inv[[base + a, total_t + ch.index]] * dh;
                         }
                     }
@@ -1437,6 +1768,14 @@ impl SaeManifoldTerm {
                     }
                     gamma_beta[w_channel.index] += gamma;
                 }
+            }
+        }
+        // #2330 Patch D channel-2 — fold the ordered-BB prior logit θ-adjoint into
+        // the logit t-slots (full channel only; it is the ∂ΔC_obb/∂θ leg).
+        if want_data {
+            if let Some(data) = patchd_obb_adjoint.as_ref() {
+                let obb = self.dense_exact_a_ordered_bb_logit_theta_adjoint(cache, inv, data)?;
+                gamma_t += &obb;
             }
         }
         Ok(SaeArrowVector {
@@ -1760,6 +2099,7 @@ impl SaeManifoldTerm {
                 ThetaAdjointDhChannel::All,
                 false,
                 false,
+                None,
             )?;
             let mut d_gamma_tt = self.logdet_theta_adjoint_dense(
                 rho,
@@ -1768,6 +2108,7 @@ impl SaeManifoldTerm {
                 ThetaAdjointDhChannel::All,
                 false,
                 false,
+                None,
             )?;
             if smooth_range.contains(&i) {
                 // Smooth part(b) = 0; the only smooth ρ-derivative of Γ_eff is
@@ -1783,6 +2124,7 @@ impl SaeManifoldTerm {
                     ThetaAdjointDhChannel::SoftmaxSparseMixed,
                     false,
                     false,
+                    None,
                 )?;
                 let mixed_tt = self.logdet_theta_adjoint_dense(
                     rho,
@@ -1791,6 +2133,7 @@ impl SaeManifoldTerm {
                     ThetaAdjointDhChannel::SoftmaxSparseMixed,
                     false,
                     false,
+                    None,
                 )?;
                 d_gamma_joint.t += &mixed_joint.t;
                 d_gamma_joint.beta += &mixed_joint.beta;
@@ -1805,6 +2148,7 @@ impl SaeManifoldTerm {
                     ThetaAdjointDhChannel::ArdMixed { target_flat: i },
                     false,
                     false,
+                    None,
                 )?;
                 let mixed_tt = self.logdet_theta_adjoint_dense(
                     rho,
@@ -1813,6 +2157,7 @@ impl SaeManifoldTerm {
                     ThetaAdjointDhChannel::ArdMixed { target_flat: i },
                     false,
                     false,
+                    None,
                 )?;
                 d_gamma_joint.t += &mixed_joint.t;
                 d_gamma_joint.beta += &mixed_joint.beta;
@@ -2982,6 +3327,7 @@ impl SaeManifoldTerm {
             ThetaAdjointDhChannel::All,
             true,
             true,
+            Some(target),
         )?;
         let gamma_tt = self.logdet_theta_adjoint_dense(
             rho,
@@ -2990,6 +3336,7 @@ impl SaeManifoldTerm {
             ThetaAdjointDhChannel::All,
             true,
             true,
+            Some(target),
         )?;
         gamma.t -= &gamma_tt.t;
         gamma.beta -= &gamma_tt.beta;
@@ -3007,6 +3354,95 @@ impl SaeManifoldTerm {
     /// The operator lives on logit t-slots only (no β border), so the coordinate
     /// block reuses the same columns against `A_tt⁺`. Learnable α (nonlinear
     /// concentration derivative) is refused, not silently mispriced.
+    /// #2330 Patch D — the ordered-Beta--Bernoulli prior curvature θ-adjoint
+    /// `Σ_{i,j} inv[i,j]·∂ΔC_obb[i,j]/∂ℓ_w`, the logit-block contribution the
+    /// residual-curvature legs cannot carry (`ΔC_obb` couples rows CROSS-column,
+    /// not row-locally). Per column `c`, `ΔC_obb = weight·S'_c·uuᵀ +
+    /// diag(min(D_i, 0))` with `u_i = w_i·z_i(1−z_i)/τ`,
+    /// `curv_i = z_i(1−z_i)(1−2z_i)/τ²`, `D_i = weight·S_c·w_i·curv_i`. Its logit
+    /// derivative contracts to (with `P = uᵀ inv_cc u`, `(inv·u)_r`,
+    /// `G = Σ_i inv[i,i]·[D_i<0]·w_i·curv_i`, `curv'_i = z_i(1−z_i)(1−6z_i+6z_i²)/τ³`):
+    ///   `Γ[w=(r,c)] = weight·{ S''_c·u_r·P + 2·S'_c·w_r·curv_r·(inv·u)_r
+    ///                          + S'_c·u_r·G + [D_r<0]·S_c·inv[r,r]·w_r·curv'_r }`.
+    /// Contracts whichever pseudo-inverse the caller passes (`A⁺` for the joint
+    /// leg, `A_tt⁺` for the coordinate leg), on the logit t-slots.
+    fn dense_exact_a_ordered_bb_logit_theta_adjoint(
+        &self,
+        cache: &ArrowFactorCache,
+        inv: &Array2<f64>,
+        data: &gam_terms::analytic_penalties::OrderedBetaBernoulliLogitAdjointData,
+    ) -> Result<Array1<f64>, String> {
+        let n = data.n;
+        let k = data.k_max;
+        let weight = data.weight;
+        let inv_tau = 1.0 / data.tau;
+        let inv_tau2 = inv_tau * inv_tau;
+        let inv_tau3 = inv_tau2 * inv_tau;
+        let total_t = cache.delta_t_len();
+        let mut out = Array1::<f64>::zeros(total_t);
+        // Global t-slot of each (row, column) logit in the cache layout.
+        let mut gindex: Vec<Vec<Option<usize>>> = vec![vec![None; k]; n];
+        for row in 0..n {
+            let base = cache.row_offsets[row];
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            for (local, var) in vars.iter().enumerate() {
+                if let SaeLocalRowVar::Logit { atom } = *var {
+                    if atom < k {
+                        gindex[row][atom] = Some(base + local);
+                    }
+                }
+            }
+        }
+        // Structural quantities per (row, column): (u, curv, curv', w, active).
+        let uval = |row: usize, col: usize| -> (f64, f64, f64, f64, bool) {
+            let z = data.z[row * k + col];
+            let w = data.row_weight[row];
+            let zc = z * (1.0 - z);
+            let u = w * zc * inv_tau;
+            let curv = zc * (1.0 - 2.0 * z) * inv_tau2;
+            let curvp = zc * (1.0 - 6.0 * z + 6.0 * z * z) * inv_tau3;
+            let d = weight * data.score[col] * w * curv;
+            (u, curv, curvp, w, d < 0.0)
+        };
+        for col in 0..k {
+            if data.column_fixed[col] {
+                continue;
+            }
+            let s = data.score[col];
+            let sp = data.score_derivative[col];
+            let spp = data.score_second[col];
+            let rows: Vec<usize> = (0..n).filter(|&r| gindex[r][col].is_some()).collect();
+            let mut au = vec![0.0_f64; n];
+            let mut p = 0.0_f64;
+            let mut g = 0.0_f64;
+            for &ri in &rows {
+                let gi = gindex[ri][col].expect("row filtered to Some");
+                let (ui, curvi, _curvpi, wi, acti) = uval(ri, col);
+                let mut au_ri = 0.0_f64;
+                for &rj in &rows {
+                    let gj = gindex[rj][col].expect("row filtered to Some");
+                    let (uj, _, _, _, _) = uval(rj, col);
+                    au_ri += inv[[gi, gj]] * uj;
+                }
+                au[ri] = au_ri;
+                p += ui * au_ri;
+                if acti {
+                    g += inv[[gi, gi]] * wi * curvi;
+                }
+            }
+            for &ri in &rows {
+                let gi = gindex[ri][col].expect("row filtered to Some");
+                let (ui, curvi, curvpi, wi, acti) = uval(ri, col);
+                let mut val = spp * ui * p + 2.0 * sp * wi * curvi * au[ri] + sp * ui * g;
+                if acti {
+                    val += s * inv[[gi, gi]] * wi * curvpi;
+                }
+                out[gi] += weight * val;
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn dense_exact_a_ordered_bb_sparse_trace(
         &self,
         rho: &SaeManifoldRho,
@@ -3113,8 +3549,64 @@ mod test_support {
         ThetaAdjointDhChannel,
     };
     use ndarray::{Array1, s};
+    use gam_linalg::faer_ndarray::FaerEigh;
+    use super::Side;
 
     impl super::SaeManifoldTerm {
+        /// #2330 Patch D arbiter support — spectrum summary of the EXACT `A` at a
+        /// built cache: `(min_eig, max_eig, n_below_neg_floor, ‖ΔC‖_F, ‖A‖_F)`.
+        /// The PD-window scan uses it to pick an arbiter fixture whose exact `A`
+        /// is positive definite (so the criterion does not refuse) while the
+        /// residual-curvature block `ΔC` — the very object Patch D
+        /// differentiates — stays large enough for a finite difference to
+        /// resolve. A fixture with `‖ΔC‖ ≈ 0` would false-green the arbiter.
+        pub(crate) fn exact_a_spectrum_summary(
+            &self,
+            rho: &SaeManifoldRho,
+            target: ndarray::ArrayView2<'_, f64>,
+            cache: &ArrowFactorCache,
+        ) -> Result<(f64, f64, usize, f64, f64), String> {
+            let a = self.materialize_exact_hessian_dense(rho, target, cache)?;
+            let (eigs, _vecs) = a
+                .eigh(Side::Lower)
+                .map_err(|e| format!("exact_a_spectrum_summary: eigh failed: {e:?}"))?;
+            let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let min_eig = eigs.iter().copied().fold(f64::INFINITY, f64::min);
+            let floor = Self::SAE_EXACT_A_PD_FLOOR_REL * max_eig.max(1.0);
+            let n_neg = eigs.iter().filter(|&&lambda| lambda < -floor).count();
+            let mut sorted: Vec<f64> = eigs.to_vec();
+            sorted.sort_by(|x, y| x.partial_cmp(y).expect("finite eigenvalues"));
+            let tail: Vec<String> = sorted.iter().take(6).map(|l| format!("{l:.6e}")).collect();
+            eprintln!(
+                "PATCHD_SPECTRUM floor={floor:.6e} smallest6=[{}]",
+                tail.join(", ")
+            );
+            let total_t = cache.delta_t_len();
+            let dim = total_t + cache.k;
+            let mut dc_sq = 0.0_f64;
+            let mut unit = SaeArrowVector {
+                t: Array1::<f64>::zeros(total_t),
+                beta: Array1::<f64>::zeros(cache.k),
+            };
+            for col in 0..dim {
+                if col < total_t {
+                    unit.t[col] = 1.0;
+                } else {
+                    unit.beta[col - total_t] = 1.0;
+                }
+                let dcv = self.apply_exact_hessian_minus_b(rho, target, cache, &unit)?;
+                if col < total_t {
+                    unit.t[col] = 0.0;
+                } else {
+                    unit.beta[col - total_t] = 0.0;
+                }
+                dc_sq += dcv.t.iter().map(|x| x * x).sum::<f64>()
+                    + dcv.beta.iter().map(|x| x * x).sum::<f64>();
+            }
+            let a_frob = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+            Ok((min_eig, max_eig, n_neg, dc_sq.sqrt(), a_frob))
+        }
+
         /// PATH C (#2253) CH5 test-support — the max `|dense − production|` of the
         /// θ-adjoint reconstruction over the `(t, β)` blocks, for the joint
         /// (`inv = G`) and coordinate-block (`inv = h_bd`) legs. A failing FD gate
@@ -3131,7 +3623,7 @@ mod test_support {
             let g = self.materialize_joint_inverse(cache, &solver)?;
             let h_bd = self.materialize_block_diag_t_inverse(cache);
             let dense_joint =
-                self.logdet_theta_adjoint_dense(rho, cache, &g, ThetaAdjointDhChannel::All, false, false)?;
+                self.logdet_theta_adjoint_dense(rho, cache, &g, ThetaAdjointDhChannel::All, false, false, None)?;
             let dense_tt = self.logdet_theta_adjoint_dense(
                 rho,
                 cache,
@@ -3139,6 +3631,7 @@ mod test_support {
                 ThetaAdjointDhChannel::All,
                 false,
                 false,
+                None,
             )?;
             let prod_joint = self.logdet_theta_adjoint(rho, cache, &solver)?;
             let prod_tt = self.coordinate_block_logdet_theta_adjoint(rho, cache, &solver)?;
@@ -3160,6 +3653,32 @@ mod test_support {
                 max_diff(&dense_joint, &prod_joint),
                 max_diff(&dense_tt, &prod_tt),
             ))
+        }
+
+        /// #2330 Patch D arbiter support — the EXACT-A joint θ-adjoint
+        /// `Γ_A = tr(A⁺ ∂A/∂θ) = ∂(log|A|)/∂θ`, built from the quotient
+        /// pseudo-inverse and the `exact_a = true` dh (`∂B/∂θ + ∂ΔC/∂θ`).
+        /// Comparing this against a central difference of
+        /// `exact_observed_information_log_dets(...).0` over frozen θ̂ measures
+        /// exactly the residual-curvature/ordered-BB/entropy legs of `∂ΔC/∂θ`
+        /// still missing, coordinate by coordinate.
+        pub(crate) fn exact_a_theta_adjoint_joint(
+            &self,
+            rho: &SaeManifoldRho,
+            target: ndarray::ArrayView2<'_, f64>,
+            cache: &ArrowFactorCache,
+        ) -> Result<SaeArrowVector, String> {
+            let (a_pinv, _a_tt_pinv) =
+                self.materialize_exact_hessian_quotient_inverse(rho, target, cache)?;
+            self.logdet_theta_adjoint_dense(
+                rho,
+                cache,
+                &a_pinv,
+                ThetaAdjointDhChannel::All,
+                true,
+                true,
+                Some(target),
+            )
         }
 
         /// #2330 split probe — the g3 cross non-conservation attributed to the
@@ -3209,6 +3728,7 @@ mod test_support {
                         ThetaAdjointDhChannel::All,
                         skip_dk,
                         false,
+                        None,
                     )?))
                 } else if smooth_range.contains(&c) {
                     Ok(Array1::<f64>::zeros(dim)) // smooth part-b is 0
@@ -3221,6 +3741,7 @@ mod test_support {
                     Ok(flatten(&self.logdet_theta_adjoint_dense(
                         rho, cache, &g, channel, skip_dk,
                         false,
+                        None,
                     )?))
                 }
             };
