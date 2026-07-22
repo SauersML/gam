@@ -594,11 +594,17 @@ struct LatentSurvivalTimeJet {
 
 pub fn fit_latent_survival_terms(
     data: ArrayView2<'_, f64>,
-    spec: LatentSurvivalTermSpec,
+    mut spec: LatentSurvivalTermSpec,
     frailty: FrailtySpec,
     options: &BlockwiseFitOptions,
 ) -> Result<LatentSurvivalTermFitResult, String> {
     let frailty_scale = validate_latent_survival_inputs(data, &spec, &frailty)?;
+    // Cover the monotone I-spline baseline's unpenalized affine null direction
+    // with a REML-selected function-space shrinkage ridge, so the interval
+    // warm-start surrogates (whose likelihood has no curvature along that
+    // direction) have a unique MAP instead of refusing. No-op on blocks whose
+    // penalties already span their column space. See the installer's doc.
+    install_latent_time_nullspace_shrinkage_penalty(&mut spec.time_block)?;
     let (latent_sd, learned_initial_sigma) = match frailty_scale {
         FrailtyScale::Fixed { sigma } => (Some(sigma), None),
         FrailtyScale::Learned { initial_sigma } => (None, Some(initial_sigma)),
@@ -1184,6 +1190,136 @@ fn build_log_sigma_blockspec(initial_sigma: f64, n_obs: usize) -> ParameterBlock
         stacked_design: None,
         stacked_offset: None,
     }
+}
+
+/// Install the Marra & Wood function-space null-space shrinkage penalty (the
+/// "double penalty") on the latent-survival time block, so the monotone I-spline
+/// baseline's unpenalized affine null direction carries its own REML-selected
+/// curvature instead of being left flat.
+///
+/// The I-spline value-space penalty `S_I = Lᵀ S_B[1:,1:] L` (see the `ISpline`
+/// arm of [`crate::survival::construction::build_survival_time_basis`])
+/// deliberately leaves the affine trend `d(log Λ)/d(log t)` in its 1-D null space
+/// (`constant γ ↦ affine log Λ ↦ D₂ = 0`, gam#1076): on an event-rich fit the
+/// likelihood identifies that trend, so penalizing it would only bias the
+/// baseline. But the interval-censored warm-start evaluates the same direction
+/// where the surrogate likelihood has no curvature there — the
+/// right-censored-at-`L` surrogate has no finite failures at all, and the
+/// finite-lower-endpoint surrogate's grid-tied events leave `Jᵀ W J` near-flat
+/// along the affine mode — so the MAP is non-unique and the fit refuses
+/// (`gam_identifiability::check_map_uniqueness`: the affine null direction of
+/// `Jᵀ W J` carries `nᵀ S n < tol`, dominant block `time_transform`).
+///
+/// This is the treatment the survival marginal-slope time block already installs
+/// (`install_time_nullspace_shrinkage_penalty`): the shared
+/// [`gam_terms::basis::function_space_nullspace_shrinkage`] builds the
+/// function-metric ridge `G Z (ZᵀGZ)⁻¹ ZᵀG` (`Z` spanning the primary penalty's
+/// null space, `G` the endpoint-averaged basis Gram), whose range is exactly that
+/// null direction, so `nᵀ S n > 0` there. It is a *second* REML coordinate:
+/// where the affine trend is identified by the data REML drives its λ toward zero
+/// (no bias — the gam#1076 behaviour is preserved), and where it is not (the
+/// interval warm-start) the ridge supplies the curvature that makes the MAP
+/// unique. Returns `Ok(false)` when the block carries no penalty with a null
+/// space (nothing to cover).
+fn install_latent_time_nullspace_shrinkage_penalty(
+    time_block: &mut TimeBlockInput,
+) -> Result<bool, String> {
+    let p = time_block.design_exit.ncols();
+    if p == 0 || time_block.penalties.is_empty() {
+        return Ok(false);
+    }
+    if time_block.nullspace_dims.len() != time_block.penalties.len() {
+        return Err(format!(
+            "latent-survival time_block nullspace_dims length {} does not match penalties {}",
+            time_block.nullspace_dims.len(),
+            time_block.penalties.len(),
+        ));
+    }
+
+    // Aggregate the existing wiggliness penalties, each normalized by its own
+    // max-abs scale so the shared null space (not a scale-weighted average) is
+    // what the ridge covers. Mirrors the marginal-slope installer.
+    let mut aggregate = Array2::<f64>::zeros((p, p));
+    for (idx, penalty) in time_block.penalties.iter().enumerate() {
+        if penalty.nrows() != p || penalty.ncols() != p {
+            return Err(format!(
+                "latent-survival time_block penalty {idx} must be {p}x{p}, got {}x{}",
+                penalty.nrows(),
+                penalty.ncols(),
+            ));
+        }
+        let scale = penalty
+            .iter()
+            .try_fold(0.0_f64, |acc, &value| {
+                value.is_finite().then_some(acc.max(value.abs()))
+            })
+            .ok_or_else(|| {
+                format!("latent-survival time_block penalty {idx} contains non-finite values")
+            })?;
+        if scale > 0.0 {
+            ndarray::Zip::from(&mut aggregate)
+                .and(penalty)
+                .for_each(|agg, &value| *agg += value / scale);
+        }
+    }
+
+    // Endpoint-averaged function metric: entry and exit are the two value
+    // channels through which the baseline enters the survival likelihood, so
+    // averaging their Grams makes the ridge invariant to whole-sample
+    // replication and covariant under any coefficient-chart change
+    // (`G -> MᵀGM`), exactly like the marginal-slope time-block ridge.
+    if time_block.design_entry.ncols() != p {
+        return Err(format!(
+            "latent-survival time_block entry design has {} columns, expected {p}",
+            time_block.design_entry.ncols(),
+        ));
+    }
+    let entry_mass = time_block.design_entry.nrows();
+    let exit_mass = time_block.design_exit.nrows();
+    let total_mass = entry_mass.saturating_add(exit_mass);
+    if total_mass == 0 {
+        return Err(
+            "latent-survival time_block cannot define a function metric from zero endpoint rows"
+                .to_string(),
+        );
+    }
+    let entry_gram = time_block
+        .design_entry
+        .diag_xtw_x(&Array1::ones(entry_mass))
+        .map_err(|err| format!("latent-survival time_block entry function Gram: {err}"))?;
+    let exit_gram = time_block
+        .design_exit
+        .diag_xtw_x(&Array1::ones(exit_mass))
+        .map_err(|err| format!("latent-survival time_block exit function Gram: {err}"))?;
+    let function_gram = (entry_gram + exit_gram).mapv(|value| value / total_mass as f64);
+
+    let Some(shrinkage) =
+        gam_terms::basis::function_space_nullspace_shrinkage(&aggregate, &function_gram)
+            .map_err(|err| format!("latent-survival time_block nullspace shrinkage: {err}"))?
+    else {
+        return Ok(false);
+    };
+    if shrinkage.nrows() != p || shrinkage.ncols() != p {
+        return Err(format!(
+            "latent-survival time_block nullspace shrinkage penalty must be {p}x{p}, got {}x{}",
+            shrinkage.nrows(),
+            shrinkage.ncols(),
+        ));
+    }
+    time_block.penalties.push(shrinkage);
+    time_block.nullspace_dims.push(0);
+    // Keep the seed ρ vector consistent with the widened penalty list. The
+    // latent block builder reads `initial_log_lambdas` directly (unlike the
+    // marginal-slope path, which rebuilds its seed from the penalty list), so a
+    // `Some` seed must gain a coordinate for the new null-space penalty; seed it
+    // at the same smoothing scale as the existing time penalties.
+    if let Some(seeds) = time_block.initial_log_lambdas.as_mut() {
+        let seed = seeds.iter().copied().last().unwrap_or(0.0);
+        let mut widened = seeds.to_vec();
+        widened.push(seed);
+        *seeds = Array1::from_vec(widened);
+    }
+    Ok(true)
 }
 
 const LATENT_SURVIVAL_PRIMARY_Q_ENTRY: usize = 0;
@@ -6881,6 +7017,121 @@ mod tests {
             random_effect_terms: Vec::new(),
             smooth_terms: Vec::new(),
         }
+    }
+
+    /// Quadratic form `nᵀ M n`.
+    fn quad_form(m: &Array2<f64>, n_vec: &Array1<f64>) -> f64 {
+        n_vec.dot(&m.dot(n_vec))
+    }
+
+    /// The latent-survival time-block ridge must COVER the monotone baseline's
+    /// unpenalized affine null direction — the exact direction whose flat MAP
+    /// makes the interval-censored warm-start refuse
+    /// (`check_map_uniqueness`: `nᵀ S n < tol`, dominant block `time_transform`).
+    ///
+    /// The I-spline value-space penalty leaves a 1-D null space spanned by the
+    /// constant coefficient direction (`constant γ ↦ affine log Λ`). We stand it
+    /// in here with the first-difference penalty `D₁ᵀD₁`, whose null space is
+    /// exactly that constant/level direction, on a full-rank endpoint design so
+    /// the function Gram is SPD. Before installation the direction carries no
+    /// penalty curvature; after installation the appended shrinkage penalty
+    /// gives it the block's function-norm curvature, so the assembled penalty is
+    /// no longer flat there.
+    #[test]
+    fn latent_time_nullspace_shrinkage_covers_affine_null_direction() {
+        let n = 12usize;
+        let p = 4usize;
+
+        // Full column-rank endpoint designs (a Vandermonde over a spread grid),
+        // so the endpoint-averaged function Gram is SPD.
+        let design_at = |shift: f64| {
+            Array2::<f64>::from_shape_fn((n, p), |(i, j)| {
+                let t = shift + (i as f64) / (n as f64 - 1.0);
+                t.powi(j as i32)
+            })
+        };
+        let x_entry = design_at(0.0);
+        let x_exit = design_at(0.3);
+
+        // First-difference penalty D₁ᵀD₁ (order-1 P-spline): PSD with a 1-D null
+        // space = the constant (level) direction, mirroring the I-spline
+        // value-space penalty's affine null.
+        let mut penalty = Array2::<f64>::zeros((p, p));
+        for k in 0..p - 1 {
+            penalty[[k, k]] += 1.0;
+            penalty[[k + 1, k + 1]] += 1.0;
+            penalty[[k, k + 1]] -= 1.0;
+            penalty[[k + 1, k]] -= 1.0;
+        }
+
+        let mut time_block = TimeBlockInput {
+            design_entry: DesignMatrix::Dense(DenseDesignMatrix::from(x_entry.clone())),
+            design_exit: DesignMatrix::Dense(DenseDesignMatrix::from(x_exit.clone())),
+            design_derivative_exit: DesignMatrix::Dense(DenseDesignMatrix::from(x_exit.clone())),
+            offset_entry: Array1::zeros(n),
+            offset_exit: Array1::zeros(n),
+            derivative_offset_exit: Array1::zeros(n),
+            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
+            penalties: vec![penalty.clone()],
+            nullspace_dims: vec![1],
+            initial_log_lambdas: Some(Array1::from_elem(1, 0.5)),
+            initial_beta: None,
+        };
+
+        // The constant (level) direction is the penalty's null direction.
+        let null_dir = Array1::from_elem(p, 1.0 / (p as f64).sqrt());
+        let primary_before = quad_form(&penalty, &null_dir);
+        let penalty_scale = penalty.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        assert!(
+            primary_before < 1e-9 * penalty_scale,
+            "affine direction must start unpenalized: nᵀ S n = {primary_before:.3e}"
+        );
+
+        let installed = install_latent_time_nullspace_shrinkage_penalty(&mut time_block)
+            .expect("shrinkage installation must succeed on a full-rank endpoint design");
+        assert!(installed, "a penalty with a null space must gain a ridge");
+
+        // Bookkeeping stays self-consistent: one extra penalty, its structural
+        // nullspace dim recorded as 0 (a full-rank-on-support ridge), and the
+        // seed ρ vector widened to match.
+        assert_eq!(time_block.penalties.len(), 2);
+        assert_eq!(time_block.nullspace_dims, vec![1, 0]);
+        assert_eq!(
+            time_block.initial_log_lambdas.as_ref().map(|s| s.len()),
+            Some(2)
+        );
+
+        // The appended ridge gives the previously-null direction the block's
+        // function-norm curvature: `nᵀ R n ≈ nᵀ G n`, the endpoint-averaged
+        // function Gram of the null direction (the Marra & Wood identity for
+        // `n` spanning the 1-D null space).
+        let shrinkage = &time_block.penalties[1];
+        let function_gram =
+            (x_entry.t().dot(&x_entry) + x_exit.t().dot(&x_exit)).mapv(|v| v / (2 * n) as f64);
+        let ridge_curvature = quad_form(shrinkage, &null_dir);
+        let function_norm = quad_form(&function_gram, &null_dir);
+        assert!(
+            function_norm > 0.0,
+            "the null direction has positive function norm on a full-rank design"
+        );
+        assert!(
+            ridge_curvature > 0.5 * function_norm,
+            "ridge must cover the affine null direction: nᵀ R n = {ridge_curvature:.3e} vs \
+             nᵀ G n = {function_norm:.3e}"
+        );
+        assert!(
+            (ridge_curvature - function_norm).abs() < 1e-6 * function_norm.max(1.0),
+            "ridge curvature on the 1-D null must equal the function norm: \
+             nᵀ R n = {ridge_curvature:.3e}, nᵀ G n = {function_norm:.3e}"
+        );
+
+        // The assembled time-block penalty is no longer flat along the direction
+        // the MAP-uniqueness audit flagged.
+        let total: Array2<f64> = &penalty + shrinkage;
+        assert!(
+            quad_form(&total, &null_dir) > 0.5 * function_norm,
+            "assembled penalty must cover the previously-null direction"
+        );
     }
 
     /// A valid two-row latent-survival term spec (one exact event under loaded
