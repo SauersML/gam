@@ -801,6 +801,114 @@ mod amortized_encoder_tests {
         );
     }
 
+    /// PATH C (#2253) / #2339 DIAGNOSTIC — NAME the FD-kink site the softplus did
+    /// not heal. fix-2253 attributed the smooth×ARD FD instability to the periodic
+    /// `max(V'',0)` cos-basis majorizer clamp; #2339 smoothed that clamp and the
+    /// two FD gates stayed red. This dumps, at the failing tests' frozen-θ̂ eval ρ,
+    /// the per-row SPECTRAL-DEFLATION set (`cache.deflated_row_directions`) and the
+    /// criterion value at ρ−h and ρ+h for every ρ coordinate, so the branch that
+    /// flips across the ±h stencil is named directly. Pure diagnostic — asserts
+    /// only that the caches build and the coord set is non-empty.
+    #[test]
+    fn kink_site_deflation_flip_diagnostic_2339() {
+        use ndarray::{Array1, array};
+        let (term, target, rho, _sc) =
+            super::exact_hessian_fixture_tests::converged_state_with_residual();
+        let mut rho_eval = rho.clone();
+        rho_eval.log_lambda_sparse = -0.5;
+        for v in rho_eval.log_lambda_smooth.iter_mut() {
+            *v = -1.5;
+        }
+        rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
+        let rho = rho_eval;
+        let base = rho.to_flat();
+        let h = 1.0e-5;
+
+        let mut coords: Vec<usize> = Vec::new();
+        for a in 0..rho.log_lambda_smooth.len() {
+            coords.push(rho.smooth_flat_index(a));
+        }
+        for kk in 0..rho.log_ard.len() {
+            for axis in 0..rho.log_ard[kk].len() {
+                let idx = rho.ard_flat_index(kk, axis);
+                if !coords.contains(&idx) {
+                    coords.push(idx);
+                }
+            }
+        }
+        if let Some(sparse) = rho.sparse_flat_index() {
+            coords.push(sparse);
+        }
+        let label = |idx: usize| -> String {
+            if rho.sparse_flat_index() == Some(idx) {
+                "sparse".to_string()
+            } else if (rho.smooth_flat_start()
+                ..rho.smooth_flat_start() + rho.log_lambda_smooth.len())
+                .contains(&idx)
+            {
+                format!("smooth{}", idx - rho.smooth_flat_start())
+            } else {
+                format!("ard@{idx}")
+            }
+        };
+
+        // (value, per-row deflated-direction counts, total deflated, spectrally
+        // deflated rows with their min raw eigenvalue).
+        let dump = |flat: &Array1<f64>| -> (f64, Vec<usize>, usize, Vec<(usize, f64)>) {
+            let r = rho.from_flat(flat.view()).unwrap();
+            let mut t = term.clone();
+            let (value, _loss, cache) = t
+                .penalized_quasi_laplace_criterion_with_cache(
+                    target.view(),
+                    &r,
+                    None,
+                    0,
+                    0.4,
+                    1.0e-6,
+                    1.0e-6,
+                )
+                .expect("diagnostic cache");
+            let per_row: Vec<usize> =
+                cache.deflated_row_directions.iter().map(Vec::len).collect();
+            let total: usize = per_row.iter().sum();
+            let spectra: Vec<(usize, f64)> = cache
+                .deflation_row_spectra
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    s.as_ref().map(|sp| {
+                        (
+                            i,
+                            sp.raw_evals.iter().copied().fold(f64::INFINITY, f64::min),
+                        )
+                    })
+                })
+                .collect();
+            (value, per_row, total, spectra)
+        };
+
+        for &j in &coords {
+            let mut fm = base.clone();
+            fm[j] -= h;
+            let mut fp = base.clone();
+            fp[j] += h;
+            let (vm, prm, tm, spm) = dump(&fm);
+            let (vp, prp, tp, spp) = dump(&fp);
+            let flipped: Vec<usize> = (0..prm.len().min(prp.len()))
+                .filter(|&i| prm[i] != prp[i])
+                .collect();
+            eprintln!(
+                "KINKDIAG coord {}: value(-h)={vm:.9e} value(+h)={vp:.9e} d(value)={:.3e} | deflated_total {tm}->{tp} | rows_flipped={flipped:?}",
+                label(j),
+                vp - vm
+            );
+            if !spm.is_empty() || !spp.is_empty() {
+                eprintln!("    spectrally-deflated rows (row,min_raw_eval): -h={spm:?} +h={spp:?}");
+            }
+        }
+        assert!(!coords.is_empty(), "coord set must be non-empty");
+    }
+
     /// PATH C (#2253) DIAGNOSTIC — localize the smooth↔ARD non-conservation of the
     /// production third-order gradient `g3[j] = −½⟨A⁺Γ_eff, g_ρ,j⟩`. `g3` is
     /// `∂Φ/∂ρ − ∂L/∂ρ` for a scalar `Φ`, so it MUST be conservative
