@@ -23,6 +23,7 @@
 use super::codes::{SparseCode, solve_row_codes};
 use super::scoring::{ScoreRoutePath, ScoreRouteStats, TileScorer};
 use super::{SparseDictConfig, SparseDictConvergence, SparseDictFit};
+use gam_linalg::pcg::{CpuPcgBlockBackend, PcgCoreResult, PcgStop, pcg_multi_core};
 use ndarray::{Array2, ArrayView2, Axis};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -458,7 +459,8 @@ pub(super) fn run(
             &normal_eq,
             config.decoder_ridge as f64,
             sigma,
-        );
+            config.score_mode,
+        )?;
         decoder_solve_stats = stats;
         let refresh_secs = epoch_start.elapsed().as_secs_f64();
 
@@ -1453,14 +1455,24 @@ impl Default for DecoderSolveStats {
 }
 
 impl DecoderSolveStats {
-    fn record_cg(&mut self, result: &CgSolveResult) {
+    /// Fold one block-CG column certificate ([`PcgCoreResult`]) into the
+    /// refresh statistics — the same accounting the historical per-column
+    /// `cg_solve` recording performed (`MaxIters`/`Breakdown` both count as a
+    /// non-converged column; `kappa_hat` is the Lanczos estimate from the
+    /// column's own `alpha`/`beta` trace).
+    fn record_block_column(&mut self, core: &PcgCoreResult, kappa_hat: Option<f64>) {
         self.cg_columns += 1;
-        self.cg_iterations += result.iterations;
-        self.cg_relative_residual = self.cg_relative_residual.max(result.relative_residual);
-        if result.stop != CgStop::Converged {
+        self.cg_iterations += core.iterations;
+        let relative_residual = if core.rhs_norm > 0.0 {
+            core.final_residual_norm / core.rhs_norm
+        } else {
+            0.0
+        };
+        self.cg_relative_residual = self.cg_relative_residual.max(relative_residual);
+        if core.stop != PcgStop::Converged {
             self.cg_nonconverged_columns += 1;
         }
-        if let Some(kappa) = result.kappa_hat {
+        if let Some(kappa) = kappa_hat {
             self.cg_kappa_hat = Some(self.cg_kappa_hat.map_or(kappa, |old| old.max(kappa)));
         }
     }
@@ -1560,10 +1572,11 @@ pub(super) fn solve_decoder_with_routability_gate(
     eq: &DecoderNormalEq,
     ridge: f64,
     residual_scale: f64,
-) -> (DecoderSolveStats, Vec<RoutabilityGateDecision>) {
+    gpu: gam_gpu::GpuPolicy,
+) -> Result<(DecoderSolveStats, Vec<RoutabilityGateDecision>), String> {
     let gate = routability_gate_decisions(eq, residual_scale);
     let mut candidate = decoder.clone();
-    let stats = solve_decoder(&mut candidate, eq, ridge);
+    let stats = solve_decoder(&mut candidate, eq, ridge, gpu)?;
     for decision in gate.iter() {
         if !decision.refresh {
             // A deferred atom keeps its previous decoder row and accumulates
@@ -1589,7 +1602,7 @@ pub(super) fn solve_decoder_with_routability_gate(
         let mut dst = decoder.row_mut(decision.atom);
         dst.assign(&src);
     }
-    (stats, gate)
+    Ok((stats, gate))
 }
 
 /// Re-seed atoms that fired for no row this epoch (dead atoms) onto the current
@@ -1700,7 +1713,8 @@ pub(super) fn solve_decoder(
     decoder: &mut Array2<f32>,
     eq: &DecoderNormalEq,
     ridge: f64,
-) -> DecoderSolveStats {
+    gpu: gam_gpu::GpuPolicy,
+) -> Result<DecoderSolveStats, String> {
     let k = eq.diag.len();
     let p = eq.b.ncols();
 
@@ -1775,8 +1789,9 @@ pub(super) fn solve_decoder(
             &neigh,
             p,
             direct_threshold,
+            gpu,
             &mut stats,
-        );
+        )?;
     }
     if k > 0 {
         stats.giant_component_fraction = stats.max_component_size as f64 / k as f64;
@@ -1804,14 +1819,28 @@ pub(super) fn solve_decoder(
         stats.cg_relative_residual,
         stats.cg_residual_stop,
     );
-    stats
+    Ok(stats)
 }
 
 /// Solve one connected component's block: dense SPD Cholesky when the block is
 /// below the percolation critical-component scale (`direct_threshold`, see
-/// [`direct_solve_size_threshold`]), else matrix-free CG. `comp` is the
-/// component's atom indices in ascending order; `neigh` is the global sorted
-/// adjacency.
+/// [`direct_solve_size_threshold`]), else matrix-free BLOCK CG over all `P`
+/// decoder columns at once. `comp` is the component's atom indices in
+/// ascending order; `neigh` is the global sorted adjacency.
+///
+/// # Why a block solve (#1017)
+///
+/// The giant co-firing component shares ONE operator across every decoder
+/// column. Solving the columns one at a time re-walks that operator's sparse
+/// structure per column per CG iteration — at the measured production shape
+/// (K = 32 000, P = 2048, ≈200 iterations/column) that is petabytes of
+/// redundant structure traffic and was the entire epoch wall (69 174 s of
+/// serial refresh next to 13.9 s of routed device compute, #1017). The block
+/// solve advances all columns together off one CSR traversal per iteration
+/// ([`pcg_multi_core`]), each column keeping its own `alpha`/`beta`/stopping
+/// state, and each column's iterates are BIT-IDENTICAL to the historical
+/// per-column `cg_solve` (same summation order everywhere; pinned in
+/// `gam_linalg::pcg` and by the block tests below).
 fn solve_component(
     decoder: &mut Array2<f32>,
     eq: &DecoderNormalEq,
@@ -1820,8 +1849,9 @@ fn solve_component(
     neigh: &[Vec<(u32, f64)>],
     p: usize,
     direct_threshold: usize,
+    gpu: gam_gpu::GpuPolicy,
     stats: &mut DecoderSolveStats,
-) {
+) -> Result<(), String> {
     let m = comp.len();
     // Local atom -> block-row index map (comp is sorted, so this is canonical).
     let mut local: HashMap<usize, usize> = HashMap::with_capacity(m);
@@ -1847,32 +1877,41 @@ fn solve_component(
         }
         let Some(sol) = cholesky_solve_block(&mat, &rhs) else {
             stats.dense_factorization_failures += 1;
-            return;
+            return Ok(());
         };
         for (i, &a) in comp.iter().enumerate() {
             for c in 0..p {
                 decoder[[a, c]] = sol[[i, c]] as f32;
             }
         }
-        return;
+        return Ok(());
     }
 
-    // Default coupled path: solve each column by matrix-free CG. The operator is
-    // the component-restricted symmetric mat-vec and touches only stored sparse
-    // co-firing entries.
-    let matvec = |xloc: &[f64]| -> Vec<f64> {
-        let mut y = vec![0.0f64; m];
-        for (i, &a) in comp.iter().enumerate() {
-            let mut acc = (eq.diag[a] + ridge) * xloc[i];
-            for &(nb, val) in &neigh[a] {
-                if let Some(&j) = local.get(&(nb as usize)) {
-                    acc += val * xloc[j];
-                }
-            }
-            y[i] = acc;
+    // Default coupled path: one matrix-free BLOCK CG over all live columns.
+    //
+    // CSR restricted to the component, in local (block-row) indices. A
+    // connected component is neighbor-closed, so every stored neighbor of a
+    // member is itself a member. The per-row entry order is the per-atom
+    // ascending-original-id order of `neigh` — and `local` is a monotone map
+    // (both `comp` and each adjacency list are ascending) — so the block
+    // operator's per-column summation order (diagonal first, then ascending
+    // neighbors) is EXACTLY the legacy per-column matvec's order.
+    let nnz: usize = comp.iter().map(|&a| neigh[a].len()).sum();
+    let mut row_ptr: Vec<u32> = Vec::with_capacity(m + 1);
+    let mut csr_cols: Vec<u32> = Vec::with_capacity(nnz);
+    let mut csr_vals: Vec<f64> = Vec::with_capacity(nnz);
+    row_ptr.push(0);
+    for &a in comp {
+        for &(nb, val) in &neigh[a] {
+            let j = *local
+                .get(&(nb as usize))
+                .expect("connected component must be neighbor-closed");
+            csr_cols.push(j as u32);
+            csr_vals.push(val);
         }
-        y
-    };
+        row_ptr.push(csr_cols.len() as u32);
+    }
+    let diag_ridge: Vec<f64> = comp.iter().map(|&a| eq.diag[a] + ridge).collect();
     let residual_tolerance = decoder_solve_relative_tolerance();
 
     // A-priori spectral bounds of the component operator M = A_sub + ρI via
@@ -1909,41 +1948,184 @@ fn solve_component(
     let chebyshev = 0.5 * root * (2.0 * root / residual_tolerance).ln();
     let cap = (chebyshev.max(0.0).ceil() as usize).min(m).max(1);
 
-    for c in 0..p {
-        let mut bvec = vec![0.0f64; m];
-        let mut bnorm2 = 0.0f64;
-        for (i, &a) in comp.iter().enumerate() {
-            bvec[i] = eq.b[[a, c]];
-            bnorm2 += bvec[i] * bvec[i];
-        }
-        if bnorm2.sqrt() <= DEAD_DENOM {
-            for &a in comp {
-                decoder[[a, c]] = 0.0;
+    // Split live columns from dead ones (right-hand-side norm at/below the
+    // dead-denominator floor). The dead-column norm below is the same strict
+    // ascending fold the legacy per-column gather performed, so the live/dead
+    // split is bit-for-bit the historical one; dead columns are zeroed and —
+    // exactly as before — never enter CG or the solve statistics.
+    let live_columns: Vec<usize> = {
+        let mut live_flags = vec![false; p];
+        live_flags
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(c, live)| {
+                let mut bnorm2 = 0.0f64;
+                for &a in comp {
+                    let b = eq.b[[a, c]];
+                    bnorm2 += b * b;
+                }
+                *live = bnorm2.sqrt() > DEAD_DENOM;
+            });
+        for (c, &live) in live_flags.iter().enumerate() {
+            if !live {
+                for &a in comp {
+                    decoder[[a, c]] = 0.0;
+                }
             }
-            continue;
         }
-        let result = cg_solve(&matvec, &bvec, residual_tolerance, cap);
-        stats.record_cg(&result);
-        if result.stop == CgStop::Converged {
-            for (i, &a) in comp.iter().enumerate() {
-                decoder[[a, c]] = result.x[i] as f32;
+        live_flags
+            .iter()
+            .enumerate()
+            .filter_map(|(c, &live)| live.then_some(c))
+            .collect()
+    };
+
+    // Column-tile width: the block CG holds four dense `m × tile` f64 buffers
+    // (`X`, `R`, `P`, `AP`), so cap the tile at the footprint of the caller's
+    // own `K × P` normal-equation right-hand side — the refresh never
+    // allocates beyond the memory scale the accumulated normal equations
+    // already committed to (SPEC: never OOM on reasonably-resourced machines).
+    let k_total = eq.diag.len();
+    let tile_columns = ((k_total * p) / (4 * m)).max(1);
+
+    for tile in live_columns.chunks(tile_columns) {
+        let t = tile.len();
+        let mut rhs_block = Array2::<f64>::zeros((m, t));
+        {
+            let rhs_slice = rhs_block
+                .as_slice_mut()
+                .expect("freshly allocated block is standard layout");
+            rhs_slice
+                .par_chunks_mut(t)
+                .enumerate()
+                .for_each(|(i, row)| {
+                    let a = comp[i];
+                    for (j, &c) in tile.iter().enumerate() {
+                        row[j] = eq.b[[a, c]];
+                    }
+                });
+        }
+
+        let (results, solution) = solve_block_cg(
+            gpu,
+            &row_ptr,
+            &csr_cols,
+            &csr_vals,
+            &diag_ridge,
+            rhs_block,
+            residual_tolerance,
+            cap,
+        )?;
+
+        for (j, (&c, core)) in tile.iter().zip(results.iter()).enumerate() {
+            let kappa_hat = core
+                .diagnostics
+                .as_ref()
+                .and_then(|d| kappa_from_cg_tridiagonal(&d.alpha, &d.beta));
+            stats.record_block_column(core, kappa_hat);
+            if core.stop == PcgStop::Converged {
+                for (i, &a) in comp.iter().enumerate() {
+                    decoder[[a, c]] = solution[[i, j]] as f32;
+                }
+            } else {
+                // The derived cap was hit or CG broke down. Keep the previous
+                // decoder column; the recorded failure forbids the enclosing
+                // optimizer from minting a model, with no diagonal substitute.
+                let relative_residual = if core.rhs_norm > 0.0 {
+                    core.final_residual_norm / core.rhs_norm
+                } else {
+                    0.0
+                };
+                log::warn!(
+                    "[SAE CG] component size={m} did not converge: stop={:?} iters={} \
+                     rel_residual={:.3e} residual_tolerance={:.3e} \
+                     kappa_bound={:.3e} cap={cap}",
+                    core.stop,
+                    core.iterations,
+                    relative_residual,
+                    residual_tolerance,
+                    kappa_bound,
+                );
             }
-        } else {
-            // The derived cap was hit or CG broke down. Keep the previous decoder
-            // column; the recorded failure forbids the enclosing optimizer from
-            // minting a model, with no diagonal substitute.
-            log::warn!(
-                "[SAE CG] component size={m} did not converge: stop={:?} iters={} \
-                 rel_residual={:.3e} residual_tolerance={:.3e} \
-                 kappa_bound={:.3e} cap={cap}",
-                result.stop,
-                result.iterations,
-                result.relative_residual,
-                residual_tolerance,
-                kappa_bound,
-            );
         }
     }
+    Ok(())
+}
+
+/// Run the component-restricted block CG on the best admitted backend: the
+/// device-resident CUDA backend when the platform, the fit's GPU policy, and
+/// the workload admit it, else the rayon CPU backend. Both backends drive the
+/// SAME shared recurrence ([`pcg_multi_core`]) and honor the same per-column
+/// summation-order contract, so backend choice never changes a result bit
+/// (pinned by the device parity test in `decoder_gpu`).
+///
+/// Under `GpuPolicy::Required` a missing CUDA platform/device is a typed
+/// error, never a silent CPU continuation; under `Auto` an admission decline
+/// falls back to the CPU backend, while a post-admission device fault
+/// panics loudly inside the device backend (no misleading CPU retry).
+fn solve_block_cg(
+    gpu: gam_gpu::GpuPolicy,
+    row_ptr: &[u32],
+    csr_cols: &[u32],
+    csr_vals: &[f64],
+    diag_ridge: &[f64],
+    rhs_block: Array2<f64>,
+    residual_tolerance: f64,
+    cap: usize,
+) -> Result<(Vec<PcgCoreResult>, Array2<f64>), String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(mut device) = super::decoder_gpu::DeviceBlockCgBackend::try_new(
+            gpu,
+            row_ptr,
+            csr_cols,
+            csr_vals,
+            diag_ridge,
+            &rhs_block,
+        )? {
+            let results = pcg_multi_core(&mut device, residual_tolerance, cap, true);
+            let solution = device.take_solution()?;
+            return Ok((results, solution));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if gpu == gam_gpu::GpuPolicy::Required {
+        return Err(
+            "sparse_dict decoder refresh: gpu=required but the CUDA backend is not compiled \
+             on this platform"
+                .to_string(),
+        );
+    }
+
+    let m = diag_ridge.len();
+    let apply = |pblk: &Array2<f64>, apblk: &mut Array2<f64>| {
+        let t = pblk.ncols();
+        let ps = pblk
+            .as_slice()
+            .expect("block CG state is standard layout");
+        let out = apblk
+            .as_slice_mut()
+            .expect("block CG state is standard layout");
+        out.par_chunks_mut(t).enumerate().for_each(|(i, out_row)| {
+            let d = diag_ridge[i];
+            let base_i = i * t;
+            for (c, slot) in out_row.iter_mut().enumerate() {
+                *slot = d * ps[base_i + c];
+            }
+            for e in row_ptr[i] as usize..row_ptr[i + 1] as usize {
+                let v = csr_vals[e];
+                let base_j = csr_cols[e] as usize * t;
+                for (c, slot) in out_row.iter_mut().enumerate() {
+                    *slot += v * ps[base_j + c];
+                }
+            }
+        });
+        debug_assert_eq!(out.len(), m * t);
+    };
+    let mut backend = CpuPcgBlockBackend::new(rhs_block, apply);
+    let results = pcg_multi_core(&mut backend, residual_tolerance, cap, true);
+    let solution = backend.into_solution();
+    Ok((results, solution))
 }
 
 /// Why a CG solve returned. Only [`CgStop::Converged`] means the column reached
@@ -2400,7 +2582,9 @@ mod exact_solve_tests {
         let mut decoder = Array2::<f32>::zeros((2, 2));
         decoder[[0, 1]] = 1.0;
         decoder[[1, 0]] = 1.0;
-        let (_stats, gate) = solve_decoder_with_routability_gate(&mut decoder, &eq, 0.0, 1.0);
+        let (_stats, gate) =
+            solve_decoder_with_routability_gate(&mut decoder, &eq, 0.0, 1.0, gam_gpu::GpuPolicy::Auto)
+                .expect("decoder refresh");
 
         assert!(gate[0].refresh, "well-fired atom must refresh");
         assert!(
@@ -2430,7 +2614,8 @@ mod exact_solve_tests {
 
         accumulate_constant_rows(&mut eq, 0, 1, 1.0, [3.0, 0.0]);
         let (_stats_first, first_gate) =
-            solve_decoder_with_routability_gate(&mut decoder, &eq, 0.0, 1.0);
+            solve_decoder_with_routability_gate(&mut decoder, &eq, 0.0, 1.0, gam_gpu::GpuPolicy::Auto)
+                .expect("decoder refresh");
         eq.clear_refreshed_atoms(&first_gate);
 
         assert!(!first_gate[0].refresh, "single firing should defer");
@@ -2445,7 +2630,8 @@ mod exact_solve_tests {
 
         accumulate_constant_rows(&mut eq, 0, 63, 1.0, [3.0, 0.0]);
         let (_stats_second, second_gate) =
-            solve_decoder_with_routability_gate(&mut decoder, &eq, 0.0, 1.0);
+            solve_decoder_with_routability_gate(&mut decoder, &eq, 0.0, 1.0, gam_gpu::GpuPolicy::Auto)
+                .expect("decoder refresh");
         eq.clear_refreshed_atoms(&second_gate);
 
         assert!(
@@ -2502,7 +2688,8 @@ mod exact_solve_tests {
         );
 
         let mut decoder = Array2::<f32>::zeros((k, p));
-        solve_decoder(&mut decoder, &eq, ridge);
+        solve_decoder(&mut decoder, &eq, ridge, gam_gpu::GpuPolicy::Auto)
+            .expect("decoder refresh");
 
         // The internal solve is f64 (Cholesky residual ~1e-15), but the returned
         // decoder is f32, so the measurable relative residual bottoms out at the f32
@@ -2531,7 +2718,8 @@ mod exact_solve_tests {
         let eq = assemble_normal_eq(x.view(), &codes, k, p);
 
         let mut decoder = Array2::<f32>::zeros((k, p));
-        solve_decoder(&mut decoder, &eq, ridge);
+        solve_decoder(&mut decoder, &eq, ridge, gam_gpu::GpuPolicy::Auto)
+            .expect("decoder refresh");
 
         // Dense full system (A + ρI) D = B, solved independently.
         let mut mat = Array2::<f64>::zeros((k, k));
@@ -2567,7 +2755,8 @@ mod exact_solve_tests {
         let ridge = 1.0e-5f64;
         let eq = connected_tridiagonal_eq(k, p);
         let mut decoder = Array2::<f32>::zeros((k, p));
-        let stats = solve_decoder(&mut decoder, &eq, ridge);
+        let stats = solve_decoder(&mut decoder, &eq, ridge, gam_gpu::GpuPolicy::Auto)
+            .expect("decoder refresh");
         assert_eq!(stats.component_count, 1);
         assert_eq!(stats.max_component_size, k);
         assert_eq!(stats.cg_columns, p);
@@ -2725,7 +2914,8 @@ mod exact_solve_tests {
         };
         let mut decoder = Array2::<f32>::zeros((k, p));
         let ridge = 1.0e-9f64;
-        let stats = solve_decoder(&mut decoder, &eq, ridge);
+        let stats = solve_decoder(&mut decoder, &eq, ridge, gam_gpu::GpuPolicy::Auto)
+            .expect("decoder refresh");
 
         assert_eq!(
             stats.max_component_size, k,

@@ -392,7 +392,8 @@ impl SparseDictStreamState {
             &self.eq,
             self.config.decoder_ridge as f64,
             sigma,
-        );
+            self.config.score_mode,
+        )?;
         self.eq.clear_refreshed_atoms(&gate);
         unit_norm_rows(&mut self.decoder)?;
 

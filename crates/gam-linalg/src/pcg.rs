@@ -26,6 +26,7 @@
 //! large-`p` parallelism.
 
 use ndarray::{Array1, ArrayView1, ArrayViewMut1, Zip};
+use rayon::prelude::*;
 
 /// Floor on the requested PCG relative tolerance. Asking for convergence tighter
 /// than this is below the achievable accuracy of the SPD energy minimization in
@@ -418,6 +419,409 @@ where
     }
 }
 
+// ============================ Multi-RHS block CG ============================
+//
+// A single SPD operator solved against MANY right-hand sides at once — the
+// shape of the sparse-dictionary decoder refresh (#1017), where one giant
+// co-firing component's normal-equation operator must be solved for every one
+// of `P` decoder columns. Solving the columns one at a time re-traverses the
+// operator's sparse structure per column per iteration; at the measured
+// production shape (K=32000, P=2048) that redundant structure traffic alone is
+// petabytes and was the entire epoch wall (#1017, 69,174 s serial refresh next
+// to 13.9 s of routed device compute). The block core below advances ALL
+// columns together off ONE operator application per iteration, so the operator
+// is streamed once per iteration regardless of the column count.
+//
+// ## Contract: per-column equivalence with `pcg_core`
+//
+// [`pcg_multi_core`] is `pcg_core` with the all-ones (identity Jacobi)
+// preconditioner, `refresh_period = 0`, and [`DotReduction::Serial`], applied
+// independently to each column — BIT-FOR-BIT. Every per-column inner product
+// is a strict ascending-row fold, every per-column vector update performs the
+// same multiply-then-add sequence in the same order, and each column carries
+// its own `alpha`/`beta`/convergence state, so a column's iterates never
+// depend on which other columns share the block or on how work is tiled
+// across threads. A converged (or broken-down) column freezes: its iterate
+// stops updating while the remaining active columns continue. The equivalence
+// is pinned by `pcg_multi_matches_pcg_core_bitwise_per_column` below.
+
+/// Fixed column-tile width for the deterministic block inner products: one
+/// cache line of `f64`s. Each tile's accumulators are private to one task and
+/// every column's fold is strict ascending-row regardless of tiling, so this
+/// constant affects performance only, never a single result bit.
+const BLOCK_DOT_COLUMN_TILE: usize = 8;
+
+/// Backend contract for [`pcg_multi_core`]: owns the block iterate state
+/// `X` (solution), `R` (residual), `P` (search direction), `AP` (operator
+/// image), each logically `rows × columns`, plus the operator itself.
+///
+/// Numerical obligations (what makes a backend admissible):
+/// * `apply_block` sets `AP ← A·P` where column `c` of `AP` is EXACTLY the
+///   operator applied to column `c` of `P` — same summation order as the
+///   scalar operator the backend claims to represent. Frozen columns may be
+///   recomputed (their values are never read back into the recurrence).
+/// * `dot_p_ap` / `dot_r_r` write, per column, a STRICT ascending-row fold
+///   `acc = fold(acc + a[i]·b[i])` — the [`DotReduction::Serial`] contract.
+/// * `update_x_r` performs, for each active column `c`,
+///   `X[·][c] += alpha[c]·P[·][c]` then `R[·][c] += (-alpha[c])·AP[·][c]`
+///   as separate multiply-then-add per element (no FMA contraction).
+/// * `update_p` performs, for each active column `c`,
+///   `P[·][c] = R[·][c] + beta[c]·P[·][c]` (multiply-then-add, no FMA).
+///
+/// The recurrence itself (scalar `alpha`/`beta` math, convergence and
+/// breakdown decisions, diagnostics) lives in [`pcg_multi_core`] and is shared
+/// by every backend, so a device implementation cannot drift from the CPU one.
+pub trait PcgBlockBackend {
+    fn rows(&self) -> usize;
+    fn columns(&self) -> usize;
+    /// `AP ← A·P` for all columns.
+    fn apply_block(&mut self);
+    /// `out[c] ← Σ_i P[i][c]·AP[i][c]`, strict ascending-`i` fold per column.
+    fn dot_p_ap(&mut self, out: &mut [f64]);
+    /// `out[c] ← Σ_i R[i][c]²`, strict ascending-`i` fold per column.
+    fn dot_r_r(&mut self, out: &mut [f64]);
+    /// Per active column: `X += alpha·P`, then `R += (-alpha)·AP`.
+    fn update_x_r(&mut self, alpha: &[f64], active: &[bool]);
+    /// Per active column: `P = R + beta·P`.
+    fn update_p(&mut self, beta: &[f64], active: &[bool]);
+}
+
+/// Drive the shared CG recurrence over a block backend. Returns one
+/// [`PcgCoreResult`] per column, bit-identical to running [`pcg_core`] on that
+/// column alone (all-ones preconditioner, `refresh_period = 0`, Serial dots).
+///
+/// The backend must enter with `X = 0`, `R = P = B` (the right-hand-side
+/// block) and `AP` arbitrary. On return, the backend's `X` holds each
+/// column's final iterate: the converged solution for `Converged` columns, the
+/// last numerically valid iterate for `Breakdown`/`MaxIters` columns, and the
+/// zero vector for columns whose right-hand side was zero or non-finite.
+pub fn pcg_multi_core<B: PcgBlockBackend>(
+    backend: &mut B,
+    rel_tol: f64,
+    max_iters: usize,
+    record_diagnostics: bool,
+) -> Vec<PcgCoreResult> {
+    let t = backend.columns();
+    let mut scratch = vec![0.0f64; t];
+
+    // R = B on entry, so this is the per-column ‖rhs‖² in the same strict
+    // ascending fold `pcg_core`'s Serial `dot(rhs, rhs)` performs.
+    backend.dot_r_r(&mut scratch);
+
+    let mut done: Vec<Option<PcgCoreResult>> = vec![None; t];
+    let mut active = vec![false; t];
+    let mut rhs_norm = vec![0.0f64; t];
+    let mut tol = vec![0.0f64; t];
+    let mut rz_old = vec![0.0f64; t];
+    let mut last_r_norm = vec![0.0f64; t];
+    let mut diagnostics: Vec<Option<PcgDiagnostics>> = (0..t).map(|_| None).collect();
+
+    for c in 0..t {
+        let norm = scratch[c].sqrt();
+        rhs_norm[c] = norm;
+        last_r_norm[c] = norm;
+        let diag = record_diagnostics.then(|| PcgDiagnostics::new(norm));
+        if !norm.is_finite() {
+            done[c] = Some(PcgCoreResult {
+                stop: PcgStop::Breakdown,
+                iterations: 0,
+                rhs_norm: norm,
+                final_residual_norm: norm,
+                diagnostics: diag,
+            });
+            continue;
+        }
+        if norm == 0.0 {
+            done[c] = Some(PcgCoreResult {
+                stop: PcgStop::Converged,
+                iterations: 0,
+                rhs_norm: 0.0,
+                final_residual_norm: 0.0,
+                diagnostics: diag,
+            });
+            continue;
+        }
+        // Identity preconditioner: z ≡ r, so the initial rᵀz is the same
+        // strict fold that produced ‖rhs‖² above.
+        let rz = scratch[c];
+        if !rz.is_finite() || rz <= 0.0 {
+            done[c] = Some(PcgCoreResult {
+                stop: PcgStop::Breakdown,
+                iterations: 0,
+                rhs_norm: norm,
+                final_residual_norm: norm,
+                diagnostics: diag,
+            });
+            continue;
+        }
+        tol[c] = (rel_tol.max(PCG_REL_TOL_FLOOR) * norm).max(PCG_REL_TOL_FLOOR);
+        rz_old[c] = rz;
+        active[c] = true;
+        diagnostics[c] = diag;
+    }
+
+    let mut alpha = vec![0.0f64; t];
+    let mut beta = vec![0.0f64; t];
+
+    for iter in 0..max_iters {
+        if !active.iter().any(|&a| a) {
+            break;
+        }
+        backend.apply_block();
+        backend.dot_p_ap(&mut scratch);
+        for c in 0..t {
+            if !active[c] {
+                alpha[c] = 0.0;
+                continue;
+            }
+            let denom = scratch[c];
+            if !denom.is_finite() || denom <= 0.0 {
+                active[c] = false;
+                alpha[c] = 0.0;
+                done[c] = Some(PcgCoreResult {
+                    stop: PcgStop::Breakdown,
+                    iterations: iter,
+                    rhs_norm: rhs_norm[c],
+                    final_residual_norm: last_r_norm[c],
+                    diagnostics: diagnostics[c].take(),
+                });
+                continue;
+            }
+            let a = rz_old[c] / denom;
+            if !a.is_finite() {
+                active[c] = false;
+                alpha[c] = 0.0;
+                done[c] = Some(PcgCoreResult {
+                    stop: PcgStop::Breakdown,
+                    iterations: iter,
+                    rhs_norm: rhs_norm[c],
+                    final_residual_norm: last_r_norm[c],
+                    diagnostics: diagnostics[c].take(),
+                });
+                continue;
+            }
+            alpha[c] = a;
+        }
+        backend.update_x_r(&alpha, &active);
+        backend.dot_r_r(&mut scratch);
+        for c in 0..t {
+            if !active[c] {
+                beta[c] = 0.0;
+                continue;
+            }
+            let rr = scratch[c];
+            let r_norm = rr.sqrt();
+            last_r_norm[c] = r_norm;
+            if r_norm.is_finite() && r_norm <= tol[c] {
+                active[c] = false;
+                beta[c] = 0.0;
+                if let Some(d) = diagnostics[c].as_mut() {
+                    d.push_iteration(alpha[c], None, r_norm);
+                }
+                done[c] = Some(PcgCoreResult {
+                    stop: PcgStop::Converged,
+                    iterations: iter + 1,
+                    rhs_norm: rhs_norm[c],
+                    final_residual_norm: r_norm,
+                    diagnostics: diagnostics[c].take(),
+                });
+                continue;
+            }
+            // Identity preconditioner: rᵀz is the same fold as ‖r‖².
+            let rz_new = rr;
+            if !rz_new.is_finite() || rz_new <= 0.0 {
+                active[c] = false;
+                beta[c] = 0.0;
+                done[c] = Some(PcgCoreResult {
+                    stop: PcgStop::Breakdown,
+                    iterations: iter + 1,
+                    rhs_norm: rhs_norm[c],
+                    final_residual_norm: r_norm,
+                    diagnostics: diagnostics[c].take(),
+                });
+                continue;
+            }
+            let b = rz_new / rz_old[c];
+            if !b.is_finite() {
+                active[c] = false;
+                beta[c] = 0.0;
+                done[c] = Some(PcgCoreResult {
+                    stop: PcgStop::Breakdown,
+                    iterations: iter + 1,
+                    rhs_norm: rhs_norm[c],
+                    final_residual_norm: r_norm,
+                    diagnostics: diagnostics[c].take(),
+                });
+                continue;
+            }
+            beta[c] = b;
+            if let Some(d) = diagnostics[c].as_mut() {
+                d.push_iteration(alpha[c], Some(b), r_norm);
+            }
+        }
+        backend.update_p(&beta, &active);
+        for c in 0..t {
+            if active[c] {
+                rz_old[c] = scratch[c];
+            }
+        }
+    }
+
+    done.into_iter()
+        .enumerate()
+        .map(|(c, slot)| {
+            slot.unwrap_or_else(|| PcgCoreResult {
+                stop: PcgStop::MaxIters,
+                iterations: max_iters,
+                rhs_norm: rhs_norm[c],
+                final_residual_norm: last_r_norm[c],
+                diagnostics: diagnostics[c].take(),
+            })
+        })
+        .collect()
+}
+
+/// CPU block backend over dense row-major `rows × columns` state, with the
+/// operator supplied as a caller closure (`AP ← A·P`). The closure is
+/// responsible for honoring the per-column summation-order contract of
+/// [`PcgBlockBackend::apply_block`].
+///
+/// All block traversals parallelize only across DISJOINT outputs (row chunks
+/// for the elementwise updates, [`BLOCK_DOT_COLUMN_TILE`]-column tiles for the
+/// inner products), and every per-column fold is strict ascending-row, so the
+/// results are independent of thread count — the same bit-reproducibility the
+/// Serial reduction gives `pcg_core`.
+pub struct CpuPcgBlockBackend<F>
+where
+    F: Fn(&ndarray::Array2<f64>, &mut ndarray::Array2<f64>) + Sync,
+{
+    x: ndarray::Array2<f64>,
+    r: ndarray::Array2<f64>,
+    p: ndarray::Array2<f64>,
+    ap: ndarray::Array2<f64>,
+    apply: F,
+}
+
+impl<F> CpuPcgBlockBackend<F>
+where
+    F: Fn(&ndarray::Array2<f64>, &mut ndarray::Array2<f64>) + Sync,
+{
+    /// Enter the CG initial state: `X = 0`, `R = P = rhs_block`.
+    pub fn new(rhs_block: ndarray::Array2<f64>, apply: F) -> Self {
+        let (m, t) = rhs_block.dim();
+        let p = rhs_block.clone();
+        Self {
+            x: ndarray::Array2::zeros((m, t)),
+            r: rhs_block,
+            p,
+            ap: ndarray::Array2::zeros((m, t)),
+            apply,
+        }
+    }
+
+    /// The solution block `X` (`rows × columns`); column `c` is the final
+    /// iterate reported by the matching [`PcgCoreResult`].
+    pub fn solution(&self) -> &ndarray::Array2<f64> {
+        &self.x
+    }
+
+    /// Consume the backend and take the solution block without copying.
+    pub fn into_solution(self) -> ndarray::Array2<f64> {
+        self.x
+    }
+
+    fn column_dots(a: &ndarray::Array2<f64>, b: &ndarray::Array2<f64>, out: &mut [f64]) {
+        let (m, t) = a.dim();
+        let av = a.as_slice().expect("block backend state is standard layout");
+        let bv = b.as_slice().expect("block backend state is standard layout");
+        out.par_chunks_mut(BLOCK_DOT_COLUMN_TILE)
+            .enumerate()
+            .for_each(|(tile, chunk)| {
+                let c0 = tile * BLOCK_DOT_COLUMN_TILE;
+                let w = chunk.len();
+                let mut acc = [0.0f64; BLOCK_DOT_COLUMN_TILE];
+                for i in 0..m {
+                    let base = i * t + c0;
+                    for (l, slot) in acc.iter_mut().enumerate().take(w) {
+                        *slot += av[base + l] * bv[base + l];
+                    }
+                }
+                chunk.copy_from_slice(&acc[..w]);
+            });
+    }
+}
+
+impl<F> PcgBlockBackend for CpuPcgBlockBackend<F>
+where
+    F: Fn(&ndarray::Array2<f64>, &mut ndarray::Array2<f64>) + Sync,
+{
+    fn rows(&self) -> usize {
+        self.x.nrows()
+    }
+
+    fn columns(&self) -> usize {
+        self.x.ncols()
+    }
+
+    fn apply_block(&mut self) {
+        (self.apply)(&self.p, &mut self.ap);
+    }
+
+    fn dot_p_ap(&mut self, out: &mut [f64]) {
+        Self::column_dots(&self.p, &self.ap, out);
+    }
+
+    fn dot_r_r(&mut self, out: &mut [f64]) {
+        Self::column_dots(&self.r, &self.r, out);
+    }
+
+    fn update_x_r(&mut self, alpha: &[f64], active: &[bool]) {
+        let t = self.x.ncols();
+        let xs = self
+            .x
+            .as_slice_mut()
+            .expect("block backend state is standard layout");
+        let rs = self
+            .r
+            .as_slice_mut()
+            .expect("block backend state is standard layout");
+        let ps = self.p.as_slice().expect("block backend state is standard layout");
+        let aps = self
+            .ap
+            .as_slice()
+            .expect("block backend state is standard layout");
+        xs.par_chunks_mut(t)
+            .zip(rs.par_chunks_mut(t))
+            .zip(ps.par_chunks(t).zip(aps.par_chunks(t)))
+            .for_each(|((xrow, rrow), (prow, aprow))| {
+                for c in 0..t {
+                    if active[c] {
+                        xrow[c] += alpha[c] * prow[c];
+                        rrow[c] += -alpha[c] * aprow[c];
+                    }
+                }
+            });
+    }
+
+    fn update_p(&mut self, beta: &[f64], active: &[bool]) {
+        let t = self.p.ncols();
+        let ps = self
+            .p
+            .as_slice_mut()
+            .expect("block backend state is standard layout");
+        let rs = self.r.as_slice().expect("block backend state is standard layout");
+        ps.par_chunks_mut(t)
+            .zip(rs.par_chunks(t))
+            .for_each(|(prow, rrow)| {
+                for c in 0..t {
+                    if active[c] {
+                        prow[c] = rrow[c] + beta[c] * prow[c];
+                    }
+                }
+            });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +998,192 @@ mod tests {
         );
         assert_eq!(result.stop, PcgStop::BadPreconditioner);
         assert_eq!(x, Array1::<f64>::zeros(2));
+    }
+
+    use ndarray::Array2;
+
+    /// Deterministic sparse SPD test operator: diagonally dominant with a few
+    /// off-diagonal couplings, applied per column in a FIXED summation order
+    /// (diagonal first, then ascending neighbor index) so the single-RHS and
+    /// block applications are bit-identical by construction.
+    struct SparseSpd {
+        n: usize,
+        diag: Vec<f64>,
+        neigh: Vec<Vec<(usize, f64)>>,
+    }
+
+    impl SparseSpd {
+        fn seeded(n: usize, seed: u64) -> Self {
+            let mut state = seed.max(1);
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state as f64 / u64::MAX as f64) - 0.5
+            };
+            let mut neigh: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if (i * 31 + j * 17 + (seed as usize)) % 7 == 0 {
+                        let v = next();
+                        neigh[i].push((j, v));
+                        neigh[j].push((i, v));
+                    }
+                }
+            }
+            let diag: Vec<f64> = (0..n)
+                .map(|i| {
+                    let row_abs: f64 = neigh[i].iter().map(|&(_, v)| v.abs()).sum();
+                    row_abs + 0.5 + next().abs()
+                })
+                .collect();
+            Self { n, diag, neigh }
+        }
+
+        fn apply_column(&self, x: &[f64], out: &mut [f64]) {
+            for i in 0..self.n {
+                let mut acc = self.diag[i] * x[i];
+                for &(j, v) in &self.neigh[i] {
+                    acc += v * x[j];
+                }
+                out[i] = acc;
+            }
+        }
+
+        fn apply_block(&self, p: &Array2<f64>, ap: &mut Array2<f64>) {
+            let t = p.ncols();
+            for i in 0..self.n {
+                for c in 0..t {
+                    let mut acc = self.diag[i] * p[[i, c]];
+                    for &(j, v) in &self.neigh[i] {
+                        acc += v * p[[j, c]];
+                    }
+                    ap[[i, c]] = acc;
+                }
+            }
+        }
+    }
+
+    /// Run `pcg_core` per column (ones preconditioner, refresh 0, Serial) and
+    /// `pcg_multi_core` on the same block; every column must agree BIT-FOR-BIT
+    /// in stop reason, iteration count, norms, iterate, and diagnostics trace.
+    fn assert_multi_matches_core(op: &SparseSpd, rhs: &Array2<f64>, rel_tol: f64, max_iters: usize) {
+        let (m, t) = rhs.dim();
+        let mut backend =
+            CpuPcgBlockBackend::new(rhs.clone(), |p: &Array2<f64>, ap: &mut Array2<f64>| {
+                op.apply_block(p, ap)
+            });
+        let multi = pcg_multi_core(&mut backend, rel_tol, max_iters, true);
+        assert_eq!(multi.len(), t);
+
+        for c in 0..t {
+            let b: Array1<f64> = rhs.column(c).to_owned();
+            let ones = Array1::<f64>::ones(m);
+            let mut x = Array1::<f64>::zeros(m);
+            let single = pcg_core(
+                |v: &Array1<f64>, out: &mut Array1<f64>| {
+                    let mut buf = vec![0.0f64; m];
+                    op.apply_column(v.as_slice().expect("contiguous"), &mut buf);
+                    out.assign(&Array1::from_vec(buf));
+                },
+                &b.view(),
+                &ones.view(),
+                rel_tol,
+                max_iters,
+                0,
+                true,
+                DotReduction::Serial,
+                &mut x.view_mut(),
+            );
+            let blocked = &multi[c];
+            assert_eq!(single.stop, blocked.stop, "column {c} stop");
+            assert_eq!(single.iterations, blocked.iterations, "column {c} iterations");
+            assert_eq!(
+                single.rhs_norm.to_bits(),
+                blocked.rhs_norm.to_bits(),
+                "column {c} rhs_norm"
+            );
+            assert_eq!(
+                single.final_residual_norm.to_bits(),
+                blocked.final_residual_norm.to_bits(),
+                "column {c} final residual"
+            );
+            for i in 0..m {
+                assert_eq!(
+                    x[i].to_bits(),
+                    backend.solution()[[i, c]].to_bits(),
+                    "column {c} solution row {i}"
+                );
+            }
+            let ds = single.diagnostics.expect("single diagnostics");
+            let dm = blocked.diagnostics.as_ref().expect("multi diagnostics");
+            assert_eq!(ds.alpha.len(), dm.alpha.len(), "column {c} alpha trace");
+            assert_eq!(ds.beta.len(), dm.beta.len(), "column {c} beta trace");
+            for (k, (a, b)) in ds.alpha.iter().zip(dm.alpha.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "column {c} alpha[{k}]");
+            }
+            for (k, (a, b)) in ds.beta.iter().zip(dm.beta.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "column {c} beta[{k}]");
+            }
+            for (k, (a, b)) in ds.residuals.iter().zip(dm.residuals.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "column {c} residual[{k}]");
+            }
+        }
+    }
+
+    /// Heterogeneous block — well-conditioned columns, a zero column, and
+    /// wildly scaled columns — must reproduce `pcg_core` per column exactly,
+    /// including different per-column iteration counts (the freeze path).
+    #[test]
+    fn pcg_multi_matches_pcg_core_bitwise_per_column() {
+        let op = SparseSpd::seeded(41, 0x1017);
+        let m = op.n;
+        let t = 7;
+        let mut rhs = Array2::<f64>::zeros((m, t));
+        for c in 0..t {
+            if c == 3 {
+                continue; // zero right-hand side column
+            }
+            let scale = 10f64.powi(c as i32 - 2);
+            for i in 0..m {
+                rhs[[i, c]] = scale * (((i * 13 + c * 7 + 5) as f64).sin());
+            }
+        }
+        assert_multi_matches_core(&op, &rhs, 1e-12, 400);
+    }
+
+    /// The iteration-cap path (`MaxIters`) must freeze per column exactly as
+    /// `pcg_core` reports it.
+    #[test]
+    fn pcg_multi_matches_pcg_core_at_iteration_cap() {
+        let op = SparseSpd::seeded(29, 0xBEEF);
+        let m = op.n;
+        let t = 4;
+        let mut rhs = Array2::<f64>::zeros((m, t));
+        for c in 0..t {
+            for i in 0..m {
+                rhs[[i, c]] = ((i * 5 + c * 3 + 1) as f64).cos();
+            }
+        }
+        assert_multi_matches_core(&op, &rhs, 1e-14, 3);
+    }
+
+    /// Breakdown parity: an indefinite operator must produce the same
+    /// per-column `Breakdown` stop, iteration count, and last-valid iterate.
+    #[test]
+    fn pcg_multi_matches_pcg_core_on_breakdown() {
+        let mut op = SparseSpd::seeded(17, 0xD00D);
+        // Flip one diagonal negative: pᵀAp goes non-positive along the way.
+        op.diag[5] = -3.0;
+        let m = op.n;
+        let t = 3;
+        let mut rhs = Array2::<f64>::zeros((m, t));
+        for c in 0..t {
+            for i in 0..m {
+                rhs[[i, c]] = ((i * 7 + c * 11 + 2) as f64).sin();
+            }
+        }
+        assert_multi_matches_core(&op, &rhs, 1e-12, 200);
     }
 
     /// Convergence target is RELATIVE for sub-unit rhs.

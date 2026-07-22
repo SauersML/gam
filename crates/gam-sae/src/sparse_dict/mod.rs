@@ -34,6 +34,8 @@ mod codes;
 mod cofit;
 mod cofit_arrow;
 mod coordinate;
+#[cfg(target_os = "linux")]
+mod decoder_gpu;
 mod scoring;
 #[cfg(target_os = "linux")]
 mod scoring_gpu;
