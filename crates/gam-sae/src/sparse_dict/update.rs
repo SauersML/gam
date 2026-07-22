@@ -1204,14 +1204,16 @@ pub fn run_linear_reml_schedule(
                 // boundary; a trace failure AT OR ABOVE the seed ridge is off the
                 // boundary (interior ρ) and remains a genuine numerical error that
                 // still propagates.
-                return Ok(schedule_fit_from_iterate(
+                return schedule_fit_from_iterate(
+                    x,
+                    config,
                     fit,
                     false,
                     rho,
                     f64::INFINITY,
                     tol,
                     outer_iterations,
-                ));
+                );
             }
             Err(err) => return Err(err),
         };
@@ -1238,14 +1240,16 @@ pub fn run_linear_reml_schedule(
             // best-effort-open inner iterate (#2275, K >> rank) yields a
             // best-effort-open schedule fit.
             let certified = fit.certified;
-            return Ok(schedule_fit_from_iterate(
+            return schedule_fit_from_iterate(
+                x,
+                config,
                 fit,
                 certified,
                 rho,
                 log_change,
                 tol,
                 outer_iterations,
-            ));
+            );
         }
         rho = rho_new;
         fit = run_linear_fast_kernel(x, config, rho)?;
@@ -1257,15 +1261,45 @@ pub fn run_linear_reml_schedule(
 /// converged ρ fixed point (`certified` carries the inner arm's verdict) and the
 /// #2275 ρ-boundary best-effort return (`certified = false`, `outer_rho_residual`
 /// left open at `∞`).
+///
+/// API honesty (#2275): the returned EV must be the EV of the returned MODEL, and
+/// the returned codes must be exactly what a caller reconstructs by routing the
+/// returned decoder at the code ridge THEY passed — which is how held-out
+/// prediction routes (see `held_out_ev`). But the inner REML runs override the
+/// code ridge with the shared variance ρ (`run_linear_fast_kernel`: one ρ drives
+/// both the code and decoder ridge, so the evidence sees a single variance), so
+/// the inner iterate's packed codes and cached EV are at ρ, not at the caller's
+/// `config.code_ridge`; the dead-atom nulling can stale them further. Re-route the
+/// codes ONCE against the returned decoder at the caller's `config.code_ridge` and
+/// report THAT model's EV, so the returned artifact is self-consistent with how it
+/// will be used. One route + one EV, at the schedule's single exit — never per
+/// epoch, so not on the hot path.
 fn schedule_fit_from_iterate(
+    x: ArrayView2<'_, f32>,
+    config: &SparseDictConfig,
     fit: SparseDictIterate,
     certified: bool,
     selected_rho: f64,
     outer_rho_residual: f64,
     outer_tolerance: f64,
     outer_iterations: usize,
-) -> SparseDictFit {
-    SparseDictFit {
+) -> Result<SparseDictFit, SparseDictionaryError> {
+    let n = x.nrows();
+    let s = fit.active;
+    let scorer = TileScorer::new(s, config.score_tile);
+    let final_codes = route_and_code_all(
+        x,
+        fit.decoder.view(),
+        &scorer,
+        s,
+        config.code_ridge,
+        config.minibatch,
+        config.score_mode,
+        None,
+    )?;
+    let final_ev = explained_variance(x, &final_codes, fit.decoder.view());
+    let (indices, codes) = pack_codes(&final_codes, n, s);
+    Ok(SparseDictFit {
         convergence: SparseDictConvergence {
             inner_ev_residual: fit.inner_ev_residual,
             inner_tolerance: fit.inner_tolerance,
@@ -1280,14 +1314,14 @@ fn schedule_fit_from_iterate(
             certified,
         },
         decoder: fit.decoder,
-        indices: fit.indices,
-        codes: fit.codes,
-        explained_variance: fit.explained_variance,
+        indices,
+        codes,
+        explained_variance: final_ev,
         epochs: fit.epochs,
         active: fit.active,
         score_route_stats: fit.score_route_stats,
         decoder_solve_stats: fit.decoder_solve_stats,
-    }
+    })
 }
 
 fn validate(
