@@ -5,10 +5,6 @@ use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar, OneSeedBatch,
     Order2AtomChannels, RuntimeJetScalar,
 };
-// Consumed only by the test-gated jet-compiled V/G/H oracle/racer
-// (`sls_row_vgh_compiled`) since the fused-schedule promotion.
-#[cfg(test)]
-use gam_math::jet_scalar::MappedOrder2Accumulator;
 use gam_row_macros::row_atom;
 use wide::f64x4;
 
@@ -582,75 +578,6 @@ pub(crate) fn sls_row_nll<S: JetScalar<SLS_ROW_K>>(
         nll = nll.add(&g.compose_unary(stack));
     }
     Ok(nll)
-}
-
-/// Ahead-of-time sparse jet lowering of [`sls_row_nll`] for the V/G/H
-/// channels. The scalar index expressions and outer derivative plan above are
-/// shared with every higher-order jet; only the execution representation
-/// changes. Since the SPEC-line-1 promotion of [`sls_row_vgh_fused`] this
-/// lowering is the mechanical oracle/racer the release cell measures
-/// production against, not a production consumer — hence test-gated.
-#[cfg(test)]
-#[inline(always)]
-fn sls_row_vgh_compiled(
-    primary: &[f64; SLS_ROW_K],
-    kernel: &SurvivalExactRowKernel,
-) -> (f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]) {
-    // These static atoms are symbolically differentiated and CSE'd at build
-    // time from the exact same `row_atom!` expressions used by the generic
-    // high-order jets. Only final live channels exist at runtime.
-    let u0 = sls_index_order2(
-        primary[SLS_U0_AXES[0]],
-        primary[SLS_U0_AXES[1]],
-        primary[SLS_U0_AXES[2]],
-    );
-    let u1 = sls_index_order2(
-        primary[SLS_U1_AXES[0]],
-        primary[SLS_U1_AXES[1]],
-        primary[SLS_U1_AXES[2]],
-    );
-    let g = sls_event_rate_order2(
-        primary[SLS_G_AXES[0]],
-        primary[SLS_G_AXES[1]],
-        primary[SLS_G_AXES[2]],
-        primary[SLS_G_AXES[3]],
-        primary[SLS_G_AXES[4]],
-    );
-    let plan = sls_outer_plan(kernel);
-    let truncate = |stack: [f64; 5]| [stack[0], stack[1], stack[2]];
-    let mut output = MappedOrder2Accumulator::zero();
-    output.add_composed(
-        &u0,
-        SLS_U0_AXES,
-        truncate(plan.u0),
-        false,
-        [false; 3],
-        [false; 6],
-    );
-    if let Some(stack) = plan.u1 {
-        output.add_composed(
-            &u1,
-            SLS_U1_AXES,
-            truncate(stack),
-            true,
-            [false; 3],
-            [false; 6],
-        );
-    }
-    if let Some(stack) = plan.g {
-        output.add_composed(
-            &g,
-            SLS_G_AXES,
-            truncate(stack),
-            true,
-            [false, true, false, true, false],
-            [
-                false, false, false, false, false, true, false, true, false, false, false, false,
-                true, false, false,
-            ],
-        );
-    }
-    output.into_channels()
 }
 
 /// Production V/G/H schedule for the location-scale row: the structure-fused
@@ -4844,6 +4771,81 @@ mod index_derivative_lowering_tests {
 #[cfg(test)]
 mod patterned_order2_perf_tests {
     use super::*;
+    use gam_math::jet_scalar::MappedOrder2Accumulator;
+
+    // Ahead-of-time sparse jet lowering of `sls_row_nll` for the V/G/H
+    // channels — the mechanical oracle/racer the release cell measures
+    // production against, not a production consumer (test-only since the
+    // SPEC-line-1 promotion of the fused schedule). Lives in the test module
+    // that consumes it so no `#[cfg(test)]` sits on a src-level item (#780).
+    /// Ahead-of-time sparse jet lowering of [`sls_row_nll`] for the V/G/H
+    /// channels. The scalar index expressions and outer derivative plan above are
+    /// shared with every higher-order jet; only the execution representation
+    /// changes. Since the SPEC-line-1 promotion of [`sls_row_vgh_fused`] this
+    /// lowering is the mechanical oracle/racer the release cell measures
+    /// production against, not a production consumer — hence test-gated.
+    #[inline(always)]
+    fn sls_row_vgh_compiled(
+        primary: &[f64; SLS_ROW_K],
+        kernel: &SurvivalExactRowKernel,
+    ) -> (f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]) {
+        // These static atoms are symbolically differentiated and CSE'd at build
+        // time from the exact same `row_atom!` expressions used by the generic
+        // high-order jets. Only final live channels exist at runtime.
+        let u0 = sls_index_order2(
+            primary[SLS_U0_AXES[0]],
+            primary[SLS_U0_AXES[1]],
+            primary[SLS_U0_AXES[2]],
+        );
+        let u1 = sls_index_order2(
+            primary[SLS_U1_AXES[0]],
+            primary[SLS_U1_AXES[1]],
+            primary[SLS_U1_AXES[2]],
+        );
+        let g = sls_event_rate_order2(
+            primary[SLS_G_AXES[0]],
+            primary[SLS_G_AXES[1]],
+            primary[SLS_G_AXES[2]],
+            primary[SLS_G_AXES[3]],
+            primary[SLS_G_AXES[4]],
+        );
+        let plan = sls_outer_plan(kernel);
+        let truncate = |stack: [f64; 5]| [stack[0], stack[1], stack[2]];
+        let mut output = MappedOrder2Accumulator::zero();
+        output.add_composed(
+            &u0,
+            SLS_U0_AXES,
+            truncate(plan.u0),
+            false,
+            [false; 3],
+            [false; 6],
+        );
+        if let Some(stack) = plan.u1 {
+            output.add_composed(
+                &u1,
+                SLS_U1_AXES,
+                truncate(stack),
+                true,
+                [false; 3],
+                [false; 6],
+            );
+        }
+        if let Some(stack) = plan.g {
+            output.add_composed(
+                &g,
+                SLS_G_AXES,
+                truncate(stack),
+                true,
+                [false, true, false, true, false],
+                [
+                    false, false, false, false, false, true, false, true, false, false, false, false,
+                    true, false, false,
+                ],
+            );
+        }
+        output.into_channels()
+    }
+
     use gam_math::jet_scalar::Order2;
     use gam_math::nested_dual::JetField;
 
