@@ -1360,4 +1360,35 @@ mod tests {
             );
         }
     }
+
+    /// #2372 probe: print the exact intermediates of the covariance chain at
+    /// the failing extreme scale so the 5.3% divergence names its own source.
+    #[test]
+    fn zz_measure_2372_cyclic_covariance_intermediates() {
+        let (degree, n, order) = (3usize, 9usize, 2usize);
+        let c = 1e-13_f64;
+        let s1 = cyclic_bspline_derivative_penalty_matrix(degree, n, 1.0, order).unwrap();
+        let s2 = cyclic_bspline_derivative_penalty_matrix(degree, n, c, order).unwrap();
+        let f1 = cyclic_bspline_derivative_penalty_factor(degree, n, 1.0, order).unwrap();
+        let f2 = cyclic_bspline_derivative_penalty_factor(degree, n, c, order).unwrap();
+        let factor = c.powi(1 - 2 * order as i32);
+        eprintln!(
+            "[zz2372:cyclic] c={c:e} scale=c^(1-2m)={factor:e} sqrt={:e}",
+            factor.sqrt()
+        );
+        for (i, j) in [(0usize, 0usize), (0, 1), (4, 4), (0, 8)] {
+            eprintln!(
+                "[zz2372:cyclic] S1[{i}][{j}]={:+.17e} S2[{i}][{j}]={:+.17e} S1*scale={:+.17e} ratio_err={:+.3e} F1={:+.17e} F2={:+.17e} F_ratio_err={:+.3e}",
+                s1[[i, j]],
+                s2[[i, j]],
+                s1[[i, j]] * factor,
+                (s1[[i, j]] * factor - s2[[i, j]]).abs()
+                    / s2[[i, j]].abs().max((s1[[i, j]] * factor).abs()).max(1.0),
+                f1[[i, j]],
+                f2[[i, j]],
+                (f1[[i, j]] * factor.sqrt() - f2[[i, j]]).abs()
+                    / f2[[i, j]].abs().max(1e-300),
+            );
+        }
+    }
 }

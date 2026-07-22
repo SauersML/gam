@@ -274,6 +274,13 @@ fn fit_multi_atom_dictionary(
         if accepted_births == 0
             && ev_residual <= config.tolerance
             && routing_residual <= config.tolerance
+            // A plateau is a SEQUENCE property: `ev_residual` compares this
+            // sweep's canonical EV against the PREVIOUS one, and on sweep 0
+            // "previous" is the initialization — a single agreeing pair is one
+            // data point, not a plateau (an initialization that happens to sit
+            // at the fixed point would self-certify without the solver ever
+            // demonstrating stability). Two completed sweeps minimum.
+            && iteration >= 1
         {
             // The per-atom update recorded scores at intermediate Gauss-Seidel
             // states. Recompute every active score from the exact canonical state
@@ -1299,4 +1306,93 @@ mod tests {
             fit.explained_variance
         );
     }
+
+    /// #2372 instrument: per-sweep EV/routing trace on the planted fixture the
+    /// two plateau tests use — discriminates a routing LIMIT CYCLE (support
+    /// flipping between equivalent top-k routings, residual oscillating at a
+    /// fixed amplitude) from slow drift (residual decaying but not reaching
+    /// the 1e-9 tolerance inside the 40-sweep budget).
+    #[test]
+    fn zz_measure_2372_dictionary_plateau_trace() {
+        let (x, config) = planted_fixture_for_trace();
+        let top_k = config.top_k.min(config.n_atoms).max(1);
+        let mut atoms = initialize_atoms(x.view(), config.n_atoms);
+        let mut assignments =
+            reroute_against_atoms(x.view(), atoms.view(), top_k, &config).expect("route");
+        let mut fitted = assignments.dot(&atoms);
+        let mut lambdas = Array1::<f64>::from_elem(config.n_atoms, INACTIVE_LAMBDA);
+        let mut reml_scores = Array1::<f64>::zeros(config.n_atoms);
+        let mut previous_ev = explained_variance(x.view(), fitted.view());
+        let mut prev_support: Option<Vec<Vec<bool>>> = None;
+        for sweep in 0..12 {
+            for atom_idx in 0..config.n_atoms {
+                let _ = fit_one_atom_penalized_ls(
+                    x.view(),
+                    &mut atoms,
+                    &mut assignments,
+                    &mut fitted,
+                    &mut lambdas,
+                    &mut reml_scores,
+                    atom_idx,
+                    config.code_ridge,
+                )
+                .expect("atom update");
+            }
+            let sweep_ev = explained_variance(x.view(), fitted.view());
+            let rerouted =
+                reroute_against_atoms(x.view(), atoms.view(), top_k, &config).expect("route");
+            let rerouted_fitted = rerouted.dot(&atoms);
+            let rerouted_ev = explained_variance(x.view(), rerouted_fitted.view());
+            let support: Vec<Vec<bool>> = (0..rerouted.nrows())
+                .map(|i| rerouted.row(i).iter().map(|v| *v != 0.0).collect())
+                .collect();
+            let support_changed = prev_support.as_ref().map_or(-1_i64, |p| {
+                p.iter()
+                    .zip(&support)
+                    .map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x != y).count())
+                    .sum::<usize>() as i64
+            });
+            eprintln!(
+                "[zz2372:dict] sweep={sweep} sweep_ev={sweep_ev:.15} rerouted_ev={rerouted_ev:.15} ev_res={:.3e} routing_res={:.3e} support_flips={support_changed}",
+                (rerouted_ev - previous_ev).abs(),
+                (rerouted_ev - sweep_ev).abs(),
+            );
+            previous_ev = rerouted_ev;
+            prev_support = Some(support);
+            assignments = rerouted;
+            fitted = rerouted_fitted;
+        }
+    }
+
+    /// The same 6x12 planted two-atom overcomplete fixture
+    /// `planted_sparse_linear_dictionary_reaches_high_explained_variance` uses,
+    /// factored so the trace and the contract test stay on identical data.
+    fn planted_fixture_for_trace() -> (ndarray::Array2<f64>, LinearDictionaryConfig) {
+        let truth = array![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut assignments = Array2::<f64>::zeros((160, 4));
+        for row in 0..160 {
+            let atom = row % 4;
+            assignments[[row, atom]] = 0.7 + 0.01 * ((row / 4) as f64);
+            assignments[[row, (atom + 1) % 4]] = 0.2;
+        }
+        let x = assignments.dot(&truth);
+        let config = LinearDictionaryConfig {
+            n_atoms: 4,
+            max_iter: 40,
+            top_k: 2,
+            assignment: LinearDictionaryAssignment::TopK,
+            temperature: DEFAULT_TEMPERATURE,
+            code_ridge: DEFAULT_CODE_RIDGE,
+            tolerance: 1.0e-9,
+            center_rank_one: false,
+        };
+
+        (x, config)
+    }
+
 }

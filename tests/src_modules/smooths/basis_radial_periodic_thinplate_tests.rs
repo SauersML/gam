@@ -8099,5 +8099,25 @@ fn zz_measure_2372_duchon_frozen_block_decomposition() {
             &derivative.first.penalties_derivative[idx],
             &format!("penalty{idx}:analytic"),
         );
+        // Direction discriminators. cos∠(FD, analytic) ≈ 1 ⇒ a pure per-penalty
+        // SCALE defect (a missing scalar chain); ≈ 0 ⇒ wrong derivative content.
+        // Both derivatives of a norm-1 penalty family must be trace-orthogonal
+        // to S(0); a large S(0)-component in the analytic side convicts its
+        // normalizer quotient terms.
+        let a = &derivative.first.penalties_derivative[idx];
+        let s0 = &base.active_penalties[idx].matrix;
+        let ip = |x: &ndarray::Array2<f64>, y: &ndarray::Array2<f64>| {
+            x.iter().zip(y.iter()).map(|(u, v)| u * v).sum::<f64>()
+        };
+        let nf = ip(&fd, &fd).sqrt().max(1e-300);
+        let na = ip(a, a).sqrt().max(1e-300);
+        let ns = ip(s0, s0).sqrt().max(1e-300);
+        eprintln!(
+            "[zz2372:penalty{idx}:dir] cos(FD,analytic)={:+.6} cos(FD,S0)={:+.3e} cos(analytic,S0)={:+.3e} scale FD/analytic={:.4e}",
+            ip(&fd, a) / (nf * na),
+            ip(&fd, s0) / (nf * ns),
+            ip(a, s0) / (na * ns),
+            nf / na,
+        );
     }
 }
