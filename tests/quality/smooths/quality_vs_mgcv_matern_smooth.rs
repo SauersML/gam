@@ -28,7 +28,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, QualityPair, pad_to, r2, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, r2, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -170,22 +170,47 @@ fn gam_matern_smooth_recovers_truth() {
 // 2-D Matérn ν=5/2 spatial smooth over (long, lat).
 const QUAKES_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/quakes.csv");
 
+/// #2395: K random train/test partitions for the real-data (quakes) arm. The 2-D
+/// Matérn GP fit (k=60 on ~800 rows) is the expensive one here, so K=5 keeps the
+/// 2*K=10 fits near ~5x the former single-split cost, inside the current
+/// slowest-normal-test envelope, while still cutting the metric's std error ~2.2x.
+const K_SPLITS: usize = 5;
+/// Held-out fraction per partition (~80/20, matching the former split scale).
+const HOLDOUT: f64 = 0.20;
+
+/// Deterministic uniform(0,1) hash of (row, split) via splitmix64 — row `i` is in
+/// the TEST fold of partition `split` iff it maps below `HOLDOUT`. No RNG dep; gam
+/// and mgcv, fed the SAME masks, partition byte-identically.
+fn is_heldout(i: usize, split: usize) -> bool {
+    let mut z = (i as u64)
+        .wrapping_add((split as u64).wrapping_mul(0x9E3779B97F4A7C15))
+        .wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^= z >> 31;
+    let u = ((z >> 11) as f64) / ((1u64 << 53) as f64);
+    u < HOLDOUT
+}
+
 /// REAL-DATA arm: the SAME 2-D Matérn ν=5/2 spatial-smooth capability, exercised
 /// on `quakes` (Fiji earthquakes). The truth is unknown on real data, so quality
-/// is OUT-OF-SAMPLE predictive accuracy of the spatial surface, not truth
-/// recovery:
+/// is OUT-OF-SAMPLE predictive accuracy of the spatial surface.
 ///
-///   PRIMARY (objective, tool-free): held-out coefficient of determination
-///     `test_R2 >= 0.10` — the (long, lat) Matérn surface genuinely explains
-///     held-out magnitude variance above the constant-mean predictor (R2 = 0).
-///     Magnitude is only weakly spatially structured, so the bar is modest but
-///     strictly positive: a degenerate/over-smoothed surface scores ~0.
+/// #2395 K-split averaging: the former single deterministic hold-out flipped the
+/// gam-vs-mgcv sign across splits (single-split noise). We now score K random
+/// train/test partitions and average. gam and mgcv are scored on the SAME K
+/// partitions (identical 0/1 fold masks shipped into the R body):
 ///
-///   BASELINE (match-or-beat): mgcv (the mature GAM standard) fits the SAME
-///     training rows with the SAME 2-D GP smooth (`s(long, lat, bs="gp", m=4)`,
-///     ν=5/2) and predicts the SAME held-out rows; gam's held-out RMSE must be no
-///     worse than `mgcv_test_rmse * 1.10`. mgcv is a baseline to match-or-beat on
-///     the SAME held-out metric, never a fitted target to replicate.
+///   PRIMARY (objective, tool-free): the (long, lat) Matérn surface is informative
+///     (AVERAGED held-out R2 > 0) AND at least as good as the mature reference
+///     (`gam_R2_avg >= mgcv_R2_avg - 0.02`). Magnitude is only weakly spatially
+///     structured (mgcv itself reaches R²≈0.085), so an absolute R²≥0.10 bar would
+///     measure the data, not gam — the match-or-beat philosophy is used instead.
+///
+///   BASELINE (match-or-beat): mgcv fits the SAME 2-D GP smooth
+///     (`s(long, lat, bs="gp", m=4)`, ν=5/2) on the SAME training rows and predicts
+///     the SAME held-out rows of each partition; gam's AVERAGED held-out RMSE must
+///     be no worse than `mgcv_rmse_avg * 1.10`.
 #[test]
 fn gam_matern_smooth_recovers_truth_on_real_data() {
     init_parallelism();
@@ -201,117 +226,117 @@ fn gam_matern_smooth_recovers_truth_on_real_data() {
     let mag: Vec<f64> = ds.values.column(mag_idx).to_vec();
     let n = long.len();
     assert!(n > 900, "quakes should have ~1000 rows, got {n}");
-
-    // ---- deterministic train/test split: every 5th row held out ----------
-    let is_test = |i: usize| i % 5 == 0;
-    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
-    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
-    assert!(
-        train_rows.len() > 600 && test_rows.len() > 150,
-        "split sizes: train={} test={}",
-        train_rows.len(),
-        test_rows.len()
-    );
-
-    let train_long: Vec<f64> = train_rows.iter().map(|&i| long[i]).collect();
-    let train_lat: Vec<f64> = train_rows.iter().map(|&i| lat[i]).collect();
-    let train_mag: Vec<f64> = train_rows.iter().map(|&i| mag[i]).collect();
-    let test_long: Vec<f64> = test_rows.iter().map(|&i| long[i]).collect();
-    let test_lat: Vec<f64> = test_rows.iter().map(|&i| lat[i]).collect();
-    let test_mag: Vec<f64> = test_rows.iter().map(|&i| mag[i]).collect();
-
-    // Build a training-only encoded dataset by sub-setting the encoded rows;
-    // headers, schema, and column kinds are unchanged, so the formula resolves
-    // identically to the full-data fit.
     let p = ds.headers.len();
-    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
-    for (out_row, &src_row) in train_rows.iter().enumerate() {
-        for c in 0..p {
-            train_values[[out_row, c]] = ds.values[[src_row, c]];
-        }
-    }
-    let mut train_ds = ds.clone();
-    train_ds.values = train_values;
 
-    // ---- fit gam on TRAIN: mag ~ matern(long, lat, nu=2.5, k=60), REML ----
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("mag ~ matern(long, lat, nu=2.5, k=60)", &train_ds, &cfg)
-        .expect("gam 2-D matern fit on quakes train");
-    let FitResult::Standard(fit) = result else {
-        panic!("expected a standard Gaussian GAM fit for 2-D matern() spatial smooth");
-    };
-    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
 
-    // gam predictions at the held-out (long, lat) points: rebuild the frozen-spec
-    // design (identity link => design*beta = predicted mean). Both spatial
-    // columns must be filled at their schema column indices.
-    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
-    for i in 0..test_rows.len() {
-        test_grid[[i, long_idx]] = test_long[i];
-        test_grid[[i, lat_idx]] = test_lat[i];
+    let mut gam_rmses = Vec::with_capacity(K_SPLITS);
+    let mut gam_r2s = Vec::with_capacity(K_SPLITS);
+    let mut fold_data: Vec<Vec<f64>> = Vec::with_capacity(K_SPLITS);
+    let mut fold_names: Vec<String> = Vec::with_capacity(K_SPLITS);
+    let mut gam_edf_repr = f64::NAN;
+
+    for split in 0..K_SPLITS {
+        let train_rows: Vec<usize> = (0..n).filter(|&i| !is_heldout(i, split)).collect();
+        let test_rows: Vec<usize> = (0..n).filter(|&i| is_heldout(i, split)).collect();
+        assert!(
+            train_rows.len() > 600 && test_rows.len() > 120,
+            "#2395 matern split {split} degenerate: train={} test={}",
+            train_rows.len(),
+            test_rows.len()
+        );
+        let test_long: Vec<f64> = test_rows.iter().map(|&i| long[i]).collect();
+        let test_lat: Vec<f64> = test_rows.iter().map(|&i| lat[i]).collect();
+        let test_mag: Vec<f64> = test_rows.iter().map(|&i| mag[i]).collect();
+
+        let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+        for (out_row, &src_row) in train_rows.iter().enumerate() {
+            for c in 0..p {
+                train_values[[out_row, c]] = ds.values[[src_row, c]];
+            }
+        }
+        let mut train_ds = ds.clone();
+        train_ds.values = train_values;
+
+        let result = fit_from_formula("mag ~ matern(long, lat, nu=2.5, k=60)", &train_ds, &cfg)
+            .expect("gam 2-D matern fit on quakes train");
+        let FitResult::Standard(fit) = result else {
+            panic!("expected a standard Gaussian GAM fit for 2-D matern() spatial smooth");
+        };
+        if split == 0 {
+            gam_edf_repr = fit.fit.edf_total().expect("gam reports total edf");
+        }
+
+        let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+        for i in 0..test_rows.len() {
+            test_grid[[i, long_idx]] = test_long[i];
+            test_grid[[i, lat_idx]] = test_lat[i];
+        }
+        let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+            .expect("rebuild 2-D matern design at held-out quakes points");
+        let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+        gam_rmses.push(rmse(&gam_test_pred, &test_mag));
+        gam_r2s.push(r2(&gam_test_pred, &test_mag));
+
+        fold_data.push(
+            (0..n)
+                .map(|i| if is_heldout(i, split) { 1.0 } else { 0.0 })
+                .collect(),
+        );
+        fold_names.push(format!("fold{split}"));
     }
-    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
-        .expect("rebuild 2-D matern design at held-out quakes points");
-    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
-    assert_eq!(
-        gam_test_pred.len(),
-        test_rows.len(),
-        "gam held-out prediction length mismatch"
-    );
 
-    // ---- fit the SAME train rows with mgcv, predict the SAME test rows ----
-    // bs="gp" with m=4 selects the Matérn ν=5/2 correlation function (the first
-    // m entry is the correlation-function index; 4 == Matérn 5/2), matching gam's
-    // matern(long, lat, nu=2.5). REML selects the smoothing parameters. Every
-    // Column in this single run_r call is train-length: the test coordinates ride
-    // along right-padded, and only their first `test_n` entries are read back.
+    // ---- mgcv on the SAME K partitions (full data.frame + K fold masks) ----
+    let mut columns: Vec<Column> = vec![
+        Column::new("long", &long),
+        Column::new("lat", &lat),
+        Column::new("mag", &mag),
+    ];
+    for (name, data) in fold_names.iter().zip(fold_data.iter()) {
+        columns.push(Column::new(name, data));
+    }
     let r = run_r(
-        &[
-            Column::new("long", &train_long),
-            Column::new("lat", &train_lat),
-            Column::new("mag", &train_mag),
-            Column::new("test_long", &pad_to(&test_long, train_long.len())),
-            Column::new("test_lat", &pad_to(&test_lat, train_long.len())),
-            Column::new("test_n", &vec![test_rows.len() as f64; train_long.len()]),
-        ],
-        r#"
-        suppressPackageStartupMessages(library(mgcv))
-        # All columns arrive train-length and all-finite; fit on (long, lat, mag),
-        # predict on the first test_n rows of the test coordinate columns.
-        fit_df <- data.frame(long = df$long, lat = df$lat, mag = df$mag)
-        m <- gam(mag ~ s(long, lat, bs = "gp", k = 60, m = 4),
-                 data = fit_df, method = "REML")
-        k <- as.integer(df$test_n[1])
-        newd <- data.frame(long = df$test_long[1:k], lat = df$test_lat[1:k])
-        emit("test_pred", as.numeric(predict(m, newdata = newd)))
-        emit("edf", sum(m$edf))
-        "#,
+        &columns,
+        &format!(
+            r#"
+            suppressPackageStartupMessages(library(mgcv))
+            K <- {K_SPLITS}
+            rmses <- numeric(K)
+            r2s <- numeric(K)
+            for (s in 0:(K - 1)) {{
+              fold <- df[[paste0("fold", s)]]
+              tr <- data.frame(long = df$long[fold < 0.5], lat = df$lat[fold < 0.5],
+                               mag = df$mag[fold < 0.5])
+              te <- data.frame(long = df$long[fold >= 0.5], lat = df$lat[fold >= 0.5])
+              obs <- df$mag[fold >= 0.5]
+              m <- gam(mag ~ s(long, lat, bs = "gp", k = 60, m = 4), data = tr, method = "REML")
+              p <- as.numeric(predict(m, newdata = te))
+              rmses[s + 1] <- sqrt(mean((p - obs)^2))
+              r2s[s + 1] <- 1 - sum((obs - p)^2) / sum((obs - mean(obs))^2)
+            }}
+            emit("mgcv_rmses", rmses)
+            emit("mgcv_r2s", r2s)
+            "#
+        ),
     );
-    let mgcv_test_pred = r.vector("test_pred");
-    let mgcv_edf = r.scalar("edf");
-    assert_eq!(
-        mgcv_test_pred.len(),
-        test_rows.len(),
-        "mgcv held-out prediction length mismatch"
-    );
+    let mgcv_rmses = r.vector("mgcv_rmses");
+    let mgcv_r2s = r.vector("mgcv_r2s");
+    assert_eq!(mgcv_rmses.len(), K_SPLITS, "mgcv per-split rmse count mismatch");
+    assert_eq!(mgcv_r2s.len(), K_SPLITS, "mgcv per-split r2 count mismatch");
 
-    // ---- objective metrics on gam's OWN held-out predictions --------------
-    let gam_test_r2 = r2(&gam_test_pred, &test_mag);
-    let gam_test_rmse = rmse(&gam_test_pred, &test_mag);
-    let mgcv_test_rmse = rmse(mgcv_test_pred, &test_mag);
-    // Context only (NOT a pass criterion): how close gam's surface is to mgcv's.
-    let rel_to_mgcv = relative_l2(&gam_test_pred, mgcv_test_pred);
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let gam_rmse_avg = mean(&gam_rmses);
+    let gam_r2_avg = mean(&gam_r2s);
+    let mgcv_rmse_avg = mean(mgcv_rmses);
+    let mgcv_r2_avg = mean(mgcv_r2s);
 
     eprintln!(
-        "quakes matern(long,lat,nu=2.5) held-out: n_train={} n_test={} \
-         gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} gam_test_R2={gam_test_r2:.4} \
-         gam_test_rmse={gam_test_rmse:.4} mgcv_test_rmse={mgcv_test_rmse:.4} \
-         (context: held-out rel_l2 vs mgcv={rel_to_mgcv:.4})",
-        train_rows.len(),
-        test_rows.len(),
+        "quakes matern(long,lat,nu=2.5) #2395 K={K_SPLITS}-split avg: gam_edf(split0)={gam_edf_repr:.3} \
+         gam_test_R2_avg={gam_r2_avg:.4} mgcv_test_R2_avg={mgcv_r2_avg:.4} \
+         gam_test_rmse_avg={gam_rmse_avg:.4} mgcv_test_rmse_avg={mgcv_rmse_avg:.4}"
     );
     eprintln!(
         "{}",
@@ -319,36 +344,29 @@ fn gam_matern_smooth_recovers_truth_on_real_data() {
             "smooths",
             "quality_vs_mgcv_matern_smooth::test",
             "test_rmse",
-            gam_test_rmse,
+            gam_rmse_avg,
             "mgcv",
-            mgcv_test_rmse,
+            mgcv_rmse_avg,
         )
         .line()
     );
 
-    // ---- PRIMARY objective assertion: gam predicts the held-out surface ----
-    // Earthquake magnitude is only weakly spatially structured: the mature
-    // reference (mgcv `bs="gp"`) itself only reaches held-out R²≈0.085 here, so an
-    // absolute `R²≥0.10` bar measures the data's weak signal, not gam. Anchor to
-    // "informative (beats the no-skill mean, R²>0) AND at least as good as the
-    // mature reference" — the same match-or-beat philosophy used for the quakes
-    // spatial test and the EBM/loo recalibrations on this issue.
-    let mgcv_test_r2 = r2(mgcv_test_pred, &test_mag);
+    // ---- PRIMARY: informative AND at least as good as the mature reference ---
     assert!(
-        gam_test_r2 > 0.0 && gam_test_r2 >= mgcv_test_r2 - 0.02,
-        "gam's held-out spatial R2 {gam_test_r2:.4} is not informative or trails mgcv \
-         {mgcv_test_r2:.4} (the mature reference) by more than 0.02"
+        gam_r2_avg > 0.0 && gam_r2_avg >= mgcv_r2_avg - 0.02,
+        "gam's averaged held-out spatial R2 {gam_r2_avg:.4} is not informative or trails mgcv \
+         {mgcv_r2_avg:.4} (the mature reference) by more than 0.02"
     );
 
-    // ---- BASELINE (match-or-beat): no worse than mgcv on held-out RMSE -----
+    // ---- BASELINE (match-or-beat): no worse than mgcv on averaged held-out RMSE.
     assert!(
-        gam_test_rmse <= mgcv_test_rmse * 1.10,
-        "gam held-out RMSE {gam_test_rmse:.4} exceeds mgcv {mgcv_test_rmse:.4} * 1.10"
+        gam_rmse_avg <= mgcv_rmse_avg * 1.10,
+        "gam averaged held-out RMSE {gam_rmse_avg:.4} exceeds mgcv {mgcv_rmse_avg:.4} * 1.10"
     );
 
     // ---- complexity sanity: spatial edf in a sane range (not matched) ------
     assert!(
-        gam_edf > 1.0 && gam_edf < 60.0,
-        "gam effective dof out of sane range: {gam_edf:.3}"
+        gam_edf_repr > 1.0 && gam_edf_repr < 60.0,
+        "gam effective dof out of sane range: edf(split0)={gam_edf_repr:.3}"
     );
 }
