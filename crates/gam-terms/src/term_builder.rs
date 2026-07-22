@@ -1746,15 +1746,21 @@ pub fn build_smooth_basis(
     // "the one column is constant": `smooth(x)`/`matern(x)` on constant `x` would
     // otherwise silently fit the mean of `y` with no visible cue (Duchon already
     // errors loudly via the basis layer; this makes the diagnosis explicit and
-    // uniform). For a MULTIVARIATE smooth (tensor, sphere, tps, ...) a single
-    // constant coordinate is NOT degenerate — the basis still varies along the
-    // other coordinate(s) and the penalty absorbs the rank-deficient direction
-    // (e.g. a constant-longitude meridian arc on the sphere is a well-posed 1-D
-    // slice of S²). Such a term is degenerate only when EVERY coordinate is
-    // constant at once, i.e. the joint input is a single point. Test the JOINT
-    // cardinality, not each column independently, so the loud diagnosis still
-    // fires for the genuinely rank-1 case without rejecting well-posed
-    // lower-dimensional slices.
+    // uniform). For a general MULTIVARIATE Euclidean smooth (tensor, tps,
+    // matern, ...) a single constant coordinate is NOT degenerate — the basis
+    // still varies along the other coordinate(s) and the penalty absorbs the
+    // rank-deficient direction (a constant-`x2` slice of `tps(x1, x2)` is a
+    // well-posed 1-D function of `x1`). Such a term is degenerate only when
+    // EVERY coordinate is constant at once, i.e. the joint input is a single
+    // point. Test the JOINT cardinality, not each column independently, so the
+    // loud diagnosis still fires for the genuinely rank-1 case without rejecting
+    // well-posed lower-dimensional slices.
+    //
+    // The SPHERE/SOS term is the exception (handled separately just below): its
+    // spherical-harmonic / Wahba basis is intrinsically a function of BOTH
+    // angular coordinates, so a constant latitude or longitude is not an honest
+    // lower-D slice but an unidentifiable axis (every point on a single meridian
+    // or parallel) — that case is rejected per-coordinate.
     let coord_cols: Vec<(&String, usize)> = vars
         .iter()
         .zip(cols.iter().copied())
@@ -1798,6 +1804,47 @@ pub fn build_smooth_basis(
                 )
             })
             .to_string());
+        }
+
+        // Sphere/SOS exception: the S² smooth is intrinsically a function of
+        // BOTH angular coordinates, so a single constant axis is unidentifiable
+        // (every point on one meridian or one parallel), not an honest 1-D
+        // slice. Reject it per-coordinate at fit-time with a coordinate-named
+        // error. This runs ONLY during term construction (build_smooth_basis);
+        // predict rebuilds the design from the frozen resolvedspec and never
+        // re-enters this path, so a constant predict grid (e.g. a single query
+        // point on a fixed meridian) is never re-validated (#frozen-mass).
+        if matches!(
+            resolve_smooth_type_name(kind, cols.len(), options).as_str(),
+            "sphere" | "s2" | "sos"
+        ) {
+            for (axis, (var, col)) in coord_cols.iter().enumerate() {
+                let column = ds.values.column(*col);
+                let mut distinct = std::collections::HashSet::<u64>::new();
+                for &value in column.iter() {
+                    distinct.insert(gam_data::canonical_level_bits(value));
+                    if distinct.len() > 1 {
+                        break;
+                    }
+                }
+                if distinct.len() <= 1 {
+                    // Axis 0 is latitude, axis 1 longitude (formula order
+                    // `sphere(lat, lon)`); name the collapsed slice accordingly.
+                    let slice = if axis == 0 {
+                        "a single parallel (constant latitude)"
+                    } else {
+                        "a single meridian (constant longitude)"
+                    };
+                    return Err(TermBuilderError::degenerate_data(format!(
+                        "sphere smooth has a constant '{var}' column — every point lies on \
+                         {slice}, so the 2-sphere term is degenerate and unidentifiable along \
+                         that axis. A spherical smooth needs genuine variation in BOTH latitude \
+                         and longitude; vary '{var}', drop the term, or fit a 1-D smooth on the \
+                         varying coordinate."
+                    ))
+                    .to_string());
+                }
+            }
         }
     }
     if let Some(by_name) = options.get("by").cloned() {
@@ -5019,6 +5066,64 @@ mod tests {
             SmoothBasisSpec::MeasureJet { spec, .. } => &spec.center_strategy,
             other => panic!("expected curvature or measure-jet basis, got {other:?}"),
         }
+    }
+
+    /// Build a `sphere(lat, lon)` term over columns 1 (lat) and 2 (lon) of `ds`.
+    fn build_sphere_over_lat_lon(ds: &Dataset) -> Result<SmoothBasisSpec, String> {
+        let mut options = BTreeMap::new();
+        options.insert("bs".to_string(), "sphere".to_string());
+        options.insert("k".to_string(), "10".to_string());
+        options.insert("kernel".to_string(), "sobolev".to_string());
+        let mut notes = Vec::new();
+        build_smooth_basis(
+            SmoothKind::S,
+            &["lat".to_string(), "lon".to_string()],
+            &[1, 2],
+            &options,
+            ds,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+            1,
+        )
+    }
+
+    /// A sphere/SOS smooth is intrinsically a function of BOTH angular
+    /// coordinates: a constant longitude puts every point on one meridian, an
+    /// unidentifiable 1-D slice of S² that must be rejected at term construction
+    /// with a coordinate-named error — not fit silently. Varying both angular
+    /// coordinates is accepted.
+    #[test]
+    fn sphere_rejects_constant_longitude_but_accepts_varying() {
+        // lat varies across [-70, 70]; lon is pinned at 0 (a single meridian).
+        let rows_const_lon: Vec<Vec<f64>> = (0..60)
+            .map(|i| {
+                let lat = -70.0 + 140.0 * (i as f64) / 59.0;
+                vec![0.0, lat, 0.0] // y, lat, lon(const)
+            })
+            .collect();
+        let ds_const = continuous_dataset(&["y", "lat", "lon"], rows_const_lon);
+        let err = build_sphere_over_lat_lon(&ds_const)
+            .expect_err("a constant-longitude sphere smooth must be rejected as degenerate");
+        let lower = err.to_lowercase();
+        assert!(
+            (lower.contains("constant") || lower.contains("degenerate") || lower.contains("unique"))
+                && lower.contains("lon"),
+            "rejection must flag degeneracy and name the constant longitude coordinate: {err}"
+        );
+
+        // Both angular coordinates vary: a well-posed 2-sphere smooth builds.
+        let rows_ok: Vec<Vec<f64>> = (0..60)
+            .map(|i| {
+                let lat = -70.0 + 140.0 * (i as f64) / 59.0;
+                // A well-spread longitude (deterministic, no RNG) so the input
+                // genuinely covers both angular axes.
+                let lon = -170.0 + 340.0 * ((i * 17 % 60) as f64) / 59.0;
+                vec![0.0, lat, lon]
+            })
+            .collect();
+        let ds_ok = continuous_dataset(&["y", "lat", "lon"], rows_ok);
+        build_sphere_over_lat_lon(&ds_ok)
+            .expect("a sphere smooth over varying latitude and longitude must build");
     }
 
     #[test]
