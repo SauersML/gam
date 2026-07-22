@@ -2485,8 +2485,8 @@ fn pack_codes(codes: &[SparseCode], n: usize, s: usize) -> (Array2<u32>, Array2<
 #[cfg(test)]
 mod exact_solve_tests {
     use super::{
-        CgStop, DecoderNormalEq, cg_solve, explained_variance, route_and_code_all, solve_decoder,
-        solve_decoder_with_routability_gate,
+        CgStop, DecoderNormalEq, cg_solve, explained_variance, kappa_from_cg_tridiagonal,
+        pcg_multi_core, route_and_code_all, solve_decoder, solve_decoder_with_routability_gate,
     };
     use crate::sparse_dict::codes::SparseCode;
     use crate::sparse_dict::scoring::TileScorer;
