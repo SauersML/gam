@@ -2595,12 +2595,31 @@ mod tests {
         variants
     }
 
+    /// Same K{1..4} × 3-basis battery matrix as [`battery_variant_matrix`], on
+    /// a small border. The multiplex parity property is SCHEDULING invariance
+    /// — it is independent of `p` — while the CPU reference oracle factors the
+    /// full dense joint Hessian with a naive scalar Cholesky, O((n·d + p)³)
+    /// per fit. At the color-arm border (p = 5120) that oracle alone cost the
+    /// suite 67 minutes at 0% GPU (#1017 datum, 2026-07-20); at p = 256 the
+    /// identical property costs sub-second. The wide border stays exercised on
+    /// the device by [`gpu_multiplex_throughput_bench`], which keeps the full
+    /// color-arm matrix.
+    fn battery_variant_matrix_cpu_gate() -> Vec<super::SweepVariant> {
+        battery_variant_matrix()
+            .into_iter()
+            .map(|mut variant| {
+                variant.dim.p = 256;
+                variant
+            })
+            .collect()
+    }
+
     /// Phase-4 parity: the multiplexed sweep must be bit-identical to running the
     /// same fits sequentially (CPU reference path here so the gate runs on the
     /// build box; the device path is exercised by the throughput bench on the a100).
     #[test]
     fn variant_sweep_multiplex_matches_sequential() {
-        let variants = battery_variant_matrix();
+        let variants = battery_variant_matrix_cpu_gate();
         let opts = DeviceResidentInnerOptions::default();
 
         // Multiplexed via the CPU-reference runner so the gate is meaningful
