@@ -1279,8 +1279,27 @@ pub(crate) fn active_face_logdet_with_ridge_policy(
     let logdet = if strict_spd {
         strict_exact_pseudo_logdet(determinant_matrix, n_observations)?
     } else {
-        stable_logdet_with_ridge_policy(determinant_matrix, ridge_floor, ridge_policy).map_err(
-            |error| {
+        match stable_logdet_with_ridge_policy(determinant_matrix, ridge_floor, ridge_policy) {
+            Ok(value) => value,
+            // VALUE-SIDE CONVENTION for a genuinely-indefinite constrained mode
+            // (gam#979 survival marginal-slope seed-κ saddle; the same
+            // indefinite ⇒ +∞ convention gam#2336 landed for the SAE quotient).
+            // A constrained mode whose active-face tangent penalized Hessian
+            // carries a certified-negative eigenvalue is NOT a Laplace mode: the
+            // Gaussian normalization has no SPD determinant, so the profiled
+            // LAML value is +∞ — this ρ/κ is infeasible for the Laplace
+            // approximation. Returning +∞ lets the outer REML/κ optimizer REJECT
+            // this evaluation (its infeasible-on-non-finite-cost guard fires) and
+            // fall back to another seed/step, instead of the fatal Cholesky
+            // abort that strands the whole fit at the seed with no feasible
+            // history (the measured survival-marginal-slope n=2500 centers=12
+            // hard failure). ONLY the certified-negative-spectrum error takes
+            // this path — the message the `stable_logdet` PD-vs-indefinite split
+            // emits for a genuine SPD-contract violation. A shape or
+            // eigendecomposition failure is a real error, not an infeasible
+            // mode, and still propagates with the face geometry annotation.
+            Err(error) if error.contains("genuinely indefinite") => f64::INFINITY,
+            Err(error) => {
                 let face = match (&projected, active_constraints) {
                     (Some(reduced), _) => format!(
                         "tangent-projected face (tangent_dim={}, full_dim={})",
@@ -1298,9 +1317,9 @@ pub(crate) fn active_face_logdet_with_ridge_policy(
                         matrix.nrows()
                     ),
                 };
-                format!("{error}; geometry: {face}")
-            },
-        )?
+                return Err(format!("{error}; geometry: {face}"));
+            }
+        }
     };
     Ok(logdet + logdet_correction)
 }

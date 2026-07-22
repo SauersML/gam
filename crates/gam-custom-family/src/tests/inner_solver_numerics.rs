@@ -2020,6 +2020,35 @@ pub(crate) fn active_face_logdet_ignores_constraint_normal_indefiniteness() {
 }
 
 #[test]
+pub(crate) fn active_face_logdet_indefinite_tangent_is_infeasible_not_fatal() {
+    // gam#979 survival marginal-slope seed-κ saddle. Here the negative curvature
+    // is in the FREE tangent direction (the second axis, curvature −4), not
+    // pinned by the active row — so the constrained mode is genuinely NOT a
+    // Laplace mode. The value-side convention returns +∞ (this ρ/κ is infeasible
+    // for the Laplace approximation) so the outer REML/κ optimizer rejects the
+    // evaluation, instead of the fatal Cholesky error that stranded the whole
+    // fit at the seed. Mirror of gam#2336's indefinite ⇒ +∞ convention.
+    let h = array![[3.0, 0.0], [0.0, -4.0]];
+    let active = ActiveLinearConstraintBlock {
+        a: array![[1.0, 0.0]],
+    };
+    let logdet = active_face_logdet_with_ridge_policy(
+        &h,
+        Some(&active),
+        false,
+        10,
+        0.0,
+        RidgePolicy::exact_full_objective(),
+        0.0,
+    )
+    .expect("an indefinite tangent must yield a value (+inf), not a fatal error");
+    assert!(
+        logdet.is_infinite() && logdet > 0.0,
+        "indefinite constrained mode must return +inf (infeasible), got {logdet}",
+    );
+}
+
+#[test]
 pub(crate) fn indefinite_hessian_uses_smooth_regularized_logdet() {
     // Indefinite Hessian: eigenvalues {-1, 2}.
     //
