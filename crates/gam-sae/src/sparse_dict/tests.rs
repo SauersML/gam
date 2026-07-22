@@ -494,6 +494,92 @@ fn sparse_trainer_beats_rank_k_pca_on_held_out_reconstruction() {
     );
 }
 
+/// #2275 trichotomy on the `fit_sparse_dictionary` trainer path: at `K` far above
+/// the intrinsic rank the objective (EV) plateaus at ~1 while the discrete top-s
+/// routing keeps churning (spurious support directions rotate freely in the
+/// equivalent-optima manifold), so the routing fixed-point residual legitimately
+/// cannot close. The trainer must return that objective-converged iterate as a
+/// **best-effort OPEN certificate** (`certified = false`, routing residual honestly
+/// above tolerance) rather than collapsing it to a hard `InnerNonConvergence` — the
+/// same contract inc1 restored on `fit_block_sparse_dictionary`. NO tolerance is
+/// softened: the open residual is reported as-is.
+#[test]
+fn over_complete_trainer_returns_best_effort_open_certificate_2275() {
+    // K=64 atoms in p=16 dims (K >> rank), 2-sparse rows — the over-complete regime
+    // whose routing oscillates while EV saturates.
+    let (k, p, n) = (64usize, 16usize, 1600usize);
+    let (x, _atoms) = planted(k, p, n, 0.35);
+    let config = SparseDictConfig {
+        n_atoms: k,
+        active: 2,
+        minibatch: 256,
+        max_epochs: 60,
+        score_tile: 16,
+        code_ridge: 1.0e-6,
+        decoder_ridge: 1.0e-6,
+        tolerance: 1.0e-9,
+        score_mode: gam_gpu::GpuPolicy::Off,
+    };
+    let fit = fit_sparse_dictionary(x.view(), &config)
+        .expect("#2275: over-complete trainer fit must RETURN best-effort, not error");
+
+    // Objective converged: EV at its achievable plateau.
+    assert!(
+        fit.explained_variance > 0.9,
+        "over-complete EV should saturate the planted structure; got {}",
+        fit.explained_variance
+    );
+    // Best-effort OPEN, not certified: the absolute routing fixed point did not close.
+    assert!(
+        !fit.convergence.certified,
+        "K >> rank fit must carry an OPEN (best-effort) certificate; got certified=true \
+         (routing_residual={}, tol={})",
+        fit.convergence.routing_residual, fit.convergence.routing_tolerance
+    );
+    // No tolerance softening: the openness is reported honestly, above the SAME tol.
+    assert!(
+        fit.convergence.routing_residual > fit.convergence.routing_tolerance,
+        "an open certificate must record routing_residual above tolerance; got {} <= {}",
+        fit.convergence.routing_residual, fit.convergence.routing_tolerance
+    );
+    assert!(
+        fit.convergence.inner_ev_residual.is_finite(),
+        "the plateaued objective residual must be recorded (finite); got {}",
+        fit.convergence.inner_ev_residual
+    );
+}
+
+/// #2275 no-weakening guard: best-effort is NOT handed out on a whim. Genuine
+/// non-convergence — the objective plateau never CONFIRMED within the epoch budget
+/// — must still surface the typed `InnerNonConvergence` error. With a budget below
+/// the sustained-plateau horizon the same over-complete fit (which can never certify
+/// its routing) has no confirmed plateau to return, so it must error, exactly as
+/// before this change.
+#[test]
+fn over_complete_trainer_still_errors_without_confirmed_plateau_2275() {
+    let (k, p, n) = (64usize, 16usize, 1600usize);
+    let (x, _atoms) = planted(k, p, n, 0.35);
+    let config = SparseDictConfig {
+        n_atoms: k,
+        active: 2,
+        minibatch: 256,
+        // Below the sustained-plateau confirmation horizon: too short to certify OR
+        // to confirm a best-effort plateau, so this is genuine non-convergence.
+        max_epochs: 3,
+        score_tile: 16,
+        code_ridge: 1.0e-6,
+        decoder_ridge: 1.0e-6,
+        tolerance: 1.0e-9,
+        score_mode: gam_gpu::GpuPolicy::Off,
+    };
+    let err = fit_sparse_dictionary(x.view(), &config)
+        .expect_err("an unconfirmed plateau must remain a typed non-convergence error");
+    assert!(
+        err.to_string().contains("did not converge"),
+        "expected the typed InnerNonConvergence, got: {err}"
+    );
+}
+
 /// Fraction of atoms that fired for no training row (dead atoms) in a fit.
 fn dead_atom_fraction(fit: &super::SparseDictFit) -> f64 {
     let k = fit.decoder.nrows();

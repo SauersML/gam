@@ -213,6 +213,17 @@ pub struct SparseDictConvergence {
     pub selected_rho: f64,
     /// Full inner fits evaluated by the outer REML schedule.
     pub outer_iterations: usize,
+    /// Whether the inner fit reached the ABSOLUTE fixed point (EV, decoder AND
+    /// routing residuals all within tolerance). `false` marks a **best-effort**
+    /// fit returned at `K` above the intrinsic rank, where the `>rank` spurious
+    /// support directions rotate freely in the equivalent-optima manifold and the
+    /// routing residual legitimately cannot close (#2275) — the objective (EV) has
+    /// plateaued but the discrete routing keeps churning. Convergence is decided by
+    /// the gauge-invariant EV plateau, so both certified and open fits are returned;
+    /// only a still-climbing objective (or a failed linear subsolve) is a genuine
+    /// non-convergence error. Mirrors
+    /// [`super::block::BlockSparseConvergence::certified`].
+    pub certified: bool,
 }
 
 impl SparseDictConvergence {
@@ -232,6 +243,7 @@ impl SparseDictConvergence {
             outer_tolerance: 1e-6,
             selected_rho: f64::INFINITY,
             outer_iterations: 0,
+            certified: true,
         }
     }
 }

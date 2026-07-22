@@ -153,6 +153,17 @@ pub(crate) struct SparseDictIterate {
     decoder_fixed_point_residual: f64,
     routing_residual: f64,
     inner_tolerance: f64,
+    /// Whether the decoder AND routing fixed-point residuals ALSO closed to
+    /// `inner_tolerance` (arm 1). `false` marks a **best-effort** iterate returned
+    /// at `K` above the intrinsic rank, where the `>rank` spurious support
+    /// directions rotate freely in the equivalent-optima manifold and the routing
+    /// residual legitimately cannot close (#2275) — the objective (EV) has
+    /// plateaued but the discrete routing keeps churning. Convergence itself is
+    /// decided by the gauge-invariant EV plateau, so both certified and open
+    /// iterates are returned; only a still-climbing objective (or a failed linear
+    /// subsolve) is a genuine non-convergence error. Mirrors
+    /// [`super::block::BlockSparseConvergence::certified`].
+    certified: bool,
 }
 
 /// Route + sparse-code every row of `x`, processing the rows in minibatches of
@@ -373,6 +384,16 @@ fn routing_fixed_point_residual(
     code_residual.max(reconstruction_residual)
 }
 
+/// Scale-free EV-plateau fraction for the linear trainer's best-effort arm
+/// (#2275), mirroring [`super::block`]'s `BLOCK_EV_PLATEAU_FRACTION`: a round is
+/// stationary when it captured less than this fraction of the total EV
+/// improvement achieved since entry, so it fires at the achievable plateau
+/// wherever it sits (~1e-6 well-posed, ~1e-4 over-complete).
+const LINEAR_EV_PLATEAU_FRACTION: f64 = 1.0e-3;
+/// Consecutive stationary rounds required before returning a best-effort open
+/// iterate — prevents a transient early flat from exiting a still-climbing fit.
+const LINEAR_EV_PLATEAU_MIN_ROUNDS: usize = 3;
+
 pub(super) fn run(
     x: ArrayView2<'_, f32>,
     config: &SparseDictConfig,
@@ -432,6 +453,11 @@ pub(super) fn run(
         fit_start.elapsed().as_secs_f64(),
     );
     let mut current_ev = explained_variance(x, &codes, decoder.view());
+    // Anchor for the captured-fraction EV-plateau detector (arm 2 best-effort):
+    // the denominator of "how much of the total climb since entry did this round
+    // capture". Consecutive near-zero-capture rounds mark the achievable plateau.
+    let entry_ev = current_ev;
+    let mut plateau_rounds = 0usize;
 
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
@@ -547,13 +573,18 @@ pub(super) fn run(
         // and the CG certificate (giant component size, the a-priori κ bound,
         // any typed non-convergence) is on the same line.
         log::warn!(
-            "[SAE epoch {}/{}] ev={:.6} improve={:.3e} revived={} refresh_s={:.2} \
+            "[SAE epoch {}/{}] ev={:.6} improve={:.3e} ev_resid={:.3e} decoder_resid={:.3e} \
+             routing_resid={:.3e} births={} revived={} refresh_s={:.2} \
              route_s={:.2} elapsed_s={:.1} max_component={} cg_columns={} device_cols={} \
              cg_nonconverged={} cg_kappa_bound={:?} cg_relative_residual={:.3e}",
             epochs_run,
             config.max_epochs,
             next_ev,
             improve,
+            ev_residual,
+            decoder_residual,
+            routing_residual,
+            accepted_births,
             revived_atoms.len(),
             refresh_secs,
             route_secs,
@@ -565,19 +596,57 @@ pub(super) fn run(
             decoder_solve_stats.cg_kappa_bound,
             decoder_solve_stats.cg_relative_residual,
         );
-        // A proposed dead-atom birth is work only when it entered the canonical
-        // routing. Couple that test to full-map state residuals and the linear
-        // subsolve evidence. Raw normal-equation convergence alone cannot certify
-        // a model because unit projection and rerouting happen afterward.
-        if accepted_births == 0
-            && decoder_solve_stats.cg_nonconverged_columns == 0
+        // #2275/#2023 trichotomy (mirrors `super::block`): a fit is returned when
+        // the OBJECTIVE has settled — either at the absolute fixed point (arm 1,
+        // certified) or at the achievable EV plateau with the discrete routing
+        // still churning (arm 2, best-effort open at K >> rank). Only a
+        // still-climbing objective — or a failed linear subsolve — is a genuine
+        // non-convergence error (arm 3, below).
+        //
+        // Structure must be settled and the subsolve sound for BOTH arms: a
+        // proposed dead-atom birth is work only when it entered the canonical
+        // routing, and raw normal-equation convergence alone cannot certify a
+        // model because unit projection and rerouting happen afterward.
+        let numerically_sound = decoder_solve_stats.cg_nonconverged_columns == 0
             && decoder_solve_stats.dense_factorization_failures == 0
             && decoder_solve_stats.cg_relative_residual
-                <= decoder_solve_stats.cg_residual_stop.max(f64::MIN_POSITIVE)
+                <= decoder_solve_stats.cg_residual_stop.max(f64::MIN_POSITIVE);
+        let structure_settled = accepted_births == 0;
+
+        // Arm 1 CERTIFIED: EV, decoder AND routing residuals all closed. Checked
+        // first so an exactly-determined fit is certified, never demoted.
+        let certified_fixed_point = structure_settled
+            && numerically_sound
             && ev_residual <= config.tolerance
             && decoder_residual <= config.tolerance
-            && routing_residual <= config.tolerance
-        {
+            && routing_residual <= config.tolerance;
+
+        // Arm 2 book-keeping: captured-fraction EV plateau. A round is stationary
+        // when it captured a negligible fraction of the total EV climb since entry
+        // (scale-free, so it fires wherever the achievable plateau sits). The
+        // gauge-invariant OBJECTIVE is the convergence criterion; the decoder-gauge
+        // and routing residuals are recorded, not gated on — at K >> rank the
+        // spurious support directions rotate freely and the routing residual
+        // legitimately cannot close. Reset on any non-stationary / unsettled /
+        // numerically-unsound round so a still-climbing objective can never be
+        // laundered as a plateau.
+        let round_improvement = improve.max(0.0);
+        let total_improvement = (next_ev - entry_ev).max(0.0);
+        let captured_fraction = if total_improvement > f64::MIN_POSITIVE {
+            round_improvement / total_improvement
+        } else {
+            0.0
+        };
+        let objective_plateaued = ev_residual <= config.tolerance
+            || captured_fraction < LINEAR_EV_PLATEAU_FRACTION;
+        if epoch > 0 && structure_settled && numerically_sound && objective_plateaued {
+            plateau_rounds += 1;
+        } else {
+            plateau_rounds = 0;
+        }
+        let best_effort_open = plateau_rounds >= LINEAR_EV_PLATEAU_MIN_ROUNDS;
+
+        if certified_fixed_point || best_effort_open {
             let (indices, code_mat) = pack_codes(&certified_codes, n, s);
             return Ok(SparseDictIterate {
                 decoder: certified_decoder,
@@ -592,6 +661,7 @@ pub(super) fn run(
                 decoder_fixed_point_residual: decoder_residual,
                 routing_residual,
                 inner_tolerance: config.tolerance,
+                certified: certified_fixed_point,
             });
         }
         codes = std::mem::take(&mut next_codes);
@@ -1073,6 +1143,7 @@ pub fn run_linear_reml_schedule(
                 outer_tolerance: tolerance,
                 selected_rho: f64::INFINITY,
                 outer_iterations: 0,
+                certified: true,
             },
             active,
             score_route_stats: ScoreRouteStats::default(),
@@ -1081,19 +1152,47 @@ pub fn run_linear_reml_schedule(
     }
     // Warm start at the caller's shared ridge; from here ρ is REML-selected.
     let mut rho = config.decoder_ridge as f64;
+    // The caller's seed ridge is the interior anchor: an edof trace solve that
+    // fails only AFTER the schedule has driven ρ strictly below it is the #2275
+    // ρ-boundary (below), not a genuine numerical failure.
+    let initial_ridge = rho;
     let mut fit = run_linear_fast_kernel(x, config, rho)?;
     let tol = reml_schedule_rho_log_tol(config.tolerance);
     let mut outer_iterations = 0usize;
 
     loop {
         outer_iterations += 1;
-        let stats = linear_block_reml_stats_from_parts(
+        let stats = match linear_block_reml_stats_from_parts(
             x,
             fit.decoder.view(),
             fit.indices.view(),
             fit.codes.view(),
             rho,
-        )?;
+        ) {
+            Ok(stats) => stats,
+            Err(SparseDictionaryError::TraceNonConvergence { .. }) if rho < initial_ridge => {
+                // #2275 OUTER boundary. The Fellner–Schall schedule has driven the
+                // shared ridge strictly below the seed toward the zero boundary
+                // (for a near-perfect over-complete fit σ² → 0, so ρ_new → 0). At
+                // that boundary the over-complete code Gram A = CᵀC is
+                // rank-deficient and A+ρI is too ill-conditioned for the
+                // Hutchinson trace CG — the ρ-space image of the same open frame:
+                // the evidence has no interior fixed point, it wants ρ → 0. Return
+                // the last resolvable inner fit as a best-effort OPEN certificate
+                // rather than hard-erroring. `rho < initial_ridge` scopes this to
+                // the descent-to-boundary; a trace failure at or above the seed
+                // ridge is a genuine numerical error and still propagates.
+                return Ok(schedule_fit_from_iterate(
+                    fit,
+                    false,
+                    rho,
+                    f64::INFINITY,
+                    tol,
+                    outer_iterations,
+                ));
+            }
+            Err(err) => return Err(err),
+        };
         let rho_new = linear_shared_rho_fs_step(&stats, rho)?;
         let log_change = (rho_new.ln() - rho.ln()).abs();
         // Per-iteration heartbeat on the warn channel (survives RUST_LOG=warn
@@ -1113,33 +1212,59 @@ pub fn run_linear_reml_schedule(
         if log_change <= tol {
             // The current `fit` was produced at `rho`, which is within `tol` of
             // `rho_new`: it already reflects the fixed point. Stop without a
-            // redundant refit.
-            let convergence = SparseDictConvergence {
-                inner_ev_residual: fit.inner_ev_residual,
-                inner_tolerance: fit.inner_tolerance,
-                decoder_residual: fit.decoder_fixed_point_residual,
-                decoder_tolerance: fit.inner_tolerance,
-                routing_residual: fit.routing_residual,
-                routing_tolerance: fit.inner_tolerance,
-                outer_rho_residual: log_change,
-                outer_tolerance: tol,
-                selected_rho: rho,
+            // redundant refit. The inner fit's certificate propagates: a
+            // best-effort-open inner iterate (#2275, K >> rank) yields a
+            // best-effort-open schedule fit.
+            let certified = fit.certified;
+            return Ok(schedule_fit_from_iterate(
+                fit,
+                certified,
+                rho,
+                log_change,
+                tol,
                 outer_iterations,
-            };
-            return Ok(SparseDictFit {
-                decoder: fit.decoder,
-                indices: fit.indices,
-                codes: fit.codes,
-                explained_variance: fit.explained_variance,
-                epochs: fit.epochs,
-                convergence,
-                active: fit.active,
-                score_route_stats: fit.score_route_stats,
-                decoder_solve_stats: fit.decoder_solve_stats,
-            });
+            ));
         }
         rho = rho_new;
         fit = run_linear_fast_kernel(x, config, rho)?;
+    }
+}
+
+/// Assemble the public [`SparseDictFit`] from a settled inner iterate and the
+/// outer REML schedule's certificate. Shared by the schedule's two exits — the
+/// converged ρ fixed point (`certified` carries the inner arm's verdict) and the
+/// #2275 ρ-boundary best-effort return (`certified = false`, `outer_rho_residual`
+/// left open at `∞`).
+fn schedule_fit_from_iterate(
+    fit: SparseDictIterate,
+    certified: bool,
+    selected_rho: f64,
+    outer_rho_residual: f64,
+    outer_tolerance: f64,
+    outer_iterations: usize,
+) -> SparseDictFit {
+    SparseDictFit {
+        convergence: SparseDictConvergence {
+            inner_ev_residual: fit.inner_ev_residual,
+            inner_tolerance: fit.inner_tolerance,
+            decoder_residual: fit.decoder_fixed_point_residual,
+            decoder_tolerance: fit.inner_tolerance,
+            routing_residual: fit.routing_residual,
+            routing_tolerance: fit.inner_tolerance,
+            outer_rho_residual,
+            outer_tolerance,
+            selected_rho,
+            outer_iterations,
+            certified,
+        },
+        decoder: fit.decoder,
+        indices: fit.indices,
+        codes: fit.codes,
+        explained_variance: fit.explained_variance,
+        epochs: fit.epochs,
+        active: fit.active,
+        score_route_stats: fit.score_route_stats,
+        decoder_solve_stats: fit.decoder_solve_stats,
     }
 }
 
