@@ -1409,6 +1409,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             );
             if matches!(eval_mode, EvalMode::ValueGradientHessian)
                 && analytic_joint_hessian_available
+                // Only a FEASIBLE mode owes an outer Hessian (gam#979). When the
+                // constrained inner mode is genuinely indefinite the profiled
+                // objective is +inf — this ρ/κ is infeasible for the Laplace
+                // approximation (the value-side convention of the active-face
+                // logdet) — and no analytic outer Hessian is produced for it.
+                // Demanding one there would re-raise the seed-κ saddle as a fatal
+                // error, defeating the value-side routing; instead pass the
+                // non-finite objective through so the outer optimizer's
+                // infeasible-on-non-finite-cost guard rejects the step.
+                && owned.result.objective.is_finite()
                 && !owned.result.outer_hessian.is_analytic()
             {
                 return Err(
