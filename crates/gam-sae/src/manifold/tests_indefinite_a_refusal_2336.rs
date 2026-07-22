@@ -7,7 +7,7 @@
 use super::tests::*;
 use super::*;
 use gam_solve::rho_optimizer::OuterObjective;
-use ndarray::Array2;
+use ndarray::{s, Array1, Array2};
 
 /// Reproduce the off-manifold, fixed-stratum state whose `B`-converged mode is an
 /// exact-`A` SADDLE. This is the excitation the #2253/#2330 shared fixture uses:
@@ -130,5 +130,400 @@ fn zz_measure_best_seen_classification_2228() {
             );
         }
         Err(err) => eprintln!("2228-MEASURE: Err({err:?}) => plateau above band (solver stall)"),
+    }
+}
+
+/// #2336 DECISIVE MEASUREMENT v2 (zz_measure) — the CORRECTED escape test.
+///
+/// v1 undershot: the stall-clearing step `sqrt(2·tol/|λ|) ≈ 1.3e-3` is ~85× smaller
+/// than the true 1-D minimizer the external bot found (`s ≈ 0.11`, `ΔL ≈ −1e-4`,
+/// purely quadratic `½s²λ_min`), so v1 never left the near-stationary neighbourhood
+/// and could not test whether a lower mode exists. This version does a real 1-D
+/// line search of `penalized_objective_total` along `±v` (v = most-negative exact-A
+/// eigenvector) to the minimizer, steps there, then re-converges through the
+/// DESCENT-enforcing accepted lane (`converge_inner_for_undamped_logdet`,
+/// `refine_progress_extension = true`, `inner_max_iter > 0`), and re-materialises
+/// the exact A. Iterated up to 3× (MAX_SAE_SADDLE_ESCAPES-style), reporting the
+/// spectrum at every mode. This decides: does escape+descent reach a lower/PD mode
+/// (⇒ implement escape with a line-search magnitude), or does the negative-curvature
+/// direction persist so no nearby lower mode exists (⇒ value-side is the honest fix)?
+#[test]
+fn zz_measure_saddle_escape_linesearch_reconverge_2336() {
+    use super::{FaerEigh, Side};
+    let (mut term, target, rho) = ard_saddle_state();
+    let inner_max_iter = 40usize;
+    let learning_rate = 0.4;
+    let ridge_ext_coord = 1.0e-6;
+    let ridge_beta = 1.0e-6;
+
+    let mut rho_fixed = rho.clone();
+    let initial = term
+        .run_joint_fit_arrow_schur_for_quasi_laplace(
+            target.view(),
+            &mut rho_fixed,
+            None,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+        )
+        .expect("initial joint fit to seed the inner state");
+    let mut loss = initial.loss;
+    let mut criterion_fixed_point = initial.fixed_point;
+    let options = ArrowSolveOptions::direct()
+        .with_gpu_policy(term.gpu_policy)
+        .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
+        .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
+    let mut cache = term
+        .converge_inner_for_undamped_logdet(
+            target.view(),
+            &rho,
+            &mut rho_fixed,
+            None,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            &mut loss,
+            &mut criterion_fixed_point,
+            &options,
+            true,
+        )
+        .expect("converge inner to the undamped-logdet optimum (saddle)");
+
+    for iter in 0..3usize {
+        let total_t = cache.delta_t_len();
+        let a = term
+            .materialize_exact_hessian_dense(&rho, target.view(), &cache)
+            .expect("materialize exact A");
+        let (eigs, vecs) = a.eigh(Side::Lower).expect("A eigh");
+        let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut min_idx = 0usize;
+        let mut min_eig = f64::INFINITY;
+        for (i, &v) in eigs.iter().enumerate() {
+            if v < min_eig {
+                min_eig = v;
+                min_idx = i;
+            }
+        }
+        let n_neg = eigs.iter().filter(|&&v| v < 0.0).count();
+        let obj0 = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("penalized objective at mode");
+        let reclass = term.exact_observed_information_log_dets(&rho, target.view(), &cache);
+        eprintln!(
+            "2336-ITER{iter}: MODE obj={obj0:.9e} min_eig={min_eig:.6e} max_eig={max_eig:.6e} n_neg={n_neg} reclass={}",
+            match &reclass {
+                Ok(_) => "Ok(accepted)".to_string(),
+                Err(e) => format!("Err({e:?})"),
+            }
+        );
+        let floor = 1.0e-9 * max_eig.max(1.0);
+        if min_eig >= -floor {
+            eprintln!("2336-ITER{iter}: ACCEPTED — exact A is PD within the criterion floor; escaped");
+            break;
+        }
+
+        // Real 1-D line search of penalized_objective_total along ±v.
+        let dir = vecs.column(min_idx);
+        let dir_t = dir.slice(s![..total_t]).to_owned();
+        let dir_beta = dir.slice(s![total_t..]).to_owned();
+        let snapshot = term.snapshot_mutable_state();
+        let mut best: (f64, f64, bool) = (obj0, 0.0, false);
+        for negate in [false, true] {
+            let dt = if negate { -&dir_t } else { dir_t.clone() };
+            let db = if negate { -&dir_beta } else { dir_beta.clone() };
+            let mut s = 1.0e-3;
+            while s <= 0.6 {
+                term.apply_newton_step(dt.view(), db.view(), s)
+                    .expect("line-search trial step");
+                let cand = term
+                    .penalized_objective_total(target.view(), &rho, None, 1.0)
+                    .expect("line-search objective");
+                term.restore_mutable_state(&snapshot)
+                    .expect("restore after line-search trial");
+                if cand.is_finite() && cand < best.0 {
+                    best = (cand, s, negate);
+                }
+                s *= 1.4;
+            }
+        }
+        let (obj_min, s_min, negate) = best;
+        eprintln!(
+            "2336-ITER{iter}: LINESEARCH s_min={s_min:.6e} negate={negate} obj_min={obj_min:.9e} dL={:.6e}  (predicted ½s²|λ|={:.6e})",
+            obj_min - obj0,
+            0.5 * s_min * s_min * min_eig.abs()
+        );
+        if s_min == 0.0 || !(obj_min < obj0) {
+            eprintln!(
+                "2336-ITER{iter}: NO DESCENT along ±v at any tried s — escape structurally unavailable"
+            );
+            break;
+        }
+
+        // Step to the minimizer, then re-converge via the descent-enforcing lane.
+        let dt = if negate { -&dir_t } else { dir_t.clone() };
+        let db = if negate { -&dir_beta } else { dir_beta.clone() };
+        term.apply_newton_step(dt.view(), db.view(), s_min)
+            .expect("commit line-search step");
+        let obj_stepped = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("objective after step");
+        cache = term
+            .converge_inner_for_undamped_logdet(
+                target.view(),
+                &rho,
+                &mut rho_fixed,
+                None,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+                &mut loss,
+                &mut criterion_fixed_point,
+                &options,
+                true,
+            )
+            .expect("re-converge after escape step");
+        let obj_reconv = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("objective after re-convergence");
+        eprintln!(
+            "2336-ITER{iter}: STEPPED obj={obj_stepped:.9e} (dL_step={:.6e}) -> RECONV obj={obj_reconv:.9e} (dL_reconv={:.6e})",
+            obj_stepped - obj0,
+            obj_reconv - obj_stepped
+        );
+    }
+
+    let a = term
+        .materialize_exact_hessian_dense(&rho, target.view(), &cache)
+        .expect("materialize final A");
+    let (eigs, _) = a.eigh(Side::Lower).expect("final A eigh");
+    let min_eig = eigs.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let n_neg = eigs.iter().filter(|&&v| v < 0.0).count();
+    let obj_final = term
+        .penalized_objective_total(target.view(), &rho, None, 1.0)
+        .expect("final objective");
+    let reclass = term.exact_observed_information_log_dets(&rho, target.view(), &cache);
+    eprintln!(
+        "2336-FINAL: obj={obj_final:.9e} min_eig={min_eig:.6e} max_eig={max_eig:.6e} n_neg={n_neg} now_pd_accepted={}",
+        reclass.is_ok()
+    );
+}
+
+/// #2336 ROOT-CAUSE (zz_measure) — is the +1.25e-4 re-convergence CLIMB (v2) a
+/// gate-refreeze objective desync, or genuine B-Newton attraction to the saddle?
+///
+/// v2 showed: step to the exact-A negative-curvature minimizer (s≈0.11, exact
+/// objective drops −9.45e-5), then `converge_inner_for_undamped_logdet(refine=true)`
+/// RAISES the objective by +1.25e-4, overshooting ABOVE the original saddle. A pure
+/// ∇L=0 attractor would climb by exactly +9.45e-5 (undo the step); the +3e-5
+/// overshoot is the tell that the re-convergence prices a DIFFERENT objective than
+/// the line-search probe. `converge_inner_for_undamped_logdet` REFRESHES the
+/// collapse-prevention gates (decoder repulsion, coactivation barriers) at its entry
+/// state unless `streaming_gates_frozen` is already set. This test measures (A) the
+/// gate-induced objective shift at the stepped point, and (B) whether holding the
+/// gates frozen-consistent across probe + re-convergence removes the climb.
+#[test]
+fn zz_measure_saddle_gate_desync_2336() {
+    use super::{FaerEigh, Side};
+    let inner_max_iter = 40usize;
+    let learning_rate = 0.4;
+    let ridge_ext_coord = 1.0e-6;
+    let ridge_beta = 1.0e-6;
+
+    // Helper closure would need &mut term; inline twice on fresh terms instead.
+    let reach_saddle = |term: &mut SaeManifoldTerm,
+                        target: &Array2<f64>,
+                        rho: &SaeManifoldRho|
+     -> (ArrowFactorCache, SaeManifoldRho, SaeManifoldLoss, bool, ArrowSolveOptions) {
+        let mut rho_fixed = rho.clone();
+        let initial = term
+            .run_joint_fit_arrow_schur_for_quasi_laplace(
+                target.view(),
+                &mut rho_fixed,
+                None,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            )
+            .expect("initial joint fit");
+        let mut loss = initial.loss;
+        let mut criterion_fixed_point = initial.fixed_point;
+        let options = ArrowSolveOptions::direct()
+            .with_gpu_policy(term.gpu_policy)
+            .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
+            .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
+        let cache = term
+            .converge_inner_for_undamped_logdet(
+                target.view(),
+                rho,
+                &mut rho_fixed,
+                None,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+                &mut loss,
+                &mut criterion_fixed_point,
+                &options,
+                true,
+            )
+            .expect("converge inner to saddle");
+        (cache, rho_fixed, loss, criterion_fixed_point, options)
+    };
+
+    let neg_dir = |term: &SaeManifoldTerm,
+                   target: &Array2<f64>,
+                   rho: &SaeManifoldRho,
+                   cache: &ArrowFactorCache|
+     -> (f64, Array1<f64>, Array1<f64>) {
+        let total_t = cache.delta_t_len();
+        let a = term
+            .materialize_exact_hessian_dense(rho, target.view(), cache)
+            .expect("materialize A");
+        let (eigs, vecs) = a.eigh(Side::Lower).expect("eigh");
+        let mut min_idx = 0usize;
+        let mut min_eig = f64::INFINITY;
+        for (i, &v) in eigs.iter().enumerate() {
+            if v < min_eig {
+                min_eig = v;
+                min_idx = i;
+            }
+        }
+        let dir = vecs.column(min_idx);
+        (
+            min_eig,
+            dir.slice(s![..total_t]).to_owned(),
+            dir.slice(s![total_t..]).to_owned(),
+        )
+    };
+
+    // Line search of penalized_objective_total along ±v; returns (obj, s, negate).
+    let line_search = |term: &mut SaeManifoldTerm,
+                       target: &Array2<f64>,
+                       rho: &SaeManifoldRho,
+                       dir_t: &Array1<f64>,
+                       dir_beta: &Array1<f64>,
+                       obj0: f64|
+     -> (f64, f64, bool) {
+        let snapshot = term.snapshot_mutable_state();
+        let mut best = (obj0, 0.0f64, false);
+        for negate in [false, true] {
+            let dt = if negate { -dir_t } else { dir_t.clone() };
+            let db = if negate { -dir_beta } else { dir_beta.clone() };
+            let mut s = 1.0e-3;
+            while s <= 0.6 {
+                term.apply_newton_step(dt.view(), db.view(), s).expect("trial");
+                let cand = term
+                    .penalized_objective_total(target.view(), rho, None, 1.0)
+                    .expect("trial obj");
+                term.restore_mutable_state(&snapshot).expect("restore");
+                if cand.is_finite() && cand < best.0 {
+                    best = (cand, s, negate);
+                }
+                s *= 1.4;
+            }
+        }
+        best
+    };
+
+    // ---- Experiment A: gate-induced objective shift at the stepped point. ----
+    {
+        let (mut term, target, rho) = ard_saddle_state();
+        let (cache, _rf, _loss, _cfp, _opts) = reach_saddle(&mut term, &target, &rho);
+        // Freeze the gates AT the saddle (what the line-search probe will price).
+        term.refresh_decoder_repulsion_gate();
+        term.refresh_barrier_coactivation_gate();
+        term.streaming_gates_frozen = true;
+        let (min_eig, dir_t, dir_beta) = neg_dir(&term, &target, &rho, &cache);
+        let obj_saddle = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("obj saddle frozen");
+        let (obj_min, s_min, negate) = line_search(&mut term, &target, &rho, &dir_t, &dir_beta, obj_saddle);
+        let dt = if negate { -&dir_t } else { dir_t.clone() };
+        let db = if negate { -&dir_beta } else { dir_beta.clone() };
+        term.apply_newton_step(dt.view(), db.view(), s_min).expect("step");
+        // Objective at the stepped point under the SADDLE-frozen gates (probe view).
+        let obj_stepped_frozen = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("obj stepped frozen");
+        // Now refresh the gates AT the stepped point (what re-convergence would do).
+        term.refresh_decoder_repulsion_gate();
+        term.refresh_barrier_coactivation_gate();
+        let obj_stepped_refreshed = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("obj stepped refreshed");
+        eprintln!(
+            "2336-GATESHIFT: min_eig={min_eig:.6e} s_min={s_min:.4e} negate={negate} \
+             obj_saddle={obj_saddle:.9e} obj_min(ls)={obj_min:.9e} dL_step={:.6e} | \
+             obj_stepped_frozen={obj_stepped_frozen:.9e} obj_stepped_refreshed={obj_stepped_refreshed:.9e} \
+             GATE_SHIFT={:.6e}",
+            obj_stepped_frozen - obj_saddle,
+            obj_stepped_refreshed - obj_stepped_frozen
+        );
+    }
+
+    // ---- Experiment B: re-converge with gates held frozen-consistent. ----
+    {
+        let (mut term, target, rho) = ard_saddle_state();
+        let (cache, mut rho_fixed, mut loss, mut cfp, options) =
+            reach_saddle(&mut term, &target, &rho);
+        // Freeze gates at the saddle and KEEP them frozen through re-convergence
+        // (converge_inner sees streaming_gates_frozen==true and does NOT refresh).
+        term.refresh_decoder_repulsion_gate();
+        term.refresh_barrier_coactivation_gate();
+        term.streaming_gates_frozen = true;
+        let (min_eig, dir_t, dir_beta) = neg_dir(&term, &target, &rho, &cache);
+        let obj_saddle = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("obj saddle frozen B");
+        let (_om, s_min, negate) = line_search(&mut term, &target, &rho, &dir_t, &dir_beta, obj_saddle);
+        let dt = if negate { -&dir_t } else { dir_t.clone() };
+        let db = if negate { -&dir_beta } else { dir_beta.clone() };
+        term.apply_newton_step(dt.view(), db.view(), s_min).expect("step B");
+        let obj_stepped = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("obj stepped B");
+        let cache2 = term
+            .converge_inner_for_undamped_logdet(
+                target.view(),
+                &rho,
+                &mut rho_fixed,
+                None,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+                &mut loss,
+                &mut cfp,
+                &options,
+                true,
+            )
+            .expect("re-converge frozen B");
+        let obj_reconv = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("obj reconv B");
+        let a = term
+            .materialize_exact_hessian_dense(&rho, target.view(), &cache2)
+            .expect("materialize A B");
+        let (eigs, _) = a.eigh(Side::Lower).expect("eigh B");
+        let min_eig2 = eigs.iter().copied().fold(f64::INFINITY, f64::min);
+        let n_neg2 = eigs.iter().filter(|&&v| v < 0.0).count();
+        eprintln!(
+            "2336-FROZENRECONV: min_eig0={min_eig:.6e} s_min={s_min:.4e} negate={negate} \
+             obj_saddle={obj_saddle:.9e} obj_stepped={obj_stepped:.9e} (dL_step={:.6e}) \
+             obj_reconv={obj_reconv:.9e} (dL_reconv={:.6e}) min_eig_reconv={min_eig2:.6e} n_neg_reconv={n_neg2}",
+            obj_stepped - obj_saddle,
+            obj_reconv - obj_stepped
+        );
+        eprintln!(
+            "2336-FROZENVERDICT: with gates held frozen-consistent, re-convergence dL={:.6e} \
+             (v2 unfrozen was +1.25e-4 CLIMB). climb_removed={}",
+            obj_reconv - obj_stepped,
+            (obj_reconv - obj_stepped) < 1.0e-4
+        );
     }
 }
