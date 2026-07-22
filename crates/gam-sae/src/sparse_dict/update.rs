@@ -1788,9 +1788,13 @@ pub(super) fn solve_decoder(
         neigh[a as usize].push((b, val));
         neigh[b as usize].push((a, val));
     }
-    for list in neigh.iter_mut() {
+    // Per-atom adjacency sorts are independent; parallelizing them changes
+    // nothing about the (deterministic) sorted result. At production scale
+    // this is ~2|E| entries across K lists - a measurable serial slice of
+    // the refresh now that the solve itself is fast (#1017).
+    neigh.par_iter_mut().for_each(|list| {
         list.sort_by_key(|&(nb, _)| nb);
-    }
+    });
 
     let mut stats = DecoderSolveStats {
         mean_cofiring_degree: if k == 0 {
