@@ -481,15 +481,17 @@ fn hifreq_sphere_l8() -> Result<(), String> {
     hifreq_sphere_probe(8)
 }
 
-fn hifreq_tensor_probe(k: usize) -> Result<(), String> {
-    init_parallelism();
+/// Deterministic 2-D high-frequency tensor fixture shared by the k-arms and the
+/// zz_measure λ-readout sibling: y = sin(k·θ)·cos(π·h) on a 24×24 grid, σ=0.10,
+/// fit with te(theta[periodic], h[natural]), kb=(2k+4).max(10) per margin.
+/// Returns (data, formula, n_train, sigma).
+fn hifreq_tensor_dataset(k: usize) -> (gam::data::EncodedDataset, String, usize, f64) {
     let n_theta = 24;
     let n_h = 24;
     let sigma = 0.10;
     let mut rng = Lcg::new(0xD7 * (k as u64) + 41);
     let mut theta = Vec::with_capacity(n_theta * n_h);
     let mut h = Vec::with_capacity(n_theta * n_h);
-    let mut y_truth = Vec::with_capacity(n_theta * n_h);
     let mut y_noisy = Vec::with_capacity(n_theta * n_h);
     for i in 0..n_theta {
         let t = TAU * (i as f64) / (n_theta as f64);
@@ -498,7 +500,6 @@ fn hifreq_tensor_probe(k: usize) -> Result<(), String> {
             let yt = (k as f64 * t).sin() * (PI * hv).cos();
             theta.push(t);
             h.push(hv);
-            y_truth.push(yt);
             y_noisy.push(yt + sigma * rng.normal());
         }
     }
@@ -506,6 +507,12 @@ fn hifreq_tensor_probe(k: usize) -> Result<(), String> {
     let kb = (2 * k + 4).max(10);
     let formula =
         format!("y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k={kb})");
+    (data, formula, n_theta * n_h, sigma)
+}
+
+fn hifreq_tensor_probe(k: usize) -> Result<(), String> {
+    init_parallelism();
+    let (data, formula, n_train, sigma) = hifreq_tensor_dataset(k);
 
     // Test grid
     let g: Vec<f64> = (0..25).map(|i| 0.02 + 0.96 * i as f64 / 24.0).collect();
@@ -535,7 +542,7 @@ fn hifreq_tensor_probe(k: usize) -> Result<(), String> {
     let sf = span(&yhat);
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
-    let extra = format!("k={k} l1_at_truth={l1:.4} n_train={}", theta.len());
+    let extra = format!("k={k} l1_at_truth={l1:.4} n_train={n_train}");
     let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
     if let Category::Collapsed = cat {
         return Err(format!("probe collapsed"));
@@ -583,6 +590,69 @@ fn hifreq_tensor_k8() -> Result<(), String> {
 #[test]
 fn hifreq_tensor_k10() -> Result<(), String> {
     hifreq_tensor_probe(10)
+}
+
+// zz_measure DIAGNOSTIC (#1082/#2392): why does `hifreq_tensor_k8` collapse to
+// flat (span 0.002)? It MINTS a fit (unlike k10, which refuses at an indefinite
+// railed saddle), so REML genuinely converges to (near-)flat. Two candidate roots
+// are indistinguishable from the [fit-quality] line (it carries no λ/edf):
+//   (a) GENUINE single-λ high-frequency under-selection — the periodic marginal
+//       has ONE λ against a modal roughness penalty ∝ m⁴, so the signal-carrying
+//       8th Fourier mode costs ~8⁴≈4096× the fundamental; a single λ cannot admit
+//       it without under-penalizing the (noise-only) low modes, so the REML
+//       evidence shrinks the signal to the penalty null. Interior ρ + collapsed
+//       edf is the signature.
+//   (b) RAIL-TO-NULL — the double_penalty null-space λ railed at the ρ ceiling
+//       (~30) like k10, but with a PSD Hessian that certified the flat optimum.
+//       A ρ pinned at the box ceiling with collapsed edf is the signature (== the
+//       #2392 family).
+// This prints the converged fit's log_lambdas / edf_by_block / edf_total / reml so
+// the reader can read the discriminator directly. zz_measure discipline: numbers
+// eprintln'd, NO assertion (the k8 arm already asserts the collapse either way).
+// The name contains `hifreq_tensor_k8` so it inherits the dedicated slow-timeout
+// override in `.config/nextest.toml` (the k8 fit is minutes-long, p=kb²=400).
+#[test]
+fn zz_measure_hifreq_tensor_k8_lambda_readout() {
+    init_parallelism();
+    let (data, formula, n_train, sigma) = hifreq_tensor_dataset(8);
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = match fit_from_formula(&formula, &data, &cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[zz:hifreq_k8] fit refused (no minted optimum): {e}");
+            return;
+        }
+    };
+    let FitResult::Standard(fit) = result else {
+        eprintln!("[zz:hifreq_k8] unexpected non-standard fit result");
+        return;
+    };
+    let log_lambdas: Vec<f64> = fit
+        .fit
+        .log_lambdas
+        .iter()
+        .map(|v| (v * 1000.0).round() / 1000.0)
+        .collect();
+    let edf_by_block: Vec<f64> = fit
+        .fit
+        .edf_by_block()
+        .iter()
+        .map(|v| (v * 1000.0).round() / 1000.0)
+        .collect();
+    eprintln!(
+        "[zz:hifreq_k8] n_train={n_train} sigma_noise={sigma:.3} p_coef={} \
+         edf_total={:.3} edf_by_block={edf_by_block:?} log_lambdas={log_lambdas:?} \
+         reml={:.4} outer_iters={} | discriminator: all-interior ρ (box ceiling ~30) + \
+         collapsed edf ⇒ (a) single-λ high-freq under-selection; a ρ pinned at ~30 with \
+         collapsed edf ⇒ (b) rail-to-null / #2392 family",
+        fit.fit.beta.len(),
+        fit.fit.edf_total().unwrap_or(f64::NAN),
+        fit.fit.reml_score,
+        fit.fit.outer_iterations,
+    );
 }
 
 // =====================================================================
@@ -650,17 +720,28 @@ fn near_flat_signal() -> Result<(), String> {
     let sigma = 0.02;
     let mut rng = Lcg::new(202);
     let x: Vec<f64> = (0..n).map(|_| rng.uniform_01()).collect();
-    let truth_const = 3.5_f64;
     // #1967/#2069: the probe formerly planted signal_amp == sigma (SNR ≈ 1), so a
     // fit that chased noise was indistinguishable from one that recovered the true
     // near-flat sinusoid — the over-fit/collapse verdict was muddy. Plant a signal
-    // clearly above the noise floor (SNR ≈ 3) while staying near-flat (~1.7 %
-    // modulation on the 3.5 baseline), so span_fit/span_truth cleanly separates a
-    // genuine recovery from a collapsed-to-flat or noise-chasing fit.
+    // clearly above the noise floor (SNR = 0.06/0.02 ≈ 3) yet near-null in span
+    // (peak-to-peak 0.12), so span_fit/span_truth cleanly separates genuine
+    // recovery from a collapsed-to-flat or noise-chasing (over-fit) fit.
+    //
+    // The truth MUST vanish at the anchored endpoint. `bc=anchored` pins the fitted
+    // function to f(0)=0 AND suppresses the global intercept — an anchored endpoint
+    // is the model's level-setting gauge, so term-design construction drops the
+    // intercept and applies no sum-to-zero chart (gam-terms term_builder.rs, the
+    // `BSplineIdentifiability::None` branch for `has_anchor()`), and the anchored
+    // I-spline additionally loses its constant direction (basis/derivative_penalty.rs).
+    // A truth with a NONZERO value at x=0 is therefore structurally unrepresentable:
+    // the fit is forced to ramp from the pinned 0 up to the baseline, a boundary
+    // artifact unrelated to over/under-smoothing (it formerly made this probe report
+    // a spurious 36× "overfit" — span_fit ≈ the forced 0→baseline ramp). So plant a
+    // pure sinusoid 0.06·sin(2πx), which is 0 at x=0 and compatible with the anchor.
     let signal_amp = 0.06_f64;
     let y_truth: Vec<f64> = x
         .iter()
-        .map(|&t| truth_const + signal_amp * (2.0 * PI * t).sin())
+        .map(|&t| signal_amp * (2.0 * PI * t).sin())
         .collect();
     let y_noisy: Vec<f64> = y_truth.iter().map(|&v| v + sigma * rng.normal()).collect();
     let data = make_dataset_1d(&x, &y_noisy);
@@ -672,7 +753,7 @@ fn near_flat_signal() -> Result<(), String> {
         .collect();
     let truth: Vec<f64> = x_grid
         .iter()
-        .map(|&t| truth_const + signal_amp * (2.0 * PI * t).sin())
+        .map(|&t| signal_amp * (2.0 * PI * t).sin())
         .collect();
     let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
         Ok(v) => v,
@@ -685,10 +766,8 @@ fn near_flat_signal() -> Result<(), String> {
     let r = rmse(&yhat, &truth);
     let sf = span(&yhat);
     let st = span(&truth);
-    let extra = format!("max_abs_dev_from_truth={:.4}", {
-        yhat.iter()
-            .map(|v| (v - truth_const).abs())
-            .fold(0.0_f64, f64::max)
+    let extra = format!("max_abs_fit={:.4}", {
+        yhat.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
     });
     let cat = report("near_flat_signal", formula, r, sigma, sf, st, &extra);
     if let Category::Collapsed = cat {
