@@ -386,7 +386,7 @@ fn zz_measure_1561_bygroup_oracle_lambda_sweep() {
     eprintln!(
         "=== #1561 BY-GROUP DECISIVE EXPERIMENT: is group-A over- or under-smoothed? ===\n\
          Fit y ~ s(x,bs='tp',by=group) with noise s(x,bs='tp',by=group) on the exact\n\
-         quality-test data (seed 321, n=200). Per-group oracle sweeps of λ_{μ,A}/λ_{σ,A}\n\
+         quality-test data (seed 321, n=200). Per-group oracle sweeps of λ_{{μ,A}}/λ_{{σ,A}}\n\
          about the REML choice pin the sign: ρ*<0 ⇒ over-smoothing, ρ*>0 ⇒ under-smoothing.\n\
          ρ=0 reproduces the production solve (asserted) so the oracle is faithful."
     );

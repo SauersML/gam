@@ -452,7 +452,7 @@ mod sigma_parameter_jet_release_tests {
     use crate::survival::lognormal_kernel::ProbitFrailtyScaleJet;
     use gam_math::jet_scalar::JetScalar;
     use gam_math::jet_tower::{Tower3, Tower4};
-    use gam_math::nested_dual::{Dual2, JetField};
+    use gam_math::nested_dual::Dual2;
     use std::time::Instant;
 
     // One synthetic interior row: finite signed margins and a strictly-positive
