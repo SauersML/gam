@@ -170,6 +170,8 @@ impl PerAtomEfsResult {
             flat_noise_grad_bound: None,
             tail_snap_reseed: None,
             saddle_escape_reseed: None,
+            wrong_rail_reseed: None,
+            active_set_reseed: None,
         }
     }
 }

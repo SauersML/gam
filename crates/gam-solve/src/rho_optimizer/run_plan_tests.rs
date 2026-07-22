@@ -424,6 +424,76 @@ fn certificate_certifies_kkt_stationary_railed_optimum() {
     );
 }
 
+/// #2392 active-set reduction: when a coordinate is railed at the ρ box with a
+/// genuine (KKT-pinned) tail but the INTERIOR is not stationary, the refused
+/// certificate publishes an `active_set_reseed` that FREEZES the railed
+/// coordinate at its bound so the optimizer can polish the interior in the
+/// reduced box. The genuine rail (`ĉ>0`) must NOT be pulled back — only frozen.
+#[test]
+fn active_set_reduction_freezes_a_railed_coordinate_when_the_interior_is_unpolished_2392() {
+    let bounded = OuterConfig {
+        bounds: Some((array![-30.0, -30.0], array![30.0, 30.0])),
+        ..OuterConfig::default()
+    };
+    // Coord 0: genuine upper-rail tail `a·e^{−ρ₀}` (∂V/∂ρ₀ = −a·e^{−ρ₀} < 0 ⇒
+    // ĉ>0, KKT-pinned at +30). Coord 1: quadratic `½ρ₁²` left UNCONVERGED at
+    // ρ₁=5 (g₁ = 5 ≫ the stationarity bound), so the interior is not stationary.
+    let a = 1.0_f64;
+    let mut obj = OuterProblem::new(2)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| Ok(a * (-rho[0]).exp() + 0.5 * rho[1] * rho[1]),
+            move |_: &mut (), rho: &Array1<f64>| {
+                let e0 = (-rho[0]).exp();
+                Ok(OuterEval {
+                    cost: a * e0 + 0.5 * rho[1] * rho[1],
+                    gradient: array![-a * e0, rho[1]],
+                    hessian: HessianValue::Dense(array![[a * e0, 0.0], [0.0, 1.0]]),
+                    inner_beta_hint: Some(array![e0, 0.0]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+    let mut result = OuterResult::new(
+        array![30.0, 5.0],
+        0.0,
+        1,
+        true,
+        OuterPlan {
+            solver: Solver::Bfgs,
+            hessian_source: HessianSource::BfgsApprox,
+        },
+    );
+    let outcome = certify_outer_optimality(&mut obj, &bounded, "active-set-2392", &mut result);
+    assert!(
+        outcome.is_err(),
+        "an unpolished interior beside a rail must refuse certification"
+    );
+    let reseed = result
+        .active_set_reseed
+        .as_ref()
+        .expect("an unpolished interior beside a genuine rail must mint an active-set reseed");
+    assert_eq!(reseed.frozen, vec![0], "the railed coordinate must be frozen");
+    assert_eq!(reseed.rho[0], 30.0, "the frozen coordinate is pinned at its rail");
+    assert_eq!(
+        (reseed.bounds.0[0], reseed.bounds.1[0]),
+        (30.0, 30.0),
+        "the frozen box must pin lower == upper == the rail"
+    );
+    assert_eq!(
+        (reseed.bounds.0[1], reseed.bounds.1[1]),
+        (-30.0, 30.0),
+        "the interior coordinate's box must be untouched"
+    );
+    assert!(
+        result.wrong_rail_reseed.is_none(),
+        "a genuine λ→∞ rail must be frozen, never pulled off its bound"
+    );
+}
+
 /// Build an interior 1-coordinate objective `½·ρ₀²` (analytic gradient `[ρ₀]`,
 /// analytic Dense Hessian `[[1]]`) and certify at `theta_hat` with NO
 /// `operator_stop_reason` set — i.e. the non-flat-valley exit path a fit takes

@@ -1111,6 +1111,50 @@ pub struct OuterResult {
     /// which lets the optimizer descend to the true PSD minimum exactly as an
     /// identical warm-started resume does by hand.
     pub saddle_escape_reseed: Option<Array1<f64>>,
+    /// Wrong-rail pull-back reseed point minted by a refused certification whose
+    /// coordinate sits AT the ρ box bound but whose clean-band probes prove the
+    /// objective DECREASES as the coordinate moves INWARD (#2392). The outer
+    /// search drove the coordinate to the wrong bound — its terminal gradient is
+    /// deep-λ instrument noise, so the trust region never proposed the large
+    /// inward move — while a drift-band-clean, above-noise-floor run of probes a
+    /// few e-folds inside carries a pencil constant of the sign OPPOSITE the rail
+    /// (descent points away from the bound, `∂V/∂ρ > 0` at an upper rail). This
+    /// point moves that coordinate to its clean-band interior scale, where the
+    /// gradient is informative again; the plan runner reseeds ONCE (gate closed)
+    /// and the optimizer descends to the true interior optimum. Gated strictly on
+    /// the opposite-sign clean-tail proof, so a GENUINE rail (descent toward the
+    /// bound) never mints it and no real λ→∞ optimum is pulled off its rail.
+    pub wrong_rail_reseed: Option<Array1<f64>>,
+    /// Active-set reduction reseed minted by a refused certification whose
+    /// INTERIOR is not stationary while a coordinate is railed at the ρ box with
+    /// a deep-λ noise-floor gradient (#2392). The railed coordinate's
+    /// ill-conditioned Hessian row poisons the joint Newton/ARC steps, so the
+    /// interior cannot polish; freezing that coordinate at its bound and
+    /// re-running lets the optimizer converge the interior in the well-conditioned
+    /// REDUCED space. The reseed carries the frozen box (`bounds`, with
+    /// `lower[k]==upper[k]==rail` for each frozen coordinate) and the frozen
+    /// indices, so the plan runner's un-freeze re-check can judge each frozen
+    /// coordinate's KKT sign against the ORIGINAL bounds at the reduced optimum
+    /// (an inward-feasible-descent gradient un-freezes it — no silent clamping of
+    /// a coordinate that stops wanting the rail).
+    pub active_set_reseed: Option<ActiveSetReseed>,
+}
+
+/// An active-set reduction reseed (#2392): re-run the outer search with a set of
+/// railed coordinates FROZEN at their box bounds so the optimizer polishes the
+/// interior in the reduced space, plus the metadata the un-freeze re-check needs.
+#[derive(Clone, Debug)]
+pub struct ActiveSetReseed {
+    /// The reseed point: the refused checkpoint with the frozen coordinates
+    /// pinned at their bounds (`rho[k] == bounds.0[k] == bounds.1[k]`).
+    pub rho: Array1<f64>,
+    /// The reduced-space box: `lower[k] == upper[k] == rail` for every frozen
+    /// coordinate `k`, the original bounds elsewhere.
+    pub bounds: (Array1<f64>, Array1<f64>),
+    /// The coordinates frozen at their bounds for the reduced-space run. The
+    /// un-freeze re-check judges each of these against the original box after the
+    /// interior converges.
+    pub frozen: Vec<usize>,
 }
 
 impl OuterResult {
@@ -1138,6 +1182,8 @@ impl OuterResult {
             rho_uncertainty_diagnostic: None,
             tail_snap_reseed: None,
             saddle_escape_reseed: None,
+            wrong_rail_reseed: None,
+            active_set_reseed: None,
         }
     }
 
@@ -2741,6 +2787,11 @@ fn certify_outer_optimality_at_terminal_fidelity(
     result.criterion_certificate = Some(certificate.clone());
     if !certificate.certifies() {
         result.converged = false;
+        // Mint the #2392 reseeds fresh for THIS refused point: clear any value a
+        // prior (multistart / pre-polish) certification of a different ρ left on
+        // the result so the resume loop never consumes a stale pull-back/freeze.
+        result.wrong_rail_reseed = None;
+        result.active_set_reseed = None;
         // #2357 — saddle escape. The point is first-order stationary
         // (`is_stationary`: ‖Pg‖ ≤ bound) yet its INTERIOR reduced Hessian is a
         // certified strict saddle (`!curvature_admissible`). A railed coordinate
@@ -2778,6 +2829,106 @@ fn certify_outer_optimality_at_terminal_fidelity(
                 &bounds,
                 context,
             );
+        }
+        // #2392 — wrong-rail pull-back and active-set reduction. A coordinate at
+        // the ρ box whose deep-λ terminal gradient is instrument noise leaves the
+        // outer search unable to move it: the trust region's local model is flat
+        // there. Two evidence-gated one-shot reseeds recover the fit (both gated
+        // by `allow_tail_snap` so the retry pass cannot recurse):
+        //   (1) WRONG-RAIL PULL-BACK: the coordinate's clean-band probes (a few
+        //       e-folds inside, above the noise floor) prove the objective
+        //       DECREASES inward — it was driven to the wrong bound. Reseed it at
+        //       its clean-band interior scale so the optimizer descends to the
+        //       true interior optimum. Fires ONLY on the opposite-sign clean-tail
+        //       proof, so a genuine λ→∞/λ→0 rail is never pulled off its bound.
+        //   (2) ACTIVE-SET REDUCTION: no wrong rail, but the INTERIOR is not
+        //       stationary while a rail is present — the railed coordinate's
+        //       ill-conditioned Hessian row poisons the joint step. Freeze the
+        //       rail(s) at their bound and re-run so the interior converges in the
+        //       reduced space; the plan runner re-certifies the polished point
+        //       under the ORIGINAL box, so a frozen coordinate whose gradient
+        //       turns inward there un-freezes (no silent clamping).
+        // (1) takes precedence: a wrong rail must be pulled back, never frozen.
+        if allow_tail_snap
+            && !certificate_railed.is_empty()
+            && let Some(hessian) = result.final_hessian.clone()
+        {
+            let beta_norm = terminal_beta
+                .as_ref()
+                .map(|b| b.dot(b).sqrt())
+                .filter(|v| v.is_finite())
+                .unwrap_or(0.0);
+            let mut rail_tol =
+                AsymptoteTolerances::exp4_rail_bands(ASYMPTOTE_ESTIMAND_REL_TOL * (1.0 + beta_norm));
+            rail_tol.tail_drift_rel = TAIL_SNAP_DRIFT_REL;
+            let (lower, upper) = &bounds;
+            let mut wrong_rail_point: Option<Array1<f64>> = None;
+            for &k in certificate_railed.iter() {
+                if k >= result.rho.len() || k >= lower.len() || k >= upper.len() {
+                    continue;
+                }
+                let side = if (upper[k] - result.rho[k]).abs() <= (result.rho[k] - lower[k]).abs() {
+                    AsymptoteSide::Upper
+                } else {
+                    AsymptoteSide::Lower
+                };
+                if let Some(target) = detect_wrong_rail_pullback(
+                    obj,
+                    &result.rho,
+                    k,
+                    side,
+                    &rail_tol,
+                    (lower[k], upper[k]),
+                )? {
+                    let mut reseed = result.rho.clone();
+                    reseed[k] = target;
+                    wrong_rail_point = Some(reseed);
+                    break;
+                }
+            }
+            if let Some(reseed) = wrong_rail_point {
+                result.wrong_rail_reseed = Some(reseed);
+            } else {
+                let interior_indices: Vec<usize> = (0..projected_gradient.len())
+                    .filter(|k| !certificate_railed.contains(k))
+                    .collect();
+                let interior_not_stationary = !interior_indices.is_empty()
+                    && certify_interior_stationarity(
+                        &projected_gradient,
+                        &hessian,
+                        &interior_indices,
+                        stationarity_bound,
+                        asymptote_objective_tol,
+                    )
+                    .is_err();
+                if interior_not_stationary {
+                    let mut froz_lower = lower.clone();
+                    let mut froz_upper = upper.clone();
+                    let mut reseed = result.rho.clone();
+                    let mut frozen: Vec<usize> = Vec::new();
+                    for &k in certificate_railed.iter() {
+                        if k >= reseed.len() {
+                            continue;
+                        }
+                        let rail = if (upper[k] - reseed[k]).abs() <= (reseed[k] - lower[k]).abs() {
+                            upper[k]
+                        } else {
+                            lower[k]
+                        };
+                        reseed[k] = rail;
+                        froz_lower[k] = rail;
+                        froz_upper[k] = rail;
+                        frozen.push(k);
+                    }
+                    if !frozen.is_empty() {
+                        result.active_set_reseed = Some(ActiveSetReseed {
+                            rho: reseed,
+                            bounds: (froz_lower, froz_upper),
+                            frozen,
+                        });
+                    }
+                }
+            }
         }
         // Carry the railed-mint and tail-snap decline evidence into the
         // refusal so a railed or budget-exhausted crawl explains which
@@ -3504,6 +3655,112 @@ fn build_and_assess_rail_coordinate(
         })),
         other => Ok(Err(format!("k={coord}: tail verdict {other:?}"))),
     }
+}
+
+/// Detect a WRONG-RAIL coordinate (#2392): one sitting AT its ρ box bound whose
+/// clean-band probes prove the objective strictly DECREASES as the coordinate
+/// moves INWARD — the outer search drove it to the wrong bound. Returns the
+/// interior ρ to reseed the coordinate at (the deepest drift-clean probe, where
+/// `|g|` is largest and the descent is most informative) when the proof holds,
+/// else `None`.
+///
+/// # Proof condition (evidence-gated; cannot launder a genuine λ→∞ / λ→0 optimum)
+///
+/// Probe [`ASYMPTOTE_PROBE_COUNT`] e-folds inward and require a contiguous run of
+/// at least [`MIN_TAIL_SAMPLES`] probes that is, at once:
+/// 1. above the gradient interior floor, `|g| > interior_grad_tol` (so a probe
+///    whose gradient has decayed into finite-difference cancellation next to the
+///    rail is excluded rather than read as a settled tail);
+/// 2. above the pencil-constant noise floor, `|ĉ| > tail_noise_floor`, where
+///    `ĉ = side.tail_constant(ρ, g)` uses the coordinate's ACTUAL rail side;
+/// 3. drift-band-clean in `ĉ` within `tail_drift_rel` (the same constant-pencil
+///    band the genuine tail uses — `run_drift_within_band` keys on `|mean|`, so a
+///    uniformly-negative run is judged on its magnitude); AND
+/// 4. `ĉ` uniformly of the sign OPPOSITE a genuine tail — `ĉ < 0` — i.e. the
+///    descent direction points AWAY from the bound (`∂V/∂ρ > 0` at an upper rail,
+///    `∂V/∂ρ < 0` at a lower rail).
+///
+/// A genuine rail (descent TOWARD the bound) has `ĉ > 0` across the clean run and
+/// never satisfies (4), so it is never pulled off its rail. This shares every
+/// tolerance with the genuine asymptote path ([`AsymptoteTolerances`]); the ONLY
+/// difference is the sign gate in (4).
+fn detect_wrong_rail_pullback(
+    obj: &mut dyn OuterObjective,
+    rho: &Array1<f64>,
+    coord: usize,
+    side: AsymptoteSide,
+    tol: &AsymptoteTolerances,
+    domain: (f64, f64),
+) -> Result<Option<f64>, EstimationError> {
+    const PROBE_DELTA: f64 = 1.0;
+    const PROBE_DOMAIN_MARGIN: f64 = 1.0e-6;
+    // Upper rail (ρ → +∞): step ρ DOWN into the interior. Lower rail: step UP.
+    let sign = match side {
+        AsymptoteSide::Upper => -1.0,
+        AsymptoteSide::Lower => 1.0,
+    };
+    // rows[r] is probe j=r+1: r=0 is CLOSEST to the rail, increasing r steps
+    // further into the interior (larger |grad| on a clean run).
+    let mut rows: Vec<(f64, f64)> = Vec::new();
+    for j in 1..=ASYMPTOTE_PROBE_COUNT {
+        let stepped = rho[coord] + sign * (j as f64) * PROBE_DELTA;
+        if stepped <= domain.0 + PROBE_DOMAIN_MARGIN || stepped >= domain.1 - PROBE_DOMAIN_MARGIN {
+            break;
+        }
+        let mut probe = rho.clone();
+        probe[coord] = stepped;
+        let eval = match obj.eval_with_order(&probe, OuterEvalOrder::ValueAndGradient) {
+            Ok(eval) => eval,
+            Err(_) => break,
+        };
+        if !eval.cost.is_finite() || coord >= eval.gradient.len() || !eval.gradient[coord].is_finite()
+        {
+            break;
+        }
+        rows.push((stepped, eval.gradient[coord]));
+    }
+    if rows.len() < MIN_TAIL_SAMPLES {
+        return Ok(None);
+    }
+    let constants: Vec<f64> = rows
+        .iter()
+        .map(|(r, g)| side.tail_constant(*r, *g))
+        .collect();
+    // Wrong-rail element-clean: gradient above the interior floor, pencil
+    // constant above the noise floor IN MAGNITUDE, and of the descent-inward
+    // (negative) sign. Genuine tails have ĉ > 0 here and are excluded.
+    let element_clean: Vec<bool> = rows
+        .iter()
+        .zip(&constants)
+        .map(|((_, g), c)| {
+            c.is_finite() && *c < -tol.tail_noise_floor && g.abs() > tol.interior_grad_tol
+        })
+        .collect();
+    // Longest contiguous element-clean, drift-band-clean run; reseed the
+    // coordinate at the DEEPEST such probe (largest |g|, closest to the true
+    // interior optimum the descent points toward).
+    let mut best: Option<(usize, usize)> = None;
+    for a in 0..rows.len() {
+        if !element_clean[a] {
+            continue;
+        }
+        for b in a..rows.len() {
+            if !element_clean[b] {
+                break;
+            }
+            if b - a + 1 < MIN_TAIL_SAMPLES {
+                continue;
+            }
+            if !run_drift_within_band(&constants[a..=b], tol.tail_drift_rel) {
+                continue;
+            }
+            match best {
+                Some((ba, bb)) if bb - ba + 1 >= b - a + 1 => {}
+                _ => best = Some((a, b)),
+            }
+        }
+    }
+    Ok(best.map(|(_, b)| rows[b].0))
 }
 
 /// Probe one coordinate's tail by stepping the analytic gradient a fixed number
@@ -4282,6 +4539,31 @@ pub(crate) fn run_outer(
                     result.tail_snap_reseed.take()
                 };
                 let resume_from_tail_snap = tail_snap_reseed.is_some();
+                // #2392 — wrong-rail pull-back and active-set reduction reseeds,
+                // consumed with LOWER precedence than the saddle/tail-snap
+                // reseeds. A higher-precedence reseed DROPS them (take-and-discard)
+                // so no stale reseed leaks into a later iteration, exactly as the
+                // saddle escape drops a co-minted tail snap above. Both are
+                // first-order evidence (a proven inward descent / a poisoned-rail
+                // interior), so — like the tail snap — they fire regardless of the
+                // solver's convergence claim.
+                let higher_precedence_reseed = resume_from_saddle_escape || resume_from_tail_snap;
+                let wrong_rail_reseed = if higher_precedence_reseed {
+                    result.wrong_rail_reseed.take();
+                    None
+                } else {
+                    result.wrong_rail_reseed.take()
+                };
+                let resume_from_wrong_rail = wrong_rail_reseed.is_some();
+                let active_set_reseed = if higher_precedence_reseed || resume_from_wrong_rail {
+                    result.active_set_reseed.take();
+                    None
+                } else {
+                    result.active_set_reseed.take()
+                };
+                let resume_from_active_set = active_set_reseed.is_some();
+                let active_set_rho = active_set_reseed.as_ref().map(|a| a.rho.clone());
+                let active_set_bounds = active_set_reseed.map(|a| a.bounds);
                 // A published reseed means the refused point IS first-order
                 // stationary (the escape mint gate requires `is_stationary`), so
                 // it is a genuine saddle escapable regardless of whether the
@@ -4292,7 +4574,11 @@ pub(crate) fn run_outer(
                 // stale-tolerance resume, which reseeds AT the refused checkpoint,
                 // still requires a genuine convergence claim (a budget-exhausted
                 // non-stationary iterate has no desync to remove).
-                if (!claimed_converged && !resume_from_saddle_escape && !resume_from_tail_snap)
+                if (!claimed_converged
+                    && !resume_from_saddle_escape
+                    && !resume_from_tail_snap
+                    && !resume_from_wrong_rail
+                    && !resume_from_active_set)
                     || resumes_remaining == 0
                     || (resume_from_saddle_escape && saddle_escapes_remaining == 0)
                 {
@@ -4321,6 +4607,10 @@ pub(crate) fn run_outer(
                         "off the negative-curvature saddle ridge"
                     } else if resume_from_tail_snap {
                         "at the confirmed-tail snapped face"
+                    } else if resume_from_wrong_rail {
+                        "at the wrong-rail coordinate's clean-band interior scale"
+                    } else if resume_from_active_set {
+                        "with the poisoned rail frozen so the interior polishes in the reduced box"
                     } else {
                         "at the refused checkpoint"
                     }
@@ -4329,16 +4619,34 @@ pub(crate) fn run_outer(
                 retry_cfg.initial_rho = Some(
                     saddle_escape_reseed
                         .or(tail_snap_reseed)
+                        .or(wrong_rail_reseed)
+                        .or(active_set_rho)
                         .unwrap_or_else(|| result.rho.clone()),
                 );
+                // Active-set reduction (#2392): the polish runs in the REDUCED
+                // (frozen) box so the interior converges without the railed
+                // coordinate's ill-conditioned Hessian row poisoning the step. The
+                // loop re-certifies the polished point under the ORIGINAL box at
+                // the top of the next iteration (`certify_diagnose_and_install`
+                // captures the original `config`), so a frozen coordinate whose
+                // gradient turns inward there un-freezes through the wrong-rail
+                // path — no silent clamping — while a genuine rail certifies with
+                // the interior now stationary. `config.clone()` reset each
+                // iteration, so the frozen box never persists past this run.
+                if let Some(frozen_bounds) = active_set_bounds {
+                    retry_cfg.bounds = Some(frozen_bounds);
+                }
                 retry_cfg.heuristic_lambdas = None;
                 retry_cfg.seed_config.max_seeds = 1;
                 retry_cfg.seed_config.seed_budget = 1;
                 retry_cfg.screen_initial_rho = false;
-                // Both reseed kinds land at a genuinely different point, so the
+                // Every reseed kind lands at a genuinely different point, so the
                 // refused checkpoint's metric (trust radius, outer Hessian)
                 // must not be transferred into the restart.
-                let fresh_metric = resume_from_saddle_escape || resume_from_tail_snap;
+                let fresh_metric = resume_from_saddle_escape
+                    || resume_from_tail_snap
+                    || resume_from_wrong_rail
+                    || resume_from_active_set;
                 retry_cfg.operator_initial_trust_radius = if fresh_metric {
                     None
                 } else {
@@ -5213,6 +5521,72 @@ mod asymptote_rail_certify_tests {
         assert!(
             verdict.is_err(),
             "a drifting ĉ must not certify a tail, got {verdict:?}",
+        );
+    }
+
+    /// #2392 wrong-rail pull-back FIRES: a coordinate sitting at the UPPER bound
+    /// whose clean-band probes carry a POSITIVE gradient (`∂V/∂ρ > 0`, so the
+    /// pencil constant `ĉ = −e^{ρ}·g < 0` — descent points INWARD, away from the
+    /// bound) was driven to the wrong rail. `detect_wrong_rail_pullback` returns
+    /// an interior reseed target strictly below the coordinate's current ρ.
+    #[test]
+    fn wrong_rail_pullback_fires_on_inward_descent_2392() {
+        // V(ρ) = −c·e^{−ρ} ⇒ ∂V/∂ρ = +c·e^{−ρ} > 0: the descent runs ρ DOWN, away
+        // from the upper rail, and ĉ_upper = −e^{ρ}·(c·e^{−ρ}) = −c < 0 uniformly.
+        let c = 6723.0;
+        let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
+        let mut obj = problem.build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| Ok(-c * (-rho[0]).exp()),
+            move |_: &mut (), rho: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: -c * (-rho[0]).exp(),
+                    gradient: array![c * (-rho[0]).exp()],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: Some(array![(-rho[0]).exp()]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let rho = array![29.9];
+        let tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
+        let target = detect_wrong_rail_pullback(
+            &mut obj,
+            &rho,
+            0,
+            AsymptoteSide::Upper,
+            &tol,
+            (-30.0, 30.0),
+        )
+        .expect("probing the wrong-rail objective must not error")
+        .expect("an inward-descent rail must publish a pull-back target");
+        assert!(
+            target < rho[0] && target.is_finite(),
+            "the reseed must move the coordinate INWARD (ρ down), got {target}",
+        );
+    }
+
+    /// #2392 wrong-rail pull-back does NOT fire on a GENUINE upper-rail tail:
+    /// `∂V/∂ρ < 0` ⇒ `ĉ > 0` ⇒ descent runs TOWARD the bound (a real λ→∞ optimum),
+    /// which must never be pulled off its rail.
+    #[test]
+    fn wrong_rail_pullback_refuses_a_genuine_upper_tail_2392() {
+        let mut obj = upper_tail_objective(6723.0, 1.0, 0.0);
+        let rho = array![29.9];
+        let tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
+        let verdict = detect_wrong_rail_pullback(
+            &mut obj,
+            &rho,
+            0,
+            AsymptoteSide::Upper,
+            &tol,
+            (-30.0, 30.0),
+        )
+        .expect("probing must not error");
+        assert!(
+            verdict.is_none(),
+            "a genuine λ→∞ tail (ĉ>0) must not be pulled off its rail, got {verdict:?}",
         );
     }
 
