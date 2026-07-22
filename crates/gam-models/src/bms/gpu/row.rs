@@ -3895,12 +3895,16 @@ mod tests {
         gam_gpu::device_runtime::GpuRuntime::require()
             .expect("#932 full-row release measurement requires CUDA");
 
-        let (family, states) = row_kernel_tests::parity_415::make_flex_parity_family(N, 8, 6);
+        // Cubic deviation runtimes expose `num_internal_knots + 1` live
+        // controls since the #2319 knot-selection orbit canonicalization, so
+        // 9/7 internal knots give p_h=10, p_w=8 — the same r=20 measurement
+        // shape this cell has always timed.
+        let (family, states) = row_kernel_tests::parity_415::make_flex_parity_family(N, 9, 7);
         let cache = family
             .build_exact_eval_cache(&states)
             .expect("full-row timing exact cache");
         let r = cache.primary.total;
-        assert_eq!(r, 20, "8/6 knot fixture must expose primary width r=20");
+        assert_eq!(r, 20, "9/7 knot fixture must expose primary width r=20");
         let marginal = family
             .marginal_design
             .as_dense_ref()
