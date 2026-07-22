@@ -999,4 +999,78 @@ mod tests {
             jet_ns / closed_ns,
         );
     }
+
+    /// #932 release speed gate for the #1591 order prune: the production
+    /// m1..m3 generic-link path composes a `Tower3<1>` twin
+    /// ([`binomial_neglog_q_derivatives_from_jet`]); it must beat computing
+    /// the same three channels through the full `Tower4<1>` composition
+    /// (the pre-prune shape, whose fourth-order seeding/compose is built and
+    /// discarded). The tower arithmetic is link-agnostic given the μ-jet, so
+    /// the logit μ stack serves as the fixture. Emits the harness-parsed
+    /// `hand_over_production` token (`tower4_ns / tower3_ns`); the MSI
+    /// release harness fails closed on any cell `<= 1`.
+    #[test]
+    fn release_measure_binomial_q_tower3_prune_vs_tower4_932() {
+        use std::time::Instant;
+
+        let y = 0.7_f64;
+        let w = 1.3_f64;
+        let q0 = -0.6_f64;
+
+        let tower4_m123 = |q: f64| -> (f64, f64, f64) {
+            let (mu, d1, d2, d3, d4) = logit_jet(q);
+            if w == 0.0 || !binomial_mu_is_interior(mu) {
+                return (0.0, 0.0, 0.0);
+            }
+            let tower = binomial_loglik_q_tower(y, mu, d1, d2, d3, d4);
+            (
+                -w * tower.g[0],
+                -w * tower.h[0][0],
+                -w * tower.t3[0][0][0],
+            )
+        };
+
+        // Parity pin on the exact benchmarked inputs: the prune is proven
+        // bit-identical on the read channels, so this is an equality check.
+        let (mu, d1, d2, d3, _) = logit_jet(q0);
+        let pruned = binomial_neglog_q_derivatives_from_jet(y, w, mu, d1, d2, d3);
+        let full = tower4_m123(q0);
+        assert_eq!(pruned.0.to_bits(), full.0.to_bits(), "m1 prune bit-identity");
+        assert_eq!(pruned.1.to_bits(), full.1.to_bits(), "m2 prune bit-identity");
+        assert_eq!(pruned.2.to_bits(), full.2.to_bits(), "m3 prune bit-identity");
+
+        fn best_ns<F: FnMut(f64) -> f64>(iterations: usize, base_q: f64, mut evaluate: F) -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let mut checksum = 0.0_f64;
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    checksum += evaluate(base_q + checksum * 1e-18);
+                }
+                assert!(
+                    checksum.is_finite(),
+                    "binomial tower-prune release-measure checksum must stay finite"
+                );
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            best * 1e9 / iterations as f64
+        }
+
+        let iterations = 2_000_000usize;
+        let tower3_ns = best_ns(iterations, q0, |q| {
+            let (jet_mu, jet_d1, jet_d2, jet_d3, _) = logit_jet(q);
+            let (m1, m2, m3) =
+                binomial_neglog_q_derivatives_from_jet(y, w, jet_mu, jet_d1, jet_d2, jet_d3);
+            m1 + m2 + m3
+        });
+        let tower4_ns = best_ns(iterations, q0, |q| {
+            let (m1, m2, m3) = tower4_m123(q);
+            m1 + m2 + m3
+        });
+        eprintln!(
+            "BINOMIAL-Q-PRUNE-932 production_tower3={tower3_ns:.2} ns/row \
+             full_tower4={tower4_ns:.2} ns/row hand_over_production={:.6}",
+            tower4_ns / tower3_ns,
+        );
+    }
 }
