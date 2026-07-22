@@ -412,4 +412,158 @@ mod oracle_tests {
             "c_ww drifted from single source: {max_ww:.3e}"
         );
     }
+
+    /// #932 release speed gate for the three `faa_top` single-channel
+    /// production kernels. Each production coefficient
+    /// (`hessian_coeff_fromobjective_q_terms` order 2,
+    /// `directionalhessian_coeff_fromobjective_q_terms` order 3,
+    /// `second_directionalhessian_coeff_fromobjective_q_terms` order 4) reads
+    /// ONLY the fully-mixed top channel of the `F∘q` composition as a
+    /// compile-time-unrolled partition sum (`fast_channel::faa_top{2,3,4}`).
+    /// The honest generic racer is the dense jet tower the oracle tests already
+    /// pin these kernels against as the single-source witness
+    /// (`hessian_via_tower` = `Tower2<2>`, `tower_order3` = `Tower4<3>`,
+    /// `tower_order4` = `Tower4<4>`), which seeds every mixed sub-block and
+    /// composes the whole `N^k` derivative tensor only to read the same one
+    /// entry. The single-channel kernel must beat the dense tower at every
+    /// order — otherwise the production lowering carries no advantage over the
+    /// witness and should BE the witness. Emits one harness-parsed
+    /// `hand_over_production` token per order (`generic_tower_ns / faa_top_ns`);
+    /// the MSI release harness fails closed on any cell `<= 1`.
+    #[test]
+    fn release_measure_binomial_q_coeffs_faa_top_vs_generic_tower_932() {
+        use std::time::Instant;
+
+        // Feedback-coupled timing barrier (no `std::hint::black_box`): the
+        // perturbed input is nudged by a negligible multiple of the running
+        // checksum so neither racer can be hoisted or dropped, while the
+        // measured regime stays bit-adjacent to the parity-pinned fixture.
+        fn best_ns<F: FnMut(f64) -> f64>(iterations: usize, base: f64, mut evaluate: F) -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let mut checksum = 0.0_f64;
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    checksum += evaluate(base + checksum * 1e-18);
+                }
+                assert!(
+                    checksum.is_finite(),
+                    "binomial q-coeffs release-measure checksum must stay finite"
+                );
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            best * 1e9 / iterations as f64
+        }
+
+        let close = |label: &str, a: f64, b: f64| {
+            let band = 1e-12 + 1e-9 * a.abs().max(b.abs());
+            assert!(
+                (a - b).abs() <= band,
+                "{label}: faa_top {a:+.15e} vs generic tower {b:+.15e}"
+            );
+        };
+
+        // ----- order 2: H_ab = faa_top2 vs Tower2<2> -----
+        {
+            let mut next = stream(0x9320_0002);
+            let (m1, m2) = (next(), next());
+            let (q_a, q_b, q_ab) = (next(), next(), next());
+            // Parity pin on the exact benchmarked inputs (the random grid check
+            // is `hessian_matches_tower` above).
+            close(
+                "order2",
+                hessian_coeff_fromobjective_q_terms(m1, m2, q_a, q_b, q_ab),
+                hessian_via_tower(m1, m2, q_a, q_b, q_ab),
+            );
+            let production_ns = best_ns(500_000, q_a, |q| {
+                hessian_coeff_fromobjective_q_terms(m1, m2, q, q_b, q_ab)
+            });
+            let generic_ns = best_ns(500_000, q_a, |q| hessian_via_tower(m1, m2, q, q_b, q_ab));
+            eprintln!(
+                "BINOMIAL-Q-COEFFS-932 order=2 production_faatop={production_ns:.2} ns/row \
+                 generic_tower={generic_ns:.2} ns/row hand_over_production={:.6}",
+                generic_ns / production_ns,
+            );
+        }
+
+        // ----- order 3: D_u H_ab = faa_top3 vs Tower4<3> -----
+        {
+            let mut next = stream(0x9320_0003);
+            let (m1, m2, m3) = (next(), next(), next());
+            let (dq, q_a, q_b, q_ab, dq_a, dq_b, dq_ab) =
+                (next(), next(), next(), next(), next(), next(), next());
+            // Parity pin (random grid check: `directional_matches_jet_single_source`).
+            close(
+                "order3",
+                directionalhessian_coeff_fromobjective_q_terms(
+                    m1, m2, m3, dq, q_a, q_b, q_ab, dq_a, dq_b, dq_ab,
+                ),
+                tower_order3(m1, m2, m3, dq, q_a, q_b, q_ab, dq_a, dq_b, dq_ab),
+            );
+            let production_ns = best_ns(150_000, q_a, |q| {
+                directionalhessian_coeff_fromobjective_q_terms(
+                    m1, m2, m3, dq, q, q_b, q_ab, dq_a, dq_b, dq_ab,
+                )
+            });
+            let generic_ns = best_ns(150_000, q_a, |q| {
+                tower_order3(m1, m2, m3, dq, q, q_b, q_ab, dq_a, dq_b, dq_ab)
+            });
+            eprintln!(
+                "BINOMIAL-Q-COEFFS-932 order=3 production_faatop={production_ns:.2} ns/row \
+                 generic_tower={generic_ns:.2} ns/row hand_over_production={:.6}",
+                generic_ns / production_ns,
+            );
+        }
+
+        // ----- order 4: D²_{uv} H_ab = faa_top4 vs Tower4<4> -----
+        {
+            let mut next = stream(0x9320_0004);
+            let (m1, m2, m3, m4) = (next(), next(), next(), next());
+            let dq_u = next();
+            let dqv = next();
+            let d2q_uv = next();
+            let q_a = next();
+            let q_b = next();
+            let q_ab = next();
+            let dq_a_u = next();
+            let dq_av = next();
+            let dq_b_u = next();
+            let dq_bv = next();
+            let d2q_a_uv = next();
+            let d2q_b_uv = next();
+            let dq_ab_u = next();
+            let dq_abv = next();
+            let d2q_ab_uv = next();
+            // Parity pin (random grid check:
+            // `second_directional_matches_jet_single_source`).
+            close(
+                "order4",
+                second_directionalhessian_coeff_fromobjective_q_terms(
+                    m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_a, q_b, q_ab, dq_a_u, dq_av, dq_b_u,
+                    dq_bv, d2q_a_uv, d2q_b_uv, dq_ab_u, dq_abv, d2q_ab_uv,
+                ),
+                tower_order4(
+                    m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_a, q_b, q_ab, dq_a_u, dq_av, dq_b_u,
+                    dq_bv, d2q_a_uv, d2q_b_uv, dq_ab_u, dq_abv, d2q_ab_uv,
+                ),
+            );
+            let production_ns = best_ns(50_000, q_a, |q| {
+                second_directionalhessian_coeff_fromobjective_q_terms(
+                    m1, m2, m3, m4, dq_u, dqv, d2q_uv, q, q_b, q_ab, dq_a_u, dq_av, dq_b_u, dq_bv,
+                    d2q_a_uv, d2q_b_uv, dq_ab_u, dq_abv, d2q_ab_uv,
+                )
+            });
+            let generic_ns = best_ns(50_000, q_a, |q| {
+                tower_order4(
+                    m1, m2, m3, m4, dq_u, dqv, d2q_uv, q, q_b, q_ab, dq_a_u, dq_av, dq_b_u, dq_bv,
+                    d2q_a_uv, d2q_b_uv, dq_ab_u, dq_abv, d2q_ab_uv,
+                )
+            });
+            eprintln!(
+                "BINOMIAL-Q-COEFFS-932 order=4 production_faatop={production_ns:.2} ns/row \
+                 generic_tower={generic_ns:.2} ns/row hand_over_production={:.6}",
+                generic_ns / production_ns,
+            );
+        }
+    }
 }
