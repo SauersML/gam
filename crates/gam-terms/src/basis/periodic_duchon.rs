@@ -2133,6 +2133,17 @@ mod mixed_periodicity_psd_tests {
         }
     }
 
+    /// gam#2372: the Duchon trend block is the COMPLEMENTARY metric ridge
+    /// `R = N(NᵀGN)Nᵀ`, not the metric projector `GN(NᵀGN)⁻¹NᵀG`. The two agree
+    /// on how they weight the trend directions (both carry `NᵀGN`, the center
+    /// FUNCTION metric restricted to the structural trends — this is what makes
+    /// the block covariant under a center-chart reparameterization rather than a
+    /// Euclidean coefficient shrinkage `NNᵀ`), but only the ridge has range
+    /// exactly `span(N)`, so it annihilates the constant and the kernel block
+    /// and keeps `null(Σ λ_k S_k) = span{1}`. The projector's range `span(GN)`
+    /// leaks onto the constant. This test pins the ridge identity and the
+    /// constant-annihilation property, and still discriminates against a
+    /// Euclidean selector (for which `NᵀGN` would be the identity).
     #[test]
     fn native_trend_ridge_acts_as_center_function_metric_on_structural_trends() {
         let centers = array![
@@ -2181,22 +2192,47 @@ mod mixed_periodicity_psd_tests {
             trend_frame[[n_kernel + column, column - 1]] = 1.0;
         }
 
-        // A function-metric projector equals G on every vector in its target
-        // subspace. A Euclidean coefficient selector fails this identity as
-        // soon as the center chart is non-orthonormal, making this assertion a
-        // discriminating guard against regressing to coefficient shrinkage.
-        let error = (&ridge.dot(&trend_frame) - &gram.dot(&trend_frame))
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f64, f64::max);
-        let scale = gram
-            .dot(&trend_frame)
+        // (1) The shipped block is exactly the complementary metric ridge
+        // `R = N(NᵀGN)Nᵀ`.
+        let trend_metric = trend_frame.t().dot(&gram).dot(&trend_frame);
+        let reference =
+            symmetrize_penalty(&fast_abt(&fast_ab(&trend_frame, &trend_metric), &trend_frame));
+        let ridge_scale = reference
             .iter()
             .map(|value| value.abs())
             .fold(1.0_f64, f64::max);
+        let ridge_err = (&ridge - &reference)
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
         assert!(
-            error <= 2.0e-11 * scale,
-            "Duchon trend ridge must equal the center function metric on structural trends; error={error:.3e}, scale={scale:.3e}"
+            ridge_err <= 2.0e-11 * ridge_scale,
+            "Duchon trend ridge must equal N(NᵀGN)Nᵀ; error={ridge_err:.3e}, scale={ridge_scale:.3e}"
+        );
+
+        // (2) The ridge annihilates the constant (n_kernel is the constant poly
+        // column) and the entire kernel block — range = span(trend frame), so
+        // `null(Σ λ_k S_k) = span{1}` holds (gam#2372).
+        for probe_col in 0..=n_kernel {
+            let mut v = Array1::<f64>::zeros(center_design.ncols());
+            v[probe_col] = 1.0;
+            let rv_norm = ridge.dot(&v).iter().map(|x| x * x).sum::<f64>().sqrt();
+            assert!(
+                rv_norm <= 2.0e-11 * ridge_scale,
+                "trend ridge must annihilate column {probe_col} (constant/kernel); ||Rv||={rv_norm:.3e}"
+            );
+        }
+
+        // (3) The metric is the genuine center FUNCTION metric on trends, not a
+        // Euclidean coefficient selector: `NᵀGN` is materially off-identity.
+        let identity = Array2::<f64>::eye(trend_metric.nrows());
+        let metric_gap = (&trend_metric - &identity)
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            metric_gap > 1e-3,
+            "trend metric NᵀGN must be non-Euclidean (guards against coefficient shrinkage); gap={metric_gap:.3e}"
         );
     }
 
