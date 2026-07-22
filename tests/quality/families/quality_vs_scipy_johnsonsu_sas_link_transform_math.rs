@@ -8,10 +8,11 @@
 //! peer fitting tool whose noisy output we chase):
 //!
 //!   1. VALUE (mu): gam's mu(eta) equals the closed-form sinh-arcsinh CDF
-//!      `Phi(sinh(B*tanh((delta*asinh(eta)+eps)/B)))` to ~machine precision.
-//!      scipy composes this from the elementary functions `norm.cdf`, `sinh`,
-//!      `tanh`, `arcsinh` — it does NOT reuse gam's internal jet, so agreement
-//!      is a genuine independent check that gam evaluates the right function.
+//!      `Phi(sinh(delta*asinh(eta)+eps))` (with `delta = exp(log_delta)`) to
+//!      ~machine precision on this grid. scipy composes this from the elementary
+//!      functions `norm.cdf`, `sinh`, `arcsinh`, `exp` — it does NOT reuse gam's
+//!      internal jet, so agreement is a genuine independent check that gam
+//!      evaluates the right function.
 //!
 //!   2. DERIVATIVES (d1, d2, d3): gam's *analytic* first/second/third
 //!      eta-derivatives equal the true derivatives of that CDF, where the truth
@@ -32,11 +33,22 @@
 //!
 //! gam's SAS inverse link is, verbatim from `sas_inverse_link_jet`:
 //!
-//!   mu(eta) = Phi( sinh( B*tanh( (delta*asinh(eta) + epsilon) / B ) ) ),
-//!   delta   = exp( B_d * tanh(log_delta / B_d) ),
+//!   mu(eta) = Phi( sinh( smooth_bound( delta*asinh(eta) + epsilon, B ) ) ),
+//!   delta   = exp( smooth_bound( log_delta, B_d ) ),
 //!
 //! with `B = SAS_U_CLAMP = 50` and `B_d = SAS_LOG_DELTA_BOUND = 12`. This is the
 //! Jones-Pewsey sinh-arcsinh latent fed through a probit.
+//!
+//! `smooth_bound` is the INTERIOR-EXACT bounded latent map (gam#2389, commit
+//! 056fe5e20): `smooth_bound(x, B) = x` exactly for `|x| <= 0.8*B`, splicing
+//! (C^5) to `+/-B` only across `0.8B < |x| < 1.2B` and saturating beyond. It is
+//! NOT the old `B*tanh(x/B)` clamp — that clamp perturbed the interior by
+//! `O((x/B)^2)`, which is exactly the `~1e-3` disagreement this test used to
+//! flag when its reference still transcribed `tanh`. This grid lies ENTIRELY in
+//! the identity interior (`max|delta*asinh(eta)+eps| ~ 5.4 << 40 = 0.8*B`, and
+//! `|log_delta| <= 1 << 9.6 = 0.8*B_d`, asserted below), so `smooth_bound` is the
+//! identity everywhere here and the exact reference is the pure Jones-Pewsey
+//! sinh-arcsinh CDF `Phi(sinh(exp(log_delta)*asinh(eta) + eps))`.
 //!
 //! Why scipy `norm` and NOT `scipy.stats.johnsonsu`: the Johnson SU CDF is
 //! `Phi(gamma + delta*asinh(x))` — no outer `sinh`. gam's transform has the
@@ -73,6 +85,34 @@ fn gam_sas_link_transform_matches_scipy_sinh_arcsinh_cdf() {
     }
     let n = eta_col.len();
     assert_eq!(n, 100 * 3 * 3, "grid size");
+
+    // The reference below is gam's INTERIOR-EXACT latent map (`smooth_bound` is
+    // the identity for |x| <= 0.8*B, gam#2389). Assert this grid — including the
+    // widest finite-difference stencil offset (3h below) — stays inside that
+    // identity region so the elementary-function reference is gam's exact math
+    // (the pure sinh-arcsinh CDF), not the C^5 splice. If a future grid extends
+    // past it, this fails loudly instead of silently comparing against the wrong
+    // reference.
+    const SAS_U_CLAMP: f64 = 50.0; // B
+    const SAS_LOG_DELTA_BOUND: f64 = 12.0; // B_d
+    const FD_MAX_OFFSET: f64 = 3.0 * 1.5e-3; // widest stencil reach (3h)
+    for i in 0..n {
+        let delta = logd_col[i].exp(); // identity region ⇒ delta = exp(log_delta)
+        let eta_far = eta_col[i].abs() + FD_MAX_OFFSET;
+        let u_raw = delta * eta_far.asinh() + eps_col[i].abs();
+        assert!(
+            u_raw.abs() < 0.8 * SAS_U_CLAMP,
+            "grid point leaves the SAS latent identity interior: |u_raw|={:.3} >= {:.1}",
+            u_raw.abs(),
+            0.8 * SAS_U_CLAMP
+        );
+        assert!(
+            logd_col[i].abs() < 0.8 * SAS_LOG_DELTA_BOUND,
+            "grid log_delta leaves the identity interior: |log_delta|={:.3} >= {:.1}",
+            logd_col[i].abs(),
+            0.8 * SAS_LOG_DELTA_BOUND
+        );
+    }
 
     // ---- gam: evaluate the SAS inverse-link jet at every grid point ---------
     let mut gam_mu = Vec::with_capacity(n);
@@ -128,8 +168,14 @@ fn gam_sas_link_transform_matches_scipy_sinh_arcsinh_cdf() {
         r#"
 from scipy.stats import norm
 
-B = 50.0       # SAS_U_CLAMP
-B_D = 12.0     # SAS_LOG_DELTA_BOUND
+# gam's SAS latent map is the INTERIOR-EXACT bounded map (gam#2389, commit
+# 056fe5e20): smooth_bound(x, B) = x for |x| <= 0.8*B, splicing to +/-B only for
+# |x| in (0.8B, 1.2B). It is NOT the old B*tanh(x/B) clamp. This grid lives
+# entirely in the identity interior (asserted on the Rust side), so the bound is
+# inactive everywhere here: delta = exp(log_delta) and z = sinh(delta*asinh(eta)
+# + eps), the pure Jones-Pewsey sinh-arcsinh law. Applying tanh here would model
+# a bounding function gam no longer uses and re-introduce the O((u/B)^2) interior
+# error this test is meant to catch.
 
 eta  = np.asarray(df["eta"],  dtype=float)
 eps  = np.asarray(df["eps"],  dtype=float)
@@ -137,22 +183,19 @@ logd = np.asarray(df["logd"], dtype=float)
 
 Phi = lambda x: norm.cdf(x)
 
-def delta_of(ld):
-    return np.exp(B_D * np.tanh(ld / B_D))
-
 def cdf(e, ep, ld):
-    # EXACT sinh-arcsinh CDF, built only from elementary functions:
-    #   mu = Phi(sinh(B*tanh((delta*asinh(eta)+eps)/B)))
-    # gam takes a probit shortcut (latent z == eta) whenever eps==0 and
-    # delta==1; replicate that shortcut elementwise so the differentiated
-    # reference is the identical mathematical function gam evaluates there
-    # (otherwise the O((asinh(eta)/B)^2) deviation of the full chain from the
-    # identity at those points would compare gam's derivative against the
-    # derivative of a *different* function and fail for a bogus reason).
-    d = delta_of(ld)
+    # EXACT interior sinh-arcsinh CDF, built only from elementary functions:
+    #   delta = exp(log_delta)                (smooth_bound is the identity here)
+    #   z     = sinh(delta*asinh(eta) + eps)  (smooth_bound is the identity here)
+    #   mu    = Phi(z)
+    # gam takes a probit shortcut (latent z == eta) whenever eps==0 and delta==1;
+    # replicate it elementwise so the differentiated reference is the identical
+    # mathematical function gam evaluates there. It is a near-no-op — sinh(asinh)
+    # reproduces the identity to f64 roundoff — but it keeps those columns
+    # bit-aligned with gam's probit branch.
+    d = np.exp(ld)
     a = np.arcsinh(e)
-    ur = d * a + ep
-    z = np.sinh(B * np.tanh(ur / B))
+    z = np.sinh(d * a + ep)
     shortcut = (np.abs(ep) < 1e-12) & (np.abs(d - 1.0) < 1e-12)
     return Phi(np.where(shortcut, e, z))
 
