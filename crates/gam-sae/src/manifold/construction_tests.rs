@@ -60,13 +60,18 @@ mod exact_hessian_fixture_tests {
         (term, target, rho, cache)
     }
 
-    /// #2330/#2336 refusal-branch companion to `converged_state_with_residual`.
+    /// #2330/#2336 PRICING-branch companion to `converged_state_with_residual`.
     /// The historical softmax `gamma_fd_tiny_fixture` target is NOT ordered-Beta--
     /// Bernoulli reachable, so its majorizer-converged mode is an exact-A saddle
-    /// (a joint-block eigenvalue below the shared PD floor). Returned UN-fitted:
-    /// the criterion refuses at construction on this state, which is exactly the
-    /// coverage `exact_observed_information_refuses_on_a_saddle_2336` asserts. Do
-    /// not `.expect()` a cache here.
+    /// (a joint-block eigenvalue below the shared PD floor). MEASURED (#2336): that
+    /// negative curvature is FULLY attributable to the bounded ARD periodic
+    /// concave-clamp wrinkle E (`λ+e_v(ARD)=+0.026`, `e_v=0.041 ≥ |λ|=0.015`), so
+    /// under the value-side E-attributability semantics the criterion PRICES it
+    /// finite at its basin curvature rather than refusing. This is therefore the
+    /// canonical E-attributable wrinkle-saddle PRICING specimen
+    /// (`exact_observed_information_prices_e_attributable_a_saddle_2336`); the
+    /// genuine (non-attributable) refusal specimen is `obb_patchd_fixture` at a
+    /// window-scan saddle scale.
     pub(super) fn converged_state_with_residual_a_saddle_2336()
     -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
         use crate::manifold::tests::gamma_fd_tiny_fixture;
@@ -1456,9 +1461,15 @@ mod amortized_encoder_tests {
                 "log|A_tt| kept-eigenvalue sum {log_a_tt} != oracle {kept_tt}"
             );
         } else {
-            // A is non-PD: the typed refusal must fire on the joint block, and the
-            // eigen oracle independently confirms the non-positive spectrum. This
-            // is a complete parity test (refusal ⟺ indefinite), not a skipped one.
+            // A is non-PD. Under #2336 value-side E-attributability the classification
+            // is three-way: an indefinite direction attributable to the bounded ARD
+            // concave-clamp (λ+e_v ≥ −floor) is PRICED finite, only a genuinely
+            // indefinite one (λ+e_v < −floor) REFUSES. This fixture is PD on the gauge
+            // quotient at the current head so this branch is unreached; if a future
+            // fixture lands here the assertion must split by attributability (see
+            // e_attributable_ard_saddle_prices_finite_2336 /
+            // genuine_saddle_is_infeasible_probe_not_fatal_2336). Kept as the refusal
+            // guard for a genuinely-indefinite specimen.
             match result {
                 Err(SaeCriterionError::IndefiniteObservedInformation { block }) => {
                     assert_eq!(block, "joint", "refusal fired on the wrong block: {block}");
@@ -1471,25 +1482,18 @@ mod amortized_encoder_tests {
         }
     }
 
-    /// #2330 Phase-2a refusal arbiter (reachable companion to the PD parity test
-    /// above). On the softmax A-saddle specimen the exact observed-information
-    /// criterion MUST refuse with the typed `IndefiniteObservedInformation` on
-    /// the joint block: the majorizer-converged mode has a joint-block eigenvalue
-    /// below the shared PD floor, so +/-log|A| is undefined and the criterion is
-    /// probe-infeasible there. This is the refusal half of the (refusal <=>
-    /// indefinite) parity, preserved as a LIVE gate after the #2253 re-anchor
-    /// moved the shared fixture into the PD window.
-    ///
-    /// This specimen is a GENUINE saddle, NOT a shallow ARD-concave wrinkle: the
-    /// sin excitation makes the target model-UNREACHABLE, so the dropped residual
-    /// curvature ΔC (= ⟨error_metric, ∂²f⟩) is large and drives a deep negative
-    /// joint eigenvalue rooted in the residual, not a shallow basin-curvature
-    /// dip. It must therefore stay REFUSED even under an E-attributability
-    /// value-side semantics (#2336) that prices shallow concave-wrinkle negatives
-    /// at their clamped vᵀBv basin curvature instead of refusing.
+    /// #2330/#2336 PRICING arbiter (reachable companion to the PD parity test
+    /// above). MEASURED correction to the earlier premise: the a_saddle specimen's
+    /// two exact-A negatives are FULLY attributable to the bounded ARD periodic
+    /// concave-clamp wrinkle (`λ+e_v(ARD)=+0.026`, verified in
+    /// `zz_measure_e_attributability_2336`) — NOT a residual-rooted genuine saddle.
+    /// So under the value-side E-attributability semantics (#2336) the criterion
+    /// PRICES it at the basin curvature and returns a FINITE value. This is the
+    /// price half of the (price ⟺ E-attributable, refuse ⟺ genuine) contract; the
+    /// refuse half is `genuine_saddle_is_infeasible_probe_not_fatal_2336` on the
+    /// obb window-scan specimen.
     #[test]
-    fn exact_observed_information_refuses_on_a_saddle_2336() {
-        use super::SaeCriterionError;
+    fn exact_observed_information_prices_e_attributable_a_saddle_2336() {
         let (mut term, target, rho) =
             super::exact_hessian_fixture_tests::converged_state_with_residual_a_saddle_2336();
         let result = term.penalized_quasi_laplace_criterion_with_cache(
@@ -1501,15 +1505,11 @@ mod amortized_encoder_tests {
             1.0e-6,
             1.0e-6,
         );
-        match result {
-            Err(SaeCriterionError::IndefiniteObservedInformation { block }) => {
-                assert_eq!(block, "joint", "refusal fired on the wrong block: {block}");
-            }
-            other => panic!(
-                "the softmax A-saddle specimen must refuse with \
-                 IndefiniteObservedInformation, got {other:?}"
-            ),
-        }
+        assert!(
+            matches!(&result, Ok((value, _, _)) if value.is_finite()),
+            "the E-attributable a_saddle specimen must PRICE FINITE under #2336, not refuse; got: {:?}",
+            result.as_ref().map(|(value, _, _)| *value).map_err(|e| format!("{e:?}"))
+        );
     }
 
     /// The fitted amplitudes the encoder derives are exactly the posterior gate

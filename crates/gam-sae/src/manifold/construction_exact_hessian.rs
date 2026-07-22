@@ -700,6 +700,65 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
+    /// #2336 — the diagonal of `E = B − A` restricted to the ARD periodic
+    /// prior's concave-half clamp (block (3) of
+    /// [`Self::apply_exact_hessian_minus_b`]), over the coordinate (t) block; zero
+    /// on the β border and on logit rows.
+    ///
+    /// `E ⪰ 0` is diagonal in the t-block with entries `w_row·|min(V'',0)|`, the
+    /// negative curvature of the periodic ARD prior that the Newton/Schur majorizer
+    /// DROPS: the assembly writes only `w_row·max(V'',0)` into `B`
+    /// ([`SaeManifoldAtom::psd_majorizer_hess`]), so `A = B + ΔC` with the ARD
+    /// channel of `ΔC` equal to `w_row·min(V'',0) ≤ 0`. This is the EXACTLY-known,
+    /// bounded amplitude of the prior micro-wrinkle that turns a `B`-converged mode
+    /// into an `A`-saddle. Collected here as a diagonal so the criterion can test,
+    /// per negative exact-`A` eigendirection `v`, whether `vᵀEv ≥ |λ|` — i.e. whether
+    /// the indefiniteness is fully attributable to the clamp (#2336 value-side
+    /// E-attributability). Reuses the identical per-row term block (3) applies, so
+    /// the two cannot drift.
+    pub(crate) fn materialize_ard_concave_clamp_diagonal(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+    ) -> Result<Array1<f64>, String> {
+        self.assignment.validate_rho_domain(rho)?;
+        let total_t = cache.delta_t_len();
+        let mut e_diag = Array1::<f64>::zeros(total_t);
+        if self.k_atoms() == 0 {
+            return Ok(e_diag);
+        }
+        let ard_axis_periods: Vec<Vec<Option<f64>>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(|coord| coord.effective_axis_periods())
+            .collect();
+        let ard_precisions = self.validated_ard_precisions(rho)?;
+        let row_loss_w = self.row_loss_weights.as_deref();
+        for row in 0..self.n_obs() {
+            let base = cache.row_offsets[row];
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            let w_row = row_loss_w.map_or(1.0, |w| w[row]);
+            for (a, va) in vars.iter().enumerate() {
+                let SaeLocalRowVar::Coord { atom, axis } = *va else {
+                    continue;
+                };
+                if rho.log_ard[atom].is_empty() {
+                    continue;
+                }
+                let alpha = ard_precisions[atom][axis];
+                let t_val = self.assignment.coords[atom].row(row)[axis];
+                let prior = ArdAxisPrior::eval(alpha, t_val, ard_axis_periods[atom][axis]);
+                let neg = prior.negative_hessian_remainder();
+                if neg != 0.0 {
+                    // E = B − A, so on this diagonal E = −(w_row·neg) = w_row·|neg| ≥ 0.
+                    e_diag[base + a] += -w_row * neg;
+                }
+            }
+        }
+        Ok(e_diag)
+    }
+
     /// #1418: matrix-free apply of the EXACT stationarity Jacobian `A = ∇²_θθ L`:
     /// `A v = B v + ΔC v`, the assembled arrow Hessian apply
     /// ([`apply_cached_arrow_hessian`]) plus the matrix-free dropped-curvature
@@ -3169,24 +3228,61 @@ impl SaeManifoldTerm {
         let a = self
             .materialize_exact_hessian_dense(rho, target, cache)
             .map_err(SaeCriterionError::Numerical)?;
+        // #2336 value-side E-attributability: the ARD periodic prior's concave
+        // half contributes a bounded, EXACTLY-known negative curvature `E ⪰ 0`
+        // (diagonal in the t-block) that the Newton/Schur majorizer DROPS from B
+        // (see `materialize_ard_concave_clamp_diagonal`). A B-converged mode can
+        // therefore be an exact-A saddle whose only negative directions are that
+        // clamp wrinkle. This is COARSE-GRAINED Laplace: the posterior Gaussian
+        // envelope cannot resolve a prior micro-wrinkle below its own
+        // quadratic-model resolution, so a negative eigendirection `v` whose whole
+        // negativity is attributable to the clamp (`vᵀEv ≥ |λ|`, i.e. basin
+        // curvature `λ + vᵀEv ≥ −floor`) is priced at that basin curvature instead
+        // of refused. A negative direction the clamp cannot explain
+        // (`λ + vᵀEv < −floor`) is a GENUINE saddle and still returns the typed
+        // IndefiniteObservedInformation refusal. No new constant: the SAME shared
+        // `SAE_EXACT_A_PD_FLOOR_REL` band, and a `|λ + vᵀEv| ≤ floor` result drops
+        // into the existing radial-gauge unit-stiffness deflation (`log 1 = 0`).
+        // NOTE (#2330): this changes VALUE semantics only; the exact-A quotient
+        // pseudo-inverse the θ-adjoint consumes still refuses an indefinite A, so
+        // the analytic gradient and this value disagree on the priced directions
+        // by construction until a matching B-channel adjoint increment lands.
+        let e_diag = self
+            .materialize_ard_concave_clamp_diagonal(rho, cache)
+            .map_err(SaeCriterionError::Numerical)?;
         let quotient_log_det =
             |m: &Array2<f64>, block: &'static str| -> Result<f64, SaeCriterionError> {
-                let (eigs, _vecs) = m.eigh(Side::Lower).map_err(|e| {
+                let (eigs, vecs) = Self::cluster_stable_eigh(m, &e_diag, total_t).map_err(|e| {
                     SaeCriterionError::Numerical(format!(
-                        "exact_observed_information_log_dets: {block} eigendecomposition failed: {e:?}"
+                        "exact_observed_information_log_dets: {block}: {e}"
                     ))
                 })?;
                 let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 let floor = Self::SAE_EXACT_A_PD_FLOOR_REL * max_eig.max(1.0);
                 let mut log_det = 0.0_f64;
-                for &lambda in eigs.iter() {
-                    if lambda < -floor {
-                        return Err(SaeCriterionError::IndefiniteObservedInformation { block });
+                for (idx, &lambda) in eigs.iter().enumerate() {
+                    let priced = if lambda < -floor {
+                        // Add back the dropped ARD-concave clamp curvature along
+                        // this eigendirection (E is zero on the β border, so only
+                        // the first `total_t` components contribute).
+                        let v = vecs.column(idx);
+                        let limit = total_t.min(v.len());
+                        let mut e_v = 0.0_f64;
+                        for j in 0..limit {
+                            e_v += e_diag[j] * v[j] * v[j];
+                        }
+                        let basin = lambda + e_v;
+                        if basin < -floor {
+                            return Err(SaeCriterionError::IndefiniteObservedInformation { block });
+                        }
+                        basin
+                    } else {
+                        lambda
+                    };
+                    if priced > floor {
+                        log_det += priced.ln();
                     }
-                    if lambda > floor {
-                        log_det += lambda.ln();
-                    }
-                    // |lambda| <= floor: radial-gauge quotient null ⇒ log 1 = 0.
+                    // |priced| <= floor: radial-gauge / clamp-attributed null ⇒ log 1 = 0.
                 }
                 Ok(log_det)
             };
@@ -3212,21 +3308,42 @@ impl SaeManifoldTerm {
         let total_t = cache.delta_t_len();
         let dim = total_t + cache.k;
         let a = self.materialize_exact_hessian_dense(rho, target, cache)?;
+        // #2336 — mirror the value-side E-attributability pricing into the quotient
+        // pseudo-inverse so the θ-adjoint is DEFINED (finite) at a wrinkle-priced
+        // mode: an ARD-concave-clamp-attributable negative direction is inverted at
+        // its priced basin curvature `1/(λ+e_v)` rather than refused; a genuine
+        // saddle (`λ+e_v < −floor`) still refuses. PROTOTYPE NOTE (#2336/#2330): this
+        // is NOT the exact adjoint of the priced value — the derivative of the priced
+        // `½log|A|` carries an extra `dE/dρ` B-channel on the switched directions that
+        // this inverse omits, so the analytic gradient and a finite-difference of the
+        // priced value disagree there by construction until that channel lands.
+        let e_diag = self.materialize_ard_concave_clamp_diagonal(rho, cache)?;
         let pinv = |m: &Array2<f64>| -> Result<Array2<f64>, String> {
-            let (eigs, vecs) = m.eigh(Side::Lower).map_err(|e| {
-                format!("materialize_exact_hessian_quotient_inverse: eigh failed: {e:?}")
-            })?;
+            let (eigs, vecs) = Self::cluster_stable_eigh(m, &e_diag, total_t)?;
             let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let floor = Self::SAE_EXACT_A_PD_FLOOR_REL * max_eig.max(1.0);
             let mut w = Array1::<f64>::zeros(eigs.len());
             for (idx, &lambda) in eigs.iter().enumerate() {
-                if lambda < -floor {
-                    return Err(format!(
-                        "materialize_exact_hessian_quotient_inverse: indefinite A \
-                         (λ={lambda:.3e}); the outer gradient must not be assembled at a saddle"
-                    ));
-                }
-                w[idx] = if lambda > floor { 1.0 / lambda } else { 0.0 };
+                let priced = if lambda < -floor {
+                    let v = vecs.column(idx);
+                    let limit = total_t.min(v.len());
+                    let mut e_v = 0.0_f64;
+                    for j in 0..limit {
+                        e_v += e_diag[j] * v[j] * v[j];
+                    }
+                    let basin = lambda + e_v;
+                    if basin < -floor {
+                        return Err(format!(
+                            "materialize_exact_hessian_quotient_inverse: indefinite A \
+                             (λ={lambda:.3e}, λ+e_v={basin:.3e}); genuine saddle, the outer \
+                             gradient must not be assembled here"
+                        ));
+                    }
+                    basin
+                } else {
+                    lambda
+                };
+                w[idx] = if priced > floor { 1.0 / priced } else { 0.0 };
             }
             Ok(vecs.dot(&Array2::from_diag(&w)).dot(&vecs.t()))
         };
@@ -3309,6 +3426,261 @@ impl SaeManifoldTerm {
     /// `∂B/∂θ + ∂ΔC_ard/∂θ` but NOT the residual-curvature / softmax-entropy legs
     /// of `∂ΔC/∂θ` (Patch D). Until D lands, Γ_eff — hence the IFT correction — is
     /// missing that term and the conservation bisection stays red by exactly it.
+    /// #2336 flag-1 — cluster-stable eigendecomposition for the E-attributability
+    /// pricing. Within any eigenvalue cluster whose consecutive gaps sit below the
+    /// shared PD floor, `eigh`'s eigenvectors are arbitrary, so the per-vector price
+    /// `e_i = vᵀEv` and the Daleckii–Krein denominators `(λ_i−λ_j)` are both
+    /// ill-defined. This rotates the eigenbasis WITHIN each such cluster to
+    /// diagonalize `E` restricted to it: `vᵀEv` becomes basis-unambiguous (the
+    /// cluster's `E`-eigenvalues) and the intra-cluster `vᵢᵀEvⱼ` vanish exactly, so
+    /// the K terms that would divide by a sub-floor gap are removed at source. The
+    /// eigenvalues are untouched; a fixture with no clustered spectrum returns the
+    /// plain decomposition bit-for-bit. `e_diag` is the t-block diagonal of `E`
+    /// (zero on the β border), so the restriction reads only the first `total_t`
+    /// rows of each eigenvector.
+    pub(crate) fn cluster_stable_eigh(
+        m: &Array2<f64>,
+        e_diag: &Array1<f64>,
+        total_t: usize,
+    ) -> Result<(Array1<f64>, Array2<f64>), String> {
+        let (eigs, mut vecs) = m
+            .eigh(Side::Lower)
+            .map_err(|e| format!("cluster_stable_eigh: eigh failed: {e:?}"))?;
+        let dim = eigs.len();
+        let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let floor = Self::SAE_EXACT_A_PD_FLOOR_REL * max_eig.max(1.0);
+        let t_lim = total_t.min(dim);
+        let mut i = 0usize;
+        while i < dim {
+            let mut j = i + 1;
+            while j < dim && (eigs[j] - eigs[j - 1]).abs() <= floor {
+                j += 1;
+            }
+            let width = j - i;
+            if width > 1 {
+                let mut ec = Array2::<f64>::zeros((width, width));
+                for a in 0..width {
+                    for b in a..width {
+                        let mut acc = 0.0_f64;
+                        for r in 0..t_lim {
+                            acc += vecs[[r, i + a]] * e_diag[r] * vecs[[r, i + b]];
+                        }
+                        ec[[a, b]] = acc;
+                        ec[[b, a]] = acc;
+                    }
+                }
+                let (_ec_eigs, rot) = ec
+                    .eigh(Side::Lower)
+                    .map_err(|e| format!("cluster_stable_eigh: cluster eigh failed: {e:?}"))?;
+                let cluster = vecs.slice(s![.., i..j]).to_owned();
+                let rotated = cluster.dot(&rot);
+                vecs.slice_mut(s![.., i..j]).assign(&rotated);
+            }
+            i = j;
+        }
+        Ok((eigs, vecs))
+    }
+
+    /// #2336 — the coordinate-block (t-index → (atom, axis)) map for a cache, so
+    /// the ARD-clamp E-attributability channels can attribute each priced
+    /// direction's `e_v` mass back to the ρ_ard slot that scales it. `None` on
+    /// logit / β rows (E is zero there).
+    pub(crate) fn coord_axis_map_for_cache(
+        &self,
+        cache: &ArrowFactorCache,
+    ) -> Result<Vec<Option<(usize, usize)>>, String> {
+        let total_t = cache.delta_t_len();
+        let mut map = vec![None; total_t];
+        for row in 0..self.n_obs() {
+            let base = cache.row_offsets[row];
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            for (a, va) in vars.iter().enumerate() {
+                if let SaeLocalRowVar::Coord { atom, axis } = *va {
+                    map[base + a] = Some((atom, axis));
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    /// #2336 — the t-derivative diagonal of the ARD concave-clamp remainder E,
+    /// `∂E_rr/∂t_r = w_row·κ²·grad·[hess<0]` (companion to
+    /// `materialize_ard_concave_clamp_diagonal`; `grad = (α/κ)·sin κt`,
+    /// `hess = α·cos κt`, so `κ²·grad = α·κ·sin κt = ∂(−min(hess,0))/∂t` on the
+    /// concave half, 0 elsewhere). Zero on logit / non-periodic / convex rows.
+    pub(crate) fn ard_concave_clamp_dt_diagonal(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+    ) -> Result<Array1<f64>, String> {
+        let total_t = cache.delta_t_len();
+        let mut dt = Array1::<f64>::zeros(total_t);
+        if self.k_atoms() == 0 {
+            return Ok(dt);
+        }
+        let ard_axis_periods: Vec<Vec<Option<f64>>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(|coord| coord.effective_axis_periods())
+            .collect();
+        let ard_precisions = self.validated_ard_precisions(rho)?;
+        let row_loss_w = self.row_loss_weights.as_deref();
+        for row in 0..self.n_obs() {
+            let base = cache.row_offsets[row];
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            let w_row = row_loss_w.map_or(1.0, |w| w[row]);
+            for (a, va) in vars.iter().enumerate() {
+                let SaeLocalRowVar::Coord { atom, axis } = *va else {
+                    continue;
+                };
+                if rho.log_ard[atom].is_empty() {
+                    continue;
+                }
+                let Some(period) = ard_axis_periods[atom][axis] else {
+                    continue; // non-periodic axis: hess = α > 0, clamp never bites.
+                };
+                let alpha = ard_precisions[atom][axis];
+                let t_val = self.assignment.coords[atom].row(row)[axis];
+                let prior = ArdAxisPrior::eval(alpha, t_val, Some(period));
+                let kappa = std::f64::consts::TAU / period;
+                // #2339 smooth clamp: E = hess_majorized − hess = α·softplus_τ(−cos κt),
+                // so ∂E/∂t = κ²·grad·(1 − clamp_slope(cos κt)) (clamp_slope = logistic(cos/τ);
+                // τ→0 recovers the hard-clamp κ²·grad·[cos<0]).
+                let cos = prior.hess / alpha;
+                let contrib = kappa * kappa * prior.grad * (1.0 - ArdAxisPrior::clamp_slope(cos));
+                if contrib != 0.0 {
+                    dt[base + a] += w_row * contrib;
+                }
+            }
+        }
+        Ok(dt)
+    }
+
+    /// #2336 — the value-side E-attributability pricing's ρ-derivative increment
+    /// (the `dE/dρ` B-channel), returned as `(delta_logdet_trace, delta_gamma_t,
+    /// k_joint, k_tt)` for [`Self::dense_exact_a_logdet_channels`] to fold in.
+    ///
+    /// Priced value `½log|A_priced|`, `A_priced = A + Σ_{i∈priced} e_i v_iv_iᵀ`,
+    /// `e_i = v_iᵀE v_i`. Beyond `½ tr(A_priced⁺ dA/dρ)` (which the caller already
+    /// gets from the priced pseudo-inverse), `d(½log|A_priced|)/dρ` carries
+    /// `½ Σ_p (1/μ_i) de_i/dρ` with `de_i/dρ = v_iᵀ(dE/dρ)v_i + 2 v_iᵀE(dv_i/dρ)`:
+    ///   (II) Daleckii–Krein eigenvector-derivative term
+    ///        `2 Σ_p (1/μ_i) Σ_{j≠i}(v_iᵀE v_j)(v_jᵀ dA/dρ v_i)/(λ_i−λ_j)
+    ///         = tr(K·dA/dρ)`, K the symmetric matrix below — folded into `inv`;
+    ///   (III-direct) explicit ρ_ard leg: `E ∝ α = e^{ρ_ard}` ⇒ `dE/dρ_ard = E`,
+    ///        contributing `½ Σ_p (1/μ_i)·Σ_{r∈(a,x)} E_rr v_i[r]²` to the ρ_ard slot;
+    ///   (III-θ) `∂E/∂t` diagonal into the θ-adjoint: `½ Σ_p (1/μ_i)·(∂E_rr/∂t_r)v_i[r]²`.
+    /// Each block contributes with the sign of the `½[log|A| − log|A_tt|]` split
+    /// (joint `+`, tt `−`), matching the caller's `gamma.t -= gamma_tt.t`.
+    pub(crate) fn priced_ard_adjoint_extras(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array2<f64>, Array2<f64>), String> {
+        let total_t = cache.delta_t_len();
+        let dim = total_t + cache.k;
+        let n_params = rho.to_flat().len();
+        let a = self.materialize_exact_hessian_dense(rho, target, cache)?;
+        let e_diag = self.materialize_ard_concave_clamp_diagonal(rho, cache)?;
+        let de_dt = self.ard_concave_clamp_dt_diagonal(rho, cache)?;
+        let coord_axis = self.coord_axis_map_for_cache(cache)?;
+
+        let mut delta_trace = Array1::<f64>::zeros(n_params);
+        let mut delta_gamma_t = Array1::<f64>::zeros(total_t);
+        let mut k_joint = Array2::<f64>::zeros((dim, dim));
+        let mut k_tt = Array2::<f64>::zeros((dim, dim));
+
+        // One block's contribution. `block_dim` is the eigenvector length
+        // (`dim` for the joint A, `total_t` for A_tt); `sign` is +1 (joint) or
+        // −1 (tt). `k_out` receives this block's K (embedded in the dim×dim frame).
+        let mut accumulate = |m: &Array2<f64>,
+                              block_dim: usize,
+                              sign: f64,
+                              k_out: &mut Array2<f64>|
+         -> Result<(), String> {
+            let (eigs, vecs) = Self::cluster_stable_eigh(m, &e_diag, total_t)?;
+            let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let floor = Self::SAE_EXACT_A_PD_FLOOR_REL * max_eig.max(1.0);
+            let t_lim = total_t.min(block_dim);
+            // E·v_i on the t-block for every column (E diagonal = e_diag on t rows).
+            for i in 0..block_dim {
+                if eigs[i] >= -floor {
+                    continue; // not a negative direction
+                }
+                let vi = vecs.column(i);
+                let mut e_v = 0.0_f64;
+                for r in 0..t_lim {
+                    e_v += e_diag[r] * vi[r] * vi[r];
+                }
+                let mu = eigs[i] + e_v;
+                if mu < -floor {
+                    continue; // genuine saddle: not priced, no increment (value refuses)
+                }
+                if !(mu.abs() > floor) {
+                    continue; // priced into the near-null deflation band ⇒ log 1, no trace
+                }
+                let inv_mu = 1.0 / mu;
+                let half_sign = 0.5 * sign;
+
+                // (III-direct): attribute e_v mass to each ρ_ard(atom,axis).
+                for r in 0..t_lim {
+                    if let Some((atom, axis)) = coord_axis[r] {
+                        let contrib = e_diag[r] * vi[r] * vi[r];
+                        if contrib != 0.0 {
+                            let idx = rho.ard_flat_index(atom, axis);
+                            delta_trace[idx] += half_sign * inv_mu * contrib;
+                        }
+                    }
+                }
+                // (III-θ): ∂E/∂t diagonal into the θ-adjoint.
+                for r in 0..t_lim {
+                    if de_dt[r] != 0.0 {
+                        delta_gamma_t[r] += half_sign * inv_mu * de_dt[r] * vi[r] * vi[r];
+                    }
+                }
+                // (II): K = Σ_p (1/μ_i)(v_i w_iᵀ + w_i v_iᵀ),
+                //   w_i = Σ_{j≠i} [(v_iᵀE v_j)/(λ_i−λ_j)] v_j.
+                let mut w = Array1::<f64>::zeros(block_dim);
+                for j in 0..block_dim {
+                    if j == i {
+                        continue;
+                    }
+                    let denom = eigs[i] - eigs[j];
+                    if denom.abs() <= floor {
+                        continue; // near-degenerate: skip (well-separated shallow saddle)
+                    }
+                    let vj = vecs.column(j);
+                    let mut vi_e_vj = 0.0_f64;
+                    for r in 0..t_lim {
+                        vi_e_vj += vi[r] * e_diag[r] * vj[r];
+                    }
+                    let coeff = vi_e_vj / denom;
+                    if coeff != 0.0 {
+                        for r in 0..block_dim {
+                            w[r] += coeff * vj[r];
+                        }
+                    }
+                }
+                for r in 0..block_dim {
+                    if w[r] == 0.0 && vi[r] == 0.0 {
+                        continue;
+                    }
+                    for c in 0..block_dim {
+                        k_out[[r, c]] += inv_mu * (vi[r] * w[c] + w[r] * vi[c]);
+                    }
+                }
+            }
+            Ok(())
+        };
+
+        accumulate(&a, dim, 1.0, &mut k_joint)?;
+        let a_tt = a.slice(s![..total_t, ..total_t]).to_owned();
+        accumulate(&a_tt, total_t, -1.0, &mut k_tt)?;
+        Ok((delta_trace, delta_gamma_t, k_joint, k_tt))
+    }
+
     pub(crate) fn dense_exact_a_logdet_channels(
         &self,
         target: ArrayView2<'_, f64>,
@@ -3319,6 +3691,16 @@ impl SaeManifoldTerm {
         let n_params = rho.to_flat().len();
         let (a_pinv, a_tt_pinv) =
             self.materialize_exact_hessian_quotient_inverse(rho, target, cache)?;
+        // #2336 — the value-side E-attributability pricing's ρ-derivative increment.
+        // (II) folds into the pseudo-inverses as K so every dA/dρ and dA/dθ channel
+        // below emits `tr((A_priced⁺+K)·d…)` = the (I)+(II) legs at once; (III-direct)
+        // and (III-θ) are added after the channel contractions. On a fit with no
+        // priced directions all four are exactly zero, so the exact-A path is
+        // unchanged.
+        let (priced_delta_trace, priced_delta_gamma_t, priced_k_joint, priced_k_tt) =
+            self.priced_ard_adjoint_extras(rho, target, cache)?;
+        let a_pinv = &a_pinv + &priced_k_joint;
+        let a_tt_pinv = &a_tt_pinv + &priced_k_tt;
         let m = self.penalty_curvature_operators_by_flat(rho, cache)?;
         let d = self.exact_stationarity_penalty_derivative_delta_by_flat(rho, cache)?;
         let frob = |x: &Array2<f64>, y: &Array2<f64>| -> f64 { (x * y).sum() };
@@ -3364,6 +3746,10 @@ impl SaeManifoldTerm {
         )?;
         gamma.t -= &gamma_tt.t;
         gamma.beta -= &gamma_tt.beta;
+        // #2336 (III-direct) explicit ρ_ard leg + (III-θ) ∂E/∂t θ-adjoint diagonal
+        // (both carry the joint−tt sign internally).
+        logdet_trace += &priced_delta_trace;
+        gamma.t += &priced_delta_gamma_t;
         let rank_charge = self.production_rank_charge_derivative(target, rho, loss, cache)?;
         gamma.t.scaled_add(2.0, &rank_charge.theta.t);
         gamma.beta.scaled_add(2.0, &rank_charge.theta.beta);

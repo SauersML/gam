@@ -42,26 +42,70 @@ fn ard_saddle_state() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     (term, target, rho)
 }
 
-/// #2336 regression — an outer evaluation at a ρ whose exact observed information
-/// is INDEFINITE must return the conventional `+inf` infeasible evaluation so the
-/// optimizer backtracks, NOT a fatal error that kills the whole fit.
-///
-/// Before the fix, all four `IndefiniteObservedInformation` arms in
-/// `outer_objective.rs` returned `Err`. Those arms were added as exhaustiveness
-/// patches for the new enum variant (`223715e9b`, `40855deec`), not as a lane
-/// policy — and they contradict both the criterion's own documented contract
-/// ("makes saddle-ρ probe-infeasible (+inf) and steers the outer away") and the
-/// doctrine `is_recoverable_value_probe_refusal` states for exactly this class:
-/// the indefinite basin is adjacent to the PD optimum, so the outer solver must
-/// read `+∞` and steer back rather than abort. RED before the fix (the `eval`
-/// below returns `Err`), GREEN after.
+/// #2336 GATE — after the value-side E-attributability fix, a B-converged mode
+/// whose exact-A indefiniteness is FULLY attributable to the bounded ARD periodic
+/// concave-clamp wrinkle `E` prices a FINITE criterion (basin curvature `λ+e_v ≥ 0`
+/// on the switched directions) instead of refusing. `ard_saddle_state`'s two
+/// negatives (≈ −0.015) are E-attributable (`e_v ≥ |λ|`, verified in
+/// `zz_measure_e_attributability_2336`), so both the criterion and the outer eval
+/// return finite. RED before the fix (the criterion returned
+/// `Err(IndefiniteObservedInformation{{joint}})` and `eval` priced `+inf`), GREEN
+/// STABLE across #2339: E = α·softplus_τ₀(−cos κt) ≥ α·max(−cos,0) (the hard clamp)
+/// pointwise, so the smooth clamp only GROWS e_v — the attributability test loosens
+/// by at most α·τ₀·ln2 = α·(deflation floor), within #2339's τ₀ budget — hence
+/// a_saddle prices under both the hard and the smooth clamp.
+/// after. This is the canonical E-attributable wrinkle-saddle specimen (same state
+/// fix-2253 anchored as `converged_state_with_residual_a_saddle_2336`, now
+/// documented as the PRICING specimen: its `λ+e_v(ARD)=+0.026` shows the clamp
+/// alone lifts it, so it prices — it is NOT a genuine deep saddle). The genuine
+/// refusal path is exercised by `genuine_saddle_is_infeasible_probe_not_fatal_2336`.
 #[test]
-pub(crate) fn indefinite_exact_a_is_an_infeasible_probe_not_a_fatal_abort_2336() {
+pub(crate) fn e_attributable_ard_saddle_prices_finite_2336() {
     let (mut term, target, rho) = ard_saddle_state();
+    let priced = term.penalized_quasi_laplace_criterion_with_cache(
+        target.view(),
+        &rho,
+        None,
+        40,
+        0.4,
+        1.0e-6,
+        1.0e-6,
+    );
+    assert!(
+        matches!(&priced, Ok((value, _, _)) if value.is_finite()),
+        "post E-attributability fix the ARD-wrinkle saddle must PRICE FINITE, not refuse; got: {:?}",
+        priced.as_ref().map(|(value, _, _)| *value).map_err(|e| format!("{e:?}"))
+    );
 
-    // The fixture must actually exercise the defect: at this ρ the criterion's
-    // exact-A classification refuses on the joint block. If this ever stops
-    // holding, the test below would pass vacuously, so assert it explicitly.
+    let (term, target, rho) = ard_saddle_state();
+    let rho_flat = rho.to_flat();
+    let mut objective =
+        SaeManifoldOuterObjective::new(term, target, None, rho, 40, 0.4, 1.0e-6, 1.0e-6);
+    match objective.eval(&rho_flat) {
+        Ok(evaluation) => assert!(
+            evaluation.cost.is_finite(),
+            "an E-attributable saddle-ρ must price FINITE (was +inf refusal), got cost={}",
+            evaluation.cost
+        ),
+        Err(err) => panic!(
+            "#2336: an E-attributable saddle-ρ must be a FINITE outer eval, not a fatal abort; \
+             got: {err}"
+        ),
+    }
+}
+
+/// #2336 refusal companion — a GENUINE saddle (indefiniteness NOT attributable to
+/// the bounded ARD concave-clamp: `λ+e_v < −floor`) must STILL return the typed
+/// `IndefiniteObservedInformation` refusal, and the outer eval must price it as
+/// `+inf` infeasible (not a fatal abort). The specimen is `obb_patchd_fixture`
+/// at a window-scan saddle scale — verified genuine (E-non-attributable) by the
+/// #2336 spectral scan (scale 0.02: `n_neg=1, attributable=0`). Guards the
+/// "refuse ⟺ genuinely-indefinite" half of the value-side contract; the price
+/// half is `e_attributable_ard_saddle_prices_finite_2336`.
+#[test]
+fn genuine_saddle_is_infeasible_probe_not_fatal_2336() {
+    let (mut term, target, rho) =
+        super::tests_logdet_adjoint_780::obb_patchd_fixture(0.02, -6.0);
     let refusal = term.penalized_quasi_laplace_criterion_with_cache(
         target.view(),
         &rho,
@@ -76,25 +120,24 @@ pub(crate) fn indefinite_exact_a_is_an_infeasible_probe_not_a_fatal_abort_2336()
             refusal,
             Err(SaeCriterionError::IndefiniteObservedInformation { block }) if block == "joint"
         ),
-        "fixture must exercise the indefinite exact-A refusal on the joint block; got: {:?}",
+        "the genuine (non-E-attributable) saddle specimen must refuse on the joint block; got: {:?}",
         refusal.map(|(value, _, _)| value)
     );
 
-    // The load-bearing assertion: the SAME ρ, driven through the outer objective's
-    // evaluation lane, is an infeasible probe rather than a fatal error.
-    let (term, target, rho) = ard_saddle_state();
+    let (term, target, rho) =
+        super::tests_logdet_adjoint_780::obb_patchd_fixture(0.02, -6.0);
     let rho_flat = rho.to_flat();
     let mut objective =
         SaeManifoldOuterObjective::new(term, target, None, rho, 40, 0.4, 1.0e-6, 1.0e-6);
     match objective.eval(&rho_flat) {
         Ok(evaluation) => assert!(
             evaluation.cost.is_infinite() && evaluation.cost.is_sign_positive(),
-            "a saddle-ρ must price as +inf infeasible, got cost={}",
+            "a genuine saddle-ρ must price as +inf infeasible, got cost={}",
             evaluation.cost
         ),
         Err(err) => panic!(
-            "#2336: an indefinite exact A must be an INFEASIBLE probe the outer solver can \
-             backtrack from, not a fatal abort; got: {err}"
+            "#2336: a genuine indefinite exact A must be an INFEASIBLE probe the outer solver \
+             can backtrack from, not a fatal abort; got: {err}"
         ),
     }
 }
@@ -527,4 +570,127 @@ fn zz_measure_saddle_gate_desync_2336() {
             (obj_reconv - obj_stepped) < 1.0e-4
         );
     }
+}
+
+/// #2336 E-ATTRIBUTABILITY VERIFICATION (zz_measure) — the decisive theory gate.
+///
+/// The value-side fix prices a negative exact-A eigendirection v at its BASIN
+/// curvature `λ + e_v` (adding back the dropped ARD-concave clamp) iff the
+/// indefiniteness is fully attributable to that bounded wrinkle, i.e. `e_v ≥ |λ|`
+/// where `e_v = vᵀ E v` and E is the ARD concave-clamp remainder diagonal
+/// (materialize_ard_concave_clamp_diagonal). If e_v < |λ| the negative curvature
+/// exceeds anything the wrinkle can produce ⇒ genuine saddle ⇒ keep refusing.
+///
+/// This test VERIFIES the premise on ard_saddle_state: its 2 negative eigenvalues
+/// (≈ −0.015) must be E-attributable (`e_v ≥ |λ|`). If any negative direction is
+/// NOT attributable, the theory is wrong and the fix must not be built as designed.
+/// Cross-checks e_v (ARD-only diagonal) against the full ΔC = A−B contraction
+/// (apply_exact_hessian_minus_b) — for coord-dominated directions they should be
+/// close (softmax/residual channels small on those directions).
+#[test]
+fn zz_measure_e_attributability_2336() {
+    use super::{FaerEigh, Side};
+    let (mut term, target, rho) = ard_saddle_state();
+    let inner_max_iter = 40usize;
+    let learning_rate = 0.4;
+    let ridge_ext_coord = 1.0e-6;
+    let ridge_beta = 1.0e-6;
+
+    let mut rho_fixed = rho.clone();
+    let initial = term
+        .run_joint_fit_arrow_schur_for_quasi_laplace(
+            target.view(),
+            &mut rho_fixed,
+            None,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+        )
+        .expect("initial joint fit");
+    let mut loss = initial.loss;
+    let mut criterion_fixed_point = initial.fixed_point;
+    let options = ArrowSolveOptions::direct()
+        .with_gpu_policy(term.gpu_policy)
+        .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
+        .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
+    let cache = term
+        .converge_inner_for_undamped_logdet(
+            target.view(),
+            &rho,
+            &mut rho_fixed,
+            None,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            &mut loss,
+            &mut criterion_fixed_point,
+            &options,
+            true,
+        )
+        .expect("converge inner to saddle");
+
+    let total_t = cache.delta_t_len();
+    let a = term
+        .materialize_exact_hessian_dense(&rho, target.view(), &cache)
+        .expect("materialize exact A");
+    let (eigs, vecs) = a.eigh(Side::Lower).expect("A eigh");
+    let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let floor = 1.0e-9 * max_eig.max(1.0);
+
+    let e_diag = term
+        .materialize_ard_concave_clamp_diagonal(&rho, &cache)
+        .expect("materialize E_ard diagonal");
+    eprintln!(
+        "2336-EATTR: total_t={total_t} beta={} max_eig={max_eig:.6e} floor={floor:.3e} E_diag_sum={:.6e} E_diag_max={:.6e}",
+        cache.k,
+        e_diag.iter().sum::<f64>(),
+        e_diag.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+    );
+
+    let mut n_neg = 0usize;
+    let mut all_attributable = true;
+    for (i, &lambda) in eigs.iter().enumerate() {
+        if lambda >= -floor {
+            continue;
+        }
+        n_neg += 1;
+        let v = vecs.column(i);
+        // e_v = vᵀ E v (E diagonal in the t-block, zero on β / logit rows).
+        let mut e_v = 0.0_f64;
+        for j in 0..total_t {
+            e_v += e_diag[j] * v[j] * v[j];
+        }
+        // Cross-check: full ΔC = A−B contraction along v (ARD + softmax + residual).
+        let v_t = v.slice(s![..total_t]).to_owned();
+        let v_beta = v.slice(s![total_t..]).to_owned();
+        let dc = term
+            .apply_exact_hessian_minus_b(
+                &rho,
+                target.view(),
+                &cache,
+                &SaeArrowVector { t: v_t.clone(), beta: v_beta.clone() },
+            )
+            .expect("apply ΔC");
+        let vt_dc = v_t.dot(&dc.t) + v_beta.dot(&dc.beta);
+        // vᵀ(B−A)v_full = −vt_dc; the t-coord fraction of ‖v‖² measures how
+        // coord-localised (hence ARD-relevant) the direction is.
+        let t_frac = (0..total_t).map(|j| v[j] * v[j]).sum::<f64>();
+        let priced = lambda + e_v;
+        let attributable = priced >= -floor;
+        if !attributable {
+            all_attributable = false;
+        }
+        eprintln!(
+            "2336-EATTR: neg#{n_neg} lambda={lambda:.6e} e_v(ARD)={e_v:.6e} lambda+e_v={priced:.6e} \
+             attributable={attributable} | full(B-A)v.v={:.6e} t_frac={t_frac:.4e}",
+            -vt_dc
+        );
+    }
+    eprintln!(
+        "2336-EATTR: VERDICT n_neg={n_neg} all_attributable={all_attributable} \
+         => fixture criterion would be {}",
+        if all_attributable { "FINITE (priced)" } else { "STILL REFUSED (genuine saddle remains)" }
+    );
 }

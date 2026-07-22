@@ -2222,7 +2222,7 @@ fn fixed_state_exact_a_logdet(
 // component on top of the reachable target, so `ΔC` — the object Patch D
 // differentiates — is nonzero and tunable rather than either zero (a fixture
 // that would false-green the arbiter) or saddle-inducing.
-fn obb_patchd_fixture(
+pub(crate) fn obb_patchd_fixture(
     residual_scale: f64,
     log_lambda_sparse: f64,
 ) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
