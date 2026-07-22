@@ -1300,9 +1300,9 @@ impl DecoderNormalEq {
     /// independent), so the streaming decoder refresh equals the full-batch one.
     pub(super) fn accumulate(&mut self, x: ArrayView2<'_, f32>, codes: &[SparseCode]) {
         let p = self.b.ncols();
-        for (row_idx, code) in codes.iter().enumerate() {
-            let xi = x.row(row_idx);
-            let xi_slice = xi.as_slice();
+        // Scalar and coupling statistics: one serial walk (cheap relative to
+        // the `O(N·s·P)` right-hand-side accumulation below).
+        for code in codes.iter() {
             for a in 0..code.indices.len() {
                 let ca = code.codes[a] as f64;
                 if ca == 0.0 {
@@ -1312,20 +1312,6 @@ impl DecoderNormalEq {
                 self.firings[ka as usize] += 1;
                 self.amplitude_sum[ka as usize] += ca.abs();
                 self.diag[ka as usize] += ca * ca;
-                let brow = ka as usize;
-                let mut brow_view = self.b.row_mut(brow);
-                match (brow_view.as_slice_mut(), xi_slice) {
-                    (Some(bs), Some(xs)) => {
-                        for (bref, &xv) in bs.iter_mut().zip(xs.iter()) {
-                            *bref += ca * xv as f64;
-                        }
-                    }
-                    _ => {
-                        for c in 0..p {
-                            brow_view[c] += ca * xi[c] as f64;
-                        }
-                    }
-                }
                 for bsel in (a + 1)..code.indices.len() {
                     let cb = code.codes[bsel] as f64;
                     if cb == 0.0 {
@@ -1341,6 +1327,59 @@ impl DecoderNormalEq {
                 }
             }
         }
+        // `B += CᵀX`, parallelized over DISJOINT atom-row blocks of `B`: each
+        // task owns a contiguous block of atom rows and replays the full
+        // (row, atom) walk in the same ascending order the serial loop used,
+        // touching only the atoms in its block. Every `B[k][c]` entry
+        // therefore accumulates its contributions in exactly the historical
+        // order — bit-identical regardless of the partition — while the
+        // epoch's dominant `O(N·s·P)` flops use every core (#1017: this pass
+        // was part of the serial epoch wall next to the idle accelerator).
+        // The re-walked code indices are `O(N·s)` per block, noise against
+        // the `O(N·s·P)` right-hand-side arithmetic they gate.
+        if p == 0 {
+            return;
+        }
+        let k_atoms = self.diag.len();
+        let atom_block = k_atoms.div_ceil(ACCUMULATE_ATOM_BLOCKS).max(1);
+        let b_slice = self
+            .b
+            .as_slice_mut()
+            .expect("normal-equation rhs is standard layout");
+        b_slice
+            .par_chunks_mut(atom_block * p)
+            .enumerate()
+            .for_each(|(block_idx, bchunk)| {
+                let k0 = block_idx * atom_block;
+                let k1 = k0 + bchunk.len() / p;
+                for (row_idx, code) in codes.iter().enumerate() {
+                    let xi = x.row(row_idx);
+                    let xi_slice = xi.as_slice();
+                    for a in 0..code.indices.len() {
+                        let ca = code.codes[a] as f64;
+                        if ca == 0.0 {
+                            continue;
+                        }
+                        let ka = code.indices[a] as usize;
+                        if ka < k0 || ka >= k1 {
+                            continue;
+                        }
+                        let brow = &mut bchunk[(ka - k0) * p..(ka - k0 + 1) * p];
+                        match xi_slice {
+                            Some(xs) => {
+                                for (bref, &xv) in brow.iter_mut().zip(xs.iter()) {
+                                    *bref += ca * xv as f64;
+                                }
+                            }
+                            None => {
+                                for (c, bref) in brow.iter_mut().enumerate() {
+                                    *bref += ca * xi[c] as f64;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
     }
 
     /// Drop accumulated rows for atoms that just refreshed. Deferred atoms keep
@@ -1656,32 +1695,41 @@ fn revive_dead_atoms(
         return Vec::new();
     }
 
-    // Per-row residual under the current model, and its squared norm for ranking.
+    // Per-row residual under the current model, and its squared norm for
+    // ranking. Every value here is row-local (the norm fold never crosses
+    // rows), so parallelizing over rows is bit-identical to the historical
+    // serial pass.
     let mut resid = Array2::<f32>::zeros((n, p));
     let mut resid_norm2 = vec![0.0f64; n];
-    for i in 0..n {
-        let xi = x.row(i);
-        let mut ri = resid.row_mut(i);
-        for c in 0..p {
-            ri[c] = xi[c];
-        }
-        let code = &codes[i];
-        for j in 0..code.indices.len() {
-            let cj = code.codes[j];
-            if cj == 0.0 {
-                continue;
-            }
-            let drow = decoder.row(code.indices[j] as usize);
+    let decoder_view = decoder.view();
+    resid
+        .as_slice_mut()
+        .expect("freshly allocated residual block is standard layout")
+        .par_chunks_mut(p)
+        .zip(resid_norm2.par_iter_mut())
+        .enumerate()
+        .for_each(|(i, (ri, norm2))| {
+            let xi = x.row(i);
             for c in 0..p {
-                ri[c] -= cj * drow[c];
+                ri[c] = xi[c];
             }
-        }
-        let mut acc = 0.0f64;
-        for c in 0..p {
-            acc += ri[c] as f64 * ri[c] as f64;
-        }
-        resid_norm2[i] = acc;
-    }
+            let code = &codes[i];
+            for j in 0..code.indices.len() {
+                let cj = code.codes[j];
+                if cj == 0.0 {
+                    continue;
+                }
+                let drow = decoder_view.row(code.indices[j] as usize);
+                for c in 0..p {
+                    ri[c] -= cj * drow[c];
+                }
+            }
+            let mut acc = 0.0f64;
+            for c in 0..p {
+                acc += ri[c] as f64 * ri[c] as f64;
+            }
+            *norm2 = acc;
+        });
 
     // Rows ranked by descending residual energy (ties by ascending index →
     // deterministic). Only rows with real residual can seed a useful atom.
@@ -2301,6 +2349,76 @@ pub(super) fn unit_norm_rows(decoder: &mut Array2<f32>) -> Result<(), String> {
     Ok(())
 }
 
+/// Fixed row-chunk width for the deterministic parallel reconstruction
+/// reductions ([`explained_variance`], [`residual_scale`]). Chunk boundaries
+/// are derived from the row index alone — never from the thread count — and
+/// per-chunk partials are combined in ascending chunk order, so the reductions
+/// are deterministic and thread-count-independent (the same discipline as the
+/// block-CG column tiles). The value itself only balances scheduling overhead
+/// against parallel width; it cannot change which rows contribute what.
+const RECONSTRUCTION_ROW_CHUNK: usize = 1024;
+
+/// Number of disjoint atom-row blocks the `B += CᵀX` accumulation is split
+/// into. Purely a work-partition width (every `B` entry's value is identical
+/// under any partition — see [`DecoderNormalEq::accumulate`]); 256 keeps
+/// every host well-fed while bounding the per-block code-walk overhead.
+const ACCUMULATE_ATOM_BLOCKS: usize = 256;
+
+/// Per-chunk `(rss, tss)` partials of the reconstruction pass. Within a chunk
+/// the fold order is exactly the historical serial one; across chunks the
+/// partials are combined in ascending order. This reassociates the global sum
+/// relative to the old fully-serial fold (an ulp-scale shift, far below the
+/// `config.tolerance`-scale decisions the EV feeds) in exchange for running
+/// the epoch's `O(N·s·P)` reconstruction — previously a serial wall next to
+/// the parallel refresh (#1017) — across all cores.
+fn reconstruction_rss_tss_chunks(
+    x: ArrayView2<'_, f32>,
+    codes: &[SparseCode],
+    decoder: ArrayView2<'_, f32>,
+    means: Option<&[f64]>,
+) -> (f64, f64) {
+    let p = x.ncols();
+    let partials: Vec<(f64, f64)> = codes
+        .par_chunks(RECONSTRUCTION_ROW_CHUNK)
+        .enumerate()
+        .map(|(chunk_idx, chunk)| {
+            let row0 = chunk_idx * RECONSTRUCTION_ROW_CHUNK;
+            let mut rss = 0.0f64;
+            let mut tss = 0.0f64;
+            let mut recon = vec![0.0f64; p];
+            for (offset, code) in chunk.iter().enumerate() {
+                let i = row0 + offset;
+                for slot in recon.iter_mut() {
+                    *slot = 0.0;
+                }
+                for j in 0..code.indices.len() {
+                    let cj = code.codes[j] as f64;
+                    if cj == 0.0 {
+                        continue;
+                    }
+                    let drow = decoder.row(code.indices[j] as usize);
+                    for c in 0..p {
+                        recon[c] += cj * drow[c] as f64;
+                    }
+                }
+                let xi = x.row(i);
+                for c in 0..p {
+                    let r = xi[c] as f64 - recon[c];
+                    rss += r * r;
+                    if let Some(means) = means {
+                        let t = xi[c] as f64 - means[c];
+                        tss += t * t;
+                    }
+                }
+            }
+            (rss, tss)
+        })
+        .collect();
+    partials
+        .into_iter()
+        .fold((0.0, 0.0), |(rss, tss), (pr, pt)| (rss + pr, tss + pt))
+}
+
 fn explained_variance(
     x: ArrayView2<'_, f32>,
     codes: &[SparseCode],
@@ -2308,44 +2426,33 @@ fn explained_variance(
 ) -> f64 {
     let n = x.nrows();
     let p = x.ncols();
-    // Column means for TSS.
+    // Column means for TSS: per-chunk column partials, combined in ascending
+    // chunk order (deterministic, thread-count-independent).
+    let mean_partials: Vec<Vec<f64>> = (0..n)
+        .collect::<Vec<_>>()
+        .par_chunks(RECONSTRUCTION_ROW_CHUNK)
+        .map(|rows| {
+            let mut sums = vec![0.0f64; p];
+            for &i in rows {
+                let xi = x.row(i);
+                for c in 0..p {
+                    sums[c] += xi[c] as f64;
+                }
+            }
+            sums
+        })
+        .collect();
     let mut means = vec![0.0f64; p];
-    for i in 0..n {
-        let xi = x.row(i);
+    for partial in &mean_partials {
         for c in 0..p {
-            means[c] += xi[c] as f64;
+            means[c] += partial[c];
         }
     }
     for c in 0..p {
         means[c] /= n as f64;
     }
 
-    let mut rss = 0.0f64;
-    let mut tss = 0.0f64;
-    let mut recon = vec![0.0f64; p];
-    for i in 0..n {
-        for c in 0..p {
-            recon[c] = 0.0;
-        }
-        let code = &codes[i];
-        for j in 0..code.indices.len() {
-            let cj = code.codes[j] as f64;
-            if cj == 0.0 {
-                continue;
-            }
-            let drow = decoder.row(code.indices[j] as usize);
-            for c in 0..p {
-                recon[c] += cj * drow[c] as f64;
-            }
-        }
-        let xi = x.row(i);
-        for c in 0..p {
-            let r = xi[c] as f64 - recon[c];
-            rss += r * r;
-            let t = xi[c] as f64 - means[c];
-            tss += t * t;
-        }
-    }
+    let (rss, tss) = reconstruction_rss_tss_chunks(x, codes, decoder, Some(&means));
     if tss <= 1.0e-24 {
         if rss <= 1.0e-24 { 1.0 } else { 0.0 }
     } else {
@@ -2360,29 +2467,7 @@ fn residual_scale(
 ) -> f64 {
     let n = x.nrows();
     let p = x.ncols();
-    let mut rss = 0.0f64;
-    let mut recon = vec![0.0f64; p];
-    for i in 0..n {
-        for c in 0..p {
-            recon[c] = 0.0;
-        }
-        let code = &codes[i];
-        for j in 0..code.indices.len() {
-            let cj = code.codes[j] as f64;
-            if cj == 0.0 {
-                continue;
-            }
-            let drow = decoder.row(code.indices[j] as usize);
-            for c in 0..p {
-                recon[c] += cj * drow[c] as f64;
-            }
-        }
-        let xi = x.row(i);
-        for c in 0..p {
-            let r = xi[c] as f64 - recon[c];
-            rss += r * r;
-        }
-    }
+    let (rss, _) = reconstruction_rss_tss_chunks(x, codes, decoder, None);
     (rss / (n * p) as f64).sqrt()
 }
 
