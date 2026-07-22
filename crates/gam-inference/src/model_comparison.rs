@@ -507,14 +507,30 @@ pub fn model_comparison_from_unified(
     // the optimizer retained with the correction itself: first-order IFT on the
     // identified outer-Hessian subspace. SigmaPointCubature is a named
     // approximation and must stay out of the exact channel.
+    //
+    // Read the RETAINED first-order pair, not the fit's primary
+    // `smoothing_correction()`/`smoothing_correction_method()`: the optimizer's
+    // auto-selector escalates the primary pair to a cubature upgrade exactly
+    // when smoothing-parameter uncertainty is large enough to matter (rho
+    // posterior variance over threshold, near-boundary, or high outer
+    // gradient) — precisely the regime this correction exists to report on.
+    // Gating on the primary pair made this channel `None` whenever the
+    // correction would have been large enough to be interesting and `Some`
+    // only when it was small enough that first-order alone was already
+    // deemed adequate (#946). `compute_smoothing_correction_auto` always
+    // computes the exact first-order correction before deciding whether to
+    // escalate, and the optimizer now retains it alongside the cubature
+    // upgrade rather than discarding it, so this channel is populated
+    // whenever the first-order geometry was computable at all, independent
+    // of whether cubature also ran for some other consumer's benefit.
     let method_certified_exact = matches!(
-        fit.smoothing_correction_method(),
+        fit.smoothing_correction_method_first_order(),
         Some(SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace { .. })
     );
     let edf = corrected_edf(
         edf_conditional,
         fit.weighted_gram().map(|g| g.view()),
-        fit.smoothing_correction().map(|c| c.view()),
+        fit.smoothing_correction_first_order().map(|c| c.view()),
         covariance_scale,
         fit.log_lambdas.len(),
         method_certified_exact,
@@ -881,5 +897,161 @@ mod tests {
         assert_eq!(rep.delta_elpd, None);
         // AIC gap still reported.
         assert_eq!(rep.delta_aic_corrected, Some(0.0));
+    }
+
+    /// #946 regression: a fit whose PRIMARY smoothing correction escalated to
+    /// sigma-point cubature (a named approximation) must still populate the
+    /// EXACT corrected-EDF/AIC channel, reading the separately-retained
+    /// first-order pair instead of going dark. Before this fix,
+    /// `model_comparison_from_unified` gated `corrected`/`aic_corrected` on
+    /// `fit.smoothing_correction_method()` (the PRIMARY method), so any fit
+    /// whose auto-selector chose cubature — precisely the regime with
+    /// non-trivial smoothing-parameter uncertainty the correction exists to
+    /// report on — silently reported `MissingMethodProvenance` instead of the
+    /// exact first-order estimate that was computed and available all along.
+    #[test]
+    fn corrected_edf_uses_retained_first_order_pair_when_primary_method_is_cubature() {
+        use gam_solve::model_types::{
+            Dispersion, FitArtifacts, FitInference, FittedBlock, FittedLinkState,
+            UnifiedFitResultParts,
+        };
+        use gam_solve::pirls::PirlsStatus;
+        use gam_problem::{LikelihoodScaleMetadata, LogLikelihoodNormalization};
+
+        // Distinct matrices for the primary (cubature) vs retained (first-order)
+        // corrections so the test can prove which one the channel actually used.
+        let cubature_correction = array![[9.0, 0.0], [0.0, 9.0]];
+        let first_order_correction = array![[0.4, 0.0], [0.0, 0.4]];
+        let weighted_gram = array![[1.0, 0.0], [0.0, 1.0]];
+
+        let parts = UnifiedFitResultParts {
+            blocks: vec![FittedBlock {
+                beta: array![0.25, -0.5],
+                role: gam_problem::BlockRole::Mean,
+                edf: 1.5,
+                lambdas: array![2.0],
+            }],
+            log_lambdas: array![2.0_f64.ln()],
+            lambdas: array![2.0],
+            likelihood_family: Some(LikelihoodSpec::gaussian_identity()),
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: -1.2,
+            deviance: 2.4,
+            reml_score: 0.7,
+            stable_penalty_term: 0.3,
+            penalized_objective: 2.2,
+            used_device: false,
+            // `outer_iterations: 0` sidesteps the analytic-certificate
+            // requirement in `UnifiedFitResult::try_from_parts` (a fit is
+            // certified either by a passing criterion certificate, or
+            // trivially when the outer loop never ran) — irrelevant to what
+            // this test exercises (the corrected-EDF wiring), so the simplest
+            // valid fixture is used.
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: None,
+            // 1.0 so the ProfiledGaussian coefficient-covariance scale
+            // (= standard_deviation^2 = dispersion_phi()) is exactly 1.0,
+            // keeping the hand-checked ρ-uncertainty arithmetic below simple.
+            standard_deviation: 1.0,
+            covariance_conditional: Some(array![[1.0, 0.1], [0.1, 2.0]]),
+            covariance_corrected: None,
+            inference: Some(FitInference {
+                edf_by_block: vec![0.6, 0.9],
+                penalty_block_trace: vec![],
+                edf_total: 1.5,
+                // PRIMARY: escalated to a cubature upgrade.
+                smoothing_correction: Some(cubature_correction.clone()),
+                smoothing_correction_method: Some(SmoothingCorrectionMethod::SigmaPointCubature {
+                    rank: 1,
+                    n_points: 2,
+                    rho_hessian_stabilization: gam_problem::StabilizationLedger::approximation_only(
+                        1.0e-8,
+                        gam_problem::StabilizationRule::FixedConstant,
+                    )
+                    .expect("valid test cubature ridge"),
+                }),
+                // RETAINED: the exact first-order correction computed before
+                // the escalation decision, never discarded (#946).
+                smoothing_correction_first_order: Some(first_order_correction.clone()),
+                smoothing_correction_method_first_order: Some(
+                    SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                        active_rank: 1,
+                        rho_dimension: 1,
+                    },
+                ),
+                penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]].into(),
+                reparam_qs: Some(array![[1.0, 0.0], [0.0, 1.0]]),
+                dispersion: Dispersion::estimated(1.0).expect("valid test dispersion"),
+                beta_covariance: Some(array![[1.0, 0.1], [0.1, 2.0]].into()),
+                beta_standard_errors: Some(array![1.0, 2.0_f64.sqrt()]),
+                beta_covariance_corrected: None,
+                beta_standard_errors_corrected: None,
+                beta_covariance_frequentist: None,
+                coefficient_influence: None,
+                weighted_gram: Some(weighted_gram),
+                bias_correction_beta: None,
+                bias_correction_jacobian: None,
+            }),
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: PirlsStatus::Converged,
+            max_abs_eta: 1.25,
+            constraint_kkt: None,
+            artifacts: FitArtifacts::default(),
+            inner_cycles: 0,
+        };
+        let fit = UnifiedFitResult::try_from_parts(parts)
+            .unwrap_or_else(|e| panic!("construct #946 cubature-vs-first-order fixture: {e:?}"));
+
+        // Sanity: the fixture's PRIMARY method really is cubature, and the
+        // RETAINED first-order method really is distinct from it.
+        assert!(matches!(
+            fit.smoothing_correction_method(),
+            Some(SmoothingCorrectionMethod::SigmaPointCubature { .. })
+        ));
+        assert!(matches!(
+            fit.smoothing_correction_method_first_order(),
+            Some(SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace { .. })
+        ));
+
+        let y = array![0.1, 0.2, 0.3];
+        let eta_hat = array![0.05, 0.15, 0.35];
+        let weights = Array1::<f64>::ones(3);
+        let cmp = model_comparison_from_unified(&fit, y.view(), eta_hat.view(), weights.view(), None)
+            .expect("construct comparison for the cubature-vs-first-order fixture");
+
+        let corrected = cmp
+            .edf
+            .corrected
+            .expect("corrected EDF must be Some even though the PRIMARY method is cubature");
+        let aic_corrected = cmp
+            .aic_corrected
+            .expect("corrected AIC must be Some even though the PRIMARY method is cubature");
+
+        // The channel must have used the RETAINED first-order correction
+        // (0.4 on the diagonal), not the primary cubature one (9.0): the
+        // ρ-uncertainty contribution is tr(weighted_gram · first_order_correction)
+        // / covariance_scale = tr(I · 0.4I) / 1.0 = 0.8, so corrected =
+        // conditional (edf_total=1.5) + 0.8 = 2.3 — NOT conditional + 18.0
+        // (which the cubature matrix would have produced).
+        let rho_uncertainty_df = cmp
+            .edf
+            .rho_uncertainty_df()
+            .expect("rho-uncertainty df must be Some");
+        assert!(
+            (rho_uncertainty_df - 0.8).abs() < 1e-9,
+            "expected the retained first-order correction's contribution (0.8), got {rho_uncertainty_df}"
+        );
+        assert!(
+            (corrected - 2.3).abs() < 1e-9,
+            "corrected EDF must equal conditional + the first-order contribution, got {corrected}"
+        );
+        assert!(
+            aic_corrected.is_finite(),
+            "corrected AIC must be finite, got {aic_corrected}"
+        );
     }
 }

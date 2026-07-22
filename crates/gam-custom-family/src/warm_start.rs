@@ -800,6 +800,13 @@ pub fn blockwise_fit_from_parts(
         edf_by_block: edf_by_penalty,
         penalty_block_trace: penalty_trace,
         edf_total,
+        // This custom-family lane only ever computes the first-order IFT
+        // correction (never a cubature upgrade — see `smoothing_corrected`'s
+        // doc comment above), so its retained "first-order" pair is exactly
+        // its primary pair; mirror it so the #946 exact corrected-EDF/AIC
+        // channel keeps reading a populated value from this lane too.
+        smoothing_correction_first_order: smoothing_correction.clone(),
+        smoothing_correction_method_first_order: smoothing_correction_method,
         smoothing_correction,
         smoothing_correction_method,
         penalized_hessian: geom.penalized_hessian.clone(),

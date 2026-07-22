@@ -4186,6 +4186,8 @@ mod tests {
             edf_total: p as f64,
             smoothing_correction: None,
             smoothing_correction_method: None,
+            smoothing_correction_first_order: None,
+            smoothing_correction_method_first_order: None,
             penalized_hessian: Array2::<f64>::eye(p).into(),
             reparam_qs: None,
             dispersion: gam_problem::Dispersion::UNIT,

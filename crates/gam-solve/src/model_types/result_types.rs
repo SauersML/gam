@@ -154,6 +154,8 @@ mod per_term_edf_tests {
                 edf_total: 28.0,
                 smoothing_correction: None,
                 smoothing_correction_method: None,
+                smoothing_correction_first_order: None,
+                smoothing_correction_method_first_order: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(36)),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0).unwrap(),
@@ -239,6 +241,8 @@ mod per_term_edf_tests {
                 edf_total,
                 smoothing_correction: None,
                 smoothing_correction_method: None,
+                smoothing_correction_first_order: None,
+                smoothing_correction_method_first_order: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0).unwrap(),
@@ -310,6 +314,8 @@ mod per_term_edf_tests {
                 edf_total,
                 smoothing_correction: None,
                 smoothing_correction_method: None,
+                smoothing_correction_first_order: None,
+                smoothing_correction_method_first_order: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0).unwrap(),
@@ -503,6 +509,8 @@ mod per_term_edf_tests {
                 edf_total: p as f64,
                 smoothing_correction: None,
                 smoothing_correction_method: None,
+                smoothing_correction_first_order: None,
+                smoothing_correction_method_first_order: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0).unwrap(),
@@ -1226,6 +1234,26 @@ pub struct FitInference {
     /// Method that produced `smoothing_correction`. Required whenever a matrix
     /// is present; `None` means no correction was retained.
     pub smoothing_correction_method: Option<SmoothingCorrectionMethod>,
+    /// The exact first-order IFT smoothing-parameter-uncertainty correction,
+    /// RETAINED even when `smoothing_correction`/`smoothing_correction_method`
+    /// above hold a cubature upgrade instead. `compute_smoothing_correction_auto`
+    /// always computes the first-order correction before deciding whether to
+    /// escalate to sigma-point cubature; discarding it once cubature is chosen
+    /// made the #946 WPS-corrected-EDF/AIC channel go dark precisely when
+    /// smoothing-parameter uncertainty is large enough to matter — the regime
+    /// the correction exists for (see `model_comparison_from_unified`'s
+    /// `method_certified_exact` gate, which is exact-provenance-only by
+    /// design). `Some` exactly when `smoothing_correction_method_first_order`
+    /// is `Some(FirstOrderIdentifiedSubspace{..})`; `None` when the first-order
+    /// geometry itself was unavailable (mirrors `smoothing_correction` in that
+    /// case — there is nothing to retain either way).
+    #[serde(default)]
+    pub smoothing_correction_first_order: Option<Array2<f64>>,
+    /// Provenance for `smoothing_correction_first_order`. Always either `None`
+    /// or `Some(FirstOrderIdentifiedSubspace{..})` — this field never holds
+    /// `SigmaPointCubature`, unlike `smoothing_correction_method` above.
+    #[serde(default)]
+    pub smoothing_correction_method_first_order: Option<SmoothingCorrectionMethod>,
     /// Penalised Hessian `H = X'W_HX + S(λ)` with NO dispersion scaling.
     /// When [`UnifiedFitResult::geometry`] is present, this matrix shares its
     /// exact active coefficient frame and therefore has dimension
@@ -1603,6 +1631,8 @@ mod assembly_inner_status_gate_tests {
                 edf_total: 1.0,
                 smoothing_correction: None,
                 smoothing_correction_method: None,
+                smoothing_correction_first_order: None,
+                smoothing_correction_method_first_order: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(hessian),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0).unwrap(),
@@ -1955,6 +1985,12 @@ impl FitInference {
         }
         if let Some(v) = self.smoothing_correction.as_ref() {
             validate_all_finite_estimation("fit_result.smoothing_correction", v.iter().copied())?;
+        }
+        if let Some(v) = self.smoothing_correction_first_order.as_ref() {
+            validate_all_finite_estimation(
+                "fit_result.smoothing_correction_first_order",
+                v.iter().copied(),
+            )?;
         }
         if let Some(v) = self.reparam_qs.as_ref() {
             validate_all_finite_estimation("fit_result.reparam_qs", v.iter().copied())?;
@@ -2912,6 +2948,26 @@ impl UnifiedFitResult {
         self.inference
             .as_ref()
             .and_then(|inference| inference.smoothing_correction_method)
+    }
+
+    /// The exact first-order IFT smoothing-parameter-uncertainty correction,
+    /// retained even when [`Self::smoothing_correction`] holds a cubature
+    /// upgrade instead. This is the accessor the #946 WPS corrected-EDF/AIC
+    /// channel must read from: it is populated whenever the first-order
+    /// geometry was computable, independent of whether the fit's PRIMARY
+    /// correction escalated to sigma-point cubature for some other consumer.
+    pub fn smoothing_correction_first_order(&self) -> Option<&Array2<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.smoothing_correction_first_order.as_ref())
+    }
+
+    /// Provenance for [`Self::smoothing_correction_first_order`]. Always
+    /// either `None` or `Some(FirstOrderIdentifiedSubspace{..})`.
+    pub fn smoothing_correction_method_first_order(&self) -> Option<SmoothingCorrectionMethod> {
+        self.inference
+            .as_ref()
+            .and_then(|inference| inference.smoothing_correction_method_first_order)
     }
 
     /// Total effective degrees of freedom.

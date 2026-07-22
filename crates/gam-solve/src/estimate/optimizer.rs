@@ -1746,6 +1746,12 @@ where
     let mut edf_total = 0.0;
     let mut smoothing_correction = None;
     let mut smoothing_correction_method = None;
+    // The exact first-order IFT correction, RETAINED even when the primary
+    // pair above escalates to a cubature upgrade (#946): the corrected-EDF/AIC
+    // channel reads these instead of the primary pair so it does not go dark
+    // exactly when smoothing-parameter uncertainty is large enough to matter.
+    let mut smoothing_correction_first_order = None;
+    let mut smoothing_correction_method_first_order = None;
     let mut rho_covariance = None;
     let mut penalized_hessian = Array2::<f64>::zeros((0, 0));
     let mut beta_covariance = None;
@@ -2337,11 +2343,17 @@ where
                     rho_covariance = None;
                     smoothing_correction = None;
                     smoothing_correction_method = None;
+                    smoothing_correction_first_order = None;
+                    smoothing_correction_method_first_order = None;
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
-                    (smoothing_correction, smoothing_correction_method) =
-                        outcome.into_correction_with_method();
+                    (
+                        smoothing_correction,
+                        smoothing_correction_method,
+                        smoothing_correction_first_order,
+                        smoothing_correction_method_first_order,
+                    ) = outcome.into_correction_with_method();
                 }
             }
         }
@@ -2550,6 +2562,8 @@ where
         edf_total,
         smoothing_correction,
         smoothing_correction_method,
+        smoothing_correction_first_order,
+        smoothing_correction_method_first_order,
         penalized_hessian: penalized_hessian.into(),
         reparam_qs: Some(pirls_res.reparam_result.qs.clone()),
         dispersion,

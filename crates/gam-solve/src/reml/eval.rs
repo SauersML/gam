@@ -66,6 +66,17 @@ pub enum SmoothingCorrectionOutcome {
         near_boundary: bool,
         grad_norm: f64,
         max_rho_var: f64,
+        /// The exact first-order IFT correction computed BEFORE the decision
+        /// to escalate to cubature, retained rather than discarded (#946).
+        /// `Some` exactly when `first_order_method` is
+        /// `Some(FirstOrderIdentifiedSubspace{..})`. Callers that need the
+        /// exact (not cubature-approximated) WPS correction — the corrected-
+        /// EDF/AIC channel — read this instead of `correction`/the method
+        /// this variant reports as primary.
+        first_order_correction: Option<Array2<f64>>,
+        /// Provenance for `first_order_correction`. Always either `None` or
+        /// `Some(FirstOrderIdentifiedSubspace{..})` — never `SigmaPointCubature`.
+        first_order_method: Option<SmoothingCorrectionMethod>,
     },
     /// Principled first-order linearization was returned.
     FirstOrder {
@@ -85,15 +96,33 @@ pub enum SmoothingCorrectionOutcome {
 
 impl SmoothingCorrectionOutcome {
     /// Consume the outcome without discarding how a retained matrix was made.
+    ///
+    /// Returns `(primary_correction, primary_method, first_order_correction,
+    /// first_order_method)`. The primary pair is the fit's EFFECTIVE
+    /// correction — cubature when it escalated, otherwise first-order — and
+    /// is unchanged in meaning from before this method grew a first-order
+    /// pair (#946): every existing consumer that only reads `.0`/`.1` keeps
+    /// its exact prior behavior. The first-order pair is ADDITIONALLY
+    /// retained so a consumer that specifically needs the exact (never
+    /// cubature-approximated) WPS correction — the corrected-EDF/AIC channel
+    /// — has it available even when the primary pair escalated to cubature
+    /// for some other consumer's benefit.
     pub fn into_correction_with_method(
         self,
-    ) -> (Option<Array2<f64>>, Option<SmoothingCorrectionMethod>) {
+    ) -> (
+        Option<Array2<f64>>,
+        Option<SmoothingCorrectionMethod>,
+        Option<Array2<f64>>,
+        Option<SmoothingCorrectionMethod>,
+    ) {
         match self {
             SmoothingCorrectionOutcome::Cubature {
                 correction,
                 rank,
                 n_points,
                 rho_hessian_stabilization,
+                first_order_correction,
+                first_order_method,
                 ..
             } => (
                 Some(correction),
@@ -102,11 +131,18 @@ impl SmoothingCorrectionOutcome {
                     n_points,
                     rho_hessian_stabilization,
                 }),
+                first_order_correction,
+                first_order_method,
             ),
             SmoothingCorrectionOutcome::FirstOrder {
                 correction, method, ..
-            } => (correction, method),
-            SmoothingCorrectionOutcome::Unavailable { .. } => (None, None),
+            } => {
+                // The primary result already IS the first-order result here
+                // (no cubature ran); the first-order pair mirrors it exactly.
+                let first_order_correction = correction.clone();
+                (correction, method, first_order_correction, method)
+            }
+            SmoothingCorrectionOutcome::Unavailable { .. } => (None, None, None, None),
         }
     }
 
@@ -1065,6 +1101,8 @@ impl<'a> RemlState<'a> {
             near_boundary,
             grad_norm,
             max_rho_var: max_rhovar,
+            first_order_correction,
+            first_order_method,
         })
     }
 
@@ -2314,9 +2352,18 @@ mod smoothing_correction_outcome_tests {
             near_boundary: true,
             grad_norm: 1.5,
             max_rho_var: 0.7,
+            // Deliberately DIFFERENT from `correction` above so the test can
+            // prove the retained first-order pair is not silently aliased to
+            // the primary cubature pair (#946).
+            first_order_correction: Some(array![[1.0, 0.0], [0.0, 1.0]]),
+            first_order_method: Some(SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                active_rank: 1,
+                rho_dimension: 1,
+            }),
         };
         assert_eq!(outcome.branch_label(), "cubature");
-        let (mat, method) = outcome.into_correction_with_method();
+        let (mat, method, first_order_mat, first_order_method) =
+            outcome.into_correction_with_method();
         let mat = mat.expect("cubature always has a matrix");
         assert!(matches!(
             method,
@@ -2324,6 +2371,22 @@ mod smoothing_correction_outcome_tests {
         ));
         assert_eq!(mat.dim(), (2, 2));
         assert_eq!(mat[[0, 0]], 2.0);
+
+        let first_order_mat = first_order_mat.expect("retained first-order matrix");
+        assert_eq!(first_order_mat.dim(), (2, 2));
+        assert_eq!(
+            first_order_mat[[0, 0]],
+            1.0,
+            "retained first-order correction must be the value the cubature branch was \
+             constructed with, not the primary cubature correction"
+        );
+        assert!(
+            matches!(
+                first_order_method,
+                Some(SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace { .. })
+            ),
+            "retained first-order provenance must never be SigmaPointCubature"
+        );
     }
 
     #[test]

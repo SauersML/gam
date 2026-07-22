@@ -2627,6 +2627,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 edf_total,
                 smoothing_correction: None,
                 smoothing_correction_method: None,
+                smoothing_correction_first_order: None,
+                smoothing_correction_method_first_order: None,
                 // Boundary adapter: wrap the raw `Array2<f64>` Hessian as
                 // `UnscaledPrecision` for the newtype storage.
                 penalized_hessian: penalized_hessian.clone().into(),
@@ -7121,6 +7123,8 @@ fn fit_bounded_term_collection_with_design(
                 edf_total,
                 smoothing_correction: None,
                 smoothing_correction_method: None,
+                smoothing_correction_first_order: None,
+                smoothing_correction_method_first_order: None,
                 // Boundary adapter: `penalized_hessian` storage is now
                 // `UnscaledPrecision`.
                 penalized_hessian: penalized_hessian.clone().into(),

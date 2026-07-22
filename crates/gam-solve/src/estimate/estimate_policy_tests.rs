@@ -692,6 +692,16 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
                     rho_dimension: 1,
                 },
             ),
+            // This fixture's primary method is already FirstOrderIdentifiedSubspace
+            // (no cubature upgrade), so its retained "first-order" pair mirrors
+            // the primary pair.
+            smoothing_correction_first_order: Some(array![[0.2, 0.0], [0.0, 0.2]]),
+            smoothing_correction_method_first_order: Some(
+                crate::model_types::SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                    active_rank: 1,
+                    rho_dimension: 1,
+                },
+            ),
             penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]].into(),
             reparam_qs: Some(array![[1.0, 0.0], [0.0, 1.0]]),
             dispersion: Dispersion::UNIT,

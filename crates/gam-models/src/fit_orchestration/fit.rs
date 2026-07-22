@@ -2212,6 +2212,8 @@ fn survival_unified_fit_result(
         edf_total,
         smoothing_correction: None,
         smoothing_correction_method: None,
+        smoothing_correction_first_order: None,
+        smoothing_correction_method_first_order: None,
         penalized_hessian: penalized_hessian.clone(),
         reparam_qs: None,
         dispersion: gam_solve::estimate::Dispersion::UNIT,
