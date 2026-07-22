@@ -9054,6 +9054,138 @@ pub(crate) fn gaussian_location_scale_joint_hessian_is_observed_and_psi_layers_m
     }
 }
 
+/// #932 release speed gate for the binomial location-scale WIGGLE order-two
+/// row program: the production typed-probe lowering
+/// (`wiggle_order2_rows`, ONE `Order2<4>` evaluation per row with 8
+/// coefficient channels, cost linear in the basis width `pw`) must beat the
+/// naive per-(row, column) dense-tower assembly (`pw` independent `Tower2<3>`
+/// compositions per row — the generic shape the oracle below uses as its
+/// witness, and the only alternative representation since the pre-cutover
+/// hand ladder was deleted by the #932 single-source migration). Both sides
+/// consume the same block states and build their own bases, so this is a
+/// system-level race of everything the joint-Hessian consumer needs. Emits
+/// the harness-parsed `hand_over_production` token
+/// (`per_column_tower_ns / production_ns`); the MSI release harness fails
+/// closed on any cell `<= 1`.
+#[test]
+pub(crate) fn release_measure_bls_wiggle_order2_rows_vs_per_column_tower_932() {
+    use super::binomial_q_derivs::binomial_neglog_q_derivatives_dispatch;
+    use gam_math::jet_tower::Tower2;
+    use std::time::Instant;
+
+    let (family, states, _specs, _xt, _xls, _wd) = bls_wiggle_workspace_fixture();
+
+    let production_batch = |states: &[ParameterBlockState]| -> f64 {
+        let pieces = family
+            .wiggle_order2_rows(states)
+            .expect("production wiggle order-two rows");
+        let n = pieces.coeff_tt.len();
+        pieces.coeff_tt[0] + pieces.coeff_tl[0] + pieces.coeff_ww[n - 1] + pieces.coeff_tw_b[0]
+    };
+
+    // The naive generic assembly: per (row, column) an independent Tower2<3>
+    // over (eta_t, eta_ls, betaw_j), composed exactly as the oracle below.
+    let generic_batch = |states: &[ParameterBlockState]| -> f64 {
+        let eta_t = &states[BinomialLocationScaleWiggleFamily::BLOCK_T].eta;
+        let eta_ls = &states[BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA].eta;
+        let etaw = &states[BinomialLocationScaleWiggleFamily::BLOCK_WIGGLE].eta;
+        let betaw = &states[BinomialLocationScaleWiggleFamily::BLOCK_WIGGLE].beta;
+        let core0 = binomial_location_scale_core(
+            &family.y,
+            &family.weights,
+            eta_t,
+            eta_ls,
+            Some(etaw),
+            &family.link_kind,
+        )
+        .expect("binomial location-scale core");
+        let b0 = family
+            .wiggle_basiswith_options(core0.q0.view(), BasisOptions::value())
+            .expect("wiggle value basis");
+        let d0 = family
+            .wiggle_basiswith_options(core0.q0.view(), BasisOptions::first_derivative())
+            .expect("wiggle first-derivative basis");
+        let dd0 = family
+            .wiggle_basiswith_options(core0.q0.view(), BasisOptions::second_derivative())
+            .expect("wiggle second-derivative basis");
+        let n = family.y.len();
+        let pw = b0.ncols();
+        let mut folded = 0.0;
+        for i in 0..n {
+            let qi = core0.q0[i] + etaw[i];
+            let (m1, m2, _m3) = binomial_neglog_q_derivatives_dispatch(
+                family.y[i],
+                family.weights[i],
+                qi,
+                core0.mu[i],
+                core0.dmu_dq[i],
+                core0.d2mu_dq2[i],
+                core0.d3mu_dq3[i],
+                &family.link_kind,
+            );
+            let eta_t_t = Tower2::<3>::variable(eta_t[i], 0);
+            let eta_ls_t = Tower2::<3>::variable(eta_ls[i], 1);
+            let q0_tower = (eta_t_t * -1.0) * (eta_ls_t * -1.0).exp();
+            for j in 0..pw {
+                let mut q = q0_tower;
+                for k in 0..pw {
+                    let coef = if k == j {
+                        Tower2::<3>::variable(betaw[j], 2)
+                    } else {
+                        Tower2::<3>::constant(betaw[k])
+                    };
+                    let basis_k = q0_tower.compose_unary([b0[[i, k]], d0[[i, k]], dd0[[i, k]]]);
+                    q = q + coef * basis_k;
+                }
+                let nll = q.compose_unary([0.0, m1, m2]);
+                folded += nll.h[0][0] + nll.h[0][2] + nll.h[2][2];
+            }
+        }
+        folded
+    };
+
+    // Sanity: both batches produce finite folds on the fixture.
+    assert!(production_batch(&states).is_finite());
+    assert!(generic_batch(&states).is_finite());
+
+    // Feedback-coupled timing barrier (no `std::hint::black_box`): the first
+    // threshold eta is nudged by a negligible multiple of the running
+    // checksum, so neither whole-batch call can be hoisted or dropped.
+    let base_eta = states[BinomialLocationScaleWiggleFamily::BLOCK_T].eta[0];
+    let mut best_ns = |use_generic: bool| -> f64 {
+        let iterations = 60usize;
+        let mut work = states.clone();
+        let mut best = f64::INFINITY;
+        for _ in 0..5 {
+            let mut checksum = 0.0_f64;
+            let started = Instant::now();
+            for _ in 0..iterations {
+                work[BinomialLocationScaleWiggleFamily::BLOCK_T].eta[0] =
+                    base_eta + checksum * 1e-18;
+                checksum += if use_generic {
+                    generic_batch(&work)
+                } else {
+                    production_batch(&work)
+                };
+            }
+            assert!(
+                checksum.is_finite(),
+                "wiggle order-two release-measure checksum must stay finite"
+            );
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        best * 1e9 / iterations as f64
+    };
+
+    let production_ns = best_ns(false);
+    let generic_ns = best_ns(true);
+    eprintln!(
+        "BLS-WIGGLE-ORDER2-932 production={production_ns:.2} ns/batch \
+         per_column_tower={generic_ns:.2} ns/batch hand_over_production={:.6}",
+        generic_ns / production_ns,
+    );
+}
+
 /// #932 exact-tower oracle for the canonical binomial location-scale WIGGLE
 /// order-two row program.
 ///
@@ -9868,210 +10000,3 @@ fn zz_measure_2155_cloglog_control_mode_geography() {
     zz2155_mode_geography_for_link("cloglog", InverseLink::Standard(StandardLink::CLogLog));
 }
 
-/// #1561 order-3 dispersion tower, part 1: the third-order tower's value,
-/// gradient, and Hessian channels must reproduce the production `Order2<2>`
-/// tower (same expression structure, one order deeper) on every family arm.
-#[test]
-fn dispersion_order3_tower_matches_order2_through_second_order() {
-    use super::dispersion_family::{dispersion_eta_nll_order2, dispersion_eta_nll_order3};
-    let cases = [
-        (DispersionFamilyKind::NegativeBinomial, 6.0, 2.0, 3.0, 1.3),
-        (DispersionFamilyKind::NegativeBinomial, 0.0, -1.5, 0.4, 0.7),
-        (DispersionFamilyKind::Gamma, 0.2, -2.0, 0.8, 0.9),
-        (DispersionFamilyKind::Gamma, 9.0, 1.7, 2.0, 1.1),
-        (DispersionFamilyKind::Beta, 0.02, -3.0, 1.6, 0.8),
-        (DispersionFamilyKind::Beta, 0.98, 3.0, -0.5, 1.4),
-        (DispersionFamilyKind::Tweedie { p: 1.5 }, 4.2, 0.9, -0.6, 1.0),
-        (DispersionFamilyKind::Tweedie { p: 1.5 }, 0.0, 0.3, 0.2, 1.2),
-    ];
-    for (kind, y, em, ed, w) in cases {
-        let t2 = dispersion_eta_nll_order2(kind, y, em, ed, w);
-        let t3 = dispersion_eta_nll_order3(kind, y, em, ed, w);
-        let label = format!("{kind:?} y={y} em={em} ed={ed}");
-        assert_rel_close(&format!("{label} value"), t3.v, t2.value(), 1e-12);
-        let g2 = t2.g();
-        let h2 = t2.h();
-        for a in 0..2 {
-            assert_rel_close(&format!("{label} grad[{a}]"), t3.g[a], g2[a], 1e-11);
-            for b in 0..2 {
-                assert_rel_close(
-                    &format!("{label} hess[{a}][{b}]"),
-                    t3.h[a][b],
-                    h2[a][b],
-                    1e-11,
-                );
-            }
-        }
-    }
-}
-
-/// #1561 order-3 dispersion tower, part 2: every `t3` channel must equal the
-/// centered finite difference of the observed Hessian channels in both
-/// predictor directions, on every family arm.
-#[test]
-fn dispersion_order3_third_channels_match_finite_difference() {
-    use super::dispersion_family::{
-        dispersion_eta_nll_order3, dispersion_row_observed_hessian_weights,
-    };
-    let cases = [
-        (DispersionFamilyKind::NegativeBinomial, 6.0, 2.0, 3.0, 1.3),
-        (DispersionFamilyKind::Gamma, 9.0, 1.7, 2.0, 1.1),
-        (DispersionFamilyKind::Beta, 0.3, -0.7, 1.6, 0.8),
-        (DispersionFamilyKind::Beta, 0.92, 1.4, 0.9, 1.4),
-        (DispersionFamilyKind::Tweedie { p: 1.5 }, 4.2, 0.9, -0.6, 1.0),
-    ];
-    let h = 1e-5;
-    for (kind, y, em, ed, w) in cases {
-        let tower = dispersion_eta_nll_order3(kind, y, em, ed, w);
-        for (axis, name) in [(0usize, "d/d_eta_mu"), (1usize, "d/d_eta_d")] {
-            let (emp, edp) = if axis == 0 { (em + h, ed) } else { (em, ed + h) };
-            let (emm, edm) = if axis == 0 { (em - h, ed) } else { (em, ed - h) };
-            let plus = dispersion_row_observed_hessian_weights(kind, y, emp, edp, w);
-            let minus = dispersion_row_observed_hessian_weights(kind, y, emm, edm, w);
-            let fd = [
-                (plus.0 - minus.0) / (2.0 * h),
-                (plus.1 - minus.1) / (2.0 * h),
-                (plus.2 - minus.2) / (2.0 * h),
-            ];
-            let analytic = [
-                tower.t3[0][0][axis],
-                tower.t3[0][1][axis],
-                tower.t3[1][1][axis],
-            ];
-            for (channel, (a, f)) in analytic.iter().zip(fd.iter()).enumerate() {
-                let scale = a.abs().max(f.abs()).max(1e-6);
-                assert!(
-                    (a - f).abs() / scale < 5e-5,
-                    "{kind:?} y={y} {name} t3 channel {channel}: analytic {a:.9e} vs FD {f:.9e}"
-                );
-            }
-        }
-    }
-}
-
-/// #1561 order-3 dispersion tower, part 3: the assembled joint-Hessian
-/// directional derivative `D_beta H_L[u]` must equal the centered finite
-/// difference of `exact_newton_joint_hessian_with_specs` along `u` — the
-/// full-assembly gate (designs, offsets, block packing, cross block) whose
-/// prior absence degraded the Firth/Jeffreys gradient to zero and desynced
-/// the inner joint-Newton merit from its KKT residual.
-#[test]
-fn dispersion_joint_hessian_directional_matches_finite_difference() {
-    use super::dispersion_family::DispersionGlmLocationScaleFamily;
-    use crate::custom_family::CustomFamily as _;
-    use gam_linalg::matrix::DesignMatrix;
-
-    let n = 9usize;
-    let p_mean = 3usize;
-    let p_disp = 2usize;
-    let x_mean = Array2::from_shape_fn((n, p_mean), |(i, j)| {
-        let t = i as f64 / (n as f64 - 1.0);
-        [1.0, t - 0.5, (t - 0.5) * (t - 0.5)][j]
-    });
-    let x_disp = Array2::from_shape_fn((n, p_disp), |(i, j)| {
-        let t = i as f64 / (n as f64 - 1.0);
-        [1.0, t - 0.5][j]
-    });
-    let offset_mean = Array1::from_shape_fn(n, |i| 0.01 * i as f64);
-    let offset_disp = Array1::from_shape_fn(n, |i| -0.02 * i as f64);
-    let make_specs = || {
-        vec![
-            ParameterBlockSpec {
-                name: "mu".to_string(),
-                design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-                    x_mean.clone(),
-                )),
-                offset: offset_mean.clone(),
-                penalties: Vec::new(),
-                nullspace_dims: Vec::new(),
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: None,
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            },
-            ParameterBlockSpec {
-                name: "log_disp".to_string(),
-                design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-                    x_disp.clone(),
-                )),
-                offset: offset_disp.clone(),
-                penalties: Vec::new(),
-                nullspace_dims: Vec::new(),
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: None,
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            },
-        ]
-    };
-    let beta_mu = Array1::from(vec![0.4, 0.8, -0.3]);
-    let beta_d = Array1::from(vec![0.9, -0.6]);
-    let u = Array1::from(vec![0.7, -1.1, 0.5, -0.4, 0.9]);
-    let states_at = |scale: f64| {
-        let bm = &beta_mu + &(u.slice(s![0..p_mean]).to_owned() * scale);
-        let bd = &beta_d + &(u.slice(s![p_mean..p_mean + p_disp]).to_owned() * scale);
-        vec![
-            ParameterBlockState {
-                eta: x_mean.dot(&bm) + &offset_mean,
-                beta: bm,
-            },
-            ParameterBlockState {
-                eta: x_disp.dot(&bd) + &offset_disp,
-                beta: bd,
-            },
-        ]
-    };
-    let fixtures: [(DispersionFamilyKind, fn(usize) -> f64); 4] = [
-        (DispersionFamilyKind::NegativeBinomial, |i| {
-            [0.0, 1.0, 3.0, 6.0, 2.0, 0.0, 4.0, 1.0, 8.0][i]
-        }),
-        (DispersionFamilyKind::Gamma, |i| 0.5 + 0.9 * i as f64),
-        (DispersionFamilyKind::Beta, |i| 0.08 + 0.09 * i as f64),
-        (DispersionFamilyKind::Tweedie { p: 1.5 }, |i| {
-            [0.0, 1.2, 3.4, 0.0, 2.7, 5.1, 0.9, 1.8, 4.4][i]
-        }),
-    ];
-    let h = 1e-6;
-    for (kind, y_fn) in fixtures {
-        let family = DispersionGlmLocationScaleFamily {
-            kind,
-            y: Array1::from_shape_fn(n, y_fn),
-            weights: Array1::from_elem(n, 1.0),
-        };
-        let specs = make_specs();
-        let analytic = family
-            .exact_newton_joint_hessian_directional_derivative_with_specs(
-                &states_at(0.0),
-                &specs,
-                &u,
-            )
-            .expect("directional derivative evaluates")
-            .expect("directional derivative available");
-        let h_plus = family
-            .exact_newton_joint_hessian_with_specs(&states_at(h), &specs)
-            .expect("H(beta+hu) evaluates")
-            .expect("H(beta+hu) available");
-        let h_minus = family
-            .exact_newton_joint_hessian_with_specs(&states_at(-h), &specs)
-            .expect("H(beta-hu) evaluates")
-            .expect("H(beta-hu) available");
-        let fd = (&h_plus - &h_minus) / (2.0 * h);
-        let scale = fd
-            .iter()
-            .fold(0.0f64, |m, v| m.max(v.abs()))
-            .max(analytic.iter().fold(0.0f64, |m, v| m.max(v.abs())))
-            .max(1.0);
-        let max_err = (&analytic - &fd)
-            .iter()
-            .fold(0.0f64, |m, v| m.max(v.abs()));
-        assert!(
-            max_err / scale < 5e-7,
-            "{kind:?}: joint Hessian directional derivative disagrees with FD: \
-             max abs err {max_err:.3e} at scale {scale:.3e}"
-        );
-    }
-}

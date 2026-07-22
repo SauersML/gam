@@ -1326,7 +1326,7 @@ mod tests {
         let mut prev_support: Option<Vec<Vec<bool>>> = None;
         for sweep in 0..12 {
             for atom_idx in 0..config.n_atoms {
-                let _ = fit_one_atom_penalized_ls(
+                fit_one_atom_penalized_ls(
                     x.view(),
                     &mut atoms,
                     &mut assignments,
