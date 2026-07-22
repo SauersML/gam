@@ -2221,3 +2221,93 @@ fn repulsion_is_radially_inert_net_radial_is_analytic_barrier_2343() {
          (INWARD) — an O(1) sign change, far above this bound."
     );
 }
+
+
+// #2253 co-collapse instrumentation (diagnostic; zz_measure). Sweep the 2-atom
+// alignment c2 toward collapse and report the separation-barrier restoring force
+// (grad norm) + value. If the force PLATEAUS at O(1) as c2->1, the tiny fixture
+// is in the WEAK-barrier (large eps_C = 2*sqrt(s/N_eff), small-N_eff) regime, not
+// the softplus curvature-cap (small-eps) regime.
+#[test]
+fn zz_measure_separation_force_vs_c2_2253() {
+    for &c2 in &[0.5_f64, 0.9, 0.99, 0.999, 0.9999, 0.999999] {
+        let term = aligned_two_atom_term_with_c2(c2);
+        let (v, g) = term.separation_barrier_value_and_grad_for_test(1.0);
+        let fnorm = g.iter().map(|x| x * x).sum::<f64>().sqrt();
+        eprintln!("SEPFORCE c2={c2:.6} value={v:.6e} force_gradnorm={fnorm:.6e}");
+    }
+}
+
+
+// #2253 co-collapse — confirm the gate-inside defect on the REAL failing
+// fixtures: report the co-firing weight q, the decoder coherence o=c2, and the
+// 2-atom collapsing eigenvalue lambda_min=1-q*o, both as constructed and with
+// the decoders forcibly ALIGNED (o->1). If q<1 with o->1, lambda_min saturates
+// at 1-q>0 (bounded away from the pole) — regime-1 confirmed on real fixtures.
+#[test]
+fn zz_measure_real_fixture_barrier_q_2253() {
+    use crate::manifold::tests::small_two_atom_periodic_term;
+    use crate::manifold::tests_recovery_split_780::gamma_fd_tiny_fixture;
+    let report = |tag: &str, term: &SaeManifoldTerm| {
+        let (pairs, _neff) = term.barrier_coactivation_pairs();
+        for (j, k, q) in &pairs {
+            let o = term.decoder_gram_cosine_sq(*j, *k);
+            eprintln!(
+                "REALQ {tag} pair=({j},{k}) q={q:.6e} o_c2={o:.6e} lam_min=1-q*o={:.6e}",
+                1.0 - q * o
+            );
+        }
+        if pairs.is_empty() {
+            eprintln!("REALQ {tag} NO co-firing pairs");
+        }
+    };
+    // recompute config: gamma_fd_tiny + ordered-Beta--Bernoulli gate + sparse 0.5.
+    let (mut term, _t, _r) = gamma_fd_tiny_fixture();
+    term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, true);
+    term.refresh_barrier_coactivation_gate();
+    report("recompute_asbuilt", &term);
+    let b0 = term.atoms[0].decoder_coefficients.clone();
+    if term.atoms[1].decoder_coefficients.dim() == b0.dim() {
+        term.atoms[1].decoder_coefficients = b0.clone();
+    }
+    term.refresh_barrier_coactivation_gate();
+    report("recompute_aligned", &term);
+    // hutchinson: small_two_atom_periodic_term.
+    let (mut h, _t2, _r2) = small_two_atom_periodic_term();
+    h.refresh_barrier_coactivation_gate();
+    report("hutchinson_asbuilt", &h);
+    let hb0 = h.atoms[0].decoder_coefficients.clone();
+    if h.atoms[1].decoder_coefficients.dim() == hb0.dim() {
+        h.atoms[1].decoder_coefficients = hb0.clone();
+    }
+    h.refresh_barrier_coactivation_gate();
+    report("hutchinson_aligned", &h);
+}
+
+// #2253 Q2/Q3 — under-power vs solver: SVD the tiny-fixture TARGETS to see
+// whether the data supports rank-2 (K=2) at all. If sigma2/sigma1 is tiny the
+// reseeder verdict "cannot anchor K=2" is CORRECT (fixture under-power), not a
+// barrier or solver failure.
+#[test]
+fn zz_measure_tiny_fixture_target_rank_2253() {
+    use gam_linalg::faer_ndarray::FaerSvd;
+    use crate::manifold::tests::small_two_atom_periodic_term;
+    use crate::manifold::tests_recovery_split_780::gamma_fd_tiny_fixture;
+    let svd_report = |tag: &str, target: &Array2<f64>| {
+        let (_u, sv, _vt) = target.svd(false, false).expect("svd");
+        let s: Vec<f64> = sv.iter().copied().collect();
+        let s1 = s.first().copied().unwrap_or(0.0);
+        let s2 = s.get(1).copied().unwrap_or(0.0);
+        let ratio = if s1 > 0.0 { s2 / s1 } else { 0.0 };
+        let sfmt: Vec<String> = s.iter().map(|x| format!("{x:.4e}")).collect();
+        eprintln!(
+            "TARGETRANK {tag} dim={:?} sigmas={:?} sigma2_over_sigma1={ratio:.6e}",
+            target.dim(),
+            sfmt
+        );
+    };
+    let (_t, tgt_r, _r) = gamma_fd_tiny_fixture();
+    svd_report("recompute_gamma_fd_tiny", &tgt_r);
+    let (_t2, tgt_h, _r2) = small_two_atom_periodic_term();
+    svd_report("hutchinson_small_two_atom", &tgt_h);
+}

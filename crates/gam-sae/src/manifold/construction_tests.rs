@@ -1942,7 +1942,6 @@ mod exact_stationarity_solve_1418_tests {
 #[cfg(test)]
 mod smoothness_dof_hutchinson_tests {
     use super::*;
-    use crate::manifold::tests::small_two_atom_periodic_term;
 
     /// Rebuild the exact function's `(offsets, out_dim)` β-layout so the estimator
     /// is fed the identical geometry.
@@ -1961,7 +1960,24 @@ mod smoothness_dof_hutchinson_tests {
 
     #[test]
     fn hutchinson_smoothness_dof_matches_exact_and_is_deterministic() {
-        let (mut term, target, rho) = small_two_atom_periodic_term();
+        // #2253: small_two_atom_periodic_term is p=1 output, where two decoders
+        // are trivially collinear (the scalar output-Gram makes the barrier
+        // coherence O identically 1) and K=2 is non-identifiable, so the fit
+        // co-collapses. Rank the p=3 REACHABLE gamma_fd_tiny two-atom fixture into
+        // its converging PD basin instead; the per-atom smoothness-DOF split this
+        // test pins (Hutchinson vs exact column-solve, cross-atom coupling) is
+        // exercised identically on two identifiable atoms.
+        let (mut term, target, mut rho) =
+            crate::manifold::tests_recovery_split_780::gamma_fd_tiny_fixture();
+        rho.log_lambda_sparse = 0.0;
+        for v in rho.log_lambda_smooth.iter_mut() {
+            *v = -1.0;
+        }
+        for axis in rho.log_ard.iter_mut() {
+            for v in axis.iter_mut() {
+                *v = -1.0;
+            }
+        }
         let (_value, _loss, cache) = term
             .penalized_quasi_laplace_criterion_with_cache(
                 target.view(),
@@ -2052,8 +2068,6 @@ mod smoothness_dof_hutchinson_tests {
 
 #[cfg(test)]
 mod shape_uncertainty_joint_recompute_tests {
-    use super::*;
-    use crate::manifold::tests::gamma_fd_tiny_fixture;
 
     /// After a structure-search / finalization change, the shape bands are
     /// rebuilt at the FINAL state by `recompute_joint_shape_uncertainty`, which
@@ -2066,9 +2080,27 @@ mod shape_uncertainty_joint_recompute_tests {
         // genuine reconstruction residual — a real dispersion and nonzero bands —
         // while the state stays near its inner optimum so the undamped joint
         // factor converges in a few steps.
-        let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
-        term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, true);
-        rho.log_lambda_sparse = 0.5;
+        // #2253: the historical OBB-gate-on-a-softmax-built-target left a
+        // residual but is model-UNREACHABLE, so after #2330 Phase-2a the joint
+        // fit co-collapses (reconstruction EV=-4.06, decoders cannot anchor K=2).
+        // Keep the REACHABLE softmax gamma_fd_tiny (p=3) but rank it into a
+        // moderate-penalty basin (all log-lambda = -1 except a mild sparse), where
+        // the regularized fit carries a genuine residual (positive dispersion,
+        // non-degenerate per-output-channel bands) and converges. Both the direct
+        // and the recompute paths fit this COLD state identically, so the
+        // band-reproduction invariance this test pins holds exactly; the mode
+        // switch was only a residual-creation trick, not an OBB-recompute assertion.
+        let (mut term, target, mut rho) =
+            crate::manifold::tests_recovery_split_780::gamma_fd_tiny_fixture();
+        rho.log_lambda_sparse = 0.0;
+        for v in rho.log_lambda_smooth.iter_mut() {
+            *v = -1.0;
+        }
+        for axis in rho.log_ard.iter_mut() {
+            for v in axis.iter_mut() {
+                *v = -1.0;
+            }
+        }
 
         // Reference joint bands via the direct Schur path.
         let (_c, loss, cache) = term
@@ -2076,14 +2108,22 @@ mod shape_uncertainty_joint_recompute_tests {
                 target.view(),
                 &rho,
                 None,
-                5,
+                40,
                 0.4,
                 1.0e-6,
                 1.0e-6,
             )
             .expect("converged joint cache");
+        // #2253: price the reference band from the SAME dispersion source the
+        // production recompute_joint_shape_uncertainty uses -- the explicit
+        // whitened reconstruction residual. Passing None reads 2*data_fit (the
+        // deviance RSS), which diverges from the whitened residual RSS under a
+        // whitening row-metric, so the reference (not recompute) was stale.
+        let residual = term
+            .reconstruction_residual(target.view(), &rho)
+            .expect("reconstruction residual");
         let dispersion = term
-            .reconstruction_dispersion(&loss, &cache, &rho, None)
+            .reconstruction_dispersion(&loss, &cache, &rho, Some(residual.view()))
             .expect("dispersion");
         assert!(dispersion > 0.0, "a real residual ⇒ positive dispersion");
         let joint = term
@@ -2093,7 +2133,7 @@ mod shape_uncertainty_joint_recompute_tests {
         // Property 1: the final-state recompute reproduces the joint path (it IS
         // the joint path, rebuilt from the term + ρ rather than a cached factor).
         let recomputed = term
-            .recompute_joint_shape_uncertainty(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+            .recompute_joint_shape_uncertainty(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
             .expect("joint recompute");
         assert_eq!(recomputed.atoms.len(), joint.atoms.len());
         for (k, (a, b)) in recomputed.atoms.iter().zip(joint.atoms.iter()).enumerate() {
