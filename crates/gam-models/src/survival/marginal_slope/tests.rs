@@ -7927,15 +7927,13 @@ fn release_measure_rigid_contracted_towers_vs_generic_tower_932() {
         // Parity pin on the exact benchmarked inputs: the specialized
         // contractions must equal the dense tower's contractions.
         let dense = program_full_tower(&program, 0).expect("dense tower");
-        let third_vars: [OneSeed<4>; 4] = std::array::from_fn(|a| {
-            OneSeed::seed_direction([q0, q1, qd1, g][a], a, dir_u[a])
-        });
+        let third_vars: [OneSeed<4>; 4] =
+            std::array::from_fn(|a| OneSeed::seed_direction([q0, q1, qd1, g][a], a, dir_u[a]));
         let third = rigid_row_nll(&third_vars, &inputs)
             .expect("specialized third")
             .contracted_third();
-        let fourth_vars: [TwoSeed<4>; 4] = std::array::from_fn(|a| {
-            TwoSeed::seed([q0, q1, qd1, g][a], a, dir_u[a], dir_v[a])
-        });
+        let fourth_vars: [TwoSeed<4>; 4] =
+            std::array::from_fn(|a| TwoSeed::seed([q0, q1, qd1, g][a], a, dir_u[a], dir_v[a]));
         let fourth = rigid_row_nll(&fourth_vars, &inputs)
             .expect("specialized fourth")
             .contracted_fourth();
@@ -7943,22 +7941,14 @@ fn release_measure_rigid_contracted_towers_vs_generic_tower_932() {
         let dense_fourth = dense.fourth_contracted(&dir_u, &dir_v);
         for a in 0..4 {
             for b in 0..4 {
-                let band = 1e-11
-                    * third[a][b]
-                        .abs()
-                        .max(dense_third[a][b].abs())
-                        .max(1.0);
+                let band = 1e-11 * third[a][b].abs().max(dense_third[a][b].abs()).max(1.0);
                 assert!(
                     (third[a][b] - dense_third[a][b]).abs() <= band,
                     "event={d:.0} third[{a}][{b}]: specialized {:+.15e} vs dense {:+.15e}",
                     third[a][b],
                     dense_third[a][b],
                 );
-                let band = 1e-11
-                    * fourth[a][b]
-                        .abs()
-                        .max(dense_fourth[a][b].abs())
-                        .max(1.0);
+                let band = 1e-11 * fourth[a][b].abs().max(dense_fourth[a][b].abs()).max(1.0);
                 assert!(
                     (fourth[a][b] - dense_fourth[a][b]).abs() <= band,
                     "event={d:.0} fourth[{a}][{b}]: specialized {:+.15e} vs dense {:+.15e}",
