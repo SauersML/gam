@@ -53,6 +53,49 @@ fn constrained_search_delta_owns_trust_step(
         || (has_active_set && ambient_spectrum_has_negative_curvature == Some(false))
 }
 
+/// Damping `α` of the self-concordant damped-Newton phase (gam#979 CTN/
+/// marginal-slope barrier crawl), or `None` once the undamped machinery owns
+/// the step.
+///
+/// For a family whose penalized inner objective is self-concordant
+/// (`CustomFamily::inner_objective_is_self_concordant` — the change-of-
+/// variables `−log h'` barrier with `h'` affine in β), the classical damped
+/// Newton step `α·δ_N` with `α = 1/(1+λ_N)` guarantees an objective decrease
+/// of at least `λ_N − log(1+λ_N)` per step while `λ_N` is large, and plain
+/// Newton is quadratically convergent once `λ_N < (3−√5)/2` (Nesterov,
+/// *Introductory Lectures on Convex Optimization*, Thm 4.1.12). `λ_N` is the
+/// Newton decrement `sqrt(gᵀH⁻¹g)`, recovered from the spectrum's model
+/// decrease `newton_decrement() = ½λ_N²` of the full modified-Newton step.
+///
+/// The trust-region ratio search lacks this guarantee on the barrier's
+/// `1/h'²` curvature: a full Newton step overshoots the barrier's region of
+/// model validity (the Dikin ellipsoid), the ρ-gate/feasibility limiter
+/// rejects it, the radius collapses, and the solve accepts only
+/// `O(1e-3)·δ_N` fragments — the measured ~0.998×/cycle KKT-residual crawl
+/// that exhausts the inner budget (the #979 survival "hang"). `α = 1/(1+λ_N)`
+/// is precisely the largest step with a guaranteed decrease, so substituting
+/// it for the first trial of each cycle replaces the crawl with the textbook
+/// bounded-decrease phase while every rejection still falls back to the
+/// unchanged trust-region machinery.
+///
+/// Returns `None` in the quadratic phase (`λ_N` below the threshold) and on a
+/// non-finite or non-positive decrement, where no self-concordance statement
+/// is available — the caller's step policy is byte-identical there.
+fn self_concordant_damped_step_alpha(newton_decrement: f64) -> Option<f64> {
+    if !(newton_decrement.is_finite() && newton_decrement > 0.0) {
+        return None;
+    }
+    let lambda_n = (2.0 * newton_decrement).sqrt();
+    // (3 − √5)/2: the classical bound on the decrement below which the FULL
+    // Newton step keeps the iterate inside the quadratic-convergence region
+    // of a standard self-concordant function.
+    const SC_QUADRATIC_PHASE_THRESHOLD: f64 = 0.381_966_011_250_105;
+    if !lambda_n.is_finite() || lambda_n < SC_QUADRATIC_PHASE_THRESHOLD {
+        return None;
+    }
+    Some(1.0 / (1.0 + lambda_n))
+}
+
 /// Reduced-space Newton candidate on a certified current inequality face.
 ///
 /// The global constrained step uses a convex model to discover the active
@@ -235,6 +278,9 @@ fn certified_reduced_face_newton_candidate(
     let candidate_values = constraints
         .values(candidate.view())
         .map_err(|error| format!("reduced active-face candidate evaluation failed: {error}"))?;
+    // Rows landing inside the working-face band at the truncated candidate,
+    // ascending index — the MULTI-BLOCKER carry set (gam#979, see below).
+    let mut band_tight_rows: Vec<usize> = Vec::new();
     for row in 0..constraints.nrows() {
         let norm = constraints
             .row_norm(row)
@@ -245,11 +291,15 @@ fn certified_reduced_face_newton_candidate(
         let bound = constraints
             .bound(row)
             .map_err(|error| format!("reduced active-face candidate bound failed: {error}"))?;
-        if bound != f64::NEG_INFINITY
-            && (candidate_values[row] - bound) / norm
-                < -gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-        {
+        if bound == f64::NEG_INFINITY {
+            continue;
+        }
+        let scaled_slack = (candidate_values[row] - bound) / norm;
+        if scaled_slack < -gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
             return Ok(None);
+        }
+        if scaled_slack <= gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL {
+            band_tight_rows.push(row);
         }
     }
 
@@ -282,6 +332,25 @@ fn certified_reduced_face_newton_candidate(
         && !next_active.contains(&row)
     {
         next_active.push(row);
+    }
+    // MULTI-BLOCKER ACTIVATION (gam#979 CTN face accretion). Truncating at the
+    // designated first blocker while several rows land in the working band at
+    // the same chord fraction used to carry only ONE of them: the next cycle
+    // re-proposed a near-identical chord, hit the next row, and the face grew
+    // one row per cycle (the measured cyc-28..43 accretion of the #2301 n=80
+    // CTN fit — a Zeno march the inner budget cannot afford at an 80-row cone
+    // over a 6-dim block). Carry EVERY row the truncated candidate presses
+    // into the working band (ascending index, deterministic), so the whole
+    // simultaneously-binding set activates in one cycle; the downstream face
+    // consumers already rank-reduce redundant rows to independent
+    // representatives. Truncated chords only — an untruncated certified
+    // Newton step keeps its exact-face semantics unchanged.
+    if blocking_row.is_some() {
+        for row in band_tight_rows {
+            if !next_active.contains(&row) {
+                next_active.push(row);
+            }
+        }
     }
     Ok(Some((candidate, next_active, exact_newton)))
 }
@@ -462,6 +531,80 @@ mod exact_face_newton_tests {
             true,
             Some(true),
         ));
+    }
+
+    #[test]
+    fn self_concordant_damping_is_inactive_in_the_quadratic_phase() {
+        // λ_N below (3−√5)/2 — plain Newton owns the endgame, so the damped
+        // trial must decline and the step policy stays byte-identical. This is
+        // the STEP-POLICY-ONLY invariant: a converged/converging fit whose
+        // decrement has entered the quadratic phase never sees a damped step.
+        let lambda_n = 0.3_f64;
+        assert!(self_concordant_damped_step_alpha(0.5 * lambda_n * lambda_n).is_none());
+        // Degenerate decrements carry no self-concordance statement.
+        assert!(self_concordant_damped_step_alpha(0.0).is_none());
+        assert!(self_concordant_damped_step_alpha(-1.0).is_none());
+        assert!(self_concordant_damped_step_alpha(f64::NAN).is_none());
+        assert!(self_concordant_damped_step_alpha(f64::INFINITY).is_none());
+    }
+
+    #[test]
+    fn self_concordant_damping_matches_the_damped_newton_alpha() {
+        // decrement = ½λ_N² ⇒ α = 1/(1+λ_N). λ_N = 2 ⇒ α = 1/3.
+        let alpha = self_concordant_damped_step_alpha(2.0).expect("damped phase");
+        assert!((alpha - 1.0 / 3.0).abs() <= 1e-15);
+        // Just above the threshold the damping engages continuously.
+        let lambda_n = 0.4_f64;
+        let alpha = self_concordant_damped_step_alpha(0.5 * lambda_n * lambda_n)
+            .expect("damped phase just above threshold");
+        assert!((alpha - 1.0 / 1.4).abs() <= 1e-15);
+    }
+
+    #[test]
+    fn reduced_face_truncation_carries_every_simultaneously_binding_blocker() {
+        // z >= 0 is the active face; the tangent Newton step (2, 2, 0) meets
+        // the two inactive rows x <= 1 and y <= 1 at the SAME chord fraction
+        // 1/2. The single-blocker carry activated only one of them per cycle
+        // (the Zeno accretion); the truncated candidate must land both rows
+        // inside the working band and carry BOTH in the returned face.
+        let hessian = array![
+            [1.0_f64, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0]
+        ];
+        let rhs = array![2.0_f64, 2.0, 0.0];
+        let beta = array![0.0_f64, 0.0, 0.0];
+        let constraints = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(
+                array![
+                    [0.0_f64, 0.0, 1.0],
+                    [-1.0, 0.0, 0.0],
+                    [0.0, -1.0, 0.0]
+                ],
+                array![0.0, -1.0, -1.0],
+            )
+            .expect("z>=0, x<=1, y<=1"),
+        );
+        let (candidate, active, exact) =
+            certified_reduced_face_newton_candidate(&hessian, &rhs, &beta, &constraints, &[0])
+                .expect("reduced face classification")
+                .expect("tangent descent truncated at the simultaneous blockers");
+        assert!(candidate[2].abs() <= 1e-12);
+        assert!(
+            candidate[0] <= 1.0 && candidate[1] <= 1.0,
+            "candidate must not overstep either blocker ({}, {})",
+            candidate[0],
+            candidate[1]
+        );
+        assert!(
+            (1.0 - candidate[0]) <= gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL
+                && (1.0 - candidate[1]) <= gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL,
+            "both blockers must land inside the working band ({}, {})",
+            candidate[0],
+            candidate[1]
+        );
+        assert_eq!(active, vec![0, 1, 2]);
+        assert!(!exact);
     }
 }
 
@@ -3341,6 +3484,26 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 } else {
                     None
                 };
+            // SELF-CONCORDANT DAMPED FIRST TRIAL (gam#979). For a family that
+            // declares its penalized inner objective self-concordant, compute
+            // once per cycle the damped-Newton `α = 1/(1+λ_N)` from the
+            // spectrum's Newton decrement. The FIRST trust attempt of the cycle
+            // then proposes `α·δ_N` (the largest step with a guaranteed
+            // decrease on the barrier objective) instead of the radius-clamped
+            // step; every later attempt — reached only if that trial is
+            // rejected by the retained feasibility/ρ acceptance gates — uses
+            // the unchanged trust-region machinery, so the fallback and every
+            // non-flagged family are byte-identical. `None` outside the damped
+            // phase (λ_N below the quadratic-phase threshold), where plain
+            // Newton owns the endgame.
+            let self_concordant_damping: Option<f64> =
+                if family.inner_objective_is_self_concordant() {
+                    joint_spectrum.as_ref().and_then(|spectrum| {
+                        self_concordant_damped_step_alpha(spectrum.newton_decrement())
+                    })
+                } else {
+                    None
+                };
             let mut model_rejects = 0usize;
             let mut likelihood_rejects = 0usize;
             let mut objective_rejects = 0usize;
@@ -3434,6 +3597,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // untruncated because the global α-crush would otherwise collapse
                 // a feasible, within-trust QP step (see the gated bypass below).
                 let mut qp_feasible_bypass = false;
+                // Self-concordant damped first trial (gam#979): live only on
+                // the cycle's FIRST attempt; a rejection falls through to the
+                // byte-identical trust-region attempts below.
+                let sc_first_trial_alpha = if trust_attempt == 0 {
+                    self_concordant_damping
+                } else {
+                    None
+                };
                 let mut block_step_norms = if let Some(spectrum) = joint_spectrum.as_ref() {
                     // POSITIVE-DEFINITE CONSTRAINED PATH (gam#979 CTN).
                     //
@@ -3508,7 +3679,39 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             // same Err downstream and shrinks the radius.
                             Err(_) => false,
                         };
-                    if constrained_search_delta_is_authoritative {
+                    if let Some(sc_alpha) = sc_first_trial_alpha {
+                        // SELF-CONCORDANT DAMPED FIRST TRIAL (gam#979). In the
+                        // damped phase the guaranteed-decrease step is
+                        // `α·δ_N`, α = 1/(1+λ_N) — independent of the D-metric
+                        // trust radius, which carries no barrier information
+                        // and, once collapsed by earlier barrier-overshoot
+                        // rejections, regrows too slowly to escape the
+                        // ~0.998×/cycle residual crawl. On the authoritative
+                        // constrained path damp the QP/face chord itself
+                        // (β and β+δ are both cone-feasible, so β+αδ stays
+                        // feasible and A_active·αδ = 0 is preserved);
+                        // otherwise damp the full modified-Newton spectrum
+                        // step and let the cone projection below restore
+                        // feasibility. Skip the global fraction-to-boundary
+                        // α-crush either way (`qp_feasible_bypass`): the crush
+                        // is the crawl mechanism this trial replaces, and the
+                        // magnitude-preserving cone projection still enforces
+                        // every hard constraint. The retained ρ/likelihood
+                        // acceptance gates decide the trial's fate exactly as
+                        // for any other proposal.
+                        qp_feasible_bypass = true;
+                        if constrained_search_delta_is_authoritative {
+                            trial_delta = search_delta.clone();
+                        } else {
+                            trial_delta = spectrum.trust_region_step(f64::INFINITY).delta;
+                        }
+                        trial_delta.mapv_inplace(|value| value * sc_alpha);
+                        joint_trust_region_block_metric_norms(
+                            &trial_delta,
+                            &ranges,
+                            &joint_trust_metric_diag,
+                        )
+                    } else if constrained_search_delta_is_authoritative {
                         // A full-space convex QP direction and a reduced-face
                         // direction both own their feasible chord. In the latter
                         // case, ambient negative curvature is inaccessible and

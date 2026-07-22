@@ -862,6 +862,166 @@ pub(crate) fn dispersion_row_observed_hessian_weights(
     (h[0][0], h[0][1], h[1][1])
 }
 
+/// Order-3 alias for the two-predictor η-space NLL tower.
+type O3 = gam_math::jet_tower::Tower3<2>;
+
+fn o3_exp(x: &O3) -> O3 {
+    x.compose_unary_with(|v| {
+        let e = v.exp();
+        [e, e, e, e]
+    })
+}
+
+fn o3_ln(x: &O3) -> O3 {
+    x.compose_unary_with(|v| [v.ln(), v.recip(), -v.powi(-2), 2.0 * v.powi(-3)])
+}
+
+fn o3_recip(x: &O3) -> O3 {
+    x.compose_unary_with(|v| [v.recip(), -v.powi(-2), 2.0 * v.powi(-3), -6.0 * v.powi(-4)])
+}
+
+fn o3_powf(x: &O3, a: f64) -> O3 {
+    x.compose_unary_with(|v| {
+        [
+            v.powf(a),
+            a * v.powf(a - 1.0),
+            a * (a - 1.0) * v.powf(a - 2.0),
+            a * (a - 1.0) * (a - 2.0) * v.powf(a - 3.0),
+        ]
+    })
+}
+
+fn o3_ln_gamma(x: &O3) -> O3 {
+    x.compose_unary_with(|v| {
+        let stack = gam_math::jet_tower::ln_gamma_derivative_stack(v);
+        [stack[0], stack[1], stack[2], stack[3]]
+    })
+}
+
+/// Observed η-space row NLL tower to THIRD order: the order-3 sibling of
+/// [`dispersion_eta_nll_order2`], written with the identical expression
+/// structure per family so the `v`/`g`/`h` channels agree with the order-2
+/// tower and `t3` is the exact per-row third-derivative tensor
+/// `∂³NLL/∂η_a∂η_b∂η_c`.
+///
+/// This tensor is what the β-directional derivative of the observed joint
+/// Hessian contracts row-wise — the object the Jeffreys/Firth gradient
+/// (`joint_jeffreys_term`'s `Hdot[e_k]`) and the outer mode-response
+/// correction (`D_β H_L[u]`) both need. Before it existed the family declined
+/// the directional-derivative hook, and `joint_jeffreys_term` degraded to
+/// `(Φ, 0, 0)`: the Firth value entered the inner merit while its gradient
+/// was silently zero, desynchronizing the inner joint-Newton objective from
+/// its KKT residual whenever the conditioning gate armed (the flat-residual
+/// stall on Beta/NB/Tweedie dispersion location-scale fits — #1561's
+/// `quality_vs_gamlss_beta_dispersion_location_scale_1060` null-model
+/// collapse).
+pub(crate) fn dispersion_eta_nll_order3(
+    kind: DispersionFamilyKind,
+    yi: f64,
+    em: f64,
+    ed: f64,
+    wi: f64,
+) -> O3 {
+    let eta_mu = O3::variable(em, 0);
+    let eta_d = O3::variable(ed, 1);
+    match kind {
+        DispersionFamilyKind::NegativeBinomial => {
+            let theta = o3_exp(&eta_d);
+            let theta_plus_y = theta.add(&O3::constant(yi));
+            let log_total = if em >= ed {
+                eta_mu.add(&o3_ln(
+                    &o3_exp(&eta_d.sub(&eta_mu)).add(&O3::constant(1.0)),
+                ))
+            } else {
+                eta_d.add(&o3_ln(
+                    &o3_exp(&eta_mu.sub(&eta_d)).add(&O3::constant(1.0)),
+                ))
+            };
+            let loglik = o3_ln_gamma(&theta_plus_y)
+                .sub(&o3_ln_gamma(&theta))
+                .sub(&O3::constant(ln_gamma(yi + 1.0)))
+                .add(&theta.mul(&eta_d.sub(&log_total)))
+                .add(&eta_mu.sub(&log_total).scale(yi));
+            loglik.scale(-wi)
+        }
+        DispersionFamilyKind::Gamma => {
+            let mu = o3_exp(&eta_mu);
+            let nu = o3_exp(&eta_d);
+            let y_pos = yi;
+            let loglik = nu
+                .mul(&o3_ln(&nu))
+                .sub(&nu.mul(&o3_ln(&mu)))
+                .sub(&o3_ln_gamma(&nu))
+                .add(&nu.sub(&O3::constant(1.0)).scale(y_pos.ln()))
+                .sub(&nu.mul(&o3_recip(&mu).scale(yi)));
+            loglik.scale(-wi)
+        }
+        DispersionFamilyKind::Beta => {
+            let mu = o3_recip(&o3_exp(&eta_mu.scale(-1.0)).add(&O3::constant(1.0)));
+            let phi = o3_exp(&eta_d);
+            let one_minus_mu = O3::constant(1.0).sub(&mu);
+            let yc = yi;
+            let a = mu.mul(&phi);
+            let b = one_minus_mu.mul(&phi);
+            let loglik = o3_ln_gamma(&phi)
+                .sub(&o3_ln_gamma(&a))
+                .sub(&o3_ln_gamma(&b))
+                .add(&a.sub(&O3::constant(1.0)).scale(yc.ln()))
+                .add(&b.sub(&O3::constant(1.0)).scale((-yc).ln_1p()));
+            loglik.scale(-wi)
+        }
+        DispersionFamilyKind::Tweedie { p } => {
+            let one_minus_p = 1.0 - p;
+            let two_minus_p = 2.0 - p;
+            let mu = o3_exp(&eta_mu);
+            let phi = o3_exp(&eta_d.scale(-1.0));
+            if yi > 0.0 {
+                let dev = o3_powf(&mu, two_minus_p)
+                    .scale(1.0 / two_minus_p)
+                    .sub(&o3_powf(&mu, one_minus_p).scale(yi / one_minus_p))
+                    .add(&O3::constant(
+                        yi.powf(two_minus_p) / (one_minus_p * two_minus_p),
+                    ))
+                    .scale(2.0);
+                let loglik = dev
+                    .mul(&o3_recip(&phi).scale(-0.5))
+                    .sub(&o3_ln(&phi.scale(2.0 * std::f64::consts::PI)).scale(0.5))
+                    .sub(&O3::constant(0.5 * p * yi.ln()));
+                loglik.scale(-wi)
+            } else {
+                let c = o3_powf(&mu, two_minus_p).scale(1.0 / two_minus_p);
+                let loglik = c.mul(&o3_recip(&phi)).scale(-1.0);
+                loglik.scale(-wi)
+            }
+        }
+    }
+}
+
+/// Per-row directional derivative of the observed η-space Hessian channels
+/// `(∂²NLL/∂η_μ², ∂²NLL/∂η_μ∂η_d, ∂²NLL/∂η_d²)` along the per-row η-motion
+/// `(du_mu, du_d)` — the row-wise contraction of the exact third-derivative
+/// tensor from [`dispersion_eta_nll_order3`].
+pub(crate) fn dispersion_row_observed_hessian_directional(
+    kind: DispersionFamilyKind,
+    yi: f64,
+    eta_mu: f64,
+    eta_d: f64,
+    prior_weight: f64,
+    du_mu: f64,
+    du_d: f64,
+) -> (f64, f64, f64) {
+    if prior_weight <= 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let tower = dispersion_eta_nll_order3(kind, yi, eta_mu, eta_d, prior_weight);
+    let t3 = &tower.t3;
+    (
+        t3[0][0][0] * du_mu + t3[0][0][1] * du_d,
+        t3[0][1][0] * du_mu + t3[0][1][1] * du_d,
+        t3[1][1][0] * du_mu + t3[1][1][1] * du_d,
+    )
+}
+
 /// Exact row-local geometry consumed by saved-model case deletion.
 ///
 /// The score is the gradient of the weighted negative log-likelihood in the
@@ -1477,6 +1637,156 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
             .assign(&h_disp);
         mirror_upper_to_lower(&mut h);
         Ok(Some(h))
+    }
+
+    /// Exact β-directional derivative of the observed joint Hessian,
+    /// `D_β H_L[u]`, assembled row-wise from the third-order η-space tower
+    /// ([`dispersion_eta_nll_order3`]): with per-row η-motion
+    /// `du_μ = X_μ u_μ`, `du_d = X_d u_d`, each Hessian channel drifts by the
+    /// exact tensor contraction `dW_ab = Σ_c (∂³NLL/∂η_a∂η_b∂η_c) du_c`, and
+    /// the blocks are the same `Xᵀ diag(dW) X` grams the Hessian itself uses.
+    ///
+    /// Supplying this hook (instead of the previous silent `None`) is
+    /// load-bearing twice over:
+    ///  * the inner Firth/Jeffreys term `joint_jeffreys_term` builds its
+    ///    `∇Φ`/`H_Φ` from `Hdot[e_k]`; with `None` it degrades to `(Φ, 0, 0)`,
+    ///    so the inner merit contains a β-dependent `−Φ` the KKT gradient
+    ///    cannot see — the objective↔gradient desync behind the flat-residual
+    ///    inner stall (and, post rail-face certification, the λ=∞ null-model
+    ///    collapse) on Beta/NB/Tweedie dispersion location-scale fits (#1561);
+    ///  * the outer profiled-Laplace mode-response correction
+    ///    (`dot H_k = A_k + D_β H_L[u_k]`) consumes the same object.
+    fn exact_newton_joint_hessian_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        validate_block_count::<GamlssError>(self.kind.family_tag(), 2, block_states.len())?;
+        if specs.len() != 2 {
+            return Err(format!(
+                "{} joint Hessian directional derivative expects 2 specs, got {}",
+                self.kind.family_tag(),
+                specs.len()
+            ));
+        }
+        let eta_mu = &block_states[Self::BLOCK_MEAN].eta;
+        let eta_d = &block_states[Self::BLOCK_DISP].eta;
+        let n = self.y.len();
+        if eta_mu.len() != n || eta_d.len() != n || self.weights.len() != n {
+            return Err(format!(
+                "{} joint Hessian directional derivative row-count mismatch: y={n}, eta_mu={}, eta_d={}, weights={}",
+                self.kind.family_tag(),
+                eta_mu.len(),
+                eta_d.len(),
+                self.weights.len()
+            ));
+        }
+        for i in 0..n {
+            validate_dispersion_row_geometry_inputs(
+                self.kind,
+                i,
+                self.y[i],
+                eta_mu[i],
+                eta_d[i],
+                self.weights[i],
+            )?;
+        }
+        let mean_spec = &specs[Self::BLOCK_MEAN];
+        let disp_spec = &specs[Self::BLOCK_DISP];
+        if mean_spec.design.nrows() != n || disp_spec.design.nrows() != n {
+            return Err(format!(
+                "{} joint Hessian directional derivative design row mismatch: y={n}, mean rows={}, precision rows={}",
+                self.kind.family_tag(),
+                mean_spec.design.nrows(),
+                disp_spec.design.nrows()
+            ));
+        }
+        let p_mean = mean_spec.design.ncols();
+        let p_disp = disp_spec.design.ncols();
+        if d_beta_flat.len() != p_mean + p_disp {
+            return Err(format!(
+                "{} joint Hessian directional derivative direction length mismatch: got {}, expected {}",
+                self.kind.family_tag(),
+                d_beta_flat.len(),
+                p_mean + p_disp
+            ));
+        }
+        let u_mu = d_beta_flat.slice(s![0..p_mean]).to_owned();
+        let u_d = d_beta_flat.slice(s![p_mean..p_mean + p_disp]).to_owned();
+        // η-motion of the direction: the offset is β-independent, so
+        // `dη_b = X_b u_b` exactly.
+        let du_mu = mean_spec.design.apply(&u_mu);
+        let du_d = disp_spec.design.apply(&u_d);
+        let directional: Vec<(f64, f64, f64)> =
+            if rayon::current_thread_index().is_none() && n > DISPERSION_PARALLEL_ROW_THRESHOLD {
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                (0..n)
+                    .into_par_iter()
+                    .map(|i| {
+                        dispersion_row_observed_hessian_directional(
+                            self.kind,
+                            self.y[i],
+                            eta_mu[i],
+                            eta_d[i],
+                            self.weights[i],
+                            du_mu[i],
+                            du_d[i],
+                        )
+                    })
+                    .collect()
+            } else {
+                (0..n)
+                    .map(|i| {
+                        dispersion_row_observed_hessian_directional(
+                            self.kind,
+                            self.y[i],
+                            eta_mu[i],
+                            eta_d[i],
+                            self.weights[i],
+                            du_mu[i],
+                            du_d[i],
+                        )
+                    })
+                    .collect()
+            };
+        for (i, &(d_mm, d_md, d_dd)) in directional.iter().enumerate() {
+            for (quantity, eta, value) in [
+                (
+                    "dispersion-family directional mean curvature drift",
+                    eta_mu[i],
+                    d_mm,
+                ),
+                (
+                    "dispersion-family directional cross curvature drift",
+                    eta_mu[i],
+                    d_md,
+                ),
+                (
+                    "dispersion-family directional precision curvature drift",
+                    eta_d[i],
+                    d_dd,
+                ),
+            ] {
+                if !value.is_finite() {
+                    return Err(dispersion_geometry_error(i, quantity, eta, value));
+                }
+            }
+        }
+        let mean_drift = Array1::from_shape_fn(n, |i| directional[i].0);
+        let cross_drift = Array1::from_shape_fn(n, |i| directional[i].1);
+        let disp_drift = Array1::from_shape_fn(n, |i| directional[i].2);
+        let dh_mean = xt_diag_x_design(&mean_spec.design, &mean_drift)?;
+        let dh_cross = xt_diag_y_design(&mean_spec.design, &cross_drift, &disp_spec.design)?;
+        let dh_disp = xt_diag_x_design(&disp_spec.design, &disp_drift)?;
+        let total = p_mean + p_disp;
+        let mut dh = Array2::<f64>::zeros((total, total));
+        dh.slice_mut(s![0..p_mean, 0..p_mean]).assign(&dh_mean);
+        dh.slice_mut(s![0..p_mean, p_mean..total]).assign(&dh_cross);
+        dh.slice_mut(s![p_mean..total, p_mean..total])
+            .assign(&dh_disp);
+        mirror_upper_to_lower(&mut dh);
+        Ok(Some(dh))
     }
 
     /// The joint likelihood Hessian is NOT block-diagonal for any member:

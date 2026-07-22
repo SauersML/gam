@@ -1382,6 +1382,194 @@ fn oracle_rigid_family(
     }
 }
 
+/// #932 dedicated correctness oracle for the rigid family-direction
+/// lowerings (`rigid_family_direction_terms` /
+/// `rigid_family_direction_beta_drift` in `eval_family.rs`) — previously the
+/// only jet-derived production lowerings of this family covered solely
+/// transitively (through the ψ-terms integration tests).
+///
+/// The Dual2-over-`Order2` output must equal a central finite-difference
+/// witness of the direct symbolic order-2 lowering (`rigid_row_order2`, a
+/// different code path from the nested-dual instantiation) along the
+/// quadratic primary path `p(t) = p + t·first + (t²/2)·second`:
+/// the first channel is `d/dt|₀` and the second channel is `d²/dt²|₀` of
+/// every (objective, gradient, Hessian) entry. The beta-drift lowering must
+/// equal a central FD over realizable block-state shifts (marginal-η,
+/// logslope-η, and time-β directions) of the first-channel terms themselves,
+/// pinning the `OneSeed::eps` wiring end-to-end through the production
+/// helper.
+#[test]
+fn rigid_family_direction_terms_match_fd_witness_932() {
+    use super::row_kernel::{rigid_row_inputs, rigid_row_kernel_primaries, rigid_row_order2};
+
+    let n = 5;
+    let z = [0.4, -1.1, 0.0, 0.7, -0.3];
+    let weights = [1.0, 0.8, 1.3, 0.9, 1.1];
+    let event = [1.0, 0.0, 0.0, 1.0, 1.0];
+    let g_eta = array![0.2, -0.5, 0.35, -0.15, 0.6];
+    let marginal_eta = array![0.1, -0.2, 0.05, 0.12, -0.08];
+
+    let first = [0.3_f64, -0.6, 0.4, 0.7];
+    let second = [-0.2_f64, 0.5, 0.1, -0.3];
+
+    let close = |label: &str, got: f64, want: f64, band_scale: f64| {
+        let band = band_scale * got.abs().max(want.abs()).max(1.0);
+        assert!(
+            got.is_finite() && want.is_finite() && (got - want).abs() <= band,
+            "{label}: production={got:+.12e} fd={want:+.12e} band={band:.3e}"
+        );
+    };
+
+    for frailty in [None, Some(0.6_f64)] {
+        let family = oracle_rigid_family(n, &z, &weights, &event, frailty);
+        let beta_time = array![0.85];
+        let block_states = vec![
+            ParameterBlockState {
+                beta: beta_time.clone(),
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: marginal_eta.clone(),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: g_eta.clone(),
+            },
+        ];
+
+        for row in 0..n {
+            let (terms_first, terms_second) = family
+                .rigid_family_direction_terms(row, &block_states, first, second)
+                .expect("family-direction terms");
+
+            let p = rigid_row_kernel_primaries(&family, &block_states, row).expect("primaries");
+            let inputs = rigid_row_inputs(&family, &block_states, row, "family-direction oracle")
+                .expect("row inputs");
+            let at = |t: f64| -> (f64, [f64; 4], [[f64; 4]; 4]) {
+                let shifted: [f64; 4] =
+                    std::array::from_fn(|a| p[a] + t * first[a] + 0.5 * t * t * second[a]);
+                rigid_row_order2(&shifted, &inputs).expect("shifted symbolic row")
+            };
+
+            // First channel: d/dt at 0 (central, h=1e-6).
+            let h1 = 1.0e-6;
+            let (plus_v, plus_g, plus_h) = at(h1);
+            let (minus_v, minus_g, minus_h) = at(-h1);
+            close(
+                &format!("row {row} first objective"),
+                terms_first.objective,
+                (plus_v - minus_v) / (2.0 * h1),
+                1.0e-7,
+            );
+            for a in 0..4 {
+                close(
+                    &format!("row {row} first gradient[{a}]"),
+                    terms_first.gradient[a],
+                    (plus_g[a] - minus_g[a]) / (2.0 * h1),
+                    1.0e-7,
+                );
+                for b in 0..4 {
+                    close(
+                        &format!("row {row} first hessian[{a},{b}]"),
+                        terms_first.hessian[[a, b]],
+                        (plus_h[a][b] - minus_h[a][b]) / (2.0 * h1),
+                        1.0e-7,
+                    );
+                }
+            }
+
+            // Second channel: d²/dt² at 0 (central, h=1e-4).
+            let h2 = 1.0e-4;
+            let (p2v, p2g, p2h) = at(h2);
+            let (m2v, m2g, m2h) = at(-h2);
+            let (zv, zg, zh) = at(0.0);
+            close(
+                &format!("row {row} second objective"),
+                terms_second.objective,
+                (p2v - 2.0 * zv + m2v) / (h2 * h2),
+                5.0e-5,
+            );
+            for a in 0..4 {
+                close(
+                    &format!("row {row} second gradient[{a}]"),
+                    terms_second.gradient[a],
+                    (p2g[a] - 2.0 * zg[a] + m2g[a]) / (h2 * h2),
+                    5.0e-5,
+                );
+                for b in 0..4 {
+                    close(
+                        &format!("row {row} second hessian[{a},{b}]"),
+                        terms_second.hessian[[a, b]],
+                        (p2h[a][b] - 2.0 * zh[a][b] + m2h[a][b]) / (h2 * h2),
+                        5.0e-5,
+                    );
+                }
+            }
+
+            // Beta-drift channel: for each realizable block-state direction,
+            // production `OneSeed::eps` must equal the central FD of the
+            // first-channel terms across the shifted states.
+            let probes: [(&str, usize, [f64; 4]); 3] = [
+                ("marginal-eta", 1, [1.0, 1.0, 0.0, 0.0]),
+                ("logslope-eta", 2, [0.0, 0.0, 0.0, 1.0]),
+                (
+                    "time-beta",
+                    0,
+                    [
+                        family.design_entry.dot_row(row, &array![1.0]),
+                        family.design_exit.dot_row(row, &array![1.0]),
+                        family.design_derivative_exit.dot_row(row, &array![1.0]),
+                        0.0,
+                    ],
+                ),
+            ];
+            for (label, block, beta_dir) in probes {
+                let drift = family
+                    .rigid_family_direction_beta_drift(row, &block_states, first, beta_dir)
+                    .expect("family-direction beta drift");
+                let hs = 1.0e-5;
+                let shifted_terms = |s: f64| {
+                    let mut states = block_states.clone();
+                    if block == 0 {
+                        states[0].beta[0] += s;
+                    } else {
+                        states[block].eta[row] += s;
+                    }
+                    family
+                        .rigid_family_direction_terms(row, &states, first, [0.0; 4])
+                        .expect("shifted family-direction terms")
+                        .0
+                };
+                let plus = shifted_terms(hs);
+                let minus = shifted_terms(-hs);
+                close(
+                    &format!("row {row} {label} drift objective"),
+                    drift.objective,
+                    (plus.objective - minus.objective) / (2.0 * hs),
+                    1.0e-6,
+                );
+                for a in 0..4 {
+                    close(
+                        &format!("row {row} {label} drift gradient[{a}]"),
+                        drift.gradient[a],
+                        (plus.gradient[a] - minus.gradient[a]) / (2.0 * hs),
+                        1.0e-6,
+                    );
+                    for b in 0..4 {
+                        close(
+                            &format!("row {row} {label} drift hessian[{a},{b}]"),
+                            drift.hessian[[a, b]],
+                            (plus.hessian[[a, b]] - minus.hessian[[a, b]]) / (2.0 * hs),
+                            1.0e-6,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// #932 universal oracle on the ONLY production `RowKernel` impl.
 ///
 /// Audits every channel the production `SurvivalMarginalSlopeRowKernel`
@@ -7667,6 +7855,153 @@ fn survival_jeffreys_contracted_trace_hook_beats_pairwise_979() {
         hook_secs <= pair_secs,
         "hook slower than the pairwise fallback it replaces: hook={hook_secs:.4}s pairwise={pair_secs:.4}s"
     );
+}
+
+/// #932 release speed gate for the rigid contracted third/fourth towers: the
+/// specialized directional seedings that production consumes
+/// (`OneSeed<4>` behind `row_primary_third_contracted_tower`, `TwoSeed<4>`
+/// behind `row_primary_fourth_contracted_tower`) must beat the generic dense
+/// `Tower4<4>` program evaluation they specialize (full 256-entry `t4` build
+/// plus dense contraction). No hand-derived third/fourth tower ever existed
+/// for this family, so — exactly as in the multinomial and cause-specific
+/// release cells — the honest fail-closed baseline is the generic
+/// AD tower, and the emitted `hand_over_production` token carries
+/// `generic_tower_ns / production_ns` for the MSI release harness to fail
+/// closed on any cell `<= 1`.
+#[test]
+fn release_measure_rigid_contracted_towers_vs_generic_tower_932() {
+    use super::row_kernel::{RigidRowInputs, rigid_row_nll};
+    use gam_math::jet_scalar::{OneSeed, TwoSeed};
+    use gam_math::jet_tower::program_full_tower;
+    use std::time::Instant;
+
+    // One ordinary interior row per event branch (censored / event are
+    // distinct live derivative stacks).
+    let cases: [[f64; 8]; 2] = [
+        [-0.7, 0.4, 0.8, -0.3, 0.6, 1.0, 0.0, 0.75],
+        [0.2, -0.5, 1.4, 0.9, -1.1, 0.8, 1.0, 1.0],
+    ];
+    let dir_u = [0.7_f64, -1.3, 0.4, 0.6];
+    let dir_v = [-0.4_f64, 0.6, 1.1, -0.2];
+
+    // Feedback-coupled timing barrier (no `std::hint::black_box`): each
+    // iteration nudges the log-slope primary by a negligible multiple of the
+    // running checksum, so the pure tower call can be neither hoisted nor
+    // dropped while the measured regime stays bit-adjacent to the fixture.
+    fn best_ns<F: FnMut(f64) -> f64>(iterations: usize, base_g: f64, mut evaluate: F) -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..5 {
+            let mut checksum = 0.0_f64;
+            let started = Instant::now();
+            for _ in 0..iterations {
+                checksum += evaluate(base_g + checksum * 1e-18);
+            }
+            assert!(
+                checksum.is_finite(),
+                "contracted-tower release-measure checksum must stay finite"
+            );
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        best * 1e9 / iterations as f64
+    }
+
+    let iterations = 200_000usize;
+    for &[q0, q1, qd1, g, z, w, d, probit_scale] in &cases {
+        let inputs = RigidRowInputs {
+            row: 0,
+            wi: w,
+            di: d,
+            z_sum: z,
+            covariance_ones: 1.0,
+            probit_scale,
+            qd1_lower: 1.0e-8,
+        };
+        let mut program = SurvivalMarginalSlopeRigidNllProgram {
+            primaries: vec![[q0, q1, qd1, g]],
+            z: vec![z],
+            w: vec![w],
+            d: vec![d],
+            probit_scale,
+        };
+
+        // Parity pin on the exact benchmarked inputs: the specialized
+        // contractions must equal the dense tower's contractions.
+        let dense = program_full_tower(&program, 0).expect("dense tower");
+        let third_vars: [OneSeed<4>; 4] =
+            std::array::from_fn(|a| OneSeed::seed_direction([q0, q1, qd1, g][a], a, dir_u[a]));
+        let third = rigid_row_nll(&third_vars, &inputs)
+            .expect("specialized third")
+            .contracted_third();
+        let fourth_vars: [TwoSeed<4>; 4] =
+            std::array::from_fn(|a| TwoSeed::seed([q0, q1, qd1, g][a], a, dir_u[a], dir_v[a]));
+        let fourth = rigid_row_nll(&fourth_vars, &inputs)
+            .expect("specialized fourth")
+            .contracted_fourth();
+        let dense_third = dense.third_contracted(&dir_u);
+        let dense_fourth = dense.fourth_contracted(&dir_u, &dir_v);
+        for a in 0..4 {
+            for b in 0..4 {
+                let band = 1e-11 * third[a][b].abs().max(dense_third[a][b].abs()).max(1.0);
+                assert!(
+                    (third[a][b] - dense_third[a][b]).abs() <= band,
+                    "event={d:.0} third[{a}][{b}]: specialized {:+.15e} vs dense {:+.15e}",
+                    third[a][b],
+                    dense_third[a][b],
+                );
+                let band = 1e-11 * fourth[a][b].abs().max(dense_fourth[a][b].abs()).max(1.0);
+                assert!(
+                    (fourth[a][b] - dense_fourth[a][b]).abs() <= band,
+                    "event={d:.0} fourth[{a}][{b}]: specialized {:+.15e} vs dense {:+.15e}",
+                    fourth[a][b],
+                    dense_fourth[a][b],
+                );
+            }
+        }
+
+        let third_production_ns = best_ns(iterations, g, |perturbed_g| {
+            let vars: [OneSeed<4>; 4] = std::array::from_fn(|a| {
+                OneSeed::seed_direction([q0, q1, qd1, perturbed_g][a], a, dir_u[a])
+            });
+            let t = rigid_row_nll(&vars, &inputs)
+                .expect("specialized third")
+                .contracted_third();
+            t[0][0] + t[3][3]
+        });
+        let third_generic_ns = best_ns(iterations, g, |perturbed_g| {
+            program.primaries[0][3] = perturbed_g;
+            let t = program_full_tower(&program, 0)
+                .expect("dense tower")
+                .third_contracted(&dir_u);
+            t[0][0] + t[3][3]
+        });
+        eprintln!(
+            "RIGID-CONTRACTED-932 order=3 event={d:.0} production={third_production_ns:.2} ns/row \
+             generic_tower={third_generic_ns:.2} ns/row hand_over_production={:.6}",
+            third_generic_ns / third_production_ns,
+        );
+
+        let fourth_production_ns = best_ns(iterations, g, |perturbed_g| {
+            let vars: [TwoSeed<4>; 4] = std::array::from_fn(|a| {
+                TwoSeed::seed([q0, q1, qd1, perturbed_g][a], a, dir_u[a], dir_v[a])
+            });
+            let t = rigid_row_nll(&vars, &inputs)
+                .expect("specialized fourth")
+                .contracted_fourth();
+            t[0][0] + t[3][3]
+        });
+        let fourth_generic_ns = best_ns(iterations, g, |perturbed_g| {
+            program.primaries[0][3] = perturbed_g;
+            let t = program_full_tower(&program, 0)
+                .expect("dense tower")
+                .fourth_contracted(&dir_u, &dir_v);
+            t[0][0] + t[3][3]
+        });
+        eprintln!(
+            "RIGID-CONTRACTED-932 order=4 event={d:.0} production={fourth_production_ns:.2} ns/row \
+             generic_tower={fourth_generic_ns:.2} ns/row hand_over_production={:.6}",
+            fourth_generic_ns / fourth_production_ns,
+        );
+    }
 }
 
 /// gam#979 isolation gate: does `SurvivalMarginalSlopeRowKernel`'s

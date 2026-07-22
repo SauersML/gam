@@ -6117,4 +6117,165 @@ mod compiled_order2_oracle_tests {
             }
         }
     }
+
+    /// #932 release speed gate for the FLEX row order-2 lowering: the
+    /// production compiled plan (`lower_flex_outer_plan_order2`, two output
+    /// allocations, structure-scheduled) must beat the generic [`Jet2`]
+    /// evaluation of the SAME single-source plan (`flex_row_nll`), the
+    /// substrate it specializes. The historical hand flex assembly was
+    /// deleted by the cutover, so — as in the multinomial / cause-specific /
+    /// contracted-tower release cells — the honest fail-closed baseline is
+    /// the generic jet plan, and the emitted `hand_over_production` token
+    /// carries `generic_plan_ns / production_ns` for the MSI release harness
+    /// to fail closed on any cell `<= 1`. One cell per event branch at a
+    /// representative flex width.
+    #[test]
+    fn release_measure_flex_compiled_order2_vs_generic_plan_932() {
+        use std::time::Instant;
+
+        let p = 12usize;
+        let qax = p - 2;
+        let qdax = p - 1;
+
+        // Feedback-coupled timing barrier (no `std::hint::black_box`): the
+        // entry-eta value channel is nudged by a negligible multiple of the
+        // running checksum, so the pure row evaluation can be neither hoisted
+        // nor dropped while the measured regime stays bit-adjacent to the
+        // fixture.
+        fn best_ns<F: FnMut(f64) -> f64>(iterations: usize, base: f64, mut evaluate: F) -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let mut checksum = 0.0_f64;
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    checksum += evaluate(base + checksum * 1e-18);
+                }
+                assert!(
+                    checksum.is_finite(),
+                    "flex order-2 release-measure checksum must stay finite"
+                );
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            best * 1e9 / iterations as f64
+        }
+
+        let iterations = 20_000usize;
+        for di in [0.0_f64, 1.0] {
+            let mut st = 0xA5F0_3C11_9D2E_7B41u64 ^ di.to_bits();
+            let wi = (xorshift(&mut st) + 1.5).abs() + 0.1;
+            let surv0: [f64; 5] = std::array::from_fn(|_| xorshift(&mut st));
+            let surv1: [f64; 5] = std::array::from_fn(|_| xorshift(&mut st));
+            let (e0v, e0g, e0h) = rand_dense(p, &mut st);
+            let (e1v, e1g, e1h) = rand_dense(p, &mut st);
+            let (mut cv, cg, ch) = rand_dense(p, &mut st);
+            cv = (cv + 2.0).abs() + 0.3;
+            let (mut dv, dg, dh) = rand_dense(p, &mut st);
+            dv = (dv + 2.0).abs() + 0.3;
+            let q1v = (xorshift(&mut st) + 2.0).abs() + 0.2;
+            let qd1v = (xorshift(&mut st) + 2.0).abs() + 0.2;
+
+            let plan = FlexOuterPlan::new(cv, dv, qd1v, surv0, surv1, wi, di);
+
+            // Parity pin on the exact benchmarked inputs (the 2200-draw sweep
+            // is `compiled_order2_row_nll_matches_generic_plan` above).
+            let generic = flex_row_nll(
+                &Jet2::from_parts(e0v, &e0g, &e0h),
+                &Jet2::from_parts(e1v, &e1g, &e1h),
+                &Jet2::from_parts(cv, &cg, &ch),
+                &Jet2::from_parts(dv, &dg, &dh),
+                &Jet2::primary(q1v, qax, p),
+                &Jet2::primary(qd1v, qdax, p),
+                surv0,
+                surv1,
+                wi,
+                di,
+            );
+            let (compiled_value, ..) = lower_flex_outer_plan_order2(
+                &plan,
+                FlexOrder2Inputs {
+                    eta0: FlexOrder2View {
+                        value: e0v,
+                        gradient: ndarray::ArrayView1::from(&e0g),
+                        hessian: ndarray::ArrayView2::from_shape((p, p), &e0h).unwrap(),
+                    },
+                    eta1: FlexOrder2View {
+                        value: e1v,
+                        gradient: ndarray::ArrayView1::from(&e1g),
+                        hessian: ndarray::ArrayView2::from_shape((p, p), &e1h).unwrap(),
+                    },
+                    q1: (q1v, qax),
+                    chi1: FlexOrder2View {
+                        value: cv,
+                        gradient: ndarray::ArrayView1::from(&cg),
+                        hessian: ndarray::ArrayView2::from_shape((p, p), &ch).unwrap(),
+                    },
+                    d1: FlexOrder2View {
+                        value: dv,
+                        gradient: ndarray::ArrayView1::from(&dg),
+                        hessian: ndarray::ArrayView2::from_shape((p, p), &dh).unwrap(),
+                    },
+                    qd1: (qd1v, qdax),
+                },
+                p,
+            );
+            let tolerance = 1e-12 * generic.v.abs().max(compiled_value.abs()).max(1.0);
+            assert!(
+                (generic.v - compiled_value).abs() <= tolerance,
+                "di={di:.0} value: generic={:+.16e} compiled={compiled_value:+.16e}",
+                generic.v,
+            );
+
+            let production_ns = best_ns(iterations, e0v, |perturbed_e0v| {
+                let (value, gradient, hessian) = lower_flex_outer_plan_order2(
+                    &plan,
+                    FlexOrder2Inputs {
+                        eta0: FlexOrder2View {
+                            value: perturbed_e0v,
+                            gradient: ndarray::ArrayView1::from(&e0g),
+                            hessian: ndarray::ArrayView2::from_shape((p, p), &e0h).unwrap(),
+                        },
+                        eta1: FlexOrder2View {
+                            value: e1v,
+                            gradient: ndarray::ArrayView1::from(&e1g),
+                            hessian: ndarray::ArrayView2::from_shape((p, p), &e1h).unwrap(),
+                        },
+                        q1: (q1v, qax),
+                        chi1: FlexOrder2View {
+                            value: cv,
+                            gradient: ndarray::ArrayView1::from(&cg),
+                            hessian: ndarray::ArrayView2::from_shape((p, p), &ch).unwrap(),
+                        },
+                        d1: FlexOrder2View {
+                            value: dv,
+                            gradient: ndarray::ArrayView1::from(&dg),
+                            hessian: ndarray::ArrayView2::from_shape((p, p), &dh).unwrap(),
+                        },
+                        qd1: (qd1v, qdax),
+                    },
+                    p,
+                );
+                value + gradient[0] + hessian[0]
+            });
+            let generic_ns = best_ns(iterations, e0v, |perturbed_e0v| {
+                let out = flex_row_nll(
+                    &Jet2::from_parts(perturbed_e0v, &e0g, &e0h),
+                    &Jet2::from_parts(e1v, &e1g, &e1h),
+                    &Jet2::from_parts(cv, &cg, &ch),
+                    &Jet2::from_parts(dv, &dg, &dh),
+                    &Jet2::primary(q1v, qax, p),
+                    &Jet2::primary(qd1v, qdax, p),
+                    surv0,
+                    surv1,
+                    wi,
+                    di,
+                );
+                out.v + out.g[0] + out.h[0]
+            });
+            eprintln!(
+                "FLEX-ORDER2-932 p={p} event={di:.0} production={production_ns:.2} ns/row \
+                 generic_plan={generic_ns:.2} ns/row hand_over_production={:.6}",
+                generic_ns / production_ns,
+            );
+        }
+    }
 }
