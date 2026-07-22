@@ -2361,7 +2361,9 @@ pub fn build_duchon_native_penalty_psi_derivatives(
             + fast_atb(&center_design_psi, &center_design_psi).mapv(|value| 2.0 * value)
             + fast_atb(&center_design, &center_design_psi_psi)),
     );
-    let trend_jet = function_space_subspace_shrinkage_derivatives(
+    // Complementary metric ridge (gam#2372): differentiate `N(NᵀG(ψ)N)Nᵀ`,
+    // matching the forward `duchon_native_penalty_candidates` trend block.
+    let trend_jet = function_space_subspace_trend_ridge_derivatives(
         &trend_frame,
         &gram,
         &gram_psi,

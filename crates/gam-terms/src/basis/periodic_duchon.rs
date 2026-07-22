@@ -1843,7 +1843,10 @@ pub(crate) fn duchon_native_penalty_candidates(
             (center_design, frame)
         };
         let function_gram = symmetrize_penalty(&fast_ata(&center_design));
-        Some(function_space_subspace_shrinkage(
+        // Complementary metric ridge `N(NᵀGN)Nᵀ` (range = span(trend frame)),
+        // NOT the leaky metric projector `GN(NᵀGN)⁻¹NᵀG` (range = span(GN)),
+        // so the constant stays in the joint null space (gam#2372).
+        Some(function_space_subspace_trend_ridge(
             &trend_frame,
             &function_gram,
         )?)

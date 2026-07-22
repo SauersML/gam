@@ -2740,6 +2740,86 @@ pub(crate) fn function_space_subspace_shrinkage(
     ridge_from_null_metric_action(frame, &metric_action)
 }
 
+/// Complementary function-space trend ridge for an explicitly identified
+/// coefficient subspace.
+///
+/// `frame` `N` spans the target trend subspace (e.g. Duchon's NON-constant
+/// polynomial null-space directions). With `G` the basis Gram under the domain
+/// measure, this returns
+///
+/// `R = N (Nᵀ G N) Nᵀ`.
+///
+/// Unlike the metric PROJECTOR `G N (Nᵀ G N)⁻¹ Nᵀ G` (see
+/// [`function_space_subspace_shrinkage`]), whose range is `span(GN)` and
+/// therefore LEAKS onto every direction the metric couples to the trend — in
+/// particular the constant, which then gets spuriously penalized — this ridge
+/// has range exactly `span(N)`. It annihilates every coefficient orthogonal to
+/// the frame (the constant and the kernel block), so the constant function
+/// stays in the joint null space, while still charging each trend direction its
+/// function L² energy through `NᵀGN`. This is the same complementary-ridge form
+/// the constrained-chart double-penalty rebuild uses (#2372); the Duchon
+/// Hilbert-scale trend block must use it on BOTH the scale-free and hybrid
+/// paths so `null(Σ λ_k S_k) = span{1}` holds (gam#2372).
+pub(crate) fn function_space_subspace_trend_ridge(
+    frame: &Array2<f64>,
+    gram: &Array2<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    if gram.nrows() != gram.ncols() || frame.nrows() != gram.nrows() {
+        crate::bail_dim_basis!(
+            "function-space trend ridge: frame is {}x{} but Gram is {}x{}",
+            frame.nrows(),
+            frame.ncols(),
+            gram.nrows(),
+            gram.ncols()
+        );
+    }
+    if frame.ncols() == 0 {
+        return Ok(Array2::<f64>::zeros(gram.raw_dim()));
+    }
+    let c = frame.t().dot(gram).dot(frame);
+    Ok(symmetrize_penalty(&fast_abt(&fast_ab(frame, &c), frame)))
+}
+
+/// Value + first/second `ψ`-derivatives of the complementary trend ridge
+/// `R(ψ) = N (Nᵀ G(ψ) N) Nᵀ` for a FIXED structural frame `N`. Because `N` is
+/// ψ-independent and `R` is linear in `G`, the jets are the same sandwich with
+/// `G` replaced by its ψ-derivatives — no inverse-of-a-moving-metric terms.
+/// Mirrors the shape contract of [`function_space_subspace_shrinkage_derivatives`].
+pub(crate) fn function_space_subspace_trend_ridge_derivatives(
+    frame: &Array2<f64>,
+    gram: &Array2<f64>,
+    gram_a: &Array2<f64>,
+    gram_b: &Array2<f64>,
+    gram_ab: &Array2<f64>,
+) -> Result<FunctionSpaceSubspaceShrinkageDerivatives, BasisError> {
+    let p = gram.nrows();
+    if gram.ncols() != p
+        || frame.nrows() != p
+        || gram_a.dim() != gram.dim()
+        || gram_b.dim() != gram.dim()
+        || gram_ab.dim() != gram.dim()
+    {
+        crate::bail_dim_basis!(
+            "function-space trend ridge derivative shape mismatch: frame={:?}, G={:?}",
+            frame.dim(),
+            gram.dim()
+        );
+    }
+    let ridge = |g: &Array2<f64>| -> Array2<f64> {
+        if frame.ncols() == 0 {
+            return Array2::<f64>::zeros((p, p));
+        }
+        let c = frame.t().dot(g).dot(frame);
+        symmetrize_penalty(&fast_abt(&fast_ab(frame, &c), frame))
+    };
+    Ok(FunctionSpaceSubspaceShrinkageDerivatives {
+        value: ridge(gram),
+        first_a: ridge(gram_a),
+        first_b: ridge(gram_b),
+        mixed: ridge(gram_ab),
+    })
+}
+
 fn strict_metric_inverse(matrix: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
     let (sym, evals, evecs) = spectral_summary(matrix)?;
     let tol = generalized_spectral_tolerance(&evals, &sym);
