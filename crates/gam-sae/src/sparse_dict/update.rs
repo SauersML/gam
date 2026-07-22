@@ -548,8 +548,8 @@ pub(super) fn run(
         // any typed non-convergence) is on the same line.
         log::warn!(
             "[SAE epoch {}/{}] ev={:.6} improve={:.3e} revived={} refresh_s={:.2} \
-             route_s={:.2} elapsed_s={:.1} max_component={} cg_columns={} cg_nonconverged={} \
-             cg_kappa_bound={:?} cg_relative_residual={:.3e}",
+             route_s={:.2} elapsed_s={:.1} max_component={} cg_columns={} device_cols={} \
+             cg_nonconverged={} cg_kappa_bound={:?} cg_relative_residual={:.3e}",
             epochs_run,
             config.max_epochs,
             next_ev,
@@ -560,6 +560,7 @@ pub(super) fn run(
             fit_start.elapsed().as_secs_f64(),
             decoder_solve_stats.max_component_size,
             decoder_solve_stats.cg_columns,
+            decoder_solve_stats.device_refresh_columns,
             decoder_solve_stats.cg_nonconverged_columns,
             decoder_solve_stats.cg_kappa_bound,
             decoder_solve_stats.cg_relative_residual,
@@ -1476,6 +1477,11 @@ pub struct DecoderSolveStats {
     /// Dense SPD components whose Cholesky factorization failed. No bumped-ridge
     /// or diagonal substitute is installed; a non-zero count forbids a fit.
     pub dense_factorization_failures: usize,
+    /// Decoder columns whose block-CG solve ran on the device-resident CUDA
+    /// backend. `0` on a CPU-only refresh — surfaced in the epoch heartbeat so
+    /// a "device-resident" label can never silently cover a CPU reality
+    /// (#1017's recurring misreporting pattern).
+    pub device_refresh_columns: usize,
     /// Largest a-priori Gershgorin condition-number bound over the CG-solved
     /// components. This is the `κ̂` that sets the derived iteration cap
     /// `⌈½√κ̂·ln(2√κ̂/ε)⌉` before any CG step runs, so an ill-conditioned block is
@@ -1497,6 +1503,7 @@ impl Default for DecoderSolveStats {
             cg_residual_stop: 0.0,
             cg_nonconverged_columns: 0,
             dense_factorization_failures: 0,
+            device_refresh_columns: 0,
             cg_kappa_bound: None,
         }
     }
@@ -2063,7 +2070,7 @@ fn solve_component(
                 });
         }
 
-        let (results, solution) = solve_block_cg(
+        let (results, solution, on_device) = solve_block_cg(
             gpu,
             &row_ptr,
             &csr_cols,
@@ -2073,6 +2080,9 @@ fn solve_component(
             residual_tolerance,
             cap,
         )?;
+        if on_device {
+            stats.device_refresh_columns += t;
+        }
 
         for (j, (&c, core)) in tile.iter().zip(results.iter()).enumerate() {
             let kappa_hat = core
@@ -2129,7 +2139,7 @@ fn solve_block_cg(
     rhs_block: Array2<f64>,
     residual_tolerance: f64,
     cap: usize,
-) -> Result<(Vec<PcgCoreResult>, Array2<f64>), String> {
+) -> Result<(Vec<PcgCoreResult>, Array2<f64>, bool), String> {
     #[cfg(target_os = "linux")]
     {
         if let Some(mut device) = super::decoder_gpu::DeviceBlockCgBackend::try_new(
@@ -2142,7 +2152,7 @@ fn solve_block_cg(
         )? {
             let results = pcg_multi_core(&mut device, residual_tolerance, cap, true);
             let solution = device.take_solution()?;
-            return Ok((results, solution));
+            return Ok((results, solution, true));
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -2180,7 +2190,7 @@ fn solve_block_cg(
     let mut backend = CpuPcgBlockBackend::new(rhs_block, apply);
     let results = pcg_multi_core(&mut backend, residual_tolerance, cap, true);
     let solution = backend.into_solution();
-    Ok((results, solution))
+    Ok((results, solution, false))
 }
 
 /// Why a CG solve returned. Only [`CgStop::Converged`] means the column reached
@@ -3613,6 +3623,14 @@ mod exact_solve_tests {
             cpu_secs / dev_secs.max(1e-9),
         );
         assert_eq!(dev_stats.cg_nonconverged_columns, 0, "device block CG must converge");
+        assert_eq!(
+            dev_stats.device_refresh_columns, dev_stats.cg_columns,
+            "Required refresh must run every live column on the device"
+        );
+        assert_eq!(
+            cpu_stats.device_refresh_columns, 0,
+            "Off refresh must never touch the device"
+        );
         assert_eq!(
             cpu_stats.cg_iterations, dev_stats.cg_iterations,
             "device recurrence must walk the same per-column iteration counts"
