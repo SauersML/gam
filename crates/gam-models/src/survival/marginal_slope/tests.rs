@@ -1382,6 +1382,194 @@ fn oracle_rigid_family(
     }
 }
 
+/// #932 dedicated correctness oracle for the rigid family-direction
+/// lowerings (`rigid_family_direction_terms` /
+/// `rigid_family_direction_beta_drift` in `eval_family.rs`) — previously the
+/// only jet-derived production lowerings of this family covered solely
+/// transitively (through the ψ-terms integration tests).
+///
+/// The Dual2-over-`Order2` output must equal a central finite-difference
+/// witness of the direct symbolic order-2 lowering (`rigid_row_order2`, a
+/// different code path from the nested-dual instantiation) along the
+/// quadratic primary path `p(t) = p + t·first + (t²/2)·second`:
+/// the first channel is `d/dt|₀` and the second channel is `d²/dt²|₀` of
+/// every (objective, gradient, Hessian) entry. The beta-drift lowering must
+/// equal a central FD over realizable block-state shifts (marginal-η,
+/// logslope-η, and time-β directions) of the first-channel terms themselves,
+/// pinning the `OneSeed::eps` wiring end-to-end through the production
+/// helper.
+#[test]
+fn rigid_family_direction_terms_match_fd_witness_932() {
+    use super::row_kernel::{rigid_row_inputs, rigid_row_kernel_primaries, rigid_row_order2};
+
+    let n = 5;
+    let z = [0.4, -1.1, 0.0, 0.7, -0.3];
+    let weights = [1.0, 0.8, 1.3, 0.9, 1.1];
+    let event = [1.0, 0.0, 0.0, 1.0, 1.0];
+    let g_eta = array![0.2, -0.5, 0.35, -0.15, 0.6];
+    let marginal_eta = array![0.1, -0.2, 0.05, 0.12, -0.08];
+
+    let first = [0.3_f64, -0.6, 0.4, 0.7];
+    let second = [-0.2_f64, 0.5, 0.1, -0.3];
+
+    let close = |label: &str, got: f64, want: f64, band_scale: f64| {
+        let band = band_scale * got.abs().max(want.abs()).max(1.0);
+        assert!(
+            got.is_finite() && want.is_finite() && (got - want).abs() <= band,
+            "{label}: production={got:+.12e} fd={want:+.12e} band={band:.3e}"
+        );
+    };
+
+    for frailty in [None, Some(0.6_f64)] {
+        let family = oracle_rigid_family(n, &z, &weights, &event, frailty);
+        let beta_time = array![0.85];
+        let block_states = vec![
+            ParameterBlockState {
+                beta: beta_time.clone(),
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: marginal_eta.clone(),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: g_eta.clone(),
+            },
+        ];
+
+        for row in 0..n {
+            let (terms_first, terms_second) = family
+                .rigid_family_direction_terms(row, &block_states, first, second)
+                .expect("family-direction terms");
+
+            let p = rigid_row_kernel_primaries(&family, &block_states, row).expect("primaries");
+            let inputs = rigid_row_inputs(&family, &block_states, row, "family-direction oracle")
+                .expect("row inputs");
+            let at = |t: f64| -> (f64, [f64; 4], [[f64; 4]; 4]) {
+                let shifted: [f64; 4] =
+                    std::array::from_fn(|a| p[a] + t * first[a] + 0.5 * t * t * second[a]);
+                rigid_row_order2(&shifted, &inputs).expect("shifted symbolic row")
+            };
+
+            // First channel: d/dt at 0 (central, h=1e-6).
+            let h1 = 1.0e-6;
+            let (plus_v, plus_g, plus_h) = at(h1);
+            let (minus_v, minus_g, minus_h) = at(-h1);
+            close(
+                &format!("row {row} first objective"),
+                terms_first.objective,
+                (plus_v - minus_v) / (2.0 * h1),
+                1.0e-7,
+            );
+            for a in 0..4 {
+                close(
+                    &format!("row {row} first gradient[{a}]"),
+                    terms_first.gradient[a],
+                    (plus_g[a] - minus_g[a]) / (2.0 * h1),
+                    1.0e-7,
+                );
+                for b in 0..4 {
+                    close(
+                        &format!("row {row} first hessian[{a},{b}]"),
+                        terms_first.hessian[[a, b]],
+                        (plus_h[a][b] - minus_h[a][b]) / (2.0 * h1),
+                        1.0e-7,
+                    );
+                }
+            }
+
+            // Second channel: d²/dt² at 0 (central, h=1e-4).
+            let h2 = 1.0e-4;
+            let (p2v, p2g, p2h) = at(h2);
+            let (m2v, m2g, m2h) = at(-h2);
+            let (zv, zg, zh) = at(0.0);
+            close(
+                &format!("row {row} second objective"),
+                terms_second.objective,
+                (p2v - 2.0 * zv + m2v) / (h2 * h2),
+                5.0e-5,
+            );
+            for a in 0..4 {
+                close(
+                    &format!("row {row} second gradient[{a}]"),
+                    terms_second.gradient[a],
+                    (p2g[a] - 2.0 * zg[a] + m2g[a]) / (h2 * h2),
+                    5.0e-5,
+                );
+                for b in 0..4 {
+                    close(
+                        &format!("row {row} second hessian[{a},{b}]"),
+                        terms_second.hessian[[a, b]],
+                        (p2h[a][b] - 2.0 * zh[a][b] + m2h[a][b]) / (h2 * h2),
+                        5.0e-5,
+                    );
+                }
+            }
+
+            // Beta-drift channel: for each realizable block-state direction,
+            // production `OneSeed::eps` must equal the central FD of the
+            // first-channel terms across the shifted states.
+            let probes: [(&str, usize, [f64; 4]); 3] = [
+                ("marginal-eta", 1, [1.0, 1.0, 0.0, 0.0]),
+                ("logslope-eta", 2, [0.0, 0.0, 0.0, 1.0]),
+                (
+                    "time-beta",
+                    0,
+                    [
+                        family.design_entry.dot_row(row, &array![1.0]),
+                        family.design_exit.dot_row(row, &array![1.0]),
+                        family.design_derivative_exit.dot_row(row, &array![1.0]),
+                        0.0,
+                    ],
+                ),
+            ];
+            for (label, block, beta_dir) in probes {
+                let drift = family
+                    .rigid_family_direction_beta_drift(row, &block_states, first, beta_dir)
+                    .expect("family-direction beta drift");
+                let hs = 1.0e-5;
+                let shifted_terms = |s: f64| {
+                    let mut states = block_states.clone();
+                    if block == 0 {
+                        states[0].beta[0] += s;
+                    } else {
+                        states[block].eta[row] += s;
+                    }
+                    family
+                        .rigid_family_direction_terms(row, &states, first, [0.0; 4])
+                        .expect("shifted family-direction terms")
+                        .0
+                };
+                let plus = shifted_terms(hs);
+                let minus = shifted_terms(-hs);
+                close(
+                    &format!("row {row} {label} drift objective"),
+                    drift.objective,
+                    (plus.objective - minus.objective) / (2.0 * hs),
+                    1.0e-6,
+                );
+                for a in 0..4 {
+                    close(
+                        &format!("row {row} {label} drift gradient[{a}]"),
+                        drift.gradient[a],
+                        (plus.gradient[a] - minus.gradient[a]) / (2.0 * hs),
+                        1.0e-6,
+                    );
+                    for b in 0..4 {
+                        close(
+                            &format!("row {row} {label} drift hessian[{a},{b}]"),
+                            drift.hessian[[a, b]],
+                            (plus.hessian[[a, b]] - minus.hessian[[a, b]]) / (2.0 * hs),
+                            1.0e-6,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// #932 universal oracle on the ONLY production `RowKernel` impl.
 ///
 /// Audits every channel the production `SurvivalMarginalSlopeRowKernel`
