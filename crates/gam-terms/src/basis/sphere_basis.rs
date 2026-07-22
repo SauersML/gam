@@ -2214,20 +2214,67 @@ pub fn build_duchon_native_penalty_psi_derivatives(
     let omega_psi = project_kernel(&kernel_psi);
     let omega_psi_psi = project_kernel(&kernel_psi_psi);
 
+    // Mirror `duchon_native_penalty_candidates`' Primary construction exactly:
+    // the shipped curvature block is the RANGE-FLOORED Gram (#1815), whose
+    // eigenvalue clamp has a nontrivial ψ-derivative (the clamped near-null
+    // modes track the moving floor `c·λ_max(ψ)` rather than their own `λ'`).
+    // Differentiate the clamp via `duchon_range_floor_curvature_psi_jet` so the
+    // Primary log-κ derivative matches a finite difference of the rebuilt
+    // penalty (without this the analytic gradient overstates it by ~60%).
+    // `embedded_penalty_dim = total_cols` matches the forward `n_pre`.
+    let floored = crate::basis::duchon_range_floor_curvature_psi_jet(
+        &omega,
+        &omega_psi,
+        &omega_psi_psi,
+        total_cols,
+    )?;
+
     let outer_gauge =
         identifiability_transform.map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
-    let embed = |block: Array2<f64>| {
+    // Embed the kernel block into the total (kernel|poly) frame, place the
+    // κ-dependent machine-scale ridge on the affine SLOPE columns (constant
+    // column stays free) exactly as the forward builder does, then apply the
+    // outer identifiability projection. `poly_cols` (= total_cols - kernel_cols)
+    // is already in scope from the design assembly above.
+    let embed = |block: &Array2<f64>, ridge: f64| {
         let mut out = Array2::<f64>::zeros((total_cols, total_cols));
-        out.slice_mut(s![..kernel_cols, ..kernel_cols])
-            .assign(&block);
+        out.slice_mut(s![..kernel_cols, ..kernel_cols]).assign(block);
+        if poly_cols > 1 {
+            for col in (kernel_cols + 1)..total_cols {
+                out[[col, col]] = ridge;
+            }
+        }
         match outer_gauge.as_ref() {
             Some(gauge) => symmetrize(&gauge.restrict_penalty(&out)),
             None => symmetrize(&out),
         }
     };
-    let primary = embed(omega);
-    let primary_psi = embed(omega_psi);
-    let primary_psi_psi = embed(omega_psi_psi);
+    // Affine ridge = DUCHON_AFFINE_NATIVE_RIDGE_REL · curvature_scale, where the
+    // curvature scale is the mean diagonal of the FLOORED kernel block (matching
+    // the forward builder); its ψ-derivatives follow from the floored block's.
+    let mean_diag = |m: &Array2<f64>| -> f64 {
+        if kernel_cols == 0 {
+            return 0.0;
+        }
+        (0..kernel_cols).map(|i| m[[i, i]]).sum::<f64>() / kernel_cols as f64
+    };
+    let curvature_scale = mean_diag(&floored.value).abs();
+    let (ridge, ridge_psi, ridge_psi_psi) = if poly_cols > 1 {
+        if curvature_scale > 0.0 {
+            (
+                DUCHON_AFFINE_NATIVE_RIDGE_REL * curvature_scale,
+                DUCHON_AFFINE_NATIVE_RIDGE_REL * mean_diag(&floored.first),
+                DUCHON_AFFINE_NATIVE_RIDGE_REL * mean_diag(&floored.second),
+            )
+        } else {
+            (DUCHON_AFFINE_NATIVE_RIDGE_REL, 0.0, 0.0)
+        }
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    let primary = embed(&floored.value, ridge);
+    let primary_psi = embed(&floored.first, ridge_psi);
+    let primary_psi_psi = embed(&floored.second, ridge_psi_psi);
     let (_, primary_psi_norm, primary_psi_psi_norm, _) =
         normalize_penaltywith_psi_derivatives(&primary, &primary_psi, &primary_psi_psi);
 

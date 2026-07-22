@@ -21,7 +21,7 @@ use super::*;
 /// the curvature magnitude keeps the ridge machine-scale relative to the penalty
 /// in every configuration, so the affine trend stays in the effective null space
 /// while the slopes remain structurally (non-zero) penalized.
-const DUCHON_AFFINE_NATIVE_RIDGE_REL: f64 = 1.490_116_119_384_765_6e-8;
+pub(crate) const DUCHON_AFFINE_NATIVE_RIDGE_REL: f64 = 1.490_116_119_384_765_6e-8;
 
 /// N-D periodic-cyclic-B-spline first-derivative jet `∂Φ̃/∂t` per row.
 ///
