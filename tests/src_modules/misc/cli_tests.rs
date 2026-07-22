@@ -3249,6 +3249,7 @@ fn warns_for_linear_terms_overlappingwith_smoothvariables() {
             coefficient_geometry: LinearCoefficientGeometry::default(),
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {

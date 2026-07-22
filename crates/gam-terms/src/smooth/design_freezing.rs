@@ -609,6 +609,26 @@ pub fn freeze_term_collection_from_design(
 
     let mut frozen = spec.clone();
 
+    // ── linear terms ─────────────────────────────────────────────────────
+    // Persist the TRAINING-time empirical function mass computed by this fit
+    // build so a later predict/rebuild call (a held-out grid, a handful of
+    // group/class anchors, a single test row, …) reuses it instead of
+    // recomputing from whatever rows that call happens to be building over.
+    // A covariate that varies fine across the full training set can easily be
+    // constant across a tiny evaluation subset by chance; recomputing there
+    // would misfire the fit-time "identically zero" identifiability guard on
+    // a perfectly good term (#1561). `.get(j)` tolerates a design built
+    // without a per-term masses vector (e.g. a synthetic/test
+    // `TermCollectionDesign` with no linear terms of its own): such a design
+    // simply leaves every term's frozen mass at its previous value (`None`
+    // for a freshly-built spec, so the ordinary fit-time computation path
+    // still applies at the next rebuild).
+    for (j, term) in frozen.linear_terms.iter_mut().enumerate() {
+        if let Some(mass) = design.linear_function_masses.get(j).copied().flatten() {
+            term.frozen_function_mass = Some(mass);
+        }
+    }
+
     // ── smooth terms ────────────────────────────────────────────────────
     for (term, fitted) in frozen
         .smooth_terms

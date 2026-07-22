@@ -353,6 +353,7 @@ pub fn build_termspec(
                         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                         coefficient_min: *coefficient_min,
                         coefficient_max: *coefficient_max,
+                        frozen_function_mass: None,
                     });
                 } else {
                     match auto_kind {
@@ -366,6 +367,7 @@ pub fn build_termspec(
                                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                                 coefficient_min: *coefficient_min,
                                 coefficient_max: *coefficient_max,
+                                frozen_function_mass: None,
                             });
                         }
                         ColumnKindTag::Categorical => {
@@ -423,6 +425,7 @@ pub fn build_termspec(
                     },
                     coefficient_min: None,
                     coefficient_max: None,
+                    frozen_function_mass: None,
                 });
             }
             ParsedTerm::RandomEffect {
@@ -723,6 +726,7 @@ pub fn build_termspec(
                         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                         coefficient_min: None,
                         coefficient_max: None,
+                        frozen_function_mass: None,
                     });
                     inference_notes.push(format!(
                         "wired linear interaction `{}` as product of numeric columns",
@@ -805,6 +809,7 @@ pub fn build_termspec(
                             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                             coefficient_min: None,
                             coefficient_max: None,
+                            frozen_function_mass: None,
                         });
                     }
                     let all_treatment_coded = !any_dummy_coded;

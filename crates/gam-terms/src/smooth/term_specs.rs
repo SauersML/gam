@@ -1090,6 +1090,22 @@ pub struct LinearTermSpec {
     pub coefficient_min: Option<f64>,
     #[serde(default)]
     pub coefficient_max: Option<f64>,
+    /// The term's empirical function mass (`n⁻¹bᵀb` on the TRAINING design
+    /// column), captured once at fit time by
+    /// [`crate::smooth::freeze_term_collection_from_design`] and baked into the
+    /// frozen/saved spec. `None` while a spec is still being resolved during
+    /// fitting (before freezing) or for a `double_penalty=false` term, which
+    /// carries no ridge and never needs a mass.
+    ///
+    /// A rebuild of this term's design column at PREDICT time (a held-out
+    /// grid, a small group/class-anchor set, a single test row, …) must reuse
+    /// this persisted value rather than recomputing it from the evaluation
+    /// rows: a covariate that varies fine across the training set can easily
+    /// be constant across a tiny evaluation subset by chance, and recomputing
+    /// there would misfire the fit-time "identically zero" identifiability
+    /// guard on a perfectly good term (#1561 REF_ERROR/METRIC_OFF triage).
+    #[serde(default)]
+    pub frozen_function_mass: Option<f64>,
 }
 
 impl LinearTermSpec {
@@ -2452,6 +2468,15 @@ pub struct TermCollectionDesign {
     pub linear_constraints: Option<LinearInequalityConstraints>,
     pub intercept_range: Range<usize>,
     pub linear_ranges: Vec<(String, Range<usize>)>,
+    /// Per-linear-term empirical function mass used for this build's ridge
+    /// penalty (parallel to `spec.linear_terms`; `Some` only for
+    /// `double_penalty=true` terms). This is the TRAINING-time value the
+    /// first (fit-time) build actually computed from `data` — never a value
+    /// recomputed from a prediction/rebuild call's (possibly tiny or
+    /// zero-variance) rows. `freeze_term_collection_from_design` copies this
+    /// into each term's `frozen_function_mass` so a later rebuild reuses it
+    /// instead of recomputing.
+    pub linear_function_masses: Vec<Option<f64>>,
     pub random_effect_ranges: Vec<(String, Range<usize>)>,
     pub random_effect_levels: Vec<(String, Vec<u64>)>,
     pub smooth: SmoothDesign,

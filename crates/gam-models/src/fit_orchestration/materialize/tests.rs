@@ -1857,6 +1857,7 @@ fn bernoulli_marginal_slope_prune_rejects_penalized_redundant_scalar_term() {
             coefficient_geometry: gam_terms::smooth::LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![],

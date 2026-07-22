@@ -54,6 +54,7 @@ fn linear(name: &str, feature_col: usize) -> LinearTermSpec {
         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
         coefficient_min: None,
         coefficient_max: None,
+        frozen_function_mass: None,
     }
 }
 

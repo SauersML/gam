@@ -87,6 +87,7 @@ mod adaptive_bounded_duchon_tests {
                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     coefficient_min: None,
                     coefficient_max: None,
+                    frozen_function_mass: None,
                 },
                 LinearTermSpec {
                     name: "unpenalized_linear".to_string(),
@@ -97,6 +98,7 @@ mod adaptive_bounded_duchon_tests {
                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     coefficient_min: None,
                     coefficient_max: None,
+                    frozen_function_mass: None,
                 },
             ],
             // Likewise, both random effects own non-empty coefficient ranges
@@ -635,6 +637,7 @@ mod adaptive_bounded_duchon_tests {
                     },
                     coefficient_min: None,
                     coefficient_max: None,
+                    frozen_function_mass: None,
                 },
                 LinearTermSpec {
                     name: "z".to_string(),
@@ -645,6 +648,7 @@ mod adaptive_bounded_duchon_tests {
                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     coefficient_min: None,
                     coefficient_max: None,
+                    frozen_function_mass: None,
                 },
             ],
             random_effect_terms: vec![],
@@ -712,6 +716,7 @@ mod adaptive_bounded_duchon_tests {
                     },
                     coefficient_min: None,
                     coefficient_max: None,
+                    frozen_function_mass: None,
                 },
                 LinearTermSpec {
                     name: "z".to_string(),
@@ -722,6 +727,7 @@ mod adaptive_bounded_duchon_tests {
                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     coefficient_min: None,
                     coefficient_max: None,
+                    frozen_function_mass: None,
                 },
             ],
             random_effect_terms: vec![],
@@ -822,6 +828,7 @@ mod adaptive_bounded_duchon_tests {
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: Some(0.0),
                 coefficient_max: Some(1.0),
+                frozen_function_mass: None,
             }],
             random_effect_terms: vec![],
             smooth_terms: vec![],
@@ -862,6 +869,7 @@ mod adaptive_bounded_duchon_tests {
                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     coefficient_min: None,
                     coefficient_max: None,
+                    frozen_function_mass: None,
                 },
                 LinearTermSpec {
                     name: "x2".to_string(),
@@ -872,6 +880,7 @@ mod adaptive_bounded_duchon_tests {
                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     coefficient_min: None,
                     coefficient_max: None,
+                    frozen_function_mass: None,
                 },
             ],
             random_effect_terms: vec![],

@@ -157,6 +157,7 @@ fn local_synth_copd_like_duchon_rejects_inadmissible_explicit_power() {
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
                 coefficient_max: None,
+                frozen_function_mass: None,
             },
             LinearTermSpec {
                 name: "prs_z".to_string(),
@@ -167,6 +168,7 @@ fn local_synth_copd_like_duchon_rejects_inadmissible_explicit_power() {
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
                 coefficient_max: None,
+                frozen_function_mass: None,
             },
         ],
         random_effect_terms: vec![],

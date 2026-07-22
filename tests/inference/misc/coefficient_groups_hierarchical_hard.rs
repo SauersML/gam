@@ -51,6 +51,7 @@ fn mixed_term_spec() -> TermCollectionSpec {
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
                 coefficient_max: None,
+                frozen_function_mass: None,
             },
             LinearTermSpec {
                 name: "lin_b".to_string(),
@@ -61,6 +62,7 @@ fn mixed_term_spec() -> TermCollectionSpec {
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
                 coefficient_max: None,
+                frozen_function_mass: None,
             },
         ],
         random_effect_terms: vec![RandomEffectTermSpec {
@@ -478,6 +480,7 @@ fn three_linear_spec() -> (TermCollectionSpec, Array2<f64>) {
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
                 coefficient_max: None,
+                frozen_function_mass: None,
             },
             LinearTermSpec {
                 name: "z2".to_string(),
@@ -488,6 +491,7 @@ fn three_linear_spec() -> (TermCollectionSpec, Array2<f64>) {
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
                 coefficient_max: None,
+                frozen_function_mass: None,
             },
             LinearTermSpec {
                 name: "z3".to_string(),
@@ -498,6 +502,7 @@ fn three_linear_spec() -> (TermCollectionSpec, Array2<f64>) {
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
                 coefficient_max: None,
+                frozen_function_mass: None,
             },
         ],
         random_effect_terms: Vec::new(),

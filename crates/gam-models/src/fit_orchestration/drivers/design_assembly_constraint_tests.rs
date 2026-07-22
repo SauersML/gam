@@ -165,6 +165,7 @@ fn remap_feature_columns_rewrites_every_index_bearing_field() {
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: vec![RandomEffectTermSpec {
             name: "re".to_string(),
@@ -1430,6 +1431,7 @@ fn term_collection_design_combines_linear_and_smooth() {
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {
@@ -1537,6 +1539,7 @@ fn spatial_smooth_drops_matching_linear_trend_columns() {
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {
@@ -1601,6 +1604,7 @@ fn spatial_option5_is_orthogonal_to_parametric_block() {
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {
@@ -1745,6 +1749,7 @@ fn spatial_option5_does_not_overconstrain_on_nonoverlapping_linear_terms() {
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
                 coefficient_max: None,
+                frozen_function_mass: None,
             })
             .collect(),
         random_effect_terms: vec![],
@@ -1819,6 +1824,7 @@ fn overlapping_linear_term_residualizes_bspline_smooth() {
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {
@@ -1926,6 +1932,7 @@ fn spatial_parametric_ownership_projects_only_explicit_linear_axes() {
         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
         coefficient_min: None,
         coefficient_max: None,
+        frozen_function_mass: None,
     }];
 
     assert_eq!(
@@ -2085,6 +2092,7 @@ fn freeze_roundtrip_preserves_hierarchical_smooth_transforms() {
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![
@@ -2187,6 +2195,7 @@ fn spatial_option5_preserves_lazy_thin_plate_terms_at_large_scale() {
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {
@@ -2241,6 +2250,7 @@ fn spatial_frozen_transform_rebuild_is_exact_on_trainingrows() {
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {
@@ -3744,6 +3754,7 @@ fn exact_joint_spatial_outer_hessian_available_for_dense_non_gaussian_designs() 
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
                 coefficient_max: None,
+                frozen_function_mass: None,
             })
             .collect(),
         random_effect_terms: vec![],
@@ -6840,6 +6851,7 @@ fn incremental_frozen_realizer_matches_unified_full_rebuild() {
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: Some(-0.5),
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: vec![RandomEffectTermSpec {
             name: "grp".to_string(),
@@ -7336,6 +7348,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {

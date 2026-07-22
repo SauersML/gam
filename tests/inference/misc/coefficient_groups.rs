@@ -57,6 +57,7 @@ fn two_linear_term_spec() -> TermCollectionSpec {
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
                 coefficient_max: None,
+                frozen_function_mass: None,
             },
             LinearTermSpec {
                 name: "score_b".to_string(),
@@ -67,6 +68,7 @@ fn two_linear_term_spec() -> TermCollectionSpec {
                 coefficient_geometry: Default::default(),
                 coefficient_min: None,
                 coefficient_max: None,
+                frozen_function_mass: None,
             },
         ],
         random_effect_terms: Vec::new(),

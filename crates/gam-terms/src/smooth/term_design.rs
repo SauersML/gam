@@ -141,15 +141,29 @@ pub fn build_term_collection_design_inner_with_policy(
     let smooth_raw = smooth_raw_result?;
     let random_blocks = random_blocks_result?;
     let linear_block = linear_block_result?;
+    // Reuse the TRAINING-time mass when this spec has already been through
+    // `freeze_term_collection_from_design` (predict/rebuild calls always pass
+    // the frozen `resolvedspec`). Recomputing from `block.column(j)` here would
+    // use whatever rows THIS call happens to be building over — a held-out
+    // grid, a handful of group/class anchors, a single test row — where a
+    // covariate that varies fine across the training set can easily look
+    // constant by chance. Only the very first, fit-time build (before the
+    // spec is frozen, so `frozen_function_mass` is still `None`) computes the
+    // mass fresh from `data`, which is right: at fit time `data` IS the
+    // training rows, so a genuine identifiability failure is real (#1561).
     let linear_function_masses = match linear_block.as_ref() {
         Some(block) => spec
             .linear_terms
             .iter()
             .enumerate()
-            .map(|(j, term)| {
-                term.double_penalty
-                    .then(|| linear_function_mass(block.column(j), &term.name))
-                    .transpose()
+            .map(|(j, term)| -> Result<Option<f64>, BasisError> {
+                if !term.double_penalty {
+                    return Ok(None);
+                }
+                if let Some(frozen_mass) = term.frozen_function_mass {
+                    return Ok(Some(frozen_mass));
+                }
+                linear_function_mass(block.column(j), &term.name).map(Some)
             })
             .collect::<Result<Vec<_>, _>>()?,
         None => Vec::new(),
@@ -425,6 +439,7 @@ pub fn build_term_collection_design_inner_with_policy(
         linear_constraints,
         intercept_range: 0..p_intercept,
         linear_ranges,
+        linear_function_masses,
         random_effect_ranges,
         random_effect_levels,
         smooth,
@@ -2214,4 +2229,114 @@ pub fn orthogonality_relative_residual_for_design(
     let c_norm = constraint_matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
     let denom = (b_norm * c_norm).max(1e-300);
     Ok(num / denom)
+}
+
+#[cfg(test)]
+mod frozen_linear_term_mass_rebuild_tests {
+    use super::*;
+
+    /// One `double_penalty=true` linear term named `x`, no smooth/random-effect
+    /// terms — the minimal spec that exercises `linear_function_mass` without
+    /// dragging in basis construction.
+    fn one_linear_term_spec() -> TermCollectionSpec {
+        TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "x".to_string(),
+                feature_col: 0,
+                feature_cols: vec![0],
+                categorical_levels: vec![],
+                double_penalty: true,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                coefficient_min: None,
+                coefficient_max: None,
+                frozen_function_mass: None,
+            }],
+            random_effect_terms: Vec::new(),
+            smooth_terms: Vec::new(),
+        }
+    }
+
+    fn training_data_varying_x(n: usize) -> Array2<f64> {
+        let mut data = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            // Genuinely varying, well away from zero for every row.
+            data[[i, 0]] = 1.0 + i as f64;
+        }
+        data
+    }
+
+    fn constant_zero_x(n_rows: usize) -> Array2<f64> {
+        Array2::<f64>::zeros((n_rows, 1))
+    }
+
+    /// Sanity check that the guard this fix must NOT weaken is still live: an
+    /// UNFROZEN spec built directly over a genuinely all-zero column (the
+    /// fit-time case — `data` really is what will be fit on) still reports the
+    /// "identically zero" identifiability failure instead of silently fitting
+    /// an unrecoverable term.
+    #[test]
+    fn unfrozen_spec_still_rejects_a_genuinely_zero_training_column() {
+        let spec = one_linear_term_spec();
+        let degenerate_training_data = constant_zero_x(20);
+        let err = build_term_collection_design(degenerate_training_data.view(), &spec)
+            .expect_err("an unfrozen spec fit directly on an all-zero column must still fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("identically zero"),
+            "expected the identifiability guard's message, got: {message}"
+        );
+    }
+
+    /// The regression this fix targets (#1561 rebuild-design triage, shortlist
+    /// item 1): fit on a TRAINING set where `x` genuinely varies, freeze the
+    /// spec, then rebuild the design at a small EVALUATION set where `x`
+    /// happens to be constant (e.g. an anchor grid that holds a covariate
+    /// fixed to isolate another term's effect — the exact pattern in
+    /// `quality_vs_mass_ordinal_polr` and
+    /// `quality_vs_inla_survival_random_intercept_baseline`). The rebuild must
+    /// succeed and must reuse the TRAINING-time mass rather than recomputing
+    /// (which would be a bogus "identically zero" recomputed from the
+    /// constant evaluation rows).
+    #[test]
+    fn frozen_spec_rebuilds_at_a_constant_evaluation_column_using_the_training_mass() {
+        let spec = one_linear_term_spec();
+        let training_data = training_data_varying_x(40);
+
+        let training_design = build_term_collection_design(training_data.view(), &spec)
+            .expect("fit-time build over a genuinely varying column must succeed");
+        let training_mass = training_design
+            .linear_function_masses
+            .first()
+            .copied()
+            .flatten()
+            .expect("a double_penalty=true term must report its fit-time function mass");
+        assert!(
+            training_mass > 0.0,
+            "training mass for a genuinely varying column must be strictly positive, got {training_mass}"
+        );
+
+        let frozen_spec = freeze_term_collection_from_design(&spec, &training_design)
+            .expect("freezing the spec against its own fit-time design must succeed");
+        assert_eq!(
+            frozen_spec.linear_terms[0].frozen_function_mass,
+            Some(training_mass),
+            "freezing must persist the exact fit-time mass onto the term"
+        );
+
+        // The rebuild-time evaluation grid: `x` is constant (zero) across
+        // every one of these rows, exactly like an anchor/group-anchor probe
+        // that fixes a covariate to isolate another effect.
+        let evaluation_grid = constant_zero_x(3);
+        let rebuilt_design = build_term_collection_design(evaluation_grid.view(), &frozen_spec)
+            .expect(
+                "rebuilding a FROZEN spec's design at a constant-covariate evaluation grid must \
+                 succeed — the training-time mass is reused, never recomputed from these rows",
+            );
+        assert_eq!(
+            rebuilt_design.linear_function_masses.first().copied().flatten(),
+            Some(training_mass),
+            "the rebuilt design must carry the REUSED training-time mass, not a value \
+             recomputed from the (all-zero) evaluation rows"
+        );
+    }
 }

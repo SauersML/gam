@@ -779,6 +779,7 @@ fn reparameterize_logslope_design_reduced(
         linear_constraints: None,
         intercept_range: 0..0,
         linear_ranges: Vec::new(),
+        linear_function_masses: Vec::new(),
         random_effect_ranges: Vec::new(),
         random_effect_levels: Vec::new(),
         smooth: gam_terms::smooth::SmoothDesign {
@@ -1389,6 +1390,7 @@ mod runaway_tests {
             linear_constraints: None,
             intercept_range,
             linear_ranges,
+            linear_function_masses: Vec::new(),
             random_effect_ranges: Vec::new(),
             random_effect_levels: Vec::new(),
             smooth: gam_terms::smooth::SmoothDesign {
@@ -1414,6 +1416,7 @@ mod runaway_tests {
             coefficient_geometry: LinearCoefficientGeometry::default(),
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }
     }
 

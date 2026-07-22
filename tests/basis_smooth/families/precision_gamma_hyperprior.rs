@@ -58,6 +58,7 @@ fn linear_fixture() -> (
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,
             coefficient_max: None,
+            frozen_function_mass: None,
         }],
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
