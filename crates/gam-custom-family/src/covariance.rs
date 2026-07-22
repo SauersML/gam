@@ -1488,12 +1488,50 @@ pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + '
         };
         hessian
     };
-    let h = penalized_hessian_from_owned_mode(
+    let mut h = penalized_hessian_from_owned_mode(
         specs,
         per_block_log_lambdas,
         options,
         &unpenalized_hessian,
     )?;
+    // #2387: fold the Jeffreys/Firth curvature H_Φ into the posterior precision
+    // for Jeffreys-armed families. Such a family (Gaussian/binomial
+    // location-scale, the dispersion GLMs, the location-scale AFT survival path)
+    // certifies its converged mode NOT on the plain active-face second-order
+    // check — that check is "deliberately skipped for Jeffreys-armed families
+    // (their definiteness is certified on the joint Jeffreys subspace instead)"
+    // — but on the AUGMENTED objective `-logL + penalty - Φ`, whose curvature is
+    // `H + Sλ + H_Φ` with H_Φ the PSD Firth/Jeffreys information curvature. The
+    // outer REML LAML value and its analytic trace kernel already run on exactly
+    // this augmented operator `(H + Sλ + H_Φ)⁺` (see `scaled_jeffreys_hphi` in
+    // `joint_penalty_subspace_trace_parts`). The terminal Laplace covariance is
+    // the inverse of that SAME operator; inverting the bare `H + Sλ` instead
+    // drops the σ-stabilizing Jeffreys curvature and can read a
+    // structurally-indefinite observed-information direction (Gaussian
+    // location-scale per-row info `[[κ,2rκ],[2rκ,2r²κ]]`, det −2r²κ² < 0) as a
+    // non-PD "saddle" at a mode the augmented objective certifies as a strict
+    // maximum — the byte-for-byte cause of the location-scale link-wiggle
+    // covariance refusal on near-interpolating (σ→floor) data. Folding H_Φ in
+    // makes the covariance consistent with the operator the mode lives on.
+    // `joint_jeffreys_term_required()` is `false` for every flat-prior
+    // exact-Newton family, so those stay byte-identical.
+    if family.joint_jeffreys_term_required() {
+        let jeffreys_ranges = block_param_ranges(specs);
+        if let Some(z_joint) =
+            crate::jeffreys::build_joint_jeffreys_subspace(specs, &jeffreys_ranges)?
+            && let Some((_, _, hphi)) = crate::jeffreys::custom_family_joint_jeffreys_term(
+                family,
+                states,
+                specs,
+                &jeffreys_ranges,
+                &z_joint,
+            )?
+            && hphi.dim() == h.dim()
+        {
+            h += &hphi;
+            symmetrize_dense_in_place(&mut h);
+        }
+    }
     // #748 + audit-41: a Laplace posterior covariance exists only when the
     // posterior precision `H + S_λ` is strictly positive definite AT THE
     // CONVERGED OPTIMUM. Indefinite means the mode is not a maximum;
