@@ -2366,5 +2366,205 @@ mod observed_single_source_oracle_tests {
                 close(d_uv[0], jt[1][1], &format!("d²H_lsls μ={mu} η={eta_ls}"));
             }
         }
+
+        /// #932 release speed gate for the Gaussian location-scale joint row.
+        /// The production structure-compiled order-2/third/fourth lowerings
+        /// ([`GaussianJointRowProgram::row_order2`] /
+        /// `row_third_contracted` / `row_fourth_contracted`, all emitted from
+        /// the one [`gaussian_normalized_row`] declaration) are timed against
+        /// the generic gam-math forward-mode jet tower ([`program_row_kernel`]
+        /// / [`program_third_contracted`] / [`program_fourth_contracted`]) —
+        /// the naive automatic-differentiation baseline the retained
+        /// specialization must beat; #932 keeps no separate `cfg(test)` hand
+        /// restatement for this family. Emits one harness-parsed
+        /// `hand_over_production` token (generic-tower time over production
+        /// time) per derivative channel; the MSI release harness fails closed
+        /// whenever any measured cell is `<= 1`.
+        ///
+        /// The batch carries distinct certified per-row scalars and distinct
+        /// per-row directions, so the optimizer cannot hoist the pure row
+        /// calls out of the sweeps, and the finite checksum over every
+        /// returned channel keeps each sweep live without
+        /// `std::hint::black_box`.
+        #[test]
+        fn release_measure_gaussian_joint_specialized_vs_generic_tower_932() {
+            use gam_math::jet_tower::program_row_kernel;
+            use std::time::Instant;
+
+            const ROWS: usize = 512;
+            let y = Array1::from_shape_fn(ROWS, |i| {
+                let f = i as f64;
+                1.4 * (f * 0.17 + 0.3).sin() - 0.5 * (f * 0.09).cos()
+            });
+            let mu = Array1::from_shape_fn(ROWS, |i| {
+                let f = i as f64;
+                0.9 * (f * 0.13 + 0.7).cos() + 0.3 * (f * 0.05).sin()
+            });
+            let eta_ls = Array1::from_shape_fn(ROWS, |i| {
+                let f = i as f64;
+                0.8 * (f * 0.11 + 0.2).sin() - 0.25 * (f * 0.07).cos()
+            });
+            let weight = Array1::from_shape_fn(ROWS, |i| {
+                let f = i as f64;
+                0.6 + 0.4 * (f * 0.19 + 1.0).sin().abs()
+            });
+            let rows = gaussian_jointrow_scalars(&y, &mu, &eta_ls, &weight)
+                .expect("certified release-measure Gaussian joint rows");
+            let program = crate::gamlss::GaussianJointRowProgram::new(&rows);
+            let dir_u: Vec<[f64; 2]> = (0..ROWS)
+                .map(|i| {
+                    let f = i as f64;
+                    [
+                        0.7 * (f * 0.23 + 0.4).cos() - 0.2 * (f * 0.03).sin(),
+                        -0.6 * (f * 0.29 + 0.1).sin() + 0.25 * (f * 0.15).cos(),
+                    ]
+                })
+                .collect();
+            let dir_v: Vec<[f64; 2]> = (0..ROWS)
+                .map(|i| {
+                    let f = i as f64;
+                    [
+                        -0.5 * (f * 0.21 + 0.9).sin() + 0.3 * (f * 0.06).cos(),
+                        0.8 * (f * 0.27 + 0.5).cos() - 0.15 * (f * 0.04).sin(),
+                    ]
+                })
+                .collect();
+
+            // Warm both paths and pin equal V/G/H plus equal contracted
+            // third/fourth, so each timed pair measures equal work.
+            for row in 0..ROWS {
+                let atom = program.row_order2(row);
+                let (tower_value, tower_gradient, tower_hessian) =
+                    program_row_kernel(&program, row).expect("tower warm kernel");
+                close(atom.value(), tower_value, "release-measure value parity");
+                let production_gradient = atom.gradient();
+                for a in 0..2 {
+                    close(
+                        production_gradient[a],
+                        tower_gradient[a],
+                        "release-measure gradient parity",
+                    );
+                    for b in 0..2 {
+                        close(
+                            atom.hessian_at(a, b),
+                            tower_hessian[a][b],
+                            "release-measure hessian parity",
+                        );
+                    }
+                }
+                let production_third = program.row_third_contracted(row, &dir_u[row]);
+                let tower_third = program_third_contracted(&program, row, &dir_u[row])
+                    .expect("tower warm third");
+                let production_fourth =
+                    program.row_fourth_contracted(row, &dir_u[row], &dir_v[row]);
+                let tower_fourth =
+                    program_fourth_contracted(&program, row, &dir_u[row], &dir_v[row])
+                        .expect("tower warm fourth");
+                for a in 0..2 {
+                    for b in 0..2 {
+                        close(
+                            production_third[a][b],
+                            tower_third[a][b],
+                            "release-measure third parity",
+                        );
+                        close(
+                            production_fourth[a][b],
+                            tower_fourth[a][b],
+                            "release-measure fourth parity",
+                        );
+                    }
+                }
+            }
+
+            let best_secs = |sweep: &mut dyn FnMut() -> f64| -> f64 {
+                let mut best = f64::INFINITY;
+                for _ in 0..5 {
+                    let started = Instant::now();
+                    let checksum = sweep();
+                    assert!(
+                        checksum.is_finite(),
+                        "Gaussian joint release-measure checksum must stay finite"
+                    );
+                    best = best.min(started.elapsed().as_secs_f64());
+                }
+                best
+            };
+
+            let mut production_order2_sweep = || {
+                let mut checksum = 0.0_f64;
+                for row in 0..ROWS {
+                    let atom = program.row_order2(row);
+                    checksum += atom.value() + atom.gradient()[0] + atom.hessian_at(0, 0);
+                }
+                checksum
+            };
+            let production_order2_secs = best_secs(&mut production_order2_sweep);
+            let mut tower_order2_sweep = || {
+                let mut checksum = 0.0_f64;
+                for row in 0..ROWS {
+                    let (value, gradient, hessian) =
+                        program_row_kernel(&program, row).expect("tower kernel");
+                    checksum += value + gradient[0] + hessian[0][0];
+                }
+                checksum
+            };
+            let tower_order2_secs = best_secs(&mut tower_order2_sweep);
+
+            let mut production_third_sweep = || {
+                let mut checksum = 0.0_f64;
+                for row in 0..ROWS {
+                    let third = program.row_third_contracted(row, &dir_u[row]);
+                    checksum += third[0][0] + third[0][1] + third[1][1];
+                }
+                checksum
+            };
+            let production_third_secs = best_secs(&mut production_third_sweep);
+            let mut tower_third_sweep = || {
+                let mut checksum = 0.0_f64;
+                for row in 0..ROWS {
+                    let third = program_third_contracted(&program, row, &dir_u[row])
+                        .expect("tower third");
+                    checksum += third[0][0] + third[0][1] + third[1][1];
+                }
+                checksum
+            };
+            let tower_third_secs = best_secs(&mut tower_third_sweep);
+
+            let mut production_fourth_sweep = || {
+                let mut checksum = 0.0_f64;
+                for row in 0..ROWS {
+                    let fourth = program.row_fourth_contracted(row, &dir_u[row], &dir_v[row]);
+                    checksum += fourth[0][0] + fourth[0][1] + fourth[1][1];
+                }
+                checksum
+            };
+            let production_fourth_secs = best_secs(&mut production_fourth_sweep);
+            let mut tower_fourth_sweep = || {
+                let mut checksum = 0.0_f64;
+                for row in 0..ROWS {
+                    let fourth =
+                        program_fourth_contracted(&program, row, &dir_u[row], &dir_v[row])
+                            .expect("tower fourth");
+                    checksum += fourth[0][0] + fourth[0][1] + fourth[1][1];
+                }
+                checksum
+            };
+            let tower_fourth_secs = best_secs(&mut tower_fourth_sweep);
+
+            for (channel, production_secs, tower_secs) in [
+                ("order2", production_order2_secs, tower_order2_secs),
+                ("third", production_third_secs, tower_third_secs),
+                ("fourth", production_fourth_secs, tower_fourth_secs),
+            ] {
+                let production_ns = production_secs * 1e9 / ROWS as f64;
+                let tower_ns = tower_secs * 1e9 / ROWS as f64;
+                eprintln!(
+                    "GAUSSIAN-JOINT-RELEASE-932 channel={channel} rows={ROWS} \
+                     production_ns={production_ns:.3} generic_tower_ns={tower_ns:.3} \
+                     hand_over_production={:.6}",
+                    tower_ns / production_ns,
+                );
+            }
+        }
     }
 }
