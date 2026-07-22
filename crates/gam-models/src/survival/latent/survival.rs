@@ -40,7 +40,9 @@ use crate::survival::lognormal_kernel::{
     FrailtyScale, FrailtySpec, HazardLoading, LatentSurvivalEventType, LatentSurvivalRow,
     LatentSurvivalRowJet, log_kernel_bundle,
 };
-use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
+use gam_linalg::matrix::{
+    DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
+};
 use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 // `value`/`compose_unary`/… now live on the shared `JetField` base (JetScalar: JetField);
 // the concrete `row_jet.base.value()` reads below need it in scope.
