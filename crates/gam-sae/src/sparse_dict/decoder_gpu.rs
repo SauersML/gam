@@ -190,6 +190,10 @@ fn module_for(b: &Backend) -> Result<Arc<CudaModule>, GpuError> {
 fn complete<T>(operation: &str, result: Result<T, GpuError>) -> T {
     match result {
         Ok(value) => value,
+        // SAFETY: policy admission already committed this solve to the device;
+        // this hook has no error channel that would not be read as an ordinary
+        // pre-admission decline, and returning would silently re-run the
+        // refresh on the CPU while misreporting device residency.
         Err(err) => panic!("sparse_dict decoder block-CG '{operation}' device fault: {err}"),
     }
 }

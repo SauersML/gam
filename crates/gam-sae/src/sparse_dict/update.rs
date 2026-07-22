@@ -2097,7 +2097,6 @@ fn solve_block_cg(
         );
     }
 
-    let m = diag_ridge.len();
     let apply = |pblk: &Array2<f64>, apblk: &mut Array2<f64>| {
         let t = pblk.ncols();
         let ps = pblk
@@ -2120,7 +2119,6 @@ fn solve_block_cg(
                 }
             }
         });
-        debug_assert_eq!(out.len(), m * t);
     };
     let mut backend = CpuPcgBlockBackend::new(rhs_block, apply);
     let results = pcg_multi_core(&mut backend, residual_tolerance, cap, true);
@@ -2144,7 +2142,6 @@ struct CgSolveResult {
     x: Vec<f64>,
     iterations: usize,
     relative_residual: f64,
-    kappa_hat: Option<f64>,
     stop: CgStop,
 }
 
@@ -2167,7 +2164,6 @@ where
             x: vec![0.0; n],
             iterations: 0,
             relative_residual: 0.0,
-            kappa_hat: None,
             stop: CgStop::Converged,
         };
     }
@@ -2176,10 +2172,10 @@ where
     // single source of truth that exists precisely to end hand-rolled CG drift.
     // This path is unpreconditioned (all-ones Jacobi diagonal), uses the
     // bit-reproducible serial reduction, and disables residual refresh, which
-    // reproduces the prior loop's pure-recurrence residual exactly. The
-    // per-iteration alpha/beta trace is requested so the Lanczos condition
-    // estimate `kappa_hat` is reconstructed unchanged on the converged and
-    // cap-reached paths that feed the derived iteration cap downstream.
+    // reproduces the prior loop's pure-recurrence residual exactly. No
+    // diagnostics are requested: the trace-probe caller consumes only the
+    // iterate and the stop certificate (the decoder refresh, which does need
+    // the Lanczos trace, runs through the block path's `pcg_multi_core`).
     let rhs = ndarray::Array1::from_vec(b.to_vec());
     let precond = ndarray::Array1::<f64>::from_elem(n, 1.0);
     let mut solution = ndarray::Array1::<f64>::zeros(n);
@@ -2194,7 +2190,7 @@ where
         residual_tolerance,
         cap,
         0,
-        true,
+        false,
         DotReduction::Serial,
         &mut solution.view_mut(),
     );
@@ -2204,10 +2200,6 @@ where
     } else {
         0.0
     };
-    let kappa_hat = result
-        .diagnostics
-        .as_ref()
-        .and_then(|d| kappa_from_cg_tridiagonal(&d.alpha, &d.beta));
     let stop = match result.stop {
         PcgStop::Converged => CgStop::Converged,
         PcgStop::MaxIters => CgStop::CapReached,
@@ -2218,7 +2210,6 @@ where
         x: solution.to_vec(),
         iterations: result.iterations,
         relative_residual,
-        kappa_hat,
         stop,
     }
 }
@@ -2831,8 +2822,22 @@ mod exact_solve_tests {
                 .map(|(&lambda, &xi)| lambda * xi)
                 .collect()
         };
-        let result = cg_solve(&matvec, &b, 1.0e-14, eigenvalues.len() + 2);
-        let got = result.kappa_hat.expect("Lanczos kappa");
+        let mut rhs = Array2::<f64>::zeros((eigenvalues.len(), 1));
+        for (i, slot) in rhs.column_mut(0).iter_mut().enumerate() {
+            *slot = b[i];
+        }
+        let mut backend = gam_linalg::pcg::CpuPcgBlockBackend::new(
+            rhs,
+            |pblk: &Array2<f64>, apblk: &mut Array2<f64>| {
+                let out = matvec(pblk.column(0).to_owned().as_slice().expect("contiguous"));
+                for (i, slot) in apblk.column_mut(0).iter_mut().enumerate() {
+                    *slot = out[i];
+                }
+            },
+        );
+        let results = pcg_multi_core(&mut backend, 1.0e-14, eigenvalues.len() + 2, true);
+        let diag = results[0].diagnostics.as_ref().expect("diagnostics trace");
+        let got = kappa_from_cg_tridiagonal(&diag.alpha, &diag.beta).expect("Lanczos kappa");
         let want = eigenvalues[eigenvalues.len() - 1] / eigenvalues[0];
         assert!(
             (got - want).abs() <= 1.0e-8 * want,
