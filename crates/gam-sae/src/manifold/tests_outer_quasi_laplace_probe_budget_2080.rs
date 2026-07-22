@@ -1219,6 +1219,69 @@ fn profile_wide_p_criterion_cost_2080() {
     }
 }
 
+/// #2080 OWNER wide-p per-eval localizer (uncommitted profiling instrument).
+/// Splits a single K=1 criterion evaluation into: (A) the damped inner (t,β)
+/// Newton solve, (M) the dense exact-A materialization column-by-column, (E) the
+/// full exact observed-information log-dets (M + two dense `eigh`), and the
+/// residual refine-loop remainder = full − A − E. Runs the wide tail p∈{16..96}
+/// the standard profiler leaves to the owner, so the cubic-in-p term is localized
+/// in ONE run.
+#[test]
+#[ignore = "owner profiling instrument for #2080; run explicitly"]
+fn profile_wide_p_criterion_cost_localizer_2080_owner() {
+    let harmonics = 2usize; // m = 5 basis columns per atom
+    for &p in &[16usize, 32, 48, 64, 96] {
+        let n = 96usize;
+        let z = one_circle_wide_target(n, p, 0.05);
+        let (term, seed_dispersion) = two_circle_periodic_term(z.view(), 1, harmonics);
+        let mode = AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false);
+        let rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
+            .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
+            .unwrap();
+        let beta_dim = term.beta_dim();
+
+        // Phase A: damped inner solve alone.
+        let mut ta = term.clone();
+        let mut rho_a = rho.clone();
+        let a0 = std::time::Instant::now();
+        ta.run_joint_fit_arrow_schur(z.view(), &mut rho_a, None, 8, 0.04, 1.0e-6, 1.0e-6)
+            .expect("inner solve");
+        let dt_a = a0.elapsed().as_secs_f64();
+
+        // Full criterion (returns the converged undamped cache).
+        let mut tb = term.clone();
+        let f0 = std::time::Instant::now();
+        let (_cost, _loss, cache) = tb
+            .penalized_quasi_laplace_criterion_with_cache(z.view(), &rho, None, 8, 0.04, 1.0e-6, 1.0e-6)
+            .expect("full criterion");
+        let dt_full = f0.elapsed().as_secs_f64();
+        let total_t = cache.delta_t_len();
+        let dim = total_t + cache.k;
+
+        // Phase M: dense exact-A materialization (dim column matvecs).
+        let m0 = std::time::Instant::now();
+        let _a_dense = tb
+            .materialize_exact_hessian_dense(&rho, z.view(), &cache)
+            .expect("materialize A");
+        let dt_m = m0.elapsed().as_secs_f64();
+
+        // Phase E: full exact observed-information log-dets (materialize + 2 eigh).
+        let e0 = std::time::Instant::now();
+        let _ = tb
+            .exact_observed_information_log_dets(&rho, z.view(), &cache)
+            .expect("observed-information log-dets");
+        let dt_e = e0.elapsed().as_secs_f64();
+
+        let dt_eigh = (dt_e - dt_m).max(0.0);
+        let dt_refine = (dt_full - dt_a - dt_e).max(0.0);
+        eprintln!(
+            "[#2080 localize] p={p:>3} beta_dim={beta_dim:>4} dim={dim:>4} | \
+             inner_A={dt_a:8.3}s | refine_rest={dt_refine:8.3}s | materialize_M={dt_m:8.3}s | \
+             eigh_E-M={dt_eigh:8.3}s | full={dt_full:8.3}s"
+        );
+    }
+}
+
 /// #2228 regression — the line-search Value lane must price the shared inner
 /// fixed point. The BFGS/ARC cost probe (`OuterEvalOrder::Value`) ranks steps
 /// whose direction came from the gradient lane's exact implicit `∇f`, computed

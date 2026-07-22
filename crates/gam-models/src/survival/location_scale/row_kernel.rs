@@ -5369,6 +5369,260 @@ mod patterned_order2_perf_tests {
             fourth_generic_ns / fourth_production_ns,
         );
     }
+
+    /// #932 release speed gate for the runtime-width SLS link/time-wiggle kernel
+    /// ([`SurvivalLsWiggleRowKernel`], primary width `KW = SLS_ROW_K + pw`). The
+    /// three ungated production lowerings over `sls_row_nll_wiggle` — the order-2
+    /// joint Hessian (`DynamicOrder2`, consumed by `hessian_dense`), the
+    /// directional third (`DynamicOneSeed`, consumed by
+    /// `directional_derivative_dense`), and the second-directional fourth
+    /// (`DynamicTwoSeed`, consumed by `second_directional_derivative_dense`) —
+    /// all run at RUNTIME width and reuse one arena across the row fold
+    /// (`acc.arena.reset()` per row).
+    ///
+    /// RACER CHOICE (documented per the #932 release-cell contract). The wiggle
+    /// family width is `pw`-runtime, so production STRUCTURALLY cannot lower into
+    /// a compile-time tower — that impossibility is the very premise of the
+    /// runtime packed jet. A padded fixed-width tower is only realizable here by
+    /// pinning `pw`, and racing `static_ns / dynamic_ns` would certify a
+    /// monomorphization production can never take (and whose inequality direction
+    /// is not a production property). The genuine engineering win the runtime
+    /// lowering carries over a naive dynamic implementation is arena
+    /// AMORTIZATION: `DynamicJetArena::reset` retains a single high-water chunk
+    /// so equal-or-smaller later rows need zero allocator traffic, whereas a
+    /// straightforward implementation allocates a fresh multi-chunk order-2 tape
+    /// every row. So the fail-closed racer is amortized reused-arena production
+    /// vs allocation-naive fresh-`DynamicJetArena::new()`-per-row, and the
+    /// emitted `hand_over_production = fresh_ns / reused_ns` (> 1 iff the
+    /// production amortization pays off; the MSI harness fails closed on `<= 1`).
+    ///
+    /// The padded fixed-width tower is NOT discarded — it is the PARITY ORACLE.
+    /// `FixedRuntimeJet<Order2/OneSeed/TwoSeed<KW>, KW>` instantiates the SAME
+    /// generic `sls_row_nll_wiggle` at compile-time width `KW`, and the runtime
+    /// packed jet (production) must reproduce it channel-for-channel to `1e-11`
+    /// relative — proving the runtime-width lowering is numerically exact before
+    /// its speed is certified.
+    #[test]
+    fn release_measure_sls_wiggle_dynamic_jets_vs_padded_static_tower_932() {
+        use gam_math::jet_scalar::{FixedRuntimeJet, OneSeed, TwoSeed};
+        use std::time::Instant;
+
+        // Small runtime wiggle width so the padded static parity tower is a
+        // clean fixed `KW`; production runs this same expression at runtime `pw`.
+        const PW: usize = 3;
+        const KW: usize = SLS_ROW_K + PW;
+
+        let (p9, kernel) = fixture();
+        let betaw = [0.13_f64, -0.21, 0.07];
+        let mut p: [f64; KW] = [0.0; KW];
+        p[..SLS_ROW_K].copy_from_slice(&p9);
+        p[SLS_ROW_K..].copy_from_slice(&betaw);
+
+        // Per-row warp basis stacks `[B, B', B'', B''']` at the base entry (`b_u0`)
+        // and exit (`b_u1`) indices, one entry per wiggle column. Synthetic but
+        // finite; the parity oracle certifies the lowering, not these numbers.
+        let b_u0_0 = [0.20_f64, -0.15, 0.09];
+        let b_u0_1 = [-0.11_f64, 0.22, -0.07];
+        let b_u0_2 = [0.05_f64, -0.03, 0.14];
+        let b_u0_3 = [-0.08_f64, 0.06, -0.02];
+        let b_u1_0 = [0.17_f64, 0.12, -0.19];
+        let b_u1_1 = [-0.09_f64, 0.04, 0.13];
+        let b_u1_2 = [0.06_f64, -0.11, 0.03];
+        let b_u1_3 = [-0.04_f64, 0.08, -0.05];
+        let basis = SlsWiggleRowBasis {
+            b_u0: [&b_u0_0, &b_u0_1, &b_u0_2, &b_u0_3],
+            b_u1: [&b_u1_0, &b_u1_1, &b_u1_2, &b_u1_3],
+        };
+
+        let dir_u: [f64; KW] = [
+            0.7, -1.3, 0.4, 0.6, -0.5, 0.9, -0.2, 0.3, -0.8, 0.5, -0.6, 0.2,
+        ];
+        let dir_v: [f64; KW] = [
+            -0.4, 0.6, 1.1, -0.2, 0.8, -0.7, 0.5, -0.9, 0.1, -0.3, 0.4, -0.5,
+        ];
+
+        let band = |a: f64, b: f64| 1e-11 * a.abs().max(b.abs()).max(1.0);
+
+        // --- Parity oracle, order 2: runtime packed Hessian == padded static. ---
+        let arena2 = DynamicJetArena::new();
+        let dyn2_vars =
+            arena2.alloc_slice_fill_with(KW, |a| DynamicOrder2::variable(p[a], a, KW, &arena2));
+        let dyn2 = sls_row_nll_wiggle(dyn2_vars, &kernel, PW, &basis);
+        let fix2_vars: Vec<FixedRuntimeJet<Order2<KW>, KW>> = (0..KW)
+            .map(|a| FixedRuntimeJet::from_inner(Order2::variable(p[a], a)))
+            .collect();
+        let fix2 = sls_row_nll_wiggle(&fix2_vars, &kernel, PW, &basis).into_inner();
+        assert!(
+            (dyn2.value() - fix2.value()).abs() <= band(dyn2.value(), fix2.value()),
+            "wiggle order-2 value: dynamic {:+.15e} vs padded-static {:+.15e}",
+            dyn2.value(),
+            fix2.value(),
+        );
+        for a in 0..KW {
+            for b in 0..KW {
+                let d = dyn2.h()[a * KW + b];
+                let s = fix2.h()[a][b];
+                assert!(
+                    (d - s).abs() <= band(d, s),
+                    "wiggle order-2 H[{a}][{b}]: dynamic {d:+.15e} vs padded-static {s:+.15e}"
+                );
+            }
+        }
+
+        // --- Parity oracle, order 3: directional third contraction. ---
+        let arena3 = DynamicJetArena::new();
+        let dyn3_vars = arena3.alloc_slice_fill_with(KW, |a| {
+            DynamicOneSeed::seed_direction(p[a], a, dir_u[a], KW, &arena3)
+        });
+        let dyn3 = sls_row_nll_wiggle(dyn3_vars, &kernel, PW, &basis);
+        let dyn3_third = dyn3.contracted_third();
+        let fix3_vars: Vec<FixedRuntimeJet<OneSeed<KW>, KW>> = (0..KW)
+            .map(|a| FixedRuntimeJet::from_inner(OneSeed::seed_direction(p[a], a, dir_u[a])))
+            .collect();
+        let fix3_third = sls_row_nll_wiggle(&fix3_vars, &kernel, PW, &basis)
+            .into_inner()
+            .contracted_third();
+        for a in 0..KW {
+            for b in 0..KW {
+                let d = dyn3_third[a * KW + b];
+                let s = fix3_third[a][b];
+                assert!(
+                    (d - s).abs() <= band(d, s),
+                    "wiggle order-3 T[{a}][{b}]: dynamic {d:+.15e} vs padded-static {s:+.15e}"
+                );
+            }
+        }
+
+        // --- Parity oracle, order 4: second-directional fourth contraction. ---
+        let arena4 = DynamicJetArena::new();
+        let dyn4_vars = arena4.alloc_slice_fill_with(KW, |a| {
+            DynamicTwoSeed::seed(p[a], a, dir_u[a], dir_v[a], KW, &arena4)
+        });
+        let dyn4 = sls_row_nll_wiggle(dyn4_vars, &kernel, PW, &basis);
+        let dyn4_fourth = dyn4.contracted_fourth();
+        let fix4_vars: Vec<FixedRuntimeJet<TwoSeed<KW>, KW>> = (0..KW)
+            .map(|a| FixedRuntimeJet::from_inner(TwoSeed::seed(p[a], a, dir_u[a], dir_v[a])))
+            .collect();
+        let fix4_fourth = sls_row_nll_wiggle(&fix4_vars, &kernel, PW, &basis)
+            .into_inner()
+            .contracted_fourth();
+        for a in 0..KW {
+            for b in 0..KW {
+                let d = dyn4_fourth[a * KW + b];
+                let s = fix4_fourth[a][b];
+                assert!(
+                    (d - s).abs() <= band(d, s),
+                    "wiggle order-4 F[{a}][{b}]: dynamic {d:+.15e} vs padded-static {s:+.15e}"
+                );
+            }
+        }
+
+        // Feedback-coupled timing barrier (no `std::hint::black_box`), the same
+        // loop-carried recurrence as the sibling release gates: iteration `n`'s
+        // input depends on iteration `n-1`'s folded output, so the compiler can
+        // neither hoist the row call out of the loop nor drop it, and the `1e-18`
+        // scale keeps the perturbed primary bit-adjacent to the fixture.
+        fn best_ns<F: FnMut(f64) -> f64>(iterations: usize, base: f64, mut evaluate: F) -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let mut checksum = 0.0_f64;
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    checksum += evaluate(base + checksum * 1e-18);
+                }
+                assert!(
+                    checksum.is_finite(),
+                    "SLS wiggle release-measure checksum must stay finite"
+                );
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            best * 1e9 / iterations as f64
+        }
+
+        let iterations = 30_000usize;
+
+        // Order 2: amortized reused arena (production) vs fresh arena per row.
+        let mut prod_arena2 = DynamicJetArena::new();
+        let reused2_ns = best_ns(iterations, p[0], |p0| {
+            let mut pp = p;
+            pp[0] = p0;
+            prod_arena2.reset();
+            let vars = prod_arena2
+                .alloc_slice_fill_with(KW, |a| DynamicOrder2::variable(pp[a], a, KW, &prod_arena2));
+            let out = sls_row_nll_wiggle(vars, &kernel, PW, &basis);
+            out.value() + out.g()[0] + out.h()[0]
+        });
+        let fresh2_ns = best_ns(iterations, p[0], |p0| {
+            let mut pp = p;
+            pp[0] = p0;
+            let fresh = DynamicJetArena::new();
+            let vars =
+                fresh.alloc_slice_fill_with(KW, |a| DynamicOrder2::variable(pp[a], a, KW, &fresh));
+            let out = sls_row_nll_wiggle(vars, &kernel, PW, &basis);
+            out.value() + out.g()[0] + out.h()[0]
+        });
+        eprintln!(
+            "SLS-WIGGLE-DYN-932 order=2 production={reused2_ns:.2} ns/row \
+             fresh_arena={fresh2_ns:.2} ns/row hand_over_production={:.6}",
+            fresh2_ns / reused2_ns,
+        );
+
+        // Order 3: directional third.
+        let mut prod_arena3 = DynamicJetArena::new();
+        let reused3_ns = best_ns(iterations, p[0], |p0| {
+            let mut pp = p;
+            pp[0] = p0;
+            prod_arena3.reset();
+            let vars = prod_arena3.alloc_slice_fill_with(KW, |a| {
+                DynamicOneSeed::seed_direction(pp[a], a, dir_u[a], KW, &prod_arena3)
+            });
+            let out = sls_row_nll_wiggle(vars, &kernel, PW, &basis);
+            out.value() + out.contracted_third()[0]
+        });
+        let fresh3_ns = best_ns(iterations, p[0], |p0| {
+            let mut pp = p;
+            pp[0] = p0;
+            let fresh = DynamicJetArena::new();
+            let vars = fresh.alloc_slice_fill_with(KW, |a| {
+                DynamicOneSeed::seed_direction(pp[a], a, dir_u[a], KW, &fresh)
+            });
+            let out = sls_row_nll_wiggle(vars, &kernel, PW, &basis);
+            out.value() + out.contracted_third()[0]
+        });
+        eprintln!(
+            "SLS-WIGGLE-DYN-932 order=3 production={reused3_ns:.2} ns/row \
+             fresh_arena={fresh3_ns:.2} ns/row hand_over_production={:.6}",
+            fresh3_ns / reused3_ns,
+        );
+
+        // Order 4: second-directional fourth.
+        let mut prod_arena4 = DynamicJetArena::new();
+        let reused4_ns = best_ns(iterations, p[0], |p0| {
+            let mut pp = p;
+            pp[0] = p0;
+            prod_arena4.reset();
+            let vars = prod_arena4.alloc_slice_fill_with(KW, |a| {
+                DynamicTwoSeed::seed(pp[a], a, dir_u[a], dir_v[a], KW, &prod_arena4)
+            });
+            let out = sls_row_nll_wiggle(vars, &kernel, PW, &basis);
+            out.value() + out.contracted_fourth()[0]
+        });
+        let fresh4_ns = best_ns(iterations, p[0], |p0| {
+            let mut pp = p;
+            pp[0] = p0;
+            let fresh = DynamicJetArena::new();
+            let vars = fresh.alloc_slice_fill_with(KW, |a| {
+                DynamicTwoSeed::seed(pp[a], a, dir_u[a], dir_v[a], KW, &fresh)
+            });
+            let out = sls_row_nll_wiggle(vars, &kernel, PW, &basis);
+            out.value() + out.contracted_fourth()[0]
+        });
+        eprintln!(
+            "SLS-WIGGLE-DYN-932 order=4 production={reused4_ns:.2} ns/row \
+             fresh_arena={fresh4_ns:.2} ns/row hand_over_production={:.6}",
+            fresh4_ns / reused4_ns,
+        );
+    }
 }
 
 #[cfg(test)]
