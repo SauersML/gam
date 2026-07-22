@@ -830,6 +830,182 @@ pub(crate) fn duchon_range_floor_curvature(
     Ok(symmetrize_penalty(&out))
 }
 
+/// First and second log-κ (ψ) derivatives of the range-floored curvature Gram.
+///
+/// The forward `duchon_native_penalty_candidates` ships the `Primary` block as
+/// `range_floor(Ω(ψ))`, where `range_floor` clamps every eigenvalue below
+/// `floor(ψ) = max(embedded_dim, n)·1e-8·λ_max(Ω(ψ))` up to that floor (#1815).
+/// The clamp is a spectral function `Ω ↦ U max(Λ, φ) Uᵀ` whose threshold `φ`
+/// itself moves with ψ (through `λ_max`), so its ψ-derivative is NOT the plain
+/// `Ω'`: the near-null curvature modes — precisely the high-frequency modes with
+/// the *largest* `λ'` — are pinned to `φ(ψ)`, killing their own derivative and
+/// replacing it with `φ' = c·λ_max'`. Omitting this makes the analytic Primary
+/// log-κ gradient overstate the true (floored) penalty derivative by ~60% on a
+/// 1-D hybrid Duchon, desyncing the outer REML gradient from the cost it is
+/// built on. This helper differentiates the clamp exactly via the
+/// Daleckii–Krein calculus (first and second Fréchet derivatives of a spectral
+/// function) plus the explicit `φ(ψ)` dependence.
+pub(crate) struct RangeFloorPsiJet {
+    pub value: Array2<f64>,
+    pub first: Array2<f64>,
+    pub second: Array2<f64>,
+}
+
+pub(crate) fn duchon_range_floor_curvature_psi_jet(
+    omega: &Array2<f64>,
+    omega_psi: &Array2<f64>,
+    omega_psi_psi: &Array2<f64>,
+    embedded_penalty_dim: usize,
+) -> Result<RangeFloorPsiJet, BasisError> {
+    let n = omega.nrows();
+    let sym = symmetrize_penalty(omega);
+    let sym_psi = symmetrize_penalty(omega_psi);
+    let sym_psi_psi = symmetrize_penalty(omega_psi_psi);
+    let passthrough = || RangeFloorPsiJet {
+        value: sym.clone(),
+        first: sym_psi.clone(),
+        second: sym_psi_psi.clone(),
+    };
+    if n == 0 {
+        return Ok(passthrough());
+    }
+    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
+    // Index of the eigenvalue of largest magnitude (mirrors `range_floor`'s
+    // `λ_max = max|λ|`; for the PSD curvature Gram this is the top eigenvalue).
+    let mut imax = 0usize;
+    let mut lam_max = 0.0_f64;
+    for (i, &v) in evals.iter().enumerate() {
+        if v.abs() > lam_max {
+            lam_max = v.abs();
+            imax = i;
+        }
+    }
+    if !lam_max.is_finite() || lam_max <= 0.0 {
+        return Ok(passthrough());
+    }
+    let c = (embedded_penalty_dim.max(n) as f64) * 1e-8;
+    let floor = c * lam_max;
+    // No mode below the floor ⇒ the clamp is locally the identity, so the plain
+    // derivatives pass through unchanged (matches `range_floor`'s early return).
+    if !evals.iter().any(|&v| v.is_finite() && v < floor) {
+        return Ok(passthrough());
+    }
+
+    let u = &evecs;
+    // Derivative matrices resolved into the eigenbasis: A = Uᵀ Ω' U, A2 = Uᵀ Ω'' U.
+    let a = u.t().dot(&sym_psi).dot(u);
+    let a2 = u.t().dot(&sym_psi_psi).dot(u);
+
+    // Moving threshold φ(ψ) = c·λ_max(ψ). Hellmann–Feynman for the (assumed
+    // simple) extremal eigenvalue: λ_max' = sign·A_{imax,imax}; the standard
+    // second-order eigenvalue perturbation gives λ_max''.
+    let sign = if evals[imax] >= 0.0 { 1.0 } else { -1.0 };
+    let tol = 1e-9 * lam_max;
+    let lam_max_prime = sign * a[[imax, imax]];
+    let mut lam_max_pp = a2[[imax, imax]];
+    for k in 0..n {
+        if k == imax {
+            continue;
+        }
+        let denom = evals[imax] - evals[k];
+        if denom.abs() > tol {
+            lam_max_pp += 2.0 * a[[imax, k]] * a[[imax, k]] / denom;
+        }
+    }
+    let lam_max_pp = sign * lam_max_pp;
+    let floor_prime = c * lam_max_prime;
+    let floor_pp = c * lam_max_pp;
+
+    // Scalar clamp g(λ) = max(λ, φ) and the indicator of the clamped subspace
+    // (∂g/∂φ = 1 on clamped modes, 0 otherwise).
+    let g = |lam: f64| lam.max(floor);
+    let gprime = |lam: f64| if lam > floor { 1.0 } else { 0.0 };
+    let clamped = |lam: f64| if lam <= floor { 1.0 } else { 0.0 };
+
+    // First divided difference of g (Daleckii–Krein weight for the implicit
+    // Ω-dependence), and the same for the clamp indicator (∂Γ¹/∂φ).
+    let fdd = |la: f64, lb: f64| -> f64 {
+        if (la - lb).abs() > tol {
+            (g(la) - g(lb)) / (la - lb)
+        } else {
+            gprime(0.5 * (la + lb))
+        }
+    };
+    let fdd_clamp = |la: f64, lb: f64| -> f64 {
+        if (la - lb).abs() > tol {
+            (clamped(la) - clamped(lb)) / (la - lb)
+        } else {
+            0.0
+        }
+    };
+    // Second divided difference of g (weight for the second Fréchet derivative).
+    let sdd = |la: f64, lb: f64, lc: f64| -> f64 {
+        if (la - lc).abs() > tol {
+            (fdd(la, lb) - fdd(lb, lc)) / (la - lc)
+        } else if (la - lb).abs() > tol {
+            (gprime(la) * (la - lb) - (g(la) - g(lb))) / ((la - lb) * (la - lb))
+        } else {
+            0.0
+        }
+    };
+
+    // Assemble the eigenbasis blocks, then rotate back with U (·) Uᵀ.
+    // Value: G = U diag(g(λ)) Uᵀ.
+    let mut gam1 = Array2::<f64>::zeros((n, n)); // Γ¹ ⊙ · weight
+    let mut gam_clamp = Array2::<f64>::zeros((n, n)); // ∂Γ¹/∂φ weight
+    for i in 0..n {
+        for j in 0..n {
+            gam1[[i, j]] = fdd(evals[i], evals[j]);
+            gam_clamp[[i, j]] = fdd_clamp(evals[i], evals[j]);
+        }
+    }
+    // Clamped-subspace projector in the eigenbasis (diagonal).
+    let clamp_diag: Vec<f64> = evals.iter().map(|&l| clamped(l)).collect();
+
+    // First derivative in the eigenbasis:
+    //   B1 = Γ¹ ⊙ A            (implicit Ω-dependence, Daleckii–Krein)
+    //      + φ' · Π            (explicit moving-threshold dependence)
+    let mut b1 = &gam1 * &a;
+    for i in 0..n {
+        b1[[i, i]] += floor_prime * clamp_diag[i];
+    }
+
+    // Second derivative in the eigenbasis:
+    //   B2 = Γ¹ ⊙ A2                                   (D_Ω h[Ω''])
+    //      + 2 · Σ_k sdd(λ_i,λ_k,λ_j) A_ik A_kj        (D²_Ω h[Ω',Ω'])
+    //      + 2 φ' · (∂Γ¹/∂φ ⊙ A)                        (cross Ω–φ term)
+    //      + φ'' · Π                                    (explicit φ'')
+    let mut b2 = &gam1 * &a2;
+    // second Fréchet block
+    for i in 0..n {
+        for j in 0..n {
+            let mut acc = 0.0;
+            for k in 0..n {
+                acc += sdd(evals[i], evals[k], evals[j]) * a[[i, k]] * a[[k, j]];
+            }
+            b2[[i, j]] += 2.0 * acc;
+        }
+    }
+    let cross = (&gam_clamp * &a).mapv(|v| 2.0 * floor_prime * v);
+    b2 = b2 + cross;
+    for i in 0..n {
+        b2[[i, i]] += floor_pp * clamp_diag[i];
+    }
+
+    // Value block diag(g(λ)).
+    let mut value_eig = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        value_eig[[i, i]] = g(evals[i]);
+    }
+
+    let rotate = |m: &Array2<f64>| symmetrize_penalty(&u.dot(m).dot(&u.t()));
+    Ok(RangeFloorPsiJet {
+        value: rotate(&value_eig),
+        first: rotate(&b1),
+        second: rotate(&b2),
+    })
+}
+
 pub fn monomial_exponents(dimension: usize, max_total_degree: usize) -> Vec<Vec<usize>> {
     fn recurse(
         axis: usize,
@@ -3484,5 +3660,120 @@ mod gc_spectrum_diag_1757_tests {
                 "{label}: condition number {cond} must be finite and >= 1"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod range_floor_psi_jet_tests {
+    use super::*;
+    use ndarray::Array2;
+
+    // Build a symmetric matrix from a lower-triangular seed so Ω(ψ) stays
+    // symmetric for every ψ.
+    fn sym_from(seed: &[f64], n: usize) -> Array2<f64> {
+        let mut m = Array2::<f64>::zeros((n, n));
+        let mut k = 0usize;
+        for i in 0..n {
+            for j in 0..=i {
+                m[[i, j]] = seed[k];
+                m[[j, i]] = seed[k];
+                k += 1;
+            }
+        }
+        m
+    }
+
+    // Controlled model: Ω(ψ) = Ω0 + ψ·B + ½ψ²·C with a WELL-SEPARATED base
+    // spectrum whose two smallest modes sit ~100× below the range floor and a
+    // deliberately SMALL non-commuting perturbation, so (a) the clamped set is
+    // stable across ±eps (the clamp is only C⁰ where a mode crosses the floor,
+    // which would corrupt a finite difference) while (b) B does not commute with
+    // Ω0, rotating the eigenvectors so the off-diagonal Daleckii–Krein terms are
+    // genuinely exercised. Ω0 = U diag(d) Uᵀ with U the eigenvectors of a fixed
+    // symmetric seed and d spanning the floor boundary.
+    fn omega_at(psi: f64) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
+        let n = 5usize;
+        let seed = sym_from(
+            &[1.0, 0.3, 0.9, -0.2, 0.4, 1.1, 0.15, -0.25, 0.35, 0.8, 0.05, 0.2, -0.1, 0.3, 0.95],
+            n,
+        );
+        let (_evals, u) = FaerEigh::eigh(&seed, Side::Lower).expect("seed eigh");
+        // Target spectrum: three modes well above the floor (8e-8·λmax = 8e-8),
+        // two modes ~100× below it and mutually separated by 10×.
+        let d = [1.0_f64, 0.08, 0.006, 5.0e-10, 5.0e-11];
+        let mut base = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            for j in 0..n {
+                let mut acc = 0.0;
+                for k in 0..n {
+                    acc += u[[i, k]] * d[k] * u[[j, k]];
+                }
+                base[[i, j]] = acc;
+            }
+        }
+        let scale = 1.0e-3;
+        let b = sym_from(
+            &[0.7, -0.2, 0.5, 0.1, -0.3, 0.4, 0.05, 0.2, -0.1, 0.6, 0.02, -0.04, 0.03, 0.08, -0.05],
+            n,
+        )
+        .mapv(|v| v * scale);
+        let c = sym_from(
+            &[0.2, 0.1, -0.15, 0.05, 0.2, -0.1, 0.03, -0.02, 0.04, 0.1, 0.01, 0.02, -0.03, 0.05, 0.02],
+            n,
+        )
+        .mapv(|v| v * scale);
+        let omega = &base + &b.mapv(|v| v * psi) + &c.mapv(|v| v * 0.5 * psi * psi);
+        let omega_psi = &b + &c.mapv(|v| v * psi);
+        (omega, omega_psi, c)
+    }
+
+    #[test]
+    fn range_floor_psi_jet_matches_central_differences() {
+        let dim = 8usize; // embedded_penalty_dim > n so the floor is active
+        let (o0, b0, c0) = omega_at(0.0);
+        let jet = duchon_range_floor_curvature_psi_jet(&o0, &b0, &c0, dim)
+            .expect("range-floor psi jet");
+
+        // The floored value must equal the standalone range-floor.
+        let direct = duchon_range_floor_curvature(&o0, dim).expect("range floor");
+        let val_err = (&jet.value - &direct).iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            val_err < 1e-10,
+            "range-floor value mismatch vs standalone: {val_err:.3e}"
+        );
+        // The floor must actually be biting (otherwise the test is vacuous).
+        let floor_gap = (&jet.value - &symmetrize_penalty(&o0))
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(floor_gap > 0.0, "range floor is not active — test is vacuous");
+
+        let eps = 1e-6;
+        let (op, _, _) = omega_at(eps);
+        let (om, _, _) = omega_at(-eps);
+        let vp = duchon_range_floor_curvature_psi_jet(&op, &b0, &c0, dim).unwrap().value;
+        let vm = duchon_range_floor_curvature_psi_jet(&om, &b0, &c0, dim).unwrap().value;
+        let fd_first = (&vp - &vm).mapv(|v| v / (2.0 * eps));
+        let first_err = (&jet.first - &fd_first).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let first_scale = jet.first.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-9);
+        assert!(
+            first_err / first_scale < 1e-4,
+            "range-floor first derivative mismatch: rel={:.3e} (err={first_err:.3e})",
+            first_err / first_scale
+        );
+
+        // FD of the analytic FIRST derivative gives the second.
+        let (op2, bp2, cp2) = omega_at(eps);
+        let (om2, bm2, cm2) = omega_at(-eps);
+        let fp = duchon_range_floor_curvature_psi_jet(&op2, &bp2, &cp2, dim).unwrap().first;
+        let fm = duchon_range_floor_curvature_psi_jet(&om2, &bm2, &cm2, dim).unwrap().first;
+        let fd_second = (&fp - &fm).mapv(|v| v / (2.0 * eps));
+        let second_err = (&jet.second - &fd_second).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let second_scale = jet.second.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-9);
+        assert!(
+            second_err / second_scale < 1e-3,
+            "range-floor second derivative mismatch: rel={:.3e} (err={second_err:.3e})",
+            second_err / second_scale
+        );
     }
 }

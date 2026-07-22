@@ -1719,8 +1719,28 @@ pub fn build_duchon_operator_penalty_psi_derivatives(
     // assertion fires here rather than at the spec layer so the
     // scale-free path stays fractional-clean.
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
-    let z_kernel =
+    let mut z_kernel =
         kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
+    // #1355: fold the frozen data-metric radial reparam `Z' = Z·V` so the
+    // operator-penalty ψ-derivatives assemble in the SAME rotated radial basis
+    // (`K·Z·V`) that the forward build's operator collocation matrices use
+    // (`duchon_operator_penalty_candidates` threads `radial_reparam` into
+    // `build_duchon_collocation_operator_matrices`). Without this fold the
+    // derivative differentiates the operator Gram in the raw `Z` frame while
+    // the REML cost is built in the `Z·V` frame — a design↔penalty desync that
+    // makes the analytic mass/tension log-κ gradient disagree with a central
+    // finite difference of the rebuilt penalty by orders of magnitude (the
+    // native `Primary`/trend arms already fold `V`).
+    if let Some(v) = spec.radial_reparam.as_ref() {
+        if v.nrows() != z_kernel.ncols() {
+            crate::bail_dim_basis!(
+                "Duchon frozen radial reparam shape {:?} does not match constrained kernel dimension {}",
+                v.dim(),
+                z_kernel.ncols()
+            );
+        }
+        z_kernel = fast_ab(&z_kernel, v);
+    }
     let n_basis = centers.nrows();
     if collocation_points.ncols() != dim {
         crate::bail_dim_basis!(
@@ -2194,20 +2214,67 @@ pub fn build_duchon_native_penalty_psi_derivatives(
     let omega_psi = project_kernel(&kernel_psi);
     let omega_psi_psi = project_kernel(&kernel_psi_psi);
 
+    // Mirror `duchon_native_penalty_candidates`' Primary construction exactly:
+    // the shipped curvature block is the RANGE-FLOORED Gram (#1815), whose
+    // eigenvalue clamp has a nontrivial ψ-derivative (the clamped near-null
+    // modes track the moving floor `c·λ_max(ψ)` rather than their own `λ'`).
+    // Differentiate the clamp via `duchon_range_floor_curvature_psi_jet` so the
+    // Primary log-κ derivative matches a finite difference of the rebuilt
+    // penalty (without this the analytic gradient overstates it by ~60%).
+    // `embedded_penalty_dim = total_cols` matches the forward `n_pre`.
+    let floored = crate::basis::duchon_range_floor_curvature_psi_jet(
+        &omega,
+        &omega_psi,
+        &omega_psi_psi,
+        total_cols,
+    )?;
+
     let outer_gauge =
         identifiability_transform.map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
-    let embed = |block: Array2<f64>| {
+    // Embed the kernel block into the total (kernel|poly) frame, place the
+    // κ-dependent machine-scale ridge on the affine SLOPE columns (constant
+    // column stays free) exactly as the forward builder does, then apply the
+    // outer identifiability projection. `poly_cols` (= total_cols - kernel_cols)
+    // is already in scope from the design assembly above.
+    let embed = |block: &Array2<f64>, ridge: f64| {
         let mut out = Array2::<f64>::zeros((total_cols, total_cols));
-        out.slice_mut(s![..kernel_cols, ..kernel_cols])
-            .assign(&block);
+        out.slice_mut(s![..kernel_cols, ..kernel_cols]).assign(block);
+        if poly_cols > 1 {
+            for col in (kernel_cols + 1)..total_cols {
+                out[[col, col]] = ridge;
+            }
+        }
         match outer_gauge.as_ref() {
             Some(gauge) => symmetrize(&gauge.restrict_penalty(&out)),
             None => symmetrize(&out),
         }
     };
-    let primary = embed(omega);
-    let primary_psi = embed(omega_psi);
-    let primary_psi_psi = embed(omega_psi_psi);
+    // Affine ridge = DUCHON_AFFINE_NATIVE_RIDGE_REL · curvature_scale, where the
+    // curvature scale is the mean diagonal of the FLOORED kernel block (matching
+    // the forward builder); its ψ-derivatives follow from the floored block's.
+    let mean_diag = |m: &Array2<f64>| -> f64 {
+        if kernel_cols == 0 {
+            return 0.0;
+        }
+        (0..kernel_cols).map(|i| m[[i, i]]).sum::<f64>() / kernel_cols as f64
+    };
+    let curvature_scale = mean_diag(&floored.value).abs();
+    let (ridge, ridge_psi, ridge_psi_psi) = if poly_cols > 1 {
+        if curvature_scale > 0.0 {
+            (
+                DUCHON_AFFINE_NATIVE_RIDGE_REL * curvature_scale,
+                DUCHON_AFFINE_NATIVE_RIDGE_REL * mean_diag(&floored.first),
+                DUCHON_AFFINE_NATIVE_RIDGE_REL * mean_diag(&floored.second),
+            )
+        } else {
+            (DUCHON_AFFINE_NATIVE_RIDGE_REL, 0.0, 0.0)
+        }
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    let primary = embed(&floored.value, ridge);
+    let primary_psi = embed(&floored.first, ridge_psi);
+    let primary_psi_psi = embed(&floored.second, ridge_psi_psi);
     let (_, primary_psi_norm, primary_psi_psi_norm, _) =
         normalize_penaltywith_psi_derivatives(&primary, &primary_psi, &primary_psi_psi);
 
@@ -2294,7 +2361,9 @@ pub fn build_duchon_native_penalty_psi_derivatives(
             + fast_atb(&center_design_psi, &center_design_psi).mapv(|value| 2.0 * value)
             + fast_atb(&center_design, &center_design_psi_psi)),
     );
-    let trend_jet = function_space_subspace_shrinkage_derivatives(
+    // Complementary metric ridge (gam#2372): differentiate `N(NᵀG(ψ)N)Nᵀ`,
+    // matching the forward `duchon_native_penalty_candidates` trend block.
+    let trend_jet = function_space_subspace_trend_ridge_derivatives(
         &trend_frame,
         &gram,
         &gram_psi,
@@ -2452,10 +2521,10 @@ pub(crate) fn fill_periodic_duchon_kernel_psi_matrices(
     length_scale: f64,
     p_order: usize,
     s_order: usize,
-    coeffs: &DuchonPartialFractionCoeffs,
 ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), BasisError> {
     let n = rows.nrows();
     let k = centers.nrows();
+    let kappa = 1.0 / length_scale.max(1e-300);
     let mut kernel = Array2::<f64>::zeros((n, k));
     let mut kernel_psi = Array2::<f64>::zeros((n, k));
     let mut kernel_psi_psi = Array2::<f64>::zeros((n, k));
@@ -2463,11 +2532,15 @@ pub(crate) fn fill_periodic_duchon_kernel_psi_matrices(
         let x = wrap_to_period(rows[[i, 0]], left, period);
         for j in 0..k {
             let r = periodic_distance_1d(x, centers[[j, 0]], period);
-            let core =
-                duchon_radial_core_psi_triplet(r, length_scale, p_order, s_order, 1, coeffs)?;
-            kernel[[i, j]] = core.phi.value;
-            kernel_psi[[i, j]] = core.phi.psi;
-            kernel_psi_psi[[i, j]] = core.phi.psi_psi;
+            // Log-κ jet of the SAME exact circular periodization the forward
+            // periodic Duchon design uses (gam#2372): the ψ-derivatives of the
+            // wrapped-distance line kernel are not the derivatives of the true
+            // (PSD) periodic kernel, so the derivative path must periodize too.
+            let (value, psi, psi_psi) =
+                periodic_hybrid_duchon_kernel_psi_triplet(r, kappa, p_order, s_order, period)?;
+            kernel[[i, j]] = value;
+            kernel_psi[[i, j]] = psi;
+            kernel_psi_psi[[i, j]] = psi_psi;
         }
     }
     Ok((kernel, kernel_psi, kernel_psi_psi))
@@ -2541,7 +2614,6 @@ pub(crate) fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
             length_scale,
             p_order,
             s_order,
-            &coeffs,
         )?;
     let kernel_amp = duchon_kernel_amplification(
         centers.view(),
@@ -2581,7 +2653,6 @@ pub(crate) fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
             length_scale,
             p_order,
             s_order,
-            &coeffs,
         )?;
     let omega = kernel_gauge.restrict_penalty(&center_kernel);
     let omega_psi = kernel_gauge.restrict_penalty(&center_kernel_psi);

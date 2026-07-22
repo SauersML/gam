@@ -1397,6 +1397,70 @@ pub(crate) fn materialize_owned_terminal_unpenalized_hessian<
     Ok(hessian)
 }
 
+/// Positive-definite gate + exact inverse of a converged posterior precision.
+///
+/// Factored out of [`compute_joint_covariance`] so the identical gam#748
+/// spectral certificate runs on EITHER the full precision `H + S_λ` (an
+/// unconstrained mode) OR its active-face tangent restriction
+/// `Zᵀ(H + S_λ)Z` (a mode sitting on active inequality constraints).
+/// `dim_for_tol` is the dimension whose `dim²·ε` factor sets the definiteness
+/// tolerance — the ambient `p` for the full matrix, the tangent dimension `r`
+/// for a reduced face. `face` names the geometry in the refusal diagnostic.
+///
+/// The gate is unchanged from the historical inline form for the full-space
+/// call (`dim_for_tol == p`), so unconstrained fits are byte-identical.
+fn spd_covariance_from_precision(
+    precision: &Array2<f64>,
+    dim_for_tol: usize,
+    face: &str,
+) -> Result<Array2<f64>, String> {
+    let p = precision.nrows();
+    let (evals, evecs) = FaerEigh::eigh(precision, Side::Lower).map_err(|e| {
+        format!("joint posterior-precision eigendecomposition failed on the {face}: {e}")
+    })?;
+    let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+    let eps_np = f64::EPSILON * (dim_for_tol as f64) * (dim_for_tol as f64);
+    let tol = (10.0 * eps_np * max_abs_eval).max(100.0 * f64::EPSILON);
+    if let Some(&min_eval) = evals
+        .iter()
+        .filter(|&&ev| ev < -tol)
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        let below = evals.iter().filter(|&&ev| ev < -tol).count();
+        return Err(format!(
+            "joint posterior precision H + S_λ is non-PD at the converged optimum on the \
+             {face} ({below} eigenvalue(s) below -tol, min(λ)={min_eval:.6e}, \
+             max|λ|={max_abs_eval:.6e}, tol={tol:.6e}); the mode is not a strict posterior \
+             maximum, so the reported covariance would be meaningless — fit-quality failure \
+             surfaced instead of δ-ridge masking (gam#748)"
+        ));
+    }
+    let flat = evals.iter().filter(|&&ev| ev <= tol).count();
+    if flat > 0 {
+        return Err(format!(
+            "joint posterior precision H + S_λ is singular at the converged optimum on the \
+             {face}: {flat} flat direction(s) (max|λ|={max_abs_eval:.6e}, tol={tol:.6e}). The \
+             posterior is improper along a flat direction — its variance is unbounded, so no \
+             finite covariance entry is honest there (a pseudo-inverse would claim zero \
+             variance, a δ-ridge an arbitrary finite one). Identify the direction via a \
+             constraint, penalty, or canonicalisation instead"
+        ));
+    }
+    // Strictly SPD: exact inverse through the eigenbasis, Σ = V diag(1/λ) Vᵀ.
+    let mut cov = Array2::<f64>::zeros((p, p));
+    for (k, &ev) in evals.iter().enumerate() {
+        let inv_ev = 1.0 / ev;
+        for i in 0..p {
+            let vi = evecs[[i, k]];
+            for j in 0..p {
+                cov[[i, j]] += inv_ev * vi * evecs[[j, k]];
+            }
+        }
+    }
+    symmetrize_dense_in_place(&mut cov);
+    Ok(cov)
+}
+
 pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -1442,50 +1506,96 @@ pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + '
     // downstream standard error, so both regimes surface as errors with the
     // spectrum diagnostics; the remedy is at the model (constraint, penalty,
     // canonicalisation), not in the covariance report.
+    //
+    // #2387: this definiteness gate must run in the SAME coefficient geometry
+    // the inner solve certified the mode on. When the converged mode sits on
+    // active inequality constraints (e.g. a monotone I-spline link-wiggle with
+    // tight γ≥0 rows), the inner solve certifies it a strict posterior maximum
+    // on the active-face TANGENT `null(A_act)` — curvature NORMAL to the face
+    // is neither part of the Laplace posterior nor differentiated by the
+    // constrained outer kernel (identical reasoning to the terminal
+    // `active_face_logdet_with_ridge_policy` and the fresh joint-mode curvature
+    // certificate). The Gaussian location-scale observed information is
+    // STRUCTURALLY indefinite (its per-row info `[[κ, 2rκ],[2rκ, 2r²κ]]` has
+    // determinant `−2r²κ² < 0`), so at a constrained optimum the negative
+    // curvature blocked by the active bounds routinely leaks into the
+    // constraint-normal space. Running the SPD gate on the FULL `H + S_λ` there
+    // wrongly refuses a genuinely-converged constrained fit; the gate and the
+    // inverse must both run on the reduced tangent. The reported covariance
+    // `Z (ZᵀHZ)⁻¹ Zᵀ` then carries zero variance in the constraint-normal
+    // directions — which is HONEST, not a #748-style fabrication: a coefficient
+    // pinned at a hard bound (with a nonnegative KKT multiplier) genuinely has
+    // no free posterior variance there, unlike an UNIDENTIFIED flat direction
+    // the model cannot resolve. With no active constraint the tangent is all of
+    // coefficient space and this reduces byte-identically to the full-space gate.
     let p = h.nrows();
-    let (evals, evecs) = FaerEigh::eigh(&h, Side::Lower)
-        .map_err(|e| format!("joint posterior-precision eigendecomposition failed: {e}"))?;
-    let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-    let eps_np = f64::EPSILON * (p as f64) * (p as f64);
-    let tol = (10.0 * eps_np * max_abs_eval).max(100.0 * f64::EPSILON);
-    if let Some(&min_eval) = evals
-        .iter()
-        .filter(|&&ev| ev < -tol)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        let below = evals.iter().filter(|&&ev| ev < -tol).count();
-        return Err(format!(
-            "joint posterior precision H + S_λ is non-PD at the converged optimum \
-             ({below} eigenvalue(s) below -tol, min(λ)={min_eval:.6e}, \
-             max|λ|={max_abs_eval:.6e}, tol={tol:.6e}); the mode is not a strict posterior \
-             maximum, so the reported covariance would be meaningless — fit-quality failure \
-             surfaced instead of δ-ridge masking (gam#748)"
-        ));
-    }
-    let flat = evals.iter().filter(|&&ev| ev <= tol).count();
-    if flat > 0 {
-        return Err(format!(
-            "joint posterior precision H + S_λ is singular at the converged optimum: {flat} \
-             flat direction(s) (max|λ|={max_abs_eval:.6e}, tol={tol:.6e}). The posterior is \
-             improper along a flat direction — its variance is unbounded, so no finite \
-             covariance entry is honest there (a pseudo-inverse would claim zero variance, a \
-             δ-ridge an arbitrary finite one). Identify the direction via a constraint, \
-             penalty, or canonicalisation instead"
-        ));
-    }
-    // Strictly SPD: exact inverse through the eigenbasis, Σ = V diag(1/λ) Vᵀ.
-    let mut cov = Array2::<f64>::zeros((p, p));
-    for (k, &ev) in evals.iter().enumerate() {
-        let inv_ev = 1.0 / ev;
-        for i in 0..p {
-            let vi = evecs[[i, k]];
-            for j in 0..p {
-                cov[[i, j]] += inv_ev * vi * evecs[[j, k]];
+    let block_constraints = collect_block_linear_constraints(family, states, specs)?;
+    let ranges = block_param_ranges(specs);
+    let mut block_active_sets: Vec<Option<Vec<usize>>> = Vec::with_capacity(specs.len());
+    for (b, constraints_opt) in block_constraints.iter().enumerate() {
+        match constraints_opt {
+            Some(constraints) => {
+                if constraints.ncols() != states[b].beta.len() {
+                    return Err(format!(
+                        "covariance active-face probe: block {b} has {} constraint columns but \
+                         {} coefficients",
+                        constraints.ncols(),
+                        states[b].beta.len(),
+                    ));
+                }
+                let candidate_rows: Vec<usize> = (0..constraints.nrows()).collect();
+                let tight = gam_solve::active_set::constraint_set_rows_tight_at_point(
+                    constraints,
+                    &states[b].beta,
+                    &candidate_rows,
+                )
+                .map_err(|e| {
+                    format!("covariance active-face tightness probe failed for block {b}: {e}")
+                })?;
+                block_active_sets.push((!tight.is_empty()).then_some(tight));
             }
+            None => block_active_sets.push(None),
         }
     }
-    symmetrize_dense_in_place(&mut cov);
-    Ok(cov)
+    let active_block = crate::blockwise_solve::assemble_active_constraint_block(
+        &block_constraints,
+        &block_active_sets,
+        &ranges,
+        p,
+    );
+    match active_block {
+        None => spd_covariance_from_precision(&h, p, "full posterior precision H + S_λ"),
+        Some(active) => match active_constraint_tangent_geometry(&active.a)? {
+            ActiveConstraintTangentGeometry::FullyPinned => {
+                // Every coefficient sits on an active bound: the constrained
+                // posterior has no free direction, so its variance is exactly
+                // zero everywhere. Report the zero covariance rather than
+                // refuse — a fully-pinned mode IS a valid (degenerate) fit.
+                log::warn!(
+                    "[custom-family covariance] converged mode is fully pinned by active \
+                     constraints ({} active row(s), p={p}); reporting a zero covariance (no \
+                     free posterior direction)",
+                    active.a.nrows(),
+                );
+                Ok(Array2::<f64>::zeros((p, p)))
+            }
+            ActiveConstraintTangentGeometry::Tangent(z) => {
+                let mut reduced = z.t().dot(&h).dot(&z);
+                symmetrize_dense_in_place(&mut reduced);
+                let reduced_cov = spd_covariance_from_precision(
+                    &reduced,
+                    z.ncols(),
+                    "active-face tangent Zᵀ(H + S_λ)Z",
+                )?;
+                // Lift the reduced covariance back to the full coefficient
+                // layout: Σ = Z Σ_z Zᵀ, zero in the pinned constraint-normal
+                // directions.
+                let mut cov = z.dot(&reduced_cov).dot(&z.t());
+                symmetrize_dense_in_place(&mut cov);
+                Ok(cov)
+            }
+        },
+    }
 }
 
 pub(crate) fn compute_joint_covariance_required<F: CustomFamily + Clone + Send + Sync + 'static>(

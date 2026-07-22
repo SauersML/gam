@@ -1390,6 +1390,16 @@ fn standard_link_complement(link: StandardLink, eta: f64, mu: f64) -> f64 {
 /// underflows to `0` only once the row is genuinely fully saturated (`z` at the
 /// `SAS_U_CLAMP` sinh scale), which is the correct value there. `Phi(-z)` is
 /// always in `[0, 1]`, so no clamp is needed.
+///
+/// The latent `asinh(eta)` is taken through the overflow-free [`asinh_jet5`]
+/// value — exactly as `sas_inverse_link_mu_d1` does — NOT the raw `f64::asinh`.
+/// The library `asinh` forms `x·x` internally, which overflows to `±∞` for
+/// `|eta| > 1.34e154` even though `asinh(±f64::MAX) ≈ ±710` is finite and well
+/// inside range. With a compressing `delta < 1` the true latent `delta·asinh`
+/// then stays in the map's identity interior (finite, unsaturated `mu`), so an
+/// overflowing complement would saturate to `±B` and return `Phi(∓sinh B) ∈
+/// {0,1}` — disagreeing with the forward `1 - mu` by up to ~0.15 and poisoning
+/// any `log(1 - mu)` tail term at extreme eta (#2389).
 #[inline]
 pub(crate) fn sas_link_complement(eta: f64, epsilon: f64, log_delta: f64, mu: f64) -> f64 {
     let eta = match finite_inverse_link_eta("SAS inverse link complement", eta) {
@@ -1400,7 +1410,7 @@ pub(crate) fn sas_link_complement(eta: f64, epsilon: f64, log_delta: f64, mu: f6
     if epsilon.abs() < 1e-12 && (delta - 1.0).abs() < 1e-12 {
         return standard_link_complement(StandardLink::Probit, eta, mu);
     }
-    let u_raw = delta * eta.asinh() + epsilon;
+    let u_raw = delta * asinh_jet5(eta).value + epsilon;
     let u = smooth_bound_jet(u_raw, SAS_U_CLAMP).g;
     normal_cdf(-u.sinh())
 }
@@ -3776,6 +3786,142 @@ mod tests {
                 (hi - center).abs() < 1e-11 && (center - lo).abs() < 1e-11,
                 "μ cliff across ε=0 at eta={eta}: lo={lo} center={center} hi={hi}"
             );
+        }
+    }
+
+    /// #2389 design point (b): all-order FD gate on the interior-exact bounded
+    /// latent map's jet tower, at interior / splice / saturation points. The map
+    /// underpins every SAS evaluation, yet the SAS-level tests only reach its
+    /// interior (the splice needs `|δ·asinh(η)+ε| ∈ (0.8B, 1.2B)`, i.e. η≈1e17).
+    /// This pins `smooth_bound_jet` directly: exact identities in the two flat
+    /// regimes and at the seams, odd symmetry, non-expansiveness, and a
+    /// derivative ladder (`d_{k} = d/dx d_{k-1}`) through fifth order in the
+    /// splice — where a wrong smoothstep coefficient would otherwise hide.
+    #[test]
+    fn smooth_bound_jet_tower_is_c5_and_fd_exact() {
+        let b = SAS_U_CLAMP;
+        let a = SPLICE_INTERIOR_FRAC * b; // 40
+        let c = (2.0 - SPLICE_INTERIOR_FRAC) * b; // 60
+        let jet = |x: f64| smooth_bound_jet(x, b);
+
+        // Interior |x| ≤ a: exact identity, every higher derivative exactly 0.
+        for &x in &[0.0, 0.5, 17.3, a - 1e-9, a] {
+            let j = jet(x);
+            assert_eq!(j.g, x, "interior identity value at x={x}");
+            assert_eq!(j.d1, 1.0, "interior d1 at x={x}");
+            assert_eq!((j.d2, j.d3, j.d4, j.d5), (0.0, 0.0, 0.0, 0.0));
+        }
+        // Saturation |x| ≥ c: exact ±B plateau, every derivative exactly 0.
+        for &x in &[c, c + 1e-9, 75.0, 1e12, f64::MAX] {
+            let j = jet(x);
+            assert_eq!(j.g, b, "saturation value at x={x}");
+            assert_eq!((j.d1, j.d2, j.d3, j.d4, j.d5), (0.0, 0.0, 0.0, 0.0, 0.0));
+        }
+        // Seam value + compactness: g(c) = B exactly (the c = 2B − a closure).
+        assert_eq!(jet(c).g, b);
+
+        // Odd symmetry: g,d2,d4 flip sign; d1,d3,d5 are even.
+        for &x in &[3.0, a - 2.0, 44.0, 50.0, 56.0, 100.0] {
+            let p = jet(x);
+            let m = jet(-x);
+            assert_eq!(m.g, -p.g, "g odd at x={x}");
+            assert_eq!(m.d1, p.d1, "d1 even at x={x}");
+            assert_eq!(m.d2, -p.d2, "d2 odd at x={x}");
+            assert_eq!(m.d3, p.d3, "d3 even at x={x}");
+            assert_eq!(m.d4, -p.d4, "d4 odd at x={x}");
+            assert_eq!(m.d5, p.d5, "d5 even at x={x}");
+        }
+
+        // Non-expansive + monotone + bounded across the whole range.
+        for i in 0..=240 {
+            let x = -80.0 + 160.0 * (i as f64) / 240.0;
+            let j = jet(x);
+            assert!((0.0..=1.0).contains(&j.d1), "d1 out of [0,1] at x={x}: {}", j.d1);
+            assert!(j.g.abs() <= b + 1e-12, "|g| exceeds B at x={x}: {}", j.g);
+        }
+
+        // FD derivative ladder through fifth order, at splice-INTERIOR points
+        // (kept ≥ 5 away from both seams so the O(h²) truncation stays small and
+        // the h-stencil never straddles a regime change). d_k must be the
+        // x-derivative of d_{k-1}; per-order tolerances track the realistic
+        // central-difference error, still orders of magnitude below the O(1)
+        // shift any wrong smoothstep coefficient would produce.
+        let h = 0.02;
+        for &x0 in &[45.0, 47.5, 50.0, 52.5, 55.0, -47.5, -52.5] {
+            let jp = jet(x0 + h);
+            let jm = jet(x0 - h);
+            let j0 = jet(x0);
+            let fd = |hi: f64, lo: f64| (hi - lo) / (2.0 * h);
+            let checks = [
+                ("d1", j0.d1, fd(jp.g, jm.g), 2e-6),
+                ("d2", j0.d2, fd(jp.d1, jm.d1), 2e-5),
+                ("d3", j0.d3, fd(jp.d2, jm.d2), 2e-4),
+                ("d4", j0.d4, fd(jp.d3, jm.d3), 2e-3),
+                ("d5", j0.d5, fd(jp.d4, jm.d4), 2e-2),
+            ];
+            for (name, analytic, numeric, tol) in checks {
+                assert!(
+                    (analytic - numeric).abs() < tol * (1.0 + analytic.abs()),
+                    "smooth_bound {name} FD mismatch at x={x0}: analytic={analytic:e} fd={numeric:e}"
+                );
+            }
+        }
+    }
+
+    /// #2389 general-case follow-up: the cancellation-free SAS complement must
+    /// live on the SAME latent surface as the forward inverse-link, so that
+    /// `μ + (1−μ) = 1` holds to full precision across the ENTIRE finite-`f64`
+    /// eta domain — including `|η| > 1.34e154`, where `η·η` overflows.
+    ///
+    /// The forward map routes `asinh` through the overflow-free [`asinh_jet5`]
+    /// (`hypot`-based value with an asymptotic `ln|η|+ln2` fallback), but
+    /// `sas_link_complement` used the raw `f64::asinh`, whose internal `x·x`
+    /// overflows to `+∞` near the domain edge. With a compressing `δ<1` the true
+    /// latent `δ·asinh(η)` stays deep in the map's identity interior (finite,
+    /// unsaturated μ), yet the overflowing complement drove `u_raw→∞`, saturated
+    /// to `±B`, and returned `Φ(∓sinh B)=0` — a full ~0.15 disagreement with the
+    /// forward `1−μ`, silently poisoning any `log(1−μ)` tail term at extreme η.
+    #[test]
+    fn sas_link_complement_mirrors_forward_map_across_finite_domain() {
+        let params = [
+            (0.0, 0.0),     // fast probit reduction
+            (0.25, -0.35),  // generic interior skew/scale
+            (0.0, -6.0),    // strong compression δ≈2.5e-3
+            (-0.5, -6.0),
+            (0.3, 6.0),     // strong dilation δ≈4e2
+        ];
+        let etas = [
+            -f64::MAX,
+            -1e160, // η·η overflows here; asinh(η)≈-369 is finite and in range
+            -1e6,
+            -3.0,
+            -0.2,
+            0.0,
+            0.4,
+            3.0,
+            1e6,
+            1e160,
+            f64::MAX,
+        ];
+        for &(epsilon, log_delta) in &params {
+            for &eta in &etas {
+                let mu = sas_inverse_link_jet(eta, epsilon, log_delta)
+                    .expect("finite SAS eta")
+                    .mu;
+                let complement = sas_link_complement(eta, epsilon, log_delta, mu);
+                assert!(
+                    complement.is_finite() && (0.0..=1.0).contains(&complement),
+                    "SAS complement out of [0,1] at η={eta} ε={epsilon} log_δ={log_delta}: {complement}"
+                );
+                // μ + (1−μ) = 1 on one consistent surface. Both endpoints are
+                // Φ(±z) for the same z, so equality holds to erfc round-off.
+                let sum = mu + complement;
+                assert!(
+                    (sum - 1.0).abs() < 1e-12,
+                    "SAS complement off the forward surface at η={eta} ε={epsilon} \
+                     log_δ={log_delta}: μ={mu} complement={complement} μ+comp={sum}"
+                );
+            }
         }
     }
 

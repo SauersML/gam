@@ -1085,8 +1085,42 @@ where
     }
 }
 
+/// Distinctive signature of a custom-family inner solve that did not reach its
+/// KKT fixed point, emitted by `psi_hyper` when it refuses to expose profile
+/// objective derivatives at a non-stationary β̂ (crates/gam-custom-family/src/
+/// psi_hyper.rs). The analytic outer gradient/Hessian require the inner KKT
+/// equation `F_β(β, θ) = 0`; when the inner solve stalls at a particular ρ that
+/// equation is unmet, so the trial is INFEASIBLE **at that ρ** — not a
+/// structural defect of the problem.
+pub(crate) const INNER_DERIVATIVE_KKT_REFUSAL_MARKER: &str =
+    "refusing to expose profile objective derivatives";
+
 pub(crate) fn into_objective_error(context: &str, err: EstimationError) -> ObjectiveEvalError {
-    ObjectiveEvalError::fatal(format!("{context}: {err}"))
+    let message = format!("{context}: {err}");
+    // #2358: a non-stationary custom-family inner solve at THIS ρ is a
+    // RECOVERABLE infeasibility (cost = ∞), not a fatal failure of the whole
+    // outer evaluation. Routing it through `Recoverable` lets the outer
+    // optimizer treat the trial as `OuterEval::infeasible` and BACK OFF to a
+    // feasible optimum (interior line-search / gradient path) or reject an
+    // infeasible seed and try the next one (seed-screening path) — the same
+    // `OuterEval::infeasible` mechanism the value-probe path already relies on.
+    // Previously EVERY objective error (including this per-ρ inner
+    // non-convergence) was classified `Fatal`: a single non-convergent interior
+    // ρ then aborted the entire fit even though the optimizer already held a
+    // feasible optimum to fall back to (the location-scale gagurine `tp` fit).
+    // Any ρ where the inner solve does reach stationarity is unaffected — it
+    // never carries this marker.
+    //
+    // This is necessary but not always sufficient: a fit whose EVERY seed is
+    // inner-infeasible (e.g. the wiggle two-block reference-flow, whose joint
+    // Newton trust region collapses on the coupled mean/log-σ/wiggle blocks)
+    // still fails, now with an honest "no candidate seeds passed validation"
+    // instead of a fatal abort. Repairing that inner collapse is separate.
+    if message.contains(INNER_DERIVATIVE_KKT_REFUSAL_MARKER) {
+        ObjectiveEvalError::recoverable(message)
+    } else {
+        ObjectiveEvalError::fatal(message)
+    }
 }
 
 pub(crate) fn finite_cost_or_error(context: &str, cost: f64) -> Result<f64, ObjectiveEvalError> {

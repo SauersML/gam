@@ -10,4 +10,4 @@ ruff>=0.6
 # exercised when CI=true (see mkdocs.yml); listed unconditionally so RTD has
 # them available.
 cairosvg>=2.7
-pillow>=10.0
+pillow>=12.3.0
