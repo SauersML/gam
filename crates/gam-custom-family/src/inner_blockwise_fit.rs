@@ -1612,12 +1612,25 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // wall-clock; cf. the explicit no-wall-clock note at the bottom of the
         // cycle loop), how many more cycles reaching `residual_tol` would take.
         const LINEAR_RATE_WINDOW: usize = 16;
-        // If, at the current geometric rate, reaching tol would take more than
-        // this many additional cycles, the ρ-evaluation cannot finish in a
-        // practical budget: exit `converged=false` with the finite β so the
-        // outer optimizer rejects this ρ and moves on (a well-conditioned ρ
-        // converges quadratically in a handful of cycles and never reaches the
-        // window, so this never touches a healthy solve).
+        // Floor on the slow-geometric-rate projection cap. The EFFECTIVE cap is
+        // `max(this floor, remaining budget = inner_max_cycles − cycle)`: if the
+        // geometric projection says tol is reachable within the caller's own
+        // remaining `inner_max_cycles` budget, the solve is allowed to run to it
+        // rather than being killed at a fixed 100 (gam#979 survival marginal-
+        // slope). The derivative-quality outer eval deliberately sets a large
+        // budget (`inner_max_cycles=1200`, psi_hyper.rs) BECAUSE the analytic
+        // LAML trace-gradient is only consistent at a joint-stationary β̂ with a
+        // very tight `residual_tol` (~1e-9): the 3-block survival-MS constrained
+        // solve descends geometrically (~0.94×/cycle) and reaches that tol in
+        // ~200 cycles — well inside 1200 — but a fixed cap of 100 cut it off at
+        // ~cycle 107, handed the outer a non-stationary mode, and the resulting
+        // IFT-inconsistent outer gradient stranded ARC at a spurious strict
+        // saddle it could not escape (the measured n=400/2500 centers=12 hard
+        // failure). Deferring the cap to the caller's budget lets the solve
+        // finish; a genuinely non-converging solve (rate ≥ 1, or projected past
+        // the remaining budget) still exits, and `inner_max_cycles` remains the
+        // hard backstop. Never SMALLER than the historic 100 (the floor), so no
+        // previously-surviving solve is cut off earlier.
         const LINEAR_RATE_PROJECTION_CAP: usize = 100;
         let mut residual_rate_history: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(LINEAR_RATE_WINDOW + 1);
@@ -6093,6 +6106,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // #979 hang (~0.99×/cycle orders above tol) projects far past the
             // cap. Deterministic: cycle indices and residual ratios only; the
             // `inner_max_cycles` ceiling remains the hard backstop.
+            // Effective cap defers to the caller's remaining `inner_max_cycles`
+            // budget (floored at the historic 100) — see the const doc.
+            let effective_projection_cap =
+                inner_max_cycles.saturating_sub(cycle).max(LINEAR_RATE_PROJECTION_CAP);
             let residual_tol_reachable_within_cap = residual_rate_history.len()
                 > LINEAR_RATE_WINDOW
                 && !gam_solve::loop_guard::slow_geometric_rate_exceeds_projection_cap(
@@ -6100,7 +6117,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     *residual_rate_history.front().unwrap(),
                     LINEAR_RATE_WINDOW,
                     residual_tol,
-                    LINEAR_RATE_PROJECTION_CAP,
+                    effective_projection_cap,
                 );
             if cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
@@ -6296,12 +6313,17 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 let oldest = *residual_rate_history.front().unwrap();
                 // Single source of truth for the slow-geometric-rate projection
                 // (gam#979): deterministic cycle-count projection, no wall-clock.
+                // The cap defers to the caller's remaining budget (floored at the
+                // historic 100) so a solve that can reach tol within its own
+                // `inner_max_cycles` is not cut off — see the const doc.
+                let effective_projection_cap =
+                    inner_max_cycles.saturating_sub(cycle).max(LINEAR_RATE_PROJECTION_CAP);
                 let too_slow = gam_solve::loop_guard::slow_geometric_rate_exceeds_projection_cap(
                     residual,
                     oldest,
                     LINEAR_RATE_WINDOW,
                     residual_tol,
-                    LINEAR_RATE_PROJECTION_CAP,
+                    effective_projection_cap,
                 );
                 if too_slow {
                     log::warn!(
@@ -6311,7 +6333,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         residual_tol,
                         (residual / oldest).powf(1.0 / (LINEAR_RATE_WINDOW as f64)),
                         LINEAR_RATE_WINDOW,
-                        LINEAR_RATE_PROJECTION_CAP,
+                        effective_projection_cap,
                         inner_max_cycles,
                     );
                     cycles_done = cycle + 1;

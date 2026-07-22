@@ -1409,21 +1409,33 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             );
             if matches!(eval_mode, EvalMode::ValueGradientHessian)
                 && analytic_joint_hessian_available
-                // Only a FEASIBLE mode owes an outer Hessian (gam#979). When the
-                // constrained inner mode is genuinely indefinite the profiled
-                // objective is +inf — this ρ/κ is infeasible for the Laplace
-                // approximation (the value-side convention of the active-face
-                // logdet) — and no analytic outer Hessian is produced for it.
-                // Demanding one there would re-raise the seed-κ saddle as a fatal
-                // error, defeating the value-side routing; instead pass the
-                // non-finite objective through so the outer optimizer's
-                // infeasible-on-non-finite-cost guard rejects the step.
-                && owned.result.objective.is_finite()
                 && !owned.result.outer_hessian.is_analytic()
             {
-                return Err(
-                    "exact survival marginal-slope joint objective did not return an outer Hessian"
-                        .to_string(),
+                // The outer objective was requested WITH its Hessian, and the
+                // family can supply one at a well-conditioned mode — but at THIS
+                // ρ/κ it could not (gam#979). The load-bearing reason is a
+                // genuinely-indefinite constrained inner mode: it is not a Laplace
+                // mode, so no SPD outer-Hessian curvature exists there. That is a
+                // property of the surface, NOT an implementation fault, so it must
+                // not abort the whole fit. Degrade GRACEFULLY: return the finite
+                // value and gradient with the Hessian left `Unavailable`. The
+                // outer solver declared `DeclaredHessianForm::Either`, so ARC
+                // takes a first-order (gradient / cubic-regularization) step at
+                // this ρ and walks OUT of the indefinite region toward a κ where
+                // the penalty convexifies the mode — instead of the former fatal
+                // "did not return an outer Hessian", which stranded the whole fit
+                // the first time ARC's re-seed probe landed on a saddle ρ (the
+                // measured survival-marginal-slope n=2500 centers=12 failure,
+                // AFTER ARC had already descended 1086.6 → 1081.5). A non-finite
+                // objective (a genuinely infeasible mode) still routes through the
+                // outer infeasible-on-non-finite-cost guard unchanged.
+                log::warn!(
+                    "[survival-marginal-slope/outer-eval] no analytic outer Hessian at this ρ \
+                     (objective={:.6e}, mode={:?}) — the constrained inner mode is indefinite \
+                     (not a Laplace mode); degrading to a first-order (value+gradient) evaluation \
+                     so the outer solver steps out of the indefinite region rather than aborting.",
+                    owned.result.objective,
+                    eval_mode,
                 );
             }
             Ok(ExactJointEvaluation {
