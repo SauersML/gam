@@ -2,9 +2,13 @@ use super::*;
 
 use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar,
-    MappedOrder2Accumulator, OneSeedBatch, Order2AtomChannels, RuntimeJetScalar,
+    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar, OneSeedBatch,
+    Order2AtomChannels, RuntimeJetScalar,
 };
+// Consumed only by the test-gated jet-compiled V/G/H oracle/racer
+// (`sls_row_vgh_compiled`) since the fused-schedule promotion.
+#[cfg(test)]
+use gam_math::jet_scalar::MappedOrder2Accumulator;
 use gam_row_macros::row_atom;
 use wide::f64x4;
 
@@ -580,9 +584,13 @@ pub(crate) fn sls_row_nll<S: JetScalar<SLS_ROW_K>>(
     Ok(nll)
 }
 
-/// Ahead-of-time sparse lowering of [`sls_row_nll`] for the V/G/H consumer.
-/// The scalar index expressions and outer derivative plan above are shared with
-/// every higher-order jet; only the execution representation changes.
+/// Ahead-of-time sparse jet lowering of [`sls_row_nll`] for the V/G/H
+/// channels. The scalar index expressions and outer derivative plan above are
+/// shared with every higher-order jet; only the execution representation
+/// changes. Since the SPEC-line-1 promotion of [`sls_row_vgh_fused`] this
+/// lowering is the mechanical oracle/racer the release cell measures
+/// production against, not a production consumer — hence test-gated.
+#[cfg(test)]
 #[inline(always)]
 fn sls_row_vgh_compiled(
     primary: &[f64; SLS_ROW_K],
