@@ -310,6 +310,22 @@ where
     ))
 }
 
+/// #2330 Patch D — shared per-row context for the residual-curvature
+/// third-derivative legs: the whitened `√w·M·r` error metric, its `√w` twin,
+/// the frozen assignments/jets, and the ordered-Beta–Bernoulli gate mode. One
+/// borrow per row replaces the per-call argument tower of the two leg helpers.
+#[derive(Clone, Copy)]
+struct PatchDResidualCtx<'a> {
+    row: usize,
+    error_metric: &'a [f64],
+    sqrt_w: f64,
+    assignments: &'a Array1<f64>,
+    second_jets: &'a [Array4<f64>],
+    third_jets: Option<&'a [Option<ndarray::Array5<f64>>]>,
+    is_obb: bool,
+    inv_tau: f64,
+}
+
 impl SaeManifoldTerm {
     /// #1418: apply the EXACT stationarity-Jacobian correction `ΔC·v = (A − B)·v`
     /// to a joint `(t, β)` vector, matrix-free via row-local work and ordered
@@ -1198,20 +1214,23 @@ impl SaeManifoldTerm {
     /// `l` the number of LOGIT derivatives among `{a,w}`, on the coord axes of the
     /// rest; nonzero only when `a,w` both touch `kβ`. `l≥1` uses the ordered-BB
     /// logistic-gate derivatives; skipped for other modes (softmax follow-on).
-    #[allow(clippy::too_many_arguments)]
     fn patchd_residual_third_leg_beta(
         &self,
-        row: usize,
+        ctx: &PatchDResidualCtx<'_>,
         a_var: SaeLocalRowVar,
         w_var: SaeLocalRowVar,
         ch: &SaeBorderChannel,
-        error_metric: &[f64],
-        sqrt_w: f64,
-        assignments: &Array1<f64>,
-        second_jets: &[Array4<f64>],
-        is_obb: bool,
-        inv_tau: f64,
     ) -> f64 {
+        let PatchDResidualCtx {
+            row,
+            error_metric,
+            sqrt_w,
+            assignments,
+            second_jets,
+            is_obb,
+            inv_tau,
+            ..
+        } = *ctx;
         let classify = |v: SaeLocalRowVar| -> (usize, Option<usize>) {
             match v {
                 SaeLocalRowVar::Coord { atom, axis } => (atom, Some(axis)),
@@ -1275,21 +1294,23 @@ impl SaeManifoldTerm {
     /// separate follow-on. `error_metric` already carries one `√w·M`; this leg
     /// carries the other `√w`, matching the `⟨error_metric, jets.second⟩`
     /// convention exactly.
-    #[allow(clippy::too_many_arguments)]
     fn patchd_residual_third_leg(
         &self,
-        row: usize,
+        ctx: &PatchDResidualCtx<'_>,
         a_var: SaeLocalRowVar,
         b_var: SaeLocalRowVar,
         w_var: SaeLocalRowVar,
-        error_metric: &[f64],
-        sqrt_w: f64,
-        assignments: &Array1<f64>,
-        second_jets: &[Array4<f64>],
-        third_jets: Option<&[Option<ndarray::Array5<f64>>]>,
-        is_obb: bool,
-        inv_tau: f64,
     ) -> f64 {
+        let PatchDResidualCtx {
+            row,
+            error_metric,
+            sqrt_w,
+            assignments,
+            second_jets,
+            third_jets,
+            is_obb,
+            inv_tau,
+        } = *ctx;
         // Classify each var as (atom, Some(axis)) for a coordinate or
         // (atom, None) for a logit; all three must share ONE atom.
         let classify = |v: SaeLocalRowVar| -> (usize, Option<usize>) {
@@ -1527,6 +1548,17 @@ impl SaeManifoldTerm {
                 }
             });
             let patchd_sqrt_w = w_row.sqrt();
+            let patchd_ctx: Option<PatchDResidualCtx<'_>> =
+                patchd_error_metric.as_deref().map(|em| PatchDResidualCtx {
+                    row,
+                    error_metric: em,
+                    sqrt_w: patchd_sqrt_w,
+                    assignments: &assignments,
+                    second_jets: &second_jets,
+                    third_jets: patchd_third_jets.as_deref(),
+                    is_obb: patchd_is_obb,
+                    inv_tau: patchd_obb_inv_tau,
+                });
             // #2308 — per-row spectral/gauge deflation the criterion factor applied.
             // It is FROZEN at the fixed stratum (the radial-gauge / ARD-inactive-half
             // null is ρ-invariant), so contracting the DEFLATED inverse `inv` and
@@ -1599,19 +1631,12 @@ impl SaeManifoldTerm {
                                 }
                             };
                         }
-                        if let Some(em) = patchd_error_metric.as_ref() {
+                        if let Some(ctx) = patchd_ctx.as_ref() {
                             dh += self.patchd_residual_third_leg(
-                                row,
+                                ctx,
                                 jets.vars[a],
                                 jets.vars[b],
                                 jets.vars[w],
-                                em,
-                                patchd_sqrt_w,
-                                &assignments,
-                                &second_jets,
-                                patchd_third_jets.as_deref(),
-                                patchd_is_obb,
-                                patchd_obb_inv_tau,
                             );
                         }
                         if want_data && exact_a {
@@ -1707,18 +1732,12 @@ impl SaeManifoldTerm {
                                 } else {
                                     0.0
                                 };
-                            if let Some(em) = patchd_error_metric.as_ref() {
+                            if let Some(ctx) = patchd_ctx.as_ref() {
                                 dh += self.patchd_residual_third_leg_beta(
-                                    row,
+                                    ctx,
                                     jets.vars[a],
                                     jets.vars[w],
                                     ch,
-                                    em,
-                                    patchd_sqrt_w,
-                                    &assignments,
-                                    &second_jets,
-                                    patchd_is_obb,
-                                    patchd_obb_inv_tau,
                                 );
                             }
                             gamma += 2.0 * inv[[base + a, total_t + ch.index]] * dh;
