@@ -396,9 +396,12 @@ impl ArdAxisPrior {
     /// Homogeneity-preserving smooth replacement for `α·max(cos, 0)` acting on
     /// the dimensionless cosine `cos = cos κt ∈ [−1,1]` (`alpha ≥ 0`). Uses the
     /// numerically stable softplus `max(c,0) + τ₀·ln(1 + e^{−|c|/τ₀})`, which
-    /// collapses to `max(c,0)` exactly once `|c| ≫ τ₀` (i.e. everywhere except a
-    /// band of width `~τ₀` around the clamp seam). Result is strictly positive,
-    /// so the majorized `H_tt` is PD (`B ≻ 0`), never merely PSD.
+    /// collapses to `max(c,0)` exactly (via IEEE underflow of `e^{−|c|/τ₀}`) once
+    /// `|c|` leaves the `~745·τ₀ ≈ 1e-5` band around the seam — so the majorizer is
+    /// bit-for-bit the hard clamp there, including a hard `0` on the deep concave
+    /// half. Mathematically `softplus > 0`, but the returned value is only `⪰ 0`
+    /// numerically (strictly positive within the transition band and on the convex
+    /// half). The majorizer is therefore PSD, matching the hard clamp it replaces.
     #[inline]
     pub(crate) fn smooth_clamp(alpha: f64, cos: f64) -> f64 {
         let tau = Self::CLAMP_TEMPERATURE;
@@ -422,7 +425,7 @@ impl ArdAxisPrior {
         }
     }
 
-    /// Positive-definite curvature used by the Newton/Schur majorizer.
+    /// Positive-semidefinite curvature used by the Newton/Schur majorizer.
     ///
     /// This is deliberately not the exact prior Hessian on a periodic axis: the
     /// exact `alpha*cos(kappa*t)` remains signed. The factorized inner solver and

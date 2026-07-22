@@ -278,17 +278,6 @@ fn certified_reduced_face_newton_candidate(
     let candidate_values = constraints
         .values(candidate.view())
         .map_err(|error| format!("reduced active-face candidate evaluation failed: {error}"))?;
-    // Rows the chord PRESSES INTO (descending slack) that land inside the
-    // working band at the truncated candidate — the simultaneously-binding
-    // blocker set (gam#979, see the carry below). The descent-rate filter is
-    // load-bearing twice over: it keeps the carry bounded by genuine blocking
-    // events (carrying the raw band membership accumulated without bound —
-    // warm_active_rows=180/720 by cycle 40 — and thrashed the QP), and it
-    // keeps RELEASED rows released (a row the duals released stays inside the
-    // band for a few cycles while the chord lifts off it; re-activating it
-    // re-pins the very direction the KKT says must free, and the measured
-    // accepted steps then RAISE the linearized residual, 94.6 → 106).
-    let mut pressed_band_rows: Vec<usize> = Vec::new();
     for row in 0..constraints.nrows() {
         let norm = constraints
             .row_norm(row)
@@ -299,17 +288,11 @@ fn certified_reduced_face_newton_candidate(
         let bound = constraints
             .bound(row)
             .map_err(|error| format!("reduced active-face candidate bound failed: {error}"))?;
-        if bound == f64::NEG_INFINITY {
-            continue;
-        }
-        let scaled_slack = (candidate_values[row] - bound) / norm;
-        if scaled_slack < -gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
-            return Ok(None);
-        }
-        if values_delta[row] < 0.0
-            && scaled_slack <= gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL
+        if bound != f64::NEG_INFINITY
+            && (candidate_values[row] - bound) / norm
+                < -gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
         {
-            pressed_band_rows.push(row);
+            return Ok(None);
         }
     }
 
@@ -342,35 +325,6 @@ fn certified_reduced_face_newton_candidate(
         && !next_active.contains(&row)
     {
         next_active.push(row);
-    }
-    // MULTI-BLOCKER ACTIVATION (gam#979 CTN face accretion). Truncating at the
-    // designated first blocker while several rows land in the working band at
-    // the same chord fraction used to carry only ONE of them: the next cycle
-    // re-proposed a near-identical chord, hit the next row, and the face grew
-    // one row per cycle (the measured 340/372-cycle Zeno accretion of the
-    // #2301 n=80 CTN fit — an 80-row cone over a 6-dim block cannot complete
-    // its face at one exchange per cycle inside the inner budget). Carry every
-    // row the truncated chord PRESSES INTO the working band (`pressed_band_
-    // rows`: descending slack AND band-tight at the candidate, ascending
-    // index), so the whole simultaneously-binding set activates in one cycle.
-    // The descent-rate condition is what separates this from the two measured
-    // over-carries: the raw band membership accumulated without bound and
-    // thrashed the QP (warm_active_rows=180/720 by cycle 40, working-set-
-    // repeat hard failure), and the rank-reduced tight face at the candidate
-    // re-activated rows the duals had just RELEASED — a released row stays
-    // inside the band while the chord lifts off it, and re-pinning it holds
-    // the very direction the KKT needs freed (measured: accepted steps RAISED
-    // the linearized residual 94.6 → 106 and the solve parked at
-    // active_set_incomplete). A pressed row is by definition one the chord is
-    // driving tight, never one it is leaving. Truncated chords only — an
-    // untruncated certified Newton step keeps its exact-face semantics
-    // unchanged.
-    if blocking_row.is_some() {
-        for row in pressed_band_rows {
-            if !next_active.contains(&row) {
-                next_active.push(row);
-            }
-        }
     }
     Ok(Some((candidate, next_active, exact_newton)))
 }
@@ -580,52 +534,6 @@ mod exact_face_newton_tests {
         assert!((alpha - 1.0 / 1.4).abs() <= 1e-15);
     }
 
-    #[test]
-    fn reduced_face_truncation_carries_every_simultaneously_binding_blocker() {
-        // z >= 0 is the active face; the tangent Newton step (2, 2, 0) meets
-        // the two inactive rows x <= 1 and y <= 1 at the SAME chord fraction
-        // 1/2. The single-blocker carry activated only one of them per cycle
-        // (the Zeno accretion); the truncated candidate must land both rows
-        // inside the working band and carry BOTH in the returned face.
-        let hessian = array![
-            [1.0_f64, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0]
-        ];
-        let rhs = array![2.0_f64, 2.0, 0.0];
-        let beta = array![0.0_f64, 0.0, 0.0];
-        let constraints = ConstraintSet::Dense(
-            LinearInequalityConstraints::new(
-                array![
-                    [0.0_f64, 0.0, 1.0],
-                    [-1.0, 0.0, 0.0],
-                    [0.0, -1.0, 0.0]
-                ],
-                array![0.0, -1.0, -1.0],
-            )
-            .expect("z>=0, x<=1, y<=1"),
-        );
-        let (candidate, active, exact) =
-            certified_reduced_face_newton_candidate(&hessian, &rhs, &beta, &constraints, &[0])
-                .expect("reduced face classification")
-                .expect("tangent descent truncated at the simultaneous blockers");
-        assert!(candidate[2].abs() <= 1e-12);
-        assert!(
-            candidate[0] <= 1.0 && candidate[1] <= 1.0,
-            "candidate must not overstep either blocker ({}, {})",
-            candidate[0],
-            candidate[1]
-        );
-        assert!(
-            (1.0 - candidate[0]) <= gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL
-                && (1.0 - candidate[1]) <= gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL,
-            "both blockers must land inside the working band ({}, {})",
-            candidate[0],
-            candidate[1]
-        );
-        assert_eq!(active, vec![0, 1, 2]);
-        assert!(!exact);
-    }
 }
 
 pub(crate) fn fused_first_attempt_log_likelihood<

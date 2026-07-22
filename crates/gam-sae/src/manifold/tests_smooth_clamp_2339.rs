@@ -80,16 +80,31 @@ fn seam_identity_reconstructs_exact_hess() {
 }
 
 #[test]
-fn majorizer_is_strictly_positive_everywhere() {
-    // `B ≻ 0`: softplus is strictly positive, so the majorized H_tt is PD even on
-    // the concave half where the exact curvature `α cos κt` is negative.
+fn majorizer_is_positive_semidefinite() {
+    // `B ⪰ 0` everywhere (the majorizer never contributes negative curvature),
+    // matching the hard clamp it replaces. Mathematically softplus > 0, but on the
+    // deep concave half `e^{cos/τ₀}` underflows so the returned value is exactly 0
+    // (bit-identical to `max(cos,0)` there) — hence PSD, not strictly PD.
     let period = 1.0;
+    let kappa = TAU / period;
     for &alpha in &[1e-6, 1e-2, 1.0, 50.0, 1e4] {
         for i in 0..512 {
             let t = i as f64 * (period / 512.0);
+            let cos = (kappa * t).cos();
             let b = ArdAxisPrior::eval(alpha, t, Some(period)).psd_majorizer_hess();
-            assert!(b > 0.0, "majorizer must be strictly positive; got {b} at t={t}");
+            assert!(b >= 0.0, "majorizer must be non-negative; got {b} at t={t}");
+            // On the convex half the majorizer is strictly positive (it is at least
+            // the hard clamp `α·cos > 0`).
+            if cos > 1e-4 {
+                assert!(b > 0.0, "convex-half majorizer must be positive; got {b} at t={t}");
+            }
         }
+    }
+    // Within the transition band around the seam the smoothing lifts the majorizer
+    // strictly above zero even where the exact curvature is zero/negative.
+    for &alpha in &[1.0, 100.0] {
+        assert!(ArdAxisPrior::smooth_clamp(alpha, 0.0) > 0.0);
+        assert!(ArdAxisPrior::smooth_clamp(alpha, -tau0()) > 0.0);
     }
 }
 
