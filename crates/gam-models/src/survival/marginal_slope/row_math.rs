@@ -2903,6 +2903,98 @@ mod tests {
         measure_width!(8, 11);
     }
 
+    /// #932 release speed gate for the hot K=1 SCALAR rigid row (the
+    /// inner-Newton `rigid_row_order2` lowering behind
+    /// [`row_primary_closed_form`]) against the retained strongest hand
+    /// schedule [`test_support::row_primary_closed_form_hand_reference`].
+    /// The packed-widths gate above times the VECTOR workspace path only, so
+    /// this is the dedicated scalar cell. Emits one harness-parsed
+    /// `hand_over_production` token per event branch; the MSI release harness
+    /// fails closed on any cell `<= 1`.
+    #[test]
+    fn release_measure_rigid_scalar_order2_vs_strongest_hand_932() {
+        use std::time::Instant;
+
+        // One ordinary interior row per event branch: censored (d=0) and
+        // event (d=1) evaluate different live derivative stacks, so each is
+        // its own measured cell.
+        let cases = [
+            (-0.7, 0.4, 0.8, -0.3, 0.6, 1.0, 0.0, 0.75),
+            (0.2, -0.5, 1.4, 0.9, -1.1, 0.8, 1.0, 1.0),
+        ];
+
+        // Feedback-coupled timing barrier (no `std::hint::black_box`): each
+        // iteration nudges the observed-slope primary by a negligible multiple
+        // of the running checksum, and the checksum folds value, gradient, and
+        // Hessian channels. The loop-carried recurrence makes iteration `n`'s
+        // input depend on iteration `n-1`'s output, so the pure row call can
+        // be neither hoisted nor dropped; the `1e-18` scale keeps the
+        // perturbed primary bit-adjacent to the fixture regime.
+        fn best_ns<F>(iterations: usize, base_g: f64, evaluate: F) -> f64
+        where
+            F: Fn(f64) -> (f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]),
+        {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let mut checksum = 0.0_f64;
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    let (value, gradient, hessian) = evaluate(base_g + checksum * 1e-18);
+                    checksum += value + gradient[0] + hessian[0][0];
+                }
+                assert!(
+                    checksum.is_finite(),
+                    "rigid scalar release-measure checksum must stay finite"
+                );
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            best * 1e9 / iterations as f64
+        }
+
+        let iterations = 2_000_000usize;
+        for &(q0, q1, qd1, g, z, w, d, scale) in &cases {
+            // Parity pin on the exact benchmarked inputs (the richer sweep
+            // lives in `canonical_rigid_order2_matches_strongest_hand_schedule_932`).
+            let canonical = row_primary_closed_form(q0, q1, qd1, g, z, w, d, 1.0e-8, scale)
+                .expect("canonical rigid row");
+            let hand = test_support::row_primary_closed_form_hand_reference(
+                q0, q1, qd1, g, z, w, d, 1.0e-8, scale,
+            )
+            .expect("strongest hand rigid row");
+            let tolerance = 2.0e-11 * canonical.0.abs().max(hand.0.abs()).max(1.0);
+            assert!(
+                (canonical.0 - hand.0).abs() <= tolerance,
+                "event={d:.0} value: canonical={:+.16e} hand={:+.16e}",
+                canonical.0,
+                hand.0,
+            );
+
+            let production_ns = best_ns(iterations, g, |perturbed_g| {
+                row_primary_closed_form(q0, q1, qd1, perturbed_g, z, w, d, 1.0e-8, scale)
+                    .expect("canonical rigid row")
+            });
+            let hand_ns = best_ns(iterations, g, |perturbed_g| {
+                test_support::row_primary_closed_form_hand_reference(
+                    q0,
+                    q1,
+                    qd1,
+                    perturbed_g,
+                    z,
+                    w,
+                    d,
+                    1.0e-8,
+                    scale,
+                )
+                .expect("strongest hand rigid row")
+            });
+            eprintln!(
+                "RIGID-SCALAR-932 event={d:.0} production={production_ns:.2} ns/row \
+                 hand={hand_ns:.2} ns/row hand_over_production={:.6}",
+                hand_ns / production_ns,
+            );
+        }
+    }
+
     /// #932 cutover gate: every live K=1 scalar caller now uses the packed
     /// lowering of `rigid_row_nll`. Pin every returned channel against the
     /// retired strongest hand schedule over both event branches, ordinary
