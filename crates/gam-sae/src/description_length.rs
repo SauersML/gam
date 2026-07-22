@@ -229,11 +229,16 @@ pub struct BirthMdlPrescreen {
 /// bits and should reach the e-process gate):
 ///
 /// ```text
-///   ΔMDL = ρ̂·N·[ (ŝ−d−1)·½log₂(1+λ̂/δ) + (ŝ−1)·log₂(G/L0) ]
+///   ΔMDL = ρ̂·N·[ (ŝ−d−1)·½log₂(λ̂/δ) + (ŝ−1)·log₂(G/L0) ]
 ///          − (m−ŝ)·P·½log₂(N)
 /// ```
 ///
-/// * the **code** term `(ŝ−d−1)·½log₂(1+λ̂/δ)` credits the scalars the curved
+/// The code coefficient is the Gaussian rate-distortion rate `scalar_rate_bits`
+/// (`½max(log₂(λ̂/δ),0)`) — the SAME per-scalar rate the Eq-4 scorer water-fills,
+/// so the pre-screen is priced in the scorer's own currency (not the `½log₂(1+SNR)`
+/// channel-capacity form, which the scorer never uses).
+///
+/// * the **code** term `(ŝ−d−1)·½log₂(λ̂/δ)` credits the scalars the curved
 ///   atom transmits fewer of than the flat span (zero for circle/sphere, positive
 ///   for torus/helix — signed, so a topology that needs MORE code dims than the
 ///   span is honestly charged);

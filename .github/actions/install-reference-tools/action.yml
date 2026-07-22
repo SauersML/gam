@@ -83,7 +83,7 @@ runs:
                     "gsl","quantreg","mlt","tram","basefun","loo","jsonlite",
                     "spheresmooth","Directional","nprotreg","compositions",
                     "robCompositions","scoringrules","gamboostLSS","mboost","bamlss",
-                    "gamlss.add")
+                    "gamlss.add","DirichletReg")
           for (p in pkgs) if (!requireNamespace(p, quietly=TRUE))
             try(install.packages(p), silent=TRUE)
           # SECOND pass: anything still missing (a binary that mismatched the
@@ -180,7 +180,13 @@ runs:
         # statsmodels (generalized_additive_model.py:814), failing the GLMGam
         # reference tests through no fault of the comparator script (#1070).
         # 0.14.1 is the last release whose select_penweight GCV runs clean.
-        pip install "numpy<2" pandas scipy scikit-learn "statsmodels<0.14.2"
+        # scipy: pin <1.16. scipy 1.16 deleted the private `_lazywhere` helper
+        # from `scipy._lib._util` (scipy/scipy#22557) which statsmodels ≤0.14.4
+        # still imports at module load (statsmodels#9542/#9584) — an unpinned
+        # scipy therefore hard-crashes `import statsmodels.api` and turned 15
+        # quality tests into REF_ERRORs. The pin restores the known-good combo;
+        # revisit when the statsmodels pin above moves to ≥0.14.5.
+        pip install "numpy<2" pandas "scipy<1.16" scikit-learn "statsmodels<0.14.2"
         pip install pygam lifelines scikit-survival properscoring scoringrules || true
         pip install geomstats GPy gpytorch || true
         # arviz: pin <1.0. arviz 1.x rewrote `from_dict`, dropping the

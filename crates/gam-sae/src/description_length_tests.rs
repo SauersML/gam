@@ -1138,7 +1138,7 @@ fn birth_prescreen_selects_same_winner_as_unscreened_eq4_race() {
 /// class split has a sharp empirical discriminator that needs no term
 /// plumbing: the predicted bits of a support-only kind are INVARIANT to the
 /// birth direction's signal variance, while torus/helix strictly increase in
-/// it by exactly `(s−d−1)·ρN·Δ(½log₂(1+λ̂/δ))`.
+/// it by exactly `(s−d−1)·ρN·Δ(½log₂(λ̂/δ))`.
 #[test]
 fn per_kind_crossover_table_splits_code_vs_support_classes_2233() {
     // Shared budget: N=2000 tokens, P=8 channels, G=1024 atoms, L0=32 active,

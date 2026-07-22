@@ -192,7 +192,7 @@ fn gam_gaussian_location_scale_matches_gamboostlss() {
     let body = r#"
         suppressPackageStartupMessages(library(gamboostLSS))
         suppressPackageStartupMessages(library(mboost))
-        m <- gamboostLSS(y ~ bbs(x, df = 4), families = GaussianLSS(),
+        m <- gamboostLSS(y ~ bbs(x, df = 4), data = df, families = GaussianLSS(),
                          control = boost_control(mstop = c(mu = 600, sigma = 600),
                                                  nu = 0.1))
         mu <- as.numeric(fitted(m, parameter = "mu"))

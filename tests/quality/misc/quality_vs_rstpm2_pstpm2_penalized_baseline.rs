@@ -294,11 +294,14 @@ fn gam_penalized_baseline_predicts_heldout_survival_on_cirrhosis() {
             # log-time (the flexible baseline) + penalized smooth covariate effect,
             # PH link (g = log cumulative hazard), REML smoothing selection. Fit on
             # the TRAIN rows that the harness placed in `df`.
-            m <- pstpm2(Surv(N_Days, event) ~ s(Age_years),
+            # pstpm2's MAIN formula takes only plain covariates; every smooth term
+            # (baseline AND covariate) must live in smooth.formula, else
+            # model.frame() rejects the list-valued s() column.
+            m <- pstpm2(Surv(N_Days, event) ~ 1,
                         data = df,
-                        smooth.formula = ~ s(log(N_Days)),
+                        smooth.formula = ~ s(log(N_Days)) + s(Age_years),
                         link.type = "PH",
-                        criterion = "REML")
+                        control = list(criterion = "REML"))
             # Covariate risk score for each held-out subject: log Λ(tref | Age),
             # evaluated at a fixed reference time. The shared baseline is a per-time
             # constant, so on a single tref the ordering of these values is exactly

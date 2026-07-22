@@ -213,7 +213,7 @@ fn gam_recovers_rmst_truth_match_or_beat_lifelines() {
         r#"
 import numpy as np, pandas as pd
 from lifelines import WeibullAFTFitter
-df = pd.DataFrame({"t": np.asarray(t,float), "d": np.asarray(d,float), "x": np.asarray(x,float)})
+df = df[["t", "d", "x"]].astype(float)
 aft = WeibullAFTFitter()
 aft.fit(df, duration_col="t", event_col="d")
 tau = 3.0

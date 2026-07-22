@@ -525,7 +525,11 @@ ll = np.asarray(df["ll"], dtype=float).reshape(-1)
 S = int(round(df["shape"][0]))
 N = int(round(df["shape"][1]))
 loglik = ll.reshape(1, S, N)          # (chain, draw, obs)
-idata = az.from_dict(log_likelihood={"y": loglik})
+# arviz's loo() requires a posterior group to resolve chain/draw dims (and the
+# relative-efficiency reff) even for a pure log-likelihood PSIS-LOO; a scalar
+# placeholder shaped (chain, draw) supplies exactly that and nothing else.
+idata = az.from_dict(posterior={"placeholder": np.zeros((1, S))},
+                     log_likelihood={"y": loglik})
 res = az.loo(idata, pointwise=True)
 # Total PSIS-LOO elpd and its per-point mean; max Pareto-k for a reliability gate.
 emit("elpd_loo_total", [float(res.elpd_loo)])

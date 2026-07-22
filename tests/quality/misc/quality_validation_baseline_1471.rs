@@ -224,14 +224,16 @@ fn tweedie_log_smooth_recovers_truth_and_matches_mgcv() {
             .collect();
 
         // mgcv: SAME basis (tp), SAME penalty model (ordinary, select=FALSE), and
-        // the SAME FIXED variance power p=1.5 — tw(p=1.5), NOT tw() (no estimate).
+        // the SAME FIXED variance power p=1.5. mgcv's fixed-power constructor is
+        // Tweedie(p=, link=); tw() is the ESTIMATED-power family and rejects a
+        // `p=` argument outright.
         let r = run_r(
             &[Column::new("x", &x), Column::new("y", &y)],
             &format!(
                 r#"
                 suppressPackageStartupMessages(library(mgcv))
                 m <- gam(y ~ s(x, bs = "tp", k = 10), data = df,
-                         family = tw(p = 1.5), select = FALSE, method = "REML")
+                         family = Tweedie(p = 1.5, link = "log"), select = FALSE, method = "REML")
                 xg <- seq(0, 3, length.out = {ng})
                 emit("mu", as.numeric(predict(m, newdata = data.frame(x = xg), type = "response")))
                 emit("edf", sum(m$edf))
