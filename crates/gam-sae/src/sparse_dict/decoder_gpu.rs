@@ -523,7 +523,7 @@ mod tests {
             (state as f64 / u64::MAX as f64) - 0.5
         };
         let mut neigh: Vec<Vec<(usize, f64)>> = vec![Vec::new(); m];
-        let mut link = |neigh: &mut Vec<Vec<(usize, f64)>>, i: usize, j: usize, v: f64| {
+        let link = |neigh: &mut Vec<Vec<(usize, f64)>>, i: usize, j: usize, v: f64| {
             neigh[i].push((j, v));
             neigh[j].push((i, v));
         };
