@@ -9152,7 +9152,7 @@ pub(crate) fn release_measure_bls_wiggle_order2_rows_vs_per_column_tower_932() {
     // threshold eta is nudged by a negligible multiple of the running
     // checksum, so neither whole-batch call can be hoisted or dropped.
     let base_eta = states[BinomialLocationScaleWiggleFamily::BLOCK_T].eta[0];
-    let mut best_ns = |use_generic: bool| -> f64 {
+    let best_ns = |use_generic: bool| -> f64 {
         let iterations = 60usize;
         let mut work = states.clone();
         let mut best = f64::INFINITY;
