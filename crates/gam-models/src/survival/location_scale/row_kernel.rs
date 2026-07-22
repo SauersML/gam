@@ -645,6 +645,128 @@ fn sls_row_vgh_compiled(
     output.into_channels()
 }
 
+/// Production V/G/H schedule for the location-scale row: the structure-fused
+/// direct evaluation of the SAME three-atom outer plan [`sls_row_vgh_compiled`]
+/// lowers (`u0`/`u1`/`g` index atoms × the kernel's ln-survival / Mills /
+/// log-density stacks). The two `u1` transforms are fused and each index's
+/// live upper-triangle support is visited exactly once, with no accumulator
+/// plumbing between atoms.
+///
+/// This schedule was the retained strongest-hand baseline; it is production
+/// per SPEC line 1 (AD-derived lowerings replace hand schedules only when
+/// measured at-least-as-fast, and the release cell below measures this
+/// schedule faster than the jet-compiled lowering on every acceptance host).
+/// Correctness is pinned by
+/// `survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels`
+/// (every channel vs the single-source `sls_row_nll` Tower4 program) and the
+/// release cell's dense-jet parity + NaN-poisoned endpoint pins; the
+/// jet-compiled lowering stays as the mechanical oracle/racer.
+fn sls_row_vgh_fused(
+    p: &[f64; SLS_ROW_K],
+    kernel: &SurvivalExactRowKernel,
+) -> (f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]) {
+    let entry_exp = (-p[7]).exp();
+    let exit_exp = (-p[6]).exp();
+
+    let mut value = kernel.w * kernel.log_s0;
+    let u0_first = -kernel.w * kernel.r0;
+    let u0_second = -kernel.w * kernel.dr0;
+
+    let censored_weight = kernel.w * (1.0 - kernel.d);
+    let event_weight = kernel.w * kernel.d;
+    let mut u1_first = 0.0;
+    let mut u1_second = 0.0;
+    if censored_weight != 0.0 {
+        value -= censored_weight * kernel.log_s1;
+        u1_first += censored_weight * kernel.r1;
+        u1_second += censored_weight * kernel.dr1;
+    }
+
+    let mut g_first = 0.0;
+    let mut g_second = 0.0;
+    if event_weight != 0.0 {
+        value -= event_weight * (kernel.logphi1 + kernel.log_g);
+        u1_first -= event_weight * kernel.dlogphi1;
+        u1_second -= event_weight * kernel.d2logphi1;
+        g_first = -event_weight * kernel.d_log_g;
+        g_second = -event_weight * kernel.d2_log_g;
+    }
+
+    let u0_g4 = -entry_exp;
+    let u0_g7 = p[4] * entry_exp;
+    let u1_g3 = -exit_exp;
+    let u1_g6 = p[3] * exit_exp;
+    let inner = p[3] * p[8] - p[5];
+    let g3 = exit_exp * p[8];
+    let g5 = -exit_exp;
+    let g6 = -exit_exp * inner;
+    let g8 = exit_exp * p[3];
+
+    let mut gradient = [0.0; SLS_ROW_K];
+    gradient[0] = u0_first;
+    gradient[4] = u0_first * u0_g4;
+    gradient[7] = u0_first * u0_g7;
+    if censored_weight != 0.0 || event_weight != 0.0 {
+        gradient[1] += u1_first;
+        gradient[3] += u1_first * u1_g3;
+        gradient[6] += u1_first * u1_g6;
+    }
+    if event_weight != 0.0 {
+        gradient[2] += g_first;
+        gradient[3] += g_first * g3;
+        gradient[5] += g_first * g5;
+        gradient[6] += g_first * g6;
+        gradient[8] += g_first * g8;
+    }
+
+    let mut hessian = [[0.0; SLS_ROW_K]; SLS_ROW_K];
+    macro_rules! symmetric {
+        ($i:expr, $j:expr, $value:expr) => {{
+            let channel = $value;
+            hessian[$i][$j] += channel;
+            if $i != $j {
+                hessian[$j][$i] += channel;
+            }
+        }};
+    }
+
+    symmetric!(0, 0, u0_second);
+    symmetric!(0, 4, u0_second * u0_g4);
+    symmetric!(0, 7, u0_second * u0_g7);
+    symmetric!(4, 4, u0_second * u0_g4 * u0_g4);
+    symmetric!(4, 7, u0_second * u0_g4 * u0_g7 + u0_first * entry_exp);
+    symmetric!(7, 7, u0_second * u0_g7 * u0_g7 - u0_first * u0_g7);
+
+    if censored_weight != 0.0 || event_weight != 0.0 {
+        symmetric!(1, 1, u1_second);
+        symmetric!(1, 3, u1_second * u1_g3);
+        symmetric!(1, 6, u1_second * u1_g6);
+        symmetric!(3, 3, u1_second * u1_g3 * u1_g3);
+        symmetric!(3, 6, u1_second * u1_g3 * u1_g6 + u1_first * exit_exp);
+        symmetric!(6, 6, u1_second * u1_g6 * u1_g6 - u1_first * u1_g6);
+    }
+
+    if event_weight != 0.0 {
+        symmetric!(2, 2, g_second);
+        symmetric!(2, 3, g_second * g3);
+        symmetric!(2, 5, g_second * g5);
+        symmetric!(2, 6, g_second * g6);
+        symmetric!(2, 8, g_second * g8);
+        symmetric!(3, 3, g_second * g3 * g3);
+        symmetric!(3, 5, g_second * g3 * g5);
+        symmetric!(3, 6, g_second * g3 * g6 - g_first * exit_exp * p[8]);
+        symmetric!(3, 8, g_second * g3 * g8 + g_first * exit_exp);
+        symmetric!(5, 5, g_second * g5 * g5);
+        symmetric!(5, 6, g_second * g5 * g6 + g_first * exit_exp);
+        symmetric!(5, 8, g_second * g5 * g8);
+        symmetric!(6, 6, g_second * g6 * g6 + g_first * exit_exp * inner);
+        symmetric!(6, 8, g_second * g6 * g8 - g_first * exit_exp * p[3]);
+        symmetric!(8, 8, g_second * g8 * g8);
+    }
+
+    (value, gradient, hessian)
+}
+
 /// Hessian-only lowering of the same build-time symbolic atoms used by
 /// [`sls_row_vgh_compiled`]. Only the 24 structurally live upper-triangle
 /// channels exist in the output; no 9×9 primary Hessian is materialized.
@@ -1145,7 +1267,7 @@ pub fn survival_location_scale_alo_row_geometry(
                 .expect("owned ALO coordinates are contiguous")
                 .try_into()
                 .expect("non-wiggle coordinate count is nine");
-            let (_, score, hessian) = sls_row_vgh_compiled(&primary, &kernel);
+            let (_, score, hessian) = sls_row_vgh_fused(&primary, &kernel);
             (
                 Array1::from_vec(score.to_vec()),
                 Array2::from_shape_vec(
@@ -2074,7 +2196,11 @@ fn sls_row_nll_onesseed_batch(
     // Leading term: the scalar ASSIGNS `nll = zero(u0)? const 0 : u0.compose(..)`,
     // so skipped lanes take the `+0.0` neutral (matching `S::constant(0.0)`).
     let u0_stack = pack(|plan| plan.u0);
-    let mut nll = select_active_term(u0.compose_unary(u0_stack), active_stack_lane_mask(&u0_stack), 0.0);
+    let mut nll = select_active_term(
+        u0.compose_unary(u0_stack),
+        active_stack_lane_mask(&u0_stack),
+        0.0,
+    );
     // The scalar collapses the censored and event `u1` contributions into ONE
     // combined stack (`plan.u1`) and composes it once; mirror that. A
     // homogeneous group's `u1` term is active exactly when a censored or event
@@ -2082,12 +2208,20 @@ fn sls_row_nll_onesseed_batch(
     // add is a bit-exact no-op there (`x + (-0.0) == x`).
     if cens_on || event_on {
         let u1_stack = pack(|plan| plan.u1.expect("homogeneous group has an active u1 stack"));
-        let term = select_active_term(u1.compose_unary(u1_stack), active_stack_lane_mask(&u1_stack), -0.0);
+        let term = select_active_term(
+            u1.compose_unary(u1_stack),
+            active_stack_lane_mask(&u1_stack),
+            -0.0,
+        );
         nll = nll.add(&term);
     }
     if event_on {
         let g_stack = pack(|plan| plan.g.expect("homogeneous group has an active g stack"));
-        let term = select_active_term(g.compose_unary(g_stack), active_stack_lane_mask(&g_stack), -0.0);
+        let term = select_active_term(
+            g.compose_unary(g_stack),
+            active_stack_lane_mask(&g_stack),
+            -0.0,
+        );
         nll = nll.add(&term);
     }
     nll
@@ -2191,16 +2325,15 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         &self,
         row: usize,
     ) -> Result<(f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]), String> {
-        // #932: value, gradient and Hessian lower the SAME scalar `u0/u1/g`
-        // expressions and outer derivative plan used by `sls_row_nll`. Each
-        // independent index is differentiated at its natural width (3/3/5) and
-        // mapped into the nine primary channels by the universal
-        // `MappedOrder2Accumulator`; no family-specific derivative formula,
-        // runtime dependency mask, or dense 9×9 intermediate exists. The
+        // #932: value, gradient and Hessian consume the SAME scalar `u0/u1/g`
+        // index expressions and outer derivative plan as `sls_row_nll`,
+        // through the structure-fused production schedule (see
+        // [`sls_row_vgh_fused`] for the SPEC-line-1 promotion rationale). The
         // `survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels`
-        // oracle pins this compiled schedule to the full Tower4 source.
+        // oracle pins this schedule to the full Tower4 source, and the release
+        // cell pins it against the jet-compiled lowering and the dense jet.
         match self.row_nll_inputs_opt(row)? {
-            Some((p, kernel)) => Ok(sls_row_vgh_compiled(&p, &kernel)),
+            Some((p, kernel)) => Ok(sls_row_vgh_fused(&p, &kernel)),
             None => Ok((0.0, [0.0; SLS_ROW_K], [[0.0; SLS_ROW_K]; SLS_ROW_K])),
         }
     }
@@ -4940,123 +5073,25 @@ mod patterned_order2_perf_tests {
         (value, gradient, hessian)
     }
 
-    /// Strongest direct row-chain baseline: fuse the two transforms of `u1`,
-    /// visit each index's live upper-triangle support once, and materialize no
-    /// intermediate dense derivative arrays. This is the schedule a successful
-    /// generic compiler must beat; comparison only with [`hand`] would reward
-    /// avoidable repeated 24-pair walks.
+    /// The PRODUCTION structure-fused schedule (promoted from this module's
+    /// strongest-hand baseline per SPEC line 1; see [`sls_row_vgh_fused`]).
+    /// Kept under its historical racer name so every parity, endpoint, and
+    /// timing pin below reads production directly.
     fn hand_fused(
         p: &[f64; SLS_ROW_K],
         kernel: &SurvivalExactRowKernel,
     ) -> (f64, [f64; 9], [[f64; 9]; 9]) {
-        let entry_exp = (-p[7]).exp();
-        let exit_exp = (-p[6]).exp();
-
-        let mut value = kernel.w * kernel.log_s0;
-        let u0_first = -kernel.w * kernel.r0;
-        let u0_second = -kernel.w * kernel.dr0;
-
-        let censored_weight = kernel.w * (1.0 - kernel.d);
-        let event_weight = kernel.w * kernel.d;
-        let mut u1_first = 0.0;
-        let mut u1_second = 0.0;
-        if censored_weight != 0.0 {
-            value -= censored_weight * kernel.log_s1;
-            u1_first += censored_weight * kernel.r1;
-            u1_second += censored_weight * kernel.dr1;
-        }
-
-        let mut g_first = 0.0;
-        let mut g_second = 0.0;
-        if event_weight != 0.0 {
-            value -= event_weight * (kernel.logphi1 + kernel.log_g);
-            u1_first -= event_weight * kernel.dlogphi1;
-            u1_second -= event_weight * kernel.d2logphi1;
-            g_first = -event_weight * kernel.d_log_g;
-            g_second = -event_weight * kernel.d2_log_g;
-        }
-
-        let u0_g4 = -entry_exp;
-        let u0_g7 = p[4] * entry_exp;
-        let u1_g3 = -exit_exp;
-        let u1_g6 = p[3] * exit_exp;
-        let inner = p[3] * p[8] - p[5];
-        let g3 = exit_exp * p[8];
-        let g5 = -exit_exp;
-        let g6 = -exit_exp * inner;
-        let g8 = exit_exp * p[3];
-
-        let mut gradient = [0.0; SLS_ROW_K];
-        gradient[0] = u0_first;
-        gradient[4] = u0_first * u0_g4;
-        gradient[7] = u0_first * u0_g7;
-        if censored_weight != 0.0 || event_weight != 0.0 {
-            gradient[1] += u1_first;
-            gradient[3] += u1_first * u1_g3;
-            gradient[6] += u1_first * u1_g6;
-        }
-        if event_weight != 0.0 {
-            gradient[2] += g_first;
-            gradient[3] += g_first * g3;
-            gradient[5] += g_first * g5;
-            gradient[6] += g_first * g6;
-            gradient[8] += g_first * g8;
-        }
-
-        let mut hessian = [[0.0; SLS_ROW_K]; SLS_ROW_K];
-        macro_rules! symmetric {
-            ($i:expr, $j:expr, $value:expr) => {{
-                let channel = $value;
-                hessian[$i][$j] += channel;
-                if $i != $j {
-                    hessian[$j][$i] += channel;
-                }
-            }};
-        }
-
-        symmetric!(0, 0, u0_second);
-        symmetric!(0, 4, u0_second * u0_g4);
-        symmetric!(0, 7, u0_second * u0_g7);
-        symmetric!(4, 4, u0_second * u0_g4 * u0_g4);
-        symmetric!(4, 7, u0_second * u0_g4 * u0_g7 + u0_first * entry_exp);
-        symmetric!(7, 7, u0_second * u0_g7 * u0_g7 - u0_first * u0_g7);
-
-        if censored_weight != 0.0 || event_weight != 0.0 {
-            symmetric!(1, 1, u1_second);
-            symmetric!(1, 3, u1_second * u1_g3);
-            symmetric!(1, 6, u1_second * u1_g6);
-            symmetric!(3, 3, u1_second * u1_g3 * u1_g3);
-            symmetric!(3, 6, u1_second * u1_g3 * u1_g6 + u1_first * exit_exp);
-            symmetric!(6, 6, u1_second * u1_g6 * u1_g6 - u1_first * u1_g6);
-        }
-
-        if event_weight != 0.0 {
-            symmetric!(2, 2, g_second);
-            symmetric!(2, 3, g_second * g3);
-            symmetric!(2, 5, g_second * g5);
-            symmetric!(2, 6, g_second * g6);
-            symmetric!(2, 8, g_second * g8);
-            symmetric!(3, 3, g_second * g3 * g3);
-            symmetric!(3, 5, g_second * g3 * g5);
-            symmetric!(3, 6, g_second * g3 * g6 - g_first * exit_exp * p[8]);
-            symmetric!(3, 8, g_second * g3 * g8 + g_first * exit_exp);
-            symmetric!(5, 5, g_second * g5 * g5);
-            symmetric!(5, 6, g_second * g5 * g6 + g_first * exit_exp);
-            symmetric!(5, 8, g_second * g5 * g8);
-            symmetric!(6, 6, g_second * g6 * g6 + g_first * exit_exp * inner);
-            symmetric!(6, 8, g_second * g6 * g8 - g_first * exit_exp * p[3]);
-            symmetric!(8, 8, g_second * g8 * g8);
-        }
-
-        (value, gradient, hessian)
+        sls_row_vgh_fused(p, kernel)
     }
 
-    /// #932 release speed gate for the location-scale row. The production
-    /// structure-compiled channels (`compiled`) and the strongest hand schedule
-    /// (`hand_fused`) both consume the same frozen kernel so timing includes row
-    /// arithmetic only. Emits the harness-parsed `hand_over_production` token
-    /// (strongest-hand time over production time) that the MSI release harness
-    /// fails closed on whenever any measured cell is `<= 1`.
+    /// #932 release speed gate for the location-scale row. Production is the
+    /// structure-fused schedule ([`sls_row_vgh_fused`], measured under the
+    /// `hand_fused` racer name) and the strongest alternative is the
+    /// jet-compiled lowering (`compiled`); both consume the same frozen kernel
+    /// so timing includes row arithmetic only. Emits the harness-parsed
+    /// `hand_over_production` token (strongest-alternative time over
+    /// production time) that the MSI release harness fails closed on whenever
+    /// any measured cell is `<= 1`.
     #[test]
     fn release_measure_sls_compiled_vs_strongest_hand_932() {
         let (p, kernel) = fixture();
@@ -5214,19 +5249,20 @@ mod patterned_order2_perf_tests {
         }
 
         let hand_ns = best_secs(iterations, &p, &kernel, hand) * 1e9 / iterations as f64;
-        let hand_fused_ns = best_secs(iterations, &p, &kernel, hand_fused) * 1e9 / iterations as f64;
+        let hand_fused_ns =
+            best_secs(iterations, &p, &kernel, hand_fused) * 1e9 / iterations as f64;
         let dense_ns = best_secs(iterations, &p, &kernel, dense) * 1e9 / iterations as f64;
         let patterned_ns = best_secs(iterations, &p, &kernel, patterned) * 1e9 / iterations as f64;
         let literal_seeds_ns =
             best_secs(iterations, &p, &kernel, patterned_literal_seeds) * 1e9 / iterations as f64;
         let compiled_ns = best_secs(iterations, &p, &kernel, compiled) * 1e9 / iterations as f64;
         eprintln!(
-            "SLS-PATTERNED-932 hand={hand_ns:.2} ns/row fused-hand={hand_fused_ns:.2} ns/row dense={dense_ns:.2} ns/row patterned={patterned_ns:.2} ns/row literal-seeds={literal_seeds_ns:.2} ns/row compiled={compiled_ns:.2} ns/row compiled/fused-hand={:.3} patterned/fused-hand={:.3} literal-seeds/fused-hand={:.3} compiled/dense={:.3} hand_over_production={:.6}",
+            "SLS-PATTERNED-932 hand={hand_ns:.2} ns/row production-fused={hand_fused_ns:.2} ns/row dense={dense_ns:.2} ns/row patterned={patterned_ns:.2} ns/row literal-seeds={literal_seeds_ns:.2} ns/row compiled={compiled_ns:.2} ns/row compiled/fused={:.3} patterned/fused={:.3} literal-seeds/fused={:.3} compiled/dense={:.3} hand_over_production={:.6}",
             compiled_ns / hand_fused_ns,
             patterned_ns / hand_fused_ns,
             literal_seeds_ns / hand_fused_ns,
             compiled_ns / dense_ns,
-            hand_fused_ns / compiled_ns,
+            compiled_ns / hand_fused_ns,
         );
     }
 
@@ -5910,8 +5946,8 @@ mod simd_batch_bit_identity_tests {
             OneSeedBatch::seed_direction(value, c, dir)
         });
         let kernel_refs: [&SurvivalExactRowKernel; 4] = std::array::from_fn(|lane| &kernels[lane]);
-        let batched = sls_row_nll_onesseed_batch(&batch_vars, &kernel_refs, true, false)
-            .contracted_third();
+        let batched =
+            sls_row_nll_onesseed_batch(&batch_vars, &kernel_refs, true, false).contracted_third();
 
         for lane in 0..4 {
             let scalar_vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(|c| {
@@ -5925,7 +5961,10 @@ mod simd_batch_bit_identity_tests {
                     let b = batched[x][y].to_array()[lane];
                     let s = scalar[x][y];
                     if s.is_nan() {
-                        assert!(b.is_nan(), "scalar NaN but SIMD finite at lane={lane} x={x} y={y}");
+                        assert!(
+                            b.is_nan(),
+                            "scalar NaN but SIMD finite at lane={lane} x={x} y={y}"
+                        );
                     } else {
                         assert_eq!(
                             b.to_bits(),

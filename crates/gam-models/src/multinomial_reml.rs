@@ -348,6 +348,53 @@ impl<'row> MultinomialLogitRowProgram<'row> {
         }
         value
     }
+
+    /// Measured-crossover V/G/H dispatch: the single-source semantic row has
+    /// two exact lowerings — the fully monomorphized `Order2<M>` jet of
+    /// [`Self::eval_expression`] (fastest at small class counts, where its
+    /// unrolled fixed-arity algebra beats slice-indexed code) and the
+    /// structure-compiled softmax lowering
+    /// ([`Self::value_gradient_hessian_into`], fastest at larger `M`, where
+    /// the jet's `O(M³)` compose cost loses to the `O(M²)` closed form). The
+    /// crossover sits between `M = 3` and `M = 4` on every acceptance host;
+    /// `release_measure_multinomial_specialized_vs_generic_tower_932` measures
+    /// BOTH lowerings at `M ∈ {2, 3, 4, 8}` and fails closed if this dispatch
+    /// ever stops picking the faster one, so the boundary is pinned by
+    /// measurement rather than asserted.
+    ///
+    /// `probabilities` is pure SCRATCH here: the jet arms never touch it and
+    /// the compiled arm overwrites it, so its contents are unspecified on
+    /// return. Callers needing the normalized masses use
+    /// [`Self::probabilities_into`].
+    pub(crate) fn value_gradient_hessian_dispatch_into(
+        &self,
+        probabilities: &mut [f64],
+        gradient: &mut [f64],
+        hessian: &mut [f64],
+    ) -> Result<f64, String> {
+        fn tower_arm<const M: usize>(
+            program: &MultinomialLogitRowProgram<'_>,
+            gradient: &mut [f64],
+            hessian: &mut [f64],
+        ) -> Result<f64, String> {
+            let (value, tower_gradient, tower_hessian) =
+                gam_math::jet_tower::program_row_kernel::<M, _>(program, 0)?;
+            gradient[..M].copy_from_slice(&tower_gradient);
+            for (row, tower_row) in tower_hessian.iter().enumerate() {
+                hessian[row * M..(row + 1) * M].copy_from_slice(tower_row);
+            }
+            Ok(value)
+        }
+        let active_classes = self.eta.len();
+        assert_eq!(gradient.len(), active_classes);
+        assert_eq!(hessian.len(), active_classes * active_classes);
+        match active_classes {
+            1 => tower_arm::<1>(self, gradient, hessian),
+            2 => tower_arm::<2>(self, gradient, hessian),
+            3 => tower_arm::<3>(self, gradient, hessian),
+            _ => Ok(self.value_gradient_hessian_into(probabilities, gradient, hessian)),
+        }
+    }
 }
 
 impl<const M: usize> gam_math::jet_tower::RowProgram<M> for MultinomialLogitRowProgram<'_> {
@@ -733,7 +780,9 @@ pub(crate) fn measured_penalty_rank(s: &Array2<f64>) -> Result<usize, String> {
     use gam_linalg::faer_ndarray::FaerEigh;
     let (eigenvalues, _) = FaerEigh::eigh(s, faer::Side::Lower)
         .map_err(|e| format!("penalty rank eigendecomposition failed: {e}"))?;
-    let max_abs = eigenvalues.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+    let max_abs = eigenvalues
+        .iter()
+        .fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
     let tol = 100.0 * (p as f64) * f64::EPSILON * max_abs;
     Ok(eigenvalues.iter().filter(|&&ev| ev > tol).count())
 }
@@ -3227,16 +3276,18 @@ mod tests {
             }
         }
 
-        /// #932 release speed gate for the multinomial-logit row. The production
-        /// structure-compiled value/gradient/Hessian lowering
-        /// ([`MultinomialLogitRowProgram::value_gradient_hessian_into`]) is timed
-        /// against the generic gam-math forward-mode jet tower
-        /// ([`program_row_kernel`]) — the naive automatic-differentiation baseline
-        /// the retained specialization must beat, since #932 removed this family's
-        /// `cfg(test)` hand restatement. Emits the harness-parsed
-        /// `hand_over_production` token (generic-tower time over production time)
-        /// per active-class width; the MSI release harness fails closed whenever
-        /// any measured cell is `<= 1`.
+        /// #932 release speed gate for the multinomial-logit row. Production is
+        /// the measured-crossover dispatch
+        /// ([`MultinomialLogitRowProgram::value_gradient_hessian_dispatch_into`]):
+        /// the monomorphized `Order2<M>` jet tower at small class counts, the
+        /// structure-compiled softmax lowering above the crossover (#932
+        /// removed this family's `cfg(test)` hand restatement, so these two
+        /// exact lowerings of the single-source row are the only candidates).
+        /// At each measured width the dispatch is timed against the lowering
+        /// it did NOT select; the emitted `hand_over_production` token
+        /// (rejected-lowering time over production time) therefore fails
+        /// closed — `<= 1` on the MSI release harness — whenever the dispatch
+        /// boundary stops picking the faster lowering on either side.
         ///
         /// The batch of distinct rows supplies genuine per-row input variation, so
         /// the optimizer cannot hoist the pure row call out of the sweep, and the
@@ -3324,6 +3375,22 @@ mod tests {
                 let mut production_sweep = || {
                     let mut checksum = 0.0_f64;
                     for program in &programs {
+                        let value = program
+                            .value_gradient_hessian_dispatch_into(
+                                &mut probabilities,
+                                &mut gradient,
+                                &mut hessian,
+                            )
+                            .expect("dispatch kernel");
+                        checksum += value + gradient[0] + hessian[0];
+                    }
+                    checksum
+                };
+                let production_secs = best_secs(&mut production_sweep);
+
+                let mut specialized_sweep = || {
+                    let mut checksum = 0.0_f64;
+                    for program in &programs {
                         let value = program.value_gradient_hessian_into(
                             &mut probabilities,
                             &mut gradient,
@@ -3333,7 +3400,7 @@ mod tests {
                     }
                     checksum
                 };
-                let production_secs = best_secs(&mut production_sweep);
+                let specialized_secs = best_secs(&mut specialized_sweep);
 
                 let mut tower_sweep = || {
                     let mut checksum = 0.0_f64;
@@ -3347,16 +3414,23 @@ mod tests {
                 let tower_secs = best_secs(&mut tower_sweep);
 
                 let production_ns = production_secs * 1e9 / ROWS as f64;
+                let specialized_ns = specialized_secs * 1e9 / ROWS as f64;
                 let tower_ns = tower_secs * 1e9 / ROWS as f64;
+                // The dispatch selects the jet tower for M <= 3 and the
+                // structure-compiled softmax above; the rejected lowering at
+                // this width is the fail-closed baseline.
+                let rejected_ns = if M <= 3 { specialized_ns } else { tower_ns };
                 eprintln!(
                     "MULTINOMIAL-RELEASE-932 M={M} rows={ROWS} production_ns={production_ns:.3} \
-                     generic_tower_ns={tower_ns:.3} hand_over_production={:.6}",
-                    tower_ns / production_ns,
+                     specialized_ns={specialized_ns:.3} generic_tower_ns={tower_ns:.3} \
+                     hand_over_production={:.6}",
+                    rejected_ns / production_ns,
                 );
             }
 
             measure::<2>(0x9322_2020_0715_face);
             measure::<3>(0x0bad_c0de_0715_2020);
+            measure::<4>(0x5eed_4444_0722_beef);
             measure::<8>(0x1234_5678_0715_abcd);
         }
     }
@@ -3841,7 +3915,11 @@ mod tests {
         let joint = multi.joint_penalty_specs().expect("joint specs");
         assert_eq!(joint.len(), n_terms * k);
         let labels: Vec<&str> = joint.iter().filter_map(|s| s.label.as_deref()).collect();
-        assert_eq!(labels.len(), n_terms * k, "every spec carries its own label");
+        assert_eq!(
+            labels.len(),
+            n_terms * k,
+            "every spec carries its own label"
+        );
         let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
         assert_eq!(
             unique.len(),
