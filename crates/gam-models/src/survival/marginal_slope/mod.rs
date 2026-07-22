@@ -82,7 +82,7 @@ pub(crate) use crate::survival::time_constraints::{
 
 pub(crate) use crate::wiggle::monotone_wiggle_basis_with_derivative_order;
 
-pub(crate) use gam_linalg::matrix::{DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix};
+pub(crate) use gam_linalg::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
 
 pub(crate) use gam_solve::pirls::LinearInequalityConstraints;
 
