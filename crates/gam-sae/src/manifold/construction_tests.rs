@@ -20,7 +20,58 @@ mod exact_hessian_fixture_tests {
     ) {
         use crate::manifold::tests::gamma_fd_tiny_fixture;
 
-        let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
+        // #2253/#2330 re-anchor: after #2330 Phase-2a ranks the EXACT +/-log|A|
+        // and refuses an indefinite A, the historical (sparse -0.5, smooth -1,
+        // ard -0.5) basin plus the sin excitation lands on an exact-A SADDLE and
+        // the criterion refuses at construction. Rank this softmax fixture in a
+        // MODERATE-penalty basin (all log-lambda = -1) where the majorizer-
+        // converged mode is exact-A positive definite with a real margin
+        // (min_eig ~ 1.7e-1, >> the 1e-9 relative PD floor), the residual /
+        // curvature-delta channels stay LIVE (‖ΔC‖ ~ 2.0, Daleckii–Krein cross
+        // ~ 1.9e-1, both far above FD noise), and the +/-1e-5 FD perturbation of
+        // every rho coordinate stays PD (so the fixed-theta FD gates below never
+        // trip the refusal at a probe point). The softmax gate is retained (NOT
+        // the ordered-Beta--Bernoulli PD specimen) because the logdet
+        // Daleckii–Krein and full outer-Hessian channels model the SOFTMAX sparse
+        // log-strength row but refuse an OBB sparse coordinate. The exact-A saddle
+        // refusal branch is preserved reachably by
+        // `converged_state_with_residual_a_saddle_2336`.
+        let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+        rho.log_lambda_sparse = 0.0;
+        for value in rho.log_lambda_smooth.iter_mut() {
+            *value = -1.0;
+        }
+        for axis in rho.log_ard.iter_mut() {
+            for value in axis.iter_mut() {
+                *value = -1.0;
+            }
+        }
+        let (_value, _loss, cache) = term
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                40,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("softmax PD-basin re-anchor fixture must converge with both atoms alive");
+        (term, target, rho, cache)
+    }
+
+    /// #2330/#2336 refusal-branch companion to `converged_state_with_residual`.
+    /// The historical softmax `gamma_fd_tiny_fixture` target is NOT ordered-Beta--
+    /// Bernoulli reachable, so its majorizer-converged mode is an exact-A saddle
+    /// (a joint-block eigenvalue below the shared PD floor). Returned UN-fitted:
+    /// the criterion refuses at construction on this state, which is exactly the
+    /// coverage `exact_observed_information_refuses_on_a_saddle_2336` asserts. Do
+    /// not `.expect()` a cache here.
+    pub(super) fn converged_state_with_residual_a_saddle_2336()
+    -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+        use crate::manifold::tests::gamma_fd_tiny_fixture;
+
+        let (term, mut target, mut rho) = gamma_fd_tiny_fixture();
         let (n, p) = (target.nrows(), target.ncols());
         for row in 0..n {
             for col in 0..p {
@@ -39,19 +90,9 @@ mod exact_hessian_fixture_tests {
                 *value = -0.5;
             }
         }
-        let (_value, _loss, cache) = term
-            .penalized_quasi_laplace_criterion_with_cache(
-                target.view(),
-                &rho,
-                None,
-                40,
-                0.4,
-                1.0e-6,
-                1.0e-6,
-            )
-            .expect("off-manifold fixture must converge with both atoms alive");
-        (term, target, rho, cache)
+        (term, target, rho)
     }
+
 }
 
 #[cfg(test)]
@@ -198,7 +239,19 @@ mod amortized_encoder_tests {
         // converging fixture the sibling criterion tests use. rank-charge is
         // smooth-index-only and assignment-mode-agnostic, so its second derivative
         // is exercised identically.
-        let (mut term, target, rho) = gamma_fd_tiny_fixture();
+        let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+        // #2253 re-anchor: rank into the moderate-penalty PD basin (all
+        // log-lambda = -1, see `converged_state_with_residual`) so the exact-A
+        // criterion is positive definite and returns a cache here too.
+        rho.log_lambda_sparse = -1.0;
+        for v in rho.log_lambda_smooth.iter_mut() {
+            *v = -1.0;
+        }
+        for axis in rho.log_ard.iter_mut() {
+            for v in axis.iter_mut() {
+                *v = -1.0;
+            }
+        }
         let (_cost, loss, cache) = term
             .penalized_quasi_laplace_criterion_with_cache(
                 target.view(),
@@ -266,20 +319,22 @@ mod amortized_encoder_tests {
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
 
-        // Evaluation ρ: lift ρ_smooth / ρ_ard off the −6 floor so the Daleckii–Krein
-        // CROSS terms — which scale as O(λ²) and O(α²) — sit well above FD noise. At
-        // the floor (λ = α ≈ 2.5e-3) the cross term is ~6e-6, under the FD tolerance,
-        // and the gate would pass on the δ self-term alone while the D-K machinery
-        // went entirely unchecked. The fixed-stratum Hessian is exact at ANY frozen
-        // θ̂ — it does not require θ̂ to be stationary for this ρ — and a ZERO inner
-        // budget assembles H(ρ) = H_data(θ̂) + penalty(ρ) without re-running the fit,
-        // so no co-collapse guard is tripped. Extra penalty only makes H more PD.
-        // A ρ perturbation scales only α, never the frozen circle coordinate t, so
-        // the max(·,0) majorizer active set is invariant — no subgradient ambiguity.
+        // Evaluation ρ: a DIFFERENT off-stationary point from the fit basin, chosen
+        // so the Daleckii–Krein CROSS terms — which scale as O(λ²) and O(α²) — sit
+        // well above FD noise (here λ_smooth = e^-1.5, α = e^-1.2/e^-1, cross ~1e-1,
+        // far above the ~1e-4 gate). At the deep floor the cross term is ~6e-6, under
+        // the FD tolerance, and the gate would pass on the δ self-term alone while
+        // the D-K machinery went entirely unchecked. The fixed-stratum Hessian is
+        // exact at ANY frozen θ̂ — it does not require θ̂ to be stationary for this ρ
+        // — and a ZERO inner budget assembles H(ρ) = H_data(θ̂) + penalty(ρ) without
+        // re-running the fit, so no co-collapse guard is tripped. #2253 re-anchor:
+        // this eval also keeps the exact A positive definite with a real margin
+        // (min_eig ~6e-2) so the #2330 Phase-2a exact-½log|A| criterion returns a
+        // cache here rather than refusing an indefinite mode.
         let mut rho_eval = rho.clone();
-        rho_eval.log_lambda_sparse = 0.5;
+        rho_eval.log_lambda_sparse = -0.5;
         for v in rho_eval.log_lambda_smooth.iter_mut() {
-            *v = -2.0;
+            *v = -1.5;
         }
         rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
         let rho = rho_eval;
@@ -463,9 +518,9 @@ mod amortized_encoder_tests {
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
         let mut rho_eval = rho.clone();
-        rho_eval.log_lambda_sparse = 0.5;
+        rho_eval.log_lambda_sparse = -0.5;
         for v in rho_eval.log_lambda_smooth.iter_mut() {
-            *v = -2.0;
+            *v = -1.5;
         }
         rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
         let rho = rho_eval;
@@ -634,9 +689,9 @@ mod amortized_encoder_tests {
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
         let mut rho_eval = rho.clone();
-        rho_eval.log_lambda_sparse = 0.5;
+        rho_eval.log_lambda_sparse = -0.5;
         for v in rho_eval.log_lambda_smooth.iter_mut() {
-            *v = -2.0;
+            *v = -1.5;
         }
         rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
         let rho = rho_eval;
@@ -760,9 +815,9 @@ mod amortized_encoder_tests {
         let (term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
         let mut rho_eval = rho.clone();
-        rho_eval.log_lambda_sparse = 0.5;
+        rho_eval.log_lambda_sparse = -0.5;
         for v in rho_eval.log_lambda_smooth.iter_mut() {
-            *v = -2.0;
+            *v = -1.5;
         }
         rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
         let rho = rho_eval;
@@ -853,9 +908,9 @@ mod amortized_encoder_tests {
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
         let mut rho_eval = rho.clone();
-        rho_eval.log_lambda_sparse = 0.5;
+        rho_eval.log_lambda_sparse = -0.5;
         for v in rho_eval.log_lambda_smooth.iter_mut() {
-            *v = -2.0;
+            *v = -1.5;
         }
         rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
         let rho = rho_eval;
@@ -939,9 +994,9 @@ mod amortized_encoder_tests {
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
         let mut rho_eval = rho.clone();
-        rho_eval.log_lambda_sparse = 0.5;
+        rho_eval.log_lambda_sparse = -0.5;
         for v in rho_eval.log_lambda_smooth.iter_mut() {
-            *v = -2.0;
+            *v = -1.5;
         }
         rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
         let rho = rho_eval;
@@ -1093,9 +1148,9 @@ mod amortized_encoder_tests {
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
         let mut rho_eval = rho.clone();
-        rho_eval.log_lambda_sparse = 0.5;
+        rho_eval.log_lambda_sparse = -0.5;
         for v in rho_eval.log_lambda_smooth.iter_mut() {
-            *v = -2.0;
+            *v = -1.5;
         }
         rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
         let rho = rho_eval;
@@ -1158,9 +1213,9 @@ mod amortized_encoder_tests {
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
         let mut rho_eval = rho.clone();
-        rho_eval.log_lambda_sparse = 0.5;
+        rho_eval.log_lambda_sparse = -0.5;
         for v in rho_eval.log_lambda_smooth.iter_mut() {
-            *v = -2.0;
+            *v = -1.5;
         }
         rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
         let rho = rho_eval;
@@ -1205,9 +1260,9 @@ mod amortized_encoder_tests {
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
         let mut rho_eval = rho.clone();
-        rho_eval.log_lambda_sparse = 0.5;
+        rho_eval.log_lambda_sparse = -0.5;
         for v in rho_eval.log_lambda_smooth.iter_mut() {
-            *v = -2.0;
+            *v = -1.5;
         }
         rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
         let rho = rho_eval;
@@ -1305,6 +1360,47 @@ mod amortized_encoder_tests {
                      did not refuse: {other:?}"
                 ),
             }
+        }
+    }
+
+    /// #2330 Phase-2a refusal arbiter (reachable companion to the PD parity test
+    /// above). On the softmax A-saddle specimen the exact observed-information
+    /// criterion MUST refuse with the typed `IndefiniteObservedInformation` on
+    /// the joint block: the majorizer-converged mode has a joint-block eigenvalue
+    /// below the shared PD floor, so +/-log|A| is undefined and the criterion is
+    /// probe-infeasible there. This is the refusal half of the (refusal <=>
+    /// indefinite) parity, preserved as a LIVE gate after the #2253 re-anchor
+    /// moved the shared fixture into the PD window.
+    ///
+    /// This specimen is a GENUINE saddle, NOT a shallow ARD-concave wrinkle: the
+    /// sin excitation makes the target model-UNREACHABLE, so the dropped residual
+    /// curvature ΔC (= ⟨error_metric, ∂²f⟩) is large and drives a deep negative
+    /// joint eigenvalue rooted in the residual, not a shallow basin-curvature
+    /// dip. It must therefore stay REFUSED even under an E-attributability
+    /// value-side semantics (#2336) that prices shallow concave-wrinkle negatives
+    /// at their clamped vᵀBv basin curvature instead of refusing.
+    #[test]
+    fn exact_observed_information_refuses_on_a_saddle_2336() {
+        use super::SaeCriterionError;
+        let (mut term, target, rho) =
+            super::exact_hessian_fixture_tests::converged_state_with_residual_a_saddle_2336();
+        let result = term.penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            40,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        );
+        match result {
+            Err(SaeCriterionError::IndefiniteObservedInformation { block }) => {
+                assert_eq!(block, "joint", "refusal fired on the wrong block: {block}");
+            }
+            other => panic!(
+                "the softmax A-saddle specimen must refuse with \
+                 IndefiniteObservedInformation, got {other:?}"
+            ),
         }
     }
 
