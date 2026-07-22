@@ -649,10 +649,13 @@ impl SaeManifoldTerm {
             // there verbatim, including the #1410 active-slot contraction and
             // the #991 `w_row` convention), so no softmax delta arises here.
 
-            // (3) periodic ARD: ΔC_coord = (V'' − max(V'',0)) = min(V'',0), diagonal.
-            // The assembly writes the mean-one design-weighted majorizer
-            // `w_row·max(V'',0)`, so the dropped-curvature correction must carry
-            // that same `w_row`: `A = B + ΔC` then recovers `w_row·V''` exactly.
+            // (3) periodic ARD: ΔC_coord = V'' − psd_majorizer_hess =
+            // negative_hessian_remainder, diagonal (#2339: the smooth
+            // homogeneity-preserving clamp, non-positive). The assembly writes the
+            // mean-one design-weighted majorizer `w_row·psd_majorizer_hess`, so the
+            // dropped-curvature correction must carry that same `w_row`: `A = B + ΔC`
+            // then recovers `w_row·V''` exactly (the seam guarantees
+            // `psd_majorizer_hess + negative_hessian_remainder == V''` bit-for-bit).
             // The prior is weighted directly, not through the √w data-jet seam.
             let w_row = row_loss_w.map_or(1.0, |w| w[row]);
             for (a, va) in jets.vars.iter().enumerate() {

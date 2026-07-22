@@ -278,9 +278,17 @@ fn certified_reduced_face_newton_candidate(
     let candidate_values = constraints
         .values(candidate.view())
         .map_err(|error| format!("reduced active-face candidate evaluation failed: {error}"))?;
-    // Rows landing inside the working-face band at the truncated candidate,
-    // ascending index — the MULTI-BLOCKER carry set (gam#979, see below).
-    let mut band_tight_rows: Vec<usize> = Vec::new();
+    // Rows the chord PRESSES INTO (descending slack) that land inside the
+    // working band at the truncated candidate — the simultaneously-binding
+    // blocker set (gam#979, see the carry below). The descent-rate filter is
+    // load-bearing twice over: it keeps the carry bounded by genuine blocking
+    // events (carrying the raw band membership accumulated without bound —
+    // warm_active_rows=180/720 by cycle 40 — and thrashed the QP), and it
+    // keeps RELEASED rows released (a row the duals released stays inside the
+    // band for a few cycles while the chord lifts off it; re-activating it
+    // re-pins the very direction the KKT says must free, and the measured
+    // accepted steps then RAISE the linearized residual, 94.6 → 106).
+    let mut pressed_band_rows: Vec<usize> = Vec::new();
     for row in 0..constraints.nrows() {
         let norm = constraints
             .row_norm(row)
@@ -298,8 +306,10 @@ fn certified_reduced_face_newton_candidate(
         if scaled_slack < -gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
             return Ok(None);
         }
-        if scaled_slack <= gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL {
-            band_tight_rows.push(row);
+        if values_delta[row] < 0.0
+            && scaled_slack <= gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL
+        {
+            pressed_band_rows.push(row);
         }
     }
 
@@ -337,16 +347,26 @@ fn certified_reduced_face_newton_candidate(
     // designated first blocker while several rows land in the working band at
     // the same chord fraction used to carry only ONE of them: the next cycle
     // re-proposed a near-identical chord, hit the next row, and the face grew
-    // one row per cycle (the measured cyc-28..43 accretion of the #2301 n=80
-    // CTN fit — a Zeno march the inner budget cannot afford at an 80-row cone
-    // over a 6-dim block). Carry EVERY row the truncated candidate presses
-    // into the working band (ascending index, deterministic), so the whole
-    // simultaneously-binding set activates in one cycle; the downstream face
-    // consumers already rank-reduce redundant rows to independent
-    // representatives. Truncated chords only — an untruncated certified
-    // Newton step keeps its exact-face semantics unchanged.
+    // one row per cycle (the measured 340/372-cycle Zeno accretion of the
+    // #2301 n=80 CTN fit — an 80-row cone over a 6-dim block cannot complete
+    // its face at one exchange per cycle inside the inner budget). Carry every
+    // row the truncated chord PRESSES INTO the working band (`pressed_band_
+    // rows`: descending slack AND band-tight at the candidate, ascending
+    // index), so the whole simultaneously-binding set activates in one cycle.
+    // The descent-rate condition is what separates this from the two measured
+    // over-carries: the raw band membership accumulated without bound and
+    // thrashed the QP (warm_active_rows=180/720 by cycle 40, working-set-
+    // repeat hard failure), and the rank-reduced tight face at the candidate
+    // re-activated rows the duals had just RELEASED — a released row stays
+    // inside the band while the chord lifts off it, and re-pinning it holds
+    // the very direction the KKT needs freed (measured: accepted steps RAISED
+    // the linearized residual 94.6 → 106 and the solve parked at
+    // active_set_incomplete). A pressed row is by definition one the chord is
+    // driving tight, never one it is leaving. Truncated chords only — an
+    // untruncated certified Newton step keeps its exact-face semantics
+    // unchanged.
     if blocking_row.is_some() {
-        for row in band_tight_rows {
+        for row in pressed_band_rows {
             if !next_active.contains(&row) {
                 next_active.push(row);
             }
@@ -862,39 +882,11 @@ fn resolve_constrained_converged_mode<F: CustomFamily + Clone + Send + Sync + 's
     // resolves that phantom to a genuine constrained mode, and any REAL saddle
     // keeps a feasible escape (its direction lies in the tight-face tangent, so
     // it has zero rate on every tight row and a meaningful feasible length).
-    let feasibility_tol = gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
-    let mut tight_active_sets: Vec<Option<Vec<usize>>> =
-        Vec::with_capacity(block_constraints.len());
-    for (block_idx, constraints_opt) in block_constraints.iter().enumerate() {
-        let Some(constraints) = constraints_opt else {
-            tight_active_sets.push(None);
-            continue;
-        };
-        let block_values = constraints.values(states[block_idx].beta.view())?;
-        let mut rows: Vec<usize> = cached_active_sets
-            .get(block_idx)
-            .and_then(|active| active.clone())
-            .unwrap_or_default();
-        for row in 0..constraints.nrows() {
-            if rows.contains(&row) {
-                continue;
-            }
-            let norm = constraints.row_norm(row)?;
-            if !(norm.is_finite() && norm > 0.0) {
-                continue;
-            }
-            let bound = constraints.bound(row)?;
-            if bound == f64::NEG_INFINITY {
-                continue;
-            }
-            if (block_values[row] - bound) / norm < feasibility_tol {
-                rows.push(row);
-            }
-        }
-        rows.sort_unstable();
-        rows.dedup();
-        tight_active_sets.push((!rows.is_empty()).then_some(rows));
-    }
+    let tight_active_sets = crate::blockwise_solve::widen_active_sets_to_tight_face(
+        block_constraints,
+        states,
+        cached_active_sets,
+    )?;
     let mode_active_block =
         assemble_active_constraint_block(block_constraints, &tight_active_sets, ranges, total_p);
     let certificate = exact_joint_mode_curvature_certificate(
@@ -6450,9 +6442,16 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // contract here.
             if !returned_mode_curvature_certified && joint_jeffreys_subspace.is_none() {
                 let mode_active_block = if joint_constraints.is_some() {
+                    // Certify on the full numerically-tight face, not only the
+                    // QP-recorded rows — see widen_active_sets_to_tight_face.
+                    let tight_sets = crate::blockwise_solve::widen_active_sets_to_tight_face(
+                        &block_constraints,
+                        &states,
+                        &cached_active_sets,
+                    )?;
                     crate::blockwise_solve::assemble_active_constraint_block(
                         &block_constraints,
-                        &cached_active_sets,
+                        &tight_sets,
                         &ranges,
                         total_p,
                     )
@@ -6607,9 +6606,21 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             );
             let active_constraints = {
                 let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+                // The LAML logdet must project onto the tangent of the FULL
+                // numerically-tight face at the returned mode — the same face
+                // the curvature certificate used. Projecting only past the
+                // QP-recorded rows leaves near-tight rows' normals inside the
+                // tangent, and the genuine curvature normal to them reads as a
+                // phantom indefiniteness that aborts the ρ-evaluation (the
+                // measured survival marginal-slope "no Laplace mode" terminal).
+                let tight_sets = crate::blockwise_solve::widen_active_sets_to_tight_face(
+                    &block_constraints,
+                    &states,
+                    &cached_active_sets,
+                )?;
                 assemble_active_constraint_block(
                     &block_constraints,
-                    &cached_active_sets,
+                    &tight_sets,
                     &ranges,
                     total_p,
                 )
@@ -6866,9 +6877,16 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 let local_ranges = block_param_ranges(specs);
                 let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
                 let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+                // Full numerically-tight face, not only the QP-recorded rows —
+                // see widen_active_sets_to_tight_face (gam#979).
+                let tight_sets = crate::blockwise_solve::widen_active_sets_to_tight_face(
+                    &block_constraints,
+                    &states,
+                    &cached_active_sets,
+                )?;
                 assemble_active_constraint_block(
                     &block_constraints,
-                    &cached_active_sets,
+                    &tight_sets,
                     &local_ranges,
                     local_total_p,
                 )
@@ -6940,9 +6958,16 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 let local_ranges = block_param_ranges(specs);
                 let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
                 let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+                // Full numerically-tight face, not only the QP-recorded rows —
+                // see widen_active_sets_to_tight_face (gam#979).
+                let tight_sets = crate::blockwise_solve::widen_active_sets_to_tight_face(
+                    &block_constraints,
+                    &states,
+                    &cached_active_sets,
+                )?;
                 assemble_active_constraint_block(
                     &block_constraints,
-                    &cached_active_sets,
+                    &tight_sets,
                     &local_ranges,
                     local_total_p,
                 )
@@ -7945,9 +7970,16 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
     );
 
     let active_constraints = {
+        // Full numerically-tight face, not only the QP-recorded rows — see
+        // widen_active_sets_to_tight_face (gam#979).
+        let tight_sets = crate::blockwise_solve::widen_active_sets_to_tight_face(
+            &block_constraints,
+            &states,
+            &cached_active_sets,
+        )?;
         assemble_active_constraint_block(
             &block_constraints,
-            &cached_active_sets,
+            &tight_sets,
             &local_ranges,
             local_total_p,
         )

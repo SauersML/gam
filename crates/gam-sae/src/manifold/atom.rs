@@ -269,12 +269,21 @@ impl SaeAtomBasisKind {
 /// `|κt|` past `π/2` (a quarter period) — so it is NOT written raw into the
 /// Newton/Schur `H_tt` diagonal: that would make the per-row coordinate block
 /// indefinite and the Schur (and log-det) Cholesky would fail on a non-PD pivot
-/// at `K ≥ 2`. The assembly accumulates the PSD majorizer `max(V'', 0)` into
-/// `H_tt` instead (mirroring `add_sae_coord_penalty`'s `psd_majorizer_diag` for
-/// the registry coord penalties). Majorizing the curvature of a *fixed* prior
+/// at `K ≥ 2`. The assembly accumulates the PSD majorizer [`Self::psd_majorizer_hess`]
+/// into `H_tt` instead (mirroring `add_sae_coord_penalty`'s `psd_majorizer_diag`
+/// for the registry coord penalties). Majorizing the curvature of a *fixed* prior
 /// only damps the Newton step; the stationary point is set by the exact gradient
 /// `V'`, so it is unchanged. The Laplace `½ log|H|` is therefore evaluated on the
 /// same PSD-majorized `H_tt` (a valid Cholesky requires a PD operator anyway).
+///
+/// The majorizer is the SMOOTH homogeneity-preserving upper envelope
+/// `α·softplus_{τ₀}(cos κt)` of the hard clamp `α·max(cos κt, 0)`, not the hard
+/// clamp itself (#2339): it removes the kink at `cos κt = 0` so the streaming
+/// `½log|B̃|` criterion is a composite-analytic estimand, while the tiny
+/// dimensionless temperature `τ₀` (see [`Self::CLAMP_TEMPERATURE`]) keeps the
+/// value change below the criterion's own spectral-deflation floor. Euclidean
+/// axes have constant `V'' = α > 0`, so the clamp is a no-op there and
+/// `hess_majorized == hess` bit-for-bit.
 ///
 /// `sq_equiv` is the Euclidean-equivalent `t²` such that `½·α·sq_equiv == V`,
 /// i.e. `sq_equiv = 2V/α = (2/κ²)(1−cos κt)`. It is what the
@@ -285,6 +294,12 @@ pub(crate) struct ArdAxisPrior {
     pub(crate) value: f64,
     pub(crate) grad: f64,
     pub(crate) hess: f64,
+    /// Smooth PSD clamp of `hess` (the majorizer written into `H_tt`). Read only
+    /// through [`Self::psd_majorizer_hess`]; the complementary remainder
+    /// [`Self::negative_hessian_remainder`] is defined as `hess - hess_majorized`
+    /// so `psd_majorizer_hess + negative_hessian_remainder == hess` holds
+    /// bit-for-bit. Equal to `hess` on Euclidean axes.
+    hess_majorized: f64,
     pub(crate) sq_equiv: f64,
 }
 
@@ -298,6 +313,9 @@ impl ArdAxisPrior {
                 value: 0.5 * alpha * t * t,
                 grad: alpha * t,
                 hess: alpha,
+                // Euclidean curvature is the constant `+α > 0`; the clamp is a
+                // no-op, so the smooth majorizer equals `hess` bit-for-bit.
+                hess_majorized: alpha,
                 sq_equiv: t * t,
             },
             Some(p) => {
@@ -313,6 +331,7 @@ impl ArdAxisPrior {
                     value: (alpha / (kappa * kappa)) * one_minus_cos,
                     grad: (alpha / kappa) * sin,
                     hess: alpha * cos,
+                    hess_majorized: Self::smooth_clamp(alpha, cos),
                     sq_equiv: (2.0 / (kappa * kappa)) * one_minus_cos,
                 }
             }
@@ -340,22 +359,92 @@ impl ArdAxisPrior {
         }
     }
 
-    /// Positive-semidefinite curvature used by the Newton/Schur majorizer.
+    /// Dimensionless softplus temperature `τ₀` for the homogeneity-preserving
+    /// smooth PSD clamp of the *periodic* ARD curvature `V'' = α·cos(κt)`
+    /// (#2339). NOT a tunable knob — derived below.
     ///
-    /// This is deliberately not the exact prior Hessian on a periodic axis:
-    /// the exact `alpha*cos(kappa*t)` remains signed.  The factorized inner
-    /// solver and its Laplace log determinant declare this positive-part
-    /// operator, so every derivative of that operator must call this seam.
+    /// The hard clamp `max(V'', 0)` has a kink at `cos κt = 0`. We instead smooth
+    /// the DIMENSIONLESS cosine `c = cos κt ∈ [−1,1]` with the temperature-`τ₀`
+    /// softplus `s_{τ₀}(c) = τ₀·ln(1 + e^{c/τ₀})` and set the majorizer to
+    /// `α·s_{τ₀}(c)` ([`Self::smooth_clamp`]). Multiplying the smoothed
+    /// dimensionless cosine by `α` — never smoothing the dimensional `α·c`
+    /// directly — keeps the operator EXACTLY degree-one homogeneous in
+    /// `α = e^{ρ_ard}`. That homogeneity is load-bearing: the `½log|B|`
+    /// θ-adjoint's explicit-`ρ` channel uses `∂/∂ρ_ard[α·s_{τ₀}(c)] = α·s_{τ₀}(c)
+    /// = psd_majorizer_hess`, so the log-precision log-det traces
+    /// (`ard_log_precision_hessian_trace`,
+    /// `coordinate_block_ard_log_precision_hessian_trace`) remain the exact
+    /// `∂B/∂ρ_ard` with no code change. A non-homogeneous `s_{τ}(α·c)` would
+    /// silently desync them.
+    ///
+    /// DERIVATION of `τ₀`. `s_{τ₀}(c)` deviates from `max(c, 0)` by at most
+    /// `s_{τ₀}(0) − 0 = τ₀·ln2` (the maximum, attained at `c = 0`), measured in
+    /// the dimensionless cosine whose natural scale is unity (`|c| ≤ 1`). The
+    /// criterion already resolves relative curvature only down to the spectral-
+    /// deflation floor `SPECTRAL_DEFLATION_REL_FLOOR` (a direction with
+    /// `λ < floor·λ_max` is deflated as null). Requiring the smoothing deviation
+    /// to stay at/below that floor's resolution,
+    /// `τ₀·ln2 ≤ SPECTRAL_DEFLATION_REL_FLOOR`, and taking the binding
+    /// (largest-admissible, hence smoothest) value gives
+    /// `τ₀ = SPECTRAL_DEFLATION_REL_FLOOR / ln2 ≈ 1.4427e-8`. The resulting
+    /// absolute majorizer perturbation is `α·τ₀·ln2 = α·SPECTRAL_DEFLATION_REL_FLOOR`,
+    /// i.e. exactly the deflation floor relative to that axis's own curvature
+    /// scale `α`.
+    pub(crate) const CLAMP_TEMPERATURE: f64 =
+        gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR / std::f64::consts::LN_2;
+
+    /// Homogeneity-preserving smooth replacement for `α·max(cos, 0)` acting on
+    /// the dimensionless cosine `cos = cos κt ∈ [−1,1]` (`alpha ≥ 0`). Uses the
+    /// numerically stable softplus `max(c,0) + τ₀·ln(1 + e^{−|c|/τ₀})`, which
+    /// collapses to `max(c,0)` exactly once `|c| ≫ τ₀` (i.e. everywhere except a
+    /// band of width `~τ₀` around the clamp seam). Result is strictly positive,
+    /// so the majorized `H_tt` is PD (`B ≻ 0`), never merely PSD.
     #[inline]
-    pub(crate) fn psd_majorizer_hess(self) -> f64 {
-        self.hess.max(0.0)
+    pub(crate) fn smooth_clamp(alpha: f64, cos: f64) -> f64 {
+        let tau = Self::CLAMP_TEMPERATURE;
+        let softplus = cos.max(0.0) + tau * (-(cos.abs()) / tau).exp().ln_1p();
+        alpha * softplus
     }
 
-    /// Signed correction that turns the PSD majorizer back into the exact
-    /// prior Hessian: `hess = psd_majorizer_hess + negative_hessian_remainder`.
+    /// Derivative of the smooth clamp w.r.t. the dimensionless cosine `c`:
+    /// `s'_{τ₀}(c) = logistic(c/τ₀) ∈ (0,1)`, the smooth replacement for the hard
+    /// clamp's `1{c > 0}` step indicator (`τ₀ → 0` recovers the step). Stable
+    /// logistic. Consumed by `ard_majorized_hessian_derivative` to form the
+    /// analytic `∂/∂t` of `α·s_{τ₀}(cos κt)`.
+    #[inline]
+    pub(crate) fn clamp_slope(cos: f64) -> f64 {
+        let z = cos / Self::CLAMP_TEMPERATURE;
+        if z >= 0.0 {
+            1.0 / (1.0 + (-z).exp())
+        } else {
+            let e = z.exp();
+            e / (1.0 + e)
+        }
+    }
+
+    /// Positive-definite curvature used by the Newton/Schur majorizer.
+    ///
+    /// This is deliberately not the exact prior Hessian on a periodic axis: the
+    /// exact `alpha*cos(kappa*t)` remains signed. The factorized inner solver and
+    /// its Laplace log determinant declare this positive-part operator, so every
+    /// derivative of that operator must call this seam. On a periodic axis it is
+    /// the smooth envelope `α·softplus_{τ₀}(cos κt)` (see
+    /// [`Self::CLAMP_TEMPERATURE`]); on a Euclidean axis it is `hess = α`.
+    #[inline]
+    pub(crate) fn psd_majorizer_hess(self) -> f64 {
+        self.hess_majorized
+    }
+
+    /// Signed correction that turns the PSD majorizer back into the exact prior
+    /// Hessian: `hess = psd_majorizer_hess + negative_hessian_remainder`. Defined
+    /// as the complement `hess - hess_majorized`, so the identity holds
+    /// bit-for-bit. Non-positive (`hess_majorized ≥ hess` always, since
+    /// `softplus_{τ₀}(c) ≥ max(c,0) ≥ c`), so the restored concave remainder
+    /// `E = −negative_hessian_remainder ⪰ 0` — the exact `A = B − E` split is
+    /// preserved.
     #[inline]
     pub(crate) fn negative_hessian_remainder(self) -> f64 {
-        self.hess.min(0.0)
+        self.hess - self.hess_majorized
     }
 }
 

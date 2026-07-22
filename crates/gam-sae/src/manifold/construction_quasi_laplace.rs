@@ -4218,25 +4218,31 @@ impl SaeManifoldTerm {
     ) -> f64 {
         let periods = self.assignment.coords[atom].effective_axis_periods();
         let t = self.assignment.coords[atom].row(row)[axis];
-        let prior = ArdAxisPrior::eval(alpha, t, periods[axis]);
-        if prior.hess <= 0.0 {
-            return 0.0;
-        }
         match periods[axis] {
             None => 0.0,
             Some(period) => {
                 let kappa = std::f64::consts::TAU / period;
-                // HT row weighting: the assembled majorizer whose t-derivative this
-                // feeds into the ½log|H| θ-adjoint is `w_row·max(V'',0)` (full
-                // `w_row`, added directly to `htt` — NOT via the √w jet seam), so on
-                // the positive branch its coordinate derivative is
-                // `w_row·d/dt[α cos κt] = w_row·(−ακ sin κt)`. The data-fit `dH/dθ`
-                // terms sharing this diagonal already carry full `w` (each is a
-                // product of two √w-scaled jets, so √w·√w = w), so the correct single
-                // factor for this prior term is likewise full `w_row`. `None`
-                // weights ⇒ w_row = 1, bit-for-bit the historical derivative.
+                let phase = kappa * t;
+                let (sin, cos) = phase.sin_cos();
+                // Exact `∂/∂t` of the assembled majorizer entry
+                // `w_row·psd_majorizer_hess = w_row·α·s_{τ₀}(cos κt)` (#2339):
+                //   d/dt = w_row·α·s'_{τ₀}(cos κt)·(−κ sin κt)
+                //        = −w_row·α·κ·sin(κt)·logistic(cos κt / τ₀).
+                // The logistic factor `clamp_slope` is the smooth replacement for
+                // the old hard `1{cos κt > 0}` branch indicator (`τ₀→0` recovers
+                // it), so both the convex and concave halves now flow through one
+                // analytic expression — C¹ across the clamp seam.
+                //
+                // HT row weighting: the assembled majorizer is `w_row·V''_clamped`
+                // (full `w_row`, added directly to `htt` — NOT via the √w jet
+                // seam), so its coordinate derivative carries the same full
+                // `w_row`. The data-fit `dH/dθ` terms sharing this diagonal already
+                // carry full `w` (a product of two √w-scaled jets), so the correct
+                // single factor for this prior term is likewise full `w_row`.
+                // `None` weights ⇒ w_row = 1.
+                let slope = ArdAxisPrior::clamp_slope(cos);
                 let w_row = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
-                -w_row * alpha * kappa * (kappa * t).sin()
+                -w_row * alpha * kappa * sin * slope
             }
         }
     }

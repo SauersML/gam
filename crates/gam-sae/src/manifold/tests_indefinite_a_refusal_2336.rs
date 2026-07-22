@@ -16,9 +16,10 @@ use ndarray::{s, Array1, Array2};
 ///
 /// The majorizer clamps that curvature away (`atom.rs`: `hess =
 /// psd_majorizer_hess + negative_hessian_remainder`, `psd_majorizer_hess =
-/// max(hess, 0)`), so `A = B − E` with `E ⪰ 0` diagonal in the coordinate block,
-/// carrying `|α·cos κt_ik|` with `α = e^{ρ_ard}`. `B ≻ 0` by construction, so the
-/// inner Newton converges, while the exact `A` it does NOT see stays indefinite.
+/// α·softplus_{τ₀}(cos κt)` — the #2339 smooth envelope of `max(hess, 0)`), so
+/// `A = B − E` with `E ⪰ 0` diagonal in the coordinate block, carrying
+/// `≈|α·cos κt_ik|` with `α = e^{ρ_ard}`. `B ≻ 0` by construction, so the inner
+/// Newton converges, while the exact `A` it does NOT see stays indefinite.
 fn ard_saddle_state() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let (term, mut target, mut rho) = gamma_fd_tiny_fixture();
     let (n, p) = (target.nrows(), target.ncols());

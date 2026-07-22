@@ -909,6 +909,63 @@ pub(crate) fn scatter_joint_active_set(
 ///
 /// Returns `None` when no block has any active constraints — the caller
 /// can then skip the constraint-aware kernel entirely.
+/// Widen per-block QP-recorded active sets to the full NUMERICALLY-TIGHT face
+/// at the current per-block β (gam#979).
+///
+/// At a degenerate binding vertex the QP can leave a row with scaled slack
+/// inside the primal-feasibility band OUT of its recorded active set (a
+/// phantom-dual / zero-multiplier omission). Such a row is on the active face
+/// all the same: every mode-geometry consumer — the Laplace tangent of the
+/// curvature certificate, the active-face logdet of the LAML value, the
+/// constrained covariance — must null it, or the face tangent over-counts free
+/// directions and curvature normal to the near-tight row leaks in as a phantom
+/// indefiniteness (the measured survival marginal-slope terminal: tangent
+/// min_eig=−1.09 on a 22-dim tangent whose true tight face is smaller, so the
+/// certified constrained mode is refused as "no Laplace mode"). The union is
+/// per block: the caller's recorded rows plus every finite-bound row whose
+/// scaled slack `(a·β−b)/‖a‖` is below `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`,
+/// ascending and deduplicated.
+pub(crate) fn widen_active_sets_to_tight_face(
+    block_constraints: &[Option<ConstraintSet>],
+    states: &[ParameterBlockState],
+    cached_active_sets: &[Option<Vec<usize>>],
+) -> Result<Vec<Option<Vec<usize>>>, String> {
+    let feasibility_tol = gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
+    let mut tight_active_sets: Vec<Option<Vec<usize>>> =
+        Vec::with_capacity(block_constraints.len());
+    for (block_idx, constraints_opt) in block_constraints.iter().enumerate() {
+        let Some(constraints) = constraints_opt else {
+            tight_active_sets.push(None);
+            continue;
+        };
+        let block_values = constraints.values(states[block_idx].beta.view())?;
+        let mut rows: Vec<usize> = cached_active_sets
+            .get(block_idx)
+            .and_then(|active| active.clone())
+            .unwrap_or_default();
+        for row in 0..constraints.nrows() {
+            if rows.contains(&row) {
+                continue;
+            }
+            let norm = constraints.row_norm(row)?;
+            if !(norm.is_finite() && norm > 0.0) {
+                continue;
+            }
+            let bound = constraints.bound(row)?;
+            if bound == f64::NEG_INFINITY {
+                continue;
+            }
+            if (block_values[row] - bound) / norm < feasibility_tol {
+                rows.push(row);
+            }
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        tight_active_sets.push((!rows.is_empty()).then_some(rows));
+    }
+    Ok(tight_active_sets)
+}
+
 pub(crate) fn assemble_active_constraint_block(
     block_constraints: &[Option<ConstraintSet>],
     block_active_sets: &[Option<Vec<usize>>],
