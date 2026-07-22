@@ -4,6 +4,9 @@
 // are imported at fn scope so a non-test `--lib` build never sees them.
 
 use super::*;
+use super::tests::assert_rel_close;
+// `Order2::value()` resolves through the shared `JetField` supertrait.
+use gam_math::nested_dual::JetField as _;
 use ndarray::{Array1, Array2};
 
 /// #1561 order-3 dispersion tower, part 1: the third-order tower's value,
