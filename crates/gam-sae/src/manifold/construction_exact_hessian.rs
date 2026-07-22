@@ -1605,22 +1605,24 @@ impl SaeManifoldTerm {
                                     sae_dot(jets.first(a), jets.first(b))
                                         * (Self::softmax_data_weight_product_logit_factor(
                                             a_soft, atom_a, atom_b, atom_w, inv_tau,
-                                        ) + if patchd_is_obb
-                                            && atom_w == atom_a
-                                            && atom_w == atom_b
-                                        {
-                                            // #2330 — ordered-Beta--Bernoulli gate
-                                            // gradient of the GN curvature. `B[a,b]`
-                                            // carries `gate^2`, so
-                                            // `dB/dl_w = 2*(gate'/gate)*B = 2(1-gate)/tau*B`.
-                                            // Same-atom only: the OBB gates are
-                                            // INDEPENDENT per atom, so the cross-atom
-                                            // derivative is exactly zero (unlike
-                                            // softmax's shared normalization). The
-                                            // softmax factor above is 0 here (`inv_tau`
-                                            // is 0 for non-softmax modes), so the softmax
-                                            // path is bitwise unchanged.
-                                            2.0 * (1.0 - a_soft[atom_w]) * patchd_obb_inv_tau
+                                        ) + if patchd_is_obb {
+                                            // #2330 / #2371 -- ordered-Beta--Bernoulli gate
+                                            // gradient of the GN curvature. `B[a,b] = <J_a, J_b>`
+                                            // and each leg `J_k` carries its INDEPENDENT gate
+                                            // `g_k = sigma(l_k/tau)` linearly, so
+                                            // `dB/dl_w = [1(w==a) + 1(w==b)] * (1-g_w)/tau * B`.
+                                            // The matching leg gate is `g_w`, so a single
+                                            // `(1 - a_soft[atom_w])` is correct per side:
+                                            // same-atom-both gives sided=2 (bitwise the prior
+                                            // landed value), one-sided cross-atom gives sided=1
+                                            // (the #2371 term wrongly dropped as exactly zero).
+                                            // The softmax factor above is 0 here (`inv_tau` is
+                                            // 0 for non-softmax modes), so softmax is unchanged.
+                                            let sided = (atom_w == atom_a) as u32
+                                                + (atom_w == atom_b) as u32;
+                                            sided as f64
+                                                * (1.0 - a_soft[atom_w])
+                                                * patchd_obb_inv_tau
                                         } else {
                                             0.0
                                         })
