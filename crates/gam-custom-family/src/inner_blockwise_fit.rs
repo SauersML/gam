@@ -3484,18 +3484,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 } else {
                     None
                 };
-            // SELF-CONCORDANT DAMPED FIRST TRIAL (gam#979). For a family that
-            // declares its penalized inner objective self-concordant, compute
-            // once per cycle the damped-Newton `α = 1/(1+λ_N)` from the
-            // spectrum's Newton decrement. The FIRST trust attempt of the cycle
-            // then proposes `α·δ_N` (the largest step with a guaranteed
-            // decrease on the barrier objective) instead of the radius-clamped
-            // step; every later attempt — reached only if that trial is
-            // rejected by the retained feasibility/ρ acceptance gates — uses
-            // the unchanged trust-region machinery, so the fallback and every
-            // non-flagged family are byte-identical. `None` outside the damped
-            // phase (λ_N below the quadratic-phase threshold), where plain
-            // Newton owns the endgame.
+            // SELF-CONCORDANT DAMPING (gam#979). For a family that declares
+            // its penalized inner objective self-concordant, compute once per
+            // cycle the damped-Newton `α = 1/(1+λ_N)` from the spectrum's
+            // Newton decrement. Consumed ONLY by the α-crush rescue arm of the
+            // first trust attempt (the measured barrier-overshoot pathology),
+            // where `α·δ_N` replaces the radius-clamped step; every other arm,
+            // every later attempt, and every non-flagged family are
+            // byte-identical. `None` outside the damped phase (λ_N below the
+            // quadratic-phase threshold), where plain Newton owns the endgame.
             let self_concordant_damping: Option<f64> =
                 if family.inner_objective_is_self_concordant() {
                     joint_spectrum.as_ref().and_then(|spectrum| {
@@ -3679,39 +3676,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             // same Err downstream and shrinks the radius.
                             Err(_) => false,
                         };
-                    if let Some(sc_alpha) = sc_first_trial_alpha {
-                        // SELF-CONCORDANT DAMPED FIRST TRIAL (gam#979). In the
-                        // damped phase the guaranteed-decrease step is
-                        // `α·δ_N`, α = 1/(1+λ_N) — independent of the D-metric
-                        // trust radius, which carries no barrier information
-                        // and, once collapsed by earlier barrier-overshoot
-                        // rejections, regrows too slowly to escape the
-                        // ~0.998×/cycle residual crawl. On the authoritative
-                        // constrained path damp the QP/face chord itself
-                        // (β and β+δ are both cone-feasible, so β+αδ stays
-                        // feasible and A_active·αδ = 0 is preserved);
-                        // otherwise damp the full modified-Newton spectrum
-                        // step and let the cone projection below restore
-                        // feasibility. Skip the global fraction-to-boundary
-                        // α-crush either way (`qp_feasible_bypass`): the crush
-                        // is the crawl mechanism this trial replaces, and the
-                        // magnitude-preserving cone projection still enforces
-                        // every hard constraint. The retained ρ/likelihood
-                        // acceptance gates decide the trial's fate exactly as
-                        // for any other proposal.
-                        qp_feasible_bypass = true;
-                        if constrained_search_delta_is_authoritative {
-                            trial_delta = search_delta.clone();
-                        } else {
-                            trial_delta = spectrum.trust_region_step(f64::INFINITY).delta;
-                        }
-                        trial_delta.mapv_inplace(|value| value * sc_alpha);
-                        joint_trust_region_block_metric_norms(
-                            &trial_delta,
-                            &ranges,
-                            &joint_trust_metric_diag,
-                        )
-                    } else if constrained_search_delta_is_authoritative {
+                    if constrained_search_delta_is_authoritative {
                         // A full-space convex QP direction and a reduced-face
                         // direction both own their feasible chord. In the latter
                         // case, ambient negative curvature is inaccessible and
@@ -3739,7 +3704,32 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         }
                     } else if constrained_alpha_would_crush {
                         qp_feasible_bypass = true;
-                        trial_delta = spectrum.trust_region_step(joint_trust_radius).delta;
+                        // SELF-CONCORDANT DAMPED CRUSH REPLACEMENT (gam#979).
+                        // This arm is reached exactly on the barrier-overshoot
+                        // pathology: the fraction-to-boundary α the legacy path
+                        // would apply is below the crush threshold, i.e. the
+                        // Newton proposal steps deep past the −log h' barrier's
+                        // region of model validity and the crush would gut it to
+                        // ~1e-4·δ_N (the measured ~0.998×/cycle residual crawl).
+                        // For a family that declares its inner objective
+                        // self-concordant, the damped Newton step `α·δ_N`,
+                        // α = 1/(1+λ_N), is the classical largest step with a
+                        // guaranteed objective decrease — a principled,
+                        // barrier-aware step length where the D-metric radius
+                        // carries no barrier information. First attempt only;
+                        // a rejection falls back to the byte-identical
+                        // radius-clamped rescue below. The authoritative
+                        // face-chord arm above is deliberately untouched: an
+                        // interior-damped step there pulls every accepted
+                        // iterate off the working band, wipes the cached active
+                        // face, and forces a from-scratch QP each cycle
+                        // (measured: warm_rows=0 on all 244 cycles).
+                        if let Some(sc_alpha) = sc_first_trial_alpha {
+                            trial_delta = spectrum.trust_region_step(f64::INFINITY).delta;
+                            trial_delta.mapv_inplace(|value| value * sc_alpha);
+                        } else {
+                            trial_delta = spectrum.trust_region_step(joint_trust_radius).delta;
+                        }
                         joint_trust_region_block_metric_norms(
                             &trial_delta,
                             &ranges,
