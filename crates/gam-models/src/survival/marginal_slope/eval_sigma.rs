@@ -445,3 +445,276 @@ impl SurvivalMarginalSlopeFamily {
         Ok(Some(acc.to_dense(&slices)))
     }
 }
+
+#[cfg(test)]
+mod sigma_parameter_jet_release_tests {
+    use super::*;
+    use crate::survival::lognormal_kernel::ProbitFrailtyScaleJet;
+    use gam_math::jet_scalar::JetScalar;
+    use gam_math::jet_tower::{Tower3, Tower4};
+    use gam_math::nested_dual::{Dual2, JetField};
+    use std::time::Instant;
+
+    // One synthetic interior row: finite signed margins and a strictly-positive
+    // raw time derivative so the monotonicity guard admits. `probit_scale = 1.0`
+    // mirrors `row_neglog_canonical_scale_jet`, which folds the frailty scale
+    // into the observed slope primary rather than a second in-kernel scaling.
+    fn synthetic_inputs(wi: f64, di: f64, z_sum: f64) -> RigidRowInputs {
+        RigidRowInputs {
+            row: 0,
+            wi,
+            di,
+            z_sum,
+            covariance_ones: 1.0,
+            probit_scale: 1.0,
+            qd1_lower: 0.0,
+        }
+    }
+
+    // The exact expression `row_neglog_canonical_scale_jet` evaluates: observe
+    // the slope primary through the frailty scale, then the sole rigid row NLL.
+    // Generic over the jet scalar so the production seeded `OneSeed`/`TwoSeed`
+    // instantiations and the dense-tower racer run bit-for-bit the same program.
+    fn eval_scaled<S: JetScalar<4>>(
+        primaries: &[S; 4],
+        scale: &S,
+        inputs: &RigidRowInputs,
+    ) -> Result<S, String> {
+        let observed = [
+            primaries[0],
+            primaries[1],
+            primaries[2],
+            primaries[3].mul(scale),
+        ];
+        rigid_row_nll(&observed, inputs)
+    }
+
+    // Naive dense alternative to `first_parameter_order2_terms`: the SAME row
+    // expression through `Dual2<Tower3<4>>` — a fully dense third-order primary
+    // tower (the generic forward-mode oracle carrier) with the log-sigma
+    // parameter folded in as the outer second-order dual direction. The outer
+    // `.g` channel is the first log-sigma derivative of the primary
+    // (value, gradient, Hessian) tower, exactly the production output.
+    fn racer_first_channel(
+        primaries: &[f64; 4],
+        scale: &ProbitFrailtyScaleJet,
+        inputs: &RigidRowInputs,
+    ) -> Result<Tower3<4>, String> {
+        let variables: [Dual2<Tower3<4>>; 4] = std::array::from_fn(|axis| Dual2 {
+            v: Tower3::variable(primaries[axis], axis),
+            g: Tower3::constant(0.0),
+            h: Tower3::constant(0.0),
+        });
+        let scale_jet = Dual2 {
+            v: Tower3::constant(scale.s),
+            g: Tower3::constant(scale.ds),
+            h: Tower3::constant(scale.d2s),
+        };
+        Ok(eval_scaled(&variables, &scale_jet, inputs)?.g)
+    }
+
+    // Naive dense alternative to `second_parameter_order2_terms`: the SAME row
+    // expression through `Dual2<Tower4<4>>` — the fully dense fourth-order
+    // primary tower with the log-sigma parameter folded in as the outer
+    // second-order dual direction. The outer `.h` channel is the second
+    // log-sigma derivative of the primary (value, gradient, Hessian) tower.
+    fn racer_second_channel(
+        primaries: &[f64; 4],
+        scale: &ProbitFrailtyScaleJet,
+        inputs: &RigidRowInputs,
+    ) -> Result<Tower4<4>, String> {
+        let variables: [Dual2<Tower4<4>>; 4] = std::array::from_fn(|axis| Dual2 {
+            v: Tower4::variable(primaries[axis], axis),
+            g: Tower4::constant(0.0),
+            h: Tower4::constant(0.0),
+        });
+        let scale_jet = Dual2 {
+            v: Tower4::constant(scale.s),
+            g: Tower4::constant(scale.ds),
+            h: Tower4::constant(scale.d2s),
+        };
+        Ok(eval_scaled(&variables, &scale_jet, inputs)?.h)
+    }
+
+    fn close(label: &str, actual: f64, expected: f64) {
+        let tolerance = 2.0e-11 * actual.abs().max(expected.abs()).max(1.0);
+        assert!(
+            actual.is_finite() && expected.is_finite() && (actual - expected).abs() <= tolerance,
+            "{label}: production={actual:+.16e}, dense_tower={expected:+.16e}, tolerance={tolerance:.3e}",
+        );
+    }
+
+    /// #932 release speed gate for the outer log-sigma hyperparameter jet path
+    /// behind [`SurvivalMarginalSlopeFamily::row_sigma_primary_terms`]. The
+    /// production seeded instantiations — `OneSeed<4>` for the first log-sigma
+    /// derivative ([`first_parameter_order2_terms`]) and `TwoSeed<4>` for the
+    /// second ([`second_parameter_order2_terms`]) — are timed against the naive
+    /// dense alternative that evaluates the same
+    /// `row_neglog_canonical_scale_jet` row expression through the generic
+    /// forward-mode jet tower (`Dual2<Tower3<4>>` / `Dual2<Tower4<4>>`, the
+    /// parameter direction folded into the dense primary tower). Each order is
+    /// parity-pinned to `2e-11` relative before timing, and emits one
+    /// harness-parsed `hand_over_production` token (dense-tower time over
+    /// production time) per event branch; the MSI release harness fails closed
+    /// whenever any measured cell is `<= 1`.
+    ///
+    /// The feedback barrier (no `std::hint::black_box`) nudges the observed
+    /// slope primary by a negligible `1e-18` multiple of the running checksum,
+    /// which folds value/gradient/Hessian channels, so the loop-carried
+    /// recurrence prevents the optimizer from hoisting or dropping the pure
+    /// jet evaluations while keeping the perturbed primary bit-adjacent to the
+    /// fixture regime.
+    #[test]
+    fn release_measure_sigma_parameter_jets_vs_generic_tower_932() {
+        // One ordinary interior row per event branch: censored (d=0) and event
+        // (d=1) drive different live derivative stacks, so each is its own cell.
+        let cases = [
+            (
+                -0.7_f64, 0.4_f64, 0.8_f64, -0.3_f64, 1.0_f64, 0.0_f64, 0.6_f64,
+            ),
+            (
+                0.2_f64, -0.5_f64, 1.4_f64, 0.9_f64, 0.8_f64, 1.0_f64, -1.1_f64,
+            ),
+        ];
+        let scale = ProbitFrailtyScaleJet::from_log_sigma((0.85_f64).ln());
+
+        fn best_ns<F>(iterations: usize, base_g: f64, mut evaluate: F) -> f64
+        where
+            F: FnMut(f64) -> (f64, Array1<f64>, Array2<f64>),
+        {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let mut checksum = 0.0_f64;
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    let (objective, grad, hess) = evaluate(base_g + checksum * 1e-18);
+                    checksum += objective + grad[0] + hess[[0, 0]];
+                }
+                assert!(
+                    checksum.is_finite(),
+                    "sigma-parameter release-measure checksum must stay finite"
+                );
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            best * 1e9 / iterations as f64
+        }
+
+        let iterations = 100_000usize;
+        for &(q0, q1, qd1, g, wi, di, z_sum) in &cases {
+            let inputs = synthetic_inputs(wi, di, z_sum);
+            let primaries = [q0, q1, qd1, g];
+
+            // Parity: first log-sigma derivative — production `OneSeed<4>` vs
+            // dense `Dual2<Tower3<4>>` on objective/gradient/Hessian.
+            let production_first =
+                first_parameter_order2_terms(primaries, scale.s, scale.ds, |vars, param| {
+                    eval_scaled(vars, param, &inputs)
+                })
+                .expect("sigma first-parameter production terms");
+            let racer_first = racer_first_channel(&primaries, &scale, &inputs)
+                .expect("sigma first-parameter dense-tower racer");
+            close(
+                &format!("event={di:.0} d/dlogsigma objective"),
+                production_first.objective,
+                racer_first.v,
+            );
+            for a in 0..4 {
+                close(
+                    &format!("event={di:.0} d/dlogsigma grad[{a}]"),
+                    production_first.grad[a],
+                    racer_first.g[a],
+                );
+                for b in 0..4 {
+                    close(
+                        &format!("event={di:.0} d/dlogsigma hess[{a},{b}]"),
+                        production_first.hess[[a, b]],
+                        racer_first.h[a][b],
+                    );
+                }
+            }
+
+            // Parity: second log-sigma derivative — production `TwoSeed<4>` vs
+            // dense `Dual2<Tower4<4>>` on objective/gradient/Hessian.
+            let production_second = second_parameter_order2_terms(
+                primaries,
+                scale.s,
+                scale.ds,
+                scale.d2s,
+                |vars, param| eval_scaled(vars, param, &inputs),
+            )
+            .expect("sigma second-parameter production terms");
+            let racer_second = racer_second_channel(&primaries, &scale, &inputs)
+                .expect("sigma second-parameter dense-tower racer");
+            close(
+                &format!("event={di:.0} d2/dlogsigma2 objective"),
+                production_second.objective,
+                racer_second.v,
+            );
+            for a in 0..4 {
+                close(
+                    &format!("event={di:.0} d2/dlogsigma2 grad[{a}]"),
+                    production_second.grad[a],
+                    racer_second.g[a],
+                );
+                for b in 0..4 {
+                    close(
+                        &format!("event={di:.0} d2/dlogsigma2 hess[{a},{b}]"),
+                        production_second.hess[[a, b]],
+                        racer_second.h[a][b],
+                    );
+                }
+            }
+
+            // Time each order. Both paths package into the same `Array1`/`Array2`
+            // shape, so the ratio isolates the seeded-jet vs dense-tower cost.
+            let production_first_ns = best_ns(iterations, g, |perturbed_g| {
+                let primaries = [q0, q1, qd1, perturbed_g];
+                let terms =
+                    first_parameter_order2_terms(primaries, scale.s, scale.ds, |vars, param| {
+                        eval_scaled(vars, param, &inputs)
+                    })
+                    .expect("sigma first-parameter production terms");
+                (terms.objective, terms.grad, terms.hess)
+            });
+            let racer_first_ns = best_ns(iterations, g, |perturbed_g| {
+                let primaries = [q0, q1, qd1, perturbed_g];
+                let channel = racer_first_channel(&primaries, &scale, &inputs)
+                    .expect("sigma first-parameter dense-tower racer");
+                let grad = Array1::from_vec(channel.g.to_vec());
+                let hess = Array2::from_shape_fn((4, 4), |(i, j)| channel.h[i][j]);
+                (channel.v, grad, hess)
+            });
+            eprintln!(
+                "SIGMA-PARAM-JET-932 order=1 event={di:.0} production={production_first_ns:.2} \
+                 ns/row dense_tower={racer_first_ns:.2} ns/row hand_over_production={:.6}",
+                racer_first_ns / production_first_ns,
+            );
+
+            let production_second_ns = best_ns(iterations, g, |perturbed_g| {
+                let primaries = [q0, q1, qd1, perturbed_g];
+                let terms = second_parameter_order2_terms(
+                    primaries,
+                    scale.s,
+                    scale.ds,
+                    scale.d2s,
+                    |vars, param| eval_scaled(vars, param, &inputs),
+                )
+                .expect("sigma second-parameter production terms");
+                (terms.objective, terms.grad, terms.hess)
+            });
+            let racer_second_ns = best_ns(iterations, g, |perturbed_g| {
+                let primaries = [q0, q1, qd1, perturbed_g];
+                let channel = racer_second_channel(&primaries, &scale, &inputs)
+                    .expect("sigma second-parameter dense-tower racer");
+                let grad = Array1::from_vec(channel.g.to_vec());
+                let hess = Array2::from_shape_fn((4, 4), |(i, j)| channel.h[i][j]);
+                (channel.v, grad, hess)
+            });
+            eprintln!(
+                "SIGMA-PARAM-JET-932 order=2 event={di:.0} production={production_second_ns:.2} \
+                 ns/row dense_tower={racer_second_ns:.2} ns/row hand_over_production={:.6}",
+                racer_second_ns / production_second_ns,
+            );
+        }
+    }
+}

@@ -433,3 +433,381 @@ fn empirical_flex_warmed_row_allocation_gate_score_warp_932() {
 fn empirical_flex_warmed_row_allocation_gate_link_dev_932() {
     measure_branch(false);
 }
+
+// ------------------------------------------------------------------
+// #932 release cell: fixed-K specialization vs runtime-width dynamic
+// evaluation of the SAME row plan (the specialization-earns-its-keep gate).
+// ------------------------------------------------------------------
+//
+// The BMS empirical-flex third/fourth contractions have NO hand-written
+// derivative tower — unlike the *rigid* Bernoulli row, whose closed forms the
+// `release_measure_rigid_bernoulli_*` cells gate against, the FLEX deviation
+// blocks were jet-only from the start. So the baseline this cell measures
+// against is not a hand tower: it is the *generic runtime-width dynamic jet*
+// (`DynamicOneSeedBatch` / `DynamicTwoSeedBatch`, arena-allocated, width chosen
+// at runtime) that production falls back to for widths without a fixed
+// specialization. Production dispatches the const-generic fixed-width jets
+// (`FixedRuntimeJet<OneSeed<K>,K>` third, `FixedRuntimeJet<TwoSeed<K>,K>`
+// fourth) exactly when the primary width `r = 2 + basis_dim` is one of the
+// specialized tiers {4, 8, 12, 18} (`empirical_bms_third_jet_schedule` /
+// `empirical_bms_fourth_jet_schedule`), and falls back to the dynamic batch
+// otherwise. This cell proves the specialization earns its keep: it compiles
+// ONE canonical [`BmsFlexRowProgram`], then evaluates the third and fourth
+// contractions of that single frozen plan BOTH ways at the SAME tier width and
+// reports the dynamic/fixed time ratio.
+//
+// Because the width that selects a fixed tier is `2 + basis_dim` and the
+// deviation runtime's `basis_dim` grows with its knot count, the natural
+// `mruntime` fixture width is NOT a fixed tier; `tier_runtime` discovers the
+// knot count whose runtime lands the primary width on a fixed tier so the vars
+// the dispatch actually specializes are the ones measured here.
+//
+// SPEC (this module's header): NO wall-clock assertions. The asserted gate is
+// (a) fixed-vs-dynamic parity on the exact benchmarked inputs and (b) checksum
+// finiteness; the speed evidence is the emitted `hand_over_production` token
+// (`dynamic_ns / fixed_ns`, > 1 when the specialization wins), which the MSI
+// release harness parses and fails closed on `<= 1`.
+//
+// The fixed fourth (`empirical_fixed_fourth_many_from_plan`) and dynamic fourth
+// (`empirical_dynamic_fourth_batch_from_plan`) production kernels are
+// `pub(super)` and take an already-compiled `&plan`, so they are invoked
+// directly on the one canonical plan. The third-order fixed/dynamic
+// from-plan helpers are private (`empirical_fixed_third_many_dispatch`) or
+// inline in `empirical_flex_row_third_contracted_many`, so the two third seed
+// wrappers below reproduce ONLY that seeding (identical `FixedRuntimeJet` /
+// `DynamicOneSeedBatch` types and the same production `BmsFlexRowProgram::
+// evaluate`) — the measured arithmetic is production either way.
+
+use super::flex_row_program::BmsFlexRowProgram;
+
+/// Uniform deviation knots over the `mruntime` span for a chosen knot count.
+fn tier_knots(n_knots: usize) -> Array1<f64> {
+    Array1::from_iter(
+        (0..n_knots).map(|i| -2.45_f64 + 5.0_f64 * (i as f64) / ((n_knots - 1) as f64)),
+    )
+}
+
+/// Discover a deviation runtime whose primary width `2 + basis_dim` lands on a
+/// fixed-K specialization tier, and return it with that width. `basis_dim`
+/// increases by one per added knot, so a tier is always reachable; width 12 is
+/// preferred (a substantial-but-fast middle tier), otherwise the first of
+/// {8, 18} encountered is used.
+fn tier_runtime() -> (DeviationRuntime, usize) {
+    let mut fallback: Option<(DeviationRuntime, usize)> = None;
+    for n_knots in 6..=64usize {
+        let Ok(runtime) = DeviationRuntime::try_new(tier_knots(n_knots), 0.0, 3) else {
+            continue;
+        };
+        let width = 2 + runtime.basis_dim();
+        if width == 12 {
+            return (runtime, width);
+        }
+        if matches!(width, 8 | 18) && fallback.is_none() {
+            fallback = Some((runtime, width));
+        }
+    }
+    fallback.expect("some knot count must land the BMS primary width on a fixed-K tier")
+}
+
+/// Build the forced-`GlobalEmpirical` single-row fixture at a caller-supplied
+/// deviation runtime (mirrors `mfixture`, which is pinned to `mruntime`, but
+/// lets this cell target a fixed-K tier width).
+fn build_fixture_with_runtime(is_score_warp: bool, runtime: DeviationRuntime) -> MFixture {
+    let grid = mgrid();
+    let basis_dim = runtime.basis_dim();
+    let policy = gam_runtime::resource::ResourcePolicy::default_library();
+    let dummy = || {
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            ndarray::Array2::zeros((1, 1)),
+        ))
+    };
+    let family = BernoulliMarginalSlopeFamily {
+        y: Arc::new(Array1::from_vec(vec![1.0])),
+        weights: Arc::new(Array1::from_vec(vec![1.0])),
+        z: Arc::new(Array1::from_vec(vec![0.45])),
+        latent_measure: LatentMeasureKind::GlobalEmpirical { grid },
+        gaussian_frailty_sd: None,
+        base_link: InverseLink::Standard(StandardLink::Probit),
+        marginal_design: dummy(),
+        logslope_design: dummy(),
+        score_warp: if is_score_warp {
+            Some(runtime.clone())
+        } else {
+            None
+        },
+        link_dev: if is_score_warp { None } else { Some(runtime) },
+        policy: policy.clone(),
+        cell_moment_lru: new_cell_moment_lru_cache(&policy),
+        cell_moment_cache_stats: new_cell_moment_cache_stats(),
+        intercept_warm_starts: None,
+        auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+    };
+    let primary = PrimarySlices {
+        q: 0,
+        logslope: 1,
+        h: if is_score_warp {
+            Some(2..2 + basis_dim)
+        } else {
+            None
+        },
+        w: if is_score_warp {
+            None
+        } else {
+            Some(2..2 + basis_dim)
+        },
+        total: 2 + basis_dim,
+    };
+    MFixture { family, primary }
+}
+
+/// Fixed-K third contraction of the frozen plan along `dir` — the seeding of
+/// the private `empirical_fixed_third_contracted_arrays::<K>` over the same
+/// `FixedRuntimeJet<OneSeed<K>,K>` algebra and the same `plan.evaluate`.
+fn fixed_third_contracted<const K: usize>(
+    plan: &BmsFlexRowProgram,
+    point: &[f64; K],
+    dir: &Array1<f64>,
+) -> ndarray::Array2<f64> {
+    use gam_math::jet_scalar::{FixedRuntimeJet, OneSeed};
+    let vars: [FixedRuntimeJet<OneSeed<K>, K>; K] = std::array::from_fn(|axis| {
+        FixedRuntimeJet::from_inner(OneSeed::seed_direction(point[axis], axis, dir[axis]))
+    });
+    let contracted = plan
+        .evaluate(&vars, 3, &())
+        .expect("fixed-K third contraction of canonical plan")
+        .into_inner()
+        .contracted_third();
+    ndarray::Array2::from_shape_fn((K, K), |(a, b)| contracted[a][b])
+}
+
+/// Runtime-width dynamic third contraction of the frozen plan along `dir` —
+/// the single-lane form of the dynamic branch in
+/// `empirical_flex_row_third_contracted_many`, over the same
+/// `DynamicOneSeedBatch` algebra and the same `plan.evaluate`.
+fn dynamic_third_contracted(
+    plan: &BmsFlexRowProgram,
+    point: &[f64],
+    dir: &Array1<f64>,
+    r: usize,
+) -> ndarray::Array2<f64> {
+    use gam_math::jet_scalar::{DynamicJetBatchWorkspace, DynamicOneSeedBatch};
+    let mut workspace = DynamicJetBatchWorkspace::new(1);
+    workspace.reset(1);
+    let vars = workspace.alloc_slice_fill_with(r, |axis| {
+        DynamicOneSeedBatch::seed_directions(point[axis], axis, r, &workspace, |_| dir[axis])
+    });
+    let jet = plan
+        .evaluate(vars, 3, &workspace)
+        .expect("dynamic third contraction of canonical plan");
+    ndarray::Array2::from_shape_vec((r, r), jet.contracted_third(0).to_vec())
+        .expect("dynamic third contraction shape")
+}
+
+/// Feedback-coupled best-of-5 timing barrier (no `std::hint::black_box`): the
+/// running checksum feeds the next perturbation so the optimizer cannot hoist
+/// the evaluation. Returns ns per evaluation.
+fn best_measure_ns<F: FnMut(f64) -> f64>(iterations: usize, base: f64, mut evaluate: F) -> f64 {
+    let mut best = f64::INFINITY;
+    for _ in 0..5 {
+        let mut checksum = 0.0_f64;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            checksum += evaluate(base + checksum * 1e-18);
+        }
+        assert!(
+            checksum.is_finite(),
+            "BMS-FLEX-CONTRACTED-932 release-measure checksum must stay finite"
+        );
+        best = best.min(started.elapsed().as_secs_f64());
+    }
+    best * 1e9 / iterations as f64
+}
+
+/// Measure one deviation branch at compile-time tier width `K`.
+fn measure_third_fourth_branch<const K: usize>(is_score_warp: bool, runtime: DeviationRuntime) {
+    use super::cell_moment_assembly::{
+        EmpiricalBmsFourthJetSchedule, EmpiricalBmsThirdJetSchedule,
+        empirical_bms_fourth_jet_schedule, empirical_bms_third_jet_schedule,
+    };
+
+    let label = if is_score_warp {
+        "score-warp"
+    } else {
+        "link-dev"
+    };
+    let fx = build_fixture_with_runtime(is_score_warp, runtime);
+    assert_empirical_branch(&fx);
+    let r = fx.primary.total;
+    assert_eq!(
+        r, K,
+        "{label}: tier fixture width {r} != specialization width K={K}"
+    );
+
+    // Production must actually dispatch the fixed specialization at this width;
+    // otherwise the "specialization vs dynamic fallback" comparison is moot.
+    assert_eq!(
+        empirical_bms_third_jet_schedule(r),
+        EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan,
+        "{label}: production must pick the fixed-K third jet at width {r}"
+    );
+    assert_eq!(
+        empirical_bms_fourth_jet_schedule(r),
+        EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth,
+        "{label}: production must pick the fixed-K fourth jet at width {r}"
+    );
+
+    let pt = mpoint(&fx);
+    let (beta_h, beta_w) = if is_score_warp {
+        (Some(&pt.beta), None)
+    } else {
+        (None, Some(&pt.beta))
+    };
+
+    // ---- one canonical row plan, compiled OUTSIDE every measured region ----
+    let intercept = fx
+        .family
+        .solve_row_intercept_base(0, pt.q, pt.b, beta_h, beta_w, None)
+        .expect("intercept solve")
+        .0;
+    let grid = fx
+        .family
+        .latent_measure
+        .empirical_grid_for_training_row(0)
+        .expect("latent measure query")
+        .expect("forced empirical grid");
+    let plan = fx
+        .family
+        .compile_empirical_bms_row_program(
+            0,
+            &fx.primary,
+            pt.q,
+            pt.b,
+            beta_h,
+            beta_w,
+            intercept,
+            &grid,
+        )
+        .expect("canonical empirical-flex row plan");
+    let point_vec =
+        BernoulliMarginalSlopeFamily::intercept_primary_point(pt.q, pt.b, beta_h, beta_w);
+    let point: [f64; K] = point_vec
+        .as_slice()
+        .try_into()
+        .expect("primary point width matches specialization K");
+
+    // Two distinct, everywhere-nonzero contraction directions.
+    let dir_u = Array1::from_shape_fn(r, |i| 0.5 + 0.3 * ((i % 3) as f64) - 0.2 * ((i % 2) as f64));
+    let dir_v = Array1::from_shape_fn(r, |i| {
+        -0.4 + 0.3 * (((i + 1) % 4) as f64) - 0.1 * ((i % 2) as f64)
+    });
+    let pairs: [(&Array1<f64>, &Array1<f64>); 1] = [(&dir_u, &dir_v)];
+
+    // ---- parity pin on the exact benchmarked inputs -----------------------
+    let fixed_third = fixed_third_contracted::<K>(&plan, &point, &dir_u);
+    let dynamic_third = dynamic_third_contracted(&plan, &point, &dir_u, r);
+    let fixed_fourth = BernoulliMarginalSlopeFamily::empirical_fixed_fourth_many_from_plan::<K>(
+        &plan, &point, &pairs,
+    )
+    .expect("fixed-K fourth contraction of canonical plan");
+    let dynamic_fourth = BernoulliMarginalSlopeFamily::empirical_dynamic_fourth_batch_from_plan(
+        &plan,
+        &point,
+        &pairs,
+        &fx.primary,
+        1,
+    )
+    .expect("dynamic fourth contraction of canonical plan");
+    for a in 0..r {
+        for b in 0..r {
+            let (f3, d3) = (fixed_third[(a, b)], dynamic_third[(a, b)]);
+            let band3 = 1e-11 * f3.abs().max(d3.abs()).max(1.0);
+            assert!(
+                (f3 - d3).abs() <= band3,
+                "{label}: third[{a}][{b}] fixed {f3:+.15e} vs dynamic {d3:+.15e}"
+            );
+            let (f4, d4) = (fixed_fourth[0][(a, b)], dynamic_fourth[0][(a, b)]);
+            let band4 = 1e-11 * f4.abs().max(d4.abs()).max(1.0);
+            assert!(
+                (f4 - d4).abs() <= band4,
+                "{label}: fourth[{a}][{b}] fixed {f4:+.15e} vs dynamic {d4:+.15e}"
+            );
+        }
+    }
+
+    // ---- timing (diagnostic; NO wall-clock assertion per SPEC) ------------
+    // Iteration counts keep each best-of-5 sweep well under ~1s for the heaviest
+    // tier while giving a stable ns/row read.
+    let iters_third = 800usize;
+    let iters_fourth = 500usize;
+
+    let third_fixed_ns = best_measure_ns(iters_third, point[0], |p0| {
+        let mut perturbed = point;
+        perturbed[0] = p0;
+        let m = fixed_third_contracted::<K>(&plan, &perturbed, &dir_u);
+        m[(0, 0)] + m[(r - 1, r - 1)]
+    });
+    let third_dynamic_ns = best_measure_ns(iters_third, point[0], |p0| {
+        let mut perturbed = point;
+        perturbed[0] = p0;
+        let m = dynamic_third_contracted(&plan, &perturbed, &dir_u, r);
+        m[(0, 0)] + m[(r - 1, r - 1)]
+    });
+    eprintln!(
+        "BMS-FLEX-CONTRACTED-932 branch={label} width={K} grid={GRID_NODES} order=3 \
+         production_fixed={third_fixed_ns:.2} ns/row dynamic={third_dynamic_ns:.2} ns/row \
+         hand_over_production={:.6}",
+        third_dynamic_ns / third_fixed_ns,
+    );
+
+    let fourth_fixed_ns = best_measure_ns(iters_fourth, point[0], |p0| {
+        let mut perturbed = point;
+        perturbed[0] = p0;
+        let out = BernoulliMarginalSlopeFamily::empirical_fixed_fourth_many_from_plan::<K>(
+            &plan, &perturbed, &pairs,
+        )
+        .expect("fixed-K fourth contraction");
+        out[0][(0, 0)] + out[0][(r - 1, r - 1)]
+    });
+    let fourth_dynamic_ns = best_measure_ns(iters_fourth, point[0], |p0| {
+        let mut perturbed = point;
+        perturbed[0] = p0;
+        let out = BernoulliMarginalSlopeFamily::empirical_dynamic_fourth_batch_from_plan(
+            &plan,
+            &perturbed,
+            &pairs,
+            &fx.primary,
+            1,
+        )
+        .expect("dynamic fourth contraction");
+        out[0][(0, 0)] + out[0][(r - 1, r - 1)]
+    });
+    eprintln!(
+        "BMS-FLEX-CONTRACTED-932 branch={label} width={K} grid={GRID_NODES} order=4 \
+         production_fixed={fourth_fixed_ns:.2} ns/row dynamic={fourth_dynamic_ns:.2} ns/row \
+         hand_over_production={:.6}",
+        fourth_dynamic_ns / fourth_fixed_ns,
+    );
+}
+
+#[test]
+fn release_measure_bms_empirical_third_fourth_fixed_vs_dynamic_932() {
+    let (runtime, width) = tier_runtime();
+    // Dispatch the runtime-discovered tier width to its compile-time
+    // specialization, then measure both deviation branches on it.
+    match width {
+        8 => {
+            measure_third_fourth_branch::<8>(true, runtime.clone());
+            measure_third_fourth_branch::<8>(false, runtime);
+        }
+        12 => {
+            measure_third_fourth_branch::<12>(true, runtime.clone());
+            measure_third_fourth_branch::<12>(false, runtime);
+        }
+        18 => {
+            measure_third_fourth_branch::<18>(true, runtime.clone());
+            measure_third_fourth_branch::<18>(false, runtime);
+        }
+        other => panic!("tier_runtime returned non-specialized width {other}"),
+    }
+}

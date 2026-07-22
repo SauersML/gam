@@ -1503,11 +1503,19 @@ impl FitConvergenceEvidence {
     fn try_from_parts(parts: &UnifiedFitResultParts) -> Result<Self, EstimationError> {
         // Inner and outer stationarity are independent obligations. An outer
         // envelope certificate cannot prove that the coefficient mode is
-        // stationary, so diagnostic stalled checkpoints never mint fits.
-        // The PIRLS final-state gate promotes strict-KKT or exact-decrement
-        // evidence to `Converged` before assembly; keeping this gate strict
-        // makes live construction and deserialization enforce one contract.
-        if !parts.pirls_status.is_converged() {
+        // stationary, so diagnostic stalled checkpoints never mint fits. The
+        // inner obligation is discharged by a *certified minimum*: either a
+        // strict-KKT `Converged` mode, or a `StalledAtValidMinimum` — a point
+        // that the PIRLS final-state gate already cleared against the
+        // near-stationary soft-acceptance band (KKT-tolerance-gated plateau /
+        // boundary saturation / exact decrement) but reached only after the
+        // iteration/LM budget ran out. Both are stationary modes; the only
+        // difference is whether the certificate is strict-KKT or plateau. A
+        // bare `MaxIterationsReached` / `LmStepSearchExhausted` (never cleared
+        // that band) and `Unstable` (separation) stay rejected. Keeping this
+        // predicate the single authority makes live construction and
+        // deserialization enforce one contract.
+        if !parts.pirls_status.is_certified_minimum() {
             return Err(Self::assembly_error(
                 parts,
                 "outer evidence was not considered because the inner mode is uncertified"
@@ -1545,6 +1553,115 @@ impl FitConvergenceEvidence {
             outer_iterations: parts.outer_iterations,
             outer,
         })
+    }
+}
+
+#[cfg(test)]
+mod assembly_inner_status_gate_tests {
+    use super::*;
+    use crate::pirls::PirlsStatus;
+
+    /// Assemble a minimal, otherwise-valid fit whose only variable is the inner
+    /// PIRLS status. `outer_iterations = 0` routes the outer obligation through
+    /// the `Fixed` evidence branch (no criterion certificate needed), so the
+    /// pass/fail turns entirely on the inner-status gate under test.
+    fn assemble_with_inner_status(
+        status: PirlsStatus,
+    ) -> Result<UnifiedFitResult, EstimationError> {
+        let p = 2usize;
+        let mut hessian = Array2::<f64>::zeros((p, p));
+        for j in 0..p {
+            hessian[[j, j]] = 1.0;
+        }
+        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+            blocks: vec![FittedBlock {
+                beta: Array1::zeros(p),
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::from_vec(vec![1.0]),
+            }],
+            log_lambdas: Array1::zeros(1),
+            lambdas: Array1::from_vec(vec![1.0]),
+            likelihood_family: Some(LikelihoodSpec::gaussian_identity()),
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            used_device: false,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: Some(0.0),
+            standard_deviation: 1.0,
+            covariance_conditional: None,
+            covariance_corrected: None,
+            inference: Some(FitInference {
+                edf_by_block: vec![1.0],
+                penalty_block_trace: vec![0.0],
+                edf_total: 1.0,
+                smoothing_correction: None,
+                smoothing_correction_method: None,
+                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(hessian),
+                reparam_qs: None,
+                dispersion: Dispersion::estimated(1.0).unwrap(),
+                beta_covariance: None,
+                beta_standard_errors: None,
+                beta_covariance_corrected: None,
+                beta_standard_errors_corrected: None,
+                beta_covariance_frequentist: None,
+                coefficient_influence: None,
+                weighted_gram: None,
+                bias_correction_beta: None,
+                bias_correction_jacobian: None,
+            }),
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: status,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: FitArtifacts::default(),
+            inner_cycles: 0,
+        })
+    }
+
+    /// `StalledAtValidMinimum` is a certified valid minimum (the iteration
+    /// budget ran out at a point already cleared against the near-stationary
+    /// soft-acceptance band), so it mints a fit exactly like `Converged`. This
+    /// is the poisson/beta tensor-te regression (#1561): the outer REML search
+    /// certified `|Pg|` within its bound while the stiff reparameterized tensor
+    /// basis left the inner P-IRLS one status short of strict `Converged`.
+    #[test]
+    fn stalled_at_valid_minimum_mints_a_fit_like_converged() {
+        assert!(
+            assemble_with_inner_status(PirlsStatus::Converged).is_ok(),
+            "a strictly converged inner mode must mint a fit"
+        );
+        assert!(
+            assemble_with_inner_status(PirlsStatus::StalledAtValidMinimum).is_ok(),
+            "a stalled-at-valid-minimum inner mode carries valid-minimum KKT \
+             evidence and must mint a fit"
+        );
+    }
+
+    /// The non-certified inner exits stay rejected: they never cleared the
+    /// near-stationary band, so no fit may be minted from them.
+    #[test]
+    fn uncertified_inner_exits_are_still_refused() {
+        for status in [
+            PirlsStatus::MaxIterationsReached,
+            PirlsStatus::LmStepSearchExhausted,
+            PirlsStatus::Unstable,
+        ] {
+            let err = assemble_with_inner_status(status)
+                .expect_err("uncertified inner status must not mint a fit");
+            assert!(
+                matches!(err, EstimationError::FitDidNotConverge { .. }),
+                "expected a non-convergence assembly error for {status:?}, got {err:?}"
+            );
+        }
     }
 }
 
