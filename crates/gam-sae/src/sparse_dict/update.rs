@@ -3386,4 +3386,146 @@ mod exact_solve_tests {
             fit.explained_variance
         );
     }
+
+    /// Synthesize a percolating (giant-component) co-firing normal-equation
+    /// system directly at a chosen shape: an Erdős–Rényi-style coupling graph
+    /// at the requested mean degree, diagonally dominant so CG converges well
+    /// inside the derived cap, plus a couple of dead columns.
+    fn giant_component_eq(k: usize, p: usize, mean_degree: usize, seed: u64) -> DecoderNormalEq {
+        let mut state = seed.max(1);
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f64 / u64::MAX as f64) - 0.5
+        };
+        let mut off = HashMap::new();
+        let mut row_abs = vec![0.0f64; k];
+        // A ring guarantees one giant component; chords bring the mean degree
+        // to the target.
+        for a in 0..k {
+            let b = (a + 1) % k;
+            let key = if a < b { (a as u32, b as u32) } else { (b as u32, a as u32) };
+            let v = 0.25 * next();
+            off.insert(key, v);
+            row_abs[a] += v.abs();
+            row_abs[b] += v.abs();
+        }
+        let chords = k.saturating_mul(mean_degree.saturating_sub(2)) / 2;
+        let mut planted = 0usize;
+        let mut pair_state = (seed ^ 0xA076_1D64_78BD_642F).max(1);
+        let mut draw = move || {
+            pair_state ^= pair_state << 13;
+            pair_state ^= pair_state >> 7;
+            pair_state ^= pair_state << 17;
+            pair_state
+        };
+        while planted < chords {
+            let a = (draw() as usize) % k;
+            let b = (draw() as usize) % k;
+            if a == b {
+                continue;
+            }
+            let key = if a < b { (a as u32, b as u32) } else { (b as u32, a as u32) };
+            if off.contains_key(&key) {
+                continue;
+            }
+            let v = 0.25 * next();
+            off.insert(key, v);
+            row_abs[a] += v.abs();
+            row_abs[b] += v.abs();
+            planted += 1;
+        }
+        let diag: Vec<f64> = (0..k).map(|a| row_abs[a] + 1.0 + next().abs()).collect();
+        let mut b = Array2::<f64>::zeros((k, p));
+        for c in 0..p {
+            if c % 97 == 96 {
+                continue; // dead column: rhs identically zero
+            }
+            for i in 0..k {
+                b[[i, c]] = ((i * 13 + c * 7 + 5) as f64).sin();
+            }
+        }
+        DecoderNormalEq {
+            diag,
+            b,
+            off,
+            firings: vec![8; k],
+            amplitude_sum: vec![8.0; k],
+        }
+    }
+
+    /// #1017 refresh-wall measurement + device parity gate.
+    ///
+    /// zz_measure discipline: eprintln every number; the asserts are the bar.
+    /// The CPU block solve must converge every live column within the
+    /// certificate, and — when a CUDA device is present (the A10 gate lane) —
+    /// the device-resident backend must reproduce the CPU refresh decoder
+    /// BIT-FOR-BIT while engaging above the admission floor.
+    #[test]
+    fn zz_measure_1017_block_refresh_and_device_parity() {
+        let k = 6000usize;
+        let p = 768usize;
+        let mean_degree = 24usize;
+        let eq = giant_component_eq(k, p, mean_degree, 0x1017);
+        let ridge = 1.0e-4f64;
+
+        let mut cpu_decoder = Array2::<f32>::zeros((k, p));
+        let cpu_start = std::time::Instant::now();
+        let cpu_stats = solve_decoder(&mut cpu_decoder, &eq, ridge, gam_gpu::GpuPolicy::Off)
+            .expect("cpu refresh");
+        let cpu_secs = cpu_start.elapsed().as_secs_f64();
+        eprintln!(
+            "[zz1017] cpu refresh: K={k} P={p} nnz={} giant={} cg_columns={} \
+             cg_iterations={} kappa_bound={:?} rel_residual={:.3e} wall_s={cpu_secs:.3}",
+            2 * eq.off.len(),
+            cpu_stats.max_component_size,
+            cpu_stats.cg_columns,
+            cpu_stats.cg_iterations,
+            cpu_stats.cg_kappa_bound,
+            cpu_stats.cg_relative_residual,
+        );
+        assert_eq!(
+            cpu_stats.max_component_size, k,
+            "fixture must percolate into one giant component"
+        );
+        assert_eq!(cpu_stats.cg_nonconverged_columns, 0, "cpu block CG must converge");
+        assert!(cpu_stats.cg_relative_residual <= cpu_stats.cg_residual_stop);
+
+        let device_present = cfg!(target_os = "linux")
+            && matches!(
+                gam_gpu::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto),
+                Ok(Some(_))
+            );
+        if !device_present {
+            eprintln!("[zz1017] no CUDA device; device arm not exercised here");
+            return;
+        }
+        let mut dev_decoder = Array2::<f32>::zeros((k, p));
+        let dev_start = std::time::Instant::now();
+        let dev_stats = solve_decoder(&mut dev_decoder, &eq, ridge, gam_gpu::GpuPolicy::Required)
+            .expect("device refresh");
+        let dev_secs = dev_start.elapsed().as_secs_f64();
+        eprintln!(
+            "[zz1017] device refresh: cg_columns={} cg_iterations={} wall_s={dev_secs:.3} \
+             cpu_over_device={:.2}",
+            dev_stats.cg_columns,
+            dev_stats.cg_iterations,
+            cpu_secs / dev_secs.max(1e-9),
+        );
+        assert_eq!(dev_stats.cg_nonconverged_columns, 0, "device block CG must converge");
+        assert_eq!(
+            cpu_stats.cg_iterations, dev_stats.cg_iterations,
+            "device recurrence must walk the same per-column iteration counts"
+        );
+        for i in 0..k {
+            for c in 0..p {
+                assert_eq!(
+                    cpu_decoder[[i, c]].to_bits(),
+                    dev_decoder[[i, c]].to_bits(),
+                    "decoder [{i},{c}] must be bit-identical across backends"
+                );
+            }
+        }
+    }
 }
