@@ -27,13 +27,15 @@
 //!
 //! gam parameterizes the same model on the log-cumulative-hazard / Royston-
 //! Parmar net scale. For `survival_likelihood="weibull"` the time axis is a
-//! *linear* basis on `log t` (columns `[1, log t]`, anchor-centered at the
+//! *linear* basis on `log t` (single column `log t`, anchor-centered at the
 //! engine's time anchor), so the fitted log-cumulative-hazard is
 //!
 //!     log Λ(t|x) = β_cov · c(x)  +  Σ_k (b_k(t) − b_k(anchor)) · β_time_k,
 //!     S(t|x)     = exp( −exp( log Λ(t|x) ) ),
 //!
-//! where `β = [β_time (2 cols) | β_cov]`, `b(t) = [1, log t]`, and `c(x)` is the
+//! where `β = [β_time (1 col) | β_cov]`, `b(t) = [log t]` (the redundant `[1, ·]`
+//! constant column was dropped in #2301, its location absorbed by the covariate
+//! intercept), and `c(x)` is the
 //! frozen covariate design. The engine ANCHOR-CENTERS the time design at the time
 //! anchor (`center_survival_time_designs_at_anchor`), which subtracts `b(anchor)`
 //! from every time row and so ZEROES the constant time column `b_0 ≡ 1` (it
@@ -50,7 +52,8 @@
 //! reproduces the fitted `log Λ(t|x)` exactly: the covariate intercept supplies
 //! the baseline level and the centered `log t` column supplies the shape slope.
 //! The fitted shape exponent `p` is the slope of `log Λ_0` in `log t`, i.e.
-//! `β_time[1]`. We never weaken the bars and never edit gam to pass.
+//! `β_time[0]` (the sole `log t` column). We never weaken the bars and never
+//! edit gam to pass.
 
 use csv::StringRecord;
 use gam::families::survival::construction::{
@@ -146,15 +149,16 @@ fn gam_transformation_survival_prediction_grid_matches_scipy() {
 
     // ---- fit with gam: parametric Weibull transformation AFT --------------
     // `survival_likelihood = "weibull"` is gam's parametric Weibull baseline
-    // (the transformation / Royston-Parmar net model with a 2-column linear
-    // time basis [1, log t] seeded by scale/shape). The formula carries the
+    // (the transformation / Royston-Parmar net model with a single-column linear
+    // time basis `log t` seeded by scale/shape). The formula carries the
     // explicit `survmodel(spec="transformation", distribution="weibull")` term
     // to declare intent; the library path resolves the likelihood mode from
     // FitConfig. The covariate term-collection design carries its own intercept
     // (the anchor-centered time block zeroes its own constant column, so the
     // baseline level lives in the covariate intercept), then the two linear
-    // covariates x1, x2, so beta = [time0(dead), time1(=shape), intercept,
-    // gamma_x1, gamma_x2] — 2 time columns then 3 covariate columns.
+    // covariates x1, x2, so beta = [time0(=shape), intercept,
+    // gamma_x1, gamma_x2] — 1 time column (the redundant constant was dropped in
+    // #2301) then 3 covariate columns.
     let headers = vec![
         "t".to_string(),
         "d".to_string(),
@@ -193,12 +197,15 @@ fn gam_transformation_survival_prediction_grid_matches_scipy() {
     );
 
     // beta = [β_time | β_cov]; the linear Weibull time block is a strict prefix
-    // of length `time_base_ncols` (2 columns: [1, log t]).
+    // of length `time_base_ncols` (1 column: [log t]). The redundant `[1, ·]`
+    // constant column was dropped in #2301, its location absorbed by the
+    // covariate intercept.
     let beta = &fit.fit.beta;
     let p_time = fit.time_base_ncols;
     assert_eq!(
-        p_time, 2,
-        "the linear Weibull time basis must be 2 columns [1, log t]; got {p_time}"
+        p_time, 1,
+        "the linear Weibull time basis must be 1 column [log t] (the redundant \
+         constant column was dropped in #2301); got {p_time}"
     );
     assert!(
         p_time < beta.len(),
@@ -208,29 +215,29 @@ fn gam_transformation_survival_prediction_grid_matches_scipy() {
     let beta_time: Array1<f64> = beta.slice(ndarray::s![..p_time]).to_owned();
     let gamma: Array1<f64> = beta.slice(ndarray::s![p_time..]).to_owned();
     let n_cov = gamma.len();
-    // The covariate term-collection design is `[1, x1, x2]`: the anchor-centered
-    // time block zeroes its own constant column `b_0 ≡ 1`, so the baseline level
-    // is carried by the covariate intercept, NOT the dead time-level coefficient.
-    // Hence the covariate block has 3 columns (intercept + x1 + x2) and the full
-    // coefficient vector is [time0(dead), time1(=shape), intercept, γ_x1, γ_x2].
-    // `gamma` is sliced from `beta` and dotted against the SAME 3-column covariate
-    // design rebuilt from `fit.resolvedspec` below, so the reconstruction stays
-    // exactly aligned with the fit.
+    // The covariate term-collection design is `[1, x1, x2]`: the baseline level
+    // is carried by the covariate intercept, which is exactly why #2301 could
+    // drop the confounded time-level constant column. Hence the covariate block
+    // has 3 columns (intercept + x1 + x2) and the full coefficient vector is
+    // [time0(=shape), intercept, γ_x1, γ_x2]. `gamma` is sliced from `beta` and
+    // dotted against the SAME 3-column covariate design rebuilt from
+    // `fit.resolvedspec` below, so the reconstruction stays exactly aligned with
+    // the fit.
     assert_eq!(
         n_cov,
         3,
-        "expected 3 covariate coefficients (intercept, x1, x2) after the 2-col Weibull time basis; beta.len()={}",
+        "expected 3 covariate coefficients (intercept, x1, x2) after the 1-col Weibull time basis; beta.len()={}",
         beta.len()
     );
     // The shape `p` of a Weibull RP baseline is the slope of log Λ_0 in log t,
-    // i.e. β_time[1] (the coefficient on the `log t` column). It must be a
+    // i.e. β_time[0] (the coefficient on the sole `log t` column). It must be a
     // positive, finite Weibull exponent. We do NOT use `baseline_cfg.scale`:
-    // the anchor-centered linear basis zeros the level column, so the recovered
-    // scale is a seed artifact, not a witness of the fit.
-    let p = beta_time[1];
+    // the anchor-centered linear basis makes the recovered scale the identified
+    // anchor, a seed artifact rather than a witness of the fit.
+    let p = beta_time[0];
     assert!(
         p.is_finite() && p > 0.0,
-        "fitted Weibull shape (β_time[1]={p}) must be a positive, finite exponent"
+        "fitted Weibull shape (β_time[0]={p}) must be a positive, finite exponent"
     );
 
     // Resolved (frozen) time-basis config + anchor row, mirroring the engine's
@@ -463,7 +470,7 @@ emit("converged", [1.0 if _ok else 0.0])
     );
 
     // (1) TRUTH RECOVERY of the shape exponent against the GENERATING CONSTANT.
-    // gam's shape is β_time[1] (slope of log Λ_0 in log t); the true exponent is
+    // gam's shape is β_time[0] (slope of log Λ_0 in log t); the true exponent is
     // exp(0.5). A 12% bar admits n=250 + 35%-censoring sampling noise while
     // catching a genuinely wrong time-axis slope.
     let shape_err = (p - shape_true).abs() / shape_true;

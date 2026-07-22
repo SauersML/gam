@@ -199,8 +199,10 @@ fn gam_weibull_survival_out_of_sample_quality_on_veteran_lung() {
 
     // ---- fit with gam on TRAIN: parametric Weibull survival ----------------
     // `survival_likelihood = "weibull"` is gam's parametric Weibull baseline: a
-    // 2-column `[1, log t]` time basis seeded by scale/shape, with the linear
-    // covariates appended. beta = [β_time(2) | β_cov]; the covariate block
+    // single-column `log t` time basis seeded by scale/shape, with the linear
+    // covariates appended. The redundant `[1, ·]` constant column was dropped in
+    // #2301 (confounded with the covariate intercept, which absorbs the Weibull
+    // location). beta = [β_time(1) | β_cov]; the covariate block
     // carries the gam-built intercept + linear karno/age/trt columns.
     let headers = vec![
         "time".to_string(),
@@ -236,8 +238,9 @@ fn gam_weibull_survival_out_of_sample_quality_on_veteran_lung() {
     let beta = &fit.fit.beta;
     let p_time = fit.time_base_ncols;
     assert_eq!(
-        p_time, 2,
-        "Weibull linear time basis must have 2 columns, got {p_time}"
+        p_time, 1,
+        "Weibull linear time basis must have 1 column (`log t`; the redundant \
+         constant column was dropped in #2301), got {p_time}"
     );
     assert!(
         p_time < beta.len(),
@@ -247,7 +250,7 @@ fn gam_weibull_survival_out_of_sample_quality_on_veteran_lung() {
     let beta_time = beta.slice(ndarray::s![..p_time]).to_owned();
 
     // Resolved (knot-frozen) time-basis config + anchor row, mirroring the
-    // engine's anchor-centred `[1, log t]` rows that produced `beta_time`.
+    // engine's anchor-centred `log t` rows that produced `beta_time`.
     let time_cfg: SurvivalTimeBasisConfig = resolved_survival_time_basis_config_from_build(
         &fit.time_basis.basisname,
         fit.time_basis.degree,
@@ -416,9 +419,9 @@ fn mae(a: &[f64], b: &[f64]) -> f64 {
 /// Where the first arm scores who-fails-first ORDER (concordance), this arm
 /// scores the survival surface's LOCATION: gam's predicted *median* survival
 /// time per held-out subject against the observed time, on the AFT
-/// (log-time) scale. For a Weibull baseline with linear `[1, log t]` time
-/// block the cumulative hazard is exactly linear in `log t` with slope = the
-/// Weibull shape `β_time[1] > 0`, so the predicted median time inverts
+/// (log-time) scale. For a Weibull baseline with the linear single-column
+/// `log t` time block the cumulative hazard is exactly linear in `log t` with
+/// slope = the Weibull shape `β_time[0] > 0`, so the predicted median time inverts
 /// analytically: solve `log Λ(t_med | x) = log(log 2)` (the t at which
 /// `S = exp(-Λ) = 1/2`) for `log t_med`. This is a genuine AFT point
 /// prediction of the survival surface, not a risk ranking.
@@ -557,8 +560,9 @@ fn gam_weibull_survival_out_of_sample_quality_on_veteran_lung_on_real_data() {
     let beta = &fit.fit.beta;
     let p_time = fit.time_base_ncols;
     assert_eq!(
-        p_time, 2,
-        "Weibull linear time basis must have 2 columns, got {p_time}"
+        p_time, 1,
+        "Weibull linear time basis must have 1 column (`log t`; the redundant \
+         constant column was dropped in #2301), got {p_time}"
     );
     let beta_time = beta.slice(ndarray::s![..p_time]).to_owned();
 
@@ -574,13 +578,14 @@ fn gam_weibull_survival_out_of_sample_quality_on_veteran_lung_on_real_data() {
         .expect("evaluate time-basis anchor row");
     assert_eq!(anchor_row.len(), p_time, "anchor row width mismatch");
 
-    // For the linear `[1, log t]` Weibull basis the cumulative-hazard slope in
-    // log t is exactly β_time[1] (the Weibull shape); it must be positive for
-    // the survival surface to be non-increasing and the median invertible.
-    let shape = beta_time[1];
+    // For the linear single-column `log t` Weibull basis the cumulative-hazard
+    // slope in log t is exactly β_time[0] (the Weibull shape); it must be
+    // positive for the survival surface to be non-increasing and the median
+    // invertible.
+    let shape = beta_time[0];
     assert!(
         shape.is_finite() && shape > 1e-6,
-        "Weibull shape (β_time[1]) must be positive to invert the median: {shape}"
+        "Weibull shape (β_time[0]) must be positive to invert the median: {shape}"
     );
 
     let karno_idx = data.column_map()["karno"];
@@ -602,16 +607,18 @@ fn gam_weibull_survival_out_of_sample_quality_on_veteran_lung_on_real_data() {
         design.design.apply(&beta_cov).to_vec()[0]
     };
 
-    // Predicted median log-time per subject. The fitted log-cumulative-hazard is
-    //   log Λ(t|x) = (1 - anchor_0)·β_time[0] + (log t - anchor_1)·β_time[1] + γ·x.
-    // The median time satisfies S = exp(-exp(log Λ)) = 1/2 ⇔ log Λ = log(log 2).
-    // Solve the linear (in log t) equation for log t_med.
+    // Predicted median log-time per subject. With the single-column `log t` time
+    // basis the fitted log-cumulative-hazard is
+    //   log Λ(t|x) = (log t - anchor_0)·β_time[0] + γ·x,   β_time[0] = shape.
+    // (The redundant constant column was dropped in #2301; its level lives in the
+    // covariate intercept, folded into `cov_eta`.) The median time satisfies
+    // S = exp(-exp(log Λ)) = 1/2 ⇔ log Λ = log(log 2). Solve the linear (in
+    // log t) equation for log t_med.
     let log_log2 = (2.0_f64.ln()).ln();
-    let const_term = (1.0 - anchor_row[0]) * beta_time[0];
     let median_log_time = |karno_val: f64, age_val: f64, trt_val: f64| -> f64 {
         let g = cov_eta(karno_val, age_val, trt_val);
-        // (log t - anchor_1)·shape = log(log 2) - const_term - g
-        anchor_row[1] + (log_log2 - const_term - g) / shape
+        // (log t - anchor_0)·shape = log(log 2) - g
+        anchor_row[0] + (log_log2 - g) / shape
     };
 
     // ---- gam predicted median log-time on the UNCENSORED held-out rows ------

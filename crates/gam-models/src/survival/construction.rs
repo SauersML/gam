@@ -4530,6 +4530,67 @@ mod tests {
     }
 
     #[test]
+    fn linear_weibull_time_basis_is_a_single_log_t_column() {
+        // #2301 dropped the redundant `[1, ·]` constant column from the linear
+        // Weibull time basis: it was EXACTLY confounded with the covariate
+        // intercept (which absorbs the Weibull location) and made the converged
+        // penalized Hessian singular. The surviving basis is the single `log t`
+        // slope column. This pins the emitted width so a re-added constant column
+        // (or any consumer drifting back to the old 2-column layout) is caught at
+        // construction — it is the width every downstream consumer agrees on:
+        // `fit_orchestration::fit` slices `beta[..x_exit_time.ncols()]` and hands
+        // it to `fitted_weibull_baseline_from_linear_time_beta`, which reads the
+        // shape from `beta[0]`, and `evaluate_survival_time_basis_row` emits a
+        // matching one-element `[log t]` row.
+        let age_entry = array![1.0_f64, 1.0, 1.0, 1.0];
+        let age_exit = array![2.0_f64, 3.0, 5.0, 8.0];
+
+        let built = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::Linear,
+            None,
+        )
+        .expect("build linear Weibull time basis");
+
+        assert_eq!(
+            built.x_exit_time.ncols(),
+            1,
+            "the linear Weibull time basis must emit exactly one column (`log t`); \
+             the confounded constant column was dropped in #2301"
+        );
+        assert_eq!(built.x_entry_time.ncols(), 1, "entry basis width must match");
+        assert_eq!(
+            built.x_derivative_time.ncols(),
+            1,
+            "derivative basis width must match"
+        );
+        assert_eq!(built.basisname, "linear");
+        assert!(
+            built.penalties.is_empty(),
+            "the linear parametric time block is unpenalized"
+        );
+
+        // The sole column is `log t` at the exit times.
+        let exit = built.x_exit_time.as_dense_cow();
+        for (i, &t) in age_exit.iter().enumerate() {
+            assert!(
+                (exit[[i, 0]] - t.ln()).abs() < 1e-12,
+                "exit column must carry log t: row {i} got {} want {}",
+                exit[[i, 0]],
+                t.ln()
+            );
+        }
+
+        // The frozen anchor-row evaluator agrees on the one-column width so the
+        // engine's centered `(b(t) − b(anchor))·β_time` reconstruction lines up.
+        let anchor_row = super::evaluate_survival_time_basis_row(4.5, &SurvivalTimeBasisConfig::Linear)
+            .expect("evaluate linear anchor row");
+        assert_eq!(anchor_row.len(), 1, "linear anchor row must be one element");
+        assert!((anchor_row[0] - 4.5_f64.ln()).abs() < 1e-12);
+    }
+
+    #[test]
     fn ispline_time_derivative_is_nonzero_at_right_boundary() {
         let age_entry = array![1.0_f64, 1.0, 1.0];
         let age_exit = array![4.0_f64, 4.0, 4.0];

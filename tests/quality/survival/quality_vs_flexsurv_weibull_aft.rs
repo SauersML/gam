@@ -1,6 +1,6 @@
 //! End-to-end OBJECTIVE quality: gam's parametric Weibull survival baseline
 //! (`survival_likelihood = "weibull"`, the Royston-Parmar net model with a
-//! *linear* `[1, log t]` time basis seeded by scale/shape) on the real
+//! *linear* single-column `log t` time basis seeded by scale/shape) on the real
 //! bone-marrow-transplant dataset (n=23, no known ground truth).
 //!
 //! What this test asserts (OBJECTIVE quality, NOT "matches flexsurv"):
@@ -143,9 +143,11 @@ fn gam_weibull_survival_objective_quality_on_bone() {
 
     // ---- fit with gam: parametric Weibull survival ------------------------
     // `survival_likelihood = "weibull"` is gam's parametric Weibull baseline: a
-    // 2-column `[1, log t]` time basis seeded by scale/shape, with the single
-    // linear covariate appended. The fit lives in the coefficient vector
-    // (beta = [time(2) | beta_cov]); baseline_cfg stays Linear and does NOT
+    // single-column `log t` time basis seeded by scale/shape, with the single
+    // linear covariate appended. The redundant `[1, ·]` constant column was
+    // dropped in #2301 (it was exactly confounded with the covariate intercept,
+    // which absorbs the Weibull location). The fit lives in the coefficient vector
+    // (beta = [time(1) | beta_cov]); baseline_cfg stays Linear and does NOT
     // carry the fitted (scale, shape).
     let headers = vec!["t".to_string(), "d".to_string(), "trt".to_string()];
     let rows: Vec<StringRecord> = (0..n)
@@ -168,7 +170,7 @@ fn gam_weibull_survival_objective_quality_on_bone() {
         panic!("expected a SurvivalTransformation fit result for survival_likelihood=weibull");
     };
 
-    // beta = [β_time(2) | β_cov]; the linear time block is a strict prefix and
+    // beta = [β_time(1) | β_cov]; the linear time block is a strict prefix and
     // the covariate block carries the (gam-built) intercept + linear `trt`
     // columns. We never assume the covariate block is a single column or that
     // `trt` is the last coefficient — its effect is recovered below as a
@@ -176,8 +178,9 @@ fn gam_weibull_survival_objective_quality_on_bone() {
     let beta = &fit.fit.beta;
     let p_time = fit.time_base_ncols;
     assert_eq!(
-        p_time, 2,
-        "Weibull linear time basis must have 2 columns, got {p_time}"
+        p_time, 1,
+        "Weibull linear time basis must have 1 column (`log t`; the redundant \
+         constant column was dropped in #2301), got {p_time}"
     );
     assert!(
         p_time < beta.len(),
@@ -187,7 +190,7 @@ fn gam_weibull_survival_objective_quality_on_bone() {
     let beta_time = beta.slice(ndarray::s![..p_time]).to_owned();
 
     // Resolved (knot-frozen) time-basis config + anchor row, mirroring the
-    // engine's anchor-centred `[1, log t]` rows that produced `beta_time`.
+    // engine's anchor-centred `log t` rows that produced `beta_time`.
     let time_cfg: SurvivalTimeBasisConfig = resolved_survival_time_basis_config_from_build(
         &fit.time_basis.basisname,
         fit.time_basis.degree,
@@ -347,7 +350,7 @@ fn gam_weibull_survival_objective_quality_on_bone_on_real_data() {
     // Real-data arm of the parametric-Weibull survival quality test. The
     // synthetic/known-truth proof lives in
     // `gam_weibull_survival_objective_quality_on_bone`; here we exercise the
-    // SAME capability (`survival_likelihood = "weibull"`, the linear `[1, log t]`
+    // SAME capability (`survival_likelihood = "weibull"`, the linear `log t`
     // Royston-Parmar net model) on a LARGER real dataset with no ground truth,
     // and assert OBJECTIVE held-out predictive discrimination — never a flexsurv
     // reproduction.
@@ -445,8 +448,9 @@ fn gam_weibull_survival_objective_quality_on_bone_on_real_data() {
     let beta = &fit.fit.beta;
     let p_time = fit.time_base_ncols;
     assert_eq!(
-        p_time, 2,
-        "Weibull linear time basis must have 2 columns, got {p_time}"
+        p_time, 1,
+        "Weibull linear time basis must have 1 column (`log t`; the redundant \
+         constant column was dropped in #2301), got {p_time}"
     );
     assert!(
         p_time < beta.len(),
