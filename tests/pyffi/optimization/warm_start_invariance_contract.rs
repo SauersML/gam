@@ -301,7 +301,7 @@ fn fits_are_invariant_to_warm_start_cache_state_across_families() {
         // Prime both the exact-key and seed-prefix checkpoints. This arm need
         // not itself be cold; after it completes the next arm is guaranteed to
         // have a valid persistent entry.
-        let _ = fit_once(case, &x, &y, "prime", true);
+        drop(fit_once(case, &x, &y, "prime", true));
         let (crit_warm, beta_warm) = fit_once(case, &x, &y, "warm", true);
 
         let crit_diff = (crit_cold - crit_warm).abs();
