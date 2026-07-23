@@ -968,3 +968,148 @@ fn separation_barrier_analytic_gradient_matches_central_fd_1026() {
          1e-5; got rel err {err:e}. analytic={analytic:?} fd={fd:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2394 regression — the fit-free (no-fit) collapse verdict must be SELECTIVE.
+//
+// The #1026 fit-free path (`reconstruct_from_assignments(.., collapse=true)` on a
+// term with no fitted `hybrid_split_report`) collapses a `d = 1` atom to its
+// straight image ONLY when the atom's realized decoded contribution already lies
+// in the straight lane. These two tests pin the OTHER half of the contract from a
+// different angle than `linear_dominance_...`: a genuinely curved realized image
+// must NOT be collapsed (else the verdict would silently corrupt reconstructions),
+// and in a mixed dictionary the collapse of a linear atom must be value-preserving
+// while the curved atom is left untouched.
+// ---------------------------------------------------------------------------
+
+/// A single circle atom whose assigned coordinates span a FULL arc decodes a
+/// genuinely curved image (a circle in the `(v, vperp)` plane). The fit-free
+/// collapse gate must DECLINE: `collapse=true` must equal `collapse=false`
+/// bit-for-bit, because collapsing the arc to a straight line would move the
+/// reconstruction by an `O(1)` amount. This guards against the new over-collapse
+/// failure mode the fit-free path could otherwise introduce.
+#[test]
+fn fit_free_collapse_declines_on_genuinely_curved_arc_2394() {
+    let p = 5usize;
+    let n = 8usize;
+    let (v, vperp) = ortho_pair(p, 4);
+    let c = 2.0_f64;
+
+    // Uniform angles around the whole circle → the realized image is a real arc
+    // with curvature, NOT collinear.
+    let coords = Array2::from_shape_fn((n, 1), |(i, _)| (i as f64) / (n as f64));
+    let mut dec = Array2::<f64>::zeros((3, p));
+    for j in 0..p {
+        dec[[1, j]] = c * vperp[j]; // sin → vperp
+        dec[[2, j]] = c * v[j]; // cos → v
+    }
+    let atom = circle_atom("curved_arc", &coords, dec);
+    let logits = Array2::from_shape_fn((n, 1), |(i, _)| 0.05 * i as f64);
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![coords.clone()],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+    let amps = Array2::from_shape_fn((n, 1), |(i, _)| 0.5 + 0.1 * i as f64);
+    let collapsed = term
+        .reconstruct_from_assignments(amps.view(), true)
+        .unwrap();
+    let curved = term
+        .reconstruct_from_assignments(amps.view(), false)
+        .unwrap();
+    let gap = sse(collapsed.view(), curved.view());
+    assert!(
+        gap == 0.0,
+        "#2394: a genuinely curved realized image must NOT collapse fit-free; \
+         collapse=true and collapse=false reconstructions must be identical, but \
+         they differ by sse={gap:e}. Over-collapsing an arc to a line would corrupt \
+         the reconstruction."
+    );
+}
+
+/// A two-atom dictionary with ONE linear-realized atom (antipodal ±v via the
+/// half-period trick) and ONE genuinely curved atom (a real arc on an independent
+/// plane). The fit-free collapse must be SELECTIVE and VALUE-PRESERVING: only the
+/// linear atom yields to its straight image, the curved atom is left curved, and
+/// the total collapsed reconstruction stays within `ε` of the curved assembly.
+/// If the fit-free gate wrongly collapsed the curved atom, the value gap would be
+/// `O(1)`, not `≤ ε`.
+#[test]
+fn fit_free_collapse_is_selective_and_value_preserving_in_mixed_dict_2394() {
+    let p = 6usize;
+    let n = 12usize;
+    let c = 3.0_f64;
+
+    // Independent orthonormal directions: linear atom on v, curved atom on (w, wp).
+    let (v, _vp) = ortho_pair(p, 1);
+    let (w, wp) = ortho_pair(p, 5);
+
+    // Atom 0 (linear-realized): decode ±c·v at θ ∈ {0, 0.5}.
+    let mut lin_coords = Array2::<f64>::zeros((n, 1));
+    let lin_amp: Vec<f64> = (0..n).map(|i| -1.0 + 0.15 * i as f64).collect();
+    let mut dec0 = Array2::<f64>::zeros((3, p));
+    for j in 0..p {
+        dec0[[1, j]] = c * wp[j]; // sin → wp (unused at θ∈{0,0.5})
+        dec0[[2, j]] = c * v[j]; // cos → v
+    }
+    // Atom 1 (genuinely curved): full arc on the (w, wp) plane.
+    let arc_coords = Array2::from_shape_fn((n, 1), |(i, _)| (i as f64) / (n as f64));
+    let mut dec1 = Array2::<f64>::zeros((3, p));
+    for j in 0..p {
+        dec1[[1, j]] = c * wp[j]; // sin → wp
+        dec1[[2, j]] = c * w[j]; // cos → w
+    }
+    for i in 0..n {
+        lin_coords[[i, 0]] = if lin_amp[i] >= 0.0 { 0.0 } else { 0.5 };
+    }
+
+    let atom0 = circle_atom("linear_realized", &lin_coords, dec0);
+    let atom1 = circle_atom("curved_arc", &arc_coords, dec1);
+    let logits = Array2::from_shape_fn((n, 2), |(i, k)| 0.05 * i as f64 - 0.03 * k as f64);
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![lin_coords.clone(), arc_coords.clone()],
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
+
+    let mut amps = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        amps[[i, 0]] = lin_amp[i].abs() / c;
+        amps[[i, 1]] = 0.4 + 0.05 * i as f64;
+    }
+
+    let collapsed = term
+        .reconstruct_from_assignments(amps.view(), true)
+        .unwrap();
+    let curved = term
+        .reconstruct_from_assignments(amps.view(), false)
+        .unwrap();
+    let gap = sse(collapsed.view(), curved.view());
+
+    // Value preserved: the only change is atom 0's linear image standing in for its
+    // (numerically identical) curved decode; the curved atom 1 must be untouched.
+    assert!(
+        gap <= 1e-9,
+        "#2394: fit-free collapse must be value-preserving; collapsed vs curved \
+         reconstruction sse={gap:e} exceeds ε. A gap this large means the curved \
+         atom was wrongly collapsed."
+    );
+    // Engaged: the linear atom DID collapse (its straight image is a different
+    // numeric path than the curved basis decode), so the map is non-empty.
+    assert!(
+        gap > 0.0,
+        "#2394: the linear atom's fit-free collapse must be load-bearing (the \
+         collapse map must be non-empty and change the reconstruction), but the \
+         collapsed and curved reconstructions are bit-identical (gap={gap:e})."
+    );
+}
