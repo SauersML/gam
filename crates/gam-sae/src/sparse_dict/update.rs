@@ -389,9 +389,25 @@ fn routing_fixed_point_residual(
 /// improvement achieved since entry, so it fires at the achievable plateau
 /// wherever it sits (~1e-6 well-posed, ~1e-4 over-complete).
 const LINEAR_EV_PLATEAU_FRACTION: f64 = 1.0e-3;
-/// Consecutive stationary rounds required before returning a best-effort open
-/// iterate — prevents a transient early flat from exiting a still-climbing fit.
+/// Stationary rounds required (within the trailing [`LINEAR_EV_PLATEAU_WINDOW`])
+/// before returning a best-effort open iterate — prevents a transient early flat
+/// from exiting a still-climbing fit, and sets the confirmation horizon (a budget
+/// too short to accumulate this many stationary rounds cannot confirm a plateau,
+/// so it stays a typed non-convergence).
 const LINEAR_EV_PLATEAU_MIN_ROUNDS: usize = 3;
+/// Trailing window over which [`LINEAR_EV_PLATEAU_MIN_ROUNDS`] stationary rounds
+/// confirm the plateau (#2396). At K >> rank the discrete top-s routing is a limit
+/// cycle: the objective oscillates within a band while its mean creeps to the
+/// achievable plateau, so a STRICT consecutive-round counter is reset by every
+/// up-swing and can miss a genuinely-bounded objective (surfaced on real OLMO
+/// activations, where the fit reaches two-in-a-row repeatedly but an up-swing
+/// resets it before three). Requiring MIN_ROUNDS stationary rounds within a window
+/// of `MIN_ROUNDS + 1` tolerates exactly one such up-swing — a minimal debounce
+/// that is a strict superset of the consecutive rule (three in a row ⇒ three in the
+/// last four), so it only ever confirms MORE, never exits a still-climbing fit
+/// (whose rounds are non-stationary and never fill the window), and keeps the
+/// confirmation horizon (a budget shorter than the window cannot confirm).
+const LINEAR_EV_PLATEAU_WINDOW: usize = LINEAR_EV_PLATEAU_MIN_ROUNDS + 1;
 /// Per-term rounding scale for the fixed-point convergence floor (#2396).
 ///
 /// The certified arm compares three O(1)-normalized residuals — the EV change
@@ -480,7 +496,11 @@ pub(super) fn run(
     // plateau; the window (not a strict consecutive run) is what makes the signal
     // robust to the K>>rank routing limit cycle (#2396).
     let entry_ev = current_ev;
-    let mut plateau_rounds = 0usize;
+    // Trailing window of per-round stationary flags; a majority-with-one-tolerance
+    // of these confirms a best-effort plateau, robust to the K>>rank routing limit
+    // cycle (#2396). See [`LINEAR_EV_PLATEAU_WINDOW`].
+    let mut plateau_flags: std::collections::VecDeque<bool> =
+        std::collections::VecDeque::with_capacity(LINEAR_EV_PLATEAU_WINDOW);
 
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
@@ -662,12 +682,20 @@ pub(super) fn run(
         };
         let objective_plateaued = ev_residual <= fixed_point_tol
             || captured_fraction < LINEAR_EV_PLATEAU_FRACTION;
-        if epoch > 0 && structure_settled && numerically_sound && objective_plateaued {
-            plateau_rounds += 1;
-        } else {
-            plateau_rounds = 0;
+        // A round is STATIONARY when the structure is settled, the subsolve sound,
+        // and the objective plateaued. Confirm a best-effort plateau on MIN_ROUNDS
+        // stationary rounds within the trailing window (tolerating one up-swing of
+        // the routing limit cycle; see LINEAR_EV_PLATEAU_WINDOW). `epoch > 0` skips
+        // the first post-entry round, whose captured fraction is against a
+        // still-forming denominator.
+        let stationary =
+            epoch > 0 && structure_settled && numerically_sound && objective_plateaued;
+        plateau_flags.push_back(stationary);
+        while plateau_flags.len() > LINEAR_EV_PLATEAU_WINDOW {
+            plateau_flags.pop_front();
         }
-        let best_effort_open = plateau_rounds >= LINEAR_EV_PLATEAU_MIN_ROUNDS;
+        let best_effort_open =
+            plateau_flags.iter().filter(|&&s| s).count() >= LINEAR_EV_PLATEAU_MIN_ROUNDS;
 
         if certified_fixed_point || best_effort_open {
             let (indices, code_mat) = pack_codes(&certified_codes, n, s);
