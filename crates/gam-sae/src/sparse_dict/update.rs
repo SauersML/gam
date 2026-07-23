@@ -1118,16 +1118,35 @@ fn linear_block_reml_stats_from_parts(
     rho: f64,
 ) -> Result<LinearBlockRemlStats, SparseDictionaryError> {
     let k = decoder.nrows();
+    let n = x.nrows();
+    let p = x.ncols();
     let (diag, off) = code_gram_from_routing(indices, codes, k);
-    let gram_edof = hutchinson_gram_edof(&diag, &off, rho, k)?;
+    let raw_gram_edof = hutchinson_gram_edof(&diag, &off, rho, k)?;
+    // The true effective dof γ = tr(A(A+ρI)⁻¹) = Σ λ_i/(λ_i+ρ) is STRICTLY below
+    // rank(A) ≤ min(K, N): each eigenterm is < 1 for ρ > 0, and the code Gram
+    // A = CᵀC has rank ≤ rank(C) ≤ min(N, K). The internal estimate is already
+    // clamped to [0, K]. The extra constraint that matters for the shared-ρ evidence
+    // is that the pooled dof γ_tot = P·γ leave positive residual dof, i.e. γ < N.
+    // When K ≥ N (the interpolating regime, γ → N) the Hutchinson estimate can
+    // overshoot N by its sampling error, making γ_tot > N·P and tripping
+    // `linear_shared_rho_fs_step`'s "pooled dof inside (0, N·P)" guard on pure
+    // estimator noise (#2396: real OLMO fit at K=512 > N=508 read γ_tot = 32524.8 >
+    // 32512). Cap γ at `N − 1/P`, so γ_tot stays strictly inside (0, N·P) and
+    // σ̂² = RSS/(N·P − γ_tot) is well-posed — the interpolating fit then drives ρ
+    // toward the identifiability boundary via the schedule's existing handling
+    // instead of hard-erroring on a sampling overshoot. The cap is keyed to N, NOT
+    // min(K, N): a non-interpolating fit (K < N) already has γ < K < N − 1/P via the
+    // internal [0, K] clamp, so this NEVER binds there and its evidence is unchanged.
+    let edof_ceiling = ((n as f64) - 1.0 / (p.max(1) as f64)).max(0.0);
+    let gram_edof = raw_gram_edof.min(edof_ceiling);
     let penalty_energy: f64 = decoder.iter().map(|&d| (d as f64) * (d as f64)).sum();
     let rss = reconstruction_rss_from_parts(x, decoder, indices, codes);
     Ok(LinearBlockRemlStats {
         gram_edof,
-        p_cols: x.ncols(),
+        p_cols: p,
         penalty_energy,
         rss,
-        n_obs: x.nrows(),
+        n_obs: n,
     })
 }
 
@@ -3753,6 +3772,71 @@ mod exact_solve_tests {
             fit.convergence.outer_tolerance
                 >= super::reml_schedule_rho_log_tol(config.tolerance),
             "the best-effort band must be at least the machine-precision √tolerance band"
+        );
+    }
+
+    #[test]
+    fn edof_estimate_clamped_below_dof_budget_for_interpolating_fit() {
+        // #2396: when K ≥ N the code Gram A = CᵀC has rank ≤ N, so the true edof
+        // γ = tr(A(A+ρI)⁻¹) < N and the pooled dof γ_tot = P·γ < N·P. The Hutchinson
+        // estimate is clamped only to [0, K] internally, so it can overshoot that
+        // rank bound by its sampling error — which then trips
+        // `linear_shared_rho_fs_step`'s "pooled dof inside (0, N·P)" guard on pure
+        // estimator noise (the real OLMO K=512 > N=508 fit read γ_tot = 32524.8 >
+        // 32512). `linear_block_reml_stats_from_parts` now clamps the estimate to the
+        // rank bound less the minimal residual dof, so the pooled dof stays strictly
+        // inside (0, N·P) and the FS step accepts it as valid (interpolating)
+        // evidence. Build a genuinely interpolating fit (K = 24 atoms over n = 8
+        // rows, p = 3) whose near-orthogonal codes drive the raw estimate to the
+        // rank ceiling, and assert both the clamp and that the FS step no longer
+        // errors.
+        use super::{linear_block_reml_stats_from_parts, linear_shared_rho_fs_step};
+        let (n, p, k, s) = (8usize, 3usize, 24usize, 2usize);
+        let mut x = Array2::<f32>::zeros((n, p));
+        for i in 0..n {
+            for c in 0..p {
+                x[[i, c]] = (((i * 5 + c * 3 + 1) % 7) as f32 - 3.0) / 3.0;
+            }
+        }
+        // Distinct atom pairs per row (24 atoms, 8 rows × 2 slots = 16 slots) with
+        // unit codes — the code Gram is a near-identity block, so its edof at a tiny
+        // ridge is essentially its full rank min(K, N) = N = 8.
+        let mut indices = Array2::<u32>::zeros((n, s));
+        let mut codes = Array2::<f32>::zeros((n, s));
+        for i in 0..n {
+            for j in 0..s {
+                indices[[i, j]] = (2 * i + j) as u32;
+                codes[[i, j]] = 1.0;
+            }
+        }
+        let decoder = Array2::<f32>::from_elem((k, p), 0.1);
+        let rho = 1.0e-9f64;
+        let stats = linear_block_reml_stats_from_parts(
+            x.view(),
+            decoder.view(),
+            indices.view(),
+            codes.view(),
+            rho,
+        )
+        .expect("stats");
+        let ceiling = (n as f64) - 1.0 / (p as f64);
+        assert!(
+            stats.gram_edof <= ceiling + 1.0e-12,
+            "edof must be clamped to N less the minimal residual dof: \
+             got {} vs ceiling {ceiling}",
+            stats.gram_edof
+        );
+        // The pooled dof is now strictly inside (0, N·P), so the FS step accepts it
+        // (it would have errored on a raw overshoot > N per column).
+        let total_obs = (n * p) as f64;
+        assert!(
+            (stats.p_cols as f64) * stats.gram_edof < total_obs,
+            "pooled dof {} must be strictly below N·P {total_obs}",
+            (stats.p_cols as f64) * stats.gram_edof
+        );
+        assert!(
+            linear_shared_rho_fs_step(&stats, rho).is_ok(),
+            "the FS step must accept the clamped interpolating evidence, not reject it"
         );
     }
 
