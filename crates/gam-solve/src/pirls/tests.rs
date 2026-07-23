@@ -1263,6 +1263,117 @@ mod tests {
         assert_eq!(decision.reason, "constraints_present");
     }
 
+    /// Regression for #2401: the cancellation-safe PSD-root solve introduced
+    /// for stiff P-IRLS systems must accept the sparse-native coordinate frame.
+    /// Before the fix, the routing oracle correctly chose `SparseNative`, the
+    /// disparate penalty energies correctly chose the augmented root solve, and
+    /// `write_fisher_design_root` then aborted solely because those two valid
+    /// choices had no shared implementation.
+    #[test]
+    pub(crate) fn sparse_native_stiff_penalty_uses_psd_root_2401() {
+        use gam_terms::construction::CanonicalPenalty;
+
+        let p = 64usize;
+        let n = 3 * p;
+        let triplets: Vec<_> = (0..n).map(|row| Triplet::new(row, row / 3, 1.0)).collect();
+        let x = SparseColMat::try_new_from_triplets(n, p, &triplets)
+            .expect("one-hot sparse design should build");
+        let x_design = DesignMatrix::from(x.clone());
+
+        let mut low_energy_root = Array2::<f64>::zeros((1, p));
+        low_energy_root[[0, 0]] = 1.0;
+        let mut high_energy_root = Array2::<f64>::zeros((p - 1, p));
+        for coefficient in 1..p {
+            high_energy_root[[coefficient - 1, coefficient]] = 1.0;
+        }
+        let canonical: Vec<_> = [low_energy_root, high_energy_root]
+            .into_iter()
+            .map(|root| {
+                let rank = root.nrows();
+                CanonicalPenalty {
+                    local: root.t().dot(&root),
+                    root,
+                    col_range: 0..p,
+                    total_dim: p,
+                    nullity: p - rank,
+                    prior_mean: Array1::zeros(p),
+                    positive_eigenvalues: vec![1.0; rank],
+                    op: None,
+                }
+            })
+            .collect();
+
+        let rho = array![-12.0, 12.0];
+        let lambdas = rho.mapv(f64::exp);
+        let weighted_penalty = &canonical[0].local * lambdas[0] + &canonical[1].local * lambdas[1];
+        let mut routing_workspace = PirlsWorkspace::new(n, p, 0, 0);
+        let decision = should_use_sparse_native_pirls(
+            &mut routing_workspace,
+            &x_design,
+            &weighted_penalty,
+            None,
+            None,
+        );
+        assert_eq!(
+            decision.path,
+            PirlsLinearSolvePath::SparseNative,
+            "fixture must exercise the sparse-native coordinate frame; reason={}",
+            decision.reason
+        );
+        assert!(
+            lambdas[1] / lambdas[0] > f64::EPSILON.sqrt().recip(),
+            "fixture must exceed the PSD-root stiffness threshold"
+        );
+
+        let y = Array1::from_shape_fn(n, |row| if row % 3 == 2 { 1.0 } else { 0.0 });
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let config = PirlsConfig {
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            )),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
+            max_iterations: 100,
+            convergence_tolerance: 1e-8,
+            firth_bias_reduction: false,
+            initial_lm_lambda: None,
+            arrow_schur: None,
+        };
+
+        let (fit, _) = fit_model_for_fixed_rho(
+            LogSmoothingParamsView::new(rho.view())
+                .expect("test rho lies in the smoothing-strength domain"),
+            PirlsProblem {
+                x,
+                offset: offset.view(),
+                y: y.view(),
+                priorweights: weights.view(),
+                covariate_se: None,
+                gaussian_fixed_cache: None,
+                glm_first_step_gram: None,
+            },
+            PenaltyConfig {
+                canonical_penalties: &canonical,
+                balanced_penalty_root: None,
+                reparam_invariant: None,
+                p,
+                coefficient_lower_bounds: None,
+                linear_constraints_original: None,
+                penalty_shrinkage_floor: None,
+                kronecker_factored: None,
+            },
+            &config,
+            None,
+        )
+        .expect("stiff sparse-native binomial P-IRLS fit must use the PSD root");
+
+        assert!(
+            fit.beta_transformed.iter().all(|value| value.is_finite()),
+            "sparse-native PSD-root fit must return finite coefficients"
+        );
+    }
+
     /// Regression for the sparse-native vs dense REML λ-selection divergence
     /// (#1266 class): the sparse-native reparam result MUST carry the same
     /// penalty (with the `penalty_shrinkage_floor` ridge folded in) that the
