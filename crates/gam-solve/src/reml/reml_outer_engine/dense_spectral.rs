@@ -4,6 +4,18 @@ use super::*;
 //  Dense spectral HessianFactorization implementation
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Relative rank tolerance for the [`PseudoLogdetMode::HardPseudo`] active mask.
+///
+/// An eigenpair is treated as numerically singular (and excluded from logdet,
+/// traces, and `H⁺` solves) when `σ_j ≤ max(ε, HARD_PSEUDO_RELATIVE_FLOOR·σ_max)`.
+/// The relative term (5 orders of magnitude below the dominant curvature)
+/// catches a penalty-lifted *structural* gauge null — whose eigenvalue is null
+/// relative to the identified spectrum but grows ∝ λ=e^ρ well above the absolute
+/// ε — while leaving well-conditioned Hessians (whose `σ_min` is within a few
+/// orders of `σ_max`) with every eigenpair active.  See `from_symmetric_with_mode`
+/// and gam#2358 for the mode-response leak this prevents.
+const HARD_PSEUDO_RELATIVE_FLOOR: f64 = 1e-5;
+
 /// Dense spectral Hessian operator using eigendecomposition.
 ///
 /// Computes logdet, trace, and solve from a single eigendecomposition,
@@ -16,7 +28,8 @@ pub struct DenseSpectralOperator {
     /// Per-eigenvalue mask: `true` if the eigenpair participates in all
     /// traces, solves, and logdet contributions.  Under
     /// [`PseudoLogdetMode::Smooth`] every entry is `true`.  Under
-    /// [`PseudoLogdetMode::HardPseudo`] entries with `σ_j ≤ ε` are `false`,
+    /// [`PseudoLogdetMode::HardPseudo`] entries with
+    /// `σ_j ≤ max(ε, HARD_PSEUDO_RELATIVE_FLOOR·σ_max)` are `false`,
     /// so the numerical null space is excluded consistently from
     /// `log|H|_+`, its gradient, its cross-traces, AND `H⁻¹` solves
     /// (`H⁺` on the active subspace).
@@ -98,13 +111,37 @@ impl DenseSpectralOperator {
         // `r_ε(σ)`. This is the documented default semantics used by the
         // unified REML/LAML objective.
         //
-        // `HardPseudo` is the identified-subspace mode: eigenpairs with
-        // `σ_j ≤ ε` are excluded consistently from logdet, traces, and solves.
+        // `HardPseudo` is the identified-subspace mode: numerically singular
+        // eigenpairs are excluded consistently from logdet, traces, and solves.
         // Families that need exact pseudo-determinant behaviour opt into this
         // mode explicitly through `pseudo_logdet_mode()`.
+        //
+        // The exclusion floor is `max(ε, HARD_PSEUDO_RELATIVE_FLOOR·σ_max)`, a
+        // relative rank tolerance rather than the bare absolute ε.  A *structural*
+        // gauge null (e.g. the threshold/log-σ direction `q = −η_t/σ` in a
+        // location-scale family) is null relative to the identified spectrum, not
+        // below any fixed absolute scale: the penalty lifts its eigenvalue ∝
+        // λ=e^ρ, so an absolute ε (≈1.3e-7) stops excluding it once λ grows even
+        // modestly.  Once it is (wrongly) kept active, the H⁻¹ mode-response solve
+        // `H⁺·(∂S/∂ρ)β` amplifies that near-null direction by `1/σ` and leaks an
+        // O(1e10) spurious term into the outer LAML gradient (and O(1e21) into its
+        // Hessian → `hessian_psd=NO`), so the outer optimizer can never certify a
+        // stationary optimum and the fit aborts (gam#2358, binomial/gaussian
+        // location-scale wiggle reference-flow).  A relative floor excludes the
+        // penalty-lifted gauge null consistently across the whole ρ-box.
+        //
+        // Well-conditioned Hessians are unaffected: their `σ_min` sits within a
+        // few orders of `σ_max` (≫ the relative floor), so every eigenpair stays
+        // active and the mask is byte-identical to the pre-#2358 absolute-ε mask.
         let active: Vec<bool> = match mode {
             PseudoLogdetMode::Smooth => vec![true; n],
-            PseudoLogdetMode::HardPseudo => eigenvalues.iter().map(|&s| s > epsilon).collect(),
+            PseudoLogdetMode::HardPseudo => {
+                let sigma_max = eigenvalues
+                    .iter()
+                    .fold(0.0_f64, |acc, &s| acc.max(s.abs()));
+                let floor = epsilon.max(HARD_PSEUDO_RELATIVE_FLOOR * sigma_max);
+                eigenvalues.iter().map(|&s| s > floor).collect()
+            }
         };
 
         // Apply smooth regularization to all eigenvalues (even inactive ones:
