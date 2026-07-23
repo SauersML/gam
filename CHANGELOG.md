@@ -1,3 +1,25 @@
+## v0.3.150 — gam 0.3.150 / gamfit 0.1.259 (2026-07-23)
+
+This release ships the post-0.3.149 correctness and convergence campaign,
+including the sparse factor-smooth failure isolated in #2401.
+
+- **Sparse stiff-penalty P-IRLS no longer aborts (#2401).** The numerically
+  safer augmented square-root solve now accepts sparse-native coordinate
+  designs through blocked Householder tall-skinny QR. It remains algebraically
+  equivalent to the dense QR solve, preserves backward-error and Firth
+  correction checks, and bounds live storage by `O(p²)` instead of densifying
+  an `n × p` design.
+- **REML/P-IRLS robustness.** The release includes the intervening optimizer,
+  stationarity-certificate, rail-boundary, sparse-penalty, and inner-solve
+  corrections accumulated since 0.3.149.
+- **Prediction and survival correctness.** Location-scale covariance remapping,
+  survival checkpoint/terminal-curvature handling, and persisted conditional
+  covariance state now follow the fitted parameterization through prediction
+  and reload.
+- **Sparse, Arrow, GPU, and SAE paths.** The Rust crate release catches up with
+  the substantial sparse-native, Arrow-Schur, GPU-kernel, and experimental
+  manifold-SAE work already present on `main`.
+
 ## v0.3.149 — gam 0.3.149 / gamfit 0.1.253 (2026-07-09)
 
 This release makes `opt` the single optimization-mechanics authority for the

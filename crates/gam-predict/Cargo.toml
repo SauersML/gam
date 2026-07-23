@@ -1,6 +1,6 @@
 [package]
 name = "gam-predict"
-version = "0.3.149"
+version = "0.3.150"
 edition = "2024"
 rust-version = "1.93"
 description = "Prediction, posterior bands, and conformal intervals for the gam penalized-likelihood engine"
@@ -10,16 +10,16 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 gam-data = { path = "../gam-data", version = "=0.3.149" }
-gam-inference = { path = "../gam-inference", version = "=0.3.149" }
-gam-linalg = { path = "../gam-linalg", version = "=0.3.149" }
-gam-math = { path = "../gam-math", version = "=0.3.149" }
-gam-model-kernels = { path = "../gam-model-kernels", version = "=0.3.149" }
-gam-models = { path = "../gam-models", version = "=0.3.149" }
-gam-problem = { path = "../gam-problem", version = "=0.3.149" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.149" }
-gam-solve = { path = "../gam-solve", version = "=0.3.149" }
-gam-spec = { path = "../gam-spec", version = "=0.3.149" }
-gam-terms = { path = "../gam-terms", version = "=0.3.149" }
+gam-inference = { path = "../gam-inference", version = "=0.3.150" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.150" }
+gam-math = { path = "../gam-math", version = "=0.3.150" }
+gam-model-kernels = { path = "../gam-model-kernels", version = "=0.3.150" }
+gam-models = { path = "../gam-models", version = "=0.3.150" }
+gam-problem = { path = "../gam-problem", version = "=0.3.150" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.150" }
+gam-solve = { path = "../gam-solve", version = "=0.3.150" }
+gam-spec = { path = "../gam-spec", version = "=0.3.150" }
+gam-terms = { path = "../gam-terms", version = "=0.3.150" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"

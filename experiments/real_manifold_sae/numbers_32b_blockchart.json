@@ -2,7 +2,7 @@
   "model": "Qwen 3.6 (A3B MoE, q36b) L17 residual",
   "lane": "BLOCK-CHART compose (block_sparse_dictionary_fit + compose_block_charts) -- NOT stagewise-T2 (which hangs)",
   "engine": "gamfit.block_sparse_dictionary_fit + BlockSparseDictionaryFit.compose_block_charts",
-  "gamfit_version": "0.1.258",
+  "gamfit_version": "0.1.259",
   "provenance": {
     "t1_transform": "ridge-LS top-active support (active=32), NOT dot-product",
     "centering": "tier0_recentered",

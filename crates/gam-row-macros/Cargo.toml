@@ -1,6 +1,6 @@
 [package]
 name = "gam-row-macros"
-version = "0.3.149"
+version = "0.3.150"
 edition = "2024"
 rust-version = "1.93"
 description = "Build-time symbolic lowering for gam row-program atoms"
