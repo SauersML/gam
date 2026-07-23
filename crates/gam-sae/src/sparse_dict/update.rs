@@ -392,6 +392,22 @@ const LINEAR_EV_PLATEAU_FRACTION: f64 = 1.0e-3;
 /// Consecutive stationary rounds required before returning a best-effort open
 /// iterate — prevents a transient early flat from exiting a still-climbing fit.
 const LINEAR_EV_PLATEAU_MIN_ROUNDS: usize = 3;
+/// Per-term rounding scale for the fixed-point convergence floor (#2396).
+///
+/// The certified arm compares three O(1)-normalized residuals — the EV change
+/// (`explained_variance ∈ [0, 1]`), the unit-normed decoder fixed-point residual,
+/// and the normalized routing residual — against `config.tolerance`. No
+/// floating-point fixed-point iteration can drive such a residual below the
+/// rounding error accumulated in computing it (a reduction over up to
+/// `max(n, k, p)` terms, each carrying ~`EPSILON` relative error), so the
+/// effective convergence tolerance floors at `SPARSE_DICT_FIXED_POINT_ROUNDING *
+/// max(n, k, p)`. This makes a `config.tolerance` of exactly `0.0` — "converge as
+/// tightly as the arithmetic allows" — certify a machine-precision fixed point
+/// (residuals at the ~1e-15 rounding floor) instead of rejecting it as
+/// non-convergent. The floor stays many orders of magnitude below any genuine
+/// non-convergence residual (~1e-4 and up), so a still-moving objective can never
+/// be laundered as converged.
+const SPARSE_DICT_FIXED_POINT_ROUNDING: f64 = 32.0 * f64::EPSILON;
 
 pub(super) fn run(
     x: ArrayView2<'_, f32>,
@@ -452,6 +468,12 @@ pub(super) fn run(
         fit_start.elapsed().as_secs_f64(),
     );
     let mut current_ev = explained_variance(x, &codes, decoder.view());
+    // Effective fixed-point tolerance: never demand tighter closure than the
+    // arithmetic can express (#2396). A `config.tolerance` of `0.0` asks for the
+    // tightest achievable fixed point, which in floating point is the rounding
+    // floor of the residual reductions, not literal zero.
+    let fixed_point_tol =
+        config.tolerance.max(SPARSE_DICT_FIXED_POINT_ROUNDING * (n.max(k).max(p) as f64));
     // Anchor for the captured-fraction EV-plateau detector (arm 2 best-effort):
     // the denominator of "how much of the total climb since entry did this round
     // capture". Consecutive near-zero-capture rounds mark the achievable plateau.
@@ -616,9 +638,9 @@ pub(super) fn run(
         // first so an exactly-determined fit is certified, never demoted.
         let certified_fixed_point = structure_settled
             && numerically_sound
-            && ev_residual <= config.tolerance
-            && decoder_residual <= config.tolerance
-            && routing_residual <= config.tolerance;
+            && ev_residual <= fixed_point_tol
+            && decoder_residual <= fixed_point_tol
+            && routing_residual <= fixed_point_tol;
 
         // Arm 2 book-keeping: captured-fraction EV plateau. A round is stationary
         // when it captured a negligible fraction of the total EV climb since entry
@@ -636,7 +658,7 @@ pub(super) fn run(
         } else {
             0.0
         };
-        let objective_plateaued = ev_residual <= config.tolerance
+        let objective_plateaued = ev_residual <= fixed_point_tol
             || captured_fraction < LINEAR_EV_PLATEAU_FRACTION;
         if epoch > 0 && structure_settled && numerically_sound && objective_plateaued {
             plateau_rounds += 1;
@@ -3675,6 +3697,81 @@ mod exact_solve_tests {
         assert!(
             (fresh_ev - fit.explained_variance).abs() < 1.0e-6,
             "returned EV {} must equal fresh-code EV {fresh_ev} (no stale-code gap)",
+            fit.explained_variance
+        );
+    }
+
+    #[test]
+    fn tolerance_zero_certifies_machine_precision_fixed_point() {
+        // #2396: a `config.tolerance` of exactly 0.0 asks for the tightest
+        // achievable fixed point. In floating point that is the residual rounding
+        // floor (~1e-15 for O(1)-normalized residuals), never literal zero, so the
+        // certified arm must floor the comparison at machine precision — otherwise a
+        // GENUINE, machine-precision fixed point is rejected as non-convergent (the
+        // `sparse_fit_records_score_route_stats` shape). This gate exercises the
+        // certificate FLAG (not just that the fit returns): a well-posed, exactly
+        // 1-sparse problem reaches an exact fixed point, so under tolerance 0.0 the
+        // fit must both RETURN and carry a CERTIFIED certificate whose residuals sit
+        // at the rounding floor.
+        let (k, p, n) = (4usize, 8usize, 48usize);
+        // Deterministic near-orthogonal unit atoms; each row is EXACTLY one atom
+        // (1-sparse), so the alternation has a unique, exactly-attainable fixed
+        // point: route → decode recovers the atoms and EV → 1 at machine precision.
+        let mut atoms = Array2::<f32>::zeros((k, p));
+        for a in 0..k {
+            let mut norm = 0.0f64;
+            for c in 0..p {
+                let v = (((a * 5 + c * 3 + 1) % 7) as f32 - 3.0) + if c == a { 4.0 } else { 0.0 };
+                atoms[[a, c]] = v;
+                norm += (v as f64) * (v as f64);
+            }
+            let inv = (1.0 / norm.sqrt().max(1.0e-12)) as f32;
+            for c in 0..p {
+                atoms[[a, c]] *= inv;
+            }
+        }
+        let mut x = Array2::<f32>::zeros((n, p));
+        for i in 0..n {
+            let a = i % k;
+            let scale = 1.0 + 0.5 * ((i / k) as f32);
+            for c in 0..p {
+                x[[i, c]] = scale * atoms[[a, c]];
+            }
+        }
+        let config = SparseDictConfig {
+            n_atoms: k,
+            active: 1,
+            minibatch: 16,
+            max_epochs: 200,
+            score_tile: 8,
+            code_ridge: 1.0e-6,
+            decoder_ridge: 1.0e-6,
+            tolerance: 0.0,
+            score_mode: gam_gpu::GpuPolicy::Off,
+        };
+        let fit = fit_sparse_dictionary(x.view(), &config).expect(
+            "#2396: a machine-precision fixed point must certify under tolerance 0.0, not error",
+        );
+        assert!(
+            fit.convergence.certified,
+            "a well-posed exact fixed point must CERTIFY under tolerance 0.0; got \
+             certified=false (ev_resid={:.3e}, decoder_resid={:.3e}, routing_resid={:.3e})",
+            fit.convergence.inner_ev_residual,
+            fit.convergence.decoder_residual,
+            fit.convergence.routing_residual
+        );
+        // The certified residuals sit at the rounding floor, not literal zero — the
+        // exact property that an absolute `tolerance == 0.0` could never satisfy
+        // before the machine-precision floor.
+        assert!(
+            fit.convergence.inner_ev_residual < 1.0e-9
+                && fit.convergence.inner_ev_residual >= 0.0,
+            "certified EV residual must be finite and at the rounding floor; got {:.3e}",
+            fit.convergence.inner_ev_residual
+        );
+        assert!(
+            fit.explained_variance > 0.999_999,
+            "an exact 1-sparse fit must reconstruct at EV≈1; got {}",
             fit.explained_variance
         );
     }
