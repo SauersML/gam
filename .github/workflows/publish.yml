@@ -79,18 +79,21 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_KEY }}
         run: |
           set -uo pipefail
-          # Since #1521 split the monolith, `gam` path-depends on the
-          # foundation crates (gam-runtime/gam-data/gam-math/gam-spec/
-          # gam-linalg/gam-problem), so publishing `gam` alone fails
-          # ("no matching package named `gam-data` found"). crates.io
-          # requires every path dependency of a published crate to resolve
-          # to a real registry version, so the family must be published
-          # together, in dependency order, BEFORE `gam`. The order below is
-          # topological (deps-first): every normal/build path-dependency in
-          # `gam`'s closure is published before `gam` itself, so cargo can
-          # resolve each `=0.3.x` path-dep to a real registry version.
-          # Only the publish=false crates (gam-cli/gam-pyffi) are omitted —
-          # they are not in `gam`'s normal-dependency closure.
+          # crates.io requires every normal/build path dependency of a
+          # published crate to exist in the registry first. Derive that order
+          # from Cargo's authoritative workspace graph: a hand-maintained list
+          # drifted when gam-row-macros became a published dependency and left
+          # the v0.3.150 family only partially uploaded.
+          mapfile -t crates < <(
+            cargo metadata --locked --no-deps --format-version 1 |
+              python3 .github/scripts/workspace_publish_order.py
+          )
+          if [ "${#crates[@]}" -eq 0 ]; then
+            echo "::error::Cargo metadata produced no publishable workspace crates"
+            exit 1
+          fi
+          printf 'dependency-first publish order: %s\n' "${crates[*]}"
+
           publish_one() {
             local crate="$1"
             local out status
@@ -103,6 +106,6 @@ jobs:
               && { echo "$crate already on crates.io — skipping"; return 0; }
             echo "::error::failed to publish $crate"; return 1
           }
-          for crate in gam-data gam-math gam-report gam-runtime gam-linalg gam-geometry gam-gpu gam-spec gam-problem gam-identifiability gam-model-api gam-terms gam-solve gam-custom-family gam-model-kernels gam-models gam-sae gam-inference gam-predict gam-config gam-test-support gam; do
+          for crate in "${crates[@]}"; do
             publish_one "$crate" || exit 1
           done
