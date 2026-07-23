@@ -9,22 +9,18 @@
 //! result depends on what you ran before is the worst bug genus a
 //! statistics tool can have, because it is invisible to any single-run
 //! test. This harness is the permanent regression net: a matrix of fits
-//! (families × constraint shapes) each run twice in one process — first
-//! against a guaranteed-cold persistent warm-start store, then against the
-//! now-warm store — asserting criterion-value and coefficient agreement.
+//! (families × constraint shapes) each run through a cold fit, a cache-priming
+//! fit, and a warm fit in one process, asserting criterion-value and
+//! coefficient agreement.
 //!
 //! ## Mechanics
 //!
-//! The persistent warm-start store is anchored under
-//! `std::env::temp_dir()/gam/warm/v1` (`src/solver/persistent_warm_start.rs`,
-//! `persistent_store`), and on Unix `temp_dir()` resolves `TMPDIR`. Before
-//! each configuration's FIRST fit we point `TMPDIR` at a fresh, empty,
-//! per-run directory, so that fit is cold by construction; the second fit
-//! of the same configuration then sees the warm entries the first one
-//! wrote (including the data-independent seed-prefix payload that handed
-//! #873 its divergent rho seed). Re-pointing per configuration also keeps
-//! one configuration's seed-prefix entries from pre-warming the next
-//! configuration's "cold" arm.
+//! The cold arm sets `persist_warm_start_disk = false`, which structurally
+//! prevents any persistent read regardless of process history. A priming arm
+//! then enables persistence and completes the same fit, and the warm arm repeats
+//! it with persistence enabled. This remains correct even though the persistent
+//! store is process-global and memoized; mutating `TMPDIR` cannot reset that
+//! `OnceLock` and therefore cannot prove coldness.
 //!
 //! ## The contract
 //!
@@ -114,6 +110,72 @@ fn binomial_data() -> (Vec<f64>, Vec<f64>) {
         .unzip()
 }
 
+fn negative_binomial_data() -> (Vec<f64>, Vec<f64>) {
+    let n = 500usize;
+    let mut rng = 0x243f6a88u64;
+    (0..n)
+        .map(|i| {
+            let x = i as f64 / (n as f64 - 1.0);
+            let mu = (0.2 + 1.5 * (2.0 * std::f64::consts::PI * x).sin()).exp();
+            // A deterministic overdispersed count fixture. Its non-flat
+            // conditional mean makes seed-η and converged-η profiling
+            // materially different, directly exercising #2363.
+            let multiplier = if lcg_uniform(&mut rng) < 0.3 {
+                0.15
+            } else {
+                1.75
+            };
+            let y = (mu * multiplier + lcg_uniform(&mut rng)).round().max(0.0);
+            (x, y)
+        })
+        .unzip()
+}
+
+fn gamma_data() -> (Vec<f64>, Vec<f64>) {
+    let n = 500usize;
+    let mut rng = 0x13198a2eu64;
+    (0..n)
+        .map(|i| {
+            let x = i as f64 / (n as f64 - 1.0);
+            let mu = (0.3 + 0.9 * (2.0 * std::f64::consts::PI * x).sin()).exp();
+            let y = mu * (0.7 + 0.6 * lcg_uniform(&mut rng));
+            (x, y)
+        })
+        .unzip()
+}
+
+fn tweedie_data() -> (Vec<f64>, Vec<f64>) {
+    let n = 500usize;
+    let mut rng = 0xa4093822u64;
+    (0..n)
+        .map(|i| {
+            let x = i as f64 / (n as f64 - 1.0);
+            let mu = (0.1 + 1.1 * (2.0 * std::f64::consts::PI * x).sin()).exp();
+            let u = lcg_uniform(&mut rng);
+            let y = if u < 0.2 {
+                0.0
+            } else {
+                mu * (0.55 + 0.9 * lcg_uniform(&mut rng))
+            };
+            (x, y)
+        })
+        .unzip()
+}
+
+fn beta_data() -> (Vec<f64>, Vec<f64>) {
+    let n = 500usize;
+    let mut rng = 0x082efa98u64;
+    (0..n)
+        .map(|i| {
+            let x = i as f64 / (n as f64 - 1.0);
+            let eta = 1.8 * (2.0 * std::f64::consts::PI * x).sin();
+            let mu = 1.0 / (1.0 + (-eta).exp());
+            let y = (mu + 0.18 * (lcg_uniform(&mut rng) - 0.5)).clamp(0.01, 0.99);
+            (x, y)
+        })
+        .unzip()
+}
+
 fn monotone_constrained_data() -> (Vec<f64>, Vec<f64>) {
     let n = 500usize;
     let mut rng = 0x3c6ef372u64;
@@ -129,7 +191,13 @@ fn monotone_constrained_data() -> (Vec<f64>, Vec<f64>) {
         .unzip()
 }
 
-fn fit_once(case: &InvarianceCase, x: &[f64], y: &[f64], arm: &str) -> (f64, Vec<f64>) {
+fn fit_once(
+    case: &InvarianceCase,
+    x: &[f64],
+    y: &[f64],
+    arm: &str,
+    persist_warm_start_disk: bool,
+) -> (f64, Vec<f64>) {
     let mut csv = String::from("x,y\n");
     for i in 0..x.len() {
         csv.push_str(&format!("{:.17e},{:.17e}\n", x[i], y[i]));
@@ -150,6 +218,7 @@ fn fit_once(case: &InvarianceCase, x: &[f64], y: &[f64], arm: &str) -> (f64, Vec
 
     let cfg = FitConfig {
         family: Some(case.family.to_string()),
+        persist_warm_start_disk,
         ..FitConfig::default()
     };
     let result = fit_from_formula(case.formula, &ds, &cfg).unwrap_or_else(|e| {
@@ -168,14 +237,6 @@ fn fit_once(case: &InvarianceCase, x: &[f64], y: &[f64], arm: &str) -> (f64, Vec
         arm
     );
     (fit.fit.reml_score, fit.fit.beta.to_vec())
-}
-
-fn salt() -> u128 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
 }
 
 #[test]
@@ -202,6 +263,30 @@ fn fits_are_invariant_to_warm_start_cache_state_across_families() {
             data: binomial_data,
         },
         InvarianceCase {
+            name: "negative_binomial_smooth",
+            family: "negative-binomial",
+            formula: "y ~ s(x, k=8)",
+            data: negative_binomial_data,
+        },
+        InvarianceCase {
+            name: "gamma_smooth",
+            family: "gamma",
+            formula: "y ~ s(x, k=8)",
+            data: gamma_data,
+        },
+        InvarianceCase {
+            name: "tweedie_smooth",
+            family: "tweedie",
+            formula: "y ~ s(x, k=8)",
+            data: tweedie_data,
+        },
+        InvarianceCase {
+            name: "beta_smooth",
+            family: "beta",
+            formula: "y ~ s(x, k=8)",
+            data: beta_data,
+        },
+        InvarianceCase {
             name: "gaussian_monotone",
             family: "gaussian",
             formula: "y ~ s(x, k=10, shape=monotone_increasing)",
@@ -210,33 +295,14 @@ fn fits_are_invariant_to_warm_start_cache_state_across_families() {
     ];
 
     let mut failures: Vec<String> = Vec::new();
-    for (idx, case) in cases.iter().enumerate() {
-        // Fresh private store per configuration: the first arm is cold by
-        // construction, AND the previous configuration's data-independent
-        // seed-prefix entries cannot pre-warm this one.
-        let mut store_root = std::env::temp_dir();
-        store_root.push(format!(
-            "gam_wsi_cold_{}_{}_{}",
-            std::process::id(),
-            idx,
-            salt()
-        ));
-        std::fs::create_dir_all(&store_root).expect("create private cold-store TMPDIR");
-        // SAFETY: single #[test] binary, set between fits on the test
-        // thread before the next fit reads the environment. Edition-2024
-        // marks `set_var` unsafe.
-        unsafe {
-            std::env::set_var("TMPDIR", &store_root);
-        }
-        assert_eq!(
-            std::env::temp_dir(),
-            store_root,
-            "TMPDIR override did not take effect; cannot guarantee a cold cache"
-        );
-
+    for case in &cases {
         let (x, y) = (case.data)();
-        let (crit_cold, beta_cold) = fit_once(case, &x, &y, "cold");
-        let (crit_warm, beta_warm) = fit_once(case, &x, &y, "warm");
+        let (crit_cold, beta_cold) = fit_once(case, &x, &y, "cold", false);
+        // Prime both the exact-key and seed-prefix checkpoints. This arm need
+        // not itself be cold; after it completes the next arm is guaranteed to
+        // have a valid persistent entry.
+        let _ = fit_once(case, &x, &y, "prime", true);
+        let (crit_warm, beta_warm) = fit_once(case, &x, &y, "warm", true);
 
         let crit_diff = (crit_cold - crit_warm).abs();
         let crit_tol = CRITERION_REL_TOL * crit_cold.abs().max(1.0);
@@ -274,8 +340,6 @@ fn fits_are_invariant_to_warm_start_cache_state_across_families() {
                 ));
             }
         }
-
-        std::fs::remove_dir_all(&store_root).ok();
     }
 
     assert!(

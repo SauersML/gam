@@ -6955,13 +6955,9 @@ impl<'a> RemlState<'a> {
             .resolved_scale()
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
         // Capture the data-driven NB θ from the first converged non-screening
-        // λ-search solve and freeze it for the rest of the search (#1082). The
-        // first solve still estimated θ from the seed η (this branch only runs
-        // when no frozen value exists yet), so the captured value is the same
-        // ML θ the legacy estimated path would have used at the seed — we simply
-        // stop letting it drift on subsequent outer evaluations. Screening
-        // solves use a tiny inner budget and a partial mode, so they are never
-        // the source of the frozen value.
+        // λ-search solve and freeze it for the rest of the search (#1082).
+        // Screening solves use a tiny inner budget and a partial mode, so they
+        // are never the source of the frozen value.
         if !in_screening
             && matches!(
                 resolved_likelihood_scale,
@@ -6976,23 +6972,33 @@ impl<'a> RemlState<'a> {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
             )
         {
-            let theta = resolved_likelihood_scale
-                .negative_binomial_theta()
-                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            // #2363 (the #2361 class, negative-binomial instance): estimate θ
+            // at this solve's CONVERGED η. The resolved scale was profiled from
+            // the seed η before P-IRLS, so copying it here made the supposedly
+            // fixed outer surface depend on whether the seed came from a cold
+            // start or the persistent cache. This is one O(n) profile at an η
+            // the accepted solve already produced, performed once per search;
+            // θ remains frozen across every subsequent ρ evaluation.
+            let theta = pirls::estimate_negbin_theta_from_eta(
+                self.y,
+                &pirls_result.final_eta.to_owned(),
+                self.weights,
+            )?;
+            if !(theta.is_finite() && theta > 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "converged-η negative-binomial freeze produced an invalid θ: {theta:?}"
+                )));
+            }
             self.frozen_negbin_theta
                 .store(theta.to_bits(), Ordering::Relaxed);
             log::info!(
-                "[OUTER] negative-binomial λ-search θ frozen at {theta:.6e} (#1082); \
-                 outer REML criterion now stationary in ρ"
+                "[OUTER] negative-binomial λ-search θ frozen at {theta:.6e} (#1082/#2363, \
+                 measured at the converged η); outer REML criterion now stationary in ρ"
             );
         }
         // Capture the data-driven Tweedie φ from the first converged non-screening
-        // λ-search solve and freeze it for the rest of the search (#1477), exactly
-        // as for the NB θ above. The first solve estimated φ from the seed η via
-        // the Pearson moment estimator (this branch only runs when no frozen value
-        // exists yet), so the captured value is the seed-fit φ the estimated path
-        // would have used — we simply stop letting it drift (and reward dispersion
-        // inflation) on subsequent outer evaluations.
+        // λ-search solve and freeze it for the rest of the search (#1477),
+        // exactly as for the NB θ above.
         if !in_screening
             && matches!(
                 resolved_likelihood_scale,

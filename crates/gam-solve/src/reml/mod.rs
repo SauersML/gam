@@ -5550,8 +5550,8 @@ pub(crate) struct RemlState<'a> {
     /// Negative-Binomial overdispersion `theta` frozen for the smoothing-
     /// parameter (λ) search (#1082), bit-packed `f64` (`f64::to_bits`). `0`
     /// (the default) signals "not yet frozen". On the first non-screening
-    /// λ-search inner solve of an estimated-θ NB fit, the seed's
-    /// maximum-likelihood θ is computed once and stored here; every subsequent
+    /// λ-search inner solve of an estimated-θ NB fit, the maximum-likelihood θ
+    /// at the solve's converged η is computed once and stored here; every subsequent
     /// λ-search evaluation pins the inner solve to this value via
     /// `GlmLikelihoodSpec::with_negbin_theta_frozen_for_search`, so the REML
     /// criterion `F(ρ) = REML(ρ, θ_frozen)` is a stationary function of ρ and
@@ -5563,8 +5563,8 @@ pub(crate) struct RemlState<'a> {
     /// Tweedie exponential-dispersion `phi` frozen for the smoothing-parameter
     /// (λ) search (#1477), bit-packed `f64` (`f64::to_bits`). `0` (the default)
     /// signals "not yet frozen". On the first non-screening λ-search inner solve
-    /// of an estimated-φ Tweedie fit, the seed's Pearson `phî` is captured once
-    /// and stored here; every subsequent λ-search evaluation pins the inner
+    /// of an estimated-φ Tweedie fit, the converged-η Pearson `phî` is captured
+    /// once and stored here; every subsequent λ-search evaluation pins the inner
     /// solve to this value via
     /// `GlmLikelihoodSpec::with_tweedie_phi_frozen_for_search`, so the REML
     /// criterion `F(ρ) = REML(ρ, φ_frozen)` is a stationary function of ρ. The
