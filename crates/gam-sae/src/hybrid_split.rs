@@ -576,6 +576,192 @@ enum AtomCandidateRefusal {
     Unadjudicable,
 }
 
+/// The closed-form mass-weighted straight-line fit of one `d = 1` atom's
+/// coordinate against a `p`-channel response `y`, plus the derived quantities the
+/// callers need. Shared by the fitted evidence adjudication
+/// ([`build_atom_candidates`], where `y = y_resp` is the leave-this-atom-out
+/// residual) and the fit-free no-target collapse verdict
+/// ([`fit_free_linear_image`], where `y = a_k·γ_k` is the atom's own realized
+/// contribution). Keeping ONE implementation of the normal equations guarantees
+/// the fit-free straight image is bit-identical to the one a full fit would mint
+/// for the same atom.
+struct MassWeightedLine {
+    /// Mass-weighted coordinate mean `t̄` the centered line is anchored on.
+    t_bar: f64,
+    /// Per-channel centered intercept `b₀` (length `p`).
+    b0: Array1<f64>,
+    /// Per-channel slope `b₁` (length `p`).
+    b1: Array1<f64>,
+    /// Effective mass `Σ a²` (the intercept Gram diagonal / `N_eff`).
+    w_sum: f64,
+    /// Mass-weighted coordinate spread `Σ a²·(t − t̄)²` (the slope Gram diagonal).
+    s_tt: f64,
+    /// The line's weighted residual sum of squares against `y`:
+    /// `Σᵢ ‖y[i] − a_i·(b₀ + (t_i − t̄)·b₁)‖²`.
+    linear_rss: f64,
+}
+
+/// Fit [`MassWeightedLine`] from `(coords, assign, y)` with design weight
+/// `wᵢ = a_i²` and prediction `a_i·(b₀ + (t_i − t̄)·b₁)`. Returns the SAME
+/// refusals [`build_atom_candidates`] surfaces: `CoordinateCollapse` when the
+/// atom's coordinate has collapsed to a single point (`s_tt ≈ 0`), `Unadjudicable`
+/// for a shape mismatch, a non-finite/negative mass, or a degenerate `w_sum`.
+fn fit_mass_weighted_line(
+    coords: ArrayView1<'_, f64>,
+    assign: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+) -> Result<MassWeightedLine, AtomCandidateRefusal> {
+    let n = coords.len();
+    let p = y.ncols();
+    if assign.len() != n || y.nrows() != n || p == 0 {
+        return Err(AtomCandidateRefusal::Unadjudicable);
+    }
+    // The LINEAR candidate fits `a_k·(b₀ + (t − t̄)·b₁)` to `y`, so the natural
+    // design column is `a_k·[1, (t − t̄)]` and the per-row Gram weight is
+    // `wᵢ = a_k²`. Accumulate the mass-weighted coordinate mean `t̄` and spread
+    // `s_tt` under that weight; a row that barely belongs to the atom (`a_k ≈ 0`)
+    // contributes ≈ nothing, exactly as in the joint loss.
+    let mut w_sum = 0.0_f64;
+    let mut t_bar = 0.0_f64;
+    for i in 0..n {
+        let a = assign[i];
+        if !(a.is_finite() && a >= 0.0) {
+            return Err(AtomCandidateRefusal::Unadjudicable);
+        }
+        let w = a * a;
+        w_sum += w;
+        t_bar += w * coords[i];
+    }
+    if !(w_sum > 0.0) {
+        return Err(AtomCandidateRefusal::Unadjudicable);
+    }
+    t_bar /= w_sum;
+
+    // Weighted Σ wᵢ·(t − t̄)² with `wᵢ = a_k²` — the coordinate spread under the
+    // line's design weight. A degenerate (single-point mass) coordinate has no
+    // slope direction; refuse rather than divide by ~0.
+    let mut s_tt = 0.0_f64;
+    for i in 0..n {
+        let dt = coords[i] - t_bar;
+        s_tt += assign[i] * assign[i] * dt * dt;
+    }
+    // The atom's OWN coordinate has collapsed to a single point (the #1777
+    // rank-1 "chord-through-the-arc" co-collapse). This is the SOLE refusal the
+    // hybrid split rescues: the caller recovers a fresh linear image from the
+    // residual's top direction. Every OTHER refusal is `Unadjudicable`.
+    if !(s_tt > 1e-12 * (1.0 + t_bar * t_bar)) {
+        return Err(AtomCandidateRefusal::CoordinateCollapse);
+    }
+
+    // Per-output-channel mass-weighted least squares. Minimizing
+    // `Σᵢ ‖y[i] − a_k·(b₀ + (t − t̄)·b₁)‖²` in the centered basis has the diagonal
+    // normal equations
+    //   b₀[j] = (Σ a_k·y[i,j]) / w_sum,   (recall the design intercept is a_k)
+    //   b₁[j] = (Σ a_k·(t − t̄)·y[i,j]) / s_tt.
+    let mut b0 = Array1::<f64>::zeros(p);
+    let mut b1 = Array1::<f64>::zeros(p);
+    for j in 0..p {
+        let mut s_1y = 0.0_f64;
+        let mut s_ty = 0.0_f64;
+        for i in 0..n {
+            let a = assign[i];
+            let dt = coords[i] - t_bar;
+            let yij = y[[i, j]];
+            s_1y += a * yij;
+            s_ty += a * dt * yij;
+        }
+        b0[j] = s_1y / w_sum;
+        b1[j] = s_ty / s_tt;
+    }
+
+    // The line's weighted RSS against `y`.
+    let mut linear_rss = 0.0_f64;
+    for i in 0..n {
+        let a = assign[i];
+        let dt = coords[i] - t_bar;
+        for j in 0..p {
+            let r_linear = y[[i, j]] - a * (b0[j] + dt * b1[j]);
+            linear_rss += r_linear * r_linear;
+        }
+    }
+
+    Ok(MassWeightedLine {
+        t_bar,
+        b0,
+        b1,
+        w_sum,
+        s_tt,
+        linear_rss,
+    })
+}
+
+/// #1026 fit-free (no-target) collapse verdict for one `d = 1` atom. Given the
+/// atom's own REALIZED contribution `realized[i] = a_i·γ_k(t_i)` over its assigned
+/// rows, decide whether that contribution already lies in the straight lane
+/// `span{1, (t − t̄)}` to numerical tolerance, and if so return the straight image
+/// that reproduces it. This is the honest verdict the public no-target
+/// reconstruction can reach WITHOUT a fitted `hybrid_split_report`: the fitted
+/// adjudication needs a response to price curvature against, but a term with no
+/// target can still observe that its realized decoded image is (to `ε`) a line in
+/// `t` and collapse to it EV-neutrally.
+///
+/// The straight image is the exact [`MassWeightedLine`] the fitted path would
+/// mint, and `v = None` (an ordinary straight image decoded at the atom's own
+/// coordinate — never a target-dependent #1777 rescue). Returns `None` when the
+/// atom's realized image is genuinely curved (relative line residual above
+/// `rel_floor`), its coordinate has collapsed, its mass is degenerate, or its
+/// realized image carries no energy (a zero atom — nothing to collapse).
+///
+/// `rel_floor` is the squared relative-residual ceiling: collapse iff
+/// `linear_rss ≤ rel_floor · ‖realized‖²`. It is a numerical-linearity gate, NOT
+/// a modeling knob — only an image that a straight line reproduces to `√rel_floor`
+/// relative amplitude is admitted, so the substitution cannot degrade the
+/// reconstruction beyond that floor (collapse-safety).
+pub(crate) fn fit_free_linear_image(
+    atom_idx: usize,
+    coords: ArrayView1<'_, f64>,
+    assign: ArrayView1<'_, f64>,
+    realized: ArrayView2<'_, f64>,
+    rel_floor: f64,
+) -> Option<AtomLinearImage> {
+    let n = coords.len();
+    if n < MIN_ROWS_FOR_LINEAR_FIT {
+        return None;
+    }
+    let line = fit_mass_weighted_line(coords, assign, realized).ok()?;
+    // Total weighted energy of the realized image — the denominator that makes
+    // the linearity test scale-invariant. A zero-energy atom (no realized mass)
+    // has nothing to collapse.
+    let mut energy = 0.0_f64;
+    for i in 0..n {
+        for j in 0..realized.ncols() {
+            energy += realized[[i, j]] * realized[[i, j]];
+        }
+    }
+    if !(energy > 0.0 && energy.is_finite() && line.linear_rss.is_finite()) {
+        return None;
+    }
+    if line.linear_rss > rel_floor * energy {
+        // Genuinely curved realized image: collapsing would degrade it. Leave curved.
+        return None;
+    }
+    Some(AtomLinearImage {
+        atom_idx,
+        t_bar: line.t_bar,
+        b0: line.b0,
+        b1: line.b1,
+        v: None,
+    })
+}
+
+/// Squared relative-residual ceiling of the #1026 fit-free linearity gate: a
+/// realized image is treated as a straight line iff its weighted line-fit RSS is
+/// below this fraction of its total energy, i.e. the line reproduces it to `1e-6`
+/// relative amplitude. Tight enough that only a numerically-linear realized image
+/// collapses (a genuine arc sits orders of magnitude above it), loose enough to
+/// admit the solver roundoff of an exactly-representable line.
+pub(crate) const FIT_FREE_LINEAR_RELATIVE_FLOOR: f64 = 1e-12;
+
 fn build_atom_candidates(
     coords: ArrayView1<'_, f64>,
     assign: ArrayView1<'_, f64>,
@@ -609,81 +795,20 @@ fn build_atom_candidates(
         return Err(AtomCandidateRefusal::Unadjudicable);
     }
 
-    // The LINEAR candidate fits `a_k·(b₀ + (t − t̄)·b₁)` to the residual `y_resp`,
-    // so the natural design column is `a_k·[1, (t − t̄)]` and the per-row Gram
-    // weight is `wᵢ = a_k²`. We accumulate the mass-weighted coordinate mean `t̄`
-    // and spread `s_tt` under that weight; a row that barely belongs to the atom
-    // (`a_k ≈ 0`) contributes ≈ nothing, exactly as in the joint loss.
-    let mut w_sum = 0.0_f64;
-    let mut t_bar = 0.0_f64;
-    for i in 0..n {
-        let a = assign[i];
-        if !(a.is_finite() && a >= 0.0) {
-            return Err(AtomCandidateRefusal::Unadjudicable);
-        }
-        let w = a * a;
-        w_sum += w;
-        t_bar += w * coords[i];
-    }
-    if !(w_sum > 0.0) {
-        return Err(AtomCandidateRefusal::Unadjudicable);
-    }
-    t_bar /= w_sum;
+    // The LINEAR candidate fits `a_k·(b₀ + (t − t̄)·b₁)` to the residual `y_resp`
+    // via the shared mass-weighted normal equations (design column `a_k·[1,(t−t̄)]`,
+    // per-row Gram weight `wᵢ = a_k²`), which also surfaces the coordinate mean
+    // `t̄`, spread `s_tt`, effective mass `w_sum` and the line's `linear_rss`.
+    // A single-point coordinate collapse becomes the #1777 rescue site.
+    let MassWeightedLine {
+        t_bar,
+        b0,
+        b1,
+        w_sum,
+        s_tt,
+        linear_rss,
+    } = fit_mass_weighted_line(coords, assign, target_resid)?;
 
-    // Weighted Σ wᵢ·(t − t̄)² with `wᵢ = a_k²` — the coordinate spread under the
-    // line's design weight. A degenerate (single-point mass) coordinate has no
-    // slope direction; refuse rather than divide by ~0.
-    let mut s_tt = 0.0_f64;
-    for i in 0..n {
-        let dt = coords[i] - t_bar;
-        s_tt += assign[i] * assign[i] * dt * dt;
-    }
-    // The atom's OWN coordinate has collapsed to a single point (the #1777
-    // rank-1 "chord-through-the-arc" co-collapse). This is the SOLE refusal the
-    // hybrid split rescues: the caller recovers a fresh linear image from the
-    // residual's top direction. Every OTHER refusal in this function is
-    // `Unadjudicable` (the candidate pair cannot be built or priced) and must
-    // NOT mint a target-dependent rescue image (#2362).
-    if !(s_tt > 1e-12 * (1.0 + t_bar * t_bar)) {
-        return Err(AtomCandidateRefusal::CoordinateCollapse);
-    }
-
-    // Per-output-channel mass-weighted least squares for the line fit to the
-    // RESIDUAL `y_resp`. Minimizing `Σᵢ ‖y_resp[i] − a_k·(b₀ + (t − t̄)·b₁)‖²` in
-    // the centered basis has the diagonal normal equations
-    //   b₀[j] = (Σ a_k·y_resp[i,j]) / w_sum,   (recall the design intercept is a_k)
-    //   b₁[j] = (Σ a_k·(t − t̄)·y_resp[i,j]) / s_tt.
-    let mut b0 = Array1::<f64>::zeros(p);
-    let mut b1 = Array1::<f64>::zeros(p);
-    for j in 0..p {
-        let mut s_1y = 0.0_f64;
-        let mut s_ty = 0.0_f64;
-        for i in 0..n {
-            let a = assign[i];
-            let dt = coords[i] - t_bar;
-            let y = target_resid[[i, j]];
-            s_1y += a * y;
-            s_ty += a * dt * y;
-        }
-        b0[j] = s_1y / w_sum;
-        b1[j] = s_ty / s_tt;
-    }
-
-    // Data-fit residual sums of squares of BOTH candidates against `y_resp`, the
-    // common data. The linear candidate predicts the best line
-    // `a_k·(b₀ + (t − t̄)·b₁)`; the curved candidate is scored at its CONSTRAINED
-    // MINIMUM over the decoder coefficients (nested min-vs-min, #1051), re-fit on
-    // this same residual — not the possibly-collapsed already-realized curve.
-    let mut linear_rss = 0.0_f64;
-    for i in 0..n {
-        let a = assign[i];
-        let dt = coords[i] - t_bar;
-        for j in 0..p {
-            let y = target_resid[[i, j]];
-            let r_linear = y - a * (b0[j] + dt * b1[j]);
-            linear_rss += r_linear * r_linear;
-        }
-    }
     // #1051 NESTED MIN — the curved arm's data fit is `min_B ‖y_resp − diag(a)Φ B‖²`,
     // its constrained minimum over the decoder. Because the linear lane is a member
     // of the curved family (the straight columns lie in `span(Φ)` for the eligible

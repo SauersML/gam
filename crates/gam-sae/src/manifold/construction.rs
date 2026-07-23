@@ -3588,8 +3588,29 @@ impl SaeManifoldTerm {
                 assignments.dim()
             ));
         }
+        // #1026 — the collapse verdict must be REACHABLE from this public
+        // explicit-assignment path even when no fit has run. When neither a fitted
+        // `hybrid_split_report` nor attached `oos_linear_images` exists, adjudicate
+        // fit-free from the CALLER'S assignments: any `d = 1` atom whose realized
+        // decoded contribution `a_i·γ_k(t_i)` already lies in the straight lane
+        // collapses to that line EV-neutrally (value preserved to the linearity
+        // floor). These owned images are held here so the borrow the map takes
+        // below outlives them; they are appended only when there is no fitted or
+        // OOS collapse policy to defer to (a completed all-curved fit is respected).
+        let fit_free_images: Vec<crate::hybrid_split::AtomLinearImage> = if collapse
+            && self.hybrid_split_report.is_none()
+            && self.oos_linear_images.is_none()
+        {
+            self.fit_free_hybrid_linear_images(assignments)
+        } else {
+            Vec::new()
+        };
         let linear_images = if collapse {
-            self.hybrid_linear_image_map()
+            let mut images = self.hybrid_linear_image_map();
+            for image in &fit_free_images {
+                images.entry(image.atom_idx).or_insert(image);
+            }
+            images
         } else {
             std::collections::HashMap::new()
         };
@@ -3659,6 +3680,79 @@ impl SaeManifoldTerm {
         // #2023 C4 — Tier-0 shared mean add-back (no-op when inactive).
         self.add_tier0_mean_inplace(&mut out);
         Ok(out)
+    }
+
+    /// #1026 — the FIT-FREE hybrid-collapse verdict for the explicit-assignment
+    /// reconstruction path, reachable WITHOUT a completed fit. For each eligible
+    /// `d = 1` atom, form its realized decoded contribution `a_i·γ_k(t_i)` under
+    /// the caller-supplied `assignments` and ask whether that contribution already
+    /// lies in the straight lane `span{1, (t − t̄)}` to numerical tolerance
+    /// ([`crate::hybrid_split::fit_free_linear_image`]). An atom that does earns a
+    /// straight image (`v = None`, decoded at its own coordinate) so the collapse
+    /// verdict becomes load-bearing on the reconstruction; a genuinely curved atom
+    /// (line residual above the linearity floor) is left curved.
+    ///
+    /// This is the honest no-target adjudication: the fitted evidence comparison
+    /// needs a response to price curvature against, but a term with no target can
+    /// still observe that its realized image IS a line and collapse to it. The
+    /// substitution is value-preserving to `√FIT_FREE_LINEAR_RELATIVE_FLOOR`
+    /// relative amplitude, so it can never degrade the reconstruction
+    /// (collapse-safety), while making the linear verdict reachable — exactly the
+    /// #1026 "fit-free public path that attaches the linear verdict" contract.
+    ///
+    /// Eligibility mirrors [`Self::compute_hybrid_split_report`]: `d = 1`, an
+    /// installed basis evaluator, the full curvature dial (`homotopy_eta == 1.0`),
+    /// and a live coordinate dim matching the atom's latent dim.
+    fn fit_free_hybrid_linear_images(
+        &self,
+        assignments: ArrayView2<'_, f64>,
+    ) -> Vec<crate::hybrid_split::AtomLinearImage> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        if assignments.dim() != (n, k_atoms) {
+            return Vec::new();
+        }
+        let mut images = Vec::new();
+        let mut decoded_buf = vec![0.0_f64; p];
+        for atom_idx in 0..k_atoms {
+            let atom = &self.atoms[atom_idx];
+            let eligible = atom.latent_dim() == 1
+                && atom.basis_evaluator.is_some()
+                && atom.homotopy_eta == 1.0
+                && self.assignment.coords[atom_idx].latent_dim() == atom.latent_dim();
+            if !eligible {
+                continue;
+            }
+            let coords = self.assignment.coords[atom_idx]
+                .as_matrix()
+                .column(0)
+                .to_owned();
+            let assign = assignments.column(atom_idx).to_owned();
+            // The atom's realized contribution `a_i·γ_k(t_i)` at every row — the
+            // straight-lane test's target (its own decoded image, mass-scaled).
+            let mut realized = Array2::<f64>::zeros((n, p));
+            for row in 0..n {
+                let a = assign[row];
+                if a == 0.0 {
+                    continue;
+                }
+                self.atoms[atom_idx].fill_decoded_row(row, &mut decoded_buf);
+                for col in 0..p {
+                    realized[[row, col]] = a * decoded_buf[col];
+                }
+            }
+            if let Some(image) = crate::hybrid_split::fit_free_linear_image(
+                atom_idx,
+                coords.view(),
+                assign.view(),
+                realized.view(),
+                crate::hybrid_split::FIT_FREE_LINEAR_RELATIVE_FLOOR,
+            ) {
+                images.push(image);
+            }
+        }
+        images
     }
 
     /// Assemble a hybrid-collapsed reconstruction from explicit assignment
