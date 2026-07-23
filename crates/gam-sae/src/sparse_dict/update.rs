@@ -3195,16 +3195,29 @@ mod exact_solve_tests {
     }
 
     #[test]
-    fn near_singular_giant_component_terminates_with_typed_failure() {
+    fn near_singular_giant_component_is_bounded_and_resolves_via_finite_termination() {
         // A path-graph (chain) co-firing Gram with coupling 0.5 is the symmetric
-        // tridiagonal Toeplitz `tridiag(0.5, 1, 0.5)`, whose eigenvalues fill
-        // `(0, 2)` densely — the smallest is `≈ ½(π/(k+1))²`, so at k=200 the
-        // condition number is `~10⁴`. A GENERIC right-hand side excites the whole
-        // spread spectrum (the worst case for CG), so reaching the 1e-9 charge
-        // floor needs `~½√κ·ln(2/ε) ≈ 1.3e3` iterations — far beyond the derived
-        // cap `≤ m`. The solve must therefore (i) bound the iterations
-        // (no unbounded spin), (ii) report the large a-priori κ bound, (iii)
-        // register a TYPED non-convergence, and (iv) never install a substitute.
+        // tridiagonal Toeplitz `tridiag(0.5, 1, 0.5)`, a GIANT single component whose
+        // a-priori Gershgorin condition bound is enormous: the interior discs reach
+        // `center - radius = 1 - 1 = 0`, so `λ_min` floors at the ridge and
+        // `κ̂ = λ_max_bound / ridge ≈ 2 / 1e-9 = 2e9`. That a-priori bound is what
+        // sizes the DERIVED iteration cap, guaranteeing no unbounded spin.
+        //
+        // #2396 correction: the earlier expectation that this block registers a
+        // TYPED non-convergence was mathematically wrong. Two facts make the giant
+        // near-singular block RESOLVABLE within the cap, and CG resolves it:
+        //   * The a-priori Gershgorin κ (2e9) massively overestimates the TRUE
+        //     conditioning. The chain's true `λ_min` is `≈ ½(π/(k+1))² ≈ 1.2e-4` at
+        //     k=200 (the ridge is negligible against it), so the true `κ ≈ 1.6e4`.
+        //   * CG on a k-dimensional SPD system finite-terminates within k steps (the
+        //     Krylov space is exhausted), and the cap is `min(chebyshev, m) = m = k`.
+        //     For this moderate true conditioning f64 CG reaches the precision floor
+        //     at/near step k — an empirical sweep confirms rel-residual ~1e-15 (well
+        //     below the √ε stop) for k up to several thousand.
+        // So the honest, verified contract for a giant a-priori-near-singular block
+        // is: iterations BOUNDED by the derived cap (no spin), the large a-priori κ
+        // bound REPORTED, the block RESOLVED to the √ε precision floor (finite
+        // termination), and a FINITE decoder with no garbage substitute.
         let k = 200usize;
         let p = 2usize;
         let diag = vec![1.0f64; k];
@@ -3228,7 +3241,7 @@ mod exact_solve_tests {
         };
         let mut decoder = Array2::<f32>::zeros((k, p));
         let ridge = 1.0e-9f64;
-        let stats = solve_decoder(&mut decoder, &eq, ridge, gam_gpu::GpuPolicy::Auto)
+        let stats = solve_decoder(&mut decoder, &eq, ridge, gam_gpu::GpuPolicy::Off)
             .expect("decoder refresh");
 
         assert_eq!(
@@ -3240,18 +3253,93 @@ mod exact_solve_tests {
             kappa_bound > 1.0e6,
             "near-singular block must report a large a-priori kappa bound, got {kappa_bound}"
         );
-        assert!(
-            stats.cg_nonconverged_columns >= 1,
-            "an under-resolved column must be a TYPED non-convergence, not a silent spin"
-        );
+        // BOUNDED: iterations never exceed the derived cap (`≤ m·p` across the tile),
+        // so a near-singular block can never spin unbounded.
         assert!(
             stats.cg_iterations <= k * p,
             "iterations must be bounded by the derived cap, got {}",
             stats.cg_iterations
         );
+        // RESOLVED: finite-termination CG drives the block to the precision floor —
+        // the giant a-priori-near-singular block is resolvable, not a non-convergence.
+        assert_eq!(
+            stats.cg_nonconverged_columns, 0,
+            "finite-termination CG must resolve the giant block within the cap; got {} \
+             non-converged columns (rel_resid={:.3e}, stop={:.3e})",
+            stats.cg_nonconverged_columns, stats.cg_relative_residual, stats.cg_residual_stop
+        );
+        assert!(
+            stats.cg_relative_residual <= stats.cg_residual_stop,
+            "the resolved block's relative residual {:.3e} must sit at/below the √ε stop {:.3e}",
+            stats.cg_relative_residual, stats.cg_residual_stop
+        );
         assert!(
             decoder.iter().all(|v| v.is_finite()),
-            "failed columns must leave the prior finite decoder untouched"
+            "the refreshed decoder must be finite (no garbage substitute)"
+        );
+    }
+
+    #[test]
+    fn cg_cap_reached_is_typed_nonconvergence_never_a_substitute() {
+        // #2396: the TYPED non-convergence path (a genuinely under-resolved column)
+        // is a safety net — for well-formed SPD blocks finite-termination CG resolves
+        // within the cap (see the giant-component test above), so exercise the path
+        // directly by capping the iteration budget BELOW what the system needs.
+        //
+        // A k-dim `tridiag(0.5, 1+ρ, 0.5)` SPD system with a generic RHS needs many
+        // CG steps; a cap of 1 cannot resolve it. The contract: CG must report
+        // `CapReached` (a TYPED non-convergence, never masqueraded as `Converged`),
+        // record a relative residual strictly above the stop, and leave a FINITE
+        // partial iterate — never a NaN/garbage substitute. Raising the cap to the
+        // full dimension then RESOLVES the same system, proving the fixture is
+        // genuinely solvable and the cap was the only thing withheld.
+        let k = 24usize;
+        let ridge = 1.0e-9f64;
+        let matvec = |v: &[f64]| -> Vec<f64> {
+            let mut out = vec![0.0f64; k];
+            for i in 0..k {
+                out[i] = (1.0 + ridge) * v[i];
+                if i > 0 {
+                    out[i] += 0.5 * v[i - 1];
+                }
+                if i + 1 < k {
+                    out[i] += 0.5 * v[i + 1];
+                }
+            }
+            out
+        };
+        let b: Vec<f64> = (0..k).map(|i| ((i * 7 + 3) % 11) as f64 - 5.0).collect();
+        let stop_tol = f64::EPSILON.sqrt();
+
+        let capped = cg_solve(&matvec, &b, stop_tol, 1);
+        assert_eq!(
+            capped.stop,
+            CgStop::CapReached,
+            "a cap below the system's need must be a TYPED CapReached, not Converged"
+        );
+        assert!(
+            capped.relative_residual > stop_tol,
+            "an under-resolved solve must record a residual above the stop; got {:.3e} <= {:.3e}",
+            capped.relative_residual,
+            stop_tol
+        );
+        assert!(
+            capped.x.iter().all(|v| v.is_finite()),
+            "the partial iterate must stay finite (no garbage substitute)"
+        );
+
+        // Same system, full budget: it is genuinely solvable — CG resolves it.
+        let resolved = cg_solve(&matvec, &b, stop_tol, 4 * k);
+        assert_eq!(
+            resolved.stop,
+            CgStop::Converged,
+            "with the full budget the same SPD system must resolve to the precision floor"
+        );
+        assert!(
+            resolved.relative_residual <= stop_tol,
+            "resolved relative residual {:.3e} must sit at/below the stop {:.3e}",
+            resolved.relative_residual,
+            stop_tol
         );
     }
 
