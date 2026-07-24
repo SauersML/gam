@@ -9,17 +9,16 @@ name: Validate One
 # by matrix jobs (Publish wheels, Build and Release All, the 6h Claude Fixer),
 # that whole graph sits QUEUED for a long time, so a fixer waiting to confirm a
 # one-line fix gets no feedback. This workflow is ONE ubuntu-latest job with a
-# tiny footprint that schedules into any small runner gap and fails fast, giving
-# a fixer quick per-issue signal. Reserve the full test.yml for a final
-# confirmation.
+# tiny footprint that schedules into any small runner gap and fails fast. Rust
+# filters consume the exact-SHA nextest archive produced by test.yml: Validate
+# One NEVER rebuilds or relinks Rust tests. If no exact archive exists, it fails
+# immediately and tells the caller to dispatch Rust CI.
 #
 # It deliberately mirrors test.yml's `python-tests` job for the Python path
-# (Rust 1.93.0, rust-cache, maturin build+wheel-install, the gamfit/_rust .so
-# copy that defeats the cwd source-package shadowing) so a pass/fail here means
-# the same thing it would in the full suite. sccache is intentionally NOT used
-# (test.yml enables it only after a backend reachability probe; here a plain
-# Swatinem/rust-cache@v2 keeps builds warm after the first run without the
-# reachability hard-fail surface).
+# (Rust 1.93.0, maturin build+wheel-install, the gamfit/_rust .so copy that
+# defeats the cwd source-package shadowing) so a pass/fail here means the same
+# thing it would in the full suite. Python still builds its extension because
+# the Rust nextest archive cannot provide a Python extension module.
 #
 # TORCH PATH (opt-in): torch is NOT installed by any CI workflow, so the
 # tests/torch/ suite (#1890/#1891/#1893/#1939/#1942/#2011/#2015/#2021/#2022/#2023
@@ -32,11 +31,11 @@ on:
   workflow_dispatch:
     inputs:
       rust_filter:
-        description: "cargo test name filter(s), whitespace-separated. Empty = skip Rust."
+        description: "Rust test-name substring(s), whitespace-separated. Empty = skip Rust."
         default: ""
         required: false
       rust_package:
-        description: "Optional Cargo package for focused Rust tests. Empty = workspace minus gam-pyffi."
+        description: "Optional Cargo package for focused Rust tests. Empty = archived workspace."
         default: ""
         required: false
       py_filter:
@@ -59,6 +58,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -81,12 +81,20 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust 1.93.0
+        if: ${{ github.event.inputs.py_filter != '' || github.event.inputs.torch_filter != '' }}
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
 
-      - name: Cache cargo artifacts
+      - name: Cache Python-extension cargo artifacts
+        if: ${{ github.event.inputs.py_filter != '' || github.event.inputs.torch_filter != '' }}
         uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        if: ${{ github.event.inputs.rust_filter != '' }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
 
       # `gam-pyffi --no-default-features` links and embeds the interpreter that
       # PyO3 discovers at build time. Some unit tests exercise the NumPy C API,
@@ -106,8 +114,51 @@ jobs:
           python -m pip install --upgrade "numpy<2"
           python -c "import numpy; print('numpy', numpy.__version__, numpy.get_include())"
 
-      # ---- Rust path (only when a rust_filter was given) -------------------
-      - name: Run Rust tests (filtered)
+      # ---- Rust path: exact-SHA prebuilt archive only ----------------------
+      - name: Download exact-SHA Rust test archive
+        if: ${{ github.event.inputs.rust_filter != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUST_PACKAGE: ${{ github.event.inputs.rust_package }}
+        run: |
+          set -euo pipefail
+          archive_name=nx-archive
+          archive_file=nx.tar.zst
+          if [[ "$RUST_PACKAGE" == "gam-pyffi" ]]; then
+            archive_name=nx-pyffi-archive
+            archive_file=nx-pyffi.tar.zst
+          fi
+
+          # Find a Rust CI run for THIS commit only. It may still be running:
+          # its build job uploads the archive before the long run shards finish.
+          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow test.yml \
+            --commit "$GITHUB_SHA" \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')
+          if [[ -z "$run_id" ]]; then
+            echo "::error::No Rust CI run exists for exact commit ${GITHUB_SHA}. Dispatch Rust CI for this SHA; Validate One never performs a source-build fallback."
+            exit 1
+          fi
+          archive_sha=$(gh run view "$run_id" --repo "$GITHUB_REPOSITORY" \
+            --json headSha --jq .headSha)
+          if [[ "$archive_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::Rust archive provenance mismatch: requested ${GITHUB_SHA}, run ${run_id} is ${archive_sha}."
+            exit 1
+          fi
+          if ! gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+            --name "$archive_name" --dir rust-archive; then
+            echo "::error::Rust CI run ${run_id} has not produced ${archive_name} for ${GITHUB_SHA}. Wait for its build job; no source-build fallback is permitted."
+            exit 1
+          fi
+          test -s "rust-archive/${archive_file}"
+          printf 'run_id=%s\ncommit=%s\nartifact=%s\n' \
+            "$run_id" "$GITHUB_SHA" "$archive_name" \
+            | tee rust-archive/PROVENANCE.txt
+
+      - name: Run Rust tests from exact-SHA archive
         if: ${{ github.event.inputs.rust_filter != '' }}
         shell: bash
         env:
@@ -115,49 +166,46 @@ jobs:
           RUST_PACKAGE: ${{ github.event.inputs.rust_package }}
         run: |
           set -euo pipefail
-          # `--exclude gam-pyffi`: gam-pyffi's default-on `extension-module`
-          # feature tells pyo3 NOT to link libpython (symbols are resolved by the
-          # host interpreter at import time), so building its TEST binary here
-          # fails at link with `undefined symbol: Py*`. test.yml handles this by
-          # archiving the main workspace with `--exclude gam-pyffi` and gam-pyffi
-          # separately under `--no-default-features`; mirror the exclusion so the
-          # filtered Rust path links for every non-pyffi crate (the Python path
-          # below already exercises the built extension for pyffi coverage).
-          # Cargo accepts exactly one TESTNAME positional argument.  Treat a
-          # whitespace-separated input as a list of independent substring
-          # filters instead of forwarding it as several invalid positionals.
-          # Array expansion stays quoted, so a filter can never become an option
-          # or shell syntax.
+          archive_file=rust-archive/nx.tar.zst
+          if [[ "$RUST_PACKAGE" == "gam-pyffi" ]]; then
+            archive_file=rust-archive/nx-pyffi.tar.zst
+          fi
+          if [[ -n "$RUST_PACKAGE" && ! "$RUST_PACKAGE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::rust_package contains unsupported characters: ${RUST_PACKAGE}"
+            exit 1
+          fi
+
+          # Treat the whitespace-separated input as independent literal
+          # substrings. Restrict the alphabet before embedding each literal
+          # into nextest's filter expression.
           read -r -a filters <<< "$RUST_FILTER"
           for filter in "${filters[@]}"; do
-            # Reject nextest filter-expression DSL (gam#2268): plain `cargo test`
-            # treats `test(NAME)` as a literal substring, matches zero tests, and
-            # exits 0 -> a silent false green. Fail early with a clear message.
-            if [[ "$filter" == *"test("* ]]; then
-              echo "::error::rust_filter '${filter}' looks like nextest DSL 'test(...)'. validate-one runs plain 'cargo test'; pass a BARE substring (e.g. my_test_name), not test(my_test_name)."
+            if [[ ! "$filter" =~ ^[A-Za-z0-9_:.-]+$ ]]; then
+              echo "::error::rust_filter '${filter}' is not a bare Rust test-name substring."
               exit 1
             fi
+            expression="test(~${filter})"
             if [[ -n "$RUST_PACKAGE" ]]; then
-              if [[ "$RUST_PACKAGE" == "gam-pyffi" ]]; then
-                echo "cargo test -p gam-pyffi --no-default-features -- ${filter}"
-                cargo test -p gam-pyffi --no-default-features -- "${filter}" --nocapture 2>&1 | tee cargo_filter_out.log
-              else
-                echo "cargo test -p ${RUST_PACKAGE} -- ${filter}"
-                cargo test -p "$RUST_PACKAGE" -- "${filter}" --nocapture 2>&1 | tee cargo_filter_out.log
-              fi
-            else
-              echo "cargo test --workspace --exclude gam-pyffi -- ${filter}"
-              cargo test --workspace --exclude gam-pyffi -- "${filter}" --nocapture 2>&1 | tee cargo_filter_out.log
+              expression="package(=${RUST_PACKAGE}) and ${expression}"
             fi
-            # False-green guard (gam#2268): a filter that matches zero tests makes
-            # cargo exit 0 with nothing run. Require >=1 test actually executed,
-            # summing passed+failed across every binary's `test result:` line.
-            ran=$(awk '/test result:/ { for (i = 1; i < NF; i++) { if ($(i + 1) == "passed;") p += $i; if ($(i + 1) == "failed;") f += $i } } END { print p + f + 0 }' cargo_filter_out.log)
-            if [[ "${ran:-0}" -eq 0 ]]; then
-              echo "::error::rust_filter '${filter}' matched ZERO tests (all filtered out) -- this would be a false green. Use a bare substring that matches a real test name."
+
+            # Prove the expression selects at least one archived test before
+            # execution. Archive list/run perform no compilation or relinking.
+            selected=$(cargo nextest list \
+              --archive-file "$archive_file" \
+              --workspace-remap . \
+              -E "$expression" 2>/dev/null | grep -cE '^\s' || true)
+            if [[ "${selected:-0}" -eq 0 ]]; then
+              echo "::error::rust_filter '${filter}' selected ZERO tests in ${archive_file}."
               exit 1
             fi
-            echo "rust_filter '${filter}' executed ${ran} test(s)."
+            echo "Running ${selected} archived test(s): ${expression}"
+            cargo nextest run \
+              --archive-file "$archive_file" \
+              --workspace-remap . \
+              --profile ci --config-file .config/nextest.toml \
+              --test-threads 1 \
+              -E "$expression"
           done
 
       # ---- Python/torch shared prerequisites (either filter needs the extension) ----
