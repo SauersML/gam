@@ -2881,7 +2881,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
             }
             if let Some(reseed) = wrong_rail_point {
                 result.wrong_rail_reseed = Some(reseed);
-            } else if let Some(hessian) = analytic_hessian.as_ref() {
+            } else if let Some(hessian) = result.final_hessian.as_ref() {
                 // Active-set reduction needs curvature to prove that the free
                 // subspace is genuinely unpolished. Wrong-rail pull-back above
                 // is a first-order tail-sign proof and deliberately does NOT:
