@@ -29,6 +29,7 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, Array3, ArrayView2, array};
 
 use gam::terms::latent::LatentManifold;
+use gam::terms::sae::hybrid_split::AtomLinearImage;
 use gam::terms::{
     sae::manifold::AssignmentMode, sae::manifold::PeriodicHarmonicEvaluator,
     sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
@@ -312,35 +313,123 @@ fn linear_dominance_curved_fit_not_worse_than_linear_on_linear_data_1026() {
 
     // On this exactly-linear, exactly-representable family the curved decode IS
     // s_i·v on the grid, so the *value* SSE is 0 here too — the bug this test
-    // pins is whether the collapse VERDICT is reachable from the public path. We
-    // therefore assert the load-bearing collapse-safety property: the collapsed
-    // reconstruction must carry NO off-direction (vperp) curvature mass, i.e.
-    // its projection onto vperp must be zero to ε. A curved atom that has not
-    // collapsed leaks the half-period seam (sign flips through cos = −1) but no
-    // vperp; the discriminating failure is that with collapse engaged the
-    // reconstruction must equal the straight line to ε AND the term must report
-    // a linear collapse. Absent a fitted verdict the map is empty, so we detect
-    // the unreachable-collapse bug directly.
-    let collapse_map_engaged = {
-        // Re-run with collapse=false; if the two reconstructions are identical
-        // the collapse verdict did nothing (empty map ⇒ #1026 bug surface).
-        let uncollapsed = term
-            .reconstruct_from_assignments(amps.view(), false)
-            .unwrap();
-        sse(curved.view(), uncollapsed.view()) > 0.0
-    };
+    // pins is whether the collapse VERDICT is reachable from the public path.
+    //
+    // Crucially, we do NOT read the verdict by differencing collapsed vs.
+    // uncollapsed reconstructions: on exactly-linear data the circle is sampled
+    // only at the two points its tangent line also passes through, so the
+    // straight-image substitution is value-preserving to round-off and that
+    // difference is ~1e-32 (pure float noise, and exactly 0.0 if the line fit
+    // ever became bit-exact). Instead we ask the term for the collapse VERDICT
+    // directly — the observable form of the linear-dominance guarantee (#2394):
+    // the atom's slot index must appear in the fit-free collapse verdict.
+    let verdict = term
+        .hybrid_collapse_verdict_from_assignments(amps.view())
+        .unwrap();
+    let collapse_map_engaged = verdict.contains(&0);
 
     assert!(
         curved_sse <= line_sse + 1e-9 && collapse_map_engaged,
-        "#1026 ACCEPTANCE: currently fails — defines done. On exactly-linear \
-         data the collapse-safe curved fit must (a) reconstruct no worse than \
-         the matched straight baseline (curved_sse={curved_sse:e} ≤ \
-         line_sse+ε={line_sse:e}) AND (b) the hybrid-collapse verdict must be \
-         REACHABLE from the public reconstruction path (collapse map engaged = \
-         {collapse_map_engaged}). Today the collapse map is empty without a \
-         completed fit, so (b) is false: the linear-dominance guarantee is not \
-         reachable. Done = a fit-free public path that attaches the linear \
-         verdict so the curved dictionary provably matches the line."
+        "#1026: on exactly-linear data the collapse-safe curved fit must (a) \
+         reconstruct no worse than the matched straight baseline \
+         (curved_sse={curved_sse:e} ≤ line_sse+ε={line_sse:e}) AND (b) the \
+         hybrid-collapse verdict must be REACHABLE from the public path — the \
+         atom's slot must appear in the fit-free collapse verdict \
+         ({verdict:?}). Done = a fit-free public path that attaches the linear \
+         verdict so the curved dictionary provably matches the line, observable \
+         WITHOUT a value difference (which is round-off-invisible on the \
+         collapse-safe case the guarantee is about)."
+    );
+}
+
+/// REGRESSION (#2394): the collapse verdict must be observable through the
+/// public accessor EVEN WHEN the collapsed and uncollapsed reconstructions are
+/// BIT-FOR-BIT identical — the case a value-difference proxy is structurally
+/// blind to, and the fragility that made the prior fix pass only by ~1e-32
+/// floating-point luck.
+///
+/// We attach an OOS straight image whose `b₀ + (t − t̄)·b₁` reproduces the
+/// atom's decoded rows EXACTLY at the two sampled coordinates. The decoder puts
+/// all its mass on the `cos` row (`sin` row zero), so the decode at `t = 0` is
+/// `+w` and at `t = 0.5` is `−w` with NO round-off (`cos 0 = 1`, `cos π = −1`
+/// exactly, and the zero `sin` row kills `sin π`'s `1.2e-16`). The straight
+/// image `t̄ = 0.25, b₀ = 0, b₁ = −4w` then satisfies `b₀ − 0.25·b₁ = +w` and
+/// `b₀ + 0.25·b₁ = −w` in exact f64 arithmetic (`0.25·4 = 1`), so the collapsed
+/// reconstruction equals the uncollapsed one to the last bit.
+///
+/// A correct implementation still reports slot 0 as collapsed; the OLD proxy
+/// (`sse(curved, uncollapsed) > 0`) would see an exact `0.0` and wrongly report
+/// "collapse map engaged = false" — the issue's panic.
+#[test]
+fn collapse_verdict_observable_when_reconstruction_is_bit_identical_2394() {
+    let p = 3usize;
+    let n = 6usize;
+    // Exactly-representable decode: `cos` row = w, `sin` row = 0, `const` row = 0.
+    let w = [1.5_f64, -2.0, 0.75];
+    let mut dec = Array2::<f64>::zeros((3, p));
+    for j in 0..p {
+        dec[[2, j]] = w[j]; // cos → w ; sin and const rows stay zero
+    }
+    // Alternate the two sampled coordinates so decode ∈ {+w, −w} across rows.
+    let mut coords = Array2::<f64>::zeros((n, 1));
+    for i in 0..n {
+        coords[[i, 0]] = if i % 2 == 0 { 0.0 } else { 0.5 };
+    }
+    let atom = circle_atom("bit_exact_line", &coords, dec);
+    let logits = Array2::from_shape_fn((n, 1), |(i, _)| 0.03 * i as f64);
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![coords.clone()],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+    // Straight image reproducing the decode EXACTLY at t ∈ {0, 0.5}.
+    let b1 = Array1::from_shape_fn(p, |j| -4.0 * w[j]);
+    let image = AtomLinearImage {
+        atom_idx: 0,
+        t_bar: 0.25,
+        b0: Array1::zeros(p),
+        b1,
+        v: None,
+    };
+    term.set_hybrid_linear_images(vec![image]).unwrap();
+
+    // Non-trivial masses (varied, nonzero) so the reconstruction is not the
+    // trivial all-zero map.
+    let amps = Array2::from_shape_fn((n, 1), |(i, _)| 0.5 + 0.1 * i as f64);
+
+    let collapsed = term.reconstruct_from_assignments(amps.view(), true).unwrap();
+    let uncollapsed = term
+        .reconstruct_from_assignments(amps.view(), false)
+        .unwrap();
+
+    // The two reconstructions are bit-for-bit identical: the collapse is
+    // perfectly value-preserving, so a value-difference proxy is blind.
+    let diff = sse(collapsed.view(), uncollapsed.view());
+    assert_eq!(
+        diff, 0.0,
+        "the collapsed and uncollapsed reconstructions must be bit-identical \
+         here (value-difference proxy is structurally blind); got sse={diff:e}"
+    );
+    // Sanity: the reconstruction actually carries mass (not a degenerate zero map).
+    assert!(
+        fro(collapsed.view()) > 1.0,
+        "reconstruction must carry real mass, got ‖·‖={}",
+        fro(collapsed.view())
+    );
+
+    // Yet the verdict IS observable through the public accessor.
+    let verdict = term
+        .hybrid_collapse_verdict_from_assignments(amps.view())
+        .unwrap();
+    assert_eq!(
+        verdict,
+        vec![0usize],
+        "slot 0 collapsed to a straight image and MUST be reported even though \
+         the reconstruction is value-identical; got {verdict:?}"
     );
 }
 
