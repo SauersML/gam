@@ -1382,6 +1382,66 @@ fn no_gradient_efs_requires_and_accepts_explicit_full_coverage_certificate() {
 }
 
 #[test]
+fn fixed_point_certificate_refuses_value_channel_desync() {
+    let n = 2;
+    let center = Array1::from_elem(n, 0.25);
+    let problem = OuterProblem::new(n)
+        .with_gradient(Derivative::Unavailable)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_initial_rho(Array1::zeros(n))
+        .with_max_iter(8)
+        .with_tolerance(1.0e-8);
+    let step_center = center.clone();
+    let mut objective = problem
+        .build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| {
+                let displacement = rho - &center;
+                Ok(0.5 * displacement.dot(&displacement))
+            },
+            |_: &mut (), rho: &Array1<f64>| Ok(OuterEval::value_only(0.0, rho.len(), None)),
+            None::<fn(&mut ())>,
+            Some(move |_: &mut (), rho: &Array1<f64>| {
+                let update = &step_center - rho;
+                Ok(EfsEval {
+                    cost: 0.5 * update.dot(&update),
+                    steps: update.to_vec(),
+                    beta: None,
+                    psi_gradient: None,
+                    psi_indices: None,
+                    inner_hessian_scale: None,
+                    logdet_enclosure_gap: None,
+                    consecutive_restored_incumbents: None,
+                })
+            }),
+        )
+        .with_fixed_point_certificate(|_: &mut (), rho: &Array1<f64>| {
+            Ok(FixedPointCertificateEval {
+                // Deliberately inconsistent with the value-only criterion,
+                // which is zero at the fixed point.
+                cost: 1.0,
+                coordinates: rho
+                    .iter()
+                    .map(|_| FixedPointCoordinateCertificate::covered(0.0, 1.0))
+                    .collect(),
+            })
+        });
+    let error = problem
+        .run(&mut objective, "desynced fixed-point certificate")
+        .expect_err("a fixed-point residual for a different value must not mint");
+    assert!(
+        matches!(error, EstimationError::RemlDidNotConverge { .. }),
+        "fixed-point value desynchronisation must be typed non-convergence: {error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("cost-only value disagrees with analytic-sample value"),
+        "fixed-point refusal must name the split objective: {error}"
+    );
+}
+
+#[test]
 fn no_gradient_efs_refuses_guarded_zero_as_uncovered_certificate() {
     let n = 9;
     let problem = OuterProblem::new(n)
@@ -5364,16 +5424,19 @@ fn initial_rho_with_single_seed_budget_skips_expensive_screening() {
         // rho-uncertainty diagnostic cost gate, so its 32 `eval_cost` samples do
         // NOT run here. This test isolates the SEED-SCREENING accounting (screening
         // is skipped: `screening_cap == 0` and `screening_calls == 0`); the
-        // post-certification uncertainty diagnostic is a separate phase and would
-        // otherwise contaminate the cost-call count it pins.
+        // mandatory terminal value audit and post-certification uncertainty
+        // diagnostic are separate phases and must not be counted as screening.
         .with_problem_size(1_000_000, 1)
         .with_max_iter(1);
     let mut obj = problem.build_objective(
         (),
         {
             let screening_calls = Arc::clone(&screening_calls);
+            let screening_cap = Arc::clone(&screening_cap);
             move |_: &mut (), _theta: &Array1<f64>| {
-                screening_calls.fetch_add(1, Ordering::Relaxed);
+                if screening_cap.load(Ordering::Relaxed) != 0 {
+                    screening_calls.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(0.0)
             }
         },
@@ -5653,7 +5716,7 @@ fn run_efs_skips_global_cost_screening() {
     let mut seed_config = gam_problem::SeedConfig::default();
     seed_config.max_seeds = 6;
     seed_config.seed_budget = 1;
-    let screening_calls = Arc::new(AtomicUsize::new(0));
+    let value_only_calls = Arc::new(AtomicUsize::new(0));
     let efs_calls = Arc::new(AtomicUsize::new(0));
     let problem = OuterProblem::new(15)
         .with_gradient(Derivative::Unavailable)
@@ -5663,9 +5726,9 @@ fn run_efs_skips_global_cost_screening() {
     let mut obj = problem.build_objective(
         (),
         {
-            let screening_calls = Arc::clone(&screening_calls);
+            let value_only_calls = Arc::clone(&value_only_calls);
             move |_: &mut (), _: &Array1<f64>| {
-                screening_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                value_only_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(0.0)
             }
         },
@@ -5692,9 +5755,10 @@ fn run_efs_skips_global_cost_screening() {
     // certify stationarity (#1095/#2228); a bare closure objective predates it
     // and refuses. Supply a fully-covered zero-update certificate — the mock's
     // EFS step is already the fixed point (all-zero steps) — so the run
-    // certifies through the cert layer WITHOUT any extra cost-screening or EFS
-    // solve (the certificate eval is separate from cost_fn/efs_fn, so the
-    // screening/efs call counts this test pins are unchanged).
+    // certifies through the cert layer WITHOUT any startup cost-screening or
+    // repeated EFS solve. Certification deliberately calls cost_fn exactly
+    // once for the same-rho value-agreement audit; that is terminal proof work,
+    // not seed screening.
     .with_fixed_point_certificate(|_: &mut (), rho: &Array1<f64>| {
         Ok(FixedPointCertificateEval {
             cost: 0.0,
@@ -5710,9 +5774,10 @@ fn run_efs_skips_global_cost_screening() {
         )
         .expect("first generated EFS seed should be sufficient");
     assert_eq!(
-        screening_calls.load(std::sync::atomic::Ordering::Relaxed),
-        0,
-        "EFS startup should not call eval_cost just to screen seeds"
+        value_only_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "EFS must perform exactly the mandatory terminal value-agreement audit, \
+         with no startup cost-screening pass"
     );
     assert_eq!(
         efs_calls.load(Ordering::Relaxed),

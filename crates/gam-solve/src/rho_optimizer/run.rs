@@ -1814,6 +1814,50 @@ fn outer_nonconvergence_error(
     }
 }
 
+/// Roundoff envelope for two independently assembled values of the same outer
+/// criterion at the same point.
+///
+/// Value-only and derivative-bearing evaluation lanes may use different
+/// kernels and reduction trees, so bitwise identity is not a valid contract.
+/// Their relative disagreement must nevertheless stay below the square root of
+/// machine epsilon: beyond that scale the derivative sample is not evidence
+/// about the scalar objective the optimizer's value lane ranks.
+fn outer_value_agreement_bound(value_only: f64, derivative_sample: f64) -> f64 {
+    f64::EPSILON.sqrt() * value_only.abs().max(derivative_sample.abs()).max(1.0)
+}
+
+fn audit_outer_value_agreement(
+    context: &str,
+    value_only: f64,
+    derivative_sample: f64,
+    result: &mut OuterResult,
+    projected_grad_norm: Option<f64>,
+    stationarity_bound: f64,
+) -> Result<(), EstimationError> {
+    let bound = outer_value_agreement_bound(value_only, derivative_sample);
+    let disagreement = (value_only - derivative_sample).abs();
+    if disagreement <= bound {
+        return Ok(());
+    }
+
+    // The value-only lane is the scalar criterion authority. Preserve it on
+    // the resumable checkpoint rather than the derivative lane's inconsistent
+    // scalar; no certificate may be attached to this mixed evidence.
+    result.final_value = value_only;
+    result.converged = false;
+    Err(outer_nonconvergence_error(
+        context,
+        &format!(
+            "cost-only value disagrees with analytic-sample value at the same outer point: \
+             value-only={value_only:.16e}, analytic-sample={derivative_sample:.16e}, \
+             disagreement={disagreement:.3e}, roundoff bound={bound:.3e}"
+        ),
+        result,
+        projected_grad_norm,
+        stationarity_bound,
+    ))
+}
+
 fn certify_fixed_point_optimality(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
@@ -1821,6 +1865,31 @@ fn certify_fixed_point_optimality(
     result: &mut OuterResult,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
     let layout = obj.capability().theta_layout();
+    // A fixed-point residual is only a certificate for the scalar objective
+    // when both lanes price that same objective at the same rho. Sample the
+    // authoritative value lane first; the analytic fixed-point evaluator then
+    // remains the installed terminal-state owner.
+    let value_only = obj
+        .eval_with_order(&result.rho, OuterEvalOrder::Value)
+        .map_err(|err| {
+            outer_nonconvergence_error(
+                context,
+                &format!("terminal value-only certificate evaluation failed: {err}"),
+                result,
+                None,
+                config.tolerance,
+            )
+        })?
+        .cost;
+    if !value_only.is_finite() {
+        return Err(outer_nonconvergence_error(
+            context,
+            "terminal value-only certificate evaluation returned a non-finite objective value",
+            result,
+            None,
+            config.tolerance,
+        ));
+    }
     let evaluation = obj
         .eval_fixed_point_certificate(&result.rho)
         .map_err(|err| {
@@ -1863,6 +1932,14 @@ fn certify_fixed_point_optimality(
             config.tolerance,
         ));
     }
+    audit_outer_value_agreement(
+        context,
+        value_only,
+        evaluation.cost,
+        result,
+        None,
+        config.tolerance,
+    )?;
 
     let mut normalized_updates = Vec::with_capacity(layout.n_params);
     let mut uncovered = Vec::new();
@@ -1963,12 +2040,14 @@ fn certify_fixed_point_optimality(
 
 /// Build the mandatory analytic optimality certificate at the returned point.
 ///
-/// The objective is evaluated once at the selected point through its analytic
-/// derivative path. Missing, malformed, or non-finite derivative evidence is
-/// non-convergence: an optimizer status bit cannot substitute for a
-/// stationarity certificate. Exact analytic curvature is checked when the
-/// objective declares it and can materialize it; BFGS/EFS solver geometry is
-/// never mistaken for objective curvature.
+/// The objective is evaluated at the selected point through both its
+/// authoritative value-only lane and its analytic derivative lane. The two
+/// values must agree within their roundoff envelope before the derivative
+/// sample can certify the scalar objective. Missing, malformed, non-finite, or
+/// split-objective evidence is non-convergence: an optimizer status bit cannot
+/// substitute for a stationarity certificate. Exact analytic curvature is
+/// checked when the objective declares it and can materialize it; BFGS/EFS
+/// solver geometry is never mistaken for objective curvature.
 pub(crate) fn certify_outer_optimality(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
@@ -2075,6 +2154,32 @@ fn certify_outer_optimality_at_terminal_fidelity(
         ));
     }
 
+    // Sample the scalar authority first and leave the derivative-bearing
+    // evaluator as the terminal state owner. This is one same-rho audit, not a
+    // finite-difference derivative: it catches a split value/gradient
+    // implementation without violating the production no-FD contract.
+    let value_only = obj
+        .eval_with_order(&result.rho, OuterEvalOrder::Value)
+        .map_err(|err| {
+            outer_nonconvergence_error(
+                context,
+                &format!("terminal value-only certificate evaluation failed: {err}"),
+                result,
+                result.final_grad_norm,
+                outer_gradient_tolerance(config).abs,
+            )
+        })?
+        .cost;
+    if !value_only.is_finite() {
+        return Err(outer_nonconvergence_error(
+            context,
+            "terminal value-only certificate evaluation returned a non-finite objective value",
+            result,
+            result.final_grad_norm,
+            outer_gradient_tolerance(config).abs,
+        ));
+    }
+
     let order = if capability.hessian.is_analytic() {
         OuterEvalOrder::ValueGradientHessian
     } else {
@@ -2173,6 +2278,14 @@ fn certify_outer_optimality_at_terminal_fidelity(
     {
         stationarity_bound = stationarity_bound.max(noise_bound);
     }
+    audit_outer_value_agreement(
+        context,
+        value_only,
+        evaluation.cost,
+        result,
+        Some(projected_grad_norm),
+        stationarity_bound,
+    )?;
 
     // The optimizer's own recorded best-iterate evidence, captured before the
     // fresh certificate-time measurement overwrites it below. Together with
