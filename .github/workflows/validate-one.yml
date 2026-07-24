@@ -105,7 +105,7 @@ jobs:
           run_id=$(gh run list --repo "$GITHUB_REPOSITORY" \
             --workflow wheel-nightly.yml \
             --commit "$GITHUB_SHA" \
-            --limit 1 \
+            --limit 20 \
             --json databaseId,conclusion \
             --jq 'map(select(.conclusion == "success"))[0].databaseId // empty')
           if [[ -z "$run_id" ]]; then
@@ -154,9 +154,9 @@ jobs:
           run_id=$(gh run list --repo "$GITHUB_REPOSITORY" \
             --workflow test.yml \
             --commit "$GITHUB_SHA" \
-            --limit 1 \
-            --json databaseId \
-            --jq '.[0].databaseId // empty')
+            --limit 20 \
+            --json databaseId,status,conclusion \
+            --jq 'map(select(.status == "in_progress" or .conclusion == "success"))[0].databaseId // empty')
           if [[ -z "$run_id" ]]; then
             echo "::error::No Rust CI run exists for exact commit ${GITHUB_SHA}. Dispatch Rust CI for this SHA; Validate One never performs a source-build fallback."
             exit 1
