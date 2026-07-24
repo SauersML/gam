@@ -1,0 +1,153 @@
+name: Focused Rust Proof
+
+# Package-scoped escape hatch for a commit that does not yet have a nextest
+# archive. This is deliberately separate from Validate One:
+#
+# - Validate One is execution-only and never compiles.
+# - Focused Rust Proof compiles exactly one named package target, but only while
+#   the shared sccache backend is live.
+#
+# The command uses the same profile override, features, and linker flags as the
+# Rust CI archive builder so completed compiler work is reusable across both
+# workflows. A 15-minute job ceiling prevents a cache miss from quietly turning
+# a focused proof into another full cold build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Cargo package containing the focused tests."
+        required: true
+      target:
+        description: "Compile the package library tests or one integration-test binary."
+        type: choice
+        options:
+          - lib
+          - integration
+        default: lib
+        required: true
+      test_binary:
+        description: "Integration-test binary name; required only when target=integration."
+        default: ""
+        required: false
+      filters:
+        description: "Bare Rust test-name substring(s), whitespace-separated."
+        required: true
+      issue:
+        description: "Issue number, used only for concurrency and display."
+        default: ""
+        required: false
+
+concurrency:
+  group: focused-rust-proof-${{ github.event.inputs.issue }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C link-arg=-Wl,--threads=1"
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  prove:
+    name: Focused Rust proof (issue ${{ github.event.inputs.issue }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up warm Rust toolchain
+        uses: ./.github/actions/setup-rust-ci
+        with:
+          free-disk-space: "false"
+          cache-targets: "false"
+
+      - name: Require reachable shared compiler cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUSTC_WRAPPER:-}" != "sccache" ]]; then
+            echo "::error::The shared sccache backend is unavailable. Refusing a cold source build."
+            exit 1
+          fi
+          sccache --show-stats
+
+      - name: Run focused tests
+        shell: bash
+        env:
+          FILTERS: ${{ github.event.inputs.filters }}
+          PACKAGE: ${{ github.event.inputs.package }}
+          TARGET: ${{ github.event.inputs.target }}
+          TEST_BINARY: ${{ github.event.inputs.test_binary }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PACKAGE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::package contains unsupported characters: ${PACKAGE}"
+            exit 1
+          fi
+
+          target_args=()
+          case "$TARGET" in
+            lib)
+              if [[ -n "$TEST_BINARY" ]]; then
+                echo "::error::test_binary must be empty when target=lib."
+                exit 1
+              fi
+              target_args=(--lib)
+              ;;
+            integration)
+              if [[ ! "$TEST_BINARY" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                echo "::error::target=integration requires a safe, non-empty test_binary."
+                exit 1
+              fi
+              target_args=(--test "$TEST_BINARY")
+              ;;
+            *)
+              echo "::error::unsupported target: ${TARGET}"
+              exit 1
+              ;;
+          esac
+
+          read -r -a filters <<< "$FILTERS"
+          if [[ "${#filters[@]}" -eq 0 ]]; then
+            echo "::error::filters must contain at least one test-name substring."
+            exit 1
+          fi
+
+          for filter in "${filters[@]}"; do
+            if [[ ! "$filter" =~ ^[A-Za-z0-9_:.-]+$ ]]; then
+              echo "::error::filter '${filter}' is not a bare Rust test-name substring."
+              exit 1
+            fi
+
+            log_file="focused-${filter//[:.]/_}.log"
+            echo "cargo test -p ${PACKAGE} --all-features ${target_args[*]} ${filter}"
+            cargo test \
+              --config "profile.dev.debug=0" \
+              -p "$PACKAGE" --all-features \
+              "${target_args[@]}" "$filter" \
+              -- --nocapture --test-threads=1 2>&1 | tee "$log_file"
+
+            ran=$(awk '/test result:/ {
+              for (i = 1; i < NF; i++) {
+                if ($(i + 1) == "passed;") passed += $i;
+                if ($(i + 1) == "failed;") failed += $i;
+              }
+            } END { print passed + failed + 0 }' "$log_file")
+            if [[ "${ran:-0}" -eq 0 ]]; then
+              echo "::error::filter '${filter}' executed zero tests."
+              exit 1
+            fi
+            echo "filter '${filter}' executed ${ran} test(s)."
+          done
+
+      - name: Report compiler-cache evidence
+        if: ${{ always() }}
+        shell: bash
+        run: sccache --show-stats
