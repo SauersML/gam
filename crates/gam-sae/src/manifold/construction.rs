@@ -3597,11 +3597,8 @@ impl SaeManifoldTerm {
         // floor). These owned images are held here so the borrow the map takes
         // below outlives them; they are appended only when there is no fitted or
         // OOS collapse policy to defer to (a completed all-curved fit is respected).
-        let fit_free_images: Vec<crate::hybrid_split::AtomLinearImage> = if collapse
-            && self.hybrid_split_report.is_none()
-            && self.oos_linear_images.is_none()
-        {
-            self.fit_free_hybrid_linear_images(assignments)
+        let fit_free_images: Vec<crate::hybrid_split::AtomLinearImage> = if collapse {
+            self.collapse_fit_free_images(assignments)
         } else {
             Vec::new()
         };
@@ -3753,6 +3750,72 @@ impl SaeManifoldTerm {
             }
         }
         images
+    }
+
+    /// The owned fit-free straight images that a `collapse = true`
+    /// [`Self::reconstruct_from_assignments`] would layer UNDER any fitted /
+    /// attached collapse policy for `assignments`. Empty when a completed fit
+    /// (`hybrid_split_report`) or an attached OOS policy (`oos_linear_images`)
+    /// already owns the collapse decision — those are respected verbatim, exactly
+    /// as the reconstruction does. The SINGLE guard shared by the reconstruction
+    /// path and the public verdict accessor
+    /// ([`Self::hybrid_collapse_verdict_from_assignments`]) so the two can never
+    /// disagree about which slots collapse.
+    fn collapse_fit_free_images(
+        &self,
+        assignments: ArrayView2<'_, f64>,
+    ) -> Vec<crate::hybrid_split::AtomLinearImage> {
+        if self.hybrid_split_report.is_none() && self.oos_linear_images.is_none() {
+            self.fit_free_hybrid_linear_images(assignments)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// #1026/#2394 — the collapse VERDICT reachable from the fit-free public
+    /// reconstruction path: the slot indices whose `d = 1` realized contribution
+    /// collapses to its straight (`Θ → 0`) sub-model under
+    /// `reconstruct_from_assignments(assignments, /*collapse=*/ true)`, in
+    /// ascending order.
+    ///
+    /// This is the observable form of the linear-dominance guarantee. The
+    /// reconstruction merely SUBSTITUTES a collapsed slot's straight image for its
+    /// curved decode; when the curved decode already lies on that straight image
+    /// at the assigned coordinates (exactly-linear data — a circle sampled only at
+    /// the two points its tangent line also passes through), the substitution is
+    /// value-preserving to round-off, so the *reconstruction* is bit-for-bit
+    /// unchanged and the verdict is INVISIBLE through a value comparison. Consumers
+    /// that need to know a slot collapsed (the #1026 "attach the linear verdict"
+    /// contract) must read it here, NOT by differencing collapsed vs. uncollapsed
+    /// reconstructions — that difference is exactly zero on the collapse-safe case
+    /// the guarantee is about.
+    ///
+    /// Honours a completed fit's `hybrid_split_report` and any attached
+    /// `oos_linear_images` (their `atom_idx` set is returned) before falling back
+    /// to the fit-free adjudication from `assignments`; the union is deduplicated
+    /// so the same slot is never reported twice. Errors only on an
+    /// assignment-shape mismatch, mirroring the reconstruction's own guard.
+    pub fn hybrid_collapse_verdict_from_assignments(
+        &self,
+        assignments: ArrayView2<'_, f64>,
+    ) -> Result<Vec<usize>, String> {
+        let n = self.n_obs();
+        let k_atoms = self.k_atoms();
+        if assignments.dim() != (n, k_atoms) {
+            return Err(format!(
+                "SaeManifoldTerm::hybrid_collapse_verdict_from_assignments: assignments {:?} != ({n}, {k_atoms})",
+                assignments.dim()
+            ));
+        }
+        // Same union the reconstruction forms: the fitted / OOS collapse policy
+        // (`hybrid_linear_image_map`) plus the fit-free images that layer under it
+        // (empty when a fitted / OOS policy already owns the decision).
+        let mut collapsed: std::collections::BTreeSet<usize> =
+            self.hybrid_linear_image_map().keys().copied().collect();
+        for image in self.collapse_fit_free_images(assignments) {
+            collapsed.insert(image.atom_idx);
+        }
+        Ok(collapsed.into_iter().collect())
     }
 
     /// Assemble a hybrid-collapsed reconstruction from explicit assignment
