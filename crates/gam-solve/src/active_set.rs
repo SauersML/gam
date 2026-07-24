@@ -3850,6 +3850,7 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
         candidate.iter().map(|value| value.to_bits()).collect(),
     ));
     let mut transitions = 0usize;
+    let mut kkt_refined_face: Option<Vec<usize>> = None;
 
     loop {
         let values = ops.values(&candidate)?;
@@ -3876,6 +3877,54 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
                      {worst_violation:.3e} at row {worst_row} after {transitions} \
                      rank-bounded dual transitions"
                 )));
+            }
+
+            // Row generation uses the fast Schur/Gram system to identify the
+            // passive face. Refine that face ONCE through the bordered KKT
+            // system before certification. This avoids squaring H's condition
+            // number at the equality boundary without refactorizing a
+            // (p+k)-square saddle system for every entering generator.
+            if kkt_refined_face.as_deref() != Some(active.as_slice()) {
+                loop {
+                    if active.is_empty() {
+                        candidate.assign(&unconstrained);
+                        multipliers = Array1::zeros(0);
+                        break;
+                    }
+                    let rows = ops.gather_unit_rows(&active)?;
+                    let active_residual = &rows.b - &rows.a.dot(&unconstrained);
+                    let zero_gradient = Array1::<f64>::zeros(p);
+                    let (correction, system_multipliers) = solve_kkt_direction(
+                        hessian,
+                        &zero_gradient,
+                        &rows.a,
+                        Some(&active_residual),
+                    )?;
+                    let refined_multipliers = -system_multipliers;
+                    if refined_multipliers
+                        .iter()
+                        .all(|value| value.is_finite() && *value > 0.0)
+                    {
+                        candidate = &unconstrained + &correction;
+                        multipliers = refined_multipliers;
+                        break;
+                    }
+                    let mut retained = Vec::with_capacity(active.len());
+                    for (position, &active_row) in active.iter().enumerate() {
+                        if refined_multipliers[position].is_finite()
+                            && refined_multipliers[position] > 0.0
+                        {
+                            retained.push(active_row);
+                        } else {
+                            is_active[active_row] = false;
+                            transitions += 1;
+                        }
+                    }
+                    active = retained;
+                }
+                banned.fill(false);
+                kkt_refined_face = Some(active.clone());
+                continue;
             }
 
             let gradient = hessian.dot(&candidate) - rhs;
@@ -3925,6 +3974,7 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
             return Ok((candidate, active));
         };
 
+        kkt_refined_face = None;
         let candidate_before_transition = candidate.clone();
         active.push(row);
         is_active[row] = true;
@@ -3937,25 +3987,20 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
 
         loop {
             let rows = ops.gather_unit_rows(&active)?;
-            // Solve the bordered primal-dual system directly. Forming
-            // C H^-1 C' and solving its Gram system squares H's condition
-            // number; on the #979 face that produced a feasible/stationary
-            // point whose active equality residual was still large enough to
-            // miss complementarity by 5.25e-5. The bordered KKT solve keeps H
-            // in its original conditioning and enforces C beta = d directly.
-            let active_residual = &rows.b - &rows.a.dot(&unconstrained);
-            let zero_gradient = Array1::<f64>::zeros(p);
-            let (trial_correction, trial_system_multipliers) = solve_kkt_direction(
-                hessian,
-                &zero_gradient,
-                &rows.a,
-                Some(&active_residual),
-            )?;
-            let trial = -trial_system_multipliers;
-            let trial_candidate = &unconstrained + &trial_correction;
+            let mut inverse_rows_t = rows.a.t().to_owned();
+            factor.solve_mat_in_place(&mut inverse_rows_t);
+            if inverse_rows_t.iter().any(|value| !value.is_finite()) {
+                crate::bail_invalid_estim!(
+                    "operator metric-projection passive inverse is non-finite"
+                );
+            }
+            let gram = rows.a.dot(&inverse_rows_t);
+            let target = &rows.b - &rows.a.dot(&unconstrained);
+            let mut trial = Array1::<f64>::zeros(active.len());
+            solve_dense_system_via_pseudoinverse(&gram, &target, &mut trial)?;
             if trial.iter().all(|value| value.is_finite() && *value > 0.0) {
                 multipliers = trial;
-                candidate = trial_candidate;
+                candidate = &unconstrained + &inverse_rows_t.dot(&multipliers);
                 break;
             }
 
@@ -3976,8 +4021,6 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
                 multipliers[position] +=
                     alpha * (trial[position] - multipliers[position]);
             }
-            let candidate_chord = &trial_candidate - &candidate;
-            candidate.scaled_add(alpha, &candidate_chord);
 
             let mut retained_rows = Vec::with_capacity(active.len());
             let mut retained_multipliers = Vec::with_capacity(active.len());
@@ -3998,6 +4041,10 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
                 candidate.assign(&unconstrained);
                 break;
             }
+            let retained = ops.gather_unit_rows(&active)?;
+            let mut inverse_retained_t = retained.a.t().to_owned();
+            factor.solve_mat_in_place(&mut inverse_retained_t);
+            candidate = &unconstrained + &inverse_retained_t.dot(&multipliers);
         }
 
         let moved = candidate
