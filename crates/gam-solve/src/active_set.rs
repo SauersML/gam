@@ -3937,20 +3937,25 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
 
         loop {
             let rows = ops.gather_unit_rows(&active)?;
-            let mut inverse_rows_t = rows.a.t().to_owned();
-            factor.solve_mat_in_place(&mut inverse_rows_t);
-            if inverse_rows_t.iter().any(|value| !value.is_finite()) {
-                crate::bail_invalid_estim!(
-                    "operator metric-projection passive inverse is non-finite"
-                );
-            }
-            let gram = rows.a.dot(&inverse_rows_t);
-            let target = &rows.b - &rows.a.dot(&unconstrained);
-            let mut trial = Array1::<f64>::zeros(active.len());
-            solve_dense_system_via_pseudoinverse(&gram, &target, &mut trial)?;
+            // Solve the bordered primal-dual system directly. Forming
+            // C H^-1 C' and solving its Gram system squares H's condition
+            // number; on the #979 face that produced a feasible/stationary
+            // point whose active equality residual was still large enough to
+            // miss complementarity by 5.25e-5. The bordered KKT solve keeps H
+            // in its original conditioning and enforces C beta = d directly.
+            let active_residual = &rows.b - &rows.a.dot(&unconstrained);
+            let zero_gradient = Array1::<f64>::zeros(p);
+            let (trial_correction, trial_system_multipliers) = solve_kkt_direction(
+                hessian,
+                &zero_gradient,
+                &rows.a,
+                Some(&active_residual),
+            )?;
+            let trial = -trial_system_multipliers;
+            let trial_candidate = &unconstrained + &trial_correction;
             if trial.iter().all(|value| value.is_finite() && *value > 0.0) {
                 multipliers = trial;
-                candidate = &unconstrained + &inverse_rows_t.dot(&multipliers);
+                candidate = trial_candidate;
                 break;
             }
 
@@ -3971,6 +3976,8 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
                 multipliers[position] +=
                     alpha * (trial[position] - multipliers[position]);
             }
+            let candidate_chord = &trial_candidate - &candidate;
+            candidate.scaled_add(alpha, &candidate_chord);
 
             let mut retained_rows = Vec::with_capacity(active.len());
             let mut retained_multipliers = Vec::with_capacity(active.len());
@@ -3991,10 +3998,6 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
                 candidate.assign(&unconstrained);
                 break;
             }
-            let retained = ops.gather_unit_rows(&active)?;
-            let mut inverse_retained_t = retained.a.t().to_owned();
-            factor.solve_mat_in_place(&mut inverse_retained_t);
-            candidate = &unconstrained + &inverse_retained_t.dot(&multipliers);
         }
 
         let moved = candidate
