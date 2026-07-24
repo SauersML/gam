@@ -1,7 +1,9 @@
 use crate::estimate::EstimationError;
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve, SolveLstsq};
 use faer::Side;
-use gam_linalg::faer_ndarray::{FaerArrayView, FaerLinalgError, FaerSvd, array1_to_col_matmut};
+use gam_linalg::faer_ndarray::{
+    FaerArrayView, FaerCholesky, FaerLinalgError, FaerSvd, array1_to_col_matmut,
+};
 use gam_linalg::utils::{StableSolver, array_is_finite, boundary_hit_step_fraction};
 use gam_problem::{
     ConstraintRowId, ConstraintSet, KhatriRaoConeConstraints, LinearInequalityConstraints,
@@ -3787,10 +3789,241 @@ pub fn project_point_strictly_into_feasible_constraint_set(
 
 /// Operator-carrier constrained quadratic solve: minimize
 /// `½ βᵀHβ − rhsᵀβ` subject to the [`ConstraintSet`]. Dense sets take the
-/// existing dense path byte-identically; the factored cone runs the operator
-/// active-set loop. Same public feasibility contract as
+/// existing dense path byte-identically; factored carriers use metric-dual row
+/// generation. Same public feasibility contract as
 /// [`solve_quadratic_with_linear_constraints`]: the returned point is
 /// feasible to [`ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`] or the solve errors.
+///
+/// For an operator carrier, the Hessian must be strictly positive definite.
+/// The unique minimizer is obtained from the metric-projection dual. If
+/// `u = H⁻¹ rhs`, unit-scaled constraint rows are `C`, and their bounds are
+/// `d`, the KKT equations are
+///
+/// ```text
+/// β = u + H⁻¹ Cᵀ μ
+/// Cβ - d >= 0,  μ >= 0,  μ ⊙ (Cβ - d) = 0.
+/// ```
+///
+/// Row generation finds the most violated constraint through one batched
+/// carrier product and materializes only the passive rows. The passive set has
+/// coefficient-space rank at most `p`; observation-row cardinality therefore
+/// affects linear scans, never the number or size of dense KKT systems. This is
+/// also a semantic boundary: a quadratic-projection API either returns the
+/// certified minimizer or an error. It never substitutes a generic feasible
+/// descent direction after exhausting a primal working-set path (#979).
+fn solve_strictly_convex_quadratic_with_constraint_set_dual(
+    hessian: &Array2<f64>,
+    rhs: &Array1<f64>,
+    set: &ConstraintSet,
+) -> Result<(Array1<f64>, Vec<usize>), EstimationError> {
+    let p = rhs.len();
+    if p == 0
+        || hessian.nrows() != p
+        || hessian.ncols() != p
+        || set.ncols() != p
+        || hessian.iter().any(|value| !value.is_finite())
+        || rhs.iter().any(|value| !value.is_finite())
+    {
+        crate::bail_invalid_estim!("operator metric-projection dimension/finite contract failed");
+    }
+    let factor = hessian.cholesky(Side::Lower).map_err(|error| {
+        EstimationError::InvalidInput(format!(
+            "operator metric projection requires a strictly positive-definite Hessian: {error}"
+        ))
+    })?;
+    let unconstrained = factor.solvevec(rhs);
+    if !array_is_finite(&unconstrained) {
+        crate::bail_invalid_estim!("operator metric-projection free solve is non-finite");
+    }
+
+    let ops = ConstraintSetOps::new(set, 0.0)?;
+    let m = ops.nrows();
+    let mut candidate = unconstrained.clone();
+    let mut active = Vec::<usize>::new();
+    let mut multipliers = Array1::<f64>::zeros(0);
+    let mut is_active = vec![false; m];
+    let mut banned = vec![false; m];
+    let mut visited = HashSet::<(Vec<usize>, Vec<usize>, Vec<u64>)>::new();
+    visited.insert((
+        Vec::new(),
+        Vec::new(),
+        candidate.iter().map(|value| value.to_bits()).collect(),
+    ));
+    let mut transitions = 0usize;
+
+    loop {
+        let values = ops.values(&candidate)?;
+        let mut entering = None;
+        let mut entering_violation = ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
+        let mut worst_violation = 0.0_f64;
+        let mut worst_row = 0usize;
+        for row in 0..m {
+            let violation = (-ops.scaled_slack(&values, row)).max(0.0);
+            if violation > worst_violation {
+                worst_violation = violation;
+                worst_row = row;
+            }
+            if !is_active[row] && !banned[row] && violation > entering_violation {
+                entering = Some(row);
+                entering_violation = violation;
+            }
+        }
+
+        let Some(row) = entering else {
+            if worst_violation > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+                return Err(EstimationError::ParameterConstraintViolation(format!(
+                    "operator metric projection has an unresolved scaled violation \
+                     {worst_violation:.3e} at row {worst_row} after {transitions} \
+                     rank-bounded dual transitions"
+                )));
+            }
+
+            let gradient = hessian.dot(&candidate) - rhs;
+            let (stationarity, complementarity) = if active.is_empty() {
+                (gradient_inf_norm(&gradient), 0.0)
+            } else {
+                let rows = ops.gather_unit_rows(&active)?;
+                let residual = &gradient - &rows.a.t().dot(&multipliers);
+                let stationarity = gradient_inf_norm(&residual);
+                let complementarity = multipliers
+                    .iter()
+                    .enumerate()
+                    .map(|(position, multiplier)| {
+                        let slack =
+                            rows.a.row(position).dot(&candidate) - rows.b[position];
+                        (multiplier * slack).abs()
+                    })
+                    .fold(0.0_f64, f64::max);
+                (stationarity, complementarity)
+            };
+            let gradient_scale = gradient_inf_norm(&gradient).max(1.0);
+            let dual_violation = multipliers
+                .iter()
+                .map(|value| (-value).max(0.0))
+                .fold(0.0_f64, f64::max);
+            if stationarity > ACTIVE_SET_KKT_STATIONARITY_TOL
+                && stationarity / gradient_scale > ACTIVE_SET_KKT_STATIONARITY_TOL
+            {
+                return Err(EstimationError::ParameterConstraintViolation(format!(
+                    "operator metric projection failed stationarity after {transitions} \
+                     dual transitions: residual={stationarity:.3e}, \
+                     relative={:.3e}, active={}",
+                    stationarity / gradient_scale,
+                    active.len(),
+                )));
+            }
+            if dual_violation > ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL
+                || complementarity > ACTIVE_SET_KKT_COMPLEMENTARITY_TOL
+            {
+                return Err(EstimationError::ParameterConstraintViolation(format!(
+                    "operator metric projection failed dual/complementarity certification \
+                     after {transitions} transitions: dual={dual_violation:.3e}, \
+                     complementarity={complementarity:.3e}, active={}",
+                    active.len(),
+                )));
+            }
+            return Ok((candidate, active));
+        };
+
+        let candidate_before_transition = candidate.clone();
+        active.push(row);
+        is_active[row] = true;
+        let mut expanded = Array1::<f64>::zeros(active.len());
+        expanded
+            .slice_mut(s![..multipliers.len()])
+            .assign(&multipliers);
+        multipliers = expanded;
+        transitions += 1;
+
+        loop {
+            let rows = ops.gather_unit_rows(&active)?;
+            let mut inverse_rows_t = rows.a.t().to_owned();
+            factor.solve_mat_in_place(&mut inverse_rows_t);
+            if inverse_rows_t.iter().any(|value| !value.is_finite()) {
+                crate::bail_invalid_estim!(
+                    "operator metric-projection passive inverse is non-finite"
+                );
+            }
+            let gram = rows.a.dot(&inverse_rows_t);
+            let target = &rows.b - &rows.a.dot(&unconstrained);
+            let mut trial = Array1::<f64>::zeros(active.len());
+            solve_dense_system_via_pseudoinverse(&gram, &target, &mut trial)?;
+            if trial.iter().all(|value| value.is_finite() && *value > 0.0) {
+                multipliers = trial;
+                candidate = &unconstrained + &inverse_rows_t.dot(&multipliers);
+                break;
+            }
+
+            let mut alpha = 1.0_f64;
+            for position in 0..active.len() {
+                if trial[position] <= 0.0 {
+                    let denominator = multipliers[position] - trial[position];
+                    if denominator > 0.0 {
+                        alpha = alpha.min(
+                            (multipliers[position] / denominator).clamp(0.0, 1.0),
+                        );
+                    } else {
+                        alpha = 0.0;
+                    }
+                }
+            }
+            for position in 0..active.len() {
+                multipliers[position] +=
+                    alpha * (trial[position] - multipliers[position]);
+            }
+
+            let mut retained_rows = Vec::with_capacity(active.len());
+            let mut retained_multipliers = Vec::with_capacity(active.len());
+            for position in 0..active.len() {
+                let active_row = active[position];
+                if multipliers[position] > 0.0 {
+                    retained_rows.push(active_row);
+                    retained_multipliers.push(multipliers[position]);
+                } else {
+                    is_active[active_row] = false;
+                    banned[active_row] = true;
+                    transitions += 1;
+                }
+            }
+            active = retained_rows;
+            multipliers = Array1::from_vec(retained_multipliers);
+            if active.is_empty() {
+                candidate.assign(&unconstrained);
+                break;
+            }
+            let retained = ops.gather_unit_rows(&active)?;
+            let mut inverse_retained_t = retained.a.t().to_owned();
+            factor.solve_mat_in_place(&mut inverse_retained_t);
+            candidate = &unconstrained + &inverse_retained_t.dot(&multipliers);
+        }
+
+        let moved = candidate
+            .iter()
+            .zip(candidate_before_transition.iter())
+            .any(|(left, right)| left.to_bits() != right.to_bits());
+        if moved {
+            banned.fill(false);
+        }
+        let mut active_key = active.clone();
+        active_key.sort_unstable();
+        let banned_key = banned
+            .iter()
+            .enumerate()
+            .filter_map(|(row, is_banned)| is_banned.then_some(row))
+            .collect::<Vec<_>>();
+        let point_key = candidate
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        if !visited.insert((active_key, banned_key, point_key)) {
+            return Err(EstimationError::ParameterConstraintViolation(format!(
+                "operator metric projection repeated an identical dual state \
+                 after {transitions} rank-bounded dual transitions"
+            )));
+        }
+    }
+}
+
 pub fn solve_quadratic_with_constraint_set(
     hessian: &Array2<f64>,
     rhs: &Array1<f64>,
@@ -3816,53 +4049,7 @@ pub fn solve_quadratic_with_constraint_set(
                     "operator-constrained quadratic solve: system dimension mismatch"
                 );
             }
-            let ops = ConstraintSetOps::new(set, 0.0)?;
-            let gradient = hessian.dot(beta_start) - rhs;
-            let mut delta = Array1::<f64>::zeros(beta_start.len());
-            let mut active_hint = warm_active_set.map_or_else(Vec::new, |active| active.to_vec());
-            let max_iterations = (beta_start.len() + set.nrows() + 8) * 4;
-            solve_newton_direction_with_constraint_set_impl(
-                hessian,
-                &gradient,
-                beta_start,
-                &ops,
-                &mut delta,
-                Some(&mut active_hint),
-                max_iterations,
-                true,
-            )?;
-            let candidate = beta_start + &delta;
-            let candidate_values = ops.values(&candidate)?;
-            let (worst, _) = ops.max_violation(&candidate_values);
-            if worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
-                return Ok((candidate, active_hint));
-            }
-            let repaired = project_point_strictly_into_feasible_constraint_set(&candidate, set)
-                .ok()
-                .filter(|repaired_point| {
-                    ops.values(repaired_point)
-                        .map(|values| ops.max_violation(&values).0)
-                        .map(|violation| violation <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL)
-                        .unwrap_or(false)
-                });
-            match repaired {
-                Some(feasible) => {
-                    let feasible_values = ops.values(&feasible)?;
-                    let active: Vec<usize> = (0..ops.nrows())
-                        .filter(|&row| {
-                            ops.norms[row] > 0.0
-                                && ops.scaled_slack(&feasible_values, row)
-                                    <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-                        })
-                        .collect();
-                    Ok((feasible, active))
-                }
-                None => Err(EstimationError::ParameterConstraintViolation(format!(
-                    "operator-constrained quadratic solve returned an infeasible iterate \
-                     (max scaled violation {worst:.3e}) and no feasible projection could be \
-                     certified onto the constraint cone",
-                ))),
-            }
+            solve_strictly_convex_quadratic_with_constraint_set_dual(hessian, rhs, set)
         }
     }
 }
@@ -5015,6 +5202,37 @@ mod tests {
     }
 
     #[test]
+    fn operator_metric_dual_solves_the_non_diagonal_projection() {
+        // Nonnegative quadrant with a genuinely coupled metric. The free
+        // solution violates x>=0. On the binding face x=0, the exact minimizer
+        // is y=1 and its row multiplier is 2:
+        //
+        // H [0,1]' - rhs = [2,0]'.
+        //
+        // An identity-metric Moreau projection would return a different point,
+        // so this pins the H-metric dual rather than only cone feasibility.
+        let psi = array![[1.0_f64, 0.0], [0.0, 1.0]];
+        let cone =
+            KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![0], 1)
+                .expect("nonnegative quadrant");
+        let set = ConstraintSet::KhatriRaoCone(cone);
+        let hessian = array![[4.0_f64, 1.0], [1.0, 2.0]];
+        let rhs = array![-1.0_f64, 2.0];
+        let beta_start = array![0.0_f64, 0.0];
+
+        let (candidate, active) =
+            solve_quadratic_with_constraint_set(&hessian, &rhs, &beta_start, &set, None)
+                .expect("strict metric projection");
+
+        assert_relative_eq!(candidate[0], 0.0, epsilon = 1e-12);
+        assert_relative_eq!(candidate[1], 1.0, epsilon = 1e-12);
+        assert_eq!(active, vec![0]);
+        let gradient = hessian.dot(&candidate) - rhs;
+        assert_relative_eq!(gradient[0], 2.0, epsilon = 1e-12);
+        assert_relative_eq!(gradient[1], 0.0, epsilon = 1e-12);
+    }
+
+    #[test]
     fn separable_khatri_rao_tangent_projection_matches_dense_oracle() {
         let cone = small_cone();
         let set = ConstraintSet::KhatriRaoCone(cone.clone());
@@ -5204,10 +5422,10 @@ mod tests {
         }
     }
 
-    /// #2378 regression at the QP level (non-identity Hessian): the operator
-    /// active-set loop's over-complete-face exchange must reach the same
-    /// constrained minimizer as the dense oracle when a coupled block is loaded
-    /// so that three of its half-spaces contend at the optimum.
+    /// #2378 regression at the QP level (non-identity Hessian): operator-native
+    /// metric projection must reach the same constrained minimizer as the dense
+    /// oracle when a coupled block is loaded so that three of its half-spaces
+    /// contend at the optimum.
     #[test]
     fn operator_cone_qp_over_complete_face_matches_dense_oracle_2378() {
         let cone = small_cone();
@@ -5253,11 +5471,10 @@ mod tests {
     #[test]
     fn operator_cone_does_not_materialize_a_whole_tight_face() {
         // All 4,096 observation rows describe the same half-space.  At the
-        // cone vertex every row is tight, but one warm row completely
-        // describes the working face.  The operator solver must preserve that
-        // compact working set instead of gathering/rank-reducing all 4,096
-        // redundant rows before taking a step (the large-scale CTN cycle-2
-        // stall from #979).
+        // cone vertex every row is tight, but one generator completely
+        // describes the dual support. The operator solver must return that
+        // compact support instead of gathering/rank-reducing all 4,096
+        // redundant rows (the large-scale CTN cycle-2 stall from #979).
         let mut psi = Array2::<f64>::zeros((4096, 2));
         psi.column_mut(0).fill(1.0);
         let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1], 2)
