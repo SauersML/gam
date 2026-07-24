@@ -411,10 +411,72 @@ fn certified_reduced_face_candidate(
     Ok(Some((candidate, next_active, kind)))
 }
 
+/// Canonical constraint face at an accepted nonlinear iterate.
+///
+/// `endpoint_active` is the sparse working-set provenance returned by the local
+/// QP. It is authoritative only when there is no constraint carrier. With a
+/// carrier, the accepted point itself determines the face: reduce its complete
+/// tight set to deterministic independent representatives so equivalent QP
+/// paths cannot seed different warm faces.
+fn canonical_accepted_active_rows(
+    constraints: Option<&ConstraintSet>,
+    accepted_beta: &Array1<f64>,
+    endpoint_active: &[usize],
+) -> Result<Vec<usize>, String> {
+    let Some(constraints) = constraints else {
+        return Ok(endpoint_active.to_vec());
+    };
+    gam_solve::active_set::ConstraintSetReducedFace::reduced_face(
+        constraints,
+        accepted_beta.view(),
+        gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL,
+    )
+    .map(|face| {
+        face.representatives
+            .into_iter()
+            .map(|row| row.index())
+            .collect()
+    })
+    .map_err(|error| {
+        format!("accepted constrained-Newton canonical face reduction failed: {error}")
+    })
+}
+
 #[cfg(test)]
 mod exact_face_newton_tests {
     use super::*;
     use ndarray::array;
+
+    #[test]
+    fn accepted_face_is_canonical_across_degenerate_qp_row_bases() {
+        // Every row is tight at the vertex. Rows 0/1 are parallel, while row 3
+        // is a general-position dependent of independent rows 0/2. Different
+        // QP paths can therefore report different sparse bases for the same
+        // geometric face; the accepted handoff must not preserve that history.
+        let constraints = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(
+                array![
+                    [1.0_f64, 0.0],
+                    [2.0_f64, 0.0],
+                    [0.0_f64, 1.0],
+                    [1.0_f64, 1.0]
+                ],
+                array![0.0, 0.0, 0.0, 0.0],
+            )
+            .expect("degenerate vertex"),
+        );
+        let beta = array![0.0_f64, 0.0];
+
+        let from_parallel_and_oblique =
+            canonical_accepted_active_rows(Some(&constraints), &beta, &[1, 3])
+                .expect("canonical face");
+        let from_coordinate_rows =
+            canonical_accepted_active_rows(Some(&constraints), &beta, &[0, 2])
+                .expect("canonical face");
+
+        assert_eq!(from_parallel_and_oblique, vec![0, 2]);
+        assert_eq!(from_coordinate_rows, vec![0, 2]);
+    }
 
     #[test]
     fn exact_face_newton_uses_tangent_curvature_not_ambient_reflection() {
@@ -1823,15 +1885,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         const RESIDUAL_DESCENT_WINDOW: usize = 3;
         let mut residual_descent_history: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(RESIDUAL_DESCENT_WINDOW);
-        // Accepted constrained-face provenance over the last two nonlinear
-        // cycles. Used only to diagnose a deterministic A→B→A complementarity
-        // orbit once per episode; it neither changes the step nor the
-        // convergence certificate.
-        let mut accepted_face_history: std::collections::VecDeque<(
-            Vec<usize>,
-            Array1<f64>,
-        )> = std::collections::VecDeque::with_capacity(2);
-        let mut accepted_face_two_cycle_reported = false;
         let mut tr_clamped_during_stall: bool = false;
         // Deterministic slow-geometric-rate stall guard (gam#979 survival
         // marginal-slope). The flat-residual guard below resets its no-improve
@@ -4706,124 +4759,34 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         }
                     }
                     if let Some(joint_active_set) = search_joint_active_set.as_ref() {
-                        // The QP reports the face at its full candidate endpoint,
-                        // but globalization may accept only a strict subsegment of
-                        // that feasible chord. Endpoint-only rows are then still
-                        // slack at `states` and cannot own either the next warm
-                        // KKT system or terminal tangent-space evidence. Filter the
-                        // sparse candidate face against the actual accepted beta;
-                        // the active-set ratio test rediscovers a discarded row
-                        // exactly when a later iterate reaches it.
+                        // Face provenance belongs to the ACCEPTED estimator state,
+                        // not to the path the local QP took to its full endpoint.
+                        // Globalization may accept only a strict subsegment of that
+                        // chord, so endpoint-only rows can still be slack. More
+                        // subtly, a degenerate cone face has many sparse row bases:
+                        // filtering only the QP's endpoint basis makes the warm
+                        // face depend on active-set history even when two accepted
+                        // betas lie on the same geometric face (#979).
+                        //
+                        // Reclassify the complete tight face at the actual accepted
+                        // beta, then retain its deterministic lowest-row independent
+                        // representatives. The reduced-face carrier performs this
+                        // operator-natively for factored cones, without materializing
+                        // a dense n×p constraint matrix. Warm starts and terminal
+                        // tangent certificates are therefore functions of beta
+                        // alone, while redundant co-tight observation rows never
+                        // enter the cached equality system.
                         let accepted_beta = flatten_state_betas(&states, specs);
-                        let accepted_joint_active = if let Some(constraints) =
-                            joint_constraints.as_ref()
-                        {
-                            gam_solve::active_set::constraint_set_rows_tight_at_point(
-                                constraints,
-                                &accepted_beta,
-                                joint_active_set,
-                            )
-                            .map_err(|error| {
-                                format!(
-                                    "accepted constrained-Newton face classification failed: {error}"
-                                )
-                            })?
-                        } else {
-                            joint_active_set.clone()
-                        };
+                        let accepted_joint_active = canonical_accepted_active_rows(
+                            joint_constraints.as_ref(),
+                            &accepted_beta,
+                            joint_active_set,
+                        )?;
                         let accepted_face = if accepted_joint_active.is_empty() {
                             None
                         } else {
                             Some(accepted_joint_active.clone())
                         };
-                        // The measured #979 orbit repeats FACE CARDINALITY
-                        // (92→93→92) while its exact row membership drifts.
-                        // Trigger on that observable recurrence; the payload
-                        // below records exact membership rather than assuming
-                        // the two same row sets recur.
-                        let has_two_cycle_cardinality = accepted_face_history.len() == 2
-                            && accepted_face_history[0].0.len()
-                                == accepted_joint_active.len()
-                            && accepted_face_history[1].0.len()
-                                != accepted_joint_active.len();
-                        if has_two_cycle_cardinality && !accepted_face_two_cycle_reported {
-                            let previous_face = &accepted_face_history[1].0;
-                            let entered = accepted_joint_active
-                                .iter()
-                                .copied()
-                                .filter(|row| !previous_face.contains(row))
-                                .collect::<Vec<_>>();
-                            let released = previous_face
-                                .iter()
-                                .copied()
-                                .filter(|row| !accepted_joint_active.contains(row))
-                                .collect::<Vec<_>>();
-                            let beta_recurrence_inf = (&accepted_beta
-                                - &accepted_face_history[0].1)
-                                .iter()
-                                .map(|value| value.abs())
-                                .fold(0.0_f64, f64::max);
-                            let (entered_slacks, released_slacks, omitted_tight_rows) =
-                                if let Some(constraints) = joint_constraints.as_ref() {
-                                    let values = constraints.values(accepted_beta.view())?;
-                                    let scaled_slacks = |rows: &[usize]| -> Result<Vec<(usize, f64)>, String> {
-                                        rows.iter()
-                                            .map(|&row| {
-                                                let norm = constraints.row_norm(row)?;
-                                                let bound = constraints.bound(row)?;
-                                                let slack = if norm > 0.0 {
-                                                    (values[row] - bound) / norm
-                                                } else {
-                                                    f64::INFINITY
-                                                };
-                                                Ok((row, slack))
-                                            })
-                                            .collect()
-                                    };
-                                    let full_face =
-                                        gam_solve::active_set::ConstraintSetReducedFace::reduced_face(
-                                            constraints,
-                                            accepted_beta.view(),
-                                            gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL,
-                                        )
-                                        .map_err(|error| {
-                                            format!(
-                                                "accepted two-cycle full-face classification failed: {error}"
-                                            )
-                                        })?;
-                                    let omitted = full_face
-                                        .tight_rows
-                                        .into_iter()
-                                        .map(|row| row.index())
-                                        .filter(|row| !accepted_joint_active.contains(row))
-                                        .collect::<Vec<_>>();
-                                    (
-                                        scaled_slacks(&entered)?,
-                                        scaled_slacks(&released)?,
-                                        scaled_slacks(&omitted)?,
-                                    )
-                                } else {
-                                    (Vec::new(), Vec::new(), Vec::new())
-                                };
-                            log::warn!(
-                                "[gam#979 active-face cardinality orbit] cycle={cycle} \
-                                 face_sizes={}→{}→{} beta_recurrence_inf={beta_recurrence_inf:.3e} \
-                                 entered(row,scaled_slack)={entered_slacks:?} \
-                                 released(row,scaled_slack)={released_slacks:?} \
-                                 omitted_full_tight(row,scaled_slack)={omitted_tight_rows:?}",
-                                accepted_face_history[0].0.len(),
-                                previous_face.len(),
-                                accepted_joint_active.len(),
-                            );
-                            accepted_face_two_cycle_reported = true;
-                        } else if !has_two_cycle_cardinality {
-                            accepted_face_two_cycle_reported = false;
-                        }
-                        if accepted_face_history.len() == 2 {
-                            accepted_face_history.pop_front();
-                        }
-                        accepted_face_history
-                            .push_back((accepted_joint_active.clone(), accepted_beta.clone()));
                         accepted_active_face_changed = accepted_face != active_face_before_step;
                         cached_active_sets =
                             scatter_joint_active_set(&accepted_joint_active, &block_constraints);
