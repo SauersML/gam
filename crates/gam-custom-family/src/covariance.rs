@@ -495,7 +495,7 @@ pub fn projected_linear_constraint_stationarity_vector(
     if residual.len() != p || constraints.ncols() != p {
         return None;
     }
-    if known_active_rows.is_some() {
+    if let Some(hint) = known_active_rows {
         // QP provenance selects the strict point-local tangent-face contract.
         // The operator-native Moreau solve discovers its complete multiplier
         // support deterministically; the historical warm row ids no longer
@@ -504,6 +504,7 @@ pub fn projected_linear_constraint_stationarity_vector(
             residual,
             beta,
             constraints,
+            hint,
         )
         .map(|(projected, _active)| projected);
     }

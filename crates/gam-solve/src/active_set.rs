@@ -3009,10 +3009,14 @@ pub fn constraint_set_rows_tight_at_point(
 /// Lawson–Hanson discovers the required generators through batched operator
 /// products and gathers only its `O(p)` passive rows. Selection depends only
 /// on the current face geometry, never on a warm active-set history.
+/// `seed_active` is output provenance only: tight seed rows are retained in the
+/// returned sparse face even when their KKT multiplier is zero, but they never
+/// enter the Lawson–Hanson pivot order or alter the projected vector.
 pub fn project_stationarity_residual_on_constraint_set(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
     set: &ConstraintSet,
+    seed_active: &[usize],
 ) -> Option<(Array1<f64>, Vec<usize>)> {
     let p = residual.len();
     if beta.len() != p || set.ncols() != p {
@@ -3036,11 +3040,19 @@ pub fn project_stationarity_residual_on_constraint_set(
                 let local_beta = beta.slice(s![start..end]).to_owned();
                 let local_set = ConstraintSet::KhatriRaoCone(cone.single_coupled_slot(slot).ok()?);
                 let row_start = slot * n;
+                let row_end = row_start + n;
+                let local_seed: Vec<usize> = seed_active
+                    .iter()
+                    .copied()
+                    .filter(|&row| row >= row_start && row < row_end)
+                    .map(|row| row - row_start)
+                    .collect();
                 let (local_projected, local_active) =
                     project_stationarity_residual_on_constraint_set(
                         &local_residual,
                         &local_beta,
                         &local_set,
+                        &local_seed,
                     )?;
                 projected.slice_mut(s![start..end]).assign(&local_projected);
                 active.extend(local_active.into_iter().map(|row| row_start + row));
@@ -3061,11 +3073,18 @@ pub fn project_stationarity_residual_on_constraint_set(
                 let local_residual = residual.slice(s![start..end]).to_owned();
                 let local_beta = beta.slice(s![start..end]).to_owned();
                 let row_end = row_offset + block.set.nrows();
+                let local_seed: Vec<usize> = seed_active
+                    .iter()
+                    .copied()
+                    .filter(|&row| row >= row_offset && row < row_end)
+                    .map(|row| row - row_offset)
+                    .collect();
                 let (local_projected, local_active) =
                     project_stationarity_residual_on_constraint_set(
                         &local_residual,
                         &local_beta,
                         &block.set,
+                        &local_seed,
                     )?;
                 projected.slice_mut(s![start..end]).assign(&local_projected);
                 active.extend(local_active.into_iter().map(|row| row_offset + row));
@@ -3073,7 +3092,12 @@ pub fn project_stationarity_residual_on_constraint_set(
             }
             Some((projected, active))
         }
-        _ => project_stationarity_residual_on_constraint_set_undivided(residual, beta, set),
+        _ => project_stationarity_residual_on_constraint_set_undivided(
+            residual,
+            beta,
+            set,
+            seed_active,
+        ),
     }
 }
 
@@ -3081,6 +3105,7 @@ fn project_stationarity_residual_on_constraint_set_undivided(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
     set: &ConstraintSet,
+    seed_active: &[usize],
 ) -> Option<(Array1<f64>, Vec<usize>)> {
     let ops = ConstraintSetOps::tangent_face(set, beta).ok()?;
     let (multipliers, projected) = nonnegative_cone_projection_by_rows(
@@ -3089,7 +3114,12 @@ fn project_stationarity_residual_on_constraint_set_undivided(
         |candidate| ops.values(candidate).ok(),
         |rows| ops.set.gather_rows(rows).ok().map(|gathered| gathered.a),
     )?;
-    let active = multipliers.into_iter().map(|(row, _)| row).collect();
+    let mut active: Vec<usize> = multipliers.into_iter().map(|(row, _)| row).collect();
+    for &row in seed_active {
+        if row < ops.nrows() && ops.norms[row] > 0.0 && !active.contains(&row) {
+            active.push(row);
+        }
+    }
     Some((projected, active))
 }
 
@@ -3111,6 +3141,7 @@ fn fallback_projected_gradient_direction_with_constraint_set(
     x: &Array1<f64>,
     d_total: &Array1<f64>,
     gradient: &Array1<f64>,
+    active: &[usize],
     ops: &ConstraintSetOps<'_>,
 ) -> Result<Option<(Array1<f64>, Vec<usize>)>, EstimationError> {
     let p = gradient.len();
@@ -3120,7 +3151,7 @@ fn fallback_projected_gradient_direction_with_constraint_set(
 
     let values_x = ops.values(x)?;
     let Some((stationarity_residual, mut tangent_active)) =
-        project_stationarity_residual_on_constraint_set(gradient, x, ops.set)
+        project_stationarity_residual_on_constraint_set(gradient, x, ops.set, active)
     else {
         return Ok(None);
     };
@@ -3500,7 +3531,7 @@ fn solve_newton_direction_with_constraint_set_impl(
         if allow_projected_gradient_fallback && added_new_active && primal_step_norm <= tol_step {
             if let Some((fallback_direction, fallback_active)) =
                 fallback_projected_gradient_direction_with_constraint_set(
-                    beta, &x, &d_total, &g_cur, ops,
+                    beta, &x, &d_total, &g_cur, &active, ops,
                 )?
             {
                 if let Some(hint) = active_hint.as_mut() {
@@ -3635,7 +3666,7 @@ fn solve_newton_direction_with_constraint_set_impl(
     }
     if let Some((fallback_direction, fallback_active)) =
         fallback_projected_gradient_direction_with_constraint_set(
-            beta, &x, &d_total, &g_cur, ops,
+            beta, &x, &d_total, &g_cur, &active, ops,
         )?
     {
         if let Some(hint) = active_hint.as_mut() {
@@ -4363,6 +4394,7 @@ mod tests {
             &residual,
             &beta,
             &set,
+            &[0, 1],
         )
         .expect("operator NNLS must solve the degenerate vertex");
         let closure = projected.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
@@ -4375,7 +4407,7 @@ mod tests {
         // A component outside the cone must survive the projection exactly.
         let outside = array![1.0_f64, 0.0, -1.0];
         let (projected_outside, _) =
-            project_stationarity_residual_on_constraint_set(&outside, &beta, &set)
+            project_stationarity_residual_on_constraint_set(&outside, &beta, &set, &[])
                 .expect("operator NNLS must solve the outside-component case");
         assert_relative_eq!(projected_outside[0], 0.0, epsilon = 1e-9);
         assert_relative_eq!(projected_outside[1], 0.0, epsilon = 1e-9);
@@ -4396,7 +4428,7 @@ mod tests {
         let beta = array![0.0_f64, 0.0];
         let residual = array![0.0_f64, 1.0];
         let (projected, active) =
-            project_stationarity_residual_on_constraint_set(&residual, &beta, &set)
+            project_stationarity_residual_on_constraint_set(&residual, &beta, &set, &[])
                 .expect("operator NNLS must solve the half-tight system");
         assert_relative_eq!(projected[1], 1.0, epsilon = 1e-12);
         assert!(
@@ -4980,7 +5012,7 @@ mod tests {
         let residual = array![0.4_f64, -0.2, 1.1, -0.7, -0.9, 0.8];
 
         let (operator_projected, _) =
-            project_stationarity_residual_on_constraint_set(&residual, &beta, &set)
+            project_stationarity_residual_on_constraint_set(&residual, &beta, &set, &[])
                 .expect("separable operator projection");
         let (dense_projected, _) =
             project_stationarity_residual_on_constraint_cone(&residual, &dense.a)
@@ -5019,7 +5051,7 @@ mod tests {
         let residual = array![3.0_f64, -2.0, 1.0];
 
         let (operator_projected, active) =
-            project_stationarity_residual_on_constraint_set(&residual, &beta, &set)
+            project_stationarity_residual_on_constraint_set(&residual, &beta, &set, &[])
                 .expect("operator Moreau projection");
         let (_, dense_projected) =
             nonnegative_cone_multipliers(&dense.a, &residual).expect("dense NNLS oracle");
@@ -5262,6 +5294,7 @@ mod tests {
             &x,
             &d_total,
             &gradient,
+            &[0],
             &ops,
         )
         .expect("operator fallback evaluation")
@@ -5299,7 +5332,7 @@ mod tests {
         let beta = array![0.0_f64, 0.0, 1.0, 0.0];
         let residual = array![0.0_f64, 0.0, 1.0, 0.0];
         let (projected, active) =
-            project_stationarity_residual_on_constraint_set(&residual, &beta, &set)
+            project_stationarity_residual_on_constraint_set(&residual, &beta, &set, &[])
                 .expect("interior tangent projection");
 
         for index in 0..residual.len() {
@@ -5317,7 +5350,7 @@ mod tests {
         let beta = array![2.0_f64, 0.0];
         let residual = array![1.0_f64, -1.0];
         let (projected, active) =
-            project_stationarity_residual_on_constraint_set(&residual, &beta, &set)
+            project_stationarity_residual_on_constraint_set(&residual, &beta, &set, &[0])
                 .expect("affine-boundary tangent projection");
 
         assert_relative_eq!(projected[0], 0.0, epsilon = 1e-12);
@@ -5344,6 +5377,7 @@ mod tests {
             &x,
             &d_total,
             &gradient,
+            &[0],
             &ops,
         )
         .expect("operator separator evaluation")
