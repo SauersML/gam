@@ -55,7 +55,7 @@ enum ReducedFaceCandidateKind {
     ReducedNewton,
     /// The reduced Hessian is singular or indefinite. Positive generalized
     /// eigenmodes retain their exact Newton curvature; only nonpositive/
-    /// numerically-null modes are lifted to the rank floor in the trust metric.
+    /// numerically-null modes use the trust metric's unit curvature.
     RegularizedNewton,
     /// The reduced Hessian is singular or indefinite, so the step is the
     /// metric-projected negative gradient. This is used when the current active
@@ -120,19 +120,24 @@ fn self_concordant_damped_step_alpha(newton_decrement: f64) -> Option<f64> {
 /// `D` is the existing affine-covariant trust/preconditioner metric. Whitening
 /// by `D` makes the curvature classification invariant to coefficient units.
 /// Every generalized eigenvalue already above the numerical-rank floor is kept
-/// exactly; only nonpositive or numerically-null modes are raised to that floor:
+/// exactly; only nonpositive or numerically-null modes receive the trust
+/// metric's unit curvature (or the larger numerical-rank floor):
 ///
 /// ```text
 /// B = D^(-1/2) H D^(-1/2) = V diag(gamma) V'
-/// M = D^(1/2) V diag(max(gamma, floor)) V' D^(1/2).
+/// gamma_plus = gamma                         if gamma > floor
+///              max(1, floor)                 otherwise
+/// M = D^(1/2) V diag(gamma_plus) V' D^(1/2).
 /// ```
 ///
-/// This is the nearest positive spectral completion in trust coordinates. It
-/// differs fundamentally from `|gamma|`: a strongly negative mode does not
-/// become a strongly attractive surrogate minimum, while identified positive
-/// modes retain their Newton scaling. The caller's exact-objective trust ratio
-/// still decides the nonlinear step.
-fn generalized_positive_reduced_metric(
+/// This is a trust-majorized positive spectral completion. It differs
+/// fundamentally from both `|gamma|` and a numerical-floor completion: a
+/// strongly negative mode neither becomes a strongly attractive surrogate
+/// minimum nor an almost-unregularized direction that races to remote
+/// constraint walls. Instead it uses exactly the stable D-projected-gradient
+/// geometry, while identified positive modes retain their Newton scaling. The
+/// caller's exact-objective trust ratio still decides the nonlinear step.
+fn generalized_trust_majorized_reduced_metric(
     reduced_hessian: &Array2<f64>,
     reduced_trust_metric: &Array2<f64>,
 ) -> Result<(Array2<f64>, bool), String> {
@@ -193,10 +198,15 @@ fn generalized_positive_reduced_metric(
     let exact_positive_curvature = generalized_eigenvalues
         .iter()
         .all(|value| *value > positive_floor);
+    let bad_mode_curvature = positive_floor.max(1.0);
 
     let mut positive_columns = generalized_eigenvectors.clone();
     for (column, eigenvalue) in generalized_eigenvalues.iter().enumerate() {
-        let curvature = eigenvalue.max(positive_floor);
+        let curvature = if *eigenvalue > positive_floor {
+            *eigenvalue
+        } else {
+            bad_mode_curvature
+        };
         for row in 0..dimension {
             positive_columns[[row, column]] *= curvature;
         }
@@ -228,9 +238,9 @@ fn generalized_positive_reduced_metric(
 /// eigenvalue reflection is not a substitute: it changes accessible positive
 /// curvature and can cycle among unrelated faces (#979). Instead, this routine
 /// whitens the reduced Hessian by the reduced trust metric, preserves every
-/// identified positive generalized eigenmode exactly, and lifts only
-/// nonpositive or numerically-null modes to the rank floor. The resulting SPD
-/// proximal metric `M` defines the constraint-aware map
+/// identified positive generalized eigenmode exactly, and gives only
+/// nonpositive or numerically-null modes the trust metric's unit curvature.
+/// The resulting SPD proximal metric `M` defines the constraint-aware map
 ///
 ///     beta_next = argmin_{x in C} 1/2 ||x-beta||_M^2 - r' (x-beta)
 ///               = P_C^M(beta + M^-1 r).
@@ -291,7 +301,10 @@ fn certified_reduced_face_candidate(
             let mut reduced_trust_metric = tangent.t().dot(&trust_metric).dot(tangent);
             symmetrize_dense_in_place(&mut reduced_trust_metric);
             let (positive_reduced_metric, exact_positive_curvature) =
-                match generalized_positive_reduced_metric(&reduced_hessian, &reduced_trust_metric) {
+                match generalized_trust_majorized_reduced_metric(
+                    &reduced_hessian,
+                    &reduced_trust_metric,
+                ) {
                     Ok(metric) => metric,
                     Err(_) => return Ok(None),
                 };
@@ -577,10 +590,10 @@ mod exact_face_newton_tests {
     }
 
     #[test]
-    fn indefinite_reduced_face_floors_negative_modes_instead_of_reflecting() {
+    fn indefinite_reduced_face_uses_trust_curvature_instead_of_reflecting() {
         // Negative accessible curvature has no Newton minimizer. Its
-        // generalized mode is lifted to the same numerical rank boundary
-        // rather than reflected to |gamma|. Both Hessians therefore head
+        // generalized mode receives trust curvature rather than |gamma| or an
+        // almost-singular numerical floor. Both Hessians therefore head
         // toward the same constrained endpoint instead of turning strong
         // negative curvature into a tiny surrogate-Newton step.
         let hessian = array![[1.0_f64, 0.0], [0.0, -2.0]];
@@ -628,25 +641,36 @@ mod exact_face_newton_tests {
     }
 
     #[test]
-    fn generalized_completion_preserves_identified_positive_modes() {
-        let reduced_hessian =
-            array![[4.0_f64, 0.0, 0.0], [0.0, -2.0, 0.0], [0.0, 0.0, 0.0]];
-        let reduced_trust =
-            array![[2.0_f64, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 8.0]];
+    fn trust_majorized_completion_preserves_identified_positive_modes() {
+        let reduced_hessian = array![
+            [4.0_f64, 0.0, 0.0, 0.0],
+            [0.0, 0.5, 0.0, 0.0],
+            [0.0, 0.0, -2.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0]
+        ];
+        let reduced_trust = array![
+            [2.0_f64, 0.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 4.0, 0.0],
+            [0.0, 0.0, 0.0, 8.0]
+        ];
         let (metric, exact) =
-            generalized_positive_reduced_metric(&reduced_hessian, &reduced_trust)
-                .expect("generalized spectral completion");
-        let floor = 2.0 * KKT_REFUSAL_RANK_TOL;
+            generalized_trust_majorized_reduced_metric(&reduced_hessian, &reduced_trust)
+                .expect("generalized trust-majorized completion");
 
         assert!(!exact);
         assert!(
             (metric[[0, 0]] - 4.0).abs() <= 1e-12,
             "the identified positive generalized mode must remain exact"
         );
-        assert!((metric[[1, 1]] - 4.0 * floor).abs() <= 1e-12);
-        assert!((metric[[2, 2]] - 8.0 * floor).abs() <= 1e-12);
-        for row in 0..3 {
-            for column in 0..3 {
+        assert!(
+            (metric[[1, 1]] - 0.5).abs() <= 1e-12,
+            "positive curvature below trust-unit scale must also remain exact"
+        );
+        assert!((metric[[2, 2]] - 4.0).abs() <= 1e-12);
+        assert!((metric[[3, 3]] - 8.0).abs() <= 1e-12);
+        for row in 0..4 {
+            for column in 0..4 {
                 if row != column {
                     assert!(metric[[row, column]].abs() <= 1e-12);
                 }
