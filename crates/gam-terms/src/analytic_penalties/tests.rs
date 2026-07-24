@@ -1824,7 +1824,7 @@ fn nuclear_norm_wide_block_max_rank_above_true_rank_value_grad_hvp_are_finite() 
 }
 
 #[test]
-fn nuclear_norm_right_gram_divided_difference_uses_eigen_floor() {
+fn nuclear_norm_right_gram_divided_difference_uses_shared_eigen_shift() {
     let n_eff = 2usize;
     let p = 2usize;
     let target = PsiSlice {
@@ -1842,10 +1842,12 @@ fn nuclear_norm_right_gram_divided_difference_uses_eigen_floor() {
         .right_spectral_inverse_sqrt_derivative(t.view(), v.view())
         .expect("right-Gram derivative");
 
+    // The robustness floor is an additive shift, not a clamp, so the spectral
+    // value and its divided difference remain derivatives of the same function.
     let eps2 = smoothing_eps * smoothing_eps;
-    let eig_floor = eps2.max(1.0e-15);
-    let lambda0 = (a * a + eps2).max(eig_floor);
-    let lambda1 = (b * b + eps2).max(eig_floor);
+    let eigen_shift = eps2.max(1.0e-15);
+    let lambda0 = a * a + eigen_shift;
+    let lambda1 = b * b + eigen_shift;
     let f0 = lambda0.powf(-0.5);
     let f1 = lambda1.powf(-0.5);
     let expected = ((f0 - f1) / (lambda0 - lambda1)) * a;

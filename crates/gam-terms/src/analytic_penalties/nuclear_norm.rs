@@ -486,9 +486,9 @@ impl NuclearNormPenalty {
         let mut f = Array1::<f64>::zeros(d);
         let mut df = Array1::<f64>::zeros(d);
         for i in 0..d {
-            // Same shared floor used by `value`/`grad_target` (#737): the
+            // Same shared shift used by `value`/`grad_target` (#737): the
             // right-Gram eigenvalue `raw_evals[i]` is the squared singular value
-            // `σ²`, so `regularized_sigma_sq(σ²) = max(σ²+ε², eig_floor)` keeps
+            // `σ²`, so `regularized_sigma_sq(σ²) = σ² + max(ε², 1e-15)` keeps
             // the filter on the identical regularized spectrum.
             regularized_evals[i] = self.regularized_sigma_sq(raw_evals[i]);
             if i >= active_start {

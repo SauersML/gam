@@ -1111,7 +1111,15 @@ pub fn create_difference_penalty_matrix(
             let mut log_span_sum = 0.0_f64;
             for i in 0..nrows {
                 let span = g[i + o] - g[i];
-                if !span.is_finite() || span <= 0.0 {
+                if span == 0.0 {
+                    return Err(BasisError::InvalidKnotVector(format!(
+                        "singular divided-difference span at order {o}, row {i}: coefficient coordinates g[{}]={:.6e} and g[{i}]={:.6e} coincide",
+                        i + o,
+                        g[i + o],
+                        g[i]
+                    )));
+                }
+                if !span.is_finite() || span < 0.0 {
                     return Err(BasisError::InvalidKnotVector(format!(
                         "divided-difference coordinates must be finite and strictly increasing at order {o}, row {i}: g[{}]={:.6e}, g[{i}]={:.6e}",
                         i + o,
