@@ -3512,23 +3512,34 @@ fn solve_newton_direction_with_constraint_set_impl(
             break;
         }
 
-        // A zero-length blocking step changes only the row representation of
-        // this active face; the primal point and its quadratic gradient have not
-        // moved. A factored cone can have thousands of observation rows carrying
-        // the same low-dimensional normal geometry, so continuing the add/drop
-        // loop enumerates distinct row-ID combinations without primal progress.
-        // The issue-979 CTN witness held a 92/93-row face and performed hundreds
-        // of these swaps immediately; its row-count-derived ceiling permitted
-        // roughly 96,000.
+        // A blocking row that is linearly dependent on the current working face
+        // changes only its row representation, not its tangent geometry. A
+        // factored cone can have thousands of observation rows carrying the same
+        // low-dimensional normal space, so continuing the add/drop loop
+        // enumerates distinct row-ID bases without gaining a coefficient-space
+        // direction. The #979 CTN witness entered this state with p=144 and then
+        // remained inside one `hessian_qp` cycle for the rest of a 300s command
+        // bound; its row-count-derived ceiling permitted roughly 96,000 pivots.
         //
         // This event is exactly a normal-cone identification problem at the
         // current x. Ask the shared factored separator for the tangent-cone
         // projection now. It adds only geometrically necessary omitted rows and
         // returns a full-set-feasible strict descent direction, or declines and
-        // leaves the ordinary active-set loop in control. The trigger is a
-        // mathematical no-progress event, not an iteration or wall-clock budget.
+        // leaves the ordinary active-set loop in control. Rank deficiency is the
+        // scale-free certificate: unlike an absolute step threshold it detects
+        // the no-new-geometry transition even when coefficient units make the
+        // boundary chord numerically nonzero.
         let primal_step_norm = alpha.abs() * step_norm;
-        if allow_projected_gradient_fallback && added_new_active && primal_step_norm <= tol_step {
+        let dependent_blocker = if added_new_active {
+            let expanded_face = ops.compress_working(&active)?;
+            expanded_face.constraints.a.nrows() <= compressed_working.constraints.a.nrows()
+        } else {
+            false
+        };
+        if allow_projected_gradient_fallback
+            && added_new_active
+            && (dependent_blocker || primal_step_norm <= tol_step)
+        {
             if let Some((fallback_direction, fallback_active)) =
                 fallback_projected_gradient_direction_with_constraint_set(
                     beta, &x, &d_total, &g_cur, &active, ops,
@@ -5316,6 +5327,51 @@ mod tests {
             active,
             vec![0],
             "operator escape expanded one sparse face row into all tight rows"
+        );
+    }
+
+    #[test]
+    fn dependent_blocker_triggers_geometry_complete_stationarity_979() {
+        // At the cone vertex, rows 0 and 1 already span the complete two-
+        // dimensional normal space; row 2 = row 0 + row 1 is a different row id
+        // but contributes no new tangent geometry. The old operator loop treated
+        // its nonzero floating-point boundary chord as progress and could keep
+        // exchanging equivalent row bases until the row-count-derived ceiling.
+        let psi = array![[1.0_f64, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1], 2)
+            .expect("dependent-blocker cone");
+        let set = ConstraintSet::KhatriRaoCone(cone);
+        let ops = ConstraintSetOps::new(&set, 0.0).expect("operator geometry");
+        let current = ops.compress_working(&[0, 1]).expect("current face");
+        let expanded = ops
+            .compress_working(&[0, 1, 2])
+            .expect("expanded face");
+        assert_eq!(current.constraints.a.nrows(), 2);
+        assert_eq!(
+            expanded.constraints.a.nrows(),
+            current.constraints.a.nrows(),
+            "the dependent blocker must not masquerade as a new tangent dimension"
+        );
+
+        // The full operator-native normal projection recognizes exact
+        // stationarity at this vertex and returns zero immediately. Thus the
+        // rank-stall branch has a certified endpoint instead of enumerating row
+        // representations of the same face.
+        let beta = Array1::<f64>::zeros(4);
+        let gradient = array![0.0_f64, 0.0, 1.0, 1.0];
+        let (direction, _) = fallback_projected_gradient_direction_with_constraint_set(
+            &beta,
+            &beta,
+            &Array1::<f64>::zeros(4),
+            &gradient,
+            &[0, 1, 2],
+            &ops,
+        )
+        .expect("operator stationarity projection")
+        .expect("dependent face has a certified projected endpoint");
+        assert!(
+            direction.iter().all(|value| *value == 0.0),
+            "stationary dependent face returned a spurious direction: {direction:?}"
         );
     }
 
