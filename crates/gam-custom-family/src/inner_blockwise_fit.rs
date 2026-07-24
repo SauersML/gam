@@ -1823,6 +1823,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         const RESIDUAL_DESCENT_WINDOW: usize = 3;
         let mut residual_descent_history: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(RESIDUAL_DESCENT_WINDOW);
+        // Accepted constrained-face provenance over the last two nonlinear
+        // cycles. Used only to diagnose a deterministic A→B→A complementarity
+        // orbit once per episode; it neither changes the step nor the
+        // convergence certificate.
+        let mut accepted_face_history: std::collections::VecDeque<(
+            Vec<usize>,
+            Array1<f64>,
+        )> = std::collections::VecDeque::with_capacity(2);
+        let mut accepted_face_two_cycle_reported = false;
         let mut tr_clamped_during_stall: bool = false;
         // Deterministic slow-geometric-rate stall guard (gam#979 survival
         // marginal-slope). The flat-residual guard below resets its no-improve
@@ -4727,6 +4736,87 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         } else {
                             Some(accepted_joint_active.clone())
                         };
+                        let is_two_cycle = accepted_face_history.len() == 2
+                            && accepted_face_history[0].0 == accepted_joint_active
+                            && accepted_face_history[1].0 != accepted_joint_active;
+                        if is_two_cycle && !accepted_face_two_cycle_reported {
+                            let previous_face = &accepted_face_history[1].0;
+                            let entered = accepted_joint_active
+                                .iter()
+                                .copied()
+                                .filter(|row| !previous_face.contains(row))
+                                .collect::<Vec<_>>();
+                            let released = previous_face
+                                .iter()
+                                .copied()
+                                .filter(|row| !accepted_joint_active.contains(row))
+                                .collect::<Vec<_>>();
+                            let beta_recurrence_inf = (&accepted_beta
+                                - &accepted_face_history[0].1)
+                                .iter()
+                                .map(|value| value.abs())
+                                .fold(0.0_f64, f64::max);
+                            let (entered_slacks, released_slacks, omitted_tight_rows) =
+                                if let Some(constraints) = joint_constraints.as_ref() {
+                                    let values = constraints.values(accepted_beta.view())?;
+                                    let scaled_slacks = |rows: &[usize]| -> Result<Vec<(usize, f64)>, String> {
+                                        rows.iter()
+                                            .map(|&row| {
+                                                let norm = constraints.row_norm(row)?;
+                                                let bound = constraints.bound(row)?;
+                                                let slack = if norm > 0.0 {
+                                                    (values[row] - bound) / norm
+                                                } else {
+                                                    f64::INFINITY
+                                                };
+                                                Ok((row, slack))
+                                            })
+                                            .collect()
+                                    };
+                                    let full_face =
+                                        gam_solve::active_set::ConstraintSetReducedFace::reduced_face(
+                                            constraints,
+                                            accepted_beta.view(),
+                                            gam_solve::active_set::ACTIVE_SET_WORKING_FACE_TOL,
+                                        )
+                                        .map_err(|error| {
+                                            format!(
+                                                "accepted two-cycle full-face classification failed: {error}"
+                                            )
+                                        })?;
+                                    let omitted = full_face
+                                        .tight_rows
+                                        .into_iter()
+                                        .map(|row| row.index())
+                                        .filter(|row| !accepted_joint_active.contains(row))
+                                        .collect::<Vec<_>>();
+                                    (
+                                        scaled_slacks(&entered)?,
+                                        scaled_slacks(&released)?,
+                                        scaled_slacks(&omitted)?,
+                                    )
+                                } else {
+                                    (Vec::new(), Vec::new(), Vec::new())
+                                };
+                            log::warn!(
+                                "[gam#979 active-face two-cycle] cycle={cycle} \
+                                 face_sizes={}→{}→{} beta_recurrence_inf={beta_recurrence_inf:.3e} \
+                                 entered(row,scaled_slack)={entered_slacks:?} \
+                                 released(row,scaled_slack)={released_slacks:?} \
+                                 omitted_full_tight(row,scaled_slack)={omitted_tight_rows:?}",
+                                accepted_face_history[0].0.len(),
+                                previous_face.len(),
+                                accepted_joint_active.len(),
+                            );
+                            accepted_face_two_cycle_reported = true;
+                        } else if !is_two_cycle {
+                            accepted_face_two_cycle_reported = false;
+                        }
+                        if accepted_face_history.len() == 2 {
+                            accepted_face_history.pop_front();
+                        }
+                        accepted_face_history
+                            .push_back((accepted_joint_active.clone(), accepted_beta.clone()));
                         accepted_active_face_changed = accepted_face != active_face_before_step;
                         cached_active_sets =
                             scatter_joint_active_set(&accepted_joint_active, &block_constraints);
