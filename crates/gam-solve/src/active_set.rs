@@ -589,6 +589,22 @@ where
         }
     }
 
+    // Exact Moreau/KKT exit: the residual must lie in the polar cone, i.e.
+    // every unit generator has non-positive correlation (within the same
+    // scale-relative tolerance used for entering). This distinguishes normal
+    // Lawson–Hanson termination from exhausting the floating-point pivot cap;
+    // a capped non-polar iterate is not a projection and must never reach a
+    // stationarity certificate or projected-gradient direction.
+    let final_values = row_values(&residual)?;
+    if final_values.len() != m
+        || final_values.iter().any(|value| !value.is_finite())
+        || (0..m).any(|row| {
+            row_norms[row] > 0.0 && final_values[row] / row_norms[row] > tol_w
+        })
+    {
+        return None;
+    }
+
     let multipliers: Vec<(usize, f64)> = passive
         .into_iter()
         .filter_map(|row| {
@@ -624,9 +640,9 @@ where
 /// Rows are unit-normalized internally so pivot ordering and tolerances are
 /// scale-invariant; the returned `λ` is in original row units. Zero rows
 /// carry `λ = 0`. Classic LH terminates after finitely many passive-set
-/// changes; a `3m + 30` outer guard bounds float pathologies and returns the
-/// best iterate — callers treat an unclosed residual as "not certified", so
-/// early return is conservative, never false-green.
+/// changes; a `3m + 30` outer guard bounds float pathologies, and the terminal
+/// full-row polarity check refuses rather than returning a non-KKT iterate if
+/// that guard is ever reached.
 pub(crate) fn nonnegative_cone_multipliers(
     rows: &Array2<f64>,
     target: &Array1<f64>,
