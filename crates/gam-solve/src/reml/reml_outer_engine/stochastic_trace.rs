@@ -335,7 +335,7 @@ impl StochasticTraceControlVariates {
         expected: f64,
         dimension: usize,
     ) -> Result<(), String> {
-        let trace = match control.chart.as_ref() {
+        let trace: f64 = match control.chart.as_ref() {
             PenaltyTraceChart::Reduced {
                 start,
                 end,

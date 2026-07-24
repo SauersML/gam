@@ -5014,7 +5014,7 @@ pub(crate) fn test_stochastic_trace_estimator_accuracy() {
 pub(crate) fn stochastic_rho_control_cancels_rank_inside_each_probe_2354() {
     // A rank-one penalty whose range is not coordinate-aligned.  Rademacher
     // probes therefore produce a noisy zᵀPz even though E[zᵀPz] = rank = 1.
-    let direction = array![1.0, 2.0, -1.5];
+    let direction: Array1<f64> = array![1.0, 2.0, -1.5];
     let norm = direction.dot(&direction).sqrt();
     let unit = direction.mapv(|value| value / norm);
     let projector = unit
