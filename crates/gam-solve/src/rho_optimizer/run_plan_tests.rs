@@ -476,7 +476,6 @@ fn active_set_reduction_freezes_a_railed_coordinate_when_the_interior_is_unpolis
         .active_set_reseed
         .as_ref()
         .expect("an unpolished interior beside a genuine rail must mint an active-set reseed");
-    assert_eq!(reseed.frozen, vec![0], "the railed coordinate must be frozen");
     assert_eq!(reseed.rho[0], 30.0, "the frozen coordinate is pinned at its rail");
     assert_eq!(
         (reseed.bounds.0[0], reseed.bounds.1[0]),
@@ -491,6 +490,95 @@ fn active_set_reduction_freezes_a_railed_coordinate_when_the_interior_is_unpolis
     assert!(
         result.wrong_rail_reseed.is_none(),
         "a genuine λ→∞ rail must be frozen, never pulled off its bound"
+    );
+}
+
+/// #2392 end-to-end recovery contract for the first-order path.
+///
+/// `V(ρ) = A(-q + q²/2)`, `q = exp(ρ★ − ρ)`, has its unique minimum at
+/// `ρ★ = 12`. At the upper rail its clean exponential band has positive
+/// gradient, so descent points inward and the upper rail is provably wrong.
+/// The detector used to be accidentally nested under `Some(H)`, making this
+/// evidence unusable for gradient-only BFGS objectives even though neither the
+/// pencil-constant sign nor its drift band requires curvature.
+#[test]
+fn wrong_rail_pullback_recovers_gradient_only_objective_2392() {
+    const AMPLITUDE: f64 = 1.0e4;
+    const RHO_STAR: f64 = 12.0;
+
+    let cost = |rho: &Array1<f64>| {
+        let q = (RHO_STAR - rho[0]).exp();
+        AMPLITUDE * (-q + 0.5 * q * q)
+    };
+    let eval = |rho: &Array1<f64>| {
+        let q = (RHO_STAR - rho[0]).exp();
+        OuterEval {
+            cost: AMPLITUDE * (-q + 0.5 * q * q),
+            gradient: array![AMPLITUDE * (q - q * q)],
+            hessian: HessianValue::Unavailable,
+            inner_beta_hint: Some(array![q]),
+        }
+    };
+
+    let audit_problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable);
+    let mut audit_obj = audit_problem.build_objective(
+        (),
+        move |_: &mut (), rho: &Array1<f64>| Ok(cost(rho)),
+        move |_: &mut (), rho: &Array1<f64>| Ok(eval(rho)),
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let refusal = audit_stationary_point(
+        &mut audit_obj,
+        array![29.9],
+        "gradient-only wrong-rail audit #2392",
+    )
+    .expect_err("the inward-descent upper rail must not certify");
+    let reseed = refusal
+        .result
+        .wrong_rail_reseed
+        .expect("first-order clean-tail evidence must publish an inward pull-back");
+    assert!(
+        reseed[0] < 29.9 && reseed[0] > RHO_STAR,
+        "pull-back should leave the rail inside the informative descent band: {reseed:?}",
+    );
+
+    // Exercise the actual outer optimizer from the published checkpoint. This
+    // is the recovery continuation the certify/resume loop consumes: it must
+    // reach and certify the known interior minimum, not merely mint a vector.
+    let recovery_problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_initial_rho(reseed)
+        .with_screen_initial_rho(false)
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
+    let mut recovery_obj = recovery_problem.build_objective(
+        (),
+        move |_: &mut (), rho: &Array1<f64>| Ok(cost(rho)),
+        move |_: &mut (), rho: &Array1<f64>| Ok(eval(rho)),
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let recovered = recovery_problem
+        .run(&mut recovery_obj, "gradient-only wrong-rail recovery #2392")
+        .expect("the wrong-rail checkpoint must descend to the interior optimum");
+    assert!(
+        (recovered.rho[0] - RHO_STAR).abs() < 1.0e-3,
+        "recovery must reach the known optimum ρ★={RHO_STAR}, got {:?}",
+        recovered.rho,
+    );
+    assert!(
+        recovered
+            .criterion_certificate
+            .as_ref()
+            .is_some_and(OuterCriterionCertificate::certifies),
+        "the recovered interior optimum must carry the mandatory certificate",
     );
 }
 

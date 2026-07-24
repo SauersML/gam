@@ -1132,17 +1132,17 @@ pub struct OuterResult {
     /// interior cannot polish; freezing that coordinate at its bound and
     /// re-running lets the optimizer converge the interior in the well-conditioned
     /// REDUCED space. The reseed carries the frozen box (`bounds`, with
-    /// `lower[k]==upper[k]==rail` for each frozen coordinate) and the frozen
-    /// indices, so the plan runner's un-freeze re-check can judge each frozen
-    /// coordinate's KKT sign against the ORIGINAL bounds at the reduced optimum
-    /// (an inward-feasible-descent gradient un-freezes it — no silent clamping of
-    /// a coordinate that stops wanting the rail).
+    /// `lower[k]==upper[k]==rail` for each frozen coordinate); the plan runner's
+    /// re-certification under the ORIGINAL bounds then judges every pinned
+    /// coordinate's KKT sign at the reduced optimum (an inward-feasible-descent
+    /// gradient unfreezes it — no silent clamping of a coordinate that stops
+    /// wanting the rail).
     pub active_set_reseed: Option<ActiveSetReseed>,
 }
 
 /// An active-set reduction reseed (#2392): re-run the outer search with a set of
 /// railed coordinates FROZEN at their box bounds so the optimizer polishes the
-/// interior in the reduced space, plus the metadata the un-freeze re-check needs.
+/// interior in the reduced space.
 #[derive(Clone, Debug)]
 pub struct ActiveSetReseed {
     /// The reseed point: the refused checkpoint with the frozen coordinates
@@ -1151,10 +1151,6 @@ pub struct ActiveSetReseed {
     /// The reduced-space box: `lower[k] == upper[k] == rail` for every frozen
     /// coordinate `k`, the original bounds elsewhere.
     pub bounds: (Array1<f64>, Array1<f64>),
-    /// The coordinates frozen at their bounds for the reduced-space run. The
-    /// un-freeze re-check judges each of these against the original box after the
-    /// interior converges.
-    pub frozen: Vec<usize>,
 }
 
 impl OuterResult {
@@ -2849,10 +2845,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
         //       under the ORIGINAL box, so a frozen coordinate whose gradient
         //       turns inward there un-freezes (no silent clamping).
         // (1) takes precedence: a wrong rail must be pulled back, never frozen.
-        if allow_tail_snap
-            && !certificate_railed.is_empty()
-            && let Some(hessian) = result.final_hessian.clone()
-        {
+        if allow_tail_snap && !certificate_railed.is_empty() {
             let beta_norm = terminal_beta
                 .as_ref()
                 .map(|b| b.dot(b).sqrt())
@@ -2888,7 +2881,13 @@ fn certify_outer_optimality_at_terminal_fidelity(
             }
             if let Some(reseed) = wrong_rail_point {
                 result.wrong_rail_reseed = Some(reseed);
-            } else {
+            } else if let Some(hessian) = analytic_hessian.as_ref() {
+                // Active-set reduction needs curvature to prove that the free
+                // subspace is genuinely unpolished. Wrong-rail pull-back above
+                // is a first-order tail-sign proof and deliberately does NOT:
+                // gradient-only BFGS objectives can rail incorrectly too, and
+                // withholding a valid pull-back merely because they do not
+                // materialize H would make recovery depend on solver class.
                 let interior_indices: Vec<usize> = (0..projected_gradient.len())
                     .filter(|k| !certificate_railed.contains(k))
                     .collect();
@@ -2905,7 +2904,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
                     let mut froz_lower = lower.clone();
                     let mut froz_upper = upper.clone();
                     let mut reseed = result.rho.clone();
-                    let mut frozen: Vec<usize> = Vec::new();
+                    let mut froze_any = false;
                     for &k in certificate_railed.iter() {
                         if k >= reseed.len() {
                             continue;
@@ -2918,13 +2917,12 @@ fn certify_outer_optimality_at_terminal_fidelity(
                         reseed[k] = rail;
                         froz_lower[k] = rail;
                         froz_upper[k] = rail;
-                        frozen.push(k);
+                        froze_any = true;
                     }
-                    if !frozen.is_empty() {
+                    if froze_any {
                         result.active_set_reseed = Some(ActiveSetReseed {
                             rho: reseed,
                             bounds: (froz_lower, froz_upper),
-                            frozen,
                         });
                     }
                 }
