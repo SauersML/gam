@@ -525,19 +525,6 @@ fn affine_function_nullspace_quadratic(
     )
 }
 
-/// Function-space affine/null-component penalty in the current coefficient
-/// chart. Under a coefficient reparameterization `E -> E R`, this matrix
-/// transforms covariantly as `S₀ -> Rᵀ S₀ R`; the statistical functional is
-/// therefore independent of coefficient scaling.
-#[cfg(test)]
-pub(crate) fn affine_function_nullspace_penalty(
-    evaluation: &Array2<f64>,
-    centers: ArrayView2<'_, f64>,
-    masses: ArrayView1<'_, f64>,
-) -> Result<Array2<f64>, BasisError> {
-    Ok(affine_function_nullspace_quadratic(evaluation, centers, masses)?.into_dense())
-}
-
 /// Pairwise squared distances `‖a_i − b_j‖²` via the GEMM identity
 /// `‖a − b‖² = ‖a‖² + ‖b‖² − 2·aᵀb`: one (n×d)·(d×m) matrix product carries
 /// every FMA at tile speed instead of n·m scalar distance loops — the
@@ -2784,15 +2771,18 @@ mod tests {
             ((i + 2 * j + 1) as f64).sin() + 0.15 * (i * (j + 1)) as f64
         });
         let reparameterization = array![[1.7, 0.2, -0.1], [0.0, 0.6, 0.3], [0.0, 0.0, 1.3]];
-        let base = affine_function_nullspace_penalty(&evaluation, centers.view(), masses.view())
-            .expect("base function-space penalty");
+        let base =
+            affine_function_nullspace_quadratic(&evaluation, centers.view(), masses.view())
+                .expect("base function-space penalty")
+                .into_dense();
         let transformed_evaluation = evaluation.dot(&reparameterization);
-        let transformed = affine_function_nullspace_penalty(
+        let transformed = affine_function_nullspace_quadratic(
             &transformed_evaluation,
             centers.view(),
             masses.view(),
         )
-        .expect("reparameterized function-space penalty");
+        .expect("reparameterized function-space penalty")
+        .into_dense();
         let expected = reparameterization.t().dot(&base).dot(&reparameterization);
         let scale = expected
             .iter()
