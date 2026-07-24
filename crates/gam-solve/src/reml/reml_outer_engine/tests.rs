@@ -5011,6 +5011,61 @@ pub(crate) fn test_stochastic_trace_estimator_accuracy() {
 }
 
 #[test]
+pub(crate) fn stochastic_rho_control_cancels_rank_inside_each_probe_2354() {
+    // A rank-one penalty whose range is not coordinate-aligned.  Rademacher
+    // probes therefore produce a noisy zᵀPz even though E[zᵀPz] = rank = 1.
+    let direction = array![1.0, 2.0, -1.5];
+    let norm = direction.dot(&direction).sqrt();
+    let unit = direction.mapv(|value| value / norm);
+    let projector = unit
+        .view()
+        .insert_axis(ndarray::Axis(1))
+        .dot(&unit.view().insert_axis(ndarray::Axis(0)));
+    let lambda = 1.6e3;
+    let a = &projector * lambda;
+    // H = λP + (I-P), hence H⁻¹A = P exactly.  The penalty-side chart also
+    // gives S_λ⁺A = P, so the fused per-probe difference is identically zero.
+    let h = &a + &(Array2::<f64>::eye(3) - &projector);
+    let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
+    let root = unit.view().insert_axis(ndarray::Axis(0)).to_owned();
+    let coordinate = PenaltyCoordinate::from_dense_root(root);
+    let controls = StochasticTraceControlVariates::from_penalty_coordinates(
+        std::slice::from_ref(&coordinate),
+        &[lambda],
+        &array![1.0],
+        1,
+        &[0],
+    )
+    .unwrap();
+    let config = StochasticTraceConfig {
+        n_probes_min: 16,
+        n_probes_max: 16,
+        relative_tol: 0.0,
+        tau_rel: 1e-12,
+        solve_rel_tol: 1e-12,
+        seed: 0x2354,
+        hutchpp_sketch_dim: None,
+    };
+    let estimator = StochasticTraceEstimator::new(config);
+    let targets = [&a];
+    let naive = estimator.estimate_traces(&hop, &targets)[0] - 1.0;
+    let fused = estimator.estimate_hinv_traces_with_control_variates(
+        &hop,
+        StochasticTraceTargets::Dense(&targets),
+        Some(&controls),
+    )[0];
+
+    assert!(
+        fused.abs() <= 1e-12,
+        "same-probe difference should cancel at the rail, got {fused:.16e}"
+    );
+    assert!(
+        naive.abs() > 1e-4,
+        "fixture must expose the separate-estimate residual, got {naive:.16e}"
+    );
+}
+
+#[test]
 pub(crate) fn modified_gram_schmidt_orthonormalizes_well_conditioned_input() {
     let y = array![
         [1.0, 2.0, 0.5, 3.0],

@@ -765,6 +765,30 @@ pub fn reml_laml_evaluate(
             .iter()
             .filter_map(|op| as_implicit(op.as_ref()))
             .collect();
+        let n_dense_total = coord_has_operator.iter().filter(|&&b| !b).count();
+        let mut dense_cursor = 0usize;
+        let mut operator_cursor = n_dense_total;
+        let mut original_to_raw = Vec::with_capacity(k + ext_dim);
+        for &has_operator in &coord_has_operator {
+            if has_operator {
+                original_to_raw.push(operator_cursor);
+                operator_cursor += 1;
+            } else {
+                original_to_raw.push(dense_cursor);
+                dense_cursor += 1;
+            }
+        }
+        let control_variates = if incl_logdet_s {
+            Some(StochasticTraceControlVariates::from_penalty_coordinates(
+                &solution.penalty_coords,
+                &curvature_lambdas,
+                &solution.penalty_logdet.first,
+                k + ext_dim,
+                &original_to_raw[..k],
+            )?)
+        } else {
+            None
+        };
 
         // ── Block 2.5: GPU-adaptive Hutchinson bypass.
         //
@@ -787,7 +811,8 @@ pub fn reml_laml_evaluate(
         // itself falls back to the SplitMix CPU reference when the CUDA
         // runtime is absent — so non-GPU hosts keep the existing
         // estimator behaviour even with the gate set.
-        let gpu_bypass_raw_traces: Option<Vec<f64>> = if operators.is_empty()
+        let gpu_bypass_raw_traces: Option<Vec<f64>> = if control_variates.is_none()
+            && operators.is_empty()
             && crate::gpu_kernels::reml_trace::should_bypass_cpu_with_gpu_adaptive(
                 total_p,
                 hop.as_exact_dense_spectral().is_some(),
@@ -852,6 +877,7 @@ pub fn reml_laml_evaluate(
                 hop,
                 StochasticTraceTargets::Dense(&dense_refs),
                 Some(Arc::clone(&solution.stochastic_trace_state)),
+                control_variates.as_ref(),
             )
         } else if generic_ops.len() == implicit_ops.len() {
             stochastic_trace_hinv_products_with_floor(
@@ -861,6 +887,7 @@ pub fn reml_laml_evaluate(
                     implicit_ops: &implicit_ops,
                 },
                 Some(Arc::clone(&solution.stochastic_trace_state)),
+                control_variates.as_ref(),
             )
         } else {
             stochastic_trace_hinv_products_with_floor(
@@ -870,21 +897,13 @@ pub fn reml_laml_evaluate(
                     operators: &generic_ops,
                 },
                 Some(Arc::clone(&solution.stochastic_trace_state)),
+                control_variates.as_ref(),
             )
         };
 
         let mut result = Vec::with_capacity(k + ext_dim);
-        let n_dense_total = coord_has_operator.iter().filter(|&&b| !b).count();
-        let mut dense_cursor = 0usize;
-        let mut operator_cursor = n_dense_total;
-        for &has_operator in &coord_has_operator {
-            if has_operator {
-                result.push(raw_traces[operator_cursor]);
-                operator_cursor += 1;
-            } else {
-                result.push(raw_traces[dense_cursor]);
-                dense_cursor += 1;
-            }
+        for &raw_index in &original_to_raw {
+            result.push(raw_traces[raw_index]);
         }
         Some(result)
     } else {
@@ -967,9 +986,9 @@ pub fn reml_laml_evaluate(
     // the active pairs `scale·s_term_j − share_j` stay O(1/λ_k) as in the
     // full-rank rail derivation, and each masked pair contributes only the
     // non-negative lump `0 − share_j` (no large-minus-large).
-    // The stochastic-SLQ branch stays on the naive pairing at this seam and is
-    // instead fused inside its Hutchinson estimator via a common-random-numbers
-    // control variate (#2354, `stochastic_trace_control_variates`).
+    // The stochastic-SLQ branch is fused at the probe seam instead: each rho
+    // sample subtracts `zᵀ S_λ⁺ A_k z` from `zᵀ H⁻¹ Ḣ_k z` before averaging
+    // through `StochasticTraceControlVariates` (#2354).
     let fused_logdet_minus_rank: Vec<Option<f64>> = if incl_logdet_h
         && incl_logdet_s
         && stochastic_trace_values.is_none()
@@ -1221,7 +1240,12 @@ pub fn reml_laml_evaluate(
                     )
                     .trace_logdet(hop)
                 };
-                (trace, solution.penalty_logdet.first[idx])
+                let penalty_logdet_trace = if stochastic_trace_values.is_some() && incl_logdet_s {
+                    0.0
+                } else {
+                    solution.penalty_logdet.first[idx]
+                };
+                (trace, penalty_logdet_trace)
             };
             let value = outer_gradient_entry(
                 a_i,
