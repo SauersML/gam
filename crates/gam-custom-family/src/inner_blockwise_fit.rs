@@ -418,18 +418,32 @@ fn certified_reduced_face_candidate(
     let directional_descent = rhs.dot(&delta);
     let metric_delta = face_metric.dot(&delta);
     let metric_norm_squared = delta.dot(&metric_delta);
+    // Relative to the feasible base point `beta`, the projected quadratic is
+    //
+    //   q(delta) - q(0) = 0.5 * delta' M delta - rhs' delta.
+    //
+    // Therefore the solver-independent descent certificate is
+    // `rhs' delta >= 0.5 * delta' M delta`. Requiring the full metric norm
+    // assumes an exact KKT variational identity; it spuriously rejects a
+    // certified finite-tolerance solution when the stationarity residual has
+    // the opposite rounding sign. Solver-level primal/dual/stationarity gates
+    // already certify optimality, while this gate independently ensures the
+    // returned point actually improves the quadratic over the feasible seed.
+    let model_decrease = directional_descent - 0.5 * metric_norm_squared;
     let projection_tolerance = 1.0e-8
         * (1.0 + directional_descent.abs().max(metric_norm_squared.abs()));
     if !(directional_descent.is_finite()
         && metric_norm_squared.is_finite()
+        && model_decrease.is_finite()
         && directional_descent > 0.0
         && metric_norm_squared > 0.0
-        && directional_descent + projection_tolerance >= metric_norm_squared)
+        && model_decrease + projection_tolerance >= 0.0)
     {
         return Err(format!(
             "reduced-face metric projection failed its descent certificate \
              (directional_descent={directional_descent:.6e}, \
              metric_norm_squared={metric_norm_squared:.6e}, \
+             model_decrease={model_decrease:.6e}, \
              tolerance={projection_tolerance:.6e}, \
              step_inf={:.6e}, active_rows={})",
             delta.iter().map(|value| value.abs()).fold(0.0_f64, f64::max),
