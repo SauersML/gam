@@ -1019,7 +1019,22 @@ fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
     } = A::into_parts(request);
 
     let Some(wiggle_cfg) = wiggle else {
-        let fit = A::fit_plain(data, spec, &options, &kappa_options)?;
+        // A location-scale model has two coupled predictors. For binomial
+        // location-scale, default response prediction integrates their
+        // nonlinear map over the joint Laplace posterior; for Gaussian
+        // location-scale, second-channel/delta-method uncertainty needs that
+        // same joint posterior. The fitted coefficient mode alone is therefore
+        // not a complete model. Request covariance at the final plain fit
+        // rather than making every low-level pilot pay for it.
+        let mut fit_options = options.clone();
+        fit_options.compute_covariance = true;
+        let fit = A::fit_plain(data, spec, &fit_options, &kappa_options)?;
+        if fit.fit.beta_covariance().is_none() {
+            return Err(
+                "plain location-scale fit reached assembly without its joint posterior covariance; no model was minted"
+                    .to_string(),
+            );
+        }
         return Ok(A::assemble_plain(fit));
     };
 
@@ -1555,13 +1570,6 @@ pub(crate) fn fit_gaussian_location_scale_model(
             .mean_offset
             .mapv_inplace(|v| v / response_scale);
     }
-
-    // Gaussian location-scale prediction has two coupled linear predictors, so
-    // uncertainty on either response channel must be assembled from the joint
-    // `(β_μ, β_logσ)` Laplace posterior covariance. Request it
-    // unconditionally; otherwise predict-time delta-method SEs for the second
-    // predictor can only fall back to scalar/block-local approximations.
-    request.options.compute_covariance = true;
 
     let mut result =
         fit_location_scale_with_optional_wiggle::<GaussianLocationScaleWorkflow>(request)?;

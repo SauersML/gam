@@ -2678,6 +2678,19 @@ fn gaussian_location_scale_engine_matches_reference_flow() {
     assert!(engine_plain.wiggle_knots.is_none());
     assert!(engine_plain.wiggle_degree.is_none());
     assert!(engine_plain.beta_link_wiggle.is_none());
+    let engine_plain_covariance = engine_plain
+        .fit
+        .fit
+        .beta_covariance()
+        .expect("engine gaussian no-wiggle fit must retain joint posterior covariance");
+    assert_eq!(
+        engine_plain_covariance.dim(),
+        (
+            engine_plain.fit.fit.beta_flat().len(),
+            engine_plain.fit.fit.beta_flat().len(),
+        ),
+        "engine gaussian no-wiggle covariance must cover every saved coefficient"
+    );
 
     // --- wiggle parity ---------------------------------------------------
     let wiggle_cfg = small_wiggle_cfg();
@@ -2785,6 +2798,19 @@ fn binomial_location_scale_engine_matches_reference_flow() {
     assert!(engine_plain.wiggle_knots.is_none());
     assert!(engine_plain.wiggle_degree.is_none());
     assert!(engine_plain.beta_link_wiggle.is_none());
+    let engine_plain_covariance = engine_plain
+        .fit
+        .fit
+        .beta_covariance()
+        .expect("engine binomial no-wiggle fit must retain joint posterior covariance");
+    assert_eq!(
+        engine_plain_covariance.dim(),
+        (
+            engine_plain.fit.fit.beta_flat().len(),
+            engine_plain.fit.fit.beta_flat().len(),
+        ),
+        "engine binomial no-wiggle covariance must cover every saved coefficient"
+    );
 
     // --- wiggle parity ---------------------------------------------------
     let wiggle_cfg = small_wiggle_cfg();
