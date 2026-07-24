@@ -4736,10 +4736,17 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         } else {
                             Some(accepted_joint_active.clone())
                         };
-                        let is_two_cycle = accepted_face_history.len() == 2
-                            && accepted_face_history[0].0 == accepted_joint_active
-                            && accepted_face_history[1].0 != accepted_joint_active;
-                        if is_two_cycle && !accepted_face_two_cycle_reported {
+                        // The measured #979 orbit repeats FACE CARDINALITY
+                        // (92→93→92) while its exact row membership drifts.
+                        // Trigger on that observable recurrence; the payload
+                        // below records exact membership rather than assuming
+                        // the two same row sets recur.
+                        let has_two_cycle_cardinality = accepted_face_history.len() == 2
+                            && accepted_face_history[0].0.len()
+                                == accepted_joint_active.len()
+                            && accepted_face_history[1].0.len()
+                                != accepted_joint_active.len();
+                        if has_two_cycle_cardinality && !accepted_face_two_cycle_reported {
                             let previous_face = &accepted_face_history[1].0;
                             let entered = accepted_joint_active
                                 .iter()
@@ -4799,7 +4806,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                     (Vec::new(), Vec::new(), Vec::new())
                                 };
                             log::warn!(
-                                "[gam#979 active-face two-cycle] cycle={cycle} \
+                                "[gam#979 active-face cardinality orbit] cycle={cycle} \
                                  face_sizes={}→{}→{} beta_recurrence_inf={beta_recurrence_inf:.3e} \
                                  entered(row,scaled_slack)={entered_slacks:?} \
                                  released(row,scaled_slack)={released_slacks:?} \
@@ -4809,7 +4816,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                 accepted_joint_active.len(),
                             );
                             accepted_face_two_cycle_reported = true;
-                        } else if !is_two_cycle {
+                        } else if !has_two_cycle_cardinality {
                             accepted_face_two_cycle_reported = false;
                         }
                         if accepted_face_history.len() == 2 {
