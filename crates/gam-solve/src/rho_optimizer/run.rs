@@ -1097,13 +1097,12 @@ pub struct OuterResult {
     /// once by [`run_outer`] when the exact rho Hessian is cheap enough to use.
     pub rho_uncertainty_diagnostic: Option<crate::rho_uncertainty::RhoUncertaintyDiagnostic>,
     /// Reseed point minted by a refused certification whose tail snap CONFIRMED
-    /// an exponential tail (probing passed) but whose interior coordinates were
-    /// not yet raw-gradient stationary (#2348 Inc 2b): the loop budget died
-    /// mid-crawl while the interior tracked the crawling tail coordinate. The
-    /// plan runner retries ONCE from this point — the box projection pins the
-    /// snapped coordinate at its rail while the interior polishes, and the
-    /// Inc 1 railed mint then judges the result through the natural path with
-    /// untouched evidence semantics.
+    /// an exponential tail (#2348 Inc 2b). A snap is a waypoint, never a
+    /// candidate optimum: even an interior coordinate stationary before the
+    /// snap can move when it is coupled to the tail coordinate (#2358). The
+    /// plan runner retries ONCE from this point, allowing every coordinate to
+    /// re-descend or remain on the rail before the natural certificate judges
+    /// the result.
     pub tail_snap_reseed: Option<Array1<f64>>,
     /// Saddle-escape reseed point minted by a refused certification whose
     /// interior reduced Hessian is a certified strict saddle — small projected
@@ -2734,10 +2733,10 @@ fn certify_outer_optimality_at_terminal_fidelity(
     // CONFIRMED exponential tail toward the ρ-box (the one-e-fold-per-step
     // grind: the loop budget can exhaust strictly inside the box, where the
     // Inc 1 railed mint can never fire), snap those coordinates to their box
-    // bound and re-certify once. The recursive certification re-solves the
-    // inner problem at the snapped point and judges it with the FULL Inc 1
-    // rail discipline — this path grants nothing by itself. On a refused snap
-    // the checkpoint is restored and the ordinary refusal below proceeds.
+    // bound and publish that point as a one-shot optimization reseed. The
+    // resumed optimizer lets coupled interior coordinates move before the
+    // FULL Inc 1 rail discipline judges the result — this path grants nothing
+    // by itself.
     let mut tail_snap_note: Option<String> = None;
     if allow_tail_snap
         && !certificate.certifies()
@@ -2836,56 +2835,14 @@ fn certify_outer_optimality_at_terminal_fidelity(
                 );
                 return Ok(certificate);
             }
-            TailSnapOutcome::Snapped(snapped) => {
-                let original_rho = result.rho.clone();
-                // The run-recorded first-order evidence describes the PRE-snap
-                // point; the recursive certification must not consume it as a
-                // same-ρ second measurement for its gradient-reproducibility
-                // floor.
-                let saved_gradient = result.final_gradient.take();
-                result.final_value = f64::NAN;
-                log::info!(
-                    "[CERTIFICATE] {context}: confirmed exponential tail on un-railed \
-                     coordinate(s); snapping ρ {original_rho} → {snapped} and re-certifying \
-                     at the rail (#2348 Inc 2)"
-                );
-                result.rho = snapped;
-                match certify_outer_optimality_at_terminal_fidelity(
-                    obj, config, context, result, false,
-                ) {
-                    Ok(snap_certificate) => return Ok(snap_certificate),
-                    Err(snap_err) => {
-                        log::info!(
-                            "[CERTIFICATE] {context}: snapped point refused \
-                             ({snap_err}); restoring the checkpoint and refusing at the \
-                             original point"
-                        );
-                        tail_snap_note = Some(format!("snapped point refused: {snap_err}"));
-                        result.rho = original_rho;
-                        result.final_value = evaluation.cost;
-                        result.final_grad_norm = Some(projected_grad_norm);
-                        result.final_gradient = saved_gradient;
-                        // Best-effort restore of the inner state to the
-                        // checkpoint; the refusal below is the verdict either
-                        // way.
-                        if let Err(restore_err) = obj.eval_cost(&result.rho) {
-                            log::warn!(
-                                "[CERTIFICATE] {context}: failed to restore the objective \
-                                 to the checkpoint after a refused tail snap: {restore_err}"
-                            );
-                        }
-                    }
-                }
-            }
             TailSnapOutcome::ConfirmedNeedsReseed(snapped) => {
                 log::info!(
                     "[CERTIFICATE] {context}: confirmed exponential tail on un-railed \
-                     coordinate(s) but the interior is not yet stationary; publishing \
-                     the snapped point {snapped} as a reseed for one retry (#2348 Inc 2b)"
+                     coordinate(s); publishing the snapped point {snapped} as a waypoint \
+                     for one re-optimization retry (#2348 Inc 2b / #2358)"
                 );
                 tail_snap_note = Some(
-                    "tail confirmed; interior unpolished — retry seeded at the snapped rail point"
-                        .to_string(),
+                    "tail confirmed; retry seeded at the snapped rail waypoint".to_string(),
                 );
                 result.tail_snap_reseed = Some(snapped);
             }
@@ -3366,10 +3323,9 @@ const TAIL_SNAP_CURVATURE_BAND: (f64, f64) = (0.25, 4.0);
 /// the asymptote certificate exists to kill — the loop can exhaust its budget
 /// strictly inside the box, where the Inc 1 railed mint can never fire),
 /// positively confirm each such coordinate's tail from the current point and
-/// return the point with those coordinates snapped to their box bound. The
-/// caller re-certifies the snapped point, where `certificate_railed_lambdas`
-/// flags the coordinates and the Inc 1 rail mint takes over with its full
-/// probe/assess discipline.
+/// return the point with those coordinates snapped to their box bound as an
+/// optimization waypoint. The caller re-runs the outer search from that point;
+/// only the resulting point is eligible for the Inc 1 rail certificate.
 ///
 /// Refusal semantics mirror [`try_certify_asymptote_rail`]: any gate failure
 /// returns `Ok(None)` (fall through to the ordinary refusal); the only `Err` is
@@ -3378,17 +3334,13 @@ const TAIL_SNAP_CURVATURE_BAND: (f64, f64) = (0.25, 4.0);
 /// 1. candidate coordinates = un-railed, `|g_k|` above the stationarity bound,
 ///    positive own-curvature within [`TAIL_SNAP_CURVATURE_BAND`] of `|g_k|`
 ///    (the tail-law tie), with the rail side read from the gradient sign;
-/// 2. every remaining interior coordinate is gradient-stationary and the
-///    interior Hessian sub-block (railed + candidates excluded) is PSD;
+/// 2. the interior Hessian sub-block (railed + candidates excluded) is PSD;
 /// 3. every candidate's tail is confirmed by the same probing engine the rail
-///    mint uses (`CertifiedAtAsymptote` or `OnTailNotYetEquivalent`; the final
-///    at-rail equivalence is re-judged by the Inc 1 mint after the snap).
-/// Outcome of a certify-time tail-snap attempt: the snapped point to
-/// re-certify, a confirmed tail whose interior still needs a polishing
-/// reseed-retry (#2348 Inc 2b), or a human-readable decline reason that is
-/// carried into the refusal summary so a budget-exhausted crawl explains WHY
-/// it was not snapped (the decline evidence is otherwise invisible in a red
-/// test/fit).
+///    mint uses (`CertifiedAtAsymptote` or `OnTailNotYetEquivalent`).
+/// Outcome of a certify-time tail-snap attempt: a point already stationary on
+/// its confirmed tail, a confirmed-tail waypoint requiring one optimization
+/// retry (#2348 Inc 2b / #2358), or a human-readable decline reason carried
+/// into the refusal summary.
 #[derive(Debug)]
 enum TailSnapOutcome {
     /// Every candidate's confirmed tail EXTRAPOLATES to a gradient already
@@ -3407,14 +3359,10 @@ enum TailSnapOutcome {
         interior_projected_grad_norm: f64,
         effective_interior_bound: f64,
     },
-    /// Tails confirmed AND the interior is already gradient-stationary:
-    /// re-certify the snapped point directly (the Inc 1 railed mint judges it).
-    Snapped(Array1<f64>),
-    /// Tails confirmed but the interior is not yet raw-gradient stationary —
-    /// the loop budget died mid-crawl while the interior tracked the crawling
-    /// tail coordinate. Re-certifying in place cannot help (the interior
-    /// gradient does not move without re-optimization); the plan runner
-    /// should retry ONCE seeded at this point instead.
+    /// Tails confirmed, but the current point is not already
+    /// tail-stationary. The snapped rail point is only a waypoint: the plan
+    /// runner must retry ONCE from it so coupled coordinates can reoptimize
+    /// before certification.
     ConfirmedNeedsReseed(Array1<f64>),
     Declined(String),
 }
@@ -3597,7 +3545,6 @@ fn try_tail_snap_to_rail(
     // reseed retry re-descends from the snapped point with the rails free to
     // hold or relax; a direct re-certification there would refuse exactly that
     // relaxation.
-    let mut joint_face_confirmed = false;
     if decline.is_some() && candidates.len() >= 2 {
         let (window, joint_rows) =
             probe_joint_tail_window(obj, rho, &candidates, &tol, (lower, upper))?;
@@ -3634,14 +3581,12 @@ fn try_tail_snap_to_rail(
                         })
                         .collect();
                 }
-                joint_face_confirmed = true;
                 decline = None;
             }
             Some(AsymptoteVerdict::OnTailNotYetEquivalent { .. }) => {
                 // Confirmed on the joint tail; travel not yet settled — the
                 // face snaps/reseeds below exactly as a confirmed single
                 // candidate would.
-                joint_face_confirmed = true;
                 decline = None;
             }
             Some(AsymptoteVerdict::NoAsymptote { reason }) => {
@@ -3655,15 +3600,14 @@ fn try_tail_snap_to_rail(
                 // ĉ settled to 34.2 over the last four probes while the crawl
                 // was still travelling). That is the same state as
                 // `OnTailNotYetEquivalent`: the law says WHERE the optimum is;
-                // the snap below re-solves and re-certifies at the face with
-                // the full rail discipline, granting nothing by itself.
+                // the snap below reoptimizes from the face, granting nothing
+                // by itself.
                 log::info!(
                     "[CERTIFICATE] joint {}-coordinate face: pencil-constant run \
                      confirmed but estimand not settled at the checkpoint \
-                     ({reason}); snapping the face for re-certification",
+                     ({reason}); snapping the face for re-optimization",
                     candidates.len(),
                 );
-                joint_face_confirmed = true;
                 decline = None;
             }
             None => {
@@ -3692,12 +3636,6 @@ fn try_tail_snap_to_rail(
     let interior_indices: Vec<usize> = (0..n)
         .filter(|k| !inputs.railed.contains(k) && !candidates.iter().any(|(c, _)| c == k))
         .collect();
-    let interior_grad_norm = interior_indices
-        .iter()
-        .map(|&k| gradient[k] * gradient[k])
-        .sum::<f64>()
-        .sqrt();
-
     // #2348 Inc 2c: every candidate's confirmed tail already extrapolates
     // BELOW the stationarity bound at the current point — the fit is
     // tail-stationary where it stands and the measured local gradient is
@@ -3734,19 +3672,12 @@ fn try_tail_snap_to_rail(
         };
     }
 
-    // Tails confirmed. Whether the snapped point can be re-certified DIRECTLY
-    // depends on the interior: the asymptote mint requires every non-rail
-    // coordinate gradient-stationary, and snapping the tail coordinate does
-    // not move the interior gradient. A budget-exhausted crawl typically
-    // leaves the interior UNPOLISHED (it was still tracking the crawling tail
-    // coordinate), so hand the runner a reseed point instead — one more
-    // optimizer pass pins the snapped coordinate at its rail (box projection)
-    // while the interior converges in its few remaining Newton steps.
-    if interior_grad_norm <= inputs.stationarity_bound && !joint_face_confirmed {
-        Ok(TailSnapOutcome::Snapped(snapped))
-    } else {
-        Ok(TailSnapOutcome::ConfirmedNeedsReseed(snapped))
-    }
+    // Tails confirmed, but a finite snap can change every coupled coordinate's
+    // optimum even when its PRE-snap gradient was stationary (#2358 measured
+    // the location-scale interior gradient jumping to 0.5). The snap proves a
+    // direction and supplies a waypoint; only a resumed optimization and its
+    // subsequent certificate can prove the endpoint.
+    Ok(TailSnapOutcome::ConfirmedNeedsReseed(snapped))
 }
 
 /// Reconstruct one railed coordinate's exponential tail by probing the analytic
@@ -5748,6 +5679,69 @@ mod asymptote_rail_certify_tests {
         );
     }
 
+    /// #2358: pre-snap interior stationarity cannot authorize direct
+    /// certification at the rail. The second coordinate is stationary at the
+    /// checkpoint but its mode depends on the tail coordinate, so moving the
+    /// first coordinate changes the second coordinate's optimum. A confirmed
+    /// snap must therefore publish a re-optimization waypoint even though the
+    /// pre-snap interior gradient is exactly zero.
+    #[test]
+    fn coupled_coordinate_stationary_before_snap_still_reseeds_2358() {
+        let c = 10.0_f64;
+        let problem = OuterProblem::new(2).with_gradient(Derivative::Analytic);
+        let mut obj = problem.build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| {
+                let tau = (-rho[0]).exp();
+                let coupled = rho[1] - tau;
+                Ok(c * tau + 0.5 * coupled * coupled)
+            },
+            move |_: &mut (), rho: &Array1<f64>| {
+                let tau = (-rho[0]).exp();
+                Ok(OuterEval {
+                    cost: c * tau + 0.5 * (rho[1] - tau).powi(2),
+                    gradient: array![
+                        -c * tau + (rho[1] - tau) * tau,
+                        rho[1] - tau
+                    ],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: Some(array![1.0e-3 * tau]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let rho = array![8.0, (-8.0_f64).exp()];
+        let tail_gradient = -c * (-rho[0]).exp();
+        let gradient = array![tail_gradient, 0.0];
+        let hessian = array![[tail_gradient.abs(), 0.0], [0.0, 1.0]];
+        let bounds = (Array1::from_elem(2, -12.0), Array1::from_elem(2, 12.0));
+
+        let outcome = try_tail_snap_to_rail(
+            &mut obj,
+            &AsymptoteRailInputs {
+                rho: &rho,
+                projected_gradient: &gradient,
+                railed: &[],
+                hessian: &hessian,
+                bounds: &bounds,
+                terminal_beta: None,
+                stationarity_bound: 1.0e-3,
+                objective_tol: 1.0e-8,
+                context: "coupled pre-snap stationarity guard",
+            },
+        )
+        .expect("tail snap must not error");
+        match outcome {
+            TailSnapOutcome::ConfirmedNeedsReseed(snapped) => {
+                assert_eq!(snapped, array![12.0, (-8.0_f64).exp()]);
+            }
+            other => panic!(
+                "a coupled coordinate stationary only before the snap must reoptimize, got {other:?}"
+            ),
+        }
+    }
+
     /// #2392 wrong-rail pull-back FIRES: a coordinate sitting at the UPPER bound
     /// whose clean-band probes carry a POSITIVE gradient (`∂V/∂ρ > 0`, so the
     /// pencil constant `ĉ = −e^{ρ}·g < 0` — descent points INWARD, away from the
@@ -5951,7 +5945,7 @@ mod asymptote_rail_certify_tests {
         )
         .expect("tail snap must not error");
         match outcome {
-            TailSnapOutcome::Snapped(snapped) | TailSnapOutcome::ConfirmedNeedsReseed(snapped) => {
+            TailSnapOutcome::ConfirmedNeedsReseed(snapped) => {
                 assert_eq!(
                     snapped,
                     array![12.0, 12.0],
@@ -5959,7 +5953,7 @@ mod asymptote_rail_certify_tests {
                 );
             }
             other => panic!(
-                "the joint face must confirm and snap (Snapped/ConfirmedNeedsReseed), got {other:?}"
+                "the joint face must confirm and publish a reseed waypoint, got {other:?}"
             ),
         }
     }
@@ -5968,11 +5962,11 @@ mod asymptote_rail_certify_tests {
     /// the multinomial checkpoint: ĉ settling 62.7 → … → 34.2) while the
     /// coefficient steps in the retained deep-interior rows are NOT yet
     /// geometrically contracting — the crawl was cut mid-travel. A confirmed
-    /// law with an unsettled estimand must SNAP the face for re-certification
+    /// law with an unsettled estimand must SNAP the face for re-optimization
     /// (the single-coordinate `OnTailNotYetEquivalent` semantics), not
     /// decline.
     #[test]
-    fn joint_face_with_unsettled_estimand_snaps_for_recertification_2349() {
+    fn joint_face_with_unsettled_estimand_snaps_for_reoptimization_2349() {
         let c = 1.2 * (7.5_f64).exp();
         // Non-contracting coefficient hints: constant per-probe steps (β moves
         // linearly in r), so coef_step_ratio has q = 1 and the estimand gate
@@ -6014,7 +6008,7 @@ mod asymptote_rail_certify_tests {
         )
         .expect("tail snap must not error");
         match outcome {
-            TailSnapOutcome::Snapped(snapped) | TailSnapOutcome::ConfirmedNeedsReseed(snapped) => {
+            TailSnapOutcome::ConfirmedNeedsReseed(snapped) => {
                 assert_eq!(
                     snapped,
                     array![12.0, 12.0],
