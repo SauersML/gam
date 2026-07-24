@@ -493,15 +493,24 @@ fn pullback_center_form_log_length_cross(
     (&cross_raw + &cross_raw.t()) * 0.5
 }
 
-/// Function-space affine/null-component penalty in the current coefficient
-/// chart. Under a coefficient reparameterization `E -> E R`, this matrix
-/// transforms covariantly as `S₀ -> Rᵀ S₀ R`; the statistical functional is
-/// therefore independent of coefficient scaling.
-pub(crate) fn affine_function_nullspace_penalty(
+/// Fixed-rank constructive witness for the affine/null quadratic in center-value
+/// space. Rank is decided here, where `H₀` is independent of `ℓ`, rather than
+/// after its coefficient pullback has acquired `ℓ`-dependent roundoff modes.
+fn affine_function_nullspace_center_quadratic(
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+) -> Result<ConstructiveQuadratic, BasisError> {
+    ConstructiveQuadratic::try_from_dense_psd(
+        affine_function_nullspace_form(centers, masses)?,
+        "measure-jet affine center-value form",
+    )
+}
+
+fn affine_function_nullspace_quadratic(
     evaluation: &Array2<f64>,
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
-) -> Result<Array2<f64>, BasisError> {
+) -> Result<ConstructiveQuadratic, BasisError> {
     if evaluation.nrows() != centers.nrows() {
         crate::bail_dim_basis!(
             "measure-jet affine function-space penalty shape mismatch: evaluation {:?}, centers {:?}",
@@ -509,8 +518,24 @@ pub(crate) fn affine_function_nullspace_penalty(
             centers.dim()
         );
     }
-    let form = affine_function_nullspace_form(centers, masses)?;
-    Ok(pullback_center_form(evaluation, &form))
+    let center_quadratic = affine_function_nullspace_center_quadratic(centers, masses)?;
+    ConstructiveQuadratic::from_energy_factor(
+        center_quadratic.factor().dot(evaluation),
+        "measure-jet affine/null coefficient penalty",
+    )
+}
+
+/// Function-space affine/null-component penalty in the current coefficient
+/// chart. Under a coefficient reparameterization `E -> E R`, this matrix
+/// transforms covariantly as `S₀ -> Rᵀ S₀ R`; the statistical functional is
+/// therefore independent of coefficient scaling.
+#[cfg(test)]
+pub(crate) fn affine_function_nullspace_penalty(
+    evaluation: &Array2<f64>,
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, BasisError> {
+    Ok(affine_function_nullspace_quadratic(evaluation, centers, masses)?.into_dense())
 }
 
 /// Pairwise squared distances `‖a_i − b_j‖²` via the GEMM identity
@@ -1847,13 +1872,11 @@ pub fn build_measure_jet_basis(
     // standard double-penalty decomposition (roughness + null component); no
     // coefficient identity and no hard-coded mixture changes the Primary.
     if spec.double_penalty {
-        let null_penalty = affine_function_nullspace_penalty(&kz, centers.view(), masses.view())?;
-        let (null_penalty_norm, c_null) = normalize_penalty(&null_penalty);
+        let null_penalty = affine_function_nullspace_quadratic(&kz, centers.view(), masses.view())?;
+        let (_, c_null) = normalize_penalty(null_penalty.dense());
         candidates.push(PenaltyCandidate {
-            matrix: ConstructiveQuadratic::try_from_dense_psd(
-                null_penalty_norm,
-                "measure-jet null-function penalty",
-            )?,
+            matrix: null_penalty
+                .scaled(1.0 / c_null, "normalized measure-jet null-function penalty")?,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: c_null,
             kronecker_factors: None,
@@ -2115,16 +2138,18 @@ pub fn build_measure_jet_basis_psi_derivatives(
     };
 
     if spec.double_penalty {
-        let null_form = affine_function_nullspace_form(geom.centers.view(), geom.masses.view())?;
+        let null_form =
+            affine_function_nullspace_center_quadratic(geom.centers.view(), geom.masses.view())?;
+        let null_form = null_form.dense();
         let mut first: Vec<Array2<f64>> = (0..n_coords).map(|_| zero_p()).collect();
         let mut second_diag: Vec<Array2<f64>> = (0..n_coords).map(|_| zero_p()).collect();
         if coord_offset == 1 {
-            let (ell_first, ell_second) = length_diag(&null_form);
+            let (ell_first, ell_second) = length_diag(null_form);
             first[0] = ell_first;
             second_diag[0] = ell_second;
         }
         raw.push(RawPenaltyJets {
-            value: sandwich(&null_form),
+            value: sandwich(null_form),
             first,
             second_diag,
             // H₀ is independent of α and τ; its only moving object is E(ℓ),
