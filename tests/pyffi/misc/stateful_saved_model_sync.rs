@@ -21,9 +21,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tempfile::tempdir;
 
-const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 13;
+const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 14;
 const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
-// FittedModelPayload has 96 serialized fields in schema version 13. These pin
+// FittedModelPayload has 96 serialized fields in schema version 14. These pin
 // fixtures leave `group_metadata=None` and `deployment_extensions=[]`; those are
 // the only two fields guarded by `skip_serializing_if`, so their JSON payloads
 // contain exactly 94 keys. Version 12 adds the required fitted-estimator tag so

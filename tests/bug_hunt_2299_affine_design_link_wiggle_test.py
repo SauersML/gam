@@ -25,10 +25,10 @@ to FAIL to converge; only the mild default ``flexible(logit)`` warp converges,
 and its joint precision is #2358-marginal -- a PD verdict that flips with
 rayon-fold order under load). So the link-wiggle contract is exercised by honest
 red gates that assert it UNWEAKENED and flip green when their upstream lanes
-land. The deterministic coverage of the covariance FUNCTION itself (exact
-``M^-1``, the best-effort typed-absence downgrade) lives in the Rust
-``best_effort_covariance_tests`` (gam-custom-family/src/covariance.rs), which
-feeds a controlled joint precision with no marginal fit involved.
+land. The deterministic covariance-function coverage (exact ``M^-1`` and
+singular-posterior fit refusal) lives in Rust ``required_covariance_tests``
+(gam-custom-family/src/covariance.rs), which feeds a controlled joint precision
+with no marginal fit involved.
 
 Honest red gates in this file (unweakened contract, red until their lane lands):
 
@@ -143,16 +143,14 @@ def test_link_wiggle_affine_design_covariance_and_identity_red_gate() -> None:
       * the fit is #2358-marginal -- the mild logit=~probit warp leaves a
         weakly-identified warp direction, so the smallest eigenvalue of
         ``H + S_lambda`` straddles the PD tolerance and rayon-fold summation
-        order (load-dependent) decides finite-covariance vs typed-absence.
-        Measured: covariance non-None 4/4 at load < 25, None in consecutive
-        isolated runs at load ~40. The load-sensitivity IS the bug (a PD verdict
-        that depends on iteration order), owned by #2358.
+        order (load-dependent) decides finite covariance versus a typed fit
+        refusal. The load-sensitivity IS the bug (a PD verdict that depends on
+        iteration order), owned by #2358.
       * ``_assert_affine_identity`` obtains the engine linear predictor via
         ``model.predict``, which for a curved flexible link routes through the
         posterior-mean path and REQUIRES the joint covariance to integrate
-        ``E[g^-1(eta)]`` -- so when the covariance is a typed absence, predict
-        cannot serve even ``eta``. Serving ``eta`` independently of the
-        covariance is the #2299 predict-mu residual (option ii).
+        ``E[g^-1(eta)]``. A posterior-incomplete fit is now refused before a
+        model can reach this assertion.
 
     A green here is PROGRESS SIGNAL, not a flake to silence; the red-gate
     direction is the safe one (an occasional quiet-box green under-reports the
@@ -160,7 +158,7 @@ def test_link_wiggle_affine_design_covariance_and_identity_red_gate() -> None:
     test until BOTH #2358 (load-invariant / iteration-order-invariant
     convergence) and the #2299 predict-mu residual land. The covariance FUNCTION
     is pinned deterministically, with exact ``M^-1`` values, in the Rust
-    ``best_effort_covariance_tests`` (gam-custom-family/src/covariance.rs); this
+    ``required_covariance_tests`` (gam-custom-family/src/covariance.rs); this
     gate is the end-to-end wiring half.
 
     Do NOT "simplify" the fixture to a leaner or heavier-penalty warp to make the

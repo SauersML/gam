@@ -203,6 +203,16 @@ fn usable_penalized_hessian<'a>(
     expected_dim: usize,
     label: &str,
 ) -> Option<&'a Array2<f64>> {
+    if fit
+        .geometry
+        .as_ref()
+        .is_some_and(|geometry| !geometry.coefficient_gauge.is_identity())
+    {
+        log::warn!(
+            "{label}: ignoring active-gauge penalized Hessian; prediction rows are in the saved/raw coefficient frame"
+        );
+        return None;
+    }
     let hessian = fit.penalized_hessian()?;
     if hessian.nrows() != expected_dim || hessian.ncols() != expected_dim {
         log::warn!(
@@ -5749,6 +5759,58 @@ mod tests {
             error
                 .to_string()
                 .contains("requires a coefficient covariance or penalized Hessian")
+        );
+    }
+
+    #[test]
+    fn curved_link_posterior_mean_is_identical_after_fit_state_round_trip() {
+        let beta = array![0.2];
+        let covariance = array![[0.49]];
+        let fit = test_fit_with_covariance(beta.clone(), covariance);
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0], [2.0]]),
+            offset: array![0.0, -0.1],
+            design_noise: None,
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let predictor = StandardPredictor {
+            beta: beta.clone(),
+            family: LikelihoodSpec::poisson_log(),
+            link_kind: None,
+            covariance: fit.beta_covariance().cloned(),
+            link_wiggle: None,
+        };
+        let before = predictor
+            .predict_posterior_mean(&input, &fit, &PosteriorMeanOptions::point_only())
+            .expect("posterior mean before persistence");
+
+        let json = serde_json::to_string(&fit).expect("serialize posterior-complete fit");
+        let restored: UnifiedFitResult =
+            serde_json::from_str(&json).expect("restore posterior-complete fit");
+        let restored_predictor = StandardPredictor {
+            beta,
+            family: LikelihoodSpec::poisson_log(),
+            link_kind: None,
+            covariance: restored.beta_covariance().cloned(),
+            link_wiggle: None,
+        };
+        let after = restored_predictor
+            .predict_posterior_mean(&input, &restored, &PosteriorMeanOptions::point_only())
+            .expect("posterior mean after persistence");
+
+        assert_eq!(after.mean, before.mean);
+        assert_eq!(after.eta_standard_error, before.eta_standard_error);
+        // The retained state is materially necessary: E[exp(η)] differs from
+        // exp(E[η]) by the log-normal variance correction.
+        let plugin = array![0.2_f64.exp(), 0.3_f64.exp()];
+        assert!(
+            before
+                .mean
+                .iter()
+                .zip(plugin.iter())
+                .all(|(posterior, mode)| (posterior - mode).abs() > 1e-3)
         );
     }
 

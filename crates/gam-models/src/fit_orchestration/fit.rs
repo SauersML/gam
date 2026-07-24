@@ -815,7 +815,13 @@ pub(crate) fn fit_standard_model(
     // `StandardBinomialWiggleConfig` now carries `refit_options` directly, so
     // the previous "pilot config present, blockwise options missing" failure
     // state (#320) is unrepresentable at the type level.
-    let wiggle_options = wiggle.refit_options.clone();
+    let mut wiggle_options = wiggle.refit_options.clone();
+    // A link-wiggle makes the response map curved, so the fitted mode is not a
+    // complete model: default prediction needs the joint [Mean, LinkWiggle]
+    // posterior to integrate E[g⁻¹(η)]. This is a model invariant, not an
+    // optional inference request. Force covariance assembly even for low-level
+    // callers that supplied custom refit options with the generic default.
+    wiggle_options.compute_covariance = true;
     let wiggle_link_kind =
         resolved_wiggle_inverse_link(&request.family, &result.fit, &wiggle.link_kind)?;
     let selected_wiggle_basis = select_binomial_mean_link_wiggle_basis_from_pilot(
@@ -890,6 +896,12 @@ pub(crate) fn fit_standard_model(
             ));
         }
     };
+    if solved.fit.beta_covariance().is_none() {
+        return Err(
+            "link-wiggle fit reached assembly without its joint [Mean, LinkWiggle] posterior covariance; no model was minted"
+                .to_string(),
+        );
+    }
 
     Ok(StandardFitResult {
         saved_link_state: result.saved_link_state,
@@ -1012,13 +1024,30 @@ fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
     };
 
     let pilot = A::fit_pilot(data, &spec, &options, &kappa_options)?;
-    let solved =
-        A::refit_with_selected_wiggle(data, spec, &pilot, &wiggle_cfg, &options, &kappa_options)?;
+    let mut refit_options = options.clone();
+    // Link-wiggle response geometry is curved even when the surrounding
+    // location model uses an identity link. Its posterior mean therefore
+    // requires the complete cross-block covariance at prediction time.
+    refit_options.compute_covariance = true;
+    let solved = A::refit_with_selected_wiggle(
+        data,
+        spec,
+        &pilot,
+        &wiggle_cfg,
+        &refit_options,
+        &kappa_options,
+    )?;
 
     // The selected link-wiggle basis is appended as the third blockwise term
     // (after the mean/threshold and log-σ blocks), so its coefficients live in
     // block 2 of the refit.
     let fit = solved.fit.fit;
+    if fit.beta_covariance().is_none() {
+        return Err(
+            "location-scale link-wiggle fit reached assembly without its joint posterior covariance; no model was minted"
+                .to_string(),
+        );
+    }
     let beta_link_wiggle = fit.block_states.get(2).map(|b| b.beta.to_vec());
     let assembled_fit = BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
         fit,

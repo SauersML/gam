@@ -1647,32 +1647,19 @@ pub(crate) fn compute_joint_covariance_required<F: CustomFamily + Clone + Send +
     if !options.compute_covariance {
         return Ok(None);
     }
-    match compute_joint_covariance(
+    compute_joint_covariance(
         family,
         specs,
         states,
         per_block_log_lambdas,
         options,
         preferred_unpenalized_hessian,
-    ) {
-        Ok(covariance) => Ok(Some(covariance)),
-        // A converged fit with a PSD penalized Hessian is a VALID fit even when
-        // the covariance cannot be factorized; escalating that into a whole-fit
-        // failure would discard usable coefficients and point predictions. When
-        // the consumer opted into best-effort covariance, downgrade to a typed
-        // absence (covariance `None`, reason logged) so the fit is still minted
-        // and inference simply reports itself unavailable (#2299).
-        Err(e) if options.covariance_best_effort => {
-            log::warn!(
-                "[custom-family covariance] joint covariance unavailable for a converged fit; minting the fit without it: {e}"
-            );
-            Ok(None)
-        }
-        Err(e) => Err(CustomFamilyError::InvalidInput {
-            context: "compute_joint_covariance_required",
-            reason: format!("joint covariance computation failed: {e}"),
-        }),
-    }
+    )
+    .map(Some)
+    .map_err(|e| CustomFamilyError::InvalidInput {
+        context: "compute_joint_covariance_required",
+        reason: format!("joint covariance computation failed: {e}"),
+    })
 }
 
 /// Compute terminal coefficient geometry, with optional single-diagonal row
@@ -2092,16 +2079,13 @@ pub(crate) fn joint_smoothing_correction(
 }
 
 #[cfg(test)]
-mod best_effort_covariance_tests {
-    //! Pins the #2299 `covariance_best_effort` downgrade at its production seam.
-    //! A converged fit whose joint posterior precision `M = H + S_λ` is singular
-    //! cannot produce a Laplace covariance; `compute_joint_covariance_required`
-    //! must return that as a typed absence (`Ok(None)`) when the consumer opted
-    //! into best-effort, and as an error otherwise. This is exercised with a
-    //! genuinely singular `M` (not a marginal knife-edge) so the assertion is
-    //! deterministic and load-independent -- the marginal fit that reaches this
-    //! path from Python is nondeterministic (rayon-fold-order-sensitive at the
-    //! tolerance) and is guarded upstream by the gauge + REML anyway (#2299).
+mod required_covariance_tests {
+    //! Pins the #2299 posterior-completeness invariant at its production seam.
+    //! A converged mode whose joint posterior precision `M = H + S_λ` is
+    //! singular cannot define the required posterior mean. Covariance
+    //! factorization must therefore refuse fit assembly, never mint a
+    //! mode-only artifact. The fixture is genuinely singular (not a marginal
+    //! knife-edge), so the assertion is deterministic and load-independent.
     use super::*;
     use ndarray::array;
 
@@ -2153,33 +2137,10 @@ mod best_effort_covariance_tests {
     }
 
     #[test]
-    fn best_effort_downgrades_singular_covariance_to_typed_absence() {
+    fn required_covariance_errors_on_singular_posterior_precision() {
         let (specs, states, per_block, unpenalized) = singular_joint_fixture();
         let options = BlockwiseFitOptions {
             compute_covariance: true,
-            covariance_best_effort: true,
-            ..BlockwiseFitOptions::default()
-        };
-        let result = compute_joint_covariance_required(
-            &TrivialFamily,
-            &specs,
-            &states,
-            &per_block,
-            &options,
-            Some(&unpenalized),
-        );
-        assert!(
-            matches!(result, Ok(None)),
-            "best-effort must downgrade an unfactorizable covariance to Ok(None); got {result:?}"
-        );
-    }
-
-    #[test]
-    fn covariance_required_without_best_effort_errors_on_singular() {
-        let (specs, states, per_block, unpenalized) = singular_joint_fixture();
-        let options = BlockwiseFitOptions {
-            compute_covariance: true,
-            covariance_best_effort: false,
             ..BlockwiseFitOptions::default()
         };
         let result = compute_joint_covariance_required(
@@ -2192,7 +2153,7 @@ mod best_effort_covariance_tests {
         );
         assert!(
             result.is_err(),
-            "without best-effort a singular joint covariance must surface as an error; got {result:?}"
+            "a singular joint posterior must refuse fit assembly; got {result:?}"
         );
     }
 
@@ -2226,7 +2187,6 @@ mod best_effort_covariance_tests {
         }];
         let options = BlockwiseFitOptions {
             compute_covariance: true,
-            covariance_best_effort: true,
             ..BlockwiseFitOptions::default()
         };
         let result = compute_joint_covariance_required(
@@ -2254,7 +2214,6 @@ mod best_effort_covariance_tests {
         let (specs, states, per_block, unpenalized) = singular_joint_fixture();
         let options = BlockwiseFitOptions {
             compute_covariance: false,
-            covariance_best_effort: true,
             ..BlockwiseFitOptions::default()
         };
         let result = compute_joint_covariance_required(

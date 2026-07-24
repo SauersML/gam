@@ -313,12 +313,11 @@ pub(crate) fn materialize_standard<'a>(
                 // multinomial, location-scale) turns it on explicitly. A fitted
                 // link-wiggle model owes external callers its
                 // `[Mean, LinkWiggle]` variance and mean--wiggle cross terms, so
-                // it must too (#2299). `covariance_best_effort` keeps a
-                // degenerate warp Hessian from converting a converged fit into a
-                // hard error: the fit is still minted, covariance is reported as
-                // a typed absence.
+                // it must too (#2299). The posterior mean is the default
+                // estimand for this curved link, so covariance factorization is
+                // part of fit assembly: an improper or unfactorizable posterior
+                // refuses the fit instead of minting a mode-only artifact.
                 compute_covariance: true,
-                covariance_best_effort: true,
                 ..BlockwiseFitOptions::default()
             },
         })

@@ -10,7 +10,7 @@ use crate::wiggle::{
     WigglePenaltyMetadata, canonical_wiggle_function_penalties,
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
-use gam_linalg::faer_ndarray::array2_to_nested_vec;
+use gam_linalg::faer_ndarray::{FaerCholesky, array2_to_nested_vec};
 use gam_linalg::matrix::DesignMatrix;
 use gam_problem::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily, SasLinkSpec,
@@ -58,7 +58,7 @@ use std::path::Path;
 /// Do NOT bump for purely additive `Option<T>` fields that the save-time
 /// invariant (`validate_for_persistence`) does not yet require. Those are
 /// forward-compatible.
-pub const MODEL_PAYLOAD_VERSION: u32 = 13;
+pub const MODEL_PAYLOAD_VERSION: u32 = 14;
 
 /// Coefficient parameterization of a saved transformation-normal (CTN) fit.
 ///
@@ -5145,6 +5145,7 @@ impl FittedModel {
         if is_survival_location_scale {
             validate_survival_location_scale_saved_fit(self.payload(), saved_link_wiggle.as_ref())?;
         }
+        self.validate_required_posterior_mean_state()?;
 
         // Validate anchored-deviation replay contracts at LOAD/SAVE time rather
         // than waiting for first predict call. Previously these contracts
@@ -5205,16 +5206,83 @@ impl FittedModel {
             }
         }
 
-        // Posterior-mean / uncertainty backends are validated at predict time
-        // by `prediction_backend_from_model`, which has access to the actual
-        // requested mode and emits the canonical "nonlinear posterior-mean
-        // prediction requires either covariance or a saved penalized Hessian"
-        // error.  Save-time we deliberately do NOT enforce that gate: a fit
-        // produced for MAP / plug-in scoring can be persisted and replayed
-        // without ever needing a covariance backend, and gating it here would
-        // refuse legitimate MAP-only saves whose `UnifiedFitResult` carries
-        // beta + lambdas without a stabilized Hessian.
+        Ok(())
+    }
 
+    /// Certify that a saved curved-link model can serve its default estimand.
+    ///
+    /// SPEC makes `E[g⁻¹(η)]` the default point estimate, never the plug-in
+    /// value `g⁻¹(η̂)`. A coefficient mode alone is therefore not a complete
+    /// saved model whenever the response map is curved. Persist either the
+    /// joint conditional covariance in the saved coefficient frame, or a
+    /// same-frame strictly-SPD penalized precision from which prediction can
+    /// reconstruct it. Anything else is rejected at save/load time rather than
+    /// failing on the first prediction or silently changing the estimand.
+    fn validate_required_posterior_mean_state(&self) -> Result<(), FittedModelError> {
+        if !self.prediction_uses_posterior_mean() {
+            return Ok(());
+        }
+        let fit = self
+            .payload()
+            .fit_result
+            .as_ref()
+            .ok_or_else(|| FittedModelError::MissingField {
+                reason:
+                    "curved-link model is missing the fit state required for posterior-mean prediction"
+                        .to_string(),
+            })?;
+        let p = fit.beta.len();
+        if let Some(covariance) = fit.beta_covariance() {
+            if covariance.dim() == (p, p) {
+                return Ok(());
+            }
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "curved-link model conditional covariance has shape {}x{}, expected {p}x{p} in the saved coefficient frame",
+                    covariance.nrows(),
+                    covariance.ncols(),
+                ),
+            });
+        }
+
+        if fit
+            .geometry
+            .as_ref()
+            .is_some_and(|geometry| !geometry.coefficient_gauge.is_identity())
+        {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "curved-link model has no saved/raw-frame covariance and its penalized precision lives in an active gauge; persist the lifted {p}x{p} covariance required for posterior-mean prediction"
+                ),
+            });
+        }
+        let precision = fit.penalized_hessian().ok_or_else(|| FittedModelError::MissingField {
+            reason: format!(
+                "curved-link model must persist a {p}x{p} joint conditional covariance or penalized precision to compute the required posterior mean"
+            ),
+        })?;
+        if precision.dim() != (p, p) {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "curved-link model penalized precision has shape {}x{}, expected {p}x{p} in the saved coefficient frame",
+                    precision.nrows(),
+                    precision.ncols(),
+                ),
+            });
+        }
+        precision
+            .cholesky(faer::Side::Lower)
+            .map_err(|error| FittedModelError::PayloadCorrupt {
+                reason: format!(
+                    "curved-link model penalized precision cannot define the required posterior mean: strict Cholesky failed: {error}"
+                ),
+            })?;
+        fit.coefficient_covariance_scale()
+            .map_err(|error| FittedModelError::PayloadCorrupt {
+                reason: format!(
+                    "curved-link model cannot scale its saved penalized precision into a posterior covariance: {error}"
+                ),
+            })?;
         Ok(())
     }
 
@@ -5789,6 +5857,118 @@ mod tests {
             inner_cycles: 0,
         })
         .expect("test fixture fit must assemble")
+    }
+
+    fn standard_binomial_model(fit: UnifiedFitResult) -> FittedModel {
+        let mut payload = FittedModelPayload::new(
+            MODEL_PAYLOAD_VERSION,
+            "y ~ 1".to_string(),
+            ModelKind::Standard,
+            FittedFamily::Standard {
+                likelihood: LikelihoodSpec::binomial_probit(),
+                link: Some(StandardLink::Probit),
+                latent_cloglog_state: None,
+                mixture_state: None,
+                sas_state: None,
+            },
+            "binomial".to_string(),
+        );
+        payload.fit_result = Some(fit.clone());
+        payload.unified = Some(fit);
+        FittedModel::from_payload(payload)
+    }
+
+    #[test]
+    fn curved_link_persistence_rejects_mode_without_posterior_state() {
+        let mut fit = saved_fit(vec![FittedBlock {
+            beta: array![0.25],
+            role: BlockRole::Mean,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        }]);
+        fit.covariance_conditional = None;
+        fit.inference = None;
+        fit.geometry = None;
+
+        let error = standard_binomial_model(fit)
+            .validate_required_posterior_mean_state()
+            .expect_err("a curved-link mode alone is not a persistable fitted model");
+        assert!(error.to_string().contains("posterior mean"));
+        assert!(error.to_string().contains("covariance or penalized precision"));
+    }
+
+    #[test]
+    fn curved_link_persistence_accepts_and_round_trips_saved_posterior_state() {
+        let fit = saved_fit(vec![FittedBlock {
+            beta: array![0.25],
+            role: BlockRole::Mean,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        }]);
+        let model = standard_binomial_model(fit);
+        model
+            .validate_required_posterior_mean_state()
+            .expect("joint conditional covariance completes the curved-link fit");
+
+        let json = serde_json::to_string(&model).expect("serialize fitted model");
+        let restored: FittedModel = serde_json::from_str(&json).expect("restore fitted model");
+        restored
+            .validate_required_posterior_mean_state()
+            .expect("posterior state must survive the saved-model wire format");
+        assert_eq!(
+            restored
+                .payload()
+                .fit_result
+                .as_ref()
+                .and_then(UnifiedFitResult::beta_covariance),
+            model
+                .payload()
+                .fit_result
+                .as_ref()
+                .and_then(UnifiedFitResult::beta_covariance),
+        );
+    }
+
+    #[test]
+    fn curved_link_persistence_accepts_factorizable_saved_precision() {
+        let mut fit = saved_fit(vec![FittedBlock {
+            beta: array![0.25],
+            role: BlockRole::Mean,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        }]);
+        fit.covariance_conditional = None;
+        fit.geometry = Some(gam_solve::estimate::FitGeometry {
+            coefficient_gauge: gam_problem::gauge::Gauge::identity(&[1]),
+            penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(array![[2.0]]),
+            working: None,
+        });
+
+        standard_binomial_model(fit)
+            .validate_required_posterior_mean_state()
+            .expect("a same-frame strictly-SPD precision can reconstruct posterior covariance");
+    }
+
+    #[test]
+    fn curved_link_persistence_rejects_active_frame_precision_without_lifted_covariance() {
+        let mut fit = saved_fit(vec![FittedBlock {
+            beta: array![0.25],
+            role: BlockRole::Mean,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        }]);
+        fit.covariance_conditional = None;
+        fit.geometry = Some(gam_solve::estimate::FitGeometry {
+            coefficient_gauge: gam_problem::gauge::Gauge::from_block_transforms(&[array![[2.0]]]),
+            penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(array![[2.0]]),
+            working: None,
+        });
+
+        let error = standard_binomial_model(fit)
+            .validate_required_posterior_mean_state()
+            .expect_err("active-frame precision cannot be paired with raw prediction rows");
+        assert!(error.to_string().contains("active gauge"));
+        assert!(error.to_string().contains("lifted"));
     }
 
     fn marginal_slope_payload(version: u32, fit: UnifiedFitResult) -> FittedModelPayload {
