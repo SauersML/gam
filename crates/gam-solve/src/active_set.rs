@@ -3871,19 +3871,15 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
         }
 
         let Some(row) = entering else {
-            if worst_violation > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
-                return Err(EstimationError::ParameterConstraintViolation(format!(
-                    "operator metric projection has an unresolved scaled violation \
-                     {worst_violation:.3e} at row {worst_row} after {transitions} \
-                     rank-bounded dual transitions"
-                )));
-            }
-
             // Row generation uses the fast Schur/Gram system to identify the
             // passive face. Refine that face ONCE through the bordered KKT
             // system before certification. This avoids squaring H's condition
             // number at the equality boundary without refactorizing a
-            // (p+k)-square saddle system for every entering generator.
+            // (p+k)-square saddle system for every entering generator. In
+            // particular, do this BEFORE the full primal-feasibility gate:
+            // the fast Gram candidate is only a face-discovery iterate, and
+            // its active equalities can carry exactly the condition-squared
+            // drift that the bordered solve exists to remove.
             if kkt_refined_face.as_deref() != Some(active.as_slice()) {
                 loop {
                     if active.is_empty() {
@@ -3925,6 +3921,14 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
                 banned.fill(false);
                 kkt_refined_face = Some(active.clone());
                 continue;
+            }
+
+            if worst_violation > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+                return Err(EstimationError::ParameterConstraintViolation(format!(
+                    "operator metric projection has an unresolved scaled violation \
+                     {worst_violation:.3e} at row {worst_row} after conditioned face \
+                     refinement and {transitions} rank-bounded dual transitions"
+                )));
             }
 
             let gradient = hessian.dot(&candidate) - rhs;
