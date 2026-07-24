@@ -60,6 +60,52 @@ fn certificate_attests_consistent_quadratic() {
     assert!(cert.stationarity.bound() > 0.0 && cert.stationarity.projected_norm().is_finite());
 }
 
+#[test]
+fn closure_objective_default_order_dispatch_preserves_value_lane() {
+    let value_calls = Arc::new(AtomicUsize::new(0));
+    let derivative_calls = Arc::new(AtomicUsize::new(0));
+    let problem = OuterProblem::new(2).with_gradient(Derivative::Analytic);
+    let mut objective = problem.build_objective(
+        (),
+        {
+            let value_calls = Arc::clone(&value_calls);
+            move |_: &mut (), _: &Array1<f64>| {
+                value_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(7.0)
+            }
+        },
+        {
+            let derivative_calls = Arc::clone(&derivative_calls);
+            move |_: &mut (), rho: &Array1<f64>| {
+                derivative_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(OuterEval {
+                    cost: 11.0,
+                    gradient: Array1::ones(rho.len()),
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: None,
+                })
+            }
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let rho = array![0.0, 0.0];
+
+    let value = objective
+        .eval_with_order(&rho, OuterEvalOrder::Value)
+        .expect("value-only closure dispatch");
+    assert_eq!(value.cost, 7.0);
+    assert_eq!(value_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(derivative_calls.load(Ordering::Relaxed), 0);
+
+    let derivative = objective
+        .eval_with_order(&rho, OuterEvalOrder::ValueAndGradient)
+        .expect("derivative-bearing closure dispatch");
+    assert_eq!(derivative.cost, 11.0);
+    assert_eq!(value_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(derivative_calls.load(Ordering::Relaxed), 1);
+}
+
 /// #979: a solver may finish before a family's nominal sampled-derivative
 /// budget. The sampled optimum is useful as a checkpoint, but the runner must
 /// then optimize the exact objective rather than merely re-evaluating and

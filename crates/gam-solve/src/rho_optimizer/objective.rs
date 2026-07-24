@@ -885,7 +885,8 @@ pub struct ClosureObjective<
     pub(crate) cost_fn: Fc,
     pub(crate) eval_fn: Fe,
     /// Optional order-aware eval closure. When `None`, `eval_with_order()`
-    /// falls back to `eval()`.
+    /// dispatches value-only work to `cost_fn` and derivative-bearing work to
+    /// `eval_fn`, matching the [`OuterObjective`] default contract.
     pub(crate) eval_order_fn: Option<Feo>,
     /// Optional reset closure. When `None`, `reset()` is a no-op.
     pub(crate) reset_fn: Option<Fr>,
@@ -951,7 +952,15 @@ where
         crate::estimate::reml::outer_eval::record_current_outer_theta_for_ift(rho);
         match self.eval_order_fn.as_mut() {
             Some(f) => f(&mut self.state, rho, order),
-            None => (self.eval_fn)(&mut self.state, rho),
+            None => match order {
+                OuterEvalOrder::Value => {
+                    let cost = (self.cost_fn)(&mut self.state, rho)?;
+                    Ok(OuterEval::value_only(cost, rho.len(), None))
+                }
+                OuterEvalOrder::ValueAndGradient | OuterEvalOrder::ValueGradientHessian => {
+                    (self.eval_fn)(&mut self.state, rho)
+                }
+            },
         }
     }
 
