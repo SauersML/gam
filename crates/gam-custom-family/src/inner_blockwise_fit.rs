@@ -115,39 +115,47 @@ fn self_concordant_damped_step_alpha(newton_decrement: f64) -> Option<f64> {
     Some(1.0 / (1.0 + lambda_n))
 }
 
-/// Positive reduced metric from the generalized eigensystem `(H, D)`.
+/// Trust-region-shifted reduced metric from the generalized eigensystem `(H, D)`.
 ///
 /// `D` is the existing affine-covariant trust/preconditioner metric. Whitening
-/// by `D` makes the curvature classification invariant to coefficient units.
-/// Every generalized eigenvalue already above the numerical-rank floor is kept
-/// exactly; only nonpositive or numerically-null modes receive the trust
-/// metric's unit curvature (or the larger numerical-rank floor):
+/// by `D` makes the curvature classification and radius invariant to coefficient
+/// units. Positive-definite interior Newton uses `λ=0` and leaves `H` unchanged.
+/// Otherwise the shared Moré–Sorensen secular solver chooses the unique
+/// `λ >= max(0, -gamma_min)` for the supplied trust radius:
 ///
 /// ```text
 /// B = D^(-1/2) H D^(-1/2) = V diag(gamma) V'
-/// gamma_plus = gamma                         if gamma > floor
-///              max(1, floor)                 otherwise
-/// M = D^(1/2) V diag(gamma_plus) V' D^(1/2).
+/// c = V' D^(-1/2) rhs
+/// eta(lambda) = c / (gamma + lambda)
+/// ||eta(lambda)||₂ <= trust_radius
+/// M = D^(1/2) V diag(gamma + lambda) V' D^(1/2).
 /// ```
 ///
-/// This is a trust-majorized positive spectral completion. It differs
-/// fundamentally from both `|gamma|` and a numerical-floor completion: a
-/// strongly negative mode neither becomes a strongly attractive surrogate
-/// minimum nor an almost-unregularized direction that races to remote
-/// constraint walls. Instead it uses exactly the stable D-projected-gradient
-/// geometry, while identified positive modes retain their Newton scaling. The
-/// caller's exact-objective trust ratio still decides the nonlinear step.
-fn generalized_trust_majorized_reduced_metric(
+/// Thus an identified negative mode reaches the finite-radius boundary instead
+/// of receiving an arbitrary unit curvature that can collapse its step under an
+/// anisotropic `D`. Genuine numerical-null modes retain unit `D` curvature: the
+/// secular solver deliberately drops those gauge directions, so they need a
+/// unique neutral metric in the downstream constrained projection. The caller's
+/// exact-objective trust ratio remains the nonlinear acceptance authority.
+fn generalized_trust_region_reduced_metric(
     reduced_hessian: &Array2<f64>,
     reduced_trust_metric: &Array2<f64>,
+    reduced_rhs: &Array1<f64>,
+    trust_radius: f64,
 ) -> Result<(Array2<f64>, bool), String> {
     let dimension = reduced_hessian.nrows();
     if dimension == 0
         || reduced_hessian.ncols() != dimension
         || reduced_trust_metric.nrows() != dimension
         || reduced_trust_metric.ncols() != dimension
+        || reduced_rhs.len() != dimension
     {
-        return Err("generalized reduced metric requires nonempty equal square matrices".into());
+        return Err(
+            "generalized reduced trust region requires equal matrix/vector dimensions".into(),
+        );
+    }
+    if !(trust_radius.is_finite() && trust_radius > 0.0) {
+        return Err("generalized reduced trust region requires a finite positive radius".into());
     }
 
     let mut trust_metric = reduced_trust_metric.clone();
@@ -190,34 +198,63 @@ fn generalized_trust_majorized_reduced_metric(
     {
         return Err("whitened reduced Hessian contains non-finite curvature".into());
     }
-    let curvature_scale = generalized_eigenvalues
+    let whitened_rhs = metric_inv_sqrt.dot(reduced_rhs);
+    let spectral_rhs = generalized_eigenvectors.t().dot(&whitened_rhs);
+    if spectral_rhs.iter().any(|value| !value.is_finite()) {
+        return Err("whitened reduced trust-region rhs is non-finite".into());
+    }
+    let lambda_max_abs = generalized_eigenvalues
         .iter()
         .map(|value| value.abs())
-        .fold(1.0_f64, f64::max);
-    let positive_floor = KKT_REFUSAL_RANK_TOL * curvature_scale;
-    let exact_positive_curvature = generalized_eigenvalues
-        .iter()
-        .all(|value| *value > positive_floor);
-    let bad_mode_curvature = positive_floor.max(1.0);
+        .fold(0.0_f64, f64::max);
+    let numerical_floor =
+        joint_hessian_numerical_eigenvalue_floor(lambda_max_abs, dimension);
+    let null_cutoff = (KKT_REFUSAL_RANK_TOL * lambda_max_abs).max(numerical_floor);
+    let spectrum = whitened_spectrum::WhitenedHessianSpectrum {
+        gamma: generalized_eigenvalues.clone(),
+        evecs: generalized_eigenvectors.clone(),
+        c: spectral_rhs,
+        d_inv_sqrt: Array1::ones(dimension),
+        lambda_max_abs,
+        null_cutoff,
+        numerical_floor,
+    };
+    let trust_step = spectrum.trust_region_step(trust_radius);
+    let Some(trust_shift) = trust_step.trust_region_shift else {
+        return Err(
+            "generalized reduced trust region unexpectedly selected reflected fallback".into(),
+        );
+    };
+    if !(trust_shift.is_finite() && trust_shift >= 0.0) {
+        return Err("generalized reduced trust-region shift is invalid".into());
+    }
+    let exact_positive_curvature = trust_shift == 0.0
+        && !trust_step.trust_region_hard_case
+        && generalized_eigenvalues
+            .iter()
+            .all(|value| *value > numerical_floor);
 
-    let mut positive_columns = generalized_eigenvectors.clone();
+    let mut shifted_columns = generalized_eigenvectors.clone();
     for (column, eigenvalue) in generalized_eigenvalues.iter().enumerate() {
-        let curvature = if *eigenvalue > positive_floor {
-            *eigenvalue
+        let curvature = if eigenvalue.abs() <= numerical_floor {
+            // The shared spectral step drops genuine numerical gauges. Give
+            // only those modes neutral unit D curvature so the constrained QP
+            // remains unique without inventing motion in an unidentified mode.
+            1.0
         } else {
-            bad_mode_curvature
+            (*eigenvalue + trust_shift).max(numerical_floor)
         };
         for row in 0..dimension {
-            positive_columns[[row, column]] *= curvature;
+            shifted_columns[[row, column]] *= curvature;
         }
     }
-    let whitened_positive = positive_columns.dot(&generalized_eigenvectors.t());
+    let whitened_shifted = shifted_columns.dot(&generalized_eigenvectors.t());
     let mut metric = metric_sqrt
-        .dot(&whitened_positive)
+        .dot(&whitened_shifted)
         .dot(&metric_sqrt);
     symmetrize_dense_in_place(&mut metric);
     if metric.iter().any(|value| !value.is_finite()) {
-        return Err("generalized positive reduced metric is non-finite".into());
+        return Err("generalized trust-region reduced metric is non-finite".into());
     }
     Ok((metric, exact_positive_curvature))
 }
@@ -234,26 +271,25 @@ fn generalized_trust_majorized_reduced_metric(
 ///     (Z' H Z) delta_z = Z' r,   delta = Z delta_z,
 ///
 /// where `Z` spans `null(A_active)`. If the reduced Hessian is singular or
-/// indefinite, there is no exact Newton minimizer on that face. Ambient
-/// eigenvalue reflection is not a substitute: it changes accessible positive
+/// indefinite, there is no unconstrained Newton minimizer on that face. Ambient
+/// eigenvalue reflection is not a substitute: it changes inaccessible normal
 /// curvature and can cycle among unrelated faces (#979). Instead, this routine
-/// whitens the reduced Hessian by the reduced trust metric, preserves every
-/// identified positive generalized eigenmode exactly, and gives only
-/// nonpositive or numerically-null modes the trust metric's unit curvature.
-/// The resulting SPD proximal metric `M` defines the constraint-aware map
+/// solves the generalized Moré–Sorensen problem on the face tangent, choosing
+/// the self-vanishing shift `λ` from the current trust radius. The resulting
+/// positive metric `M = H_face + λD_face` defines the constraint-aware map
 ///
 ///     beta_next = argmin_{x in C} 1/2 ||x-beta||_M^2 - r' (x-beta)
 ///               = P_C^M(beta + M^-1 r).
 ///
-/// Here `M` is built from the solver's existing positive
-/// trust/preconditioner metric `D`. The projection variational inequality
+/// The projection variational inequality
 /// certifies
 ///
 ///     r' delta >= ||delta||_M^2 > 0
 ///
 /// for every nonzero step, so the exact-objective trust loop receives a genuine
-/// first-order descent direction. Strict saddles at zero projected gradient are
-/// handled separately by the reduced-curvature certificate/escape machinery. A
+/// first-order descent direction. Strict hard-case saddles at zero projected
+/// gradient are handled separately by the reduced-curvature certificate/escape
+/// machinery. A
 /// fully pinned current face has no tangent system to regularize; there the
 /// routine uses the original `D`-metric projected gradient so invalid active
 /// rows can still release.
@@ -269,6 +305,7 @@ fn certified_reduced_face_candidate(
     constraints: &ConstraintSet,
     active_rows: &[usize],
     trust_metric_diag: &Array1<f64>,
+    trust_radius: f64,
 ) -> Result<Option<(Array1<f64>, Vec<usize>, ReducedFaceCandidateKind)>, String> {
     let p = beta.len();
     if active_rows.is_empty()
@@ -300,10 +337,13 @@ fn certified_reduced_face_candidate(
             symmetrize_dense_in_place(&mut reduced_hessian);
             let mut reduced_trust_metric = tangent.t().dot(&trust_metric).dot(tangent);
             symmetrize_dense_in_place(&mut reduced_trust_metric);
-            let (positive_reduced_metric, exact_positive_curvature) =
-                match generalized_trust_majorized_reduced_metric(
+            let reduced_rhs = tangent.t().dot(rhs);
+            let (trust_region_reduced_metric, exact_positive_curvature) =
+                match generalized_trust_region_reduced_metric(
                     &reduced_hessian,
                     &reduced_trust_metric,
+                    &reduced_rhs,
+                    trust_radius,
                 ) {
                     Ok(metric) => metric,
                     Err(_) => return Ok(None),
@@ -319,7 +359,7 @@ fn certified_reduced_face_candidate(
                 .dot(&trust_metric)
                 .dot(&normal_projector);
             let metric = tangent
-                .dot(&positive_reduced_metric)
+                .dot(&trust_region_reduced_metric)
                 .dot(&tangent.t())
                 + normal_metric;
             let kind = if exact_positive_curvature {
@@ -500,6 +540,7 @@ mod exact_face_newton_tests {
             &constraints,
             &[0],
             &metric,
+            1.0e6,
         )
         .expect("exact face classification")
         .expect("positive reduced curvature and nonnegative multiplier");
@@ -532,6 +573,7 @@ mod exact_face_newton_tests {
             &constraints,
             &[0],
             &metric,
+            1.0,
         )
         .expect("reduced face classification")
         .expect("regularized reduced QP resolves the blocker");
@@ -580,6 +622,7 @@ mod exact_face_newton_tests {
             &constraints,
             &[0],
             &metric,
+            1.0e6,
         )
         .expect("reduced face classification")
         .expect("face-preserving QP resolves the far blocker");
@@ -636,6 +679,7 @@ mod exact_face_newton_tests {
             &constraints,
             &[0],
             &metric,
+            1.0e6,
         )
         .expect("face classification")
         .expect("batched face QP");
@@ -677,6 +721,7 @@ mod exact_face_newton_tests {
             &constraints,
             &[0],
             &metric,
+            2.0,
         )
         .expect("reduced face classification")
         .expect("regularized reduced step is feasible");
@@ -688,6 +733,7 @@ mod exact_face_newton_tests {
                 &constraints,
                 &[0],
                 &metric,
+                2.0,
             )
             .expect("strongly indefinite face classification")
             .expect("regularized reduced step reaches the same endpoint");
@@ -703,41 +749,26 @@ mod exact_face_newton_tests {
     }
 
     #[test]
-    fn trust_majorized_completion_preserves_identified_positive_modes() {
-        let reduced_hessian = array![
-            [4.0_f64, 0.0, 0.0, 0.0],
-            [0.0, 0.5, 0.0, 0.0],
-            [0.0, 0.0, -2.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0]
-        ];
-        let reduced_trust = array![
-            [2.0_f64, 0.0, 0.0, 0.0],
-            [0.0, 2.0, 0.0, 0.0],
-            [0.0, 0.0, 4.0, 0.0],
-            [0.0, 0.0, 0.0, 8.0]
-        ];
-        let (metric, exact) =
-            generalized_trust_majorized_reduced_metric(&reduced_hessian, &reduced_trust)
-                .expect("generalized trust-majorized completion");
+    fn indefinite_reduced_metric_uses_more_sorensen_radius_not_unit_curvature() {
+        // In one dimension D=2, H=-2, rhs=2 and radius=1. The exact generalized
+        // trust solution has whitened step eta=1, hence delta=1/sqrt(2).
+        // Therefore H+lambda*D must be 2*sqrt(2), not the old arbitrary D=2
+        // completion (whose delta=1 violates the radius).
+        let reduced_hessian = array![[-2.0_f64]];
+        let reduced_trust = array![[2.0_f64]];
+        let reduced_rhs = array![2.0_f64];
+        let (metric, exact) = generalized_trust_region_reduced_metric(
+            &reduced_hessian,
+            &reduced_trust,
+            &reduced_rhs,
+            1.0,
+        )
+        .expect("generalized Moré-Sorensen metric");
 
         assert!(!exact);
-        assert!(
-            (metric[[0, 0]] - 4.0).abs() <= 1e-12,
-            "the identified positive generalized mode must remain exact"
-        );
-        assert!(
-            (metric[[1, 1]] - 0.5).abs() <= 1e-12,
-            "positive curvature below trust-unit scale must also remain exact"
-        );
-        assert!((metric[[2, 2]] - 4.0).abs() <= 1e-12);
-        assert!((metric[[3, 3]] - 8.0).abs() <= 1e-12);
-        for row in 0..4 {
-            for column in 0..4 {
-                if row != column {
-                    assert!(metric[[row, column]].abs() <= 1e-12);
-                }
-            }
-        }
+        assert!((metric[[0, 0]] - 2.0 * 2.0_f64.sqrt()).abs() <= 1e-10);
+        let delta = reduced_rhs[0] / metric[[0, 0]];
+        assert!(((2.0 * delta * delta).sqrt() - 1.0).abs() <= 1e-10);
     }
 
     #[test]
@@ -765,6 +796,7 @@ mod exact_face_newton_tests {
             &constraints,
             &[0, 1],
             &metric,
+            1.0,
         )
         .expect("fully pinned face classification")
         .expect("projected gradient releases invalid active walls");
@@ -2852,6 +2884,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             constraints,
                             active_rows,
                             &joint_trust_metric_diag,
+                            joint_trust_radius,
                         )?
                     } else {
                         None
