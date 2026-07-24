@@ -44,8 +44,9 @@ def _pca_held_out_ev(train, test, rank):
 def test_sparse_trainer_held_out_ev_beats_pca_baseline_modest_k():
     rng = np.random.default_rng(0)
     k, p = 16, 24
-    train, _ = _planted(rng, k, p, n=640)
-    test, _ = _planted(rng, k, p, n=200)
+    corpus, _ = _planted(rng, k, p, n=840)
+    train = corpus[:640]
+    test = corpus[640:]
 
     fit = sparse_dictionary_fit(
         train,
