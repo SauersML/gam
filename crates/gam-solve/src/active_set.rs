@@ -3852,8 +3852,29 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
     ));
     let mut transitions = 0usize;
     let mut conditioned_phase = false;
+    // Hard safety net on the dual add/drop walk. The `visited` set below only
+    // catches an EXACT bit-for-bit repeat of a dual state; a near-cycle that
+    // oscillates by a few ULPs each pass (condition-driven drift on an
+    // ill-scaled face) never re-hashes to an identical `point_key`, so it can
+    // slip past that guard and spin essentially forever. That unbounded spin is
+    // the marginal-slope "extremely slow / survival HANGS" failure in #979 —
+    // and a hang is strictly worse than a raise because the caller's
+    // try/except cannot catch it. Mirror the sibling primal solvers, which all
+    // cap at `(p + m + 8) * 4`, but keep a generous multiplier here since the
+    // dual counter ticks on every add AND every drop: a convergent projection
+    // needs O(m) transitions, so this bound is never reached in practice and
+    // only fires to convert a would-be hang into a catchable certification
+    // error.
+    let max_transitions = (p + m + 8) * 16;
 
     loop {
+        if transitions > max_transitions {
+            return Err(EstimationError::ParameterConstraintViolation(format!(
+                "operator metric projection exceeded {max_transitions} rank-bounded dual \
+                 transitions without certifying a face (p={p}, m={m}); returning a catchable \
+                 error instead of looping (#979)"
+            )));
+        }
         let values = ops.values(&candidate)?;
         let mut entering = None;
         let mut entering_violation = ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
