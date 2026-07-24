@@ -615,11 +615,21 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
     eval_mode: EvalMode,
+    // `true` when a value-only evaluation must still fold the `D_β H_Φ` drift.
+    // Ignored for derivative-bearing modes (they always build it).
+    value_only_requires_drift: bool,
 ) -> Result<Option<JeffreysHphiDriftBatchFn>, String> {
-    // The closure contributes only to outer derivatives.  A value-only probe
-    // never invokes a derivative provider, so do not even materialize the
-    // information matrix/eigensystem needed to construct this closure.
-    if eval_mode == EvalMode::ValueOnly {
+    // The drift closure feeds the derivative provider. A derivative-bearing eval
+    // always consumes it; a value-only eval consumes it ONLY through the
+    // moving-Hessian KKT cost correction `−½ g_ldᵀ H⁻¹ r` (gam#1395), which fires
+    // when the inner β̂ exits with a non-negligible KKT residual (`w = H⁻¹r ≠ 0`).
+    // In that regime `D_β H_Φ[w]` is a real part of the *corrected cost*, so the
+    // value-only lane must fold it too or it prices a DIFFERENT objective than the
+    // gradient lane and the terminal value-agreement audit refuses the fit
+    // (#2387). When the residual is negligible the correction is provably ~0, so
+    // the drift is skipped and no information matrix/eigensystem is materialized —
+    // preserving the value-only line-search fast path.
+    if eval_mode == EvalMode::ValueOnly && !value_only_requires_drift {
         return Ok(None);
     }
     if !family.joint_jeffreys_term_required() {
