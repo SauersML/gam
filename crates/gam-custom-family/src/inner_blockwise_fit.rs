@@ -308,8 +308,10 @@ fn certified_reduced_face_candidate(
     trust_radius: f64,
 ) -> Result<Option<(Array1<f64>, Vec<usize>, ReducedFaceCandidateKind)>, String> {
     let p = beta.len();
-    if active_rows.is_empty()
-        || rhs.len() != p
+    if active_rows.is_empty() {
+        return Ok(None);
+    }
+    if rhs.len() != p
         || exact_hessian.nrows() != p
         || exact_hessian.ncols() != p
         || constraints.ncols() != p
@@ -318,7 +320,16 @@ fn certified_reduced_face_candidate(
             .iter()
             .any(|value| !value.is_finite() || *value <= 0.0)
     {
-        return Ok(None);
+        return Err(format!(
+            "reduced-face candidate dimension/metric contract failed \
+             (p={p}, rhs={}, hessian={}x{}, constraints={}x{}, trust_metric={})",
+            rhs.len(),
+            exact_hessian.nrows(),
+            exact_hessian.ncols(),
+            constraints.nrows(),
+            constraints.ncols(),
+            trust_metric_diag.len(),
+        ));
     }
     let gathered = constraints
         .gather_rows(active_rows)
@@ -339,15 +350,19 @@ fn certified_reduced_face_candidate(
             symmetrize_dense_in_place(&mut reduced_trust_metric);
             let reduced_rhs = tangent.t().dot(rhs);
             let (trust_region_reduced_metric, exact_positive_curvature) =
-                match generalized_trust_region_reduced_metric(
+                generalized_trust_region_reduced_metric(
                     &reduced_hessian,
                     &reduced_trust_metric,
                     &reduced_rhs,
                     trust_radius,
-                ) {
-                    Ok(metric) => metric,
-                    Err(_) => return Ok(None),
-                };
+                )
+                .map_err(|error| {
+                    format!(
+                        "reduced-face generalized trust-region metric failed \
+                         (ambient_dim={p}, tangent_dim={}): {error}",
+                        tangent.ncols(),
+                    )
+                })?;
 
             // Lift the completed reduced metric into the accessible tangent.
             // Add N D N only on the inaccessible Euclidean-normal subspace so
@@ -380,20 +395,25 @@ fn certified_reduced_face_candidate(
         };
     symmetrize_dense_in_place(&mut face_metric);
     if face_metric.iter().any(|value| !value.is_finite()) {
-        return Ok(None);
+        return Err("reduced-face lifted metric is non-finite".into());
     }
     let rhs_beta = face_metric.dot(beta) + rhs;
     let (candidate, next_active) =
-        match gam_solve::active_set::solve_quadratic_with_constraint_set(
+        gam_solve::active_set::solve_quadratic_with_constraint_set(
             &face_metric,
             &rhs_beta,
             beta,
             constraints,
             Some(active_rows),
-        ) {
-            Ok(result) => result,
-            Err(_) => return Ok(None),
-        };
+        )
+        .map_err(|error| {
+            format!(
+                "reduced-face constrained metric projection failed \
+                 (ambient_dim={p}, warm_active_rows={}, constraint_rows={}): {error}",
+                active_rows.len(),
+                constraints.nrows(),
+            )
+        })?;
     let delta = &candidate - beta;
     let directional_descent = rhs.dot(&delta);
     let metric_delta = face_metric.dot(&delta);
@@ -406,7 +426,15 @@ fn certified_reduced_face_candidate(
         && metric_norm_squared > 0.0
         && directional_descent + projection_tolerance >= metric_norm_squared)
     {
-        return Ok(None);
+        return Err(format!(
+            "reduced-face metric projection failed its descent certificate \
+             (directional_descent={directional_descent:.6e}, \
+             metric_norm_squared={metric_norm_squared:.6e}, \
+             tolerance={projection_tolerance:.6e}, \
+             step_inf={:.6e}, active_rows={})",
+            delta.iter().map(|value| value.abs()).fold(0.0_f64, f64::max),
+            next_active.len(),
+        ));
     }
 
     // A positive original tangent Hessian can mint an exact Newton step only if
@@ -428,7 +456,11 @@ fn certified_reduced_face_candidate(
                     &final_rows.a,
                 )
             else {
-                return Ok(None);
+                return Err(format!(
+                    "reduced-face original-Hessian KKT projection failed \
+                     on {} terminal active rows",
+                    next_active.len(),
+                ));
             };
             projected
         };
@@ -486,6 +518,34 @@ fn canonical_accepted_active_rows(
 mod exact_face_newton_tests {
     use super::*;
     use ndarray::array;
+
+    #[test]
+    fn reduced_face_contract_violation_is_an_error_not_a_fallback() {
+        let hessian = Array2::<f64>::eye(2);
+        let rhs = array![1.0_f64];
+        let beta = array![0.0_f64, 0.0];
+        let constraints = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(array![[1.0_f64, 0.0]], array![0.0])
+                .expect("x>=0 half-space"),
+        );
+        let metric = Array1::<f64>::ones(2);
+
+        let error = certified_reduced_face_candidate(
+            &hessian,
+            &rhs,
+            &beta,
+            &constraints,
+            &[0],
+            &metric,
+            1.0,
+        )
+        .expect_err("an attempted reduced-face solve must never silently change models");
+
+        assert!(
+            error.contains("dimension/metric contract failed"),
+            "unexpected reduced-face diagnostic: {error}"
+        );
+    }
 
     #[test]
     fn accepted_face_is_canonical_across_degenerate_qp_row_bases() {
