@@ -338,7 +338,7 @@ impl StochasticTraceControlVariates {
         let trace: f64 = match control.chart.as_ref() {
             PenaltyTraceChart::Reduced {
                 start,
-                end,
+                end: _,
                 whitening,
             } => {
                 let (a, a_start, a_end) = control.coordinate.scaled_block_local(control.lambda);
