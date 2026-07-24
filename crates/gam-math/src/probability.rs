@@ -404,6 +404,27 @@ fn signed_exp_sum(log_magnitudes: &[f64], signs: &[f64]) -> f64 {
     }
 }
 
+#[inline]
+fn acklam_lower_tail_quantile_from_log_probability(log_p: f64) -> f64 {
+    const C: [f64; 6] = [
+        -7.784_894_002_430_293e-3,
+        -3.223_964_580_411_365e-1,
+        -2.400_758_277_161_838,
+        -2.549_732_539_343_734,
+        4.374_664_141_464_968,
+        2.938_163_982_698_783,
+    ];
+    const D: [f64; 4] = [
+        7.784_695_709_041_462e-3,
+        3.224_671_290_700_398e-1,
+        2.445_134_137_142_996,
+        3.754_408_661_907_416,
+    ];
+    let q = (-2.0 * log_p).sqrt();
+    (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+        / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+}
+
 /// Standard normal quantile Φ⁻¹(p) using Acklam's rational approximation.
 #[inline]
 pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
@@ -426,36 +447,18 @@ pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
         6.680_131_188_771_972e1,
         -1.328_068_155_288_572e1,
     ];
-    const C: [f64; 6] = [
-        -7.784_894_002_430_293e-3,
-        -3.223_964_580_411_365e-1,
-        -2.400_758_277_161_838,
-        -2.549_732_539_343_734,
-        4.374_664_141_464_968,
-        2.938_163_982_698_783,
-    ];
-    const D: [f64; 4] = [
-        7.784_695_709_041_462e-3,
-        3.224_671_290_700_398e-1,
-        2.445_134_137_142_996,
-        3.754_408_661_907_416,
-    ];
     const P_LOW: f64 = 0.02425;
     const P_HIGH: f64 = 1.0 - P_LOW;
 
     let mut x = if p < P_LOW {
-        let q = (-2.0 * p.ln()).sqrt();
-        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
-            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+        acklam_lower_tail_quantile_from_log_probability(p.ln())
     } else if p <= P_HIGH {
         let q = p - 0.5;
         let r = q * q;
         (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
             / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
     } else {
-        let q = (-2.0 * (1.0 - p).ln()).sqrt();
-        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
-            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+        -acklam_lower_tail_quantile_from_log_probability((1.0 - p).ln())
     };
     for _ in 0..2 {
         let density = normal_pdf(x);
@@ -482,6 +485,51 @@ pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
             break;
         }
         let step = correction / denominator;
+        if !step.is_finite() {
+            break;
+        }
+        x -= step;
+        if step.abs() <= 2.0 * f64::EPSILON * x.abs().max(1.0) {
+            break;
+        }
+    }
+    Ok(x)
+}
+
+/// Standard normal quantile from `log_p = ln Φ(x)`.
+///
+/// Unlike [`standard_normal_quantile`], this remains defined when `Φ(x)` is
+/// smaller than the least positive `f64`, and when `Φ(x)` is so close to one
+/// that exponentiating `log_p` rounds to exactly one. Acklam's lower-tail
+/// approximation supplies the initial point; Newton polishing solves
+/// `ln Φ(x) = log_p` with the stable log-CDF and Mills ratio, so neither tail
+/// forms a probability-space subtraction.
+#[inline]
+pub fn standard_normal_quantile_from_log_cdf(log_p: f64) -> Result<f64, String> {
+    if !(log_p.is_finite() && log_p < 0.0) {
+        return Err(format!(
+            "normal log-quantile requires finite log_p < 0, got {log_p}"
+        ));
+    }
+
+    if log_p > -std::f64::consts::LN_2 {
+        // Reflect through the upper tail without forming `1 - exp(log_p)`.
+        let log_q = (-log_p.exp_m1()).ln();
+        return standard_normal_quantile_from_log_cdf(log_q).map(|x| -x);
+    }
+
+    let p = log_p.exp();
+    let mut x = if p > 0.0 {
+        standard_normal_quantile(p)?
+    } else {
+        acklam_lower_tail_quantile_from_log_probability(log_p)
+    };
+    for _ in 0..4 {
+        let (current_log_p, mills_ratio) = signed_probit_logcdf_and_mills_ratio(x);
+        if !(current_log_p.is_finite() && mills_ratio.is_finite() && mills_ratio > 0.0) {
+            break;
+        }
+        let step = (current_log_p - log_p) / mills_ratio;
         if !step.is_finite() {
             break;
         }
@@ -1054,6 +1102,19 @@ mod tests {
             "logcdf(10) must retain its negative tail: {got:e}"
         );
         assert_eq!(got.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn log_cdf_quantile_round_trips_both_unrepresentable_tails() {
+        for x in [-1.0e6, -40.0, -10.0, -2.0, 0.0, 2.0, 10.0] {
+            let log_p = normal_logcdf(x);
+            let recovered = standard_normal_quantile_from_log_cdf(log_p)
+                .expect("finite strict log-CDF has a quantile");
+            assert!(
+                (recovered - x).abs() <= 2.0e-12 * x.abs().max(1.0),
+                "log-quantile round trip at x={x}: log_p={log_p}, recovered={recovered}"
+            );
+        }
     }
 
     // ── normal_logsf ─────────────────────────────────────────────────────────

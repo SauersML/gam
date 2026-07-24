@@ -8548,7 +8548,30 @@ pub(crate) fn truncated_nonnegative_normal_expectation_matches_closed_form_2390(
             "E[w | w>=0] mismatch at mu={mu} sd={sd}: got {m1}, want {expected}"
         );
     }
-    // Interior limit: truncation underflows and the plain mean is recovered.
+    // Deep negative tail: direct `1 - Φ(-μ/σ)` is already zero in f64 at
+    // μ/σ=-10, but the conditional law is not a point mass. Its first two
+    // moments remain finite and are pinned through the stable Mills ratio.
+    let mu = -10.0;
+    let sd = 1.0;
+    let (_, mills) = gam_math::probability::signed_probit_logcdf_and_mills_ratio(mu / sd);
+    let expected_first = mu + sd * mills;
+    let expected_second = mu * mu + sd * sd + mu * sd * mills;
+    let (m1, m2) = super::moments::truncated_nonnegative_normal_expectation_pair(
+        mu,
+        sd,
+        |w| Ok((w, w * w)),
+    )
+    .expect("deep-tail integrand");
+    assert!(
+        (m1 - expected_first).abs() < 1.0e-9,
+        "deep-tail first moment collapsed: got {m1}, want {expected_first}"
+    );
+    assert!(
+        (m2 - expected_second).abs() < 1.0e-9,
+        "deep-tail second moment collapsed: got {m2}, want {expected_second}"
+    );
+    // Interior limit: the removed left-tail mass is negligible and the plain
+    // Gaussian mean is recovered.
     let (m1, _) = super::moments::truncated_nonnegative_normal_expectation_pair(
         50.0, 1.0, |w| Ok((w, w * w)),
     )
