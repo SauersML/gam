@@ -14,11 +14,10 @@ name: Validate One
 # One NEVER rebuilds or relinks Rust tests. If no exact archive exists, it fails
 # immediately and tells the caller to dispatch Rust CI.
 #
-# It deliberately mirrors test.yml's `python-tests` job for the Python path
-# (Rust 1.93.0, maturin build+wheel-install, the gamfit/_rust .so copy that
-# defeats the cwd source-package shadowing) so a pass/fail here means the same
-# thing it would in the full suite. Python still builds its extension because
-# the Rust nextest archive cannot provide a Python extension module.
+# Python and torch filters consume the exact-SHA manylinux wheel produced by
+# wheel-nightly.yml. They run from runner.temp so the checked-out source package
+# cannot shadow the installed wheel. Validate One therefore compiles nothing:
+# Rust uses a nextest archive; Python uses the rolling runtime artifact.
 #
 # TORCH PATH (opt-in): torch is NOT installed by any CI workflow, so the
 # tests/torch/ suite (#1890/#1891/#1893/#1939/#1942/#2011/#2015/#2021/#2022/#2023
@@ -63,32 +62,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
 
 jobs:
   validate:
     name: Validate one (issue ${{ github.event.inputs.issue }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-        with:
-          # The build.rs human-author gate reads the real last editor of
-          # build.rs; a depth-1 clone makes `git log` return HEAD and
-          # false-fails every Claude-authored HEAD (#1458). Any cargo build/test
-          # below trips that gate, so fetch full history.
-          fetch-depth: 0
-
-      - name: Install Rust 1.93.0
-        if: ${{ github.event.inputs.py_filter != '' || github.event.inputs.torch_filter != '' }}
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
-
-      - name: Cache Python-extension cargo artifacts
-        if: ${{ github.event.inputs.py_filter != '' || github.event.inputs.torch_filter != '' }}
-        uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-nextest
         if: ${{ github.event.inputs.rust_filter != '' }}
@@ -96,11 +78,9 @@ jobs:
         with:
           tool: nextest
 
-      # `gam-pyffi --no-default-features` links and embeds the interpreter that
-      # PyO3 discovers at build time. Some unit tests exercise the NumPy C API,
-      # which imports NumPy from that interpreter at runtime. Establish one
-      # explicit interpreter before the Rust build so discovery and dependency
-      # installation cannot diverge; the Python/torch paths below reuse it.
+      # The prebuilt gam-pyffi test binary embeds Python, and some tests exercise
+      # the NumPy C API. Establish that runtime interpreter explicitly; the
+      # Python/torch paths below reuse it.
       - name: Set up Python 3.11
         if: ${{ (github.event.inputs.rust_filter != '' && github.event.inputs.rust_package == 'gam-pyffi') || github.event.inputs.py_filter != '' || github.event.inputs.torch_filter != '' }}
         uses: actions/setup-python@v5
@@ -113,6 +93,45 @@ jobs:
         run: |
           python -m pip install --upgrade "numpy<2"
           python -c "import numpy; print('numpy', numpy.__version__, numpy.get_include())"
+
+      # ---- Python runtime: exact-SHA prebuilt wheel only ------------------
+      - name: Download and install exact-SHA rolling wheel
+        if: ${{ github.event.inputs.py_filter != '' || github.event.inputs.torch_filter != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow wheel-nightly.yml \
+            --commit "$GITHUB_SHA" \
+            --limit 1 \
+            --json databaseId,conclusion \
+            --jq 'map(select(.conclusion == "success"))[0].databaseId // empty')
+          if [[ -z "$run_id" ]]; then
+            echo "::error::No successful rolling-wheel run exists for exact commit ${GITHUB_SHA}. Wait for wheel-nightly.yml; Validate One never builds an extension."
+            exit 1
+          fi
+          runtime_sha=$(gh run view "$run_id" --repo "$GITHUB_REPOSITORY" \
+            --json headSha --jq .headSha)
+          if [[ "$runtime_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::Rolling-wheel provenance mismatch: requested ${GITHUB_SHA}, run ${run_id} is ${runtime_sha}."
+            exit 1
+          fi
+          artifact_name="gamfit-runtime-${GITHUB_SHA}"
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+            --name "$artifact_name" --dir python-runtime
+          grep -Fx "commit=${GITHUB_SHA}" python-runtime/RUNTIME_PROVENANCE.txt
+          wheel=$(find python-runtime -maxdepth 1 -type f -name 'gamfit-*.whl' -print -quit)
+          if [[ -z "$wheel" || ! -s "$wheel" ]]; then
+            echo "::error::Runtime artifact ${artifact_name} contains no non-empty gamfit wheel."
+            exit 1
+          fi
+          python -m pip install --force-reinstall "$wheel"
+          (
+            cd "$RUNNER_TEMP"
+            python -c "import gamfit, gamfit._rust; print('exact runtime import ok:', gamfit.__version__)"
+          )
 
       # ---- Rust path: exact-SHA prebuilt archive only ----------------------
       - name: Download exact-SHA Rust test archive
@@ -208,28 +227,6 @@ jobs:
               -E "$expression"
           done
 
-      # ---- Python/torch shared prerequisites (either filter needs the extension) ----
-      - name: Install maturin
-        if: ${{ github.event.inputs.py_filter != '' || github.event.inputs.torch_filter != '' }}
-        run: python -m pip install --upgrade pip "maturin>=1.7,<2"
-
-      - name: Build and install gam extension (maturin build + wheel install)
-        if: ${{ github.event.inputs.py_filter != '' || github.event.inputs.torch_filter != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf dist
-          maturin build --release -i python3 -o dist
-          python -m pip install --force-reinstall dist/*.whl
-          # pytest runs from the repo root, where the source ./gamfit/ package
-          # shadows the installed wheel on sys.path (cwd searched first). The
-          # source tree has no compiled extension, so `import gamfit._rust`
-          # fails. Copy the just-built extension from the installed wheel into
-          # the source tree so the cwd-shadowed import resolves the real module.
-          SITE="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-          cp "$SITE"/gamfit/_rust*.so gamfit/ 2>/dev/null || true
-          ls -la gamfit/_rust*.so || { echo "::error::compiled gamfit._rust extension not found in $SITE/gamfit after wheel install"; exit 1; }
-
       - name: Install Python test extras
         if: ${{ github.event.inputs.py_filter != '' || github.event.inputs.torch_filter != '' }}
         run: |
@@ -239,7 +236,8 @@ jobs:
 
       - name: Run Python tests (filtered, fail-fast)
         if: ${{ github.event.inputs.py_filter != '' }}
-        run: python -m pytest tests/ -k "${{ github.event.inputs.py_filter }}" -p no:cacheprovider -x -q --tb=short
+        working-directory: ${{ runner.temp }}
+        run: python -m pytest "${{ github.workspace }}/tests/" -k "${{ github.event.inputs.py_filter }}" -p no:cacheprovider -x -q --tb=short
 
       # ---- torch path (opt-in; only when a torch_filter was given) ----------
       - name: Install CPU torch wheel
@@ -248,7 +246,8 @@ jobs:
 
       - name: Run torch tests (filtered, fail-fast)
         if: ${{ github.event.inputs.torch_filter != '' }}
-        run: python -m pytest tests/torch -k "${{ github.event.inputs.torch_filter }}" -p no:cacheprovider -x -q --tb=short
+        working-directory: ${{ runner.temp }}
+        run: python -m pytest "${{ github.workspace }}/tests/torch" -k "${{ github.event.inputs.torch_filter }}" -p no:cacheprovider -x -q --tb=short
 
       - name: Guard against an empty request
         if: ${{ github.event.inputs.rust_filter == '' && github.event.inputs.py_filter == '' && github.event.inputs.torch_filter == '' }}
