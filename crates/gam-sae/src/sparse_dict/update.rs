@@ -152,6 +152,9 @@ pub(crate) struct SparseDictIterate {
     decoder_fixed_point_residual: f64,
     routing_residual: f64,
     inner_tolerance: f64,
+    accepted_births: usize,
+    live_atom_high_water: usize,
+    support_saturated: bool,
     /// Whether the decoder AND routing fixed-point residuals ALSO closed to
     /// `inner_tolerance` (arm 1). `false` marks a **best-effort** iterate returned
     /// at `K` above the intrinsic rank, where the `>rank` spurious support
@@ -408,6 +411,43 @@ const LINEAR_EV_PLATEAU_MIN_ROUNDS: usize = 3;
 /// (whose rounds are non-stationary and never fill the window), and keeps the
 /// confirmation horizon (a budget shorter than the window cannot confirm).
 const LINEAR_EV_PLATEAU_WINDOW: usize = LINEAR_EV_PLATEAU_MIN_ROUNDS + 1;
+/// Consecutive rounds without a new high-water mark in the number of live atoms
+/// before fixed-cardinality birth swaps are treated as saturated support.
+///
+/// A residual-row proposal firing on the same row that seeded it is not evidence
+/// of structural progress. Progress means expanding the live support; once its
+/// cardinality has set no new high for this whole window, accepted proposals are
+/// replacements on the current support manifold. They may still improve the
+/// objective, so saturation alone never exits: the independent EV-plateau window
+/// must also confirm. Matching that window gives both signals the same minimum
+/// observation horizon and avoids any guessed `K/N` capacity threshold (#2400).
+const LINEAR_SUPPORT_SATURATION_ROUNDS: usize = LINEAR_EV_PLATEAU_WINDOW;
+
+#[derive(Clone, Copy, Debug)]
+struct LiveSupportGrowth {
+    high_water: usize,
+    rounds_without_growth: usize,
+}
+
+impl LiveSupportGrowth {
+    fn new(initial_live_atoms: usize) -> Self {
+        Self {
+            high_water: initial_live_atoms,
+            rounds_without_growth: 0,
+        }
+    }
+
+    fn observe(&mut self, live_atoms: usize) -> bool {
+        if live_atoms > self.high_water {
+            self.high_water = live_atoms;
+            self.rounds_without_growth = 0;
+        } else {
+            self.rounds_without_growth = self.rounds_without_growth.saturating_add(1);
+        }
+        self.rounds_without_growth >= LINEAR_SUPPORT_SATURATION_ROUNDS
+    }
+}
+
 /// Per-term rounding scale for the fixed-point convergence floor (#2396).
 ///
 /// The certified arm compares three O(1)-normalized residuals — the EV change
@@ -484,6 +524,7 @@ pub(super) fn run(
         fit_start.elapsed().as_secs_f64(),
     );
     let mut current_ev = explained_variance(x, &codes, decoder.view());
+    let mut live_support = LiveSupportGrowth::new(live_atom_count(&codes, k));
     // Effective fixed-point tolerance: never demand tighter closure than the
     // arithmetic can express (#2396). A `config.tolerance` of `0.0` asks for the
     // tightest achievable fixed point, which in floating point is the rounding
@@ -578,15 +619,22 @@ pub(super) fn run(
             revived_mask[atom] = true;
         }
         let mut accepted_mask = vec![false; k];
+        let mut next_alive = vec![false; k];
         for code in &next_codes {
             for (slot, &atom) in code.indices.iter().enumerate() {
                 let atom = atom as usize;
-                if code.codes[slot] != 0.0 && revived_mask[atom] {
+                if code.codes[slot] == 0.0 {
+                    continue;
+                }
+                next_alive[atom] = true;
+                if revived_mask[atom] {
                     accepted_mask[atom] = true;
                 }
             }
         }
         accepted_births = accepted_mask.iter().filter(|accepted| **accepted).count();
+        let next_live_atoms = next_alive.iter().filter(|&&alive| alive).count();
+        let support_saturated = live_support.observe(next_live_atoms);
 
         // Rejected residual-row proposals are dormant capacity, not trained
         // model parameters. Null them before measuring/adopting the next state so
@@ -617,8 +665,9 @@ pub(super) fn run(
         // any typed non-convergence) is on the same line.
         log::warn!(
             "[SAE epoch {}/{}] ev={:.6} improve={:.3e} ev_resid={:.3e} decoder_resid={:.3e} \
-             routing_resid={:.3e} births={} revived={} refresh_s={:.2} \
-             route_s={:.2} elapsed_s={:.1} max_component={} cg_columns={} device_cols={} \
+             routing_resid={:.3e} births={} revived={} live={}/{} no_growth={} \
+             support_saturated={} refresh_s={:.2} route_s={:.2} elapsed_s={:.1} \
+             max_component={} cg_columns={} device_cols={} \
              cg_nonconverged={} cg_kappa_bound={:?} cg_relative_residual={:.3e}",
             epochs_run,
             config.max_epochs,
@@ -629,6 +678,10 @@ pub(super) fn run(
             routing_residual,
             accepted_births,
             revived_atoms.len(),
+            next_live_atoms,
+            live_support.high_water,
+            live_support.rounds_without_growth,
+            support_saturated,
             refresh_secs,
             route_secs,
             fit_start.elapsed().as_secs_f64(),
@@ -646,10 +699,12 @@ pub(super) fn run(
         // still-climbing objective — or a failed linear subsolve — is a genuine
         // non-convergence error (arm 3, below).
         //
-        // Structure must be settled and the subsolve sound for BOTH arms: a
-        // proposed dead-atom birth is work only when it entered the canonical
-        // routing, and raw normal-equation convergence alone cannot certify a
-        // model because unit projection and rerouting happen afterward.
+        // An absolute certificate still requires zero accepted births. The open
+        // arm additionally admits fixed-cardinality birth swaps only after live
+        // support has stopped setting new highs for a full confirmation window;
+        // the independent objective window below must plateau too. Raw
+        // normal-equation convergence alone cannot certify a model because unit
+        // projection and rerouting happen afterward.
         let numerically_sound = decoder_solve_stats.cg_nonconverged_columns == 0
             && decoder_solve_stats.dense_factorization_failures == 0
             && decoder_solve_stats.cg_relative_residual
@@ -688,8 +743,9 @@ pub(super) fn run(
         // the routing limit cycle; see LINEAR_EV_PLATEAU_WINDOW). `epoch > 0` skips
         // the first post-entry round, whose captured fraction is against a
         // still-forming denominator.
+        let structure_stationary = structure_settled || support_saturated;
         let stationary =
-            epoch > 0 && structure_settled && numerically_sound && objective_plateaued;
+            epoch > 0 && structure_stationary && numerically_sound && objective_plateaued;
         plateau_flags.push_back(stationary);
         while plateau_flags.len() > LINEAR_EV_PLATEAU_WINDOW {
             plateau_flags.pop_front();
@@ -711,6 +767,9 @@ pub(super) fn run(
                 decoder_fixed_point_residual: decoder_residual,
                 routing_residual,
                 inner_tolerance: config.tolerance,
+                accepted_births,
+                live_atom_high_water: live_support.high_water,
+                support_saturated,
                 certified: certified_fixed_point,
             });
         }
@@ -731,6 +790,18 @@ pub(super) fn run(
         decoder_nonconverged_columns: decoder_solve_stats.cg_nonconverged_columns,
         decoder_factorization_failures: decoder_solve_stats.dense_factorization_failures,
     })
+}
+
+fn live_atom_count(codes: &[SparseCode], k: usize) -> usize {
+    let mut alive = vec![false; k];
+    for code in codes {
+        for (slot, &atom) in code.indices.iter().enumerate() {
+            if code.codes[slot] != 0.0 {
+                alive[atom as usize] = true;
+            }
+        }
+    }
+    alive.iter().filter(|&&is_alive| is_alive).count()
 }
 
 /// The unified **linear fast kernel** (design gam#2232, Increment 2, plug points
@@ -1226,6 +1297,9 @@ pub fn run_linear_reml_schedule(
                 outer_tolerance: tolerance,
                 selected_rho: f64::INFINITY,
                 outer_iterations: 0,
+                accepted_births: 0,
+                live_atom_high_water: 0,
+                support_saturated: false,
                 certified: true,
             },
             active,
@@ -1414,6 +1488,7 @@ fn schedule_fit_from_iterate(
         None,
     )?;
     let final_ev = explained_variance(x, &final_codes, fit.decoder.view());
+    let final_live_atoms = live_atom_count(&final_codes, config.n_atoms);
     let (indices, codes) = pack_codes(&final_codes, n, s);
     Ok(SparseDictFit {
         convergence: SparseDictConvergence {
@@ -1427,6 +1502,9 @@ fn schedule_fit_from_iterate(
             outer_tolerance,
             selected_rho,
             outer_iterations,
+            accepted_births: fit.accepted_births,
+            live_atom_high_water: fit.live_atom_high_water.max(final_live_atoms),
+            support_saturated: fit.support_saturated,
             certified,
         },
         decoder: fit.decoder,
@@ -2796,14 +2874,39 @@ fn pack_codes(codes: &[SparseCode], n: usize, s: usize) -> (Array2<u32>, Array2<
 #[cfg(test)]
 mod exact_solve_tests {
     use super::{
-        CgStop, DecoderNormalEq, cg_solve, explained_variance, kappa_from_cg_tridiagonal,
-        pcg_multi_core, route_and_code_all, solve_decoder, solve_decoder_with_routability_gate,
+        CgStop, DecoderNormalEq, LINEAR_SUPPORT_SATURATION_ROUNDS, LiveSupportGrowth, cg_solve,
+        explained_variance, kappa_from_cg_tridiagonal, pcg_multi_core, route_and_code_all,
+        solve_decoder, solve_decoder_with_routability_gate,
     };
     use crate::sparse_dict::codes::SparseCode;
     use crate::sparse_dict::scoring::TileScorer;
     use crate::sparse_dict::{SparseDictConfig, fit_sparse_dictionary};
     use ndarray::{Array2, ArrayView2};
     use std::collections::HashMap;
+
+    #[test]
+    fn live_support_growth_distinguishes_recruitment_from_fixed_cardinality_swaps_2400() {
+        let mut support = LiveSupportGrowth::new(12);
+
+        for stalled_round in 1..LINEAR_SUPPORT_SATURATION_ROUNDS {
+            assert!(
+                !support.observe(12),
+                "support must not saturate before the full confirmation window; \
+                 stalled_round={stalled_round}"
+            );
+        }
+        assert!(
+            support.observe(12),
+            "fixed-cardinality birth swaps must saturate after the full window"
+        );
+
+        assert!(
+            !support.observe(13),
+            "a genuinely new live atom must reset saturation immediately"
+        );
+        assert_eq!(support.high_water, 13);
+        assert_eq!(support.rounds_without_growth, 0);
+    }
 
     /// Full-batch reference assembly of the sparse decoder normal equations
     /// `(A + ρI) D = B` from the fixed codes/supports (`ρ` is applied at solve

@@ -213,6 +213,18 @@ pub struct SparseDictConvergence {
     pub selected_rho: f64,
     /// Full inner fits evaluated by the outer REML schedule.
     pub outer_iterations: usize,
+    /// Residual-row birth proposals that fired in the final inner transition.
+    ///
+    /// A positive count is compatible with an open certificate only when
+    /// [`Self::support_saturated`] is true: those births replace live atoms on a
+    /// fixed-cardinality support manifold instead of expanding model structure.
+    pub accepted_births: usize,
+    /// Largest live-atom cardinality reached during the final inner fit.
+    pub live_atom_high_water: usize,
+    /// Whether live-support cardinality set no new high for the full saturation
+    /// confirmation window. This is reported independently of the EV plateau;
+    /// both are required to return an open fit while births keep swapping (#2400).
+    pub support_saturated: bool,
     /// Whether the inner fit reached the ABSOLUTE fixed point (EV, decoder AND
     /// routing residuals all within tolerance). `false` marks a **best-effort**
     /// fit returned at `K` above the intrinsic rank, where the `>rank` spurious
@@ -243,6 +255,9 @@ impl SparseDictConvergence {
             outer_tolerance: 1e-6,
             selected_rho: f64::INFINITY,
             outer_iterations: 0,
+            accepted_births: 0,
+            live_atom_high_water: 0,
+            support_saturated: false,
             certified: true,
         }
     }

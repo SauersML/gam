@@ -103,7 +103,7 @@ class SparseDictionaryTransform:
 
 @dataclass(frozen=True, slots=True)
 class SparseDictionaryConvergence:
-    """Read-only certificate for a converged sparse-dictionary fit."""
+    """Read-only certificate for a sparse-dictionary fit."""
 
     inner_ev_residual: float
     inner_tolerance: float
@@ -115,15 +115,20 @@ class SparseDictionaryConvergence:
     outer_tolerance: float
     selected_rho: float
     outer_iterations: int
+    accepted_births: int
+    live_atom_high_water: int
+    support_saturated: bool
+    certified: bool
 
 
 @dataclass(frozen=True, slots=True)
 class SparseDictionaryFit:
-    """A certified-converged collapsed-linear-lane model.
+    """An objective-converged collapsed-linear-lane model.
 
-    The Rust solver raises on non-convergence, so this model type is created
-    only after both the inner alternation and outer REML fixed point satisfy
-    their stopping certificates.
+    The Rust solver raises while the objective is still moving. Exact fixed
+    points carry ``convergence.certified=True``; over-complete fits may instead
+    carry an open certificate after independent objective and live-support
+    saturation windows both settle.
 
     Attributes
     ----------
@@ -1261,6 +1266,10 @@ def sparse_dictionary_fit(
             outer_tolerance=float(convergence["outer_tolerance"]),
             selected_rho=float(convergence["selected_rho"]),
             outer_iterations=int(convergence["outer_iterations"]),
+            accepted_births=int(convergence["accepted_births"]),
+            live_atom_high_water=int(convergence["live_atom_high_water"]),
+            support_saturated=bool(convergence["support_saturated"]),
+            certified=bool(convergence["certified"]),
         ),
         active=int(data["active"]),
         score_route_stats=_route_stats(data["score_route_stats"]),

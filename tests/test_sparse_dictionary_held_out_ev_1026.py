@@ -60,6 +60,10 @@ def test_sparse_trainer_held_out_ev_beats_pca_baseline_modest_k():
     assert fit.indices.shape == (train.shape[0], 2)
     assert fit.codes.shape == (train.shape[0], 2)
     assert fit.decoder.shape == (k, p)
+    assert 0 <= fit.convergence.live_atom_high_water <= k
+    assert fit.convergence.accepted_births >= 0
+    assert isinstance(fit.convergence.support_saturated, bool)
+    assert isinstance(fit.convergence.certified, bool)
 
     # Held-out: route the test rows through the frozen decoder, reconstruct.
     routed = fit.transform(test, active=2)
