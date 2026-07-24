@@ -341,7 +341,7 @@ fn fit_multi_atom_dictionary(
             if let (Some(delta), Some(previous_delta)) =
                 (this_delta.as_ref(), prev_delta.as_ref())
             {
-                if let Some((cand_atoms, cand_route, cand_fitted, cand_ev)) =
+                if let Some((cand_atoms, cand_route, cand_fitted)) =
                     try_geometric_extrapolation(
                         atoms.view(),
                         delta.view(),
@@ -355,7 +355,6 @@ fn fit_multi_atom_dictionary(
                     atoms = cand_atoms;
                     assignments = cand_route;
                     fitted = cand_fitted;
-                    rerouted_ev = cand_ev;
                     jumped = true;
                     // Rebuild the geometric history from the jumped point with two
                     // inline plain steps so the next outer iteration can jump again.
@@ -479,7 +478,7 @@ fn try_geometric_extrapolation(
     top_k: usize,
     config: &LinearDictionaryConfig,
     current_ev: f64,
-) -> Option<(Array2<f64>, Array2<f64>, Array2<f64>, f64)> {
+) -> Option<(Array2<f64>, Array2<f64>, Array2<f64>)> {
     let cross: f64 = delta.iter().zip(prev_delta.iter()).map(|(a, b)| a * b).sum();
     let prev_norm2: f64 = prev_delta.iter().map(|v| v * v).sum();
     let delta_norm2: f64 = delta.iter().map(|v| v * v).sum();
@@ -502,7 +501,8 @@ fn try_geometric_extrapolation(
     }
     let delta_owned = delta.to_owned();
     let atoms_owned = atoms.to_owned();
-    let mut best: Option<(Array2<f64>, Array2<f64>, Array2<f64>, f64)> = None;
+    let mut best: Option<(Array2<f64>, Array2<f64>, Array2<f64>)> = None;
+    let mut best_ev = current_ev;
     let mut factor = GEOM_LADDER_BASE;
     loop {
         let mut candidate = &atoms_owned + &(factor * &delta_owned);
@@ -512,10 +512,9 @@ fn try_geometric_extrapolation(
         if let Ok(route) = reroute_against_atoms(x, candidate.view(), top_k, config) {
             let fitted = route.dot(&candidate);
             let ev = explained_variance(x, fitted.view());
-            let beats_current = ev > current_ev;
-            let beats_best = best.as_ref().map(|(_, _, _, b)| ev > *b).unwrap_or(true);
-            if beats_current && beats_best {
-                best = Some((candidate, route, fitted, ev));
+            if ev > best_ev {
+                best_ev = ev;
+                best = Some((candidate, route, fitted));
             }
         }
         if factor >= max_factor {
