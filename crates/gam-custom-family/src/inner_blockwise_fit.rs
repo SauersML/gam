@@ -439,13 +439,21 @@ fn certified_reduced_face_candidate(
         && metric_norm_squared > 0.0
         && model_decrease + projection_tolerance >= 0.0)
     {
+        let (base_violation, base_worst_row) = constraints
+            .max_scaled_violation(beta.view())
+            .unwrap_or((f64::NAN, None));
+        let (candidate_violation, candidate_worst_row) = constraints
+            .max_scaled_violation(candidate.view())
+            .unwrap_or((f64::NAN, None));
         return Err(format!(
             "reduced-face metric projection failed its descent certificate \
              (directional_descent={directional_descent:.6e}, \
              metric_norm_squared={metric_norm_squared:.6e}, \
              model_decrease={model_decrease:.6e}, \
              tolerance={projection_tolerance:.6e}, \
-             step_inf={:.6e}, active_rows={})",
+             step_inf={:.6e}, active_rows={}, \
+             base_scaled_violation={base_violation:.6e}@{base_worst_row:?}, \
+             candidate_scaled_violation={candidate_violation:.6e}@{candidate_worst_row:?})",
             delta.iter().map(|value| value.abs()).fold(0.0_f64, f64::max),
             next_active.len(),
         ));
