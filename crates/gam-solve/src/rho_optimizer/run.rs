@@ -3142,6 +3142,19 @@ const ASYMPTOTE_ESTIMAND_REL_TOL: f64 = 1.0e-4;
 // extra value+gradient evals, paid only at certification of railed fits.
 const ASYMPTOTE_PROBE_COUNT: usize = 18;
 
+/// Local confirmation resolution used only when the one-e-fold ladder cannot
+/// find a clean run. A finite smoothing box can intersect a perfectly regular
+/// asymptote before three whole e-folds of the leading-order tail are visible;
+/// half-e-fold probes resolve that band without relaxing any certificate gate.
+///
+/// The probes remain equally spaced, which is load-bearing: the estimand
+/// certificate interprets consecutive coefficient moves as one geometric
+/// sequence. Six samples cover three e-folds, so the fallback still observes
+/// curvature over a material interval instead of manufacturing constancy from
+/// an arbitrarily small neighborhood.
+const ASYMPTOTE_LOCAL_PROBE_DELTA: f64 = 0.5;
+const ASYMPTOTE_LOCAL_PROBE_COUNT: usize = 6;
+
 /// Read-only inputs to [`try_certify_asymptote_rail`], bundled so the certify
 /// path passes one borrow rather than a long positional argument list.
 struct AsymptoteRailInputs<'a> {
@@ -3737,10 +3750,11 @@ fn try_tail_snap_to_rail(
 }
 
 /// Reconstruct one railed coordinate's exponential tail by probing the analytic
-/// gradient a fixed number of e-folds back from the rail, locate the longest
-/// finite-difference-clean run (rejecting the noise floor adjacent to the rail),
-/// and assess it against the tail law (#2348 Inc 1 / #2337 Thm 2.1). Returns the
-/// certified [`RailCoordinate`] or `None` if no confirmable tail is found.
+/// gradient back from the rail at coarse and, when needed, local resolution;
+/// locate the longest finite-difference-clean run (rejecting the noise floor
+/// adjacent to the rail); and assess it against the tail law (#2348 Inc 1 /
+/// #2337 Thm 2.1). Returns the certified [`RailCoordinate`] or `None` if no
+/// confirmable tail is found.
 fn build_and_assess_rail_coordinate(
     obj: &mut dyn OuterObjective,
     rho: &Array1<f64>,
@@ -3881,14 +3895,14 @@ fn detect_wrong_rail_pullback(
     Ok(best.map(|(_, b)| rows[b].0))
 }
 
-/// Probe one coordinate's tail by stepping the analytic gradient a fixed number
-/// of e-folds from `rho[coord]` toward the interior (the shared probing engine of
-/// [`build_and_assess_rail_coordinate`] and the certify-time tail snap), locate
-/// the longest finite-difference-clean constant-`ĉ` run, and return it as an
-/// assessment window (newest sample nearest `rho[coord]`). `None` when no clean
-/// run of at least [`MIN_TAIL_SAMPLES`] rows exists; the second element is a
-/// compact `(ρ, ∂V/∂ρ, ĉ)` dump of every probed row so a refused tail carries
-/// its own evidence into the decline note instead of an opaque verdict.
+/// Probe one coordinate's tail toward the interior (the shared probing engine
+/// of [`build_and_assess_rail_coordinate`] and the certify-time tail snap).
+/// The one-e-fold ladder runs first; if it finds no clean run, a short
+/// half-e-fold ladder resolves a narrower local band without mixing step sizes
+/// in one estimand window. Returns the longest finite-difference-clean
+/// constant-`ĉ` run (newest sample nearest `rho[coord]`), or `None` when neither
+/// resolution contains at least [`MIN_TAIL_SAMPLES`] clean rows. The second
+/// element dumps `(ρ, ∂V/∂ρ, ĉ)` evidence for every attempted resolution.
 fn probe_tail_window(
     obj: &mut dyn OuterObjective,
     rho: &Array1<f64>,
@@ -3897,7 +3911,58 @@ fn probe_tail_window(
     tol: &AsymptoteTolerances,
     domain: (f64, f64),
 ) -> Result<(Option<AsymptoteWindow>, String), EstimationError> {
-    const PROBE_DELTA: f64 = 1.0;
+    let (coarse_window, coarse_rows) = probe_tail_window_at_resolution(
+        obj,
+        rho,
+        coord,
+        side,
+        tol,
+        domain,
+        (1.0, ASYMPTOTE_PROBE_COUNT),
+    )?;
+    if coarse_window.is_some() {
+        return Ok((coarse_window, coarse_rows));
+    }
+
+    // The coarse ladder is deliberately retained as the first pass: railed
+    // dense REML fits can have several e-folds of cancellation noise beside
+    // the box followed by a clean band far inside it. The local pass addresses
+    // the complementary geometry exposed by #2358, where a modest finite box
+    // contains a narrow but regular tail and unit steps skip over it.
+    let (local_window, local_rows) = probe_tail_window_at_resolution(
+        obj,
+        rho,
+        coord,
+        side,
+        tol,
+        domain,
+        (
+            ASYMPTOTE_LOCAL_PROBE_DELTA,
+            ASYMPTOTE_LOCAL_PROBE_COUNT,
+        ),
+    )?;
+    Ok((
+        local_window,
+        format!("coarse[{coarse_rows}] local[{local_rows}]"),
+    ))
+}
+
+/// Probe a single equally-spaced resolution of one coordinate's tail.
+///
+/// Keeping each returned window at one resolution is essential for
+/// [`assess_coordinate`]: its coefficient-travel bound estimates a geometric
+/// ratio from consecutive steps, which is only meaningful when their `Δρ`
+/// values are identical.
+fn probe_tail_window_at_resolution(
+    obj: &mut dyn OuterObjective,
+    rho: &Array1<f64>,
+    coord: usize,
+    side: AsymptoteSide,
+    tol: &AsymptoteTolerances,
+    domain: (f64, f64),
+    resolution: (f64, usize),
+) -> Result<(Option<AsymptoteWindow>, String), EstimationError> {
+    let (probe_delta, probe_count) = resolution;
     // Strictly-inside guard for probes against the probed coordinate's own box
     // interval (#2388). The ρ-gradient assembly freezes any coordinate at (or
     // within 1e-8 of) its recorded upper bound to the #197 KKT projection — a
@@ -3915,8 +3980,8 @@ fn probe_tail_window(
     // rows[r] corresponds to probe j=r+1: r=0 is the point CLOSEST to the rail,
     // increasing r steps further into the interior (larger |grad|).
     let mut rows: Vec<(f64, f64, Option<Array1<f64>>)> = Vec::new();
-    for j in 1..=ASYMPTOTE_PROBE_COUNT {
-        let stepped = rho[coord] + sign * (j as f64) * PROBE_DELTA;
+    for j in 1..=probe_count {
+        let stepped = rho[coord] + sign * (j as f64) * probe_delta;
         if stepped <= domain.0 + PROBE_DOMAIN_MARGIN || stepped >= domain.1 - PROBE_DOMAIN_MARGIN {
             break;
         }
@@ -5607,6 +5672,79 @@ mod asymptote_rail_certify_tests {
         assert!(
             verdict.is_err(),
             "a drifting ĉ must not certify a tail, got {verdict:?}",
+        );
+    }
+
+    /// #2358: a finite smoothing box can expose fewer than three whole
+    /// e-folds of the leading-order tail even though the compactified
+    /// criterion is already regular there. For
+    ///
+    /// `V(ρ) = c·e⁻ρ + (d/2)·e⁻²ρ`,
+    ///
+    /// the pencil constant is `ĉ(ρ) = c + d·e⁻ρ`: the ordinary asymptotic law
+    /// plus its first vanishing correction. Unit probes from ρ=10 step into
+    /// enough correction curvature that no three-row clean run exists; the
+    /// equal-spaced half-e-fold fallback resolves the local tail without
+    /// changing the drift, estimand, sign, or noise gates.
+    #[test]
+    fn tail_probe_resolves_narrow_regular_band_before_finite_box_2358() {
+        let (c, d, a) = (7.1_f64, 400.0_f64, 1.0e-3_f64);
+        let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
+        let mut obj = problem.build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| {
+                let tau = (-rho[0]).exp();
+                Ok(c * tau + 0.5 * d * tau * tau)
+            },
+            move |_: &mut (), rho: &Array1<f64>| {
+                let tau = (-rho[0]).exp();
+                Ok(OuterEval {
+                    cost: c * tau + 0.5 * d * tau * tau,
+                    gradient: array![-c * tau - d * tau * tau],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: Some(array![a * tau]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let rho = array![10.0];
+        let mut tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
+        tol.tail_drift_rel = TAIL_SNAP_DRIFT_REL;
+
+        let (coarse, coarse_rows) = probe_tail_window_at_resolution(
+            &mut obj,
+            &rho,
+            0,
+            AsymptoteSide::Upper,
+            &tol,
+            (-10.0, 10.5),
+            (1.0, ASYMPTOTE_PROBE_COUNT),
+        )
+        .expect("coarse probing must not error");
+        assert!(
+            coarse.is_none(),
+            "unit probes must not manufacture a pure tail through the curved band: {coarse_rows}"
+        );
+
+        let (window, rows) = probe_tail_window(
+            &mut obj,
+            &rho,
+            0,
+            AsymptoteSide::Upper,
+            &tol,
+            (-10.0, 10.5),
+        )
+        .expect("multi-resolution probing must not error");
+        let window = window.unwrap_or_else(|| {
+            panic!("the half-e-fold fallback must resolve the regular tail: {rows}")
+        });
+        assert!(
+            matches!(
+                assess_coordinate(&window, &tol),
+                AsymptoteVerdict::CertifiedAtAsymptote { .. }
+            ),
+            "the resolved tail must pass the unchanged asymptote gates"
         );
     }
 
