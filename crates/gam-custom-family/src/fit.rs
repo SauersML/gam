@@ -1213,15 +1213,15 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         );
     }
 
-    // Exact Hessians are primary whenever the assembled family can supply them.
-    // If a particular outer step is ill-conditioned, strategy fallback handles
-    // the downgrade; we do not suppress second-order capability preemptively
-    // based on the presence of a wiggle block. Small iteration budgets still
-    // run through this same outer solver and must earn its convergence
-    // certificate; they are not a production shortcut to an unoptimized fit.
+    // Exact Hessians remain declared whenever the assembled family can supply
+    // them, but #2359 reserves that order-four work for the terminal minimum
+    // certificate. Search uses the exact analytic gradient. Small iteration
+    // budgets still run through this same outer solver and must earn its
+    // convergence certificate; they are not a production shortcut to an
+    // unoptimized fit.
     use gam_problem::OuterEval;
     use gam_solve::model_types::EstimationError;
-    use gam_solve::rho_optimizer::{FallbackPolicy, OuterEvalOrder, OuterProblem};
+    use gam_solve::rho_optimizer::{OuterEvalOrder, OuterProblem};
 
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let outer_inner_cap = options
@@ -1233,7 +1233,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // it when it grants a STUCK-stall escape (a near-separating profiled fit
     // whose warm-started trajectory carries value hysteresis on a near-flat
     // inner ridge). The outer-eval closures below observe it, drop the warm
-    // cache, and re-solve the inner problem cold so ARC descends a consistent
+    // cache, and re-solve the inner problem cold so search descends a consistent
     // objective surface instead of grinding to `max_iter` at a non-stationary
     // point.
     let outer_force_cold = Arc::new(AtomicBool::new(false));
@@ -1260,33 +1260,18 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         family.outer_hyper_hessian_hvp_available(specs),
         family.outer_hyper_hessian_dense_available(specs),
     );
-    let bfgs_step_cap = first_order_bfgs_loglambda_step_cap(need_outer_hessian);
+    let bfgs_step_cap = Some(FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP);
     // EFS / HybridEfs structural property (`H^{-1/2} B_k H^{-1/2} ≽ 0` plus a
     // parameter-independent nullspace, Wood-Fasiolo) fails for multi-block
-    // families whose joint likelihood Hessian depends on β. Disable
-    // fixed-point only for genuinely first-order capabilities; exact-Hessian
-    // capabilities route to ARC before EFS is considered.
+    // families whose joint likelihood Hessian depends on β.
     let multi_block_beta_dependent =
         specs.len() > 1 && family.exact_newton_joint_hessian_beta_dependent();
-    // Exact-Hessian plans must fail on their own terms rather than silently
-    // retrying on a quasi-Newton surface. First-order-only families keep the
-    // automatic cascade because there is no second-order geometry to discard.
-    let fallback_policy = if need_outer_hessian {
-        FallbackPolicy::Disabled
-    } else {
-        FallbackPolicy::Automatic
-    };
     // Calibrate the outer solver to the n-scaled profiled REML/LAML objective.
     // The profiled criterion is a sum over n observations, so |f| ~ O(n) for
-    // every family. Without this calibration the outer ARC/BFGS:
-    //   (a) uses a bare absolute gradient floor of `outer_tol ≈ 1e-5` — this
-    //       IS achievable at scale but forces the optimizer to iterate until
-    //       |g| ≤ 1e-5 even when |f| ~ 200 and τ·(1+|f|) ~ 2e-3 already
-    //       signals convergence in the relative-to-cost sense; and
-    //   (b) ARC's initial trust-region regularization `σ₀=1` and default
-    //       operator trust radius `τ₀=1` reference the wrong curvature
-    //       magnitude — the first ARC step overshoots when the Hessian is
-    //       O(n) and the trust radius is O(1).
+    // every family. Without this calibration the outer search uses a bare
+    // absolute gradient floor of `outer_tol ≈ 1e-5`, forcing iteration until
+    // |g| ≤ 1e-5 even when |f| ~ 200 and τ·(1+|f|) ~ 2e-3 already signals
+    // convergence in the relative-to-cost sense.
     // Mirroring the spatial exact-joint outer fix (#1053/#1066/#1069) and
     // the primary REML outer (solver/estimate.rs) for the custom-family path.
     let n_obs = specs.first().map(|s| s.design.nrows()).unwrap_or(0);
@@ -1302,8 +1287,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_stuck_stall_cold_reeval_signal(Arc::clone(&outer_force_cold))
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
+        .with_prefer_gradient_only(true)
         .with_disable_fixed_point(multi_block_beta_dependent)
-        .with_fallback_policy(fallback_policy)
         .with_tolerance(options.outer_tol)
         .with_rel_cost_tolerance(options.outer_rel_cost_tol)
         .with_max_iter(options.outer_max_iter)
@@ -1312,13 +1297,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_initial_rho(rho0.clone())
         .with_screen_initial_rho(options.screen_initial_rho)
         // n-scaled profiled-criterion calibration: absolute gradient floor =
-        // max(outer_tol, n·1e-9), ARC σ₀ = 0.25, operator trust radius = 4.0.
-        // Mirrors the primary REML outer (solver/estimate.rs) and the spatial
-        // exact-joint path.
+        // max(outer_tol, n·1e-9). Mirrors the primary REML outer
+        // (solver/estimate.rs) and the spatial exact-joint path.
         .with_objective_scale(if n_obs > 0 { Some(n_obs as f64) } else { None })
         .with_problem_size(n_obs, p_total.max(1))
-        .with_arc_initial_regularization(if n_obs > 0 { Some(0.25) } else { None })
-        .with_operator_initial_trust_radius(if n_obs > 0 { Some(4.0) } else { None })
         // Per-coordinate ρ box bounds. The uniform ceiling
         // [`EFFECTIVE_DF_CEILING`] keeps the optimizer out of the dead-flat
         // λ ≈ 10⁹ region where ARC's quadratic model breaks down, the retry-stall
@@ -1435,7 +1417,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // #2349: consume the cold-reeval pulse once per outer evaluation. When
         // active (a near-separating warm-start-hysteresis stall the outer guard
         // flagged), every inner solve in this evaluation drops the warm cache
-        // and runs cold + uncapped so ARC descends a trajectory-independent
+        // and runs cold + uncapped so search descends a trajectory-independent
         // objective surface.
         let force_cold = outer.take_force_cold();
         if force_cold {

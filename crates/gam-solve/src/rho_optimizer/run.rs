@@ -279,6 +279,10 @@ impl OuterProblem {
             n_params,
             gradient: Derivative::Unavailable,
             hessian: DeclaredHessianForm::Unavailable,
+            // Closed-form/test objectives preserve explicit ARC availability;
+            // production family-ladder entry points opt into #2359's
+            // optimize-3/certify-4 protocol with
+            // `with_prefer_gradient_only(true)`.
             prefer_gradient_only: false,
             disable_fixed_point: false,
             psi_dim: 0,
@@ -325,6 +329,9 @@ impl OuterProblem {
         self.hessian = form;
         self
     }
+    /// Choose whether analytic Hessian work is reserved for terminal
+    /// certification (`true`, the generic derivative-ladder protocol) or may
+    /// also be consumed by the search (`false`, for closed-form objectives).
     pub fn with_prefer_gradient_only(mut self, prefer_gradient_only: bool) -> Self {
         self.prefer_gradient_only = prefer_gradient_only;
         self
@@ -4095,11 +4102,11 @@ pub(crate) fn compute_rho_uncertainty_diagnostic(
         .outer_inner_cap
         .as_ref()
         .map(TerminalInnerCapGuard::lift);
-    // Do not reset here: successful certification immediately precedes this
-    // call and already installed a fresh cap=0 state.  Holding cap=0 makes the
-    // diagnostic reuse that exact cache identity (or extend it with analytic
-    // Hessian work) instead of reopening the selected rho under the restored
-    // search cap and leaving a coarse mode as the shipped state.
+    // Do not reset here. The diagnostic intentionally runs before terminal
+    // installation and certification; the certificate must remain the final
+    // owner of objective state. Holding cap=0 ensures proposal evaluations use
+    // terminal fidelity, and the selected point is reinstalled immediately
+    // afterward before the mint audit.
     let diagnostic =
         compute_rho_uncertainty_diagnostic_at_terminal_fidelity(obj, config, context, result);
     drop(terminal_cap_guard);
@@ -4132,42 +4139,33 @@ fn compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
             0,
         );
     }
-    // The ρ-uncertainty diagnostic needs the EXACT outer Hessian. A non-analytic
-    // (BFGS / quasi-Newton) capability cannot supply one, so requesting
-    // `ValueGradientHessian` below would (a) waste an eval that materializes to
-    // `None` and skips two lines later anyway, and (b) VIOLATE the mode-aware eval
-    // contract — a BFGS run must never request Hessian work
-    // (`run_bfgs_mode_aware_eval_skips_hessian_work`). Gate on the SAME
-    // `capability.hessian.is_analytic()` the terminal certificate uses so a BFGS
-    // fit skips the diagnostic up front instead of leaking a Hessian request.
+    // The ρ-uncertainty diagnostic needs the EXACT outer Hessian, but it runs
+    // BEFORE terminal certification so that the certificate remains the final
+    // owner of objective state. Under the optimize-3/certify-4 protocol (#2359)
+    // this diagnostic may therefore consume only curvature the SEARCH already
+    // retained. It must never trigger its own `ValueGradientHessian` evaluation:
+    // a gradient-only search has deliberately reserved that one order-four pass
+    // for the mint gate. Such a search skips this optional diagnostic; the
+    // terminal certificate still computes and persists exact curvature.
     if !cap.hessian.is_analytic() {
         return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
             "outer Hessian is not analytic; rho-uncertainty diagnostic needs exact curvature",
             0,
         );
     }
+    if result.plan_used.hessian_source != HessianSource::Analytic {
+        return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
+            "search did not use exact outer curvature; order-four work is reserved for the terminal certificate",
+            0,
+        );
+    }
 
-    let final_eval = match obj.eval_with_order(&result.rho, OuterEvalOrder::ValueGradientHessian) {
-        Ok(eval) => eval,
-        Err(err) => {
+    let hessian = match result.final_hessian.as_ref() {
+        Some(hessian) => hessian.clone(),
+        None => {
             return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
-                format!("final exact Hessian evaluation failed: {err}"),
-                1,
-            );
-        }
-    };
-    let hessian = match final_eval.hessian.materialize_dense() {
-        Ok(Some(hessian)) => hessian,
-        Ok(None) => {
-            return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
-                "exact outer Hessian unavailable at fitted rho",
-                1,
-            );
-        }
-        Err(message) => {
-            return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
-                format!("exact outer Hessian materialization failed: {message}"),
-                1,
+                "search retained no exact outer Hessian; order-four work is reserved for the terminal certificate",
+                0,
             );
         }
     };
@@ -4182,23 +4180,6 @@ fn compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
             1,
         );
     }
-    // Persist the exact outer curvature at θ̂ when the solver did not already
-    // track one. A gradient-based BFGS solve keeps its inverse-Hessian
-    // internally and `opt` does not surface it, so `result.final_hessian` is
-    // `None` on the BFGS path — yet the exact analytic `H(θ̂)` was just
-    // materialized here for the rho-uncertainty diagnostic and is otherwise
-    // discarded. Stashing it lets the persistent-cache finalize write carry the
-    // converged curvature, so the NEXT structurally-matching fit (e.g. the next
-    // LOSO fold, whose θ̂ and curvature are nearly identical) can seed BFGS with
-    // `InitialMetric::DenseInverseHessian` and take a quasi-Newton first step
-    // instead of rediscovering curvature through line-search bracketing. This
-    // never changes a converged optimum (BFGS converges to ∇V=0 under any SPD
-    // initial metric); it only reshapes the starting line-search path. Guarded
-    // on finiteness and on the solver not already owning a Hessian, so the
-    // exact-Newton / ARC paths (which DO populate `final_hessian`) are untouched.
-    if result.final_hessian.is_none() && hessian.iter().all(|v| v.is_finite()) {
-        result.final_hessian = Some(hessian.clone());
-    }
     let mut hessian_rho = Array2::<f64>::zeros((rho_dim, rho_dim));
     for row in 0..rho_dim {
         for col in 0..rho_dim {
@@ -4207,8 +4188,7 @@ fn compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
     }
     let rho_hat = result.rho.slice(ndarray::s![..rho_dim]).to_owned();
     let theta_hat = result.rho.clone();
-    let cost_hat = final_eval.cost;
-    let final_beta_hint = final_eval.inner_beta_hint.clone();
+    let cost_hat = result.final_value;
     let diagnostic = {
         let mut served_hat_cost = false;
         let mut criterion = |rho: &Array1<f64>| -> Option<f64> {
@@ -4224,11 +4204,6 @@ fn compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
             let mut theta = theta_hat.clone();
             for idx in 0..rho_dim {
                 theta[idx] = rho[idx];
-            }
-            if let Some(beta) = final_beta_hint.as_ref()
-                && obj.seed_inner_state(beta).is_err()
-            {
-                return None;
             }
             obj.eval_cost(&theta).ok()
         };

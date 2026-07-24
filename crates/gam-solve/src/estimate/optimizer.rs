@@ -4,9 +4,7 @@ use crate::estimate::evaluation::{
     sas_log_delta_edge_barriercostgrad, sas_log_delta_edge_barriercostgradhess,
     sas_log_deltaridgeweight,
 };
-use crate::estimate::penalty::{
-    REML_SECOND_ORDER_RHO_CAP, REML_SEED_SCREENING_RHO_CAP, scaled_covariance,
-};
+use crate::estimate::penalty::{REML_SEED_SCREENING_RHO_CAP, scaled_covariance};
 use crate::estimate::prefit::{
     reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,
 };
@@ -729,52 +727,11 @@ where
                 .and_then(|rho| rho.as_slice())
                 .or(heuristic_lambdas);
             let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
-            // Standard-GAM dense problem dimensions configure both cost models
-            // the planner uses to decide whether ARC+Hessian or BFGS+gradient
-            // is faster end-to-end at large scale:
-            //
-            //   - per-inner-solve cost (n · p²) gates the single-Hessian-
-            //     assembly downgrade,
-            //   - per-outer-eval cost (k² · n · p²) gates the LAML-Hessian
-            //     pairwise-assembly downgrade — independent of (1) and
-            //     necessary because the LAML outer Hessian's k² pairwise
-            //     inner-derived terms can dominate per-outer work even when
-            //     each individual inner solve is moderate.
-            //
-            // Sparse designs short-circuit the policy because the n · p²
-            // model does not apply to sparse linear algebra; ARC stays in
-            // place and the sparse path's iteration-count advantage holds.
-            // Gaussian-identity REML has two well-conditioned features that
-            // the outer optimizer can exploit:
-            //
-            //   1. The REML cost is dominated by an O(n) likelihood constant,
-            //      so ∂/∂logλ inherits the same scale. A unit-magnitude
-            //      `abs` gradient floor (1e-6) becomes binding at large-scale n
-            //      even after the relative-from-seed component declared
-            //      convergence iters earlier. `with_objective_scale(n)`
-            //      lifts the floor to ~n·1e-9 so the loop terminates once
-            //      the relative reduction is met.
-            //
-            //   2. The Gaussian profile likelihood is quadratic-like in
-            //      log-λ near the optimum, so the analytic Hessian is
-            //      trustworthy and the cubic regularization can start
-            //      smaller than opt's default sigma=1.0. Setting
-            //      sigma=0.25 allows the first ARC step to be ~4× the
-            //      default — matching the 2–4 unit log-λ moves typical of
-            //      Gaussian-identity REML cold starts on tensor smooths.
-            //
-            // Other families (logit, log, survival) keep the conservative
-            // defaults because their objective is non-quadratic in log-λ
-            // and their gradient is not on an O(n) scale.
-            let gaussian_identity = matches!(cfg.link_function(), LinkFunction::Identity);
+            // #2359: search consumes the analytic outer gradient (the family
+            // derivative ladder through order three). Exact curvature remains
+            // declared because the terminal mint audit consumes it once,
+            // verifies the minimum, and persists it for inference.
             let n_obs = y_o.len();
-            let prefer_gradient_only = k >= REML_SECOND_ORDER_RHO_CAP;
-            if prefer_gradient_only {
-                log::info!(
-                    "[OUTER] rho_dim {k} reaches exact REML Hessian budget \
-                   ({REML_SECOND_ORDER_RHO_CAP}); routing analytic-gradient quasi-Newton"
-                );
-            }
             let problem = OuterProblem::new(k)
                 .with_gradient(Derivative::Analytic)
                 .with_hessian(if analytic_outer_hessian_available {
@@ -782,7 +739,7 @@ where
                 } else {
                     DeclaredHessianForm::Unavailable
                 })
-                .with_prefer_gradient_only(prefer_gradient_only)
+                .with_prefer_gradient_only(true)
                 .with_barrier(
                     crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
                         fit_linear_constraints.as_ref(),
@@ -806,23 +763,15 @@ where
                 // the n-scaled gradient's converged residual: the relative-from-seed
                 // test declares convergence iters earlier, but the binding abs floor
                 // keeps the outer optimizer chasing sub-floor log-λ changes, paying a
-                // full k²·n·p² LAML-Hessian assembly per phantom iteration until it
-                // exhausts the iteration budget — the #1082 outer-loop "cycling"
+                // full inner convergence per phantom iteration until it exhausts
+                // the iteration budget — the #1082 outer-loop "cycling"
                 // timeout. Lifting the floor to ~n·1e-9 (the same calibration the
                 // spatial/custom-family outer already uses via `with_problem_size`,
                 // #1053/#1066/#1069) lets the loop terminate as soon as the relative
                 // reduction is met, for every family, while the relative-to-cost
-                // component still owns the actual convergence decision. ARC σ and the
-                // initial trust radius stay Gaussian-gated: those exploit the
-                // Gaussian profile being quadratic-in-log-λ, which is family-specific.
+                // component still owns the actual convergence decision.
                 .with_objective_scale(Some(n_obs as f64))
                 .with_problem_size(n_obs, x_o.ncols())
-                .with_arc_initial_regularization(if gaussian_identity { Some(0.25) } else { None })
-                .with_operator_initial_trust_radius(if gaussian_identity {
-                    Some(4.0)
-                } else {
-                    None
-                })
                 .with_rho_bound(crate::estimate::RHO_BOUND)
                 // Make the outer smoothing-parameter search invariant to the order
                 // the smooth terms / tensor margins were written (#1538/#1539). The
@@ -1166,17 +1115,10 @@ where
             use crate::rho_optimizer::OuterProblem;
             use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
             let initial_link_kind = cfg.link_kind.clone();
-            let prefer_gradient_only = theta_dim >= REML_SECOND_ORDER_RHO_CAP;
-            if prefer_gradient_only {
-                log::info!(
-                    "[OUTER] theta_dim {theta_dim} reaches exact REML Hessian budget \
-                   ({REML_SECOND_ORDER_RHO_CAP}); routing analytic-gradient quasi-Newton"
-                );
-            }
             let problem = OuterProblem::new(theta_dim)
                 .with_gradient(Derivative::Analytic)
                 .with_hessian(DeclaredHessianForm::Either)
-                .with_prefer_gradient_only(prefer_gradient_only)
+                .with_prefer_gradient_only(true)
                 .with_psi_dim(mixture_dim + sas_dim)
                 .with_barrier(
                     crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(

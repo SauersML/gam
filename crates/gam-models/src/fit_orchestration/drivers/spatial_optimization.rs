@@ -3595,15 +3595,10 @@ fn run_exact_joint_spatial_optimization(
     // Directional-coordinate dimension: psi-per-axis (anisotropic) or
     // kappa-per-term (isotropic). The numerics below are identical either way.
     let coord_dim = theta_dim - rho_dim;
-    // Capability is declared solely from derivative coverage, not from
-    // problem size. The unified REML evaluator now exposes exact matrix-free
-    // outer Hessian operators for the costly third/fourth-derivative
-    // contractions used by spatial ψ coordinates; its internal
-    // `(n, p, K)` work model chooses `HessianValue::Operator` at large-scale
-    // scale and the dense analytic matrix only below that crossover. Keeping
-    // `Derivative::Analytic` here preserves ARC / trust-region-CG second-order
-    // optimization for `n > 50_000` and `coord_dim > 30` instead of forcing the
-    // obsolete HybridEFS compatibility path.
+    // Capability records the exact Hessian even though #2359 reserves it for
+    // the terminal certificate. Search uses the analytic gradient and therefore
+    // stops at the third-order family channel; minting alone consumes the
+    // fourth-order spatial contractions.
     let analytic_outer_hessian_available =
         exact_joint_spatial_outer_hessian_available(&family, baseline_design);
     if !analytic_outer_hessian_available {
@@ -3611,23 +3606,10 @@ fn run_exact_joint_spatial_optimization(
             "[{label}] analytic outer Hessian unavailable for family/design; routing without second-order geometry (coord_dim={coord_dim})"
         );
     }
-    // Cost-aware second-order routing, mirroring the n-block path's
-    // work-budget policy: past the pair budget gradient-only quasi-Newton
-    // converges to the same optimum strictly cheaper per eval; below it,
-    // exact second-order keeps the ARC/TR-CG geometry. The budget's
-    // derivation is owned by `EXACT_JOINT_SECOND_ORDER_THETA_CAP`.
-    let mut prefer_gradient_only = theta_dim > EXACT_JOINT_SECOND_ORDER_THETA_CAP;
-    if prefer_gradient_only {
-        log::info!(
-            "[{label}] joint θ-dim {theta_dim} exceeds the exact pair-Hessian budget \
-             ({EXACT_JOINT_SECOND_ORDER_THETA_CAP}); routing gradient-only quasi-Newton"
-        );
-    }
     // #1033: set when the n-free Gaussian ψ-lane arms below. It must SUPPRESS the
-    // declared analytic outer Hessian (force `Unavailable`), not merely prefer
-    // gradient-only: the planner keeps the second-order ARC solver whenever an
-    // analytic Hessian is declared `Either`, even under `prefer_gradient_only`
-    // (see `plan_prefer_gradient_only_does_not_hide_analytic_hessian`). A
+    // declared analytic outer Hessian (force `Unavailable`), not merely reserve
+    // it for the #2359 terminal certificate: the n-free lane cannot even build
+    // that curvature slab without realizing O(n) state. A
     // `ValueGradientHessian` eval forces the O(n) design re-realization because
     // the outer Hessian curvature slab `B_j` is irreducibly n-dependent, so only
     // routing to a gradient-only solver (BFGS) keeps every in-window κ-trial on
@@ -3873,7 +3855,6 @@ fn run_exact_joint_spatial_optimization(
             && cache.supports_nfree_gradient_only_routing()
         {
             suppress_outer_hessian_for_nfree = true;
-            prefer_gradient_only = true;
             log::info!(
                 "[{label}] n-free Gaussian ψ-lane armed; suppressing the analytic outer \
                  Hessian and routing gradient-only (BFGS) so the κ outer loop never realizes \
@@ -3888,12 +3869,9 @@ fn run_exact_joint_spatial_optimization(
         );
     }
 
-    let kphase_prime_order =
-        if analytic_outer_hessian_available && !suppress_outer_hessian_for_nfree {
-            OuterEvalOrder::ValueGradientHessian
-        } else {
-            OuterEvalOrder::ValueAndGradient
-        };
+    // Priming is part of search, so it must stop at the order-three gradient
+    // lane. The only `ValueGradientHessian` request belongs to the mint audit.
+    let kphase_prime_order = OuterEvalOrder::ValueAndGradient;
     let kphase_prime_start = std::time::Instant::now();
     drop(ctx.eval_full(theta0, kphase_prime_order, analytic_outer_hessian_available)?);
     log::info!(
@@ -3977,7 +3955,6 @@ fn run_exact_joint_spatial_optimization(
             // design-realization skip.
             DeclaredHessianForm::Unavailable
         },
-        prefer_gradient_only,
         // Single-block spatial path: penalty-like rho + spatial psi.
         // EFS/HybridEFS remain eligible (the Wood-Fasiolo PSD structure holds
         // for single-block families with β-independent joint H_L) UNLESS the
@@ -3992,9 +3969,8 @@ fn run_exact_joint_spatial_optimization(
         seed_risk_profile_for_likelihood_family(&family),
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
-        // Rho-axis BFGS cap: log-λ's natural step is ≈ 5 per
-        // `first_order_bfgs_loglambda_step_cap`. Anything tighter throttles
-        // BFGS on flat REML valleys.
+        // Rho-axis BFGS cap: log-λ's natural step is ≈ 5. Anything tighter
+        // throttles BFGS on flat REML valleys.
         Some(5.0),
         // Psi-axis BFGS cap: kappa / aniso-log-scale needs ~ln 2 per iter.
         Some(kappa_options.log_step.clamp(0.25, 1.0)),
@@ -4153,20 +4129,10 @@ fn run_exact_joint_spatial_optimization(
             eval_outer(
                 ctx,
                 theta,
-                // #1033: when the n-free Gaussian ψ-lane is armed we suppress the
-                // outer Hessian and route BFGS — so this default gradient eval MUST
-                // request `ValueAndGradient`, not `ValueGradientHessian`. A
-                // second-order order sets `allow_second_order`, which forces
-                // `ensure_theta` → the O(n) design re-realization (the Hessian slab
-                // is irreducibly n-dependent), DISARMING the design-revision fast
-                // path for every trial — exactly the O(n) κ-loop this lane exists to
-                // remove. Gating only the planner's solver (Unavailable→BFGS)
-                // without gating this eval-order left every trial second-order.
-                if analytic_outer_hessian_available && !suppress_outer_hessian_for_nfree {
-                    OuterEvalOrder::ValueGradientHessian
-                } else {
-                    OuterEvalOrder::ValueAndGradient
-                },
+                // The legacy gradient bridge is first-order by definition.
+                // Exact curvature is reachable only through the order-aware hook
+                // below, which terminal certification invokes once.
+                OuterEvalOrder::ValueAndGradient,
             )
         },
         |ctx: &mut &mut SpatialJointContext<'_>, theta: &Array1<f64>, order: OuterEvalOrder| {
@@ -6163,15 +6129,6 @@ pub(crate) fn seed_risk_profile_for_likelihood_family(
     }
 }
 
-/// Joint-θ dimension above which the single-block exact-joint driver routes
-/// gradient-only (this doc owns the derivation; the routing site only
-/// compares against it). The exact outer Hessian builds θ(θ+1)/2 pairwise
-/// hyper operators, so per-eval cost grows quadratically in θ-dim —
-/// profiled: `TauTauPairHyperOperator::mul_vec` dominates wall-clock at
-/// spectral-mode measure-jet candidate counts (θ ≈ 9–11), while θ ≤ 8
-/// (classic Matérn κ/η fits) keeps cheap exact second-order geometry.
-const EXACT_JOINT_SECOND_ORDER_THETA_CAP: usize = 8;
-
 fn exact_joint_seed_config(
     risk_profile: gam_problem::SeedRiskProfile,
     auxiliary_dim: usize,
@@ -6334,7 +6291,6 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     n_params: usize,
     gradient: gam_problem::Derivative,
     hessian: gam_problem::DeclaredHessianForm,
-    prefer_gradient_only: bool,
     disable_fixed_point: bool,
     risk_profile: gam_problem::SeedRiskProfile,
     tolerance: f64,
@@ -6416,7 +6372,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     let mut problem = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_gradient(gradient)
         .with_hessian(hessian)
-        .with_prefer_gradient_only(prefer_gradient_only)
+        .with_prefer_gradient_only(true)
         .with_disable_fixed_point(disable_fixed_point)
         // Re-enable the automatic fallback ladder for exact joint spatial
         // problems. It was previously `Disabled` to suppress a geo-bench
@@ -6462,18 +6418,13 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_rho_bound(rho_ceiling)
         .with_heuristic_lambdas(seed_heuristic);
     if let Some((n_obs, p_cols)) = profiled_objective_size {
-        // Calibrate to the n-scaled profiled criterion (see the param doc):
-        // n-aware objective scale → sane absolute gradient floor + correct ARC
-        // reduction-ratio reference, plus a warm ARC regularization / operator
-        // trust radius that prevents the first-step overshoot. These are the
-        // knobs the spatial exact-joint path was missing relative to the
-        // primary REML outer; without them the iso-κ length-scale fit stalls or
-        // diverges as |f| grows with n (#1053 / #1066 / #1069).
+        // Calibrate to the n-scaled profiled criterion (see the param doc).
+        // This is the scale the spatial exact-joint path was missing relative
+        // to the primary REML outer; without it the iso-κ length-scale fit
+        // stalls as |f| grows with n (#1053 / #1066 / #1069).
         problem = problem
             .with_objective_scale(Some(n_obs as f64))
-            .with_problem_size(n_obs, p_cols)
-            .with_arc_initial_regularization(Some(0.25))
-            .with_operator_initial_trust_radius(Some(4.0));
+            .with_problem_size(n_obs, p_cols);
     }
     if let Some(screening_cap) = screening_cap {
         problem = problem
@@ -6622,8 +6573,6 @@ where
                 | gam_problem::DeclaredHessianForm::Dense
                 | gam_problem::DeclaredHessianForm::Operator { .. }
         );
-    let prefer_gradient_only = !analytic_outer_hessian_available;
-
     let theta_dim = theta0.len();
     let psi_dim = theta_dim - rho_dim;
 
@@ -6838,7 +6787,6 @@ where
         } else {
             DeclaredHessianForm::Unavailable
         },
-        prefer_gradient_only,
         disable_fixed_point,
         seed_risk_profile,
         kappa_options.rel_tol.max(1e-6),
@@ -7061,15 +7009,9 @@ where
                 }
             },
             |ctx: &mut &mut NBlockExactJointState<'_, Mode>, theta: &Array1<f64>| {
-                eval_outer(
-                    ctx,
-                    theta,
-                    if analytic_outer_hessian_available {
-                        OuterEvalOrder::ValueGradientHessian
-                    } else {
-                        OuterEvalOrder::ValueAndGradient
-                    },
-                )
+                // Search's legacy derivative bridge is first-order. The
+                // order-aware hook below owns the terminal curvature request.
+                eval_outer(ctx, theta, OuterEvalOrder::ValueAndGradient)
             },
             |ctx: &mut &mut NBlockExactJointState<'_, Mode>,
              theta: &Array1<f64>,
@@ -7546,7 +7488,6 @@ fn try_exact_joint_latent_coord_optimization(
         theta0.len(),
         Derivative::Analytic,
         DeclaredHessianForm::Unavailable,
-        false,
         false,
         seed_risk_profile_for_likelihood_family(&family),
         options.tol,

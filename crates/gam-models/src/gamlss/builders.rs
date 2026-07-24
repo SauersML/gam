@@ -3478,9 +3478,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     // for all inverse links via the shared jet formulas plus the generic
     // exact-Newton D_βH / D²_βH closures routed through
     // evaluate_custom_family_joint_hyper -> joint_outer_evaluate ->
-    // BorrowedJointDerivProvider. This enables the analytic-Hessian outer
-    // plan for REML optimization instead of the downgraded gradient-only
-    // outer strategies.
+    // BorrowedJointDerivProvider. Search consumes the exact first-order lane;
+    // the terminal certificate alone consumes the exact Hessian.
     //
     // Spatial log-kappa coordinates are ψ (design-moving) dimensions because
     // they rebuild the spatial basis and penalties at each outer proposal.
@@ -3496,6 +3495,9 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         } else {
             DeclaredHessianForm::Unavailable
         })
+        // #2359: the family gradient consumes derivatives through order three;
+        // reserve its order-four Hessian for the terminal mint certificate.
+        .with_prefer_gradient_only(true)
         .with_psi_dim(theta_dim - rho_dim)
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)

@@ -1,7 +1,6 @@
 use super::*;
 use gam_problem::dispersion_cov::se_from_covariance;
 
-pub(crate) const REML_SECOND_ORDER_RHO_CAP: usize = 4;
 /// Above this rho dimension, startup work must be linear in "one real solve",
 /// not "rank a seed lattice with capped PIRLS solves". The heuristic seed is
 /// deterministic and already centered on the current penalty scale; BFGS/ARC

@@ -429,9 +429,7 @@ pub fn block_offsets_from_specs(specs: &[ParameterBlockSpec]) -> Arc<[Range<usiz
 /// validate. `5.0` allows up to `e^5 ≈ 148`-fold smoothing-parameter change
 /// per accepted outer iter, which matches the typical quasi-Newton direction
 /// magnitude while still bounding pathological probes.
-pub const fn first_order_bfgs_loglambda_step_cap(has_outer_hessian: bool) -> Option<f64> {
-    if has_outer_hessian { None } else { Some(5.0) }
-}
+pub const FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP: f64 = 5.0;
 
 pub fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
     family: &F,
@@ -780,20 +778,6 @@ mod tests {
         assert_eq!(&offsets[0], &(0..2));
         assert_eq!(&offsets[1], &(2..2));
         assert_eq!(&offsets[2], &(2..3));
-    }
-
-    // -----------------------------------------------------------------------
-    // first_order_bfgs_loglambda_step_cap
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn step_cap_without_outer_hessian_is_some_five() {
-        assert_eq!(first_order_bfgs_loglambda_step_cap(false), Some(5.0));
-    }
-
-    #[test]
-    fn step_cap_with_outer_hessian_is_none() {
-        assert_eq!(first_order_bfgs_loglambda_step_cap(true), None);
     }
 
     #[test]

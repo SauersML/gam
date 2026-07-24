@@ -2071,6 +2071,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         } else {
             DeclaredHessianForm::Unavailable
         })
+        .with_prefer_gradient_only(true)
         .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Disabled)
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)

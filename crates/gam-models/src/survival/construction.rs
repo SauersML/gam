@@ -723,9 +723,8 @@ enum BaselineDerivativeContract {
     /// Cost + analytic gradient, no analytic Hessian. Routes to BFGS, which
     /// builds its own quasi-Newton curvature from successive gradients.
     GradientOnly,
-    /// Cost + analytic gradient + analytic Hessian. Routes to the primary
-    /// second-order outer solver, which may use either the analytic Hessian or
-    /// a BFGS approximation depending on the planner.
+    /// Cost + analytic gradient + analytic Hessian. Search uses BFGS while the
+    /// terminal mint certificate evaluates the analytic Hessian once.
     GradientHessian,
 }
 
@@ -789,7 +788,7 @@ where
     let lower = seed.mapv(|v| v - 6.0);
     let upper = seed.mapv(|v| v + 6.0);
     let problem = contract
-        .configure(OuterProblem::new(dim))
+        .configure(OuterProblem::new(dim).with_prefer_gradient_only(true))
         .with_bounds(lower, upper)
         .with_initial_rho(seed.clone())
         .with_seed_config(crate::seeding::SeedConfig {
@@ -925,7 +924,7 @@ where
 /// Gradient + Hessian outer baseline-config optimizer. Thin adapter over
 /// [`run_baseline_theta_optimizer`] under the
 /// [`BaselineDerivativeContract::GradientHessian`] contract, which advertises
-/// an analytic θ-Hessian so the primary second-order outer solver can use it.
+/// an analytic θ-Hessian so terminal mint certification can audit it.
 pub fn optimize_survival_baseline_config_with_gradient<F>(
     initial: &SurvivalBaselineConfig,
     context: &str,

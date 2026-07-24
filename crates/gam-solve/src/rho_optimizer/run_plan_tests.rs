@@ -1191,7 +1191,7 @@ fn plan_analytic_hessian_selects_arc() {
 }
 
 #[test]
-fn plan_prefer_gradient_only_does_not_hide_analytic_hessian() {
+fn plan_reserves_analytic_hessian_for_terminal_certificate_2359() {
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
         hessian: DeclaredHessianForm::Either,
@@ -1203,8 +1203,8 @@ fn plan_prefer_gradient_only_does_not_hide_analytic_hessian() {
         disable_fixed_point: false,
     };
     let p = plan(&cap);
-    assert_eq!(p.solver, Solver::Arc);
-    assert_eq!(p.hessian_source, HessianSource::Analytic);
+    assert_eq!(p.solver, Solver::Bfgs);
+    assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
 }
 
 #[test]
@@ -2221,6 +2221,124 @@ fn run_bfgs_mode_aware_eval_skips_hessian_work() {
     assert!(
         seen_orders.contains(&OuterEvalOrder::ValueAndGradient),
         "BFGS should request value+gradient at accepted points, saw {seen_orders:?}"
+    );
+}
+
+/// #2359: a generic objective may DECLARE exact curvature without allowing
+/// order-four family work into the search. BFGS must consume only the
+/// value/gradient lane, and the selected point must receive exactly one
+/// fourth-order evaluation from the terminal mint certificate.
+#[test]
+fn optimize_three_certify_four_exactly_once_at_mint_2359() {
+    let seen_orders = Arc::new(Mutex::new(Vec::new()));
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .with_prefer_gradient_only(true)
+        .with_initial_rho(array![0.0])
+        .with_max_iter(1);
+    let mut obj = problem.build_objective_with_eval_order(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(1.0 + theta[0] * theta[0]),
+        |_: &mut (), _: &Array1<f64>| {
+            Err(EstimationError::InvalidInput(
+                "legacy eager eval must not bypass the derivative-order seam".to_string(),
+            ))
+        },
+        {
+            let seen_orders = Arc::clone(&seen_orders);
+            move |_: &mut (), theta: &Array1<f64>, order: OuterEvalOrder| {
+                seen_orders.lock().unwrap().push(order);
+                Ok(OuterEval {
+                    cost: 1.0 + theta[0] * theta[0],
+                    gradient: array![2.0 * theta[0]],
+                    hessian: match order {
+                        OuterEvalOrder::ValueGradientHessian => {
+                            HessianValue::Dense(array![[2.0]])
+                        }
+                        OuterEvalOrder::Value | OuterEvalOrder::ValueAndGradient => {
+                            HessianValue::Unavailable
+                        }
+                    },
+                    inner_beta_hint: None,
+                })
+            }
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+
+    let result = problem
+        .run(&mut obj, "optimize-3 certify-4")
+        .expect("the positive-curvature mint audit must certify");
+    assert_eq!(result.plan_used.solver, Solver::Bfgs);
+    let seen_orders = seen_orders.lock().unwrap();
+    let fourth_order_calls = seen_orders
+        .iter()
+        .filter(|&&order| order == OuterEvalOrder::ValueGradientHessian)
+        .count();
+    assert_eq!(
+        fourth_order_calls, 1,
+        "order four belongs exclusively to the one-shot mint audit: {seen_orders:?}"
+    );
+    assert_eq!(
+        seen_orders.last(),
+        Some(&OuterEvalOrder::ValueGradientHessian),
+        "the mint audit must be the final derivative-bearing objective owner: {seen_orders:?}"
+    );
+}
+
+/// First-order stationarity is necessary but cannot mint through a failed
+/// fourth-order minimum audit.
+#[test]
+fn certify_four_refuses_stationary_negative_curvature_2359() {
+    let fourth_order_calls = Arc::new(AtomicUsize::new(0));
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .with_prefer_gradient_only(true)
+        .with_initial_rho(array![0.0])
+        .with_max_iter(1);
+    let mut obj = problem.build_objective_with_eval_order(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(1.0 + theta[0] * theta[0]),
+        |_: &mut (), _: &Array1<f64>| {
+            Err(EstimationError::InvalidInput(
+                "legacy eager eval must not bypass the derivative-order seam".to_string(),
+            ))
+        },
+        {
+            let fourth_order_calls = Arc::clone(&fourth_order_calls);
+            move |_: &mut (), theta: &Array1<f64>, order: OuterEvalOrder| {
+                let hessian = if order == OuterEvalOrder::ValueGradientHessian {
+                    fourth_order_calls.fetch_add(1, Ordering::Relaxed);
+                    HessianValue::Dense(array![[-1.0]])
+                } else {
+                    HessianValue::Unavailable
+                };
+                Ok(OuterEval {
+                    cost: 1.0 + theta[0] * theta[0],
+                    gradient: array![2.0 * theta[0]],
+                    hessian,
+                    inner_beta_hint: None,
+                })
+            }
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+
+    let error = problem
+        .run(&mut obj, "certify-4 negative curvature")
+        .expect_err("negative terminal curvature must refuse the fit");
+    assert!(
+        error.to_string().contains("hessian_psd=NO"),
+        "refusal must name the failed fourth-order curvature audit: {error}"
+    );
+    assert_eq!(
+        fourth_order_calls.load(Ordering::Relaxed),
+        1,
+        "a failed mint audit is still one-shot"
     );
 }
 
@@ -3609,16 +3727,15 @@ fn routing_unavailable_hessian_routes_to_bfgs() {
 }
 
 #[test]
-fn routing_explicit_prefer_gradient_only_does_not_override_exact_hessian() {
-    // The primary REML outer must never hide an analytic Hessian behind a
-    // quasi-Newton route. Auxiliary gradient-only optimizers are separate
-    // solver classes; this flag is ignored for Analytic+Analytic primary
-    // capabilities.
+fn routing_explicit_prefer_gradient_only_reserves_exact_hessian_for_mint_2359() {
+    // The objective continues to declare exact curvature so terminal
+    // certification can audit the selected point. The explicit lifecycle
+    // policy keeps that expensive derivative order out of search.
     let mut cap = cap_for_routing(Derivative::Analytic, DeclaredHessianForm::Either, 6);
     cap.prefer_gradient_only = true;
     let p = plan(&cap);
-    assert_eq!(p.solver, Solver::Arc);
-    assert_eq!(p.hessian_source, HessianSource::Analytic);
+    assert_eq!(p.solver, Solver::Bfgs);
+    assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
 }
 
 #[test]

@@ -195,9 +195,15 @@ pub struct OuterCapability {
     /// blocked EFS. The quantitative check allows EFS when constraints exist but
     /// the barrier curvature is negligible (coefficients far from their bounds).
     pub barrier_config: Option<BarrierConfig>,
-    /// Policy hint for derivative-free auxiliary optimizers only. Primary REML
-    /// optimization ignores this flag when an analytic Hessian exists: exact
-    /// second-order geometry must not be hidden behind a quasi-Newton policy.
+    /// Reserve analytic Hessian work for the terminal mint certificate.
+    ///
+    /// The generic REML/LAML Hessian consumes the row-family derivative ladder
+    /// through order four, while its analytic gradient stops at order three.
+    /// When this is true, search therefore uses analytic-gradient BFGS and the
+    /// exact Hessian remains declared for the one terminal
+    /// `ValueGradientHessian` certification. Closed-form objectives whose
+    /// Hessian does not consume an order-four family tower may set this false
+    /// and use ARC during search.
     pub prefer_gradient_only: bool,
     /// Policy hint: even when the objective implements `eval_efs()` and the
     /// coordinate structure is penalty-like, the planner must NOT select
@@ -373,6 +379,10 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
     use Solver as S;
 
     match (cap.gradient, cap.declared_hessian_for_planning()) {
+        (D::Analytic, D::Analytic) if cap.prefer_gradient_only => OuterPlan {
+            solver: S::Bfgs,
+            hessian_source: H::BfgsApprox,
+        },
         (D::Analytic, D::Analytic) => OuterPlan {
             solver: S::Arc,
             hessian_source: H::Analytic,
