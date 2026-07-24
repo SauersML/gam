@@ -495,17 +495,15 @@ pub fn projected_linear_constraint_stationarity_vector(
     if residual.len() != p || constraints.ncols() != p {
         return None;
     }
-    if let Some(hint) = known_active_rows {
-        // The QP face is the sparse seed, not necessarily the complete normal
-        // cone: an omitted factored row may be tight and cut off the negative
-        // projected residual at zero step. Use the same separation oracle as
-        // the operator QP cycle escape so step, convergence certificate,
-        // covariance, and return all certify against one cone geometry.
+    if known_active_rows.is_some() {
+        // QP provenance selects the strict point-local tangent-face contract.
+        // The operator-native Moreau solve discovers its complete multiplier
+        // support deterministically; the historical warm row ids no longer
+        // alter generator selection or the projected stationarity vector.
         return gam_solve::active_set::project_stationarity_residual_on_constraint_set(
             residual,
             beta,
             constraints,
-            hint,
         )
         .map(|(projected, _active)| projected);
     }
