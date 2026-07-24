@@ -1797,6 +1797,81 @@ pub(crate) fn oos_linear_images_drive_collapsed_reconstruction() {
     );
 }
 
+/// #2394 — the fit-free collapse VERDICT is observable through the public
+/// accessor `hybrid_collapse_verdict_from_assignments`, agrees with the slots
+/// the reconstruction actually substitutes, and is read WITHOUT differencing
+/// reconstructions (the round-off-fragile proxy the issue pins). Exercises the
+/// three policy sources: no-policy fit-free (declines on genuine curves),
+/// attached OOS images (reported and value-visible), and clearing back to
+/// fit-free.
+#[test]
+pub(crate) fn hybrid_collapse_verdict_accessor_reports_collapsed_slots_2394() {
+    let (mut term, _t, _rho) = small_two_atom_periodic_term();
+    let n = term.n_obs();
+    let k = term.k_atoms();
+    let p = term.output_dim();
+    // Explicit, nonzero, row-varying masses over both atoms.
+    let amps =
+        Array2::<f64>::from_shape_fn((n, k), |(i, j)| 0.5 + 0.1 * i as f64 + 0.2 * j as f64);
+
+    // (1) No collapse policy and genuinely curved atoms (nonzero sin AND cos
+    // decoder rows) → the fit-free adjudication declines: empty verdict.
+    let empty = term
+        .hybrid_collapse_verdict_from_assignments(amps.view())
+        .unwrap();
+    assert!(
+        empty.is_empty(),
+        "genuinely curved atoms with no policy must not collapse; got {empty:?}"
+    );
+
+    // (2) Attach an OOS straight image for atom 0 only, with a genuine SLOPE so
+    // the substituted decode differs from the curve (the collapse is value-
+    // visible here, cross-checking that the reported slot is the substituted one).
+    let image = crate::hybrid_split::AtomLinearImage {
+        atom_idx: 0,
+        t_bar: 0.3,
+        b0: ndarray::Array1::from_elem(p, 0.05),
+        b1: ndarray::Array1::from_elem(p, 0.4),
+        v: None,
+    };
+    term.set_hybrid_linear_images(vec![image]).unwrap();
+
+    let verdict = term
+        .hybrid_collapse_verdict_from_assignments(amps.view())
+        .unwrap();
+    assert_eq!(
+        verdict,
+        vec![0usize],
+        "only the attached slot collapses; got {verdict:?}"
+    );
+
+    // The reconstruction substitutes exactly slot 0: collapsed and uncollapsed
+    // differ by a real amount (a sloped image is not the curve).
+    let collapsed = term.reconstruct_from_assignments(amps.view(), true).unwrap();
+    let uncollapsed = term
+        .reconstruct_from_assignments(amps.view(), false)
+        .unwrap();
+    let gap = (&collapsed - &uncollapsed)
+        .iter()
+        .fold(0.0_f64, |m, d| m.max(d.abs()));
+    assert!(
+        gap > 1e-6,
+        "a sloped OOS image must change the reconstruction; gap {gap:e}"
+    );
+
+    // (3) The accessor DEFERS to the attached policy (fit-free is not consulted
+    // while an OOS policy exists); clearing it returns to the fit-free verdict,
+    // which is empty for these curved atoms.
+    term.set_hybrid_linear_images(Vec::new()).unwrap();
+    let cleared = term
+        .hybrid_collapse_verdict_from_assignments(amps.view())
+        .unwrap();
+    assert!(
+        cleared.is_empty(),
+        "clearing the OOS policy returns to no-collapse; got {cleared:?}"
+    );
+}
+
 /// Shared builder for the Jeffreys barrier tests: a K=2
 /// periodic term over `n` rows with explicit single-row decoders and a routing
 /// where BOTH atoms carry non-negligible mass on every row (so the pair
