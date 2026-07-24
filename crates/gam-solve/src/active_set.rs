@@ -3787,6 +3787,52 @@ pub fn project_point_strictly_into_feasible_constraint_set(
     }
 }
 
+/// Re-solve one discovered passive face in the original metric, pruning every
+/// row whose conditioned equality multiplier is not strictly positive.
+fn refine_operator_metric_face(
+    hessian: &Array2<f64>,
+    unconstrained: &Array1<f64>,
+    ops: &ConstraintSetOps<'_>,
+    active: &mut Vec<usize>,
+    is_active: &mut [bool],
+    transitions: &mut usize,
+) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
+    let p = unconstrained.len();
+    loop {
+        if active.is_empty() {
+            return Ok((unconstrained.clone(), Array1::zeros(0)));
+        }
+        let rows = ops.gather_unit_rows(active)?;
+        let active_residual = &rows.b - &rows.a.dot(unconstrained);
+        let zero_gradient = Array1::<f64>::zeros(p);
+        let (correction, system_multipliers) = solve_kkt_direction(
+            hessian,
+            &zero_gradient,
+            &rows.a,
+            Some(&active_residual),
+        )?;
+        let refined_multipliers = -system_multipliers;
+        if refined_multipliers
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+        {
+            return Ok((unconstrained + &correction, refined_multipliers));
+        }
+        let mut retained = Vec::with_capacity(active.len());
+        for (position, &active_row) in active.iter().enumerate() {
+            if refined_multipliers[position].is_finite()
+                && refined_multipliers[position] > 0.0
+            {
+                retained.push(active_row);
+            } else {
+                is_active[active_row] = false;
+                *transitions += 1;
+            }
+        }
+        *active = retained;
+    }
+}
+
 /// Operator-carrier constrained quadratic solve: minimize
 /// `½ βᵀHβ − rhsᵀβ` subject to the [`ConstraintSet`]. Dense sets take the
 /// existing dense path byte-identically; factored carriers use metric-dual row
@@ -3882,43 +3928,14 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
             // its active equalities can carry exactly the condition-squared
             // drift that the bordered solve exists to remove.
             if !conditioned_phase {
-                loop {
-                    if active.is_empty() {
-                        candidate.assign(&unconstrained);
-                        multipliers = Array1::zeros(0);
-                        break;
-                    }
-                    let rows = ops.gather_unit_rows(&active)?;
-                    let active_residual = &rows.b - &rows.a.dot(&unconstrained);
-                    let zero_gradient = Array1::<f64>::zeros(p);
-                    let (correction, system_multipliers) = solve_kkt_direction(
-                        hessian,
-                        &zero_gradient,
-                        &rows.a,
-                        Some(&active_residual),
-                    )?;
-                    let refined_multipliers = -system_multipliers;
-                    if refined_multipliers
-                        .iter()
-                        .all(|value| value.is_finite() && *value > 0.0)
-                    {
-                        candidate = &unconstrained + &correction;
-                        multipliers = refined_multipliers;
-                        break;
-                    }
-                    let mut retained = Vec::with_capacity(active.len());
-                    for (position, &active_row) in active.iter().enumerate() {
-                        if refined_multipliers[position].is_finite()
-                            && refined_multipliers[position] > 0.0
-                        {
-                            retained.push(active_row);
-                        } else {
-                            is_active[active_row] = false;
-                            transitions += 1;
-                        }
-                    }
-                    active = retained;
-                }
+                (candidate, multipliers) = refine_operator_metric_face(
+                    hessian,
+                    &unconstrained,
+                    &ops,
+                    &mut active,
+                    &mut is_active,
+                    &mut transitions,
+                )?;
                 banned.fill(false);
                 conditioned_phase = true;
                 continue;
@@ -4087,8 +4104,27 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
             .map(|value| value.to_bits())
             .collect::<Vec<_>>();
         if !visited.insert((conditioned_phase, active_key, banned_key, point_key)) {
+            if !conditioned_phase {
+                // The Schur/Gram phase is deliberately an inexpensive face
+                // discoverer, not the final numerical authority. An exact
+                // add/drop repeat means it has extracted all useful progress
+                // from the condition-squared system. Promote the repeated face
+                // immediately to the original-metric KKT phase; only a repeat
+                // after that promotion is a genuine active-set cycle.
+                (candidate, multipliers) = refine_operator_metric_face(
+                    hessian,
+                    &unconstrained,
+                    &ops,
+                    &mut active,
+                    &mut is_active,
+                    &mut transitions,
+                )?;
+                banned.fill(false);
+                conditioned_phase = true;
+                continue;
+            }
             return Err(EstimationError::ParameterConstraintViolation(format!(
-                "operator metric projection repeated an identical dual state \
+                "operator metric projection repeated an identical conditioned dual state \
                  after {transitions} rank-bounded dual transitions"
             )));
         }
