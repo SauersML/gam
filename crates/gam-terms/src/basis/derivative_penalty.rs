@@ -49,10 +49,16 @@ pub fn bspline_derivative_penalty_matrix(
     degree: usize,
     order: usize,
 ) -> Result<Array2<f64>, BasisError> {
-    let factor = bspline_derivative_penalty_factor(knot_vector, degree, order)?;
-    let mut penalty = fast_ata(&factor);
+    let (unit_factor, domain_scale) = bspline_unit_energy_factor(knot_vector, degree, order)?;
+    let mut penalty = fast_ata(&unit_factor);
     symmetrize_in_place(&mut penalty);
-    Ok(penalty)
+    // Apply the exact coordinate covariance `S_x = c^(1-2m) S_u` to the
+    // assembled unit Gram, not to the constructive factor: a single scalar
+    // multiply per entry is exactly covariant (even the structurally-zero
+    // off-band entries scale identically), and the representability guard then
+    // sees the *Gram*, which is what overflows — the factor can stay finite
+    // while `AᵀA` runs to infinity.
+    scale_gram_by_coordinate_covariance(penalty, domain_scale, order)
 }
 
 /// Constructive energy factor for the exact open B-spline roughness.
@@ -64,6 +70,23 @@ pub fn bspline_derivative_penalty_factor(
     degree: usize,
     order: usize,
 ) -> Result<Array2<f64>, BasisError> {
+    let (mut factor, domain_scale) = bspline_unit_energy_factor(knot_vector, degree, order)?;
+    rescale_derivative_factor(&mut factor, domain_scale, order)?;
+    Ok(factor)
+}
+
+/// Assemble the open B-spline roughness energy factor in the normalized `[0, 1]`
+/// coordinate — validated but with the physical-unit coordinate covariance not
+/// yet applied — and return it with the domain width `c = t_{num_basis} −
+/// t_degree`. Both public entry points share this so the matrix path can carry
+/// the covariance on the assembled Gram (exactly covariant, Gram-level
+/// representability) while the factor path carries `sqrt(c^(1-2m))` on the
+/// constructive factor.
+fn bspline_unit_energy_factor(
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    order: usize,
+) -> Result<(Array2<f64>, f64), BasisError> {
     validate_knots_for_degree(knot_vector, degree)?;
     let num_basis = knot_vector.len() - degree - 1;
     if order == 0 || order >= num_basis {
@@ -84,7 +107,7 @@ pub fn bspline_derivative_penalty_factor(
     // The modeling interval is covered by spans `[t_k, t_{k+1}]` for
     // `k = degree .. num_basis`; clamped boundary knots make the exterior
     // spans degenerate and they carry no integral mass.
-    let mut factor = derivative_energy_factor_spans(
+    let factor = derivative_energy_factor_spans(
         normalized_knots.view(),
         degree,
         order,
@@ -93,8 +116,7 @@ pub fn bspline_derivative_penalty_factor(
         num_basis,
         |col| col,
     )?;
-    rescale_derivative_factor(&mut factor, domain_scale, order)?;
-    Ok(factor)
+    Ok((factor, domain_scale))
 }
 
 /// Exact function-space penalties for the anchored I-spline basis.
@@ -257,14 +279,37 @@ pub fn cyclic_bspline_derivative_penalty_matrix(
     period: f64,
     order: usize,
 ) -> Result<Array2<f64>, BasisError> {
-    let factor = cyclic_bspline_derivative_penalty_factor(degree, num_basis, period, order)?;
-    let mut penalty = fast_ata(&factor);
+    let unit_factor = cyclic_unit_energy_factor(degree, num_basis, period, order)?;
+    let mut penalty = fast_ata(&unit_factor);
     symmetrize_in_place(&mut penalty);
-    Ok(penalty)
+    // Carry the exact covariance `S_x = period^(1-2m) S_u` on the assembled unit
+    // Gram, not on the factor. A single scalar multiply per entry is exactly
+    // covariant — the structurally-zero circulant off-band entries (whose value
+    // is pure cancellation roundoff) scale identically with every other entry
+    // instead of re-summing at a different magnitude — and the guard now sees
+    // the Gram overflow that a finite factor with `AᵀA = ∞` would otherwise
+    // slip through.
+    scale_gram_by_coordinate_covariance(penalty, period, order)
 }
 
 /// Constructive energy factor for the exact cyclic B-spline roughness.
 pub fn cyclic_bspline_derivative_penalty_factor(
+    degree: usize,
+    num_basis: usize,
+    period: f64,
+    order: usize,
+) -> Result<Array2<f64>, BasisError> {
+    let mut factor = cyclic_unit_energy_factor(degree, num_basis, period, order)?;
+    rescale_derivative_factor(&mut factor, period, order)?;
+    Ok(factor)
+}
+
+/// Assemble the cyclic B-spline roughness energy factor in the dimensionless
+/// unit-period coordinate — fully validated (including the physical `period`,
+/// which the covariance step consumes) but with the coordinate covariance not
+/// yet applied. Shared by both public entry points: the matrix path scales the
+/// assembled Gram, the factor path scales this constructive factor.
+fn cyclic_unit_energy_factor(
     degree: usize,
     num_basis: usize,
     period: f64,
@@ -301,16 +346,16 @@ pub fn cyclic_bspline_derivative_penalty_factor(
     // `num_basis` while accumulating: with `num_basis > degree` no translate
     // overlaps its own wrap, so the fold is an exact identification. The Gram
     // is anchor-invariant, so the extended knots are anchored at zero.
-    // Assemble in a dimensionless unit-period coordinate and apply the exact
-    // covariance `S_x = period^(1-2m) S_u` afterwards. Besides making the unit
-    // behavior explicit, this avoids interpreting a perfectly valid small
+    // Assemble in a dimensionless unit-period coordinate; the caller applies the
+    // exact covariance `S_x = period^(1-2m) S_u` afterwards. Besides making the
+    // unit behavior explicit, this avoids interpreting a perfectly valid small
     // physical period as a numerically degenerate knot grid.
     let knots = cyclic_uniform_knot_vector(0.0, 1.0, degree, num_basis);
     let num_basis_extended = knots.len() - degree - 1;
 
     // One period = the `num_basis` spans `[t_k, t_{k+1}]`,
     // `k = degree .. degree + num_basis`, of the extended knot line.
-    let mut factor = derivative_energy_factor_spans(
+    derivative_energy_factor_spans(
         knots.view(),
         degree,
         order,
@@ -318,9 +363,7 @@ pub fn cyclic_bspline_derivative_penalty_factor(
         num_basis_extended,
         num_basis,
         |col| col % num_basis,
-    )?;
-    rescale_derivative_factor(&mut factor, period, order)?;
-    Ok(factor)
+    )
 }
 
 /// Maps the open spline's modeling interval to `[0, 1]`. Assembly in this
@@ -392,6 +435,43 @@ fn derivative_gram_coordinate_scale(domain_scale: f64, order: usize) -> Result<f
         )));
     }
     Ok(scale)
+}
+
+/// Apply the exact coordinate covariance `S_x = c^(1-2m) S_u` to an assembled
+/// unit-coordinate roughness Gram, and reject a scale whose floating
+/// representation makes the *Gram* (not merely its factor) unusable.
+///
+/// Scaling the assembled Gram by the scalar `c^(1-2m)` is what makes the
+/// covariance exact: `S_x[i,j] = c^(1-2m)·S_u[i,j]` is a single multiply, so
+/// every entry — including the structurally-zero off-band circulant entries
+/// whose value is pure cancellation roundoff — scales identically, rather than
+/// being re-summed from a factor pre-scaled by `sqrt(c^(1-2m))` (which reorders
+/// the rounding and lets a near-zero entry drift by O(1) relative at extreme
+/// scales). It also moves the representability guard onto the object that
+/// actually overflows: at a tiny period the factor entries can stay finite
+/// while their `AᵀA` runs to infinity, so checking the factor is not enough.
+fn scale_gram_by_coordinate_covariance(
+    mut gram: Array2<f64>,
+    domain_scale: f64,
+    order: usize,
+) -> Result<Array2<f64>, BasisError> {
+    let scale = derivative_gram_coordinate_scale(domain_scale, order)?;
+    gram.mapv_inplace(|value| value * scale);
+    if gram.iter().any(|value| !value.is_finite()) {
+        return Err(BasisError::InvalidInput(format!(
+            "order-{order} roughness Gram over domain width {domain_scale} is not representable"
+        )));
+    }
+    // Each basis function must keep strictly positive self-energy `S_ii =
+    // ∫(B_i^{(m)})² > 0`; a scale that underflows any diagonal to zero would
+    // silently leave a direction unpenalized.
+    let lost_energy = gram.diag().iter().any(|value| *value <= 0.0);
+    if lost_energy {
+        return Err(BasisError::InvalidInput(format!(
+            "order-{order} roughness Gram over domain width {domain_scale} lost a basis-function energy"
+        )));
+    }
+    Ok(gram)
 }
 
 /// Apply exact coordinate covariance to the energy factor and reject a scale
