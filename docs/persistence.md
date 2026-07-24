@@ -27,9 +27,18 @@ plus `payload`; the Rust save path writes it with
 
 - coefficients, smoothing parameters, basis specifications;
 - formula and family / link metadata;
+- the joint posterior state needed by the model's default point estimand;
 - the data schema used by `Model.check(...)` and `Model.predict(...)`.
 
 It does not contain the training data.
+
+The default point estimate is always the posterior mean. For a curved response
+map this differs from plugging the fitted coefficient mode into the inverse
+link, so a mode alone is not a complete saved model. Such models persist either
+the conditional coefficient covariance in the saved coefficient frame or a
+same-frame strictly positive-definite penalized precision from which it can be
+reconstructed. Save and load reject a curved-link payload lacking that state;
+they never silently substitute a plug-in/MAP prediction.
 
 Saved model payloads cover the current Python-facing model classes:
 standard scalar GAMs (the `standard` variant), Gaussian / binomial /
