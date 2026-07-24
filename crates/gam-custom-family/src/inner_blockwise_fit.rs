@@ -40,11 +40,11 @@ impl ExactJointModeCurvatureCertificate {
 /// Whether the constrained candidate, rather than an ambient unconstrained
 /// spectrum step, owns trust-region globalization.
 ///
-/// A reduced-face candidate is either the exact positive-curvature Newton
-/// direction or the cone-projected gradient when accessible curvature is not
-/// positive definite. Both are already defined on the feasible face. Replacing
-/// either with an ambient unconstrained spectrum step moves off that face while
-/// incorrectly retaining its endpoint row ids.
+/// A reduced-face candidate is the exact positive-curvature Newton direction,
+/// a generalized reduced spectral completion, or (at a fully pinned face) the
+/// cone-projected gradient. Every variant is already defined on the feasible
+/// face. Replacing it with an ambient unconstrained spectrum step moves off that
+/// face while incorrectly retaining its endpoint row ids.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReducedFaceCandidateKind {
     /// The original, unmodified reduced Hessian and final constraint cone
@@ -53,9 +53,13 @@ enum ReducedFaceCandidateKind {
     /// The reduced Hessian is positive definite, but a changed endpoint face
     /// prevents an exact original-H KKT certificate.
     ReducedNewton,
+    /// The reduced Hessian is singular or indefinite. Positive generalized
+    /// eigenmodes retain their exact Newton curvature; only nonpositive/
+    /// numerically-null modes are lifted to the rank floor in the trust metric.
+    RegularizedNewton,
     /// The reduced Hessian is singular or indefinite, so the step is the
-    /// metric-projected negative gradient rather than an eigenvalue-reflected
-    /// surrogate Newton step.
+    /// metric-projected negative gradient. This is used when the current active
+    /// rows leave no tangent space to regularize.
     ProjectedGradient,
 }
 
@@ -111,8 +115,104 @@ fn self_concordant_damped_step_alpha(newton_decrement: f64) -> Option<f64> {
     Some(1.0 / (1.0 + lambda_n))
 }
 
-/// Reduced-space Newton or projected-gradient candidate on a certified current
-/// inequality face.
+/// Positive reduced metric from the generalized eigensystem `(H, D)`.
+///
+/// `D` is the existing affine-covariant trust/preconditioner metric. Whitening
+/// by `D` makes the curvature classification invariant to coefficient units.
+/// Every generalized eigenvalue already above the numerical-rank floor is kept
+/// exactly; only nonpositive or numerically-null modes are raised to that floor:
+///
+/// ```text
+/// B = D^(-1/2) H D^(-1/2) = V diag(gamma) V'
+/// M = D^(1/2) V diag(max(gamma, floor)) V' D^(1/2).
+/// ```
+///
+/// This is the nearest positive spectral completion in trust coordinates. It
+/// differs fundamentally from `|gamma|`: a strongly negative mode does not
+/// become a strongly attractive surrogate minimum, while identified positive
+/// modes retain their Newton scaling. The caller's exact-objective trust ratio
+/// still decides the nonlinear step.
+fn generalized_positive_reduced_metric(
+    reduced_hessian: &Array2<f64>,
+    reduced_trust_metric: &Array2<f64>,
+) -> Result<(Array2<f64>, bool), String> {
+    let dimension = reduced_hessian.nrows();
+    if dimension == 0
+        || reduced_hessian.ncols() != dimension
+        || reduced_trust_metric.nrows() != dimension
+        || reduced_trust_metric.ncols() != dimension
+    {
+        return Err("generalized reduced metric requires nonempty equal square matrices".into());
+    }
+
+    let mut trust_metric = reduced_trust_metric.clone();
+    symmetrize_dense_in_place(&mut trust_metric);
+    let (metric_eigenvalues, metric_eigenvectors) =
+        FaerEigh::eigh(&trust_metric, faer::Side::Lower).map_err(|error| {
+            format!("reduced trust-metric eigendecomposition failed: {error:?}")
+        })?;
+    if metric_eigenvalues
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return Err("reduced trust metric is not positive definite".into());
+    }
+
+    let mut metric_sqrt_columns = metric_eigenvectors.clone();
+    let mut metric_inv_sqrt_columns = metric_eigenvectors.clone();
+    for (column, eigenvalue) in metric_eigenvalues.iter().enumerate() {
+        let sqrt = eigenvalue.sqrt();
+        let inverse_sqrt = sqrt.recip();
+        for row in 0..dimension {
+            metric_sqrt_columns[[row, column]] *= sqrt;
+            metric_inv_sqrt_columns[[row, column]] *= inverse_sqrt;
+        }
+    }
+    let metric_sqrt = metric_sqrt_columns.dot(&metric_eigenvectors.t());
+    let metric_inv_sqrt = metric_inv_sqrt_columns.dot(&metric_eigenvectors.t());
+
+    let mut whitened_hessian = metric_inv_sqrt
+        .dot(reduced_hessian)
+        .dot(&metric_inv_sqrt);
+    symmetrize_dense_in_place(&mut whitened_hessian);
+    let (generalized_eigenvalues, generalized_eigenvectors) =
+        FaerEigh::eigh(&whitened_hessian, faer::Side::Lower).map_err(|error| {
+            format!("whitened reduced-Hessian eigendecomposition failed: {error:?}")
+        })?;
+    if generalized_eigenvalues
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err("whitened reduced Hessian contains non-finite curvature".into());
+    }
+    let curvature_scale = generalized_eigenvalues
+        .iter()
+        .map(|value| value.abs())
+        .fold(1.0_f64, f64::max);
+    let positive_floor = KKT_REFUSAL_RANK_TOL * curvature_scale;
+    let exact_positive_curvature = generalized_eigenvalues
+        .iter()
+        .all(|value| *value > positive_floor);
+
+    let mut positive_columns = generalized_eigenvectors.clone();
+    for (column, eigenvalue) in generalized_eigenvalues.iter().enumerate() {
+        let curvature = eigenvalue.max(positive_floor);
+        for row in 0..dimension {
+            positive_columns[[row, column]] *= curvature;
+        }
+    }
+    let whitened_positive = positive_columns.dot(&generalized_eigenvectors.t());
+    let mut metric = metric_sqrt
+        .dot(&whitened_positive)
+        .dot(&metric_sqrt);
+    symmetrize_dense_in_place(&mut metric);
+    if metric.iter().any(|value| !value.is_finite()) {
+        return Err("generalized positive reduced metric is non-finite".into());
+    }
+    Ok((metric, exact_positive_curvature))
+}
+
+/// Reduced-space Newton candidate on a certified current inequality face.
 ///
 /// The global constrained step uses a convex model to discover the active
 /// face. Once that face is known, convexifying the Hessian in ambient
@@ -124,22 +224,29 @@ fn self_concordant_damped_step_alpha(newton_decrement: f64) -> Option<f64> {
 ///     (Z' H Z) delta_z = Z' r,   delta = Z delta_z,
 ///
 /// where `Z` spans `null(A_active)`. If the reduced Hessian is singular or
-/// indefinite, there is no Newton minimizer on that face. Eigenvalue reflection
-/// is not a substitute: it can lower the nonlinear objective while cycling
-/// among unrelated faces (#979). The fallback is instead the constraint-aware
-/// projected-gradient map
+/// indefinite, there is no exact Newton minimizer on that face. Ambient
+/// eigenvalue reflection is not a substitute: it changes accessible positive
+/// curvature and can cycle among unrelated faces (#979). Instead, this routine
+/// whitens the reduced Hessian by the reduced trust metric, preserves every
+/// identified positive generalized eigenmode exactly, and lifts only
+/// nonpositive or numerically-null modes to the rank floor. The resulting SPD
+/// proximal metric `M` defines the constraint-aware map
 ///
-///     beta_next = argmin_{x in C} 1/2 ||x-beta||_D^2 - r' (x-beta)
-///               = P_C^D(beta + D^-1 r),
+///     beta_next = argmin_{x in C} 1/2 ||x-beta||_M^2 - r' (x-beta)
+///               = P_C^M(beta + M^-1 r).
 ///
-/// using the solver's existing positive trust/preconditioner metric `D`. The
-/// projection variational inequality certifies
+/// Here `M` is built from the solver's existing positive
+/// trust/preconditioner metric `D`. The projection variational inequality
+/// certifies
 ///
-///     r' delta >= ||delta||_D^2 > 0
+///     r' delta >= ||delta||_M^2 > 0
 ///
 /// for every nonzero step, so the exact-objective trust loop receives a genuine
 /// first-order descent direction. Strict saddles at zero projected gradient are
-/// handled separately by the reduced-curvature certificate/escape machinery.
+/// handled separately by the reduced-curvature certificate/escape machinery. A
+/// fully pinned current face has no tangent system to regularize; there the
+/// routine uses the original `D`-metric projected gradient so invalid active
+/// rows can still release.
 ///
 /// In either branch the constraint solver resolves every blocker entry/release
 /// in one model; it never returns to the nonlinear loop after only the first
@@ -173,70 +280,51 @@ fn certified_reduced_face_candidate(
         ActiveConstraintTangentGeometry::FullyPinned => None,
         ActiveConstraintTangentGeometry::Tangent(tangent) => Some(tangent),
     };
-    let reduced_geometry = if let Some(tangent) = tangent.as_ref() {
-        let mut reduced_hessian = tangent.t().dot(exact_hessian).dot(tangent);
-        symmetrize_dense_in_place(&mut reduced_hessian);
-        let (eigenvalues, _eigenvectors) =
-            FaerEigh::eigh(&reduced_hessian, faer::Side::Lower).map_err(|error| {
-                format!("exact active-face Hessian eigendecomposition failed: {error:?}")
-            })?;
-        if eigenvalues.iter().any(|value| !value.is_finite()) {
-            return Ok(None);
-        }
-        let curvature_scale = eigenvalues
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f64, f64::max);
-        let positive_floor = KKT_REFUSAL_RANK_TOL * curvature_scale;
-        let exact_positive_curvature =
-            curvature_scale > 0.0 && eigenvalues.iter().all(|value| *value > positive_floor);
-        Some((
-            reduced_hessian,
-            curvature_scale,
-            positive_floor,
-            exact_positive_curvature,
-        ))
-    } else {
-        None
-    };
-    let exact_positive_curvature = reduced_geometry
-        .as_ref()
-        .is_some_and(|(_, _, _, positive)| *positive);
+    let mut trust_metric = Array2::<f64>::zeros((p, p));
+    for index in 0..p {
+        trust_metric[[index, index]] = trust_metric_diag[index];
+    }
+    let (mut face_metric, exact_positive_curvature, candidate_kind) =
+        if let Some(tangent) = tangent.as_ref() {
+            let mut reduced_hessian = tangent.t().dot(exact_hessian).dot(tangent);
+            symmetrize_dense_in_place(&mut reduced_hessian);
+            let mut reduced_trust_metric = tangent.t().dot(&trust_metric).dot(tangent);
+            symmetrize_dense_in_place(&mut reduced_trust_metric);
+            let (positive_reduced_metric, exact_positive_curvature) =
+                match generalized_positive_reduced_metric(&reduced_hessian, &reduced_trust_metric) {
+                    Ok(metric) => metric,
+                    Err(_) => return Ok(None),
+                };
 
-    let mut face_metric = if exact_positive_curvature {
-        // Preserve the exact Hessian on the accessible tangent and add curvature
-        // only in the inaccessible normal space so the full-space QP is unique.
-        let tangent = tangent
-            .as_ref()
-            .expect("positive reduced curvature requires a nonempty tangent");
-        let (reduced_hessian, curvature_scale, positive_floor, _) = reduced_geometry
-            .as_ref()
-            .expect("positive reduced curvature geometry");
-        let tangent_projector = tangent.dot(&tangent.t());
-        let mut metric = tangent.dot(&reduced_hessian.dot(&tangent.t()));
-        let normal_scale = (*curvature_scale)
-            .max(*positive_floor)
-            .max(f64::MIN_POSITIVE);
-        for row in 0..p {
-            for column in 0..p {
-                let identity = if row == column { 1.0 } else { 0.0 };
-                let normal_projector = identity - tangent_projector[[row, column]];
-                metric[[row, column]] += normal_scale * normal_projector;
-            }
-        }
-        metric
-    } else {
-        // Singular/indefinite accessible curvature has no Newton minimizer.
-        // Use the positive affine-covariant trust metric as a projected-gradient
-        // proximal model. This is independent of the sign/magnitude of H's
-        // negative eigenvalues and therefore cannot manufacture a reflected
-        // "Newton" attractor on a different face.
-        let mut metric = Array2::<f64>::zeros((p, p));
-        for index in 0..p {
-            metric[[index, index]] = trust_metric_diag[index];
-        }
-        metric
-    };
+            // Lift the completed reduced metric into the accessible tangent.
+            // Add N D N only on the inaccessible Euclidean-normal subspace so
+            // the ambient QP is unique without changing a single tangent mode.
+            let tangent_projector = tangent.dot(&tangent.t());
+            let mut normal_projector = Array2::<f64>::eye(p) - &tangent_projector;
+            symmetrize_dense_in_place(&mut normal_projector);
+            let normal_metric = normal_projector
+                .dot(&trust_metric)
+                .dot(&normal_projector);
+            let metric = tangent
+                .dot(&positive_reduced_metric)
+                .dot(&tangent.t())
+                + normal_metric;
+            let kind = if exact_positive_curvature {
+                ReducedFaceCandidateKind::ReducedNewton
+            } else {
+                ReducedFaceCandidateKind::RegularizedNewton
+            };
+            (metric, exact_positive_curvature, kind)
+        } else {
+            // With no tangent space, D-projection is the only face-aware
+            // first-order step and can release active rows with invalid
+            // multipliers.
+            (
+                trust_metric,
+                false,
+                ReducedFaceCandidateKind::ProjectedGradient,
+            )
+        };
     symmetrize_dense_in_place(&mut face_metric);
     if face_metric.iter().any(|value| !value.is_finite()) {
         return Ok(None);
@@ -304,10 +392,8 @@ fn certified_reduced_face_candidate(
     }
     let kind = if exact_newton {
         ReducedFaceCandidateKind::ExactNewton
-    } else if exact_positive_curvature {
-        ReducedFaceCandidateKind::ReducedNewton
     } else {
-        ReducedFaceCandidateKind::ProjectedGradient
+        candidate_kind
     };
     Ok(Some((candidate, next_active, kind)))
 }
@@ -373,7 +459,7 @@ mod exact_face_newton_tests {
             &metric,
         )
         .expect("reduced face classification")
-        .expect("projected-gradient QP resolves the blocker");
+        .expect("regularized reduced QP resolves the blocker");
         assert!(candidate[0].abs() <= 1e-12);
         assert!(
             candidate[1] <= 0.5,
@@ -389,7 +475,7 @@ mod exact_face_newton_tests {
             candidate[1]
         );
         assert_eq!(active, vec![0, 1]);
-        assert_eq!(kind, ReducedFaceCandidateKind::ProjectedGradient);
+        assert_eq!(kind, ReducedFaceCandidateKind::RegularizedNewton);
     }
 
     #[test]
@@ -491,11 +577,12 @@ mod exact_face_newton_tests {
     }
 
     #[test]
-    fn indefinite_reduced_face_uses_metric_projected_gradient_not_reflection() {
-        // Negative accessible curvature has no Newton minimizer. The candidate
-        // must therefore be the D-metric projected gradient and be independent
-        // of the magnitude of H's negative eigenvalue. With D_yy=2 and rhs_y=2,
-        // both Hessians below must propose y=1.
+    fn indefinite_reduced_face_floors_negative_modes_instead_of_reflecting() {
+        // Negative accessible curvature has no Newton minimizer. Its
+        // generalized mode is lifted to the same numerical rank boundary
+        // rather than reflected to |gamma|. Both Hessians therefore head
+        // toward the same constrained endpoint instead of turning strong
+        // negative curvature into a tiny surrogate-Newton step.
         let hessian = array![[1.0_f64, 0.0], [0.0, -2.0]];
         let strongly_indefinite_hessian = array![[1.0_f64, 0.0], [0.0, -2.0e6]];
         let rhs = array![0.0_f64, 2.0];
@@ -504,9 +591,9 @@ mod exact_face_newton_tests {
         let constraints = ConstraintSet::Dense(
             LinearInequalityConstraints::new(
                 array![[1.0_f64, 0.0], [0.0, -1.0]],
-                array![0.0, -5.0],
+                array![0.0, -1.0],
             )
-            .expect("x>=0 and y<=5"),
+            .expect("x>=0 and y<=1"),
         );
         let (candidate, active, kind) = certified_reduced_face_candidate(
             &hessian,
@@ -517,7 +604,7 @@ mod exact_face_newton_tests {
             &metric,
         )
         .expect("reduced face classification")
-        .expect("projected-gradient step is feasible");
+        .expect("regularized reduced step is feasible");
         let (strong_candidate, strong_active, strong_kind) =
             certified_reduced_face_candidate(
                 &strongly_indefinite_hessian,
@@ -528,14 +615,43 @@ mod exact_face_newton_tests {
                 &metric,
             )
             .expect("strongly indefinite face classification")
-            .expect("projected-gradient step is curvature-magnitude invariant");
+            .expect("regularized reduced step reaches the same endpoint");
         assert!(candidate[0].abs() <= 1e-12);
         assert!((candidate[1] - 1.0).abs() <= 1e-12);
-        assert_eq!(active, vec![0]);
+        assert_eq!(active, vec![0, 1]);
         assert_eq!(strong_active, active);
-        assert_eq!(strong_candidate, candidate);
-        assert_eq!(kind, ReducedFaceCandidateKind::ProjectedGradient);
-        assert_eq!(strong_kind, ReducedFaceCandidateKind::ProjectedGradient);
+        assert!((&strong_candidate - &candidate)
+            .iter()
+            .all(|difference| difference.abs() <= 1e-12));
+        assert_eq!(kind, ReducedFaceCandidateKind::RegularizedNewton);
+        assert_eq!(strong_kind, ReducedFaceCandidateKind::RegularizedNewton);
+    }
+
+    #[test]
+    fn generalized_completion_preserves_identified_positive_modes() {
+        let reduced_hessian =
+            array![[4.0_f64, 0.0, 0.0], [0.0, -2.0, 0.0], [0.0, 0.0, 0.0]];
+        let reduced_trust =
+            array![[2.0_f64, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 8.0]];
+        let (metric, exact) =
+            generalized_positive_reduced_metric(&reduced_hessian, &reduced_trust)
+                .expect("generalized spectral completion");
+        let floor = 2.0 * KKT_REFUSAL_RANK_TOL;
+
+        assert!(!exact);
+        assert!(
+            (metric[[0, 0]] - 4.0).abs() <= 1e-12,
+            "the identified positive generalized mode must remain exact"
+        );
+        assert!((metric[[1, 1]] - 4.0 * floor).abs() <= 1e-12);
+        assert!((metric[[2, 2]] - 8.0 * floor).abs() <= 1e-12);
+        for row in 0..3 {
+            for column in 0..3 {
+                if row != column {
+                    assert!(metric[[row, column]].abs() <= 1e-12);
+                }
+            }
+        }
     }
 
     #[test]
@@ -575,6 +691,11 @@ mod exact_face_newton_tests {
     fn ambient_negative_curvature_cannot_replace_a_reduced_face_direction() {
         assert!(constrained_search_delta_owns_trust_step(
             Some(ReducedFaceCandidateKind::ProjectedGradient),
+            true,
+            Some(true),
+        ));
+        assert!(constrained_search_delta_owns_trust_step(
+            Some(ReducedFaceCandidateKind::RegularizedNewton),
             true,
             Some(true),
         ));
@@ -2688,6 +2809,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             match reduced_face_kind {
                                 Some(ReducedFaceCandidateKind::ExactNewton) => "exact-face",
                                 Some(ReducedFaceCandidateKind::ReducedNewton) => "reduced-newton",
+                                Some(ReducedFaceCandidateKind::RegularizedNewton) => {
+                                    "regularized-newton"
+                                }
                                 Some(ReducedFaceCandidateKind::ProjectedGradient) => {
                                     "projected-gradient"
                                 }
@@ -3607,14 +3731,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     // FACE-AWARE CONSTRAINED PATH (gam#979 CTN).
                     //
                     // `search_delta` is authoritative when it is an exact/reduced
-                    // positive-curvature Newton step OR the D-metric projected
-                    // gradient selected for a singular/indefinite face. Replacing
-                    // either with an unconstrained Moré-Sorensen step changes the
-                    // critical cone. That replacement used to happen whenever the
-                    // QP step exceeded the trust radius. On the 4,800-row Duchon
-                    // CTN it converted a feasible O(1e-2) proposal into an O(1e-4)
-                    // projected step, repeatedly changed the active face, and left
-                    // the KKT residual near 20--30.
+                    // positive-curvature Newton step, a reduced spectral
+                    // completion, or the D-metric projected gradient selected at
+                    // a fully pinned face. Replacing any of these with an
+                    // unconstrained Moré-Sorensen step changes the critical cone.
+                    // That replacement used to happen whenever the QP step
+                    // exceeded the trust radius. On the 4,800-row Duchon CTN it
+                    // converted a feasible O(1e-2) proposal into an O(1e-4)
+                    // projected step, repeatedly changed the active face, and
+                    // left the KKT residual near 20--30.
                     //
                     // Global scaling by one alpha is the correct globalization
                     // for this case. Both beta and beta + search_delta are cone-
