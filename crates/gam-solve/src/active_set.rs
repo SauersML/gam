@@ -3843,14 +3843,15 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
     let mut multipliers = Array1::<f64>::zeros(0);
     let mut is_active = vec![false; m];
     let mut banned = vec![false; m];
-    let mut visited = HashSet::<(Vec<usize>, Vec<usize>, Vec<u64>)>::new();
+    let mut visited = HashSet::<(bool, Vec<usize>, Vec<usize>, Vec<u64>)>::new();
     visited.insert((
+        false,
         Vec::new(),
         Vec::new(),
         candidate.iter().map(|value| value.to_bits()).collect(),
     ));
     let mut transitions = 0usize;
-    let mut kkt_refined_face: Option<Vec<usize>> = None;
+    let mut conditioned_phase = false;
 
     loop {
         let values = ops.values(&candidate)?;
@@ -3880,7 +3881,7 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
             // the fast Gram candidate is only a face-discovery iterate, and
             // its active equalities can carry exactly the condition-squared
             // drift that the bordered solve exists to remove.
-            if kkt_refined_face.as_deref() != Some(active.as_slice()) {
+            if !conditioned_phase {
                 loop {
                     if active.is_empty() {
                         candidate.assign(&unconstrained);
@@ -3919,7 +3920,7 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
                     active = retained;
                 }
                 banned.fill(false);
-                kkt_refined_face = Some(active.clone());
+                conditioned_phase = true;
                 continue;
             }
 
@@ -3978,7 +3979,6 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
             return Ok((candidate, active));
         };
 
-        kkt_refined_face = None;
         let candidate_before_transition = candidate.clone();
         active.push(row);
         is_active[row] = true;
@@ -3991,20 +3991,39 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
 
         loop {
             let rows = ops.gather_unit_rows(&active)?;
-            let mut inverse_rows_t = rows.a.t().to_owned();
-            factor.solve_mat_in_place(&mut inverse_rows_t);
-            if inverse_rows_t.iter().any(|value| !value.is_finite()) {
-                crate::bail_invalid_estim!(
-                    "operator metric-projection passive inverse is non-finite"
-                );
-            }
-            let gram = rows.a.dot(&inverse_rows_t);
-            let target = &rows.b - &rows.a.dot(&unconstrained);
-            let mut trial = Array1::<f64>::zeros(active.len());
-            solve_dense_system_via_pseudoinverse(&gram, &target, &mut trial)?;
+            let (trial, trial_candidate) = if conditioned_phase {
+                // Once the fast row generator has identified and refined its
+                // terminal face, keep every newly exposed separator in the
+                // original H conditioning. Returning to the Schur/Gram solve
+                // here can recreate the approximate face that refinement just
+                // left, producing an exact add/drop cycle.
+                let active_residual = &rows.b - &rows.a.dot(&unconstrained);
+                let zero_gradient = Array1::<f64>::zeros(p);
+                let (correction, system_multipliers) = solve_kkt_direction(
+                    hessian,
+                    &zero_gradient,
+                    &rows.a,
+                    Some(&active_residual),
+                )?;
+                (-system_multipliers, &unconstrained + &correction)
+            } else {
+                let mut inverse_rows_t = rows.a.t().to_owned();
+                factor.solve_mat_in_place(&mut inverse_rows_t);
+                if inverse_rows_t.iter().any(|value| !value.is_finite()) {
+                    crate::bail_invalid_estim!(
+                        "operator metric-projection passive inverse is non-finite"
+                    );
+                }
+                let gram = rows.a.dot(&inverse_rows_t);
+                let target = &rows.b - &rows.a.dot(&unconstrained);
+                let mut trial = Array1::<f64>::zeros(active.len());
+                solve_dense_system_via_pseudoinverse(&gram, &target, &mut trial)?;
+                let trial_candidate = &unconstrained + &inverse_rows_t.dot(&trial);
+                (trial, trial_candidate)
+            };
             if trial.iter().all(|value| value.is_finite() && *value > 0.0) {
                 multipliers = trial;
-                candidate = &unconstrained + &inverse_rows_t.dot(&multipliers);
+                candidate = trial_candidate;
                 break;
             }
 
@@ -4025,6 +4044,8 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
                 multipliers[position] +=
                     alpha * (trial[position] - multipliers[position]);
             }
+            let candidate_chord = &trial_candidate - &candidate;
+            candidate.scaled_add(alpha, &candidate_chord);
 
             let mut retained_rows = Vec::with_capacity(active.len());
             let mut retained_multipliers = Vec::with_capacity(active.len());
@@ -4045,10 +4066,6 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
                 candidate.assign(&unconstrained);
                 break;
             }
-            let retained = ops.gather_unit_rows(&active)?;
-            let mut inverse_retained_t = retained.a.t().to_owned();
-            factor.solve_mat_in_place(&mut inverse_retained_t);
-            candidate = &unconstrained + &inverse_retained_t.dot(&multipliers);
         }
 
         let moved = candidate
@@ -4069,7 +4086,7 @@ fn solve_strictly_convex_quadratic_with_constraint_set_dual(
             .iter()
             .map(|value| value.to_bits())
             .collect::<Vec<_>>();
-        if !visited.insert((active_key, banned_key, point_key)) {
+        if !visited.insert((conditioned_phase, active_key, banned_key, point_key)) {
             return Err(EstimationError::ParameterConstraintViolation(format!(
                 "operator metric projection repeated an identical dual state \
                  after {transitions} rank-bounded dual transitions"
