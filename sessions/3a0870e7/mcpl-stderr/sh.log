@@ -106,3 +106,51 @@
 2026-07-26T05:50:13.715Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "cos_g\|dot\|__global__\|extern \"C\"\|KERNEL_SRC\|r#\"" crates/gam-terms/src/basis/sphere_gpu.rs | head -50
 2026-07-26T05:50:18.672Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '502,600p' crates/gam-terms/src/basis/sphere_gpu.rs
 2026-07-26T05:50:36.369Z [shell-mcp] bash: sleep 45; tail -c 150 /tmp/man.log; cd /home/runner/work/gam/gam && grep -c "SphereWahbaKernel::Sobolev =>" crates/gam-terms/src/basis/sphere_gpu.rs; grep -n "f
+2026-07-26T12:15:26.967Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git log --oneline -3 && git status --short | head
+2026-07-26T12:15:30.793Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git log --oneline --all | grep -c . ; git log --oneline -30 | grep -i "2489" ; ls crates/gam-terms/src/basis/sphere_half_angle.r
+2026-07-26T12:15:36.676Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test --test manifolds > /tmp/man.log 2>&1; echo DONE_$? >> /tmp/man.log' >/dev/null 2>&1 &); sleep 
+2026-07-26T12:15:50.555Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue comment 2489 --body "$(cat <<'EOF'
+2026-07-26T12:16:08.353Z [shell-mcp] bash: sleep 58; tail -c 120 /tmp/man.log
+2026-07-26T12:17:12.755Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log
+2026-07-26T12:18:13.932Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log
+2026-07-26T12:19:15.423Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log
+2026-07-26T12:20:17.253Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log
+2026-07-26T12:21:18.998Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log
+2026-07-26T12:22:19.915Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log
+2026-07-26T12:23:22.439Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log
+2026-07-26T12:24:23.739Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log
+2026-07-26T12:25:27.734Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log
+2026-07-26T12:26:28.990Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log
+2026-07-26T12:27:31.748Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log
+2026-07-26T12:28:32.937Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log
+2026-07-26T12:29:34.697Z [shell-mcp] bash: sleep 58; tail -c 100 /tmp/man.log; ps aux|grep -c "[r]ustc"
+2026-07-26T12:30:36.271Z [shell-mcp] bash: grep -E "^test result|^DONE|FAILED|panicked" /tmp/man.log | head -20
+2026-07-26T12:30:39.258Z [shell-mcp] bash: sleep 58; grep -E "^test result|^DONE|FAILED" /tmp/man.log | head -20
+2026-07-26T12:31:46.832Z [shell-mcp] bash: sleep 58; grep -E "^test result|^DONE|FAILED" /tmp/man.log | head -20
+2026-07-26T12:32:47.698Z [shell-mcp] bash: sleep 58; grep -E "^test result|^DONE|FAILED" /tmp/man.log|head -20; tail -c 150 /tmp/man.log
+2026-07-26T12:33:49.341Z [shell-mcp] bash: sleep 58; grep -E "^test result|^DONE|FAILED" /tmp/man.log|head; tail -c 120 /tmp/man.log
+2026-07-26T12:34:57.673Z [shell-mcp] bash: grep -A 12 "panicked at" /tmp/man.log | head -20
+2026-07-26T12:35:04.182Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue list --state open --search "cyclic seam period boundary" --limit 5 --json number,title -q '.[]|"\(.number) \(.title)"' 
+2026-07-26T12:35:07.891Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '30,70p' tests/manifolds/manifolds/cylinder_periodic.rs
+2026-07-26T12:35:15.543Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1,29p' tests/manifolds/manifolds/cylinder_periodic.rs
+2026-07-26T12:35:28.520Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "periods" crates/gam-terms/src/smooth/*.rs | grep -i "wrap\|period\[" | head -10; echo ---; grep -rn "wrap_to_period" c
+2026-07-26T12:35:32.385Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1185,1215p' crates/gam-terms/src/basis/bspline_eval.rs; echo "=== cyclic wrap"; sed -n '10,40p' crates/gam-terms/src/bas
+2026-07-26T12:35:38.925Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "periods" crates/gam-terms/src/smooth/ --include=*.rs | grep -v "^.*tests" | head -20
+2026-07-26T12:35:51.379Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '5900,5935p' crates/gam-terms/src/smooth/term_specs.rs
+2026-07-26T12:36:09.848Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "PeriodicUniform" crates/gam-terms/src/smooth/term_specs.rs | head -20
+2026-07-26T12:36:13.795Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '5840,5875p' crates/gam-terms/src/smooth/term_specs.rs
+2026-07-26T12:36:30.234Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git log -S "tensor_periodic_margin_is_exactly_cyclic_at_period_boundary" --oneline -- tests/ | tail -3; echo "--- periods field:
+2026-07-26T12:36:40.742Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '5750,5800p' crates/gam-terms/src/smooth/term_specs.rs
+2026-07-26T12:36:53.339Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "PeriodicUniform" crates/gam-terms/src/basis/bspline_build.rs | head; echo ---; grep -n "PeriodicUniform {" -A 30 crates
+2026-07-26T12:37:05.461Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "fn period(" -B 20 crates/gam-terms/src/basis/*.rs | grep -E "enum |pub |fn period" | head -20
+2026-07-26T12:37:08.189Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '185,215p' crates/gam-terms/src/basis/types.rs
+2026-07-26T12:37:15.081Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '5801,5830p' crates/gam-terms/src/smooth/term_specs.rs
+2026-07-26T12:37:31.633Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PYEOF'
+2026-07-26T12:37:36.521Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "Automatic {" -A 5 crates/gam-terms/src/basis/types.rs | head -12; grep -n "^use \|OneDimensionalBoundary" crates/gam-te
+2026-07-26T12:37:43.324Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PYEOF'
+2026-07-26T12:38:01.268Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test --test manifolds cylinder_periodic > /tmp/cp.log 2>&1; echo DONE_$? >> /tmp/cp.log' >/dev/null
+2026-07-26T12:39:00.894Z [shell-mcp] bash: sleep 58; grep -E "^test result|DONE|panicked" /tmp/cp.log|head -4; tail -c 100 /tmp/cp.log
+2026-07-26T12:40:03.010Z [shell-mcp] bash: sleep 58; grep -E "^test result|DONE|panicked" /tmp/cp.log|head -4; tail -c 100 /tmp/cp.log
+2026-07-26T12:41:04.777Z [shell-mcp] bash: sleep 58; grep -E "^test result|DONE|panicked" /tmp/cp.log|head -4; tail -c 100 /tmp/cp.log
+2026-07-26T12:42:06.711Z [shell-mcp] bash: sleep 58; grep -E "^test result|DONE|panicked|mismatch" /tmp/cp.log|head -4
+2026-07-26T12:43:08.349Z [shell-mcp] bash: sleep 58; grep -E "^test result|DONE|panicked|mismatch" /tmp/cp.log|head -4; tail -c 100 /tmp/cp.log
