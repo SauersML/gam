@@ -12,3 +12,60 @@
 2026-07-26T01:38:28.322Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "fn \|SHADER\|shader\|wgsl" crates/gam-terms/src/basis/sphere_gpu.rs | head -60
 2026-07-26T01:38:29.067Z [host] connection closed (code=null, signal=null)
 2026-07-26T04:53:24.834Z [host] connection closed (code=null, signal=null)
+2026-07-26T08:40:12.726Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git log --oneline -5 && git status --short | head
+2026-07-26T08:40:19.635Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue view 2489 --json state,title,comments 2>&1 | python3 -c "
+2026-07-26T08:40:33.237Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue list --state open --limit 100 --json number,title,createdAt,comments --jq '.[] | "\(.number)\t\(.comments|length)c\t\(.
+2026-07-26T08:40:48.594Z [shell-mcp] bash: cd /home/runner/work/gam/gam && for n in 2498 2499; do echo "######## $n"; gh issue view $n 2>&1 | head -90; done
+2026-07-26T08:40:58.592Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue view 2496 2>&1 | head -100
+2026-07-26T08:40:58.593Z [shell-mcp] bash: cd /home/runner/work/gam/gam && ls target/debug 2>/dev/null | head -3; du -sh target 2>/dev/null; nproc; free -g | head -2
+2026-07-26T08:41:06.730Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue view 2496 --json comments --jq '.comments[] | "=== \(.author.login) \(.createdAt)\n\(.body)"' 2>&1 | head -60; echo "##
+2026-07-26T08:41:15.837Z [shell-mcp] bash: cd /home/runner/work/gam/gam && date -u; for n in 2484 2508 2500; do echo "######## $n"; gh issue view $n 2>&1 | sed -n '17,70p'; done
+2026-07-26T08:41:30.025Z [shell-mcp] bash: cd /home/runner/work/gam/gam && ls crates/gam-math/src/ && echo "=== loc" && wc -l crates/gam-math/src/*.rs | sort -rn | head -25
+2026-07-26T08:41:34.131Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "^pub fn\|^pub(crate) fn\|^fn \|^/// " crates/gam-math/src/special.rs | grep "fn " | head -60; echo "=== probability"; g
+2026-07-26T08:41:39.129Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "import mpmath; print(mpmath.__version__)" 2>&1; python3 -c "import scipy; print(scipy.__version__)" 2>&1; ls example
+2026-07-26T08:41:42.262Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (pip install mpmath 2>&1 | tail -2) ; python3 -c "import mpmath; print('mpmath', mpmath.__version__)" 2>&1 | tail -1
+2026-07-26T08:41:54.943Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '460,600p' crates/gam-math/src/special.rs
+2026-07-26T08:42:11.917Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '100,180p' crates/gam-math/src/probability.rs && echo "=== logcdf derivs" && sed -n '340,420p' crates/gam-math/src/probab
+2026-07-26T08:42:37.830Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo build --release -p gam-math --example oracle_dump 2>&1 | tail -25
+2026-07-26T08:43:00.733Z [shell-mcp] bash: cd /home/runner/work/gam/gam && ./target/release/examples/oracle_dump > /tmp/dump.tsv 2>/tmp/dump.err; echo "exit=$?"; wc -l /tmp/dump.tsv; tail -3 /tmp/dump.er
+2026-07-26T08:43:21.860Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -v -e '^logcdf_d' -e '^qnorm' /tmp/dump.tsv > /tmp/dump_fast.tsv && wc -l /tmp/dump_fast.tsv && timeout 3000 python3 script
+2026-07-26T08:43:51.433Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T08:44:18.064Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T08:44:50.085Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cp scripts/oracle_score.py /tmp/os.py 2>/dev/null; ls scripts/oracle_score.py 2>&1
+2026-07-26T08:44:58.664Z [shell-mcp] bash: cd /home/runner/work/gam/gam && timeout 3000 python3 scripts/oracle_score.py /tmp/dump_fast.tsv 2>&1 | head -60
+2026-07-26T08:45:44.673Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '55,100p' crates/gam-math/src/probability.rs; echo "=== square_residual"; grep -n "fn square_residual" -A 40 crates/gam-m
+2026-07-26T08:46:53.502Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1,55p' crates/gam-math/src/probability.rs
+2026-07-26T08:47:01.983Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T08:47:28.452Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cp crates/gam-math/examples/cdf_probe.rs /tmp/ 2>/dev/null; cargo build --release -p gam-math --example cdf_probe 2>&1 | tail -8
+2026-07-26T08:47:43.400Z [shell-mcp] bash: cd /home/runner/work/gam/gam && ./target/release/examples/cdf_probe > /tmp/cdf.tsv && wc -l /tmp/cdf.tsv && python3 - <<'EOF'
+2026-07-26T08:48:31.241Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T08:49:03.869Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '255,340p' crates/gam-math/src/probability.rs
+2026-07-26T08:49:38.051Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T08:49:48.360Z [shell-mcp] bash: cd /home/runner/work/gam/gam && ./target/release/examples/cdf_probe --bench 2>&1 | tail -5; ./target/release/examples/cdf_probe > /tmp/cdf.tsv && python3 - <<'E
+2026-07-26T08:50:18.766Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "normal_cdf(" --include=*.rs crates/ src/ | grep -v "fn normal_cdf" | grep -v "^crates/gam-math/src/probability.rs" | w
+2026-07-26T08:50:28.137Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git status --short crates/gam-math/ && echo "--- head of special_audit_dump" && head -30 crates/gam-math/examples/special_audit_
+2026-07-26T08:50:34.080Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git show --stat 3bfd25554 && echo "=== channels" && grep -oP 'emit\("\K[a-z0-9_]+' crates/gam-math/examples/special_audit_dump.r
+2026-07-26T08:50:43.497Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "normal_cdf" -B3 -A12 crates/gam-math/examples/special_audit_dump.rs | head -40; echo "=== check tolerances"; grep -n "T
+2026-07-26T08:50:49.716Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '60,80p' crates/gam-math/examples/special_audit_dump.rs; echo "=== run their pair"; cargo run --release -p gam-math --exa
+2026-07-26T08:51:54.049Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '60,80p' crates/gam-math/examples/special_audit_dump.rs
+2026-07-26T08:52:00.755Z [shell-mcp] bash: cd /home/runner/work/gam/gam && nohup bash -c 'cargo run --release -p gam-math --example special_audit_dump > /tmp/sa.tsv 2>/tmp/sa.err && python3 crates/gam-ma
+2026-07-26T08:53:07.095Z [shell-mcp] bash: echo alive; date
+2026-07-26T08:53:11.923Z [shell-mcp] bash: cd /home/runner/work/gam/gam && ls -la /tmp/sa.tsv /tmp/sa.out 2>&1 | head; tail -5 /tmp/sa.out 2>/dev/null
+2026-07-26T08:53:35.963Z [shell-mcp] bash: cd /home/runner/work/gam/gam && ls scripts/ | head -40; echo "=== ban"; grep -rln "ban" scripts/ .github/workflows/ 2>/dev/null | head
+2026-07-26T08:53:40.614Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "ban" .github/workflows/pypi-wheels.yml | head -20; echo "=== SPEC rules"; grep -n "^#\|^##\|forbidden\|banned\|must no
+2026-07-26T08:53:48.131Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat SPEC.md | head -60; echo "=== test.yml scanner"; grep -rn "scan\|forbid\|grep -" .github/workflows/test.yml 2>/dev/null | he
+2026-07-26T08:53:54.261Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat /tmp/sa.out 2>/dev/null | head -50; echo "---"; ls -la /tmp/sa.out
+2026-07-26T08:53:59.183Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1,60p' crates/gam-math/examples/special_audit_check.py
+2026-07-26T08:54:55.908Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "erfc(.*SQRT_2\|erfc(-x\|erfc(x" --include=*.rs crates/ src/ | grep -v examples | head -20
+2026-07-26T08:55:07.040Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo build --release -p gam-math 2>&1 | tail -15
+2026-07-26T08:55:16.801Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat /tmp/sa.out 2>/dev/null | head -60; echo "=== still running?"; pgrep -f special_audit_check >/dev/null && echo yes || echo n
+2026-07-26T08:55:24.008Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo build --release -p gam-math --example oracle_dump 2>&1 | tail -3 && ./target/release/examples/oracle_dump | grep -E '^(nor
+2026-07-26T08:55:37.912Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "mod tests" crates/gam-math/src/probability.rs; grep -n "fn normal_cdf_\|fn .*normal_cdf" crates/gam-math/src/probabilit
+2026-07-26T08:55:51.451Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T08:56:12.242Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T08:56:50.260Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo test -p gam-math --lib 2>&1 | tail -30
+2026-07-26T08:57:21.426Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1725,1765p' crates/gam-math/src/probability.rs
+2026-07-26T08:57:50.238Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo test -p gam-math --lib 2>&1 | tail -12
+2026-07-26T08:58:25.285Z [shell-mcp] bash: cd /home/runner/work/gam/gam && rm -f crates/gam-math/examples/oracle_dump.rs crates/gam-math/examples/cdf_probe.rs scripts/oracle_score.py && cargo fmt -p gam-
+2026-07-26T08:58:34.087Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git stash list; cargo clippy -p gam-math --all-targets 2>&1 | grep -n "probability.rs" | head -20; echo "=== does clippy fail on
+2026-07-26T08:58:50.450Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo clippy -p gam-math --all-targets --message-format short 2>&1 | grep -E "^crates.*error" | sed 's/.*error: //' | sort | uni
