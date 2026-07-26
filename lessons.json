@@ -125,9 +125,12 @@
       "updated": 1785075298248
     },
     {
-      "id": "47229717",
-      "content": "Issue #2489 (gam, open, explicitly \"not claiming this lane\"): sphere Wahba kernels carry geodesic separation as a DOT PRODUCT (cos γ), but every zonal kernel immediately wants u = (1-cos γ)/2 = sin²(γ/2). Catastrophic cancellation: 72x rel err at 1e-7°, exactly 0 below 1e-8°. Fix = carry u in haversine form u = sin²(Δφ/2) + cosφ₁cosφ₂sin²(Δψ/2).\nCALL SITES (small surface, ~4 files, all in crates/gam-terms/src/basis/):\n- sphere_kernels.rs (431 LOC): wahba_sphere_kernel_pseudo_from_cos, _sobolev_closed_form, _from_cos_kind, _from_cos_simd_kind, _derivative_dcos_kind, _sobolev_derivative_dcos.\n- workspace_cache.rs:783 (SIMD) and :801 (scalar tail) in spherical_wahba_kernel_matrix_cpu — forms cos_gamma from sin/cos lat/lon.\n- radial_jets_nd.rs:1962 in spherical_wahba_kernel_jet_with_kind — same, plus ∂cosγ/∂φ, ∂cosγ/∂ψ.\n- sphere_spectral.rs: sphere_truncated_spectral_eval / _derivative_eval genuinely want cos γ (Legendre recurrence) — recover as 1-2u, harmless direction.\n- sphere_gpu.rs uses cos_g only in #[cfg(test)] parity checks (line 1850); no WGSL — CUDA via cudarc.\nTests touching this: crates/gam-terms/src/basis/zz_measure_2475_tests.rs, tests/manifolds/misc/wahba_kernel_spectral_truth.rs, tests/src_modules/smooths/basis_duchon_matern_jet_derivative_tests.rs (~line 4296).",
       "confidence": 0.9,
+      "content": "Issue #2489 (gam, open, explicitly \"not claiming this lane\"): sphere Wahba kernels carry geodesic separation as a DOT PRODUCT (cos γ), but every zonal kernel immediately wants u = (1-cos γ)/2 = sin²(γ/2). Catastrophic cancellation: 72x rel err at 1e-7°, exactly 0 below 1e-8°. Fix = carry u in haversine form u = sin²(Δφ/2) + cosφ₁cosφ₂sin²(Δψ/2).\nCALL SITES (small surface, ~4 files, all in crates/gam-terms/src/basis/):\n- sphere_kernels.rs (431 LOC): wahba_sphere_kernel_pseudo_from_cos, _sobolev_closed_form, _from_cos_kind, _from_cos_simd_kind, _derivative_dcos_kind, _sobolev_derivative_dcos.\n- workspace_cache.rs:783 (SIMD) and :801 (scalar tail) in spherical_wahba_kernel_matrix_cpu — forms cos_gamma from sin/cos lat/lon.\n- radial_jets_nd.rs:1962 in spherical_wahba_kernel_jet_with_kind — same, plus ∂cosγ/∂φ, ∂cosγ/∂ψ.\n- sphere_spectral.rs: sphere_truncated_spectral_eval / _derivative_eval genuinely want cos γ (Legendre recurrence) — recover as 1-2u, harmless direction.\n- sphere_gpu.rs uses cos_g only in #[cfg(test)] parity checks (line 1850); no WGSL — CUDA via cudarc.\nTests touching this: crates/gam-terms/src/basis/zz_measure_2475_tests.rs, tests/manifolds/misc/wahba_kernel_spectral_truth.rs, tests/src_modules/smooths/basis_duchon_matern_jet_derivative_tests.rs (~line 4296).",
+      "created": 1785044932781,
+      "deprecated": false,
+      "evidence": [],
+      "id": "47229717",
       "tags": [
         "gam",
         "issue-2489",
@@ -135,45 +138,45 @@
         "numerics",
         "analysis"
       ],
-      "evidence": [],
-      "created": 1785044932781,
-      "updated": 1785044932781,
-      "deprecated": false
+      "updated": 1785044932781
     },
     {
-      "id": "78ae426c",
-      "content": "gam test layout (verified): `tests/<dir>/main.rs` are auto-discovered cargo integration binaries (manifolds, glm, inference, sae, survival, regressions, ...) — no [[test]] entries in Cargo.toml. BUT `tests/src_modules/**` is NOT a test binary: it is `include!`d into crate source (e.g. crates/gam-terms/src/basis/tests.rs), so those files run under `cargo test -p gam-terms --lib`. Timings on the 4-core runner: `cargo test -p gam-terms --lib` ~19s run after a ~50s check; `cargo test --test manifolds` needs a ~10-15 MINUTE cold compile of the whole workspace (the root `gam` crate is the long pole) plus ~250s to run. Launch long jobs with: `setsid nohup bash -c 'cargo test ... > /tmp/x.log 2>&1; echo EXIT=$? >> /tmp/x.log' >/dev/null 2>&1 < /dev/null &` then poll with sleep+tail. The mcpl bash tool has a hard ~60s transport ceiling that ignores timeout_ms; do not run two cargo jobs at once (they deadlock on the target-dir lock and orphan).",
       "confidence": 0.85,
+      "content": "gam test layout (verified): `tests/<dir>/main.rs` are auto-discovered cargo integration binaries (manifolds, glm, inference, sae, survival, regressions, ...) — no [[test]] entries in Cargo.toml. BUT `tests/src_modules/**` is NOT a test binary: it is `include!`d into crate source (e.g. crates/gam-terms/src/basis/tests.rs), so those files run under `cargo test -p gam-terms --lib`. Timings on the 4-core runner: `cargo test -p gam-terms --lib` ~19s run after a ~50s check; `cargo test --test manifolds` needs a ~10-15 MINUTE cold compile of the whole workspace (the root `gam` crate is the long pole) plus ~250s to run. Launch long jobs with: `setsid nohup bash -c 'cargo test ... > /tmp/x.log 2>&1; echo EXIT=$? >> /tmp/x.log' >/dev/null 2>&1 < /dev/null &` then poll with sleep+tail. The mcpl bash tool has a hard ~60s transport ceiling that ignores timeout_ms; do not run two cargo jobs at once (they deadlock on the target-dir lock and orphan).",
+      "created": 1785047572144,
+      "deprecated": false,
+      "evidence": [],
+      "id": "78ae426c",
       "tags": [
         "gam",
         "runner",
         "tooling",
         "tests"
       ],
-      "evidence": [],
-      "created": 1785047572144,
-      "updated": 1785047572144,
-      "deprecated": false
+      "updated": 1785047572144
     },
     {
-      "id": "88812b2d",
-      "content": "gam: sphere m=1 Sobolev is REFUSED by design (#2475, commits 35f24b84a/487ef3db9 by SauersML). K_1 = (-ln u - 1)/4pi is log-singular at coincidence => no Gram diagonal => refused at every public matrix entry point (`validate_spherical_wahba_gram_request` in workspace_cache.rs). Deep reason: H^1(S^2) has no bounded point evaluation (Sobolev embedding needs s > d/2 = 1), so m=1 is not a reproducing kernel on S^2 at all. The refusal is STRUCTURAL (family-level), not a coincidence test — the owner's own test comment says so explicitly, so do NOT narrow it to \"only when a coincident pair occurs\". The remedy is SobolevTruncated{lmax}. I added `lmax=` (aliases l_max, l-max; range 5..=200) to the sphere formula term in crates/gam-terms/src/term_builder.rs so the remedy is reachable from the DSL at all — before that, `sphere(lat,lon,m=1)` had no working spelling.",
       "confidence": 0.9,
+      "content": "gam: sphere m=1 Sobolev is REFUSED by design (#2475, commits 35f24b84a/487ef3db9 by SauersML). K_1 = (-ln u - 1)/4pi is log-singular at coincidence => no Gram diagonal => refused at every public matrix entry point (`validate_spherical_wahba_gram_request` in workspace_cache.rs). Deep reason: H^1(S^2) has no bounded point evaluation (Sobolev embedding needs s > d/2 = 1), so m=1 is not a reproducing kernel on S^2 at all. The refusal is STRUCTURAL (family-level), not a coincidence test — the owner's own test comment says so explicitly, so do NOT narrow it to \"only when a coincident pair occurs\". The remedy is SobolevTruncated{lmax}. I added `lmax=` (aliases l_max, l-max; range 5..=200) to the sphere formula term in crates/gam-terms/src/term_builder.rs so the remedy is reachable from the DSL at all — before that, `sphere(lat,lon,m=1)` had no working spelling.",
+      "created": 1785047572132,
+      "deprecated": false,
+      "evidence": [],
+      "id": "88812b2d",
       "tags": [
         "gam",
         "sphere",
         "numerics",
         "design-decision"
       ],
-      "evidence": [],
-      "created": 1785047572132,
-      "updated": 1785047572132,
-      "deprecated": false
+      "updated": 1785047572132
     },
     {
-      "id": "b1ac2828",
-      "content": "CRITICAL runner gotcha (gam): the `mcpl--sh--bash` tool has a HARD ~60s MCPL transport limit regardless of what you pass in `timeout_ms`. Anything longer returns \"MCPL server 'sh' did not respond to tools/call within 60000ms — the server may be hung\" and the command keeps running server-side (so blind retries duplicate work).\nWORKAROUND: launch long builds/tests detached and poll:\n  nohup bash -c 'cd /path && cargo test ... > /tmp/out.log 2>&1; echo EXIT=$? >> /tmp/out.log' >/dev/null 2>&1 &\nthen in later calls `tail -5 /tmp/out.log` / `grep EXIT= /tmp/out.log`.\nA bare `cargo check -p gam-terms --all-targets` on a warm target dir takes ~51s — right at the edge. Full workspace builds MUST be backgrounded.",
       "confidence": 0.95,
+      "content": "CRITICAL runner gotcha (gam): the `mcpl--sh--bash` tool has a HARD ~60s MCPL transport limit regardless of what you pass in `timeout_ms`. Anything longer returns \"MCPL server 'sh' did not respond to tools/call within 60000ms — the server may be hung\" and the command keeps running server-side (so blind retries duplicate work).\nWORKAROUND: launch long builds/tests detached and poll:\n  nohup bash -c 'cd /path && cargo test ... > /tmp/out.log 2>&1; echo EXIT=$? >> /tmp/out.log' >/dev/null 2>&1 &\nthen in later calls `tail -5 /tmp/out.log` / `grep EXIT= /tmp/out.log`.\nA bare `cargo check -p gam-terms --all-targets` on a warm target dir takes ~51s — right at the edge. Full workspace builds MUST be backgrounded.",
+      "created": 1785045152114,
+      "deprecated": false,
+      "evidence": [],
+      "id": "b1ac2828",
       "tags": [
         "gam",
         "runner",
@@ -181,15 +184,15 @@
         "gotcha",
         "process"
       ],
-      "evidence": [],
-      "created": 1785045152114,
-      "updated": 1785045152114,
-      "deprecated": false
+      "updated": 1785045152114
     },
     {
-      "id": "c7dfa66c",
-      "content": "DONE (2026-07-26, by me): #2489 sphere geodesic-separation fix is LANDED on main.\n- 8b0201dfb fix(#2489): new `sphere_half_angle` carries (u,v) = (sin²(γ/2), cos²(γ/2)) in CHORD form:\n    4sin²(Δθ/2) = (sinθ₁−sinθ₂)² + (cosθ₁−cosθ₂)²\n    4cos²(Δθ/2) = (sinθ₁+sinθ₂)² + (cosθ₁+cosθ₂)²\n  Both sums of squares → no cancellation; u = 0 exactly iff coordinates are bitwise equal (self-distance becomes a theorem, fixes the 3-distinct-Gram-diagonal rotation-invariance break). Error O(ε/γ) instead of O(ε/γ²).\n- 7a540d565 test(#2489): six pre-registered measurements; accuracy bar DERIVED not chosen — chord form must stay inside 8ε/γ at every offset, dot product must fall outside it at every offset. No magic tolerance beyond f64::EPSILON and γ itself.\nStyle note that matched this repo: derive tolerances from first principles rather than picking constants (see also #2469 \"delete all arbitrary constants\"). Commits are authored as claude[bot].",
       "confidence": 0.95,
+      "content": "DONE (2026-07-26, by me): #2489 sphere geodesic-separation fix is LANDED on main.\n- 8b0201dfb fix(#2489): new `sphere_half_angle` carries (u,v) = (sin²(γ/2), cos²(γ/2)) in CHORD form:\n    4sin²(Δθ/2) = (sinθ₁−sinθ₂)² + (cosθ₁−cosθ₂)²\n    4cos²(Δθ/2) = (sinθ₁+sinθ₂)² + (cosθ₁+cosθ₂)²\n  Both sums of squares → no cancellation; u = 0 exactly iff coordinates are bitwise equal (self-distance becomes a theorem, fixes the 3-distinct-Gram-diagonal rotation-invariance break). Error O(ε/γ) instead of O(ε/γ²).\n- 7a540d565 test(#2489): six pre-registered measurements; accuracy bar DERIVED not chosen — chord form must stay inside 8ε/γ at every offset, dot product must fall outside it at every offset. No magic tolerance beyond f64::EPSILON and γ itself.\nStyle note that matched this repo: derive tolerances from first principles rather than picking constants (see also #2469 \"delete all arbitrary constants\"). Commits are authored as claude[bot].",
+      "created": 1785044952631,
+      "deprecated": false,
+      "evidence": [],
+      "id": "c7dfa66c",
       "tags": [
         "gam",
         "issue-2489",
@@ -197,24 +200,196 @@
         "numerics",
         "done"
       ],
-      "evidence": [],
-      "created": 1785044952631,
-      "updated": 1785044952631,
-      "deprecated": false
+      "updated": 1785044952631
     },
     {
-      "id": "d8f1e64b",
-      "content": "gam runner: `pip install mpmath` works (network available) and gives 50-dps reference values for polylog / bessel / gamma — invaluable for the special-function work in crates/gam-terms/src/basis (polylog.rs Li₂/Li₃, closed_form_penalty.rs bessel_k = Numerical-Recipes `bessik`, riesz_kernel_value). Not preinstalled; install it first thing if doing accuracy audits. Also: `cargo test -p gam-terms --lib` is fast (~19s run, 887 tests) once compiled; `cargo test --test manifolds` needs a ~10+ minute full-workspace compile.",
       "confidence": 0.85,
+      "content": "gam runner: `pip install mpmath` works (network available) and gives 50-dps reference values for polylog / bessel / gamma — invaluable for the special-function work in crates/gam-terms/src/basis (polylog.rs Li₂/Li₃, closed_form_penalty.rs bessel_k = Numerical-Recipes `bessik`, riesz_kernel_value). Not preinstalled; install it first thing if doing accuracy audits. Also: `cargo test -p gam-terms --lib` is fast (~19s run, 887 tests) once compiled; `cargo test --test manifolds` needs a ~10+ minute full-workspace compile.",
+      "created": 1785045897050,
+      "deprecated": false,
+      "evidence": [],
+      "id": "d8f1e64b",
       "tags": [
         "gam",
         "runner",
         "tooling",
         "numerics"
       ],
+      "updated": 1785045897050
+    },
+    {
+      "id": "c453ebd1",
+      "content": "RESOLVED — do not re-open. gam sphere-kernel geodesic issue (#2489), \"cos γ carried as a dot product destroys 1−cos γ by cancellation\", was fixed end-to-end and closed 2026-07-26.\nLanded: c12111b27 / 7a540d565 (CPU scalar+SIMD+jet root fix), d48b0a0b4 + fe3581281 + ff9c0e1ee (CUDA device `s2_chord_cos_gamma` helper and GPU host oracles).\nThe durable MATH, in case it's needed elsewhere in the repo:\n  - Zonal sphere kernels are functions of u = (1−cos γ)/2 = sin²(γ/2), never of cos γ. Carrying cos γ is pure loss: below ~1e-8° separation the dot product returns exactly 0 and reports distinct points as coincident.\n  - lat/lon form: u = sin²(Δφ/2) + cos φ₁ cos φ₂ sin²(Δψ/2). u = 0 iff coordinates bitwise equal.\n  - ambient xyz form (an identity, not a rearrangement): u = |t−c|²/4, v = |t+c|²/4; normalized u = |x−c|²/(|x−c|²+|x+c|²) cancels non-unit storage scale. cos γ = v − u.\n  - Legendre recurrences genuinely need cos γ; recover it as 1 − 2u, where the cancellation runs the harmless way.\nSame genus as #2127 (frame-anchored center placement): rotation invariance broken one level lower, in the metric itself.",
+      "confidence": 0.95,
+      "tags": [
+        "gam",
+        "sphere",
+        "numerics",
+        "resolved",
+        "math"
+      ],
+      "evidence": [
+        "github issue #2489"
+      ],
+      "created": 1785063155966,
+      "updated": 1785063184589,
+      "deprecated": false
+    },
+    {
+      "id": "c5f4c3c4",
+      "content": "CRITICAL runner constraint (gam repo): the `mcpl--sh--bash` tool has a HARD ~60s MCPL transport timeout that IGNORES the `timeout_ms` argument. Any cargo build/test will blow it. Pattern that works:\n  nohup bash -c 'cd /home/runner/work/gam/gam && cargo test -p X --lib ... > /tmp/out.log 2>&1; echo DONE_$? >> /tmp/out.log' >/dev/null 2>&1 &\nthen poll with short `tail /tmp/out.log` calls. Never block on a long command directly.",
+      "confidence": 0.9,
+      "tags": [
+        "repo",
+        "tooling",
+        "bash",
+        "critical"
+      ],
       "evidence": [],
-      "created": 1785045897050,
-      "updated": 1785045897050,
+      "created": 1785063322606,
+      "updated": 1785063322606,
+      "deprecated": false
+    },
+    {
+      "id": "f42c5554",
+      "content": "FLEET SPEED: on the gam repo an issue can go from filed → fully implemented (across 3 lanes incl. a CUDA remainder) in ~6 hours. Before starting ANY issue, re-check `gh issue view N --json state,comments` — \"Not claiming this lane\" in the body means nothing an hour later. Also: other lanes leave UNCOMMITTED WIP in the shared checkout. Before editing a file, run `git diff --stat origin/main -- <file>` — if it's +N/-0 vs main it may be another lane's live work; a stale/behind copy is the opposite signature (removes content main has). Concretely lost: I picked #2489 (haversine vs dot-product sphere separation), spent a run analysing it, and it was closed by others meanwhile (commits 8b0201dfb, c12111b27, d48b0a0b4).",
+      "confidence": 0.9,
+      "tags": [
+        "process",
+        "fleet",
+        "issues",
+        "workflow"
+      ],
+      "evidence": [],
+      "created": 1785055233236,
+      "updated": 1785055233236,
+      "deprecated": false
+    },
+    {
+      "id": "f4d494e4",
+      "content": "RESOLVED 2026-07-26 at commit b29eb39bd — gam #2499(ii), \"ARD EDF at atom 0, axis 0 is -7.256391e1, outside certified [0, 24]\".\nROOT CAUSE (confirmed empirically, exact digits reproduced): the identity `edf = n_active − α·tr(H⁻¹)` assumes the prior curvature on every latent diagonal slot IS α. True on a Euclidean axis; FALSE on a periodic one. On LatentManifold::Circle, ArdAxisPrior::eval (crates/gam-sae/src/manifold/atom.rs:306) selects the von Mises energy V=(α/κ²)(1−cos κt) ⇒ V''=α·cos κt is SIGNED, so what both assembly paths actually write into htt is the PSD majorizer `psd_majorizer_hess = α·softplus_τ(cos κt) ∈ [0,α]` (#2339), identically ZERO on the concave arc. With P_i<α you get [H⁻¹]_ss>1/α and α·tr(H⁻¹) is bounded by nothing (measured 96.5 vs n_active 24 ⇒ edf −72.5).\nFIX: shrinkage = Σ_i P_i·[H⁻¹]_ii. Theorem: H=C+P, C⪰0, P⪰0 diagonal ⇒ H⪰P ⇒ P_s[H⁻¹]_ss ∈[0,1] (=0 where P_s=0), so shrinkage ∈[0,n_active] with NO appeal to λ_min(H)≥α. Landed as ArdAxisPrior::curvature_shrinkage_factor (dimensionless f with psd_majorizer_hess==α·f, ≡1 Euclidean so the Euclidean path stays bit-identical) + SaeManifoldTerm::ard_shrinkage_traces, distinct from ard_inverse_traces (which the Fellner-Schall α-step legitimately still wants).\nGENERAL LESSON worth carrying: when a solver MAJORIZES a prior/penalty to keep a factorization PD, every downstream identity written in terms of the un-majorized coefficient (α, λ, ...) is silently wrong. Grep for psd_majorizer / clamp / positive-part seams and check what the EDF/trace/log-det consumers assume.\nSTILL OPEN, same genus, not fixed: outer_objective.rs:3072 efs_step's MacKay update α ← n_eff/(Σw t̂² + Σw [H⁻¹]) — its numerator already uses the periodic `sq_equiv`, its denominator's plain-count n_eff carries the same \"curvature is α everywhere\" assumption.",
+      "confidence": 0.95,
+      "tags": [
+        "gam",
+        "gam-sae",
+        "issue-2499",
+        "ard",
+        "edf",
+        "resolved",
+        "majorizer"
+      ],
+      "evidence": [
+        "github issue #2499",
+        "crates/gam-sae/src/manifold/atom.rs:306-446",
+        "crates/gam-sae/src/manifold/construction_reconstruction.rs:79-130",
+        "commit b29eb39bd",
+        "github issue #2499 comment 5083259073"
+      ],
+      "created": 1785063528009,
+      "updated": 1785065054007,
+      "deprecated": false
+    },
+    {
+      "id": "c9adc14c",
+      "content": "CONTEXT DISCIPLINE (gam runs — this killed two consecutive runs of mine with \"Adaptive picker exhausted ... exceed hard budget 163616\"):\nThe failure mode is always the same: a few huge tool outputs. Worst offenders, in order:\n1. `gh issue view <N> --json body` — these issues are 3-8k tokens EACH. NEVER dump a whole body. Use `gh issue view N --json title,body -q .body | head -c 2500`.\n2. `workspace--sync` with no path — dumps a ~160k-char file listing. Never call it.\n3. `sed -n 'A,Bp' file` over >80 lines of a documented Rust file (this repo's doc comments are enormous — 60 lines of prose per function is normal).\n4. `gh issue list` with many issues — cap to --limit 25 and select only number+title.\nRULE: pipe EVERY bash call through `head -c 2000` (or `| head -30`) unless you know it is short. Prefer `grep -n pattern file | head -20` over reading ranges. Read code in 40-line slices, not 130.\nAlso: long detached builds mean many poll calls; each `tail -c 3000` adds up. Poll with `tail -c 600` and only widen when you see a failure.",
+      "confidence": 0.95,
+      "tags": [
+        "gam",
+        "runner",
+        "tooling",
+        "gotcha",
+        "high-value",
+        "process"
+      ],
+      "evidence": [],
+      "created": 1785085914696,
+      "updated": 1785085914696,
+      "deprecated": false
+    },
+    {
+      "id": "ad08bab5",
+      "content": "gam issue #2498 (UNCLAIMED as of 2026-07-26, no comments) — \"signal-free co-collapse null q/n is derived for a FREE projection but applied to a PENALIZED fit — should be tau/n\".\nSite: crates/gam-sae/src/manifold/outer_objective.rs — `absolute_degeneracy_ev_floor(target, dictionary_rank) -> q/n` (:83) and `reachable_dictionary_rank(atoms, n, p) -> usize` (:147). Callers: fit_drivers.rs:354 (`absolute_co_collapse_verdict`), :2884, tests_olmo.rs:537, tests_collapse_bar_reachable_rank_1610.rs.\nMY DERIVATION (the elegant part, not in the issue): `reachable_dictionary_rank` already forms the concatenated design Phi = [Phi_1 ... Phi_K] (n x sum M_k) and takes its SVD, then counts singular values above SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF*max_sv. The hard rank is sum_i 1[sigma_i > tol]. For a ridge-penalized decoder solve the effective dof is\n    tau = tr(Phi (Phi^T Phi + lambda I)^-1 Phi^T) = sum_i sigma_i^2 / (sigma_i^2 + lambda)\ni.e. the SAME singular values, with the indicator replaced by a smooth shrinkage weight. tau -> rank as lambda -> 0 (recovers today's floor exactly) and tau -> 0 as lambda -> inf. So the change is a one-line generalization of an SVD the code already computes; the hard rank is the lambda=0 limit of the soft one. The real work is plumbing the actual penalty (ARD + ridge + smoothness, so S is not I) to the call site, and running the pre-registered A/B in the issue (arms: A=q/n control, B=tau/n, absurd arm floor=0; negative controls `decoder_norm_guard_reseeds_all_atoms_on_total_co_collapse_k3` and `ev_at_the_null_floor_alone_is_not_a_co_collapse_verdict_2253` must stay green).\nCaution: gam-sae is huge and #2472 says three zz_ tests in it never terminate — never run the whole crate's tests without a filter.",
+      "confidence": 0.8,
+      "tags": [
+        "gam",
+        "issue-2498",
+        "gam-sae",
+        "analysis",
+        "todo"
+      ],
+      "evidence": [],
+      "created": 1785085927623,
+      "updated": 1785085927623,
+      "deprecated": false
+    },
+    {
+      "id": "9780a83e",
+      "content": "DONE 2026-07-26: gam #2527 filed, fixed, closed by me. `standard_normal_quantile` (crates/gam-math/src/probability.rs:576) formed its Halley residual as `F(x) - p` via `(1-p) - 0.5*erfc(x/sqrt2)` or `normal_cdf(x) - p`. Near the median both subtract two ~1/2-sized numbers => residual absolute error pinned at one ulp of 1/2, so quantile ABSOLUTE error pinned ~1.2e-16 and RELATIVE error ~1.2e-16/|x| diverging as p->1/2. Adjacent to 1/2 the residual is usually EXACTLY 0 so the polish is a no-op and the raw Acklam seed ships at 1.128e-9 = |A[5]-sqrt(2pi)|/sqrt(2pi).\nFIX (commit 2c4e06ecc): for p in [1/4,3/4] use `0.5*erf(x/SQRT_2) - (p - 0.5)` (libm::erf is available alongside libm::erfc). Band derived from Sterbenz: p-1/2 exact for p in [1/4,1], reflection gives [0,3/4]. Result 1.13e-9 -> 2.94e-16 worst over the whole sweep; normal_cdf/logcdf bit-identical; gam-math 231/231.\nREUSABLE PATTERNS:\n1) Whenever a Newton/Halley polish is applied to F(x)=p, ask what the residual's ABSOLUTE error is at convergence. If the residual is formed by subtracting two O(1) quantities, the polish has a hard floor and may be a decorative no-op. Grep the repo for other `- p` / `- target` residuals.\n2) BUILDING AN MPMATH REFERENCE: use `mp.mpf(python_float)` (exact) NEVER `mp.mpf(repr(x))` (reads the decimal, perturbs by up to half an ulp). Near a zero of the function that perturbation is amplified and can hide the very bug you are hunting — it cost me a cycle here (reference reported 1.2e-3 for both broken and fixed code).",
+      "confidence": 0.9,
+      "tags": [
+        "gam",
+        "issue-2527",
+        "gam-math",
+        "numerics",
+        "done",
+        "technique"
+      ],
+      "evidence": [],
+      "created": 1785086832655,
+      "updated": 1785086832655,
+      "deprecated": false
+    },
+    {
+      "id": "5a806b74",
+      "content": "DONE 2026-07-26: gam #2528 filed, fixed, landed, CLOSED by me. Two commits: 3d54ea0f9 (fix) + 1fbfa49f8 (audit channel).\nDEFECT: `beta_quantile` (crates/gam-math/src/probability.rs:13) delegated to `statrs::function::beta::inv_beta_reg`, which converges on an ABSOLUTE tolerance in x => cannot resolve any quantile below ~1e-16. It STALLS (doesn't degrade), returning 1e-17..1e-19 which is the solver's own resolution limit, not a quantile. Reachable in production: gam-inference/src/probability.rs:165 beta predictive intervals with small mean. Beta(0.04,3.96) p=0.025 returned 6.7e-18 vs true 1.5e-41 (rel 4.6e+23); Beta(0.01,0.99) true 6.3e-161. Transition is a CLIFF not a slope: mu=0.3 correct to 2 ulp, mu=0.1 already 1.6% wrong, below that no information.\nFIX: lower-tail branch using the ascending series I_x = x^a/B(a,b) * S(x), S = sum_k (1-b)_k x^k/(k!(a+k)). Seed x0=exp((ln p + ln a + ln B(a,b))/a). Newton in y=ln x on G(y)=ln I_{e^y} - ln p, G'(y)=a + x S'/S -> a (a CONSTANT; the x-space derivative it replaces spans hundreds of orders). Branch condition x*max(1,b)<=1/2 is DERIVED (|k+1-b| <= (k+1)max(1,b) bounds every term ratio by 1/2) — same boundary/reason as gam-terms/src/basis/polylog.rs. Underflow returns exactly 0 = correctly rounded. `statrs::function::beta::ln_beta` already available, no new dep.\nRESULT: worst rel over 150 triples 9.1e+142 -> 4.9e-10, median 9.0e-16; the 8-row issue table is BIT-EXACT (worst 0e0). gam-math 232/232, gam-inference 161/161 (the downstream consumer). Gate test `beta_quantile_resolves_the_lower_tail_below_the_solver_floor` with baked 80-dps literals, bar 16*f64::EPSILON.\nREUSABLE:\n1) SOLVE FOR SMALL POSITIVE QUANTITIES IN LOG SPACE. An absolute step tolerance in y=ln x IS a relative tolerance in x, so there is no floor to stall against, and underflow becomes representable/statable rather than silently floored.\n2) Any third-party inverse-CDF with an absolute x-tolerance has this bug. Suspect statrs generally.\n3) MPMATH REFERENCE FOR EXTREME QUANTILES: mp.findroot (default/anderson/newton) FAILS — the function is flat to 100+ digits over the bracket. Use BISECTION IN ln x over y in [-1490, 0], 230 steps. Also `mp.betainc` can return `mpc`; coerce `.real`.\n4) NOT fixed, live follow-ups: statrs inv_beta_reg is only ~1e-10 in the BULK too (Beta(5,1000) p=0.1); and the upper tail 1-delta with delta<1e-16 saturates to 1.0 — a SIGNATURE problem (needs a companion API returning 1-x), not a solver problem. Both noted publicly on the issue.",
+      "confidence": 0.95,
+      "tags": [
+        "gam",
+        "issue-2528",
+        "gam-math",
+        "numerics",
+        "done",
+        "technique",
+        "statrs"
+      ],
+      "evidence": [],
+      "created": 1785087874829,
+      "updated": 1785088421873,
+      "deprecated": false
+    },
+    {
+      "id": "3f8dab6b",
+      "content": "HIGHEST-LEVERAGE TOOL IN THE gam REPO for numerics work: `crates/gam-math/examples/special_audit_dump.rs` + `crates/gam-math/examples/special_audit_check.py`. Hand-run (NOT in CI), needs `pip install mpmath`. Run:\n  cargo build -p gam-math --release --example special_audit_dump\n  ./target/release/examples/special_audit_dump > /tmp/dump.tsv\n  python3 crates/gam-math/examples/special_audit_check.py /tmp/dump.tsv [channel...]\nDump: ~10s, ~26k rows. Checker: ~213s for ALL channels, ~34s for one. It BUFFERS and prints only at the end — an empty log mid-run is normal, not a hang. Always pass explicit channel names to keep it under a minute.\nI found #2527 (normal_quantile, 1.13e-9) purely by running this and reading the one outlier. Every other channel sits at 1-2 ulp, so ANY channel reading worse than ~1e-14 is a real defect worth chasing.\nRow format is `channel\\targ\\tvalue`, but multi-arg channels are supported by precedent (`binomial`, `gl_node`, `gl_weight`, and `beta_quantile` which I added in 1fbfa49f8). To add a channel: emit extra tab-separated columns from the dump, add a `if channel == \"x\":` branch in the checker's parse loop, and add a reference fn. CHANNELS dict at ~line 94 holds the single-arg references.\nDESIGN PRINCIPLE the harness follows and you should too: the reference must not be the thing under test. Inverses come from high-precision root-finding, not from mpmath's own inverse; log-CDF derivatives from the closed-form Mills recurrence, not numerical differentiation; `log_ncdf` hand-written as `mp.log1p(-mp.erfc(x/sqrt2)/2)` because `mp.log(mp.ncdf(x))` loses every digit once Phi(-x) < mpf epsilon even at 80 dps.\ngam-math quantile surface is now audited and sound: standard_normal_quantile 2.94e-16 (#2527), standard_normal_quantile_from_log_cdf 2.7e-16, beta_quantile median 1.6e-15 (#2528). Remaining known-imperfect: statrs inv_beta_reg bulk ~4.9e-10 at Beta(5,1000); beta upper tail saturates at 1-1e-16.",
+      "confidence": 0.95,
+      "tags": [
+        "gam",
+        "gam-math",
+        "numerics",
+        "tooling",
+        "technique",
+        "high-value",
+        "audit"
+      ],
+      "evidence": [],
+      "created": 1785088405158,
+      "updated": 1785088405158,
+      "deprecated": false
+    },
+    {
+      "id": "46fb1f0a",
+      "content": "gam-math FULL AUDIT BASELINE, 2026-07-26, after #2527 + #2528 landed (dump3.tsv, all channels, ~4 min). Use this instead of re-running the 213s checker. Everything below is EXPECTED — if a future run sees a channel materially worse than this, that is new.\n  bessel_centered_log 1.03e-15 | bessel_d1 2.37e-15 | bessel_ratio 1.05e-15\n  bessel_d2 5.99e-12 @ eta=18.85  <-- KNOWN & ANALYZED, do not chase. special.rs:400 doc comment proves the cancellation is INTRINSIC to the ascending representation (sum|terms|/|sum terms| = 8*eta^2), unreachable in f64, and its one consumer (von-Mises ARD log-precision Hessian) is 9 orders clear of caring.\n  digamma 1.57e-13 @ x=1.46357 <-- at the ZERO of psi; relative measure is meaningless there, absolute is fine.\n  erfcx 3.5e-16 | log1mexp 1.66e-16 | normal_pdf 2.91e-16 | probit_mills 4.66e-16\n  normal_cdf / normal_logcdf / normal_logsf / probit_logcdf / logcdf_d0..d2 all 1.8e-13 @ |x|~30-37 <-- relative-error-of-a-near-cancelling-log artifact at the tail switch, not a defect. logcdf_d3 9.1e-13, d4 7.8e-12 @ x=-3.8.\n  normal_quantile 2.94e-16 (was 1.13e-9 before #2527) | normal_quantile_from_log 2.7e-16\n  trigamma 8.79e-16 | tetragamma 4.91e-16 | pentagamma 6.96e-16. Their huge ABS numbers (5.5e+16, 1.1e+8, 1.62) are at x~1.1e-8 where the functions genuinely blow up as 2/x^3, 6/x^4 — poles, not errors.\n  beta_quantile median 1.554e-15 over 187 rows, worst 4.93e-10 @ Beta(5,1000) p=0.1 <-- residual statrs inv_beta_reg BULK inaccuracy, outside my #2528 series branch. A real (minor) follow-up if anyone wants it.\n  binomial: 0 failures. gauss_legendre nodes ~6e-17 absolute at every n; weight sums within 8.9e-16 of 2 at every n.\nGAUSS-LEGENDRE WEIGHT REL ERROR GROWS WITH n (5.6e-16 at n=3 -> 6.9e-13 at n=256), always at i=0. I derived the mechanism and it is NOT worth fixing: w = 2/((1-x^2) P'^2), and the extreme node sits at 1-x0^2 ~ j1^2/n^2, so an epsilon-level ABSOLUTE node error becomes a relative error 2*eps/(1-x0^2) that grows as n^2. Predicted 1.9e-16/5.3e-15/8.5e-14/1.4e-12 at n=3/16/64/256 vs measured 5.6e-16/1.9e-15/9.3e-14/6.9e-13 — same law. Same genus as #2489/#2527 (a quantity destroyed by cancellation) BUT harmless: the edge weight is itself O(1/n^2), so its absolute contribution to any integral is ~1e-17, and sum-2 is at machine precision for every n. DO NOT CHASE.",
+      "confidence": 0.9,
+      "tags": [
+        "gam",
+        "gam-math",
+        "numerics",
+        "audit",
+        "baseline",
+        "high-value"
+      ],
+      "evidence": [],
+      "created": 1785088763462,
+      "updated": 1785088763462,
       "deprecated": false
     }
   ]

@@ -115,3 +115,129 @@
 2026-07-26T14:15:31.691Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "absolute_degeneracy_ev_floor\|fn reachable_dictionary_rank" --include=*.rs crates/ | head -20
 2026-07-26T14:15:36.370Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '60,190p' crates/gam-sae/src/manifold/outer_objective.rs
 2026-07-26T14:15:52.270Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '330,375p' crates/gam-sae/src/manifold/fit_drivers.rs
+2026-07-26T17:12:21.090Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test -p gam-terms --lib > /tmp/lib.log 2>&1; echo DONE_$? >> /tmp/lib.log' >/dev/null 2>&1 </dev/nu
+2026-07-26T17:12:31.474Z [shell-mcp] bash: cd /home/runner/work/gam/gam && pip install mpmath -q 2>&1 | tail -1; ls crates/gam-math/src/ | head -40
+2026-07-26T17:12:40.341Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "^pub fn\|^pub(crate) fn" crates/gam-math/src/special.rs | head -40; echo "--- lines:"; wc -l crates/gam-math/src/specia
+2026-07-26T17:12:50.627Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '474,545p' crates/gam-math/src/special.rs | head -c 3200
+2026-07-26T17:13:04.072Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "POLYGAMMA_ASYMPTOTIC_THRESHOLD\s*:" crates/gam-math/src/special.rs; sed -n '443,473p' crates/gam-math/src/special.rs | 
+2026-07-26T17:13:09.487Z [shell-mcp] bash: cd /home/runner/work/gam/gam && wc -l crates/gam-math/examples/*; grep -n "\"[a-z_0-9]*\"" crates/gam-math/examples/special_audit_dump.rs | grep -o '"[a-z_0-9]*
+2026-07-26T17:13:13.608Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git log --format='%H %ad %s' --date=short -1 3bfd25554 | head -c 200; echo; git show --stat 3bfd25554 | tail -5; echo "=== does 
+2026-07-26T17:13:20.494Z [shell-mcp] bash: cd /home/runner/work/gam/gam && head -40 crates/gam-math/examples/special_audit_check.py | head -c 2000
+2026-07-26T17:13:24.678Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -c DONE /tmp/lib.log; (setsid nohup bash -c 'cargo run -p gam-math --release --example special_audit_dump > /tmp/dump.tsv 2
+2026-07-26T17:14:08.023Z [shell-mcp] bash: cd /home/runner/work/gam/gam && wc -l /tmp/dump.tsv && timeout 900 python3 crates/gam-math/examples/special_audit_check.py /tmp/dump.tsv 2>&1 | head -c 3000
+2026-07-26T17:14:56.171Z [shell-mcp] poll: j10
+2026-07-26T17:15:44.156Z [shell-mcp] poll: j10
+2026-07-26T17:16:31.751Z [shell-mcp] poll: j10
+2026-07-26T17:17:19.363Z [shell-mcp] poll: j10
+2026-07-26T17:18:08.354Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "fn normal_quantile\|fn normal_quantile_from_log\|ACKLAM\|1.15e-9\|refine\|halley\|newton" crates/gam-math/src/probabili
+2026-07-26T17:18:12.831Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "pub fn normal_quantile" crates/gam-math/src/*.rs | head; sed -n '1870,1900p' crates/gam-math/src/probability.rs | head
+2026-07-26T17:18:27.333Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "fn standard_normal_quantile\b" crates/gam-math/src/probability.rs
+2026-07-26T17:18:46.463Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '576,640p' crates/gam-math/src/probability.rs | head -c 2600
+2026-07-26T17:19:58.059Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:20:14.984Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "pub fn normal_cdf\|pub fn normal_pdf\|fn erfc\b\|INV_SQRT_2PI\|SQRT_2PI\|const .*PI" crates/gam-math/src/probability.rs
+2026-07-26T17:20:20.650Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '85,100p' crates/gam-math/src/probability.rs | head -c 900; echo "=== erfc:"; grep -rn "pub fn erfc\|pub(crate) fn erfc\|
+2026-07-26T17:20:25.422Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "^use \|^pub use " crates/gam-math/src/probability.rs | head -10
+2026-07-26T17:21:08.710Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T17:21:13.308Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo build -p gam-math --release --example special_audit_dump 2>&1 | grep -E "^error|warning: unused|-->" | head -10; echo "BUI
+2026-07-26T17:21:29.345Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:21:39.382Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:22:16.789Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:22:28.760Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'python3 crates/gam-math/examples/special_audit_check.py /tmp/dump2.tsv normal_quantile normal_cdf normal_
+2026-07-26T17:23:01.596Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T17:23:29.441Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cp crates/gam-math/src/probability.rs /tmp/prob.keep && python3 -c "
+2026-07-26T17:23:49.110Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:23:54.996Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -i '1s/use libm::{erf, erfc};/use libm::erfc;/' crates/gam-math/src/probability.rs && cargo test -p gam-math --lib normal_qu
+2026-07-26T17:24:24.408Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test -p gam-math --lib > /tmp/gm.log 2>&1; echo DONE_$? >> /tmp/gm.log' >/dev/null 2>&1 </dev/null 
+2026-07-26T17:25:02.122Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat /tmp/aud.log | head -c 700
+2026-07-26T17:25:28.950Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:25:52.162Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git status --short | head -10
+2026-07-26T17:26:15.509Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat > /tmp/iss.md <<'EOF'
+2026-07-26T17:26:32.658Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git add crates/gam-math/src/probability.rs && git commit -q -F - <<'EOF'
+2026-07-26T17:26:42.090Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rln "standard_normal_quantile" --include=*.rs crates/ tests/ | head -20
+2026-07-26T17:26:57.830Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test -p gam-predict -p gam-inference --lib > /tmp/dn.log 2>&1; echo DONE_$? >> /tmp/dn.log' >/dev/n
+2026-07-26T17:27:17.051Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sleep 30; grep -aE "test result|^error\[|DONE_" /tmp/dn.log | tail -c 500
+2026-07-26T17:27:57.583Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "residual\s*=\|resid =" --include=*.rs crates/gam-math/src/ | grep -v "^.*tests" | head -20
+2026-07-26T17:28:02.072Z [shell-mcp] bash: cd /home/runner/work/gam/gam && head -30 crates/gam-math/src/quantile.rs | head -c 1500; echo "==="; grep -n "fn " crates/gam-math/src/quantile.rs | head
+2026-07-26T17:28:10.563Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -aE "test result|^error\[|DONE_" /tmp/dn.log | tail -c 400
+2026-07-26T17:28:14.416Z [shell-mcp] bash: cd /home/runner/work/gam/gam && tail -c 250 /tmp/dn.log
+2026-07-26T17:28:30.151Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '400,443p' crates/gam-math/src/special.rs | head -c 2200
+2026-07-26T17:28:53.127Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "fn dilog_unit\|fn trilog_unit\|^pub" crates/gam-terms/src/basis/polylog.rs | head; grep -aE "test result|DONE_" /tmp/dn
+2026-07-26T17:29:02.463Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '30,60p;75,124p' crates/gam-terms/src/basis/polylog.rs | head -c 3000
+2026-07-26T17:29:35.076Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -aE "test result|^error\[|DONE_" /tmp/dn.log | tail -c 400; echo "---"; tail -c 150 /tmp/dn.log
+2026-07-26T17:29:53.370Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "inv_beta_reg" --include=*.rs crates/ | head -5; echo "=== newton/bisect solves:"; grep -rln "fn .*newton\|bisect" --in
+2026-07-26T17:29:58.914Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '10,30p' crates/gam-math/src/probability.rs | head -c 1200
+2026-07-26T17:30:08.468Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "beta_quantile" --include=*.rs crates/ tests/ | grep -v "fn beta_quantile\|tests.rs\|_tests" | head -8
+2026-07-26T17:30:20.448Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat > /tmp/bq.rs <<'EOF'
+2026-07-26T17:30:34.832Z [shell-mcp] bash: cd /home/runner/work/gam/gam && rm crates/gam-math/examples/tmp_bq.rs && python3 -c "
+2026-07-26T17:30:42.177Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:30:55.147Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:31:11.743Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:32:11.302Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '150,170p' crates/gam-inference/src/probability.rs | head -c 1000
+2026-07-26T17:32:30.254Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat > crates/gam-math/examples/tmp_bq.rs <<'EOF'
+2026-07-26T17:33:12.289Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:33:44.378Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat > /tmp/iss2.md <<'EOF'
+2026-07-26T17:34:23.704Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "pub fn ln_beta\|pub fn ln_gamma" ~/.cargo/registry/src/*/statrs-0.19*/src/function/{beta,gamma}.rs 2>/dev/null | head -
+2026-07-26T17:34:57.494Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T17:35:45.784Z [shell-mcp] poll: j59
+2026-07-26T17:36:40.485Z [shell-mcp] poll: j59
+2026-07-26T17:37:35.138Z [shell-mcp] poll: j59
+2026-07-26T17:38:25.625Z [shell-mcp] poll: j59
+2026-07-26T17:39:20.300Z [shell-mcp] bash: grep -aE "test result|DONE_" /tmp/dn.log | tail -c 300; echo "---"; tail -c 120 /tmp/dn.log
+2026-07-26T17:39:26.027Z [shell-mcp] poll: j59
+2026-07-26T17:40:19.212Z [shell-mcp] bash: grep -aE "test result|DONE_" /tmp/dn.log | tail -c 300
+2026-07-26T17:40:27.453Z [shell-mcp] bash: grep -aE "^failures:|^    [a-z_:]+$|panicked at" /tmp/dn.log | head -10
+2026-07-26T17:40:31.182Z [shell-mcp] bash: grep -a -A4 "panicked at crates/gam-predict/src/lib.rs:3872" /tmp/dn.log | head -c 700; echo "==="; cd /home/runner/work/gam/gam && git stash list | head -2; gi
+2026-07-26T17:40:36.668Z [shell-mcp] poll: j59
+2026-07-26T17:40:45.523Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat > crates/gam-math/examples/tmp_bq.rs <<'EOF'
+2026-07-26T17:40:59.223Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:41:08.655Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:41:28.796Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:41:52.834Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat > crates/gam-math/examples/tmp_bq.rs <<'EOF'
+2026-07-26T17:42:09.623Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "fn beta_quantile_" crates/gam-math/src/probability.rs | head -5
+2026-07-26T17:42:30.187Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T17:42:57.711Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1253,1260p' crates/gam-math/src/probability.rs; cargo test -p gam-math --lib beta_quantile 2>&1 | grep -aA2 "panicked at
+2026-07-26T17:43:06.299Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:43:13.079Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T17:43:57.773Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo fmt -p gam-math && git add crates/gam-math/src/probability.rs && git commit -q -F - <<'EOF'
+2026-07-26T17:44:15.504Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test -p gam-inference --lib > /tmp/gi.log 2>&1; echo DONE_$? >> /tmp/gi.log' >/dev/null 2>&1 </dev/
+2026-07-26T17:44:38.494Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sleep 40; grep -aE "test result|DONE_|panicked" /tmp/gi.log | tail -c 400
+2026-07-26T17:45:24.052Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rhn "use statrs" --include=*.rs crates/ | sed 's/.*use statrs/statrs/' | sort -u | head -20
+2026-07-26T17:45:37.720Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "inverse_cdf" --include=*.rs crates/ | grep -v "^.*tests" | head -12
+2026-07-26T17:45:49.769Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "target_misround_probability\|error_probability" crates/gam-sae/src/inference/atlas_holonomy.rs | head -20
+2026-07-26T17:45:56.072Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "gaussian_two_sided_radius" crates/gam-sae/src/inference/atlas_holonomy.rs | head; sed -n '4055,4070p' crates/gam-sae/sr
+2026-07-26T17:45:59.667Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "gaussian_error_budget" crates/gam-sae/src/inference/atlas_holonomy.rs | head -8
+2026-07-26T17:46:04.041Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "allocated_alpha" crates/gam-sae/src/inference/atlas_holonomy.rs | head -8; echo ===; sed -n '4110,4126p' crates/gam-sae
+2026-07-26T17:46:20.433Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "^pub fn " crates/gam-math/src/probability.rs | head -40; echo "==="; grep -aE "test result|DONE_|panicked" /tmp/gi.log 
+2026-07-26T17:46:32.759Z [shell-mcp] bash: sleep 50; grep -aE "test result|DONE_|panicked" /tmp/gi.log | tail -c 300
+2026-07-26T17:47:21.028Z [shell-mcp] poll: j84
+2026-07-26T17:47:27.245Z [shell-mcp] bash: sleep 45; grep -aE "test result|DONE_|panicked" /tmp/gi.log | tail -c 300; tail -c 100 /tmp/gi.log
+2026-07-26T17:48:14.823Z [shell-mcp] poll: j85
+2026-07-26T17:48:23.958Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "normal_quantile\|fn main\|emit\|println" crates/gam-math/examples/special_audit_dump.rs | head -20
+2026-07-26T17:48:36.393Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "split\|def main\|CHANNELS\|REFERENCE\|channel" crates/gam-math/examples/special_audit_check.py | head -20
+2026-07-26T17:48:42.239Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '176,200p' crates/gam-math/examples/special_audit_check.py; echo "=== dump binomial:"; grep -n "binomial" crates/gam-math
+2026-07-26T17:48:57.956Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T17:49:16.729Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T17:49:23.232Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "binomial_rows" crates/gam-math/examples/special_audit_check.py; sed -n '250,290p' crates/gam-math/examples/special_audi
+2026-07-26T17:49:31.971Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T17:49:45.514Z [shell-mcp] bash: cd /home/runner/work/gam/gam && timeout 600 python3 crates/gam-math/examples/special_audit_check.py /tmp/dump3.tsv beta_quantile 2>&1 | tail -c 800
+2026-07-26T17:50:37.131Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo fmt -p gam-math && git add crates/gam-math/examples/ && git commit -q -F - <<'EOF'
+2026-07-26T17:50:44.923Z [shell-mcp] bash: sleep 45; grep -aE "test result|DONE_|panicked at" /tmp/gi.log | tail -c 400; echo "--- tail:"; tail -c 90 /tmp/gi.log
+2026-07-26T17:51:32.334Z [shell-mcp] poll: j95
+2026-07-26T17:51:51.124Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '150,185p' crates/gam-inference/src/probability.rs
+2026-07-26T17:51:59.388Z [shell-mcp] bash: sleep 48; grep -aE "test result|DONE_|panicked at" /tmp/gi.log | tail -c 400
+2026-07-26T17:52:47.136Z [shell-mcp] poll: j97
+2026-07-26T17:52:57.561Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue close 2528 --reason completed 2>&1 | tail -c 100; git status --short | head -5; git log --oneline -3
+2026-07-26T17:53:03.626Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git log --oneline --all --grep="#2528" | head -4; echo "--- unpushed:"; git log --oneline origin/main..HEAD | head -3; echo "(no
+2026-07-26T17:54:05.179Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'python3 crates/gam-math/examples/special_audit_check.py /tmp/dump3.tsv > /tmp/full.log 2>&1; echo DONE_$?
+2026-07-26T17:54:08.325Z [shell-mcp] bash: sleep 48; tail -c 300 /tmp/full.log
+2026-07-26T17:54:55.577Z [shell-mcp] poll: j101
+2026-07-26T17:54:59.469Z [shell-mcp] bash: sleep 50; grep -c DONE_ /tmp/full.log 2>/dev/null; echo "---"; sleep 50; grep -c DONE_ /tmp/full.log 2>/dev/null
+2026-07-26T17:55:46.877Z [shell-mcp] poll: j102
+2026-07-26T17:56:34.335Z [shell-mcp] poll: j102
+2026-07-26T17:56:42.349Z [shell-mcp] bash: sleep 55; grep -q DONE_ /tmp/full.log && cat /tmp/full.log || echo "still running"
+2026-07-26T17:57:30.152Z [shell-mcp] poll: j103
+2026-07-26T17:57:41.175Z [shell-mcp] bash: sleep 55; grep -q DONE_ /tmp/full.log && cat /tmp/full.log || echo "still running"
+2026-07-26T17:58:28.740Z [shell-mcp] poll: j104
+2026-07-26T17:58:58.601Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:59:31.939Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git status --short | head -5; echo "--- unpushed:"; git log --oneline origin/main..HEAD | head -3; echo "--- mine this run:"; gi
+2026-07-26T17:59:58.432Z [host] connection closed (code=null, signal=null)
