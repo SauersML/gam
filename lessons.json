@@ -1,32 +1,89 @@
 {
   "lessons": [
     {
-      "id": "408d196b",
-      "content": "gam repo orientation (2026-07): /home/runner/work/gam/gam. Rust workspace, ~1.27M LOC across 24 crates in crates/ (gam-solve, gam-math, gam-terms, gam-models, gam-inference, gam-linalg, gam-predict, gam-pyffi, gam-cli, ...). Root src/ is tiny (483 LOC, just re-exports/macros). Toolchain pinned 1.97.1. Python wrapper = gamfit (pyproject.toml + gamfit/). Docs in docs/ (mkdocs). Builds are SLOW on the 4-core runner — use long timeouts, prefer `cargo check -p <crate>` over full builds.",
       "confidence": 0.9,
+      "content": "gam repo orientation (2026-07): /home/runner/work/gam/gam. Rust workspace, ~1.27M LOC across 24 crates in crates/ (gam-solve, gam-math, gam-terms, gam-models, gam-inference, gam-linalg, gam-predict, gam-pyffi, gam-cli, ...). Root src/ is tiny (483 LOC, just re-exports/macros). Toolchain pinned 1.97.1. Python wrapper = gamfit (pyproject.toml + gamfit/). Docs in docs/ (mkdocs). Builds are SLOW on the 4-core runner — use long timeouts, prefer `cargo check -p <crate>` over full builds.",
+      "created": 1785029857935,
+      "deprecated": false,
+      "evidence": [],
+      "id": "408d196b",
       "tags": [
         "repo",
         "orientation",
         "gam"
       ],
-      "evidence": [],
-      "created": 1785029857935,
-      "updated": 1785029857935,
-      "deprecated": false
+      "updated": 1785029857935
     },
     {
-      "id": "489bc7fc",
-      "content": "gam repo is worked by a FLEET of concurrent agents filing issues under a shared GitHub identity. As of 2026-07-26 there were ~78 open issues, most filed within minutes of each other. Issue titles are unusually high-quality, quantitative bug reports (they read like audit findings). Expect main to move under you: `git pull --rebase` before pushing; if `gh`/`git fetch` says \"Bad credentials\" the API token expired — use `git fetch ssh && git rebase ssh/main`, push still works (SSH deploy key, no expiry).",
       "confidence": 0.85,
+      "content": "gam repo is worked by a FLEET of concurrent agents filing issues under a shared GitHub identity. As of 2026-07-26 there were ~78 open issues, most filed within minutes of each other. Issue titles are unusually high-quality, quantitative bug reports (they read like audit findings). Expect main to move under you: `git pull --rebase` before pushing; if `gh`/`git fetch` says \"Bad credentials\" the API token expired — use `git fetch ssh && git rebase ssh/main`, push still works (SSH deploy key, no expiry).",
+      "created": 1785029871425,
+      "deprecated": false,
+      "evidence": [],
+      "id": "489bc7fc",
       "tags": [
         "repo",
         "process",
         "fleet",
         "git"
       ],
+      "updated": 1785029871425
+    },
+    {
+      "id": "c453ebd1",
+      "content": "RESOLVED — do not re-open. gam sphere-kernel geodesic issue (#2489), \"cos γ carried as a dot product destroys 1−cos γ by cancellation\", was fixed end-to-end and closed 2026-07-26.\nLanded: c12111b27 / 7a540d565 (CPU scalar+SIMD+jet root fix), d48b0a0b4 + fe3581281 + ff9c0e1ee (CUDA device `s2_chord_cos_gamma` helper and GPU host oracles).\nThe durable MATH, in case it's needed elsewhere in the repo:\n  - Zonal sphere kernels are functions of u = (1−cos γ)/2 = sin²(γ/2), never of cos γ. Carrying cos γ is pure loss: below ~1e-8° separation the dot product returns exactly 0 and reports distinct points as coincident.\n  - lat/lon form: u = sin²(Δφ/2) + cos φ₁ cos φ₂ sin²(Δψ/2). u = 0 iff coordinates bitwise equal.\n  - ambient xyz form (an identity, not a rearrangement): u = |t−c|²/4, v = |t+c|²/4; normalized u = |x−c|²/(|x−c|²+|x+c|²) cancels non-unit storage scale. cos γ = v − u.\n  - Legendre recurrences genuinely need cos γ; recover it as 1 − 2u, where the cancellation runs the harmless way.\nSame genus as #2127 (frame-anchored center placement): rotation invariance broken one level lower, in the metric itself.",
+      "confidence": 0.95,
+      "tags": [
+        "gam",
+        "sphere",
+        "numerics",
+        "resolved",
+        "math"
+      ],
+      "evidence": [
+        "github issue #2489"
+      ],
+      "created": 1785063155966,
+      "updated": 1785063184589,
+      "deprecated": false
+    },
+    {
+      "id": "c5f4c3c4",
+      "content": "CRITICAL runner constraint (gam repo): the `mcpl--sh--bash` tool has a HARD ~60s MCPL transport timeout that IGNORES the `timeout_ms` argument. Any cargo build/test will blow it. Pattern that works:\n  nohup bash -c 'cd /home/runner/work/gam/gam && cargo test -p X --lib ... > /tmp/out.log 2>&1; echo DONE_$? >> /tmp/out.log' >/dev/null 2>&1 &\nthen poll with short `tail /tmp/out.log` calls. Never block on a long command directly.",
+      "confidence": 0.9,
+      "tags": [
+        "repo",
+        "tooling",
+        "bash",
+        "critical"
+      ],
       "evidence": [],
-      "created": 1785029871425,
-      "updated": 1785029871425,
+      "created": 1785063322606,
+      "updated": 1785063322606,
+      "deprecated": false
+    },
+    {
+      "id": "f4d494e4",
+      "content": "RESOLVED 2026-07-26 at commit b29eb39bd — gam #2499(ii), \"ARD EDF at atom 0, axis 0 is -7.256391e1, outside certified [0, 24]\".\nROOT CAUSE (confirmed empirically, exact digits reproduced): the identity `edf = n_active − α·tr(H⁻¹)` assumes the prior curvature on every latent diagonal slot IS α. True on a Euclidean axis; FALSE on a periodic one. On LatentManifold::Circle, ArdAxisPrior::eval (crates/gam-sae/src/manifold/atom.rs:306) selects the von Mises energy V=(α/κ²)(1−cos κt) ⇒ V''=α·cos κt is SIGNED, so what both assembly paths actually write into htt is the PSD majorizer `psd_majorizer_hess = α·softplus_τ(cos κt) ∈ [0,α]` (#2339), identically ZERO on the concave arc. With P_i<α you get [H⁻¹]_ss>1/α and α·tr(H⁻¹) is bounded by nothing (measured 96.5 vs n_active 24 ⇒ edf −72.5).\nFIX: shrinkage = Σ_i P_i·[H⁻¹]_ii. Theorem: H=C+P, C⪰0, P⪰0 diagonal ⇒ H⪰P ⇒ P_s[H⁻¹]_ss ∈[0,1] (=0 where P_s=0), so shrinkage ∈[0,n_active] with NO appeal to λ_min(H)≥α. Landed as ArdAxisPrior::curvature_shrinkage_factor (dimensionless f with psd_majorizer_hess==α·f, ≡1 Euclidean so the Euclidean path stays bit-identical) + SaeManifoldTerm::ard_shrinkage_traces, distinct from ard_inverse_traces (which the Fellner-Schall α-step legitimately still wants).\nGENERAL LESSON worth carrying: when a solver MAJORIZES a prior/penalty to keep a factorization PD, every downstream identity written in terms of the un-majorized coefficient (α, λ, ...) is silently wrong. Grep for psd_majorizer / clamp / positive-part seams and check what the EDF/trace/log-det consumers assume.\nSTILL OPEN, same genus, not fixed: outer_objective.rs:3072 efs_step's MacKay update α ← n_eff/(Σw t̂² + Σw [H⁻¹]) — its numerator already uses the periodic `sq_equiv`, its denominator's plain-count n_eff carries the same \"curvature is α everywhere\" assumption.",
+      "confidence": 0.95,
+      "tags": [
+        "gam",
+        "gam-sae",
+        "issue-2499",
+        "ard",
+        "edf",
+        "resolved",
+        "majorizer"
+      ],
+      "evidence": [
+        "github issue #2499",
+        "crates/gam-sae/src/manifold/atom.rs:306-446",
+        "crates/gam-sae/src/manifold/construction_reconstruction.rs:79-130",
+        "commit b29eb39bd",
+        "github issue #2499 comment 5083259073"
+      ],
+      "created": 1785063528009,
+      "updated": 1785065054007,
       "deprecated": false
     }
   ]
