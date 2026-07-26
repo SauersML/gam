@@ -106,3 +106,12 @@
 2026-07-26T05:50:13.715Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "cos_g\|dot\|__global__\|extern \"C\"\|KERNEL_SRC\|r#\"" crates/gam-terms/src/basis/sphere_gpu.rs | head -50
 2026-07-26T05:50:18.672Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '502,600p' crates/gam-terms/src/basis/sphere_gpu.rs
 2026-07-26T05:50:36.369Z [shell-mcp] bash: sleep 45; tail -c 150 /tmp/man.log; cd /home/runner/work/gam/gam && grep -c "SphereWahbaKernel::Sobolev =>" crates/gam-terms/src/basis/sphere_gpu.rs; grep -n "f
+2026-07-26T14:14:18.379Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git log --oneline -3 && git log --oneline --author=. --all --grep="2489" | head -5 && echo "--- half_angle present:" && ls crate
+2026-07-26T14:14:26.208Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test -p gam-terms --lib > /tmp/lib.log 2>&1; echo DONE_$? >> /tmp/lib.log' >/dev/null 2>&1 </dev/nu
+2026-07-26T14:14:58.241Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue view 2513 --json body -q .body 2>&1 | head -80
+2026-07-26T14:15:04.070Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue view 2513 --json body -q .body 2>&1 | tail -60; echo "=== COMMENTS ==="; gh issue view 2513 --json comments -q '.commen
+2026-07-26T14:15:13.390Z [shell-mcp] bash: cd /home/runner/work/gam/gam && tail -3 /tmp/lib.log; echo "=== 2446 ==="; gh issue view 2446 --json body,comments -q '.body' 2>&1 | head -70
+2026-07-26T14:15:24.301Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue view 2498 --json body,comments -q '.body + "\n=== COMMENTS: " + ([.comments[] | .author.login + " " + (.body[0:400])] |
+2026-07-26T14:15:31.691Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "absolute_degeneracy_ev_floor\|fn reachable_dictionary_rank" --include=*.rs crates/ | head -20
+2026-07-26T14:15:36.370Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '60,190p' crates/gam-sae/src/manifold/outer_objective.rs
+2026-07-26T14:15:52.270Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '330,375p' crates/gam-sae/src/manifold/fit_drivers.rs
