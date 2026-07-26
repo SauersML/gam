@@ -2,6 +2,21 @@
   "lessons": [
     {
       "confidence": 0.9,
+      "content": "gam: `dead_code` is DENIED (hard compile error), so you cannot land a \"purely additive, wires up later\" helper module — unused `pub(crate)` fns/structs/methods fail `cargo check`. Any new API must be wired to a caller in the SAME commit. (Combined with the ban on `#[allow(dead_code)]`, there is no escape hatch.) Corollary: a decomposition plan that says \"step 1 is purely additive, breaks no caller\" does not actually compile in this repo.",
+      "created": 1785042440920,
+      "deprecated": false,
+      "evidence": [],
+      "id": "3882b949",
+      "tags": [
+        "gam",
+        "build",
+        "gotcha",
+        "ban-scanner"
+      ],
+      "updated": 1785042440920
+    },
+    {
+      "confidence": 0.9,
       "content": "gam repo orientation (2026-07): /home/runner/work/gam/gam. Rust workspace, ~1.27M LOC across 24 crates in crates/ (gam-solve, gam-math, gam-terms, gam-models, gam-inference, gam-linalg, gam-predict, gam-pyffi, gam-cli, ...). Root src/ is tiny (483 LOC, just re-exports/macros). Toolchain pinned 1.97.1. Python wrapper = gamfit (pyproject.toml + gamfit/). Docs in docs/ (mkdocs). Builds are SLOW on the 4-core runner — use long timeouts, prefer `cargo check -p <crate>` over full builds.",
       "created": 1785029857935,
       "deprecated": false,
@@ -13,6 +28,22 @@
         "gam"
       ],
       "updated": 1785029857935
+    },
+    {
+      "id": "47229717",
+      "content": "Issue #2489 (gam, open, explicitly \"not claiming this lane\"): sphere Wahba kernels carry geodesic separation as a DOT PRODUCT (cos γ), but every zonal kernel immediately wants u = (1-cos γ)/2 = sin²(γ/2). Catastrophic cancellation: 72x rel err at 1e-7°, exactly 0 below 1e-8°. Fix = carry u in haversine form u = sin²(Δφ/2) + cosφ₁cosφ₂sin²(Δψ/2).\nCALL SITES (small surface, ~4 files, all in crates/gam-terms/src/basis/):\n- sphere_kernels.rs (431 LOC): wahba_sphere_kernel_pseudo_from_cos, _sobolev_closed_form, _from_cos_kind, _from_cos_simd_kind, _derivative_dcos_kind, _sobolev_derivative_dcos.\n- workspace_cache.rs:783 (SIMD) and :801 (scalar tail) in spherical_wahba_kernel_matrix_cpu — forms cos_gamma from sin/cos lat/lon.\n- radial_jets_nd.rs:1962 in spherical_wahba_kernel_jet_with_kind — same, plus ∂cosγ/∂φ, ∂cosγ/∂ψ.\n- sphere_spectral.rs: sphere_truncated_spectral_eval / _derivative_eval genuinely want cos γ (Legendre recurrence) — recover as 1-2u, harmless direction.\n- sphere_gpu.rs uses cos_g only in #[cfg(test)] parity checks (line 1850); no WGSL — CUDA via cudarc.\nTests touching this: crates/gam-terms/src/basis/zz_measure_2475_tests.rs, tests/manifolds/misc/wahba_kernel_spectral_truth.rs, tests/src_modules/smooths/basis_duchon_matern_jet_derivative_tests.rs (~line 4296).",
+      "confidence": 0.9,
+      "tags": [
+        "gam",
+        "issue-2489",
+        "sphere",
+        "numerics",
+        "analysis"
+      ],
+      "evidence": [],
+      "created": 1785044932781,
+      "updated": 1785044932781,
+      "deprecated": false
     },
     {
       "confidence": 0.85,
@@ -28,22 +59,6 @@
         "git"
       ],
       "updated": 1785029871425
-    },
-    {
-      "confidence": 0.9,
-      "content": "WORKING ON: gam issue #2489 — sphere geodesic separation carried as a dot product, so u=(1-cosγ)/2 loses all bits at small γ (72x rel err at 1e-7°, exactly 0 below 1e-8°; jet collapses to -100% at a center, reachable because FarthestPoint picks centers FROM the data).\nFix = carry u in haversine form: u = sin²(Δφ/2) + cosφ·cosφ_c·sin²(Δψ/2).\nChain rule for jet is CLEANER in u: dK/dcos·∂cos/∂φ = dK/du·∂u/∂φ (the two divergent factors cancel analytically instead of numerically).\n  ∂u/∂φ = ½sin(Δφ) − sinφ·cosφ_c·sin²(Δψ/2)\n  ∂u/∂ψ = ½·cosφ·cosφ_c·sin(Δψ)\nSites: crates/gam-terms/src/basis/sphere_kernels.rs (kernels, all functions of u), workspace_cache.rs:~784,801 (spherical_wahba_kernel_matrix_cpu, SIMD+scalar tail), radial_jets_nd.rs:~1962 (spherical_wahba_kernel_jet_with_kind). sphere_spectral.rs Legendre wants cos γ = 1−2u (recover exactly; cancellation harmless there).",
-      "created": 1785042048664,
-      "deprecated": false,
-      "evidence": [],
-      "id": "b5f3eae8",
-      "tags": [
-        "gam",
-        "issue-2489",
-        "sphere",
-        "numerics",
-        "wip"
-      ],
-      "updated": 1785042048664
     },
     {
       "confidence": 0.95,
@@ -62,35 +77,19 @@
       "updated": 1785042137544
     },
     {
-      "confidence": 0.9,
-      "content": "gam: `dead_code` is DENIED (hard compile error), so you cannot land a \"purely additive, wires up later\" helper module — unused `pub(crate)` fns/structs/methods fail `cargo check`. Any new API must be wired to a caller in the SAME commit. (Combined with the ban on `#[allow(dead_code)]`, there is no escape hatch.) Corollary: a decomposition plan that says \"step 1 is purely additive, breaks no caller\" does not actually compile in this repo.",
-      "created": 1785042440920,
-      "deprecated": false,
-      "evidence": [],
-      "id": "3882b949",
-      "tags": [
-        "gam",
-        "build",
-        "gotcha",
-        "ban-scanner"
-      ],
-      "updated": 1785042440920
-    },
-    {
-      "confidence": 0.9,
-      "content": "gam runner: the `bash` tool hard-fails at ~60s wall clock regardless of the `timeout_ms` argument (\"MCPL server sh did not respond within 60000ms\"). Anything longer than that — `cargo test`, full builds — must be detached and polled:\n  (setsid nohup bash -c 'cargo test -p X > /tmp/t.log 2>&1; echo DONE_$? >> /tmp/t.log' >/dev/null 2>&1 &)\nthen `sleep 45; tail /tmp/t.log` in later calls until DONE_ appears. `cargo check -p <crate>` on one crate is usually ~10-40s and fits. NOTE the abandoned call keeps running server-side and holds the cargo build-directory lock, so a naive retry just prints \"Blocking waiting for file lock\".",
-      "created": 1785043502475,
-      "deprecated": false,
-      "evidence": [],
-      "id": "d628af12",
+      "id": "78ae426c",
+      "content": "gam test layout (verified): `tests/<dir>/main.rs` are auto-discovered cargo integration binaries (manifolds, glm, inference, sae, survival, regressions, ...) — no [[test]] entries in Cargo.toml. BUT `tests/src_modules/**` is NOT a test binary: it is `include!`d into crate source (e.g. crates/gam-terms/src/basis/tests.rs), so those files run under `cargo test -p gam-terms --lib`. Timings on the 4-core runner: `cargo test -p gam-terms --lib` ~19s run after a ~50s check; `cargo test --test manifolds` needs a ~10-15 MINUTE cold compile of the whole workspace (the root `gam` crate is the long pole) plus ~250s to run. Launch long jobs with: `setsid nohup bash -c 'cargo test ... > /tmp/x.log 2>&1; echo EXIT=$? >> /tmp/x.log' >/dev/null 2>&1 < /dev/null &` then poll with sleep+tail. The mcpl bash tool has a hard ~60s transport ceiling that ignores timeout_ms; do not run two cargo jobs at once (they deadlock on the target-dir lock and orphan).",
+      "confidence": 0.85,
       "tags": [
         "gam",
         "runner",
         "tooling",
-        "gotcha",
-        "high-value"
+        "tests"
       ],
-      "updated": 1785043502475
+      "evidence": [],
+      "created": 1785047572144,
+      "updated": 1785047572144,
+      "deprecated": false
     },
     {
       "confidence": 0.85,
@@ -106,6 +105,21 @@
         "workspace"
       ],
       "updated": 1785043799672
+    },
+    {
+      "id": "88812b2d",
+      "content": "gam: sphere m=1 Sobolev is REFUSED by design (#2475, commits 35f24b84a/487ef3db9 by SauersML). K_1 = (-ln u - 1)/4pi is log-singular at coincidence => no Gram diagonal => refused at every public matrix entry point (`validate_spherical_wahba_gram_request` in workspace_cache.rs). Deep reason: H^1(S^2) has no bounded point evaluation (Sobolev embedding needs s > d/2 = 1), so m=1 is not a reproducing kernel on S^2 at all. The refusal is STRUCTURAL (family-level), not a coincidence test — the owner's own test comment says so explicitly, so do NOT narrow it to \"only when a coincident pair occurs\". The remedy is SobolevTruncated{lmax}. I added `lmax=` (aliases l_max, l-max; range 5..=200) to the sphere formula term in crates/gam-terms/src/term_builder.rs so the remedy is reachable from the DSL at all — before that, `sphere(lat,lon,m=1)` had no working spelling.",
+      "confidence": 0.9,
+      "tags": [
+        "gam",
+        "sphere",
+        "numerics",
+        "design-decision"
+      ],
+      "evidence": [],
+      "created": 1785047572132,
+      "updated": 1785047572132,
+      "deprecated": false
     },
     {
       "confidence": 0.9,
@@ -125,52 +139,6 @@
       "updated": 1785075298248
     },
     {
-      "id": "47229717",
-      "content": "Issue #2489 (gam, open, explicitly \"not claiming this lane\"): sphere Wahba kernels carry geodesic separation as a DOT PRODUCT (cos γ), but every zonal kernel immediately wants u = (1-cos γ)/2 = sin²(γ/2). Catastrophic cancellation: 72x rel err at 1e-7°, exactly 0 below 1e-8°. Fix = carry u in haversine form u = sin²(Δφ/2) + cosφ₁cosφ₂sin²(Δψ/2).\nCALL SITES (small surface, ~4 files, all in crates/gam-terms/src/basis/):\n- sphere_kernels.rs (431 LOC): wahba_sphere_kernel_pseudo_from_cos, _sobolev_closed_form, _from_cos_kind, _from_cos_simd_kind, _derivative_dcos_kind, _sobolev_derivative_dcos.\n- workspace_cache.rs:783 (SIMD) and :801 (scalar tail) in spherical_wahba_kernel_matrix_cpu — forms cos_gamma from sin/cos lat/lon.\n- radial_jets_nd.rs:1962 in spherical_wahba_kernel_jet_with_kind — same, plus ∂cosγ/∂φ, ∂cosγ/∂ψ.\n- sphere_spectral.rs: sphere_truncated_spectral_eval / _derivative_eval genuinely want cos γ (Legendre recurrence) — recover as 1-2u, harmless direction.\n- sphere_gpu.rs uses cos_g only in #[cfg(test)] parity checks (line 1850); no WGSL — CUDA via cudarc.\nTests touching this: crates/gam-terms/src/basis/zz_measure_2475_tests.rs, tests/manifolds/misc/wahba_kernel_spectral_truth.rs, tests/src_modules/smooths/basis_duchon_matern_jet_derivative_tests.rs (~line 4296).",
-      "confidence": 0.9,
-      "tags": [
-        "gam",
-        "issue-2489",
-        "sphere",
-        "numerics",
-        "analysis"
-      ],
-      "evidence": [],
-      "created": 1785044932781,
-      "updated": 1785044932781,
-      "deprecated": false
-    },
-    {
-      "id": "78ae426c",
-      "content": "gam test layout (verified): `tests/<dir>/main.rs` are auto-discovered cargo integration binaries (manifolds, glm, inference, sae, survival, regressions, ...) — no [[test]] entries in Cargo.toml. BUT `tests/src_modules/**` is NOT a test binary: it is `include!`d into crate source (e.g. crates/gam-terms/src/basis/tests.rs), so those files run under `cargo test -p gam-terms --lib`. Timings on the 4-core runner: `cargo test -p gam-terms --lib` ~19s run after a ~50s check; `cargo test --test manifolds` needs a ~10-15 MINUTE cold compile of the whole workspace (the root `gam` crate is the long pole) plus ~250s to run. Launch long jobs with: `setsid nohup bash -c 'cargo test ... > /tmp/x.log 2>&1; echo EXIT=$? >> /tmp/x.log' >/dev/null 2>&1 < /dev/null &` then poll with sleep+tail. The mcpl bash tool has a hard ~60s transport ceiling that ignores timeout_ms; do not run two cargo jobs at once (they deadlock on the target-dir lock and orphan).",
-      "confidence": 0.85,
-      "tags": [
-        "gam",
-        "runner",
-        "tooling",
-        "tests"
-      ],
-      "evidence": [],
-      "created": 1785047572144,
-      "updated": 1785047572144,
-      "deprecated": false
-    },
-    {
-      "id": "88812b2d",
-      "content": "gam: sphere m=1 Sobolev is REFUSED by design (#2475, commits 35f24b84a/487ef3db9 by SauersML). K_1 = (-ln u - 1)/4pi is log-singular at coincidence => no Gram diagonal => refused at every public matrix entry point (`validate_spherical_wahba_gram_request` in workspace_cache.rs). Deep reason: H^1(S^2) has no bounded point evaluation (Sobolev embedding needs s > d/2 = 1), so m=1 is not a reproducing kernel on S^2 at all. The refusal is STRUCTURAL (family-level), not a coincidence test — the owner's own test comment says so explicitly, so do NOT narrow it to \"only when a coincident pair occurs\". The remedy is SobolevTruncated{lmax}. I added `lmax=` (aliases l_max, l-max; range 5..=200) to the sphere formula term in crates/gam-terms/src/term_builder.rs so the remedy is reachable from the DSL at all — before that, `sphere(lat,lon,m=1)` had no working spelling.",
-      "confidence": 0.9,
-      "tags": [
-        "gam",
-        "sphere",
-        "numerics",
-        "design-decision"
-      ],
-      "evidence": [],
-      "created": 1785047572132,
-      "updated": 1785047572132,
-      "deprecated": false
-    },
-    {
       "id": "b1ac2828",
       "content": "CRITICAL runner gotcha (gam): the `mcpl--sh--bash` tool has a HARD ~60s MCPL transport limit regardless of what you pass in `timeout_ms`. Anything longer returns \"MCPL server 'sh' did not respond to tools/call within 60000ms — the server may be hung\" and the command keeps running server-side (so blind retries duplicate work).\nWORKAROUND: launch long builds/tests detached and poll:\n  nohup bash -c 'cd /path && cargo test ... > /tmp/out.log 2>&1; echo EXIT=$? >> /tmp/out.log' >/dev/null 2>&1 &\nthen in later calls `tail -5 /tmp/out.log` / `grep EXIT= /tmp/out.log`.\nA bare `cargo check -p gam-terms --all-targets` on a warm target dir takes ~51s — right at the edge. Full workspace builds MUST be backgrounded.",
       "confidence": 0.95,
@@ -184,6 +152,55 @@
       "evidence": [],
       "created": 1785045152114,
       "updated": 1785045152114,
+      "deprecated": false
+    },
+    {
+      "confidence": 0.9,
+      "content": "WORKING ON: gam issue #2489 — sphere geodesic separation carried as a dot product, so u=(1-cosγ)/2 loses all bits at small γ (72x rel err at 1e-7°, exactly 0 below 1e-8°; jet collapses to -100% at a center, reachable because FarthestPoint picks centers FROM the data).\nFix = carry u in haversine form: u = sin²(Δφ/2) + cosφ·cosφ_c·sin²(Δψ/2).\nChain rule for jet is CLEANER in u: dK/dcos·∂cos/∂φ = dK/du·∂u/∂φ (the two divergent factors cancel analytically instead of numerically).\n  ∂u/∂φ = ½sin(Δφ) − sinφ·cosφ_c·sin²(Δψ/2)\n  ∂u/∂ψ = ½·cosφ·cosφ_c·sin(Δψ)\nSites: crates/gam-terms/src/basis/sphere_kernels.rs (kernels, all functions of u), workspace_cache.rs:~784,801 (spherical_wahba_kernel_matrix_cpu, SIMD+scalar tail), radial_jets_nd.rs:~1962 (spherical_wahba_kernel_jet_with_kind). sphere_spectral.rs Legendre wants cos γ = 1−2u (recover exactly; cancellation harmless there).",
+      "created": 1785042048664,
+      "deprecated": false,
+      "evidence": [],
+      "id": "b5f3eae8",
+      "tags": [
+        "gam",
+        "issue-2489",
+        "sphere",
+        "numerics",
+        "wip"
+      ],
+      "updated": 1785042048664
+    },
+    {
+      "id": "c453ebd1",
+      "content": "RESOLVED — do not re-open. gam sphere-kernel geodesic issue (#2489), \"cos γ carried as a dot product destroys 1−cos γ by cancellation\", was fixed end-to-end and closed 2026-07-26.\nLanded: c12111b27 / 7a540d565 (CPU scalar+SIMD+jet root fix), d48b0a0b4 + fe3581281 + ff9c0e1ee (CUDA device `s2_chord_cos_gamma` helper and GPU host oracles).\nThe durable MATH, in case it's needed elsewhere in the repo:\n  - Zonal sphere kernels are functions of u = (1−cos γ)/2 = sin²(γ/2), never of cos γ. Carrying cos γ is pure loss: below ~1e-8° separation the dot product returns exactly 0 and reports distinct points as coincident.\n  - lat/lon form: u = sin²(Δφ/2) + cos φ₁ cos φ₂ sin²(Δψ/2). u = 0 iff coordinates bitwise equal.\n  - ambient xyz form (an identity, not a rearrangement): u = |t−c|²/4, v = |t+c|²/4; normalized u = |x−c|²/(|x−c|²+|x+c|²) cancels non-unit storage scale. cos γ = v − u.\n  - Legendre recurrences genuinely need cos γ; recover it as 1 − 2u, where the cancellation runs the harmless way.\nSame genus as #2127 (frame-anchored center placement): rotation invariance broken one level lower, in the metric itself.",
+      "confidence": 0.95,
+      "tags": [
+        "gam",
+        "sphere",
+        "numerics",
+        "resolved",
+        "math"
+      ],
+      "evidence": [
+        "github issue #2489"
+      ],
+      "created": 1785063155966,
+      "updated": 1785063184589,
+      "deprecated": false
+    },
+    {
+      "id": "c5f4c3c4",
+      "content": "CRITICAL runner constraint (gam repo): the `mcpl--sh--bash` tool has a HARD ~60s MCPL transport timeout that IGNORES the `timeout_ms` argument. Any cargo build/test will blow it. Pattern that works:\n  nohup bash -c 'cd /home/runner/work/gam/gam && cargo test -p X --lib ... > /tmp/out.log 2>&1; echo DONE_$? >> /tmp/out.log' >/dev/null 2>&1 &\nthen poll with short `tail /tmp/out.log` calls. Never block on a long command directly.",
+      "confidence": 0.9,
+      "tags": [
+        "repo",
+        "tooling",
+        "bash",
+        "critical"
+      ],
+      "evidence": [],
+      "created": 1785063322606,
+      "updated": 1785063322606,
       "deprecated": false
     },
     {
@@ -203,6 +220,22 @@
       "deprecated": false
     },
     {
+      "confidence": 0.9,
+      "content": "gam runner: the `bash` tool hard-fails at ~60s wall clock regardless of the `timeout_ms` argument (\"MCPL server sh did not respond within 60000ms\"). Anything longer than that — `cargo test`, full builds — must be detached and polled:\n  (setsid nohup bash -c 'cargo test -p X > /tmp/t.log 2>&1; echo DONE_$? >> /tmp/t.log' >/dev/null 2>&1 &)\nthen `sleep 45; tail /tmp/t.log` in later calls until DONE_ appears. `cargo check -p <crate>` on one crate is usually ~10-40s and fits. NOTE the abandoned call keeps running server-side and holds the cargo build-directory lock, so a naive retry just prints \"Blocking waiting for file lock\".",
+      "created": 1785043502475,
+      "deprecated": false,
+      "evidence": [],
+      "id": "d628af12",
+      "tags": [
+        "gam",
+        "runner",
+        "tooling",
+        "gotcha",
+        "high-value"
+      ],
+      "updated": 1785043502475
+    },
+    {
       "id": "d8f1e64b",
       "content": "gam runner: `pip install mpmath` works (network available) and gives 50-dps reference values for polylog / bessel / gamma — invaluable for the special-function work in crates/gam-terms/src/basis (polylog.rs Li₂/Li₃, closed_form_penalty.rs bessel_k = Numerical-Recipes `bessik`, riesz_kernel_value). Not preinstalled; install it first thing if doing accuracy audits. Also: `cargo test -p gam-terms --lib` is fast (~19s run, 887 tests) once compiled; `cargo test --test manifolds` needs a ~10+ minute full-workspace compile.",
       "confidence": 0.85,
@@ -215,6 +248,45 @@
       "evidence": [],
       "created": 1785045897050,
       "updated": 1785045897050,
+      "deprecated": false
+    },
+    {
+      "id": "f42c5554",
+      "content": "FLEET SPEED: on the gam repo an issue can go from filed → fully implemented (across 3 lanes incl. a CUDA remainder) in ~6 hours. Before starting ANY issue, re-check `gh issue view N --json state,comments` — \"Not claiming this lane\" in the body means nothing an hour later. Also: other lanes leave UNCOMMITTED WIP in the shared checkout. Before editing a file, run `git diff --stat origin/main -- <file>` — if it's +N/-0 vs main it may be another lane's live work; a stale/behind copy is the opposite signature (removes content main has). Concretely lost: I picked #2489 (haversine vs dot-product sphere separation), spent a run analysing it, and it was closed by others meanwhile (commits 8b0201dfb, c12111b27, d48b0a0b4).",
+      "confidence": 0.9,
+      "tags": [
+        "process",
+        "fleet",
+        "issues",
+        "workflow"
+      ],
+      "evidence": [],
+      "created": 1785055233236,
+      "updated": 1785055233236,
+      "deprecated": false
+    },
+    {
+      "id": "f4d494e4",
+      "content": "RESOLVED 2026-07-26 at commit b29eb39bd — gam #2499(ii), \"ARD EDF at atom 0, axis 0 is -7.256391e1, outside certified [0, 24]\".\nROOT CAUSE (confirmed empirically, exact digits reproduced): the identity `edf = n_active − α·tr(H⁻¹)` assumes the prior curvature on every latent diagonal slot IS α. True on a Euclidean axis; FALSE on a periodic one. On LatentManifold::Circle, ArdAxisPrior::eval (crates/gam-sae/src/manifold/atom.rs:306) selects the von Mises energy V=(α/κ²)(1−cos κt) ⇒ V''=α·cos κt is SIGNED, so what both assembly paths actually write into htt is the PSD majorizer `psd_majorizer_hess = α·softplus_τ(cos κt) ∈ [0,α]` (#2339), identically ZERO on the concave arc. With P_i<α you get [H⁻¹]_ss>1/α and α·tr(H⁻¹) is bounded by nothing (measured 96.5 vs n_active 24 ⇒ edf −72.5).\nFIX: shrinkage = Σ_i P_i·[H⁻¹]_ii. Theorem: H=C+P, C⪰0, P⪰0 diagonal ⇒ H⪰P ⇒ P_s[H⁻¹]_ss ∈[0,1] (=0 where P_s=0), so shrinkage ∈[0,n_active] with NO appeal to λ_min(H)≥α. Landed as ArdAxisPrior::curvature_shrinkage_factor (dimensionless f with psd_majorizer_hess==α·f, ≡1 Euclidean so the Euclidean path stays bit-identical) + SaeManifoldTerm::ard_shrinkage_traces, distinct from ard_inverse_traces (which the Fellner-Schall α-step legitimately still wants).\nGENERAL LESSON worth carrying: when a solver MAJORIZES a prior/penalty to keep a factorization PD, every downstream identity written in terms of the un-majorized coefficient (α, λ, ...) is silently wrong. Grep for psd_majorizer / clamp / positive-part seams and check what the EDF/trace/log-det consumers assume.\nSTILL OPEN, same genus, not fixed: outer_objective.rs:3072 efs_step's MacKay update α ← n_eff/(Σw t̂² + Σw [H⁻¹]) — its numerator already uses the periodic `sq_equiv`, its denominator's plain-count n_eff carries the same \"curvature is α everywhere\" assumption.",
+      "confidence": 0.95,
+      "tags": [
+        "gam",
+        "gam-sae",
+        "issue-2499",
+        "ard",
+        "edf",
+        "resolved",
+        "majorizer"
+      ],
+      "evidence": [
+        "github issue #2499",
+        "crates/gam-sae/src/manifold/atom.rs:306-446",
+        "crates/gam-sae/src/manifold/construction_reconstruction.rs:79-130",
+        "commit b29eb39bd",
+        "github issue #2499 comment 5083259073"
+      ],
+      "created": 1785063528009,
+      "updated": 1785065054007,
       "deprecated": false
     }
   ]
