@@ -115,3 +115,134 @@
 2026-07-26T14:15:31.691Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "absolute_degeneracy_ev_floor\|fn reachable_dictionary_rank" --include=*.rs crates/ | head -20
 2026-07-26T14:15:36.370Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '60,190p' crates/gam-sae/src/manifold/outer_objective.rs
 2026-07-26T14:15:52.270Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '330,375p' crates/gam-sae/src/manifold/fit_drivers.rs
+2026-07-26T17:14:44.384Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "EPSILON \* 1\.0e\|EPSILON\.sqrt()\|\.max(1\.0e-\|\.max(f64::EPSILON" --include=*.rs crates/gam-math/src crates/gam-ter
+2026-07-26T17:14:50.067Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '2055,2115p' crates/gam-terms/src/basis/radial_jets_nd.rs
+2026-07-26T17:15:16.265Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '2115,2175p' crates/gam-terms/src/basis/radial_jets_nd.rs
+2026-07-26T17:16:00.691Z [shell-mcp] bash: cd /tmp && python3 -c "
+2026-07-26T17:16:18.886Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "somx2\|1\.0 - x \* x" --include=*.rs crates/ | head -20
+2026-07-26T17:16:26.479Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1,50p' crates/gam-terms/src/basis/zz_measure_polar_harmonic_jet_tests.rs
+2026-07-26T17:16:45.353Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '488,512p' crates/gam-terms/src/basis/sphere_basis.rs
+2026-07-26T17:16:57.262Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PYEOF'
+2026-07-26T17:17:23.821Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PYEOF'
+2026-07-26T17:17:28.610Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo check -p gam-terms 2>&1 | grep -E "^error|^warning: unused|-->" | head -10; echo "CHECK_DONE"
+2026-07-26T17:17:50.284Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test -p gam-terms --lib > /tmp/j1.log 2>&1; echo DONE_$? >> /tmp/j1.log' >/dev/null 2>&1 </dev/null
+2026-07-26T17:18:38.052Z [shell-mcp] bash: sleep 50; grep -E "^test result|^DONE|FAILED" /tmp/j1.log | head -12
+2026-07-26T17:19:32.090Z [shell-mcp] bash: sleep 55; grep -cE "^test " /tmp/j1.log; grep -E "^test result|^DONE|failures:" /tmp/j1.log | head -12
+2026-07-26T17:20:20.129Z [shell-mcp] poll: j13
+2026-07-26T17:20:29.677Z [shell-mcp] bash: tail -2 /tmp/j1.log
+2026-07-26T17:20:32.789Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|failures:" /tmp/j1.log | head -12; tail -1 /tmp/j1.log
+2026-07-26T17:21:19.879Z [shell-mcp] poll: j15
+2026-07-26T17:21:31.258Z [shell-mcp] bash: sleep 40; grep -E "^test result|^DONE|^failures:" /tmp/j1.log | head; grep -E "^test .*(FAILED|polar|harmonic_jet)" /tmp/j1.log | head -12
+2026-07-26T17:22:23.804Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo fmt -p gam-terms 2>&1 | head -3; git status --short | head -10
+2026-07-26T17:22:44.893Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git add crates/gam-terms/src/basis/radial_jets_nd.rs crates/gam-terms/src/basis/sphere_basis.rs && git commit -q -F - <<'EOF'
+2026-07-26T17:22:48.986Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git pull --rebase -q 2>&1 | tail -3; git push -q 2>&1 | tail -3; git log --oneline -1
+2026-07-26T17:22:55.999Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "pub fn spherical_harmonic_design_jet" -A 6 crates/gam-terms/src/basis/radial_jets_nd.rs | head -12; echo ---; grep -rn 
+2026-07-26T17:23:00.445Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "^pub fn\|^pub(crate) fn\|^fn " crates/gam-terms/src/basis/radial_jets_nd.rs | sed -n '1,40p' | grep -i "harm\|spher"; e
+2026-07-26T17:23:04.118Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '2040,2050p' crates/gam-terms/src/basis/radial_jets_nd.rs; echo "--- norms fn:"; grep -n "fn precompute_harmonic_norms" c
+2026-07-26T17:23:39.385Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '51,70p' crates/gam-terms/src/basis/zz_measure_polar_harmonic_jet_tests.rs; echo "--- norms sig:"; sed -n '459,462p' crat
+2026-07-26T17:25:50.138Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git status --short && cargo check -p gam-terms --tests 2>&1 | grep -E "^error|^warning|-->" | head -12; echo CHECKED
+2026-07-26T17:26:37.832Z [shell-mcp] poll: j24
+2026-07-26T17:26:47.240Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo check -p gam-terms --tests 2>&1 | grep -B2 -A8 "^error" | head -25
+2026-07-26T17:27:03.390Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo check -p gam-terms --tests 2>&1 | grep -A6 "warning\|error" | head -20
+2026-07-26T17:27:23.685Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -i '/let here = forward_row(lat_deg, lon_deg, max_degree);/d' crates/gam-terms/src/basis/zz_measure_polar_harmonic_jet_tests
+2026-07-26T17:27:42.919Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test -p gam-terms --lib zz_measure_polar -- --nocapture > /tmp/j2.log 2>&1; echo DONE_$? >> /tmp/j2
+2026-07-26T17:28:30.389Z [shell-mcp] poll: j28
+2026-07-26T17:28:35.924Z [shell-mcp] bash: sleep 45; grep -E "^test result|^DONE|panicked at" /tmp/j2.log | head -5
+2026-07-26T17:29:23.354Z [shell-mcp] poll: j29
+2026-07-26T17:29:26.213Z [shell-mcp] bash: sleep 45; grep -E "^test result|^DONE|panicked at" /tmp/j2.log | head -5; tail -c 200 /tmp/j2.log
+2026-07-26T17:30:14.524Z [shell-mcp] poll: j30
+2026-07-26T17:30:17.151Z [shell-mcp] bash: sleep 50; grep -E "^test result|^DONE|panicked at" /tmp/j2.log | head -4
+2026-07-26T17:31:04.508Z [shell-mcp] poll: j31
+2026-07-26T17:31:11.517Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -A3 "panicked at crates" /tmp/j2.log | grep -v "^--" | head -12
+2026-07-26T17:32:00.353Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PYEOF'
+2026-07-26T17:32:19.231Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test -p gam-terms --lib zz_measure_polar -- --nocapture > /tmp/j3.log 2>&1; echo DONE_$? >> /tmp/j3
+2026-07-26T17:33:06.787Z [shell-mcp] poll: j34
+2026-07-26T17:33:17.166Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|assertion|panicked at" /tmp/j3.log | head -6
+2026-07-26T17:34:04.984Z [shell-mcp] poll: j35
+2026-07-26T17:34:15.067Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|assertion|panicked at" /tmp/j3.log | head -6; tail -c 120 /tmp/j3.log
+2026-07-26T17:35:02.381Z [shell-mcp] poll: j36
+2026-07-26T17:35:18.773Z [shell-mcp] bash: sleep 50; grep -E "^test result|^DONE|assertion|panicked at" /tmp/j3.log | head -6
+2026-07-26T17:36:06.161Z [shell-mcp] poll: j37
+2026-07-26T17:36:13.648Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -E "^ *[0-9(]|^north|^central|^worst|90 - lat|\(l,m\)" /tmp/j3.log | head -30
+2026-07-26T17:36:37.834Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo fmt -p gam-terms && git add crates/gam-terms/src/basis/zz_measure_polar_harmonic_jet_tests.rs && git status --short && git
+2026-07-26T17:36:43.960Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git pull --rebase -q && git push -q 2>&1|tail -2; git log --oneline -1; (setsid nohup bash -c 'cargo test -p gam-terms --lib > /
+2026-07-26T17:36:51.046Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue list --state all --limit 400 --json number,title -q '.[]|select(.title|test("polar|harmonic|Legendre";"i"))|"\(.number)
+2026-07-26T17:37:31.561Z [shell-mcp] bash: grep -E "^test result|^DONE|^failures:" /tmp/j4.log | head -5
+2026-07-26T17:37:36.102Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^failures:" /tmp/j4.log | head -5
+2026-07-26T17:38:26.210Z [shell-mcp] poll: j43
+2026-07-26T17:38:33.808Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^failures:" /tmp/j4.log | head -5
+2026-07-26T17:39:21.229Z [shell-mcp] poll: j44
+2026-07-26T17:39:36.015Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^failures:" /tmp/j4.log | head -5; tail -c 130 /tmp/j4.log
+2026-07-26T17:40:23.235Z [shell-mcp] poll: j45
+2026-07-26T17:40:48.756Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rln "spherical_spline_design_jet\|spherical_harmonic_jet" --include=*.rs crates tests src | grep -v "gam-terms/src/basis" 
+2026-07-26T17:40:54.612Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "89\|90.0\|pole\|harmonic" tests/manifolds/smooths/sphere_basis_jet.rs | head -20
+2026-07-26T17:41:02.318Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test --test manifolds sphere_basis_jet > /tmp/m1.log 2>&1; echo DONE_$? >> /tmp/m1.log' >/dev/null 
+2026-07-26T17:41:31.489Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat > /tmp/c.md <<'EOF'
+2026-07-26T17:41:40.346Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "1\.0 - x \* x\|1\.0 - xx\|(1\.0 - x\.powi(2))\|1\.0 - x2" --include=*.rs crates/*/src | grep -v zz_measure | head -12
+2026-07-26T17:41:44.333Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1580,1620p' crates/gam-terms/src/basis/duchon_kernel_math.rs
+2026-07-26T17:41:59.715Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -E "^test result|^DONE|error\[" /tmp/m1.log | head -4; tail -c 100 /tmp/m1.log; echo; git log --oneline -8 --name-only | gr
+2026-07-26T17:42:14.705Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue view 2127 --json body -q .body 2>&1 | head -c 2600
+2026-07-26T17:42:25.977Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "import gam_rs,gamfit,os;print(getattr(gam_rs,'__file__','?'))" 2>&1|tail -2; python3 -c "
+2026-07-26T17:42:29.807Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 -c "
+2026-07-26T17:42:39.211Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^error" /tmp/m1.log|head -3; tail -c 90 /tmp/m1.log
+2026-07-26T17:43:26.743Z [shell-mcp] poll: j56
+2026-07-26T17:43:41.476Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "\.max(f64::EPSILON" --include=*.rs crates/*/src | grep -v "zz_measure\|tests\.rs\|_tests" | head -20
+2026-07-26T17:43:51.300Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '390,430p' crates/gam-sae/src/manifold/gauge.rs
+2026-07-26T17:44:17.436Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "fit_beta_mle" --include=*.rs crates | grep -v "fn fit_beta_mle" | head -5; echo "---measure---"; python3 - <<'PY'
+2026-07-26T17:44:27.101Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T17:44:38.283Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '350,375p' crates/gam-sae/src/manifold/gauge.rs
+2026-07-26T17:45:06.690Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PY'
+2026-07-26T17:45:28.946Z [shell-mcp] bash: grep -E "^test result|^DONE|^error" /tmp/m1.log|head -3; tail -c 80 /tmp/m1.log
+2026-07-26T17:45:44.868Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PYEOF'
+2026-07-26T17:45:51.854Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^error" /tmp/m1.log|head -3; tail -c 70 /tmp/m1.log
+2026-07-26T17:46:39.320Z [shell-mcp] poll: j65
+2026-07-26T17:46:50.126Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^error" /tmp/m1.log|head -3; tail -c 70 /tmp/m1.log
+2026-07-26T17:47:37.343Z [shell-mcp] poll: j66
+2026-07-26T17:47:50.364Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "mod tests\|^    fn \|#\[test\]" crates/gam-sae/src/manifold/gauge.rs | tail -20
+2026-07-26T17:47:53.806Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '536,545p;576,592p' crates/gam-sae/src/manifold/gauge.rs
+2026-07-26T17:48:52.866Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PYEOF'
+2026-07-26T17:48:56.829Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^error" /tmp/m1.log|head -4; tail -c 60 /tmp/m1.log
+2026-07-26T17:49:44.941Z [shell-mcp] poll: j70
+2026-07-26T17:49:57.169Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^error\[|^error:" /tmp/m1.log|head -4; tail -c 60 /tmp/m1.log
+2026-07-26T17:50:45.419Z [shell-mcp] poll: j71
+2026-07-26T17:50:58.668Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^error\[|^error:" /tmp/m1.log|head -4; tail -c 60 /tmp/m1.log
+2026-07-26T17:51:46.020Z [shell-mcp] poll: j72
+2026-07-26T17:51:56.574Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^error\[|^error:" /tmp/m1.log|head -4; tail -c 60 /tmp/m1.log
+2026-07-26T17:52:44.489Z [shell-mcp] poll: j73
+2026-07-26T17:52:54.546Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^error\[|^error:" /tmp/m1.log|head -4; tail -c 60 /tmp/m1.log
+2026-07-26T17:53:41.963Z [shell-mcp] poll: j74
+2026-07-26T17:53:56.205Z [shell-mcp] bash: for i in 1 2 3 4 5 6 7 8; do sleep 50; if grep -qE "^test result|^DONE" /tmp/m1.log; then break; fi; done; grep -E "^test result|^DONE|^error\[|^error:" /tmp/m1
+2026-07-26T17:54:43.704Z [shell-mcp] poll: j75
+2026-07-26T17:55:36.377Z [shell-mcp] poll: j75
+2026-07-26T17:55:41.725Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo check -p gam-sae --tests 2>&1 | grep -A5 "^error" | head -14; echo CHECKED
+2026-07-26T17:56:34.865Z [shell-mcp] poll: j76
+2026-07-26T17:56:38.014Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test -p gam-sae --lib gauge:: -- --nocapture > /tmp/g1.log 2>&1; echo DONE_$? >> /tmp/g1.log' >/dev
+2026-07-26T17:56:45.733Z [shell-mcp] bash: for i in 1 2 3 4; do sleep 50; if grep -qE "^test result|^DONE" /tmp/g1.log; then break; fi; done; grep -E "^test result|^DONE|panicked" /tmp/g1.log|head -4
+2026-07-26T17:57:34.977Z [shell-mcp] poll: j78
+2026-07-26T17:58:27.617Z [shell-mcp] poll: j78
+2026-07-26T17:59:20.373Z [shell-mcp] poll: j78
+2026-07-26T18:00:09.335Z [shell-mcp] bash: grep -E "^test result|^DONE|panicked|^test " /tmp/g1.log|head -14
+2026-07-26T18:00:12.302Z [shell-mcp] bash: tail -c 200 /tmp/g1.log
+2026-07-26T18:00:15.485Z [shell-mcp] bash: for i in 1 2 3 4 5; do sleep 50; if grep -qE "^test result|^DONE" /tmp/g1.log; then break; fi; done; grep -E "^test result|^DONE|panicked" /tmp/g1.log|head -4
+2026-07-26T18:01:02.999Z [shell-mcp] poll: j81
+2026-07-26T18:01:55.279Z [shell-mcp] poll: j81
+2026-07-26T18:02:47.802Z [shell-mcp] poll: j81
+2026-07-26T18:03:41.552Z [shell-mcp] poll: j81
+2026-07-26T18:04:28.716Z [shell-mcp] bash: grep -E "^test result|^DONE|panicked" /tmp/g1.log|head -4; tail -c 120 /tmp/g1.log
+2026-07-26T18:04:32.098Z [shell-mcp] bash: for i in 1 2 3 4 5; do sleep 50; if grep -qE "^test result|^DONE" /tmp/g1.log; then break; fi; done; grep -E "^test result|^DONE|panicked" /tmp/g1.log|head -6
+2026-07-26T18:05:20.198Z [shell-mcp] poll: j83
+2026-07-26T18:05:25.457Z [shell-mcp] bash: grep -E "^s = 2\^" /tmp/g1.log | head -12
+2026-07-26T18:05:39.191Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo fmt -p gam-sae 2>&1|head -3; git status --short
+2026-07-26T18:05:45.836Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git checkout -- crates/gam-sae/src/manifold/atom.rs crates/gam-sae/src/manifold/construction.rs crates/gam-sae/src/manifold/fit_
+2026-07-26T18:06:07.646Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat > /tmp/msg.txt <<'EOF'
+2026-07-26T18:06:14.562Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git status -sb|head -2
+2026-07-26T18:06:21.169Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "mean \* mean\|mean\.powi(2)\|m \* m\b\|mu \* mu\|_sq / n\|sumsq\|sum_sq" --include=*.rs crates/*/src | grep -viE "test
+2026-07-26T18:06:26.365Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '355,395p' crates/gam-inference/src/polya_gamma.rs
+2026-07-26T18:06:40.677Z [shell-mcp] bash: cd /home/runner/work/gam/gam && head -30 build.sh
+2026-07-26T18:06:48.984Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "rerun-if-changed" build.rs | head -8; ls crates/gam-sae/build.rs crates/gam-terms/build.rs 2>&1|head -3
+2026-07-26T18:06:56.442Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo check -p gam > /tmp/scan.log 2>&1; echo DONE_$? >> /tmp/scan.log' >/dev/null 2>&1 </dev/null &); sl
+2026-07-26T18:08:01.956Z [shell-mcp] bash: grep -E "^DONE|^error|banned|forbidden|BAN " /tmp/scan.log|head -8; tail -c 80 /tmp/scan.log
+2026-07-26T18:08:17.239Z [shell-mcp] bash: for i in 1 2 3 4 5; do sleep 50; if grep -qE "^DONE" /tmp/scan.log; then break; fi; done; grep -E "^DONE|^error" /tmp/scan.log|head -6
+2026-07-26T18:09:05.356Z [shell-mcp] poll: j95
+2026-07-26T18:09:18.936Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -ciE "scan|ban" /tmp/scan.log; ls -la target/debug/build/gam-*/output 2>/dev/null | head -3; find target/debug/build -maxde
+2026-07-26T18:10:27.332Z [host] connection closed (code=null, signal=null)
