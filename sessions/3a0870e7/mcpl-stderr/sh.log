@@ -1,0 +1,13 @@
+2026-07-26T01:37:19.701Z [shell-mcp] bash: cd "$(git rev-parse --show-toplevel)" && pwd && git log --oneline -15 && git status --short | head -20
+2026-07-26T01:37:26.245Z [shell-mcp] bash: cd /home/runner/work/gam/gam && ls && wc -l src/*.rs | tail -5 && echo "---" && ls src | head -50 && echo "--- docs" && ls docs 2>/dev/null | head -30
+2026-07-26T01:37:30.364Z [shell-mcp] bash: cd /home/runner/work/gam/gam && ls crates && echo "--- loc" && (find crates -name '*.rs' | xargs wc -l | tail -3) && echo "--- toolchain" && cat rust-toolchain.
+2026-07-26T01:37:37.935Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (gh issue list --limit 30 --state open 2>&1 | head -40) ; echo "=== count"; gh issue list --state open --limit 500 2>/dev/null |
+2026-07-26T01:37:51.421Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue view 2489 2>&1 | head -120
+2026-07-26T01:37:59.561Z [shell-mcp] bash: cd /home/runner/work/gam/gam && ls crates/gam-terms/src/basis/ | head -40 && echo "=== sphere_kernels" && wc -l crates/gam-terms/src/basis/sphere_kernels.rs cra
+2026-07-26T01:38:01.608Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cat crates/gam-terms/src/basis/sphere_kernels.rs
+2026-07-26T01:38:14.521Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '700,860p' crates/gam-terms/src/basis/workspace_cache.rs
+2026-07-26T01:38:17.342Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1890,2050p' crates/gam-terms/src/basis/radial_jets_nd.rs
+2026-07-26T01:38:21.731Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "cos_gamma\|cos_g\b\|wahba_sphere_kernel" --include=*.rs crates/ src/ tests/ | grep -v "^crates/gam-terms/src/basis/sph
+2026-07-26T01:38:26.157Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "cos_gamma\|cosg\|cos_g\|dlon\|sin_lat\|haversine" crates/gam-terms/src/basis/sphere_gpu.rs | head -60; echo "=== wgsl f
+2026-07-26T01:38:28.322Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "fn \|SHADER\|shader\|wgsl" crates/gam-terms/src/basis/sphere_gpu.rs | head -60
+2026-07-26T01:38:29.067Z [host] connection closed (code=null, signal=null)

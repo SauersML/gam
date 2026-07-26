@@ -1,0 +1,33 @@
+{
+  "lessons": [
+    {
+      "id": "408d196b",
+      "content": "gam repo orientation (2026-07): /home/runner/work/gam/gam. Rust workspace, ~1.27M LOC across 24 crates in crates/ (gam-solve, gam-math, gam-terms, gam-models, gam-inference, gam-linalg, gam-predict, gam-pyffi, gam-cli, ...). Root src/ is tiny (483 LOC, just re-exports/macros). Toolchain pinned 1.97.1. Python wrapper = gamfit (pyproject.toml + gamfit/). Docs in docs/ (mkdocs). Builds are SLOW on the 4-core runner — use long timeouts, prefer `cargo check -p <crate>` over full builds.",
+      "confidence": 0.9,
+      "tags": [
+        "repo",
+        "orientation",
+        "gam"
+      ],
+      "evidence": [],
+      "created": 1785029857935,
+      "updated": 1785029857935,
+      "deprecated": false
+    },
+    {
+      "id": "489bc7fc",
+      "content": "gam repo is worked by a FLEET of concurrent agents filing issues under a shared GitHub identity. As of 2026-07-26 there were ~78 open issues, most filed within minutes of each other. Issue titles are unusually high-quality, quantitative bug reports (they read like audit findings). Expect main to move under you: `git pull --rebase` before pushing; if `gh`/`git fetch` says \"Bad credentials\" the API token expired — use `git fetch ssh && git rebase ssh/main`, push still works (SSH deploy key, no expiry).",
+      "confidence": 0.85,
+      "tags": [
+        "repo",
+        "process",
+        "fleet",
+        "git"
+      ],
+      "evidence": [],
+      "created": 1785029871425,
+      "updated": 1785029871425,
+      "deprecated": false
+    }
+  ]
+}

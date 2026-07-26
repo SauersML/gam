@@ -1,0 +1,6 @@
+[2026-07-26T01:37:16.889Z] headless start pid=3060 dataDir=/home/runner/work/_temp/connectome-data socket=/home/runner/work/_temp/connectome-data/ipc.sock
+[2026-07-26T01:37:16.892Z] socket listening at /home/runner/work/_temp/connectome-data/ipc.sock
+[2026-07-26T01:37:17.343Z] client connected
+[2026-07-26T01:37:17.345Z] subscription set: lifecycle, inference:speech, inference:started, inference:completed, inference:failed, tool:started, command-output
+[2026-07-26T01:38:29.000Z] quiescent — emitting lifecycle:idle
+[2026-07-26T01:38:29.001Z] shutdown: exit-when-idle
