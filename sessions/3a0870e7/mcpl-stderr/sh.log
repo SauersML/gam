@@ -11,3 +11,4 @@
 2026-07-26T01:38:26.157Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "cos_gamma\|cosg\|cos_g\|dlon\|sin_lat\|haversine" crates/gam-terms/src/basis/sphere_gpu.rs | head -60; echo "=== wgsl f
 2026-07-26T01:38:28.322Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "fn \|SHADER\|shader\|wgsl" crates/gam-terms/src/basis/sphere_gpu.rs | head -60
 2026-07-26T01:38:29.067Z [host] connection closed (code=null, signal=null)
+2026-07-26T04:53:24.834Z [host] connection closed (code=null, signal=null)
