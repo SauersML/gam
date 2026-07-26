@@ -12,3 +12,97 @@
 2026-07-26T01:38:28.322Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "fn \|SHADER\|shader\|wgsl" crates/gam-terms/src/basis/sphere_gpu.rs | head -60
 2026-07-26T01:38:29.067Z [host] connection closed (code=null, signal=null)
 2026-07-26T04:53:24.834Z [host] connection closed (code=null, signal=null)
+2026-07-26T05:00:22.282Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git log --oneline -3 && git status --short | head
+2026-07-26T05:00:30.035Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue view 2489 --json state,comments -q '.state, (.comments[]|.author.login + ": " + (.body|.[0:400]))' 2>&1 | head -30; ech
+2026-07-26T05:00:34.483Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue view 2489 --json comments -q '.comments[1].body' 2>&1 | tail -80
+2026-07-26T05:00:48.665Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git status --short && echo "=== diff vs origin/main" && git diff origin/main --stat | tail -5; echo "=== sphere_kernels head of 
+2026-07-26T05:00:53.373Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '160,250p' crates/gam-terms/src/basis/sphere_kernels.rs
+2026-07-26T05:01:49.540Z [shell-mcp] bash: cd /home/runner/work/gam/gam && ls scripts/ && grep -rn "ban" --include=*.yml .github/workflows/ | head -20
+2026-07-26T05:01:51.756Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rln "forbidden\|banned\|scanner" --include=*.rs --include=*.py --include=*.sh --include=*.toml --include=*.yml . 2>/dev/nu
+2026-07-26T05:01:54.023Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "forbidden\|banned\|scanner\|debug_assert\|unwrap" build.sh | head -40
+2026-07-26T05:01:56.958Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "debug_assert\|\"assert\|dbg!\|unimplemented\|todo!\|allow(\|1e-\|magic\|const .*f64 = " build.rs | head -60; echo "=== 
+2026-07-26T05:02:01.858Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1300,1380p' build.rs; echo "===="; sed -n '80,215p' build.rs
+2026-07-26T05:02:17.544Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '300,420p' crates/gam-terms/src/basis/sphere_kernels.rs
+2026-07-26T05:03:36.964Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "fn spherical_wahba_kernel_matrix_cpu" -A 200 crates/gam-terms/src/basis/workspace_cache.rs | sed -n '1,60p'
+2026-07-26T05:05:12.489Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "^mod \|^pub mod \|^pub(crate) mod \|zz_measure" crates/gam-terms/src/basis/mod.rs | head -50
+2026-07-26T05:05:18.307Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '125,145p' crates/gam-terms/src/basis/mod.rs
+2026-07-26T05:06:44.402Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo check -p gam-terms 2>&1 | tail -40
+2026-07-26T05:07:39.434Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '49,90p' crates/gam-terms/src/basis/sphere_kernels.rs
+2026-07-26T05:08:28.075Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '225,250p' crates/gam-terms/src/basis/sphere_kernels.rs
+2026-07-26T05:08:32.545Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '250,258p' crates/gam-terms/src/basis/sphere_kernels.rs
+2026-07-26T05:09:20.622Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "fn validate_spherical_wahba_gram_request" -A 60 crates/gam-terms/src/basis/workspace_cache.rs | head -75
+2026-07-26T05:09:35.183Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "pub(crate) fn dilog_unit" -A 25 crates/gam-terms/src/basis/polylog.rs | head -35; echo "==="; grep -n "pub(crate) fn tr
+2026-07-26T05:09:43.349Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "sobolev_closed_form\|EPSILON \* 1.0e-4\|EPSILON\*1e-4\|1.0e-4" crates/gam-terms/src/basis/zz_measure_2475_tests.rs | he
+2026-07-26T05:09:51.476Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '150,235p' crates/gam-terms/src/basis/zz_measure_2475_tests.rs
+2026-07-26T05:10:19.473Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '340,420p' crates/gam-terms/src/basis/sphere_kernels.rs
+2026-07-26T05:10:49.813Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '458,500p' crates/gam-terms/src/basis/sphere_kernels.rs; echo "..."; sed -n '540,640p' crates/gam-terms/src/basis/sphere_
+2026-07-26T05:11:30.178Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '496,540p' crates/gam-terms/src/basis/sphere_kernels.rs
+2026-07-26T05:11:57.962Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '620,665p' crates/gam-terms/src/basis/sphere_kernels.rs
+2026-07-26T05:12:13.058Z [shell-mcp] bash: cd /home/runner/work/gam/gam && tail -20 crates/gam-terms/src/basis/sphere_kernels.rs
+2026-07-26T05:13:26.391Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "^use super::\|^use crate::\|sphere_kernels::" crates/gam-terms/src/basis/workspace_cache.rs | head -20; echo "=== jets"
+2026-07-26T05:13:30.941Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "sphere_kernels\|sphere_half_angle" crates/gam-terms/src/basis/mod.rs
+2026-07-26T05:13:34.288Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "pub use sphere\|pub(crate) use sphere\|use sphere" crates/gam-terms/src/basis/mod.rs; sed -n '100,132p' crates/gam-term
+2026-07-26T05:13:41.055Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "sphere_kernels::" crates/gam-terms/src/basis/*.rs | head -20
+2026-07-26T05:13:44.385Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '860,890p' crates/gam-terms/src/basis/types.rs
+2026-07-26T05:13:58.248Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo check -p gam-terms 2>&1 | grep -E "^(error|warning: unused|  -->)" -A 3 | head -80
+2026-07-26T05:14:09.316Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo check -p gam-terms 2>&1 | tail -30
+2026-07-26T05:14:39.450Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo check -p gam-terms 2>&1 | grep -E "never used|never constructed" | head -20
+2026-07-26T05:14:54.723Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "wahba_sphere_kernel_from_cos_kind\|wahba_sphere_kernel_derivative_dcos_kind\|wahba_sphere_kernel_sobolev_closed_form\|
+2026-07-26T05:15:07.714Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -rn "src_modules" crates/gam-terms/src/*.rs crates/gam-terms/src/**/*.rs Cargo.toml crates/gam-terms/Cargo.toml 2>/dev/null
+2026-07-26T05:15:18.405Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1820,1900p' crates/gam-terms/src/basis/radial_jets_nd.rs
+2026-07-26T05:16:28.603Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'EOF'
+2026-07-26T05:16:37.278Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'EOF'
+2026-07-26T05:17:08.701Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'EOF'
+2026-07-26T05:17:13.834Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -i 's|//! `super::sphere_half_angle::half_angle_separation_scalar`|//! placeholder|' /dev/null; cargo check -p gam-terms 2>&
+2026-07-26T05:17:26.667Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo check -p gam-terms 2>&1 | tail -20
+2026-07-26T05:17:39.735Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -i 's/    HalfAngleSeparation, SphereTrig, ambient_half_angle_separation, half_angle_partials,/    SphereTrig, ambient_half_
+2026-07-26T05:17:52.977Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1,50p' crates/gam-terms/src/basis/zz_measure_2475_tests.rs
+2026-07-26T05:18:03.932Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '55,80p' crates/gam-terms/src/basis/zz_measure_2475_tests.rs; echo "-----"; sed -n '300,420p' crates/gam-terms/src/basis/
+2026-07-26T05:18:19.310Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PYEOF'
+2026-07-26T05:19:16.327Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '4280,4365p' tests/src_modules/smooths/basis_duchon_matern_jet_derivative_tests.rs
+2026-07-26T05:19:37.715Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '1,20p' crates/gam-terms/src/basis/tests.rs; echo "---"; sed -n '1,25p' tests/src_modules/smooths/basis_duchon_matern_jet
+2026-07-26T05:20:14.420Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PYEOF'
+2026-07-26T05:20:35.207Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PYEOF'
+2026-07-26T05:20:51.374Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo test -p gam-terms --lib 2>&1 | tail -50
+2026-07-26T05:22:00.960Z [shell-mcp] bash: cd /home/runner/work/gam/gam && timeout 3000 cargo test -p gam-terms --lib > /tmp/t1.log 2>&1; echo "exit=$?"; tail -40 /tmp/t1.log
+2026-07-26T05:23:04.632Z [shell-mcp] bash: cd /home/runner/work/gam/gam && ls /tmp/t1.log 2>/dev/null && tail -5 /tmp/t1.log
+2026-07-26T05:23:07.541Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test -p gam-terms --lib > /tmp/t2.log 2>&1; echo DONE_$? >> /tmp/t2.log' >/dev/null 2>&1 &) ; sleep
+2026-07-26T05:23:15.860Z [shell-mcp] bash: sleep 50; tail -5 /tmp/t2.log
+2026-07-26T05:24:08.659Z [shell-mcp] bash: ps aux | grep -c "[c]argo"; sleep 45; tail -3 /tmp/t2.log; echo "---t1"; tail -3 /tmp/t1.log
+2026-07-26T05:25:02.475Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo fmt -p gam-terms 2>&1 | tail -3; git add -A && git status --short
+2026-07-26T05:25:10.192Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git diff --cached --stat && echo "=== cargo.lock" && git diff --cached Cargo.lock | head -20
+2026-07-26T05:25:15.674Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git restore --staged --worktree Cargo.lock crates/gam-terms/examples/probe_2420_farthest_point.rs crates/gam-terms/src/basis/bsp
+2026-07-26T05:25:40.005Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git commit -q -F - <<'EOF' && git log --oneline -1
+2026-07-26T05:25:43.617Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git pull --rebase -q 2>&1 | tail -5; git push 2>&1 | tail -5
+2026-07-26T05:27:12.362Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo check -p gam-terms --tests 2>&1 | grep -E "^error|^warning|-->|cannot|expected|help:" | head -30
+2026-07-26T05:27:40.566Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git status --short && git diff --stat
+2026-07-26T05:27:43.728Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git diff crates/gam-terms/src/basis/radial_jets_nd.rs crates/gam-terms/src/basis/sphere_half_angle.rs
+2026-07-26T05:27:51.413Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git checkout -- Cargo.lock crates/gam-terms/src/basis/radial_jets_nd.rs crates/gam-terms/src/basis/sphere_half_angle.rs && git s
+2026-07-26T05:29:50.678Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git status --short && grep -c "from_cos_gamma" crates/gam-terms/src/basis/sphere_half_angle.rs
+2026-07-26T05:29:59.671Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo fmt -p gam-terms -- --check 2>&1 | head -20; echo "--- fmt check done"; (setsid nohup bash -c 'cargo test -p gam-terms --l
+2026-07-26T05:30:10.131Z [shell-mcp] bash: sleep 50; tail -60 /tmp/t3.log
+2026-07-26T05:31:12.145Z [shell-mcp] bash: sleep 55; tail -70 /tmp/t3.log
+2026-07-26T05:32:12.571Z [shell-mcp] bash: sleep 55; tail -c 4000 /tmp/t3.log
+2026-07-26T05:33:10.350Z [shell-mcp] bash: sleep 55; tail -c 3000 /tmp/t3.log; ps aux | grep -c "[r]ustc"
+2026-07-26T05:35:13.401Z [shell-mcp] bash: cd /home/runner/work/gam/gam && python3 - <<'PYEOF'
+2026-07-26T05:35:24.023Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test -p gam-terms --lib zz_measure_2489 -- --nocapture > /tmp/t4.log 2>&1; echo DONE_$? >> /tmp/t4.
+2026-07-26T05:36:21.839Z [shell-mcp] bash: sleep 55; tail -c 3500 /tmp/t4.log
+2026-07-26T05:37:19.227Z [shell-mcp] bash: sleep 55; tail -c 3500 /tmp/t4.log
+2026-07-26T05:38:17.028Z [shell-mcp] bash: sleep 58; tail -c 3500 /tmp/t4.log
+2026-07-26T05:39:27.425Z [shell-mcp] bash: cd /home/runner/work/gam/gam && cargo fmt -p gam-terms 2>&1|tail -2; git checkout -- Cargo.lock crates/gam-terms/examples crates/gam-terms/src/basis/bspline_bui
+2026-07-26T05:39:44.440Z [shell-mcp] bash: cd /home/runner/work/gam/gam && git add -A && git commit -q -F - <<'EOF' && git pull --rebase -q && git push 2>&1 | tail -3
+2026-07-26T05:39:51.419Z [shell-mcp] bash: cd /home/runner/work/gam/gam && (setsid nohup bash -c 'cargo test -p gam-terms --lib > /tmp/lib.log 2>&1; echo DONE_$? >> /tmp/lib.log; cargo test --test manifo
+2026-07-26T05:40:50.600Z [shell-mcp] bash: sleep 58; tail -c 700 /tmp/lib.log; echo "=== man"; tail -c 400 /tmp/man.log 2>/dev/null
+2026-07-26T05:41:52.657Z [shell-mcp] bash: sleep 58; tail -c 700 /tmp/lib.log; echo "=== man"; tail -c 400 /tmp/man.log 2>/dev/null
+2026-07-26T05:42:54.223Z [shell-mcp] bash: sleep 58; grep -E "^test result|^DONE" /tmp/lib.log; echo "=== man"; tail -c 300 /tmp/man.log 2>/dev/null
+2026-07-26T05:44:00.302Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "SPHERICAL_CENTER_COINCIDENT_TOL\|fn spherical_center_dot" -B2 -A 20 crates/gam-terms/src/basis/*.rs | head -70
+2026-07-26T05:44:10.079Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|error\[|^error" /tmp/man.log | head -20; tail -c 200 /tmp/man.log
+2026-07-26T05:45:09.285Z [shell-mcp] bash: sleep 58; tail -c 200 /tmp/man.log
+2026-07-26T05:46:11.777Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue view 2489 --json state,title,assignees -q '{state:.state,title:.title,a:.assignees}' 2>&1 | head -5
+2026-07-26T05:46:42.973Z [shell-mcp] bash: cd /home/runner/work/gam/gam && gh issue comment 2489 --body "$(cat <<'EOF'
+2026-07-26T05:46:49.101Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^error" /tmp/man.log | head; tail -c 200 /tmp/man.log
+2026-07-26T05:48:10.874Z [shell-mcp] bash: sleep 55; grep -E "^test result|^DONE|^error" /tmp/man.log | head; tail -c 200 /tmp/man.log
+2026-07-26T05:49:09.199Z [shell-mcp] bash: sleep 58; tail -c 150 /tmp/man.log
+2026-07-26T05:50:13.715Z [shell-mcp] bash: cd /home/runner/work/gam/gam && grep -n "cos_g\|dot\|__global__\|extern \"C\"\|KERNEL_SRC\|r#\"" crates/gam-terms/src/basis/sphere_gpu.rs | head -50
+2026-07-26T05:50:18.672Z [shell-mcp] bash: cd /home/runner/work/gam/gam && sed -n '502,600p' crates/gam-terms/src/basis/sphere_gpu.rs
+2026-07-26T05:50:36.369Z [shell-mcp] bash: sleep 45; tail -c 150 /tmp/man.log; cd /home/runner/work/gam/gam && grep -c "SphereWahbaKernel::Sobolev =>" crates/gam-terms/src/basis/sphere_gpu.rs; grep -n "f
