@@ -149,3 +149,123 @@ fn post_seed_objective_failure_without_the_marker_stays_fatal_2253() {
         "an unmarked objective failure keeps its fatal classification, got: {error}"
     );
 }
+
+/// The THIRD branch, and the one `ClassifyingFixedPointObjective` was built
+/// for: a post-seed failure that carries no routing marker and is NOT
+/// structural, but which the producer itself classified `Recoverable`.
+///
+/// The two tests above pin the ends of the range — a marker is rerouted, a
+/// structural `InvalidInput` stays fatal — and between them sits the case the
+/// classification machinery exists to serve. `run.rs`'s doc for
+/// `ClassifyingFixedPointObjective` names it first: "`Recoverable` for a
+/// refusal that is a property of THIS rho (**a non-finite cost**, a non-finite
+/// EFS step, a bubbled `RemlOptimizationFailed`, …)", and records that losing
+/// that verdict in transit meant "one recoverable per-rho refusal at outer
+/// iteration k killed the remaining seeds and the entire fallback ladder".
+///
+/// Nothing pinned it. A regression that stopped writing or reading the verdict
+/// slot for the unmarked-recoverable path would leave BOTH tests above green,
+/// because one drives the marker and the other drives a fatal input — so the
+/// demotion would silently stop happening on the only branch that needs it.
+///
+/// A non-finite EFS cost is the cheapest way in: the bridge's own `eval_step`
+/// raises exactly `outer EFS eval failed: objective returned a non-finite
+/// cost` as `ObjectiveEvalError::recoverable`, which is the same string 19 of
+/// the Python suite's failures terminate on (gam#2653).
+#[test]
+fn post_seed_recoverable_non_finite_cost_is_demoted_not_fatal_2653() {
+    let efs_calls = Arc::new(AtomicUsize::new(0));
+    let problem = OuterProblem::new(3)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_initial_rho(Array1::from_elem(3, 1.0))
+        .with_max_iter(20);
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(0.5 * theta.dot(theta)),
+        |_: &mut (), theta: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: 0.5 * theta.dot(theta),
+                gradient: theta.clone(),
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        {
+            let efs_calls = Arc::clone(&efs_calls);
+            Some(move |_: &mut (), theta: &Array1<f64>| {
+                let call = efs_calls.fetch_add(1, Ordering::Relaxed);
+                if call == 0 {
+                    // Same descending seed the two tests above use, so the
+                    // fixed-point walk genuinely starts and the refusal below
+                    // is an ITERATION, not the seed screen.
+                    Ok(EfsEval {
+                        cost: 0.5 * theta.dot(theta),
+                        steps: vec![-0.25_f64; theta.len()],
+                        beta: None,
+                        psi_gradient: None,
+                        psi_indices: None,
+                        inner_hessian_scale: None,
+                        logdet_enclosure_gap: None,
+                        consecutive_restored_incumbents: None,
+                    })
+                } else {
+                    // A property of THIS rho, not a broken artifact: the
+                    // evaluation succeeded and produced a non-finite value.
+                    // The bridge turns this into the recoverable non-finite
+                    // cost error; the outer search should step away from this
+                    // rho, not abandon the fit.
+                    Ok(EfsEval {
+                        cost: f64::NAN,
+                        steps: vec![-0.25_f64; theta.len()],
+                        beta: None,
+                        psi_gradient: None,
+                        psi_indices: None,
+                        inner_hessian_scale: None,
+                        logdet_enclosure_gap: None,
+                        consecutive_restored_incumbents: None,
+                    })
+                }
+            })
+        },
+    );
+
+    // The run may still fail — a rho whose cost is NaN at every later
+    // iteration has nowhere to go — but HOW it fails is the contract. A
+    // recoverable refusal must not be dressed as a fatal evaluation, because
+    // `is_fatal_outer_evaluation()` is a hard `return Err(e)` in both the seed
+    // loop and the strategy ladder, so the fatal label is what stops the
+    // remaining seeds and the `disable_fixed_point` fallback plan from ever
+    // being tried.
+    let outcome = problem.run(&mut obj, "post-seed recoverable non-finite cost");
+
+    // The NaN branch must actually have been reached, or the fixture proves
+    // nothing: `efs_calls == 1` would mean only the descending seed ran.
+    let calls = efs_calls.load(Ordering::Relaxed);
+    assert!(
+        calls >= 2,
+        "fixture never reached the non-finite iteration: efs_calls={calls}"
+    );
+
+    match outcome {
+        Err(error) => assert!(
+            !error.is_fatal_outer_evaluation(),
+            "a non-finite cost is the producer's own `Recoverable` verdict — it must not \
+             short-circuit the seed loop and the fallback ladder as a fatal evaluation. \
+             got: {error}"
+        ),
+        // A PASS HERE WOULD BE VACUOUS, so it is a failure. The contract under
+        // test is how a recoverable refusal is CLASSIFIED, which only exists on
+        // the error path; if the run returns Ok (e.g. `MaxIterationsReached`
+        // hands back the last solution) the classification was never exercised
+        // and this test has asserted nothing. Rebuild the fixture so the
+        // refusal reaches `run_fixed_point_outer_solver`'s error arm rather
+        // than relaxing this.
+        Ok(result) => panic!(
+            "the run SUCCEEDED, so the recoverable-vs-fatal classification was never \
+             reached and this gate is vacuous (efs_calls={calls}, termination={:?})",
+            result.termination
+        ),
+    }
+}
