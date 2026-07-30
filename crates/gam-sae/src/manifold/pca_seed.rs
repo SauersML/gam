@@ -63,6 +63,69 @@ fn topology_seed_knn(n_points: usize, d_atom: usize) -> usize {
     tangent_floor.max(connectivity_floor).max(2)
 }
 
+/// Coordinate STORAGE width one atom's chart occupies in a padded
+/// `(K, N_obs, D_max)` seed array.
+///
+/// This is deliberately NOT `atom_dim`. `atom_dim` names the manifold's
+/// INTRINSIC dimension and for every flat or product chart in the menu the two
+/// coincide — but `S²` and `RP²` are parameterised by their AMBIENT unit
+/// 3-vector, because neither admits a global 2-D chart. `sae_build_atom_plans`
+/// accordingly requires `atom_dim == 2` for both and builds a `latent_dim == 3`
+/// plan, and `sae_build_padded_basis_stacks` indexes coordinate storage by that
+/// `latent_dim`. Sizing the seed by `atom_dim` gave a sphere atom a 2-wide slot
+/// and refused every fit that reached the stacks with
+///   "sae_build_padded_basis_stacks: atom 0 latent_dim 3 exceeds
+///    seed_coords D_max=2"
+/// — or, where some other atom happened to widen the array, reached the
+/// evaluator with two coordinates and got
+///   "AmbientSphereHarmonicEvaluator::evaluate: expected ambient dim == 3".
+pub(crate) fn seed_storage_width(kind: &SaeAtomBasisKind, d: usize) -> usize {
+    match kind {
+        SaeAtomBasisKind::Sphere | SaeAtomBasisKind::ProjectivePlane => 3,
+        _ => d.max(1),
+    }
+}
+
+/// `D_max` of the padded seed array: the widest per-atom coordinate STORAGE,
+/// which is what every consumer of the array indexes by.
+pub(crate) fn seed_storage_d_max(basis_kinds: &[SaeAtomBasisKind], atom_dim: &[usize]) -> usize {
+    basis_kinds
+        .iter()
+        .zip(atom_dim.iter())
+        .map(|(kind, &d)| seed_storage_width(kind, d))
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Write one row's ambient unit 3-vector into an `S²` / `RP²` atom's chart
+/// slot. `(x, y, z)` need not be normalised; a degenerate zero frame falls back
+/// to the pole-free `(1, 0, 0)`.
+///
+/// The convention is the evaluator's, pinned by
+/// `basis::tests::ambient_sphere_matches_chart_on_the_sphere`:
+/// `(cos lat · cos lon, cos lat · sin lon, sin lat)`. Both seed paths already
+/// computed exactly this vector and then discarded it for `(lat, lon)`, which
+/// is the chart the ambient plan replaced.
+pub(crate) fn write_ambient_sphere_row(
+    out: &mut Array3<f64>,
+    atom_idx: usize,
+    row: usize,
+    x: f64,
+    y: f64,
+    z: f64,
+) {
+    let norm = (x * x + y * y + z * z).sqrt();
+    let (ux, uy, uz) = if norm > 0.0 && norm.is_finite() {
+        (x / norm, y / norm, z / norm)
+    } else {
+        (1.0, 0.0, 0.0)
+    };
+    out[[atom_idx, row, 0]] = ux;
+    out[[atom_idx, row, 1]] = uy;
+    out[[atom_idx, row, 2]] = uz;
+}
+
 fn is_curved_kind(kind: &SaeAtomBasisKind) -> bool {
     matches!(
         kind,
@@ -122,10 +185,16 @@ fn topology_curved_seed_initial_coords(
     if m < 4 {
         return Ok(None);
     }
-    let d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
+    // Two distinct widths, kept apart on purpose. The graph's neighbourhood
+    // degree and the barycentric interpolation stencil are properties of the
+    // manifold's INTRINSIC dimension, so they read `atom_dim`; the padded array
+    // they write into is indexed by coordinate STORAGE width, which for `S²`
+    // is wider. Conflating them is the defect this pair of names fixes.
+    let intrinsic_d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
+    let d_max = seed_storage_d_max(basis_kinds, atom_dim);
     // Neighborhood degree derived from intrinsic dimension + connectivity
     // (#2065), capped at the subsample size.
-    let k = topology_seed_knn(m, d_max).min(m - 1);
+    let k = topology_seed_knn(m, intrinsic_d_max).min(m - 1);
     let mut w = Array2::<f64>::zeros((m, m));
     for (ia, &ra) in rows.iter().enumerate() {
         let mut dists = Vec::with_capacity(m - 1);
@@ -182,7 +251,7 @@ fn topology_curved_seed_initial_coords(
     // here rather than once per `(atom, chart function, row)` interp call — the
     // per-call rescan multiplied the dominant seed cost by `Σ_atoms need_fns`
     // (≈ 2K at K curved atoms) for bit-identical output.
-    let interp_k = (d_max + 1).max(2).min(m);
+    let interp_k = (intrinsic_d_max + 1).max(2).min(m);
     let mut pos_of_row = vec![usize::MAX; z.nrows()];
     for (pos, &r) in rows.iter().enumerate() {
         pos_of_row[r] = pos;
@@ -304,13 +373,7 @@ fn topology_curved_seed_initial_coords(
                     let x = interp(&fns[0], row);
                     let y = interp(&fns[1], row);
                     let zz = interp(&fns[2], row);
-                    let norm = (x * x + y * y + zz * zz).sqrt().max(1.0e-24);
-                    if d >= 1 {
-                        out[[atom_idx, row, 0]] = (zz / norm).clamp(-1.0, 1.0).asin();
-                    }
-                    if d >= 2 {
-                        out[[atom_idx, row, 1]] = y.atan2(x);
-                    }
+                    write_ambient_sphere_row(&mut out, atom_idx, row, x, y, zz);
                 }
             }
             _ => {
@@ -471,11 +534,13 @@ fn surplus_phase_plane(
 /// and projects onto leading principal components to initialize each atom's
 /// chart according to its [`SaeAtomBasisKind`]: periodic atoms read a `[0, 1)`
 /// phase off the top-2 PCs (remaining axes min-max normalized to
-/// `[-0.5, 0.5]`), sphere atoms read `(lat, lon)` off the unit-normalized top-3
-/// PCs, torus axes read a `[0, 1)` phase off disjoint PC pairs, and
-/// Euclidean/other atoms take score-scaled, min-max-normalized PC projections.
-/// Returns a padded
-/// `(K_atoms, n_obs, d_max)` coordinate array.
+/// `[-0.5, 0.5]`), sphere and projective-plane atoms take the unit-normalized
+/// top-3 PCs AS their ambient 3-vector coordinate, torus axes read a `[0, 1)`
+/// phase off disjoint PC pairs, and Euclidean/other atoms take score-scaled,
+/// min-max-normalized PC projections. Returns a padded
+/// `(K_atoms, n_obs, d_max)` coordinate array, where `d_max` is the widest
+/// per-atom coordinate STORAGE ([`seed_storage_width`]) — for `S²` / `RP²`
+/// that is 3, not the requested intrinsic `atom_dim` of 2.
 pub fn sae_pca_seed_initial_coords(
     z: ArrayView2<'_, f64>,
     basis_kinds: &[SaeAtomBasisKind],
@@ -512,7 +577,7 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
     }
     let k_atoms = basis_kinds.len();
     let (n_obs, _p_out) = z.dim();
-    let d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
+    let d_max = seed_storage_d_max(basis_kinds, atom_dim);
     let mut out = Array3::<f64>::zeros((k_atoms, n_obs, d_max));
     if n_obs == 0 || z.ncols() == 0 {
         return Ok(out);
@@ -706,11 +771,14 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
                     }
                 }
             }
-            SaeAtomBasisKind::Sphere => {
-                // Seed the sphere chart from a 3-frame: drop the centred response
-                // onto three ambient directions, unit-normalise, and read off
-                // (lat, lon), placing every row on the chart with
-                // `lat ∈ (-π/2, π/2)` and `lon ∈ (-π, π]`.
+            SaeAtomBasisKind::Sphere | SaeAtomBasisKind::ProjectivePlane => {
+                // Seed the chart from a 3-frame: drop the centred response onto
+                // three ambient directions and unit-normalise, placing every row
+                // ON the sphere. That unit 3-vector IS the coordinate the
+                // ambient plan is parameterised by — see `seed_storage_width`.
+                // `RP²` shares the seed because its plan shares the cover: an
+                // `RP²` point is a unit 3-vector read modulo sign, so any
+                // representative of the class is a valid start.
                 let n_pc = vt_rows.min(3);
                 if n_pc == 0 {
                     continue;
@@ -746,20 +814,7 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
                         }
                         amb[i] = acc;
                     }
-                    let norm = (amb[0] * amb[0] + amb[1] * amb[1] + amb[2] * amb[2]).sqrt();
-                    let (x, y, z) = if norm > 0.0 {
-                        (amb[0] / norm, amb[1] / norm, amb[2] / norm)
-                    } else {
-                        (1.0, 0.0, 0.0)
-                    };
-                    let lat = z.clamp(-1.0, 1.0).asin();
-                    let lon = y.atan2(x);
-                    if d >= 1 {
-                        out[[atom_idx, row, 0]] = lat;
-                    }
-                    if d >= 2 {
-                        out[[atom_idx, row, 1]] = lon;
-                    }
+                    write_ambient_sphere_row(&mut out, atom_idx, row, amb[0], amb[1], amb[2]);
                 }
             }
             SaeAtomBasisKind::Torus => {
@@ -984,6 +1039,104 @@ pub fn sae_data_row_anchored_euclidean_coords(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifold::{sae_build_atom_plans, sae_build_padded_basis_stacks};
+
+    /// The seed array is consumed by `sae_build_padded_basis_stacks`, which
+    /// indexes coordinate storage by each PLAN's `latent_dim`. So the seed's
+    /// `D_max` must cover that width for every atom, not the requested
+    /// `atom_dim`. `S²` is the case where the two differ: `atom_dim == 2`
+    /// intrinsic, `latent_dim == 3` ambient. Sizing by `atom_dim` produced
+    /// "atom 0 latent_dim 3 exceeds seed_coords D_max=2" and refused the fit.
+    ///
+    /// This asserts against the plan builder rather than against a literal 3, so
+    /// the two cannot drift apart again silently.
+    #[test]
+    fn seed_storage_covers_every_plans_latent_dim() {
+        let n = 40usize;
+        let p = 6usize;
+        let z = structured_z(n, p);
+        for (kind, name, d) in [
+            (SaeAtomBasisKind::Sphere, "sphere", 2usize),
+            (SaeAtomBasisKind::Torus, "torus", 2usize),
+            (SaeAtomBasisKind::Periodic, "periodic", 1usize),
+            (SaeAtomBasisKind::Linear, "linear", 3usize),
+            (SaeAtomBasisKind::ProjectivePlane, "projective_plane", 2usize),
+        ] {
+            let kinds = vec![kind.clone()];
+            let dims = vec![d];
+            let seed = sae_pca_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
+            let plans = sae_build_atom_plans(
+                z.view(),
+                &[name.to_string()],
+                &dims,
+                seed.view(),
+                7,
+                &[None],
+            )
+            .unwrap_or_else(|err| panic!("{name}: plan build failed: {err}"));
+            assert_eq!(
+                seed.shape()[2],
+                plans[0].latent_dim(),
+                "{name}: seed storage width {} must equal the plan's latent_dim {}",
+                seed.shape()[2],
+                plans[0].latent_dim(),
+            );
+            // The same array must survive the consumer that refused it.
+            sae_build_padded_basis_stacks(&plans, seed.view(), n)
+                .unwrap_or_else(|err| panic!("{name}: padded stacks refused the seed: {err}"));
+        }
+    }
+
+    /// Every seeded row of an `S²` atom must lie ON the sphere, because the
+    /// ambient plan's coordinate IS the unit 3-vector — a `(lat, lon)` pair
+    /// written into the first two slots leaves the third at zero and is not a
+    /// point of the manifold at all.
+    #[test]
+    fn sphere_seed_rows_are_unit_ambient_vectors() {
+        let n = 40usize;
+        let p = 6usize;
+        let z = structured_z(n, p);
+        for k in [1usize, 3usize] {
+            let kinds = vec![SaeAtomBasisKind::Sphere; k];
+            let dims = vec![2usize; k];
+            let seed = sae_pca_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
+            assert_eq!(seed.shape()[2], 3, "K={k}: sphere storage must be ambient 3");
+            for atom in 0..k {
+                for row in 0..n {
+                    let x = seed[[atom, row, 0]];
+                    let y = seed[[atom, row, 1]];
+                    let zz = seed[[atom, row, 2]];
+                    let norm = (x * x + y * y + zz * zz).sqrt();
+                    assert!(
+                        (norm - 1.0).abs() <= 1.0e-12,
+                        "K={k} atom {atom} row {row}: ‖(x,y,z)‖ = {norm}, expected 1"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The linear path is reached when the topology seed declines (`n < 4`), and
+    /// it owns its own sphere arm — so it needs the same pin.
+    #[test]
+    fn sphere_seed_is_ambient_on_the_linear_fallback_too() {
+        let n = 3usize; // < 4 ⇒ topology_curved_seed_initial_coords returns None
+        let p = 5usize;
+        let z = structured_z(n, p);
+        let seed =
+            sae_pca_seed_initial_coords(z.view(), &[SaeAtomBasisKind::Sphere], &[2usize]).unwrap();
+        assert_eq!(seed.shape()[2], 3);
+        for row in 0..n {
+            let x = seed[[0, row, 0]];
+            let y = seed[[0, row, 1]];
+            let zz = seed[[0, row, 2]];
+            let norm = (x * x + y * y + zz * zz).sqrt();
+            assert!(
+                (norm - 1.0).abs() <= 1.0e-12,
+                "linear-fallback row {row}: ‖(x,y,z)‖ = {norm}, expected 1"
+            );
+        }
+    }
 
     /// Small deterministic `vt`-like matrix (rows = principal directions). The
     /// helper does not require orthonormal rows, only a non-degenerate span.

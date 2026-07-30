@@ -39,6 +39,7 @@
 //! self-adjoint solver. Same input ⇒ bit-identical coordinates run-to-run.
 
 use super::SaeAtomBasisKind;
+use super::pca_seed::{seed_storage_d_max, write_ambient_sphere_row};
 use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array2, Array3, ArrayView2};
 use std::cmp::Ordering;
@@ -463,7 +464,10 @@ fn min_max_normalize_into(out: &mut Array3<f64>, atom_idx: usize, axis: usize, v
 fn intrinsic_chart_embedding_axes(kind: &SaeAtomBasisKind, latent_dim: usize) -> usize {
     match kind {
         SaeAtomBasisKind::Periodic => 2 + latent_dim.max(1).saturating_sub(1),
-        SaeAtomBasisKind::Sphere => 3,
+        // `RP²` shares the sphere's ambient cover, so it needs the same
+        // three-function frame — it previously fell through to `latent_dim`,
+        // which left the third ambient axis unseeded.
+        SaeAtomBasisKind::Sphere | SaeAtomBasisKind::ProjectivePlane => 3,
         SaeAtomBasisKind::Torus => 2 * latent_dim.max(1),
         _ => latent_dim.max(1),
     }
@@ -472,13 +476,17 @@ fn intrinsic_chart_embedding_axes(kind: &SaeAtomBasisKind, latent_dim: usize) ->
 /// Intrinsic-metric seed with the SAME `(K_atoms, n_obs, d_max)` output contract
 /// and per-chart-kind conventions as [`super::sae_pca_seed_initial_coords`], built
 /// from a single geodesic embedding of `z` wide enough for every atom's chart
-/// functions. The returned coordinate tensor still uses the maximum LATENT
-/// dimension, matching the PCA seed contract. Each
-/// atom reads its chart off the leading intrinsic axes:
+/// functions. Each
+/// atom reads its chart off the leading intrinsic axes (the tensor's `d_max` is
+/// the widest coordinate STORAGE, which is what the padded-stack consumer
+/// indexes by, not the widest intrinsic dimension):
 ///   * flat (Euclidean/Linear/other) — leading `d` axes, min-max normalized to
 ///     `[-0.5, 0.5]` (the flat PCA convention);
 ///   * periodic — `[0, 1)` phase off axes 0/1 via `atan2`, extra axes min-max;
-///   * sphere — `(lat, lon)` off the unit-normalized leading 3 axes;
+///   * sphere / projective plane — the unit-normalized leading 3 axes AS the
+///     ambient 3-vector the plan is parameterised by (not `(lat, lon)`: the
+///     ambient plan replaced that chart, and a 2-wide seed no longer names a
+///     point of the manifold);
 ///   * torus — `[0, 1)` phase per axis off disjoint intrinsic-axis pairs.
 ///
 /// A drop-in for the PCA seed: same shape, finite, ready for any chart family. Its
@@ -498,7 +506,11 @@ pub fn sae_intrinsic_seed_initial_coords(
         ));
     }
     let (n_obs, _p) = z.dim();
-    let latent_d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
+    // Coordinate STORAGE width, not intrinsic dimension: `S²` / `RP²` are
+    // parameterised by their ambient unit 3-vector. See
+    // `super::pca_seed::seed_storage_width` — this seeder is documented as a
+    // drop-in for the PCA seed, so it owes the same array shape.
+    let latent_d_max = seed_storage_d_max(basis_kinds, atom_dim);
     let embedding_axes = basis_kinds
         .iter()
         .zip(atom_dim.iter().copied())
@@ -547,18 +559,12 @@ pub fn sae_intrinsic_seed_initial_coords(
                     min_max_normalize_into(&mut out, atom_idx, axis, &vals);
                 }
             }
-            SaeAtomBasisKind::Sphere => {
+            SaeAtomBasisKind::Sphere | SaeAtomBasisKind::ProjectivePlane => {
                 for row in 0..n_obs {
                     let x = embed[[row, 0]];
                     let y = embed[[row, 1]];
                     let zz = embed[[row, 2]];
-                    let norm = (x * x + y * y + zz * zz).sqrt().max(1.0e-24);
-                    if d >= 1 {
-                        out[[atom_idx, row, 0]] = (zz / norm).clamp(-1.0, 1.0).asin();
-                    }
-                    if d >= 2 {
-                        out[[atom_idx, row, 1]] = y.atan2(x);
-                    }
+                    write_ambient_sphere_row(&mut out, atom_idx, row, x, y, zz);
                 }
             }
             SaeAtomBasisKind::Torus => {
