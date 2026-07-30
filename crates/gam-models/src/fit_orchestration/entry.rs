@@ -116,12 +116,33 @@ pub fn canonical_standard_fit_options(
 ///   `FitConfig::persist_warm_start_disk`'s own doc: "Low-level embedding code
 ///   may disable it explicitly when it owns a stronger external checkpoint
 ///   transaction." A programmatic block-fit owns its own lifecycle.
-/// * `penalty_shrinkage_floor: None` and `tol: 1e-9` — PINNED, NOT ENDORSED.
-///   The canonical policy is `Some(1e-6)` and `1e-10`, and neither deviation
-///   has a stated rationale anywhere; `1e-9` in particular looks like exactly
-///   the stale-tolerance class the `1e-10` comment above was written to fix.
-///   They are pinned so that routing this call site through the seam is
-///   numerically inert, and #2630 tracks deciding them on purpose.
+/// * `penalty_shrinkage_floor: None` — PINNED, NOT ENDORSED. The canonical
+///   policy is `Some(1e-6)` and this deviation has no stated rationale
+///   anywhere. It is a different KIND of field from `tol` below: the floor
+///   changes the penalized OBJECTIVE, so changing it changes what this
+///   entry's forward computes and therefore what its adjoint differentiates.
+///   That needs a gradient measurement, not a one-line alignment, so it stays
+///   pinned and #2630 tracks deciding it on purpose.
+///
+/// `tol` is NO LONGER a deviation. It was `1e-9` against the canonical `1e-10`
+/// with no stated rationale — exactly the stale-tolerance class the `1e-10`
+/// comment above was written to fix — and this is the surface where it costs
+/// the most, for two reasons:
+///
+/// * This entry is the `forward` of a `torch.autograd.Function`
+///   (`gamfit/torch/_reml.py::_GaussianRemlFitBlocksFn`) whose `backward` is an
+///   envelope-theorem / implicit-function adjoint assembled AT the implicit
+///   optimum. `tol` is not a cosmetic accuracy knob there; it bounds how far
+///   from stationarity the point is at which the analytic gradient's derivation
+///   assumes stationarity. It is the one field that bounds a PREMISE rather
+///   than an output.
+/// * `tests/torch/test_reml_blocks_backward.py::test_f1_matches_single_smooth_forward_and_backward`
+///   asserts this path agrees with `gaussian_reml_fit` at `rtol=atol=1e-10`.
+///   That path is `gaussian_reml_multi_closed_form_with_cache` — a CLOSED-FORM
+///   Gaussian REML optimum, with no outer tolerance at all. So a `1e-9`-
+///   converged iterate was being held to a `1e-10` identity against an exact
+///   one. Inheriting `1e-10` moves this path toward the thing it is asserted
+///   equal to; it does not make the assertion easier.
 ///
 /// Two fields that LOOK like deviations are not: `max_iter: 200` matches
 /// `config.outer_max_iter.unwrap_or(200)`, and `ResourcePolicy::default_library()`
@@ -135,7 +156,6 @@ pub fn canonical_blocks_forward_fit_options(nullspace_dims: Vec<usize>) -> FitOp
     options.skip_rho_posterior_inference = false;
     options.persist_warm_start_disk = false;
     options.penalty_shrinkage_floor = None;
-    options.tol = 1.0e-9;
     options
 }
 
