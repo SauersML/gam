@@ -5342,14 +5342,25 @@ pub fn resolve_auto_primary_atoms(
                 resolution_overrides[atom_idx] = choice.n_torus_harmonics;
                 geometry_overrides[atom_idx] = Some(choice.geometry.clone());
             }
+            // `atom_dim` is the request-level INTRINSIC dimension — it is what
+            // `sae_build_atom_plans` checks (`basis 'sphere' requires
+            // atom_dim == 2`) and what prices the atom. `choice.latent_dim` is
+            // the coordinate STORAGE width, and `PrimaryTopologyChoice` says so
+            // in as many words: "Price an atom by `geometry.intrinsic_dim()`;
+            // index its storage by this." For every kind below except these two
+            // the values coincide, so only `S²` and `RP²` — carried as an
+            // ambient unit 3-vector because neither admits a global 2-D chart —
+            // could break the rule, and writing 3 into `atom_dim` made an auto
+            // sphere winner refuse its own discovery with
+            //   sae_build_atom_plans: atom 1 basis 'sphere' requires atom_dim == 2, got 3
             SaeAtomBasisKind::Sphere => {
                 atom_basis[atom_idx] = "sphere".to_string();
-                atom_dim[atom_idx] = choice.latent_dim;
+                atom_dim[atom_idx] = choice.geometry.intrinsic_dim();
                 geometry_overrides[atom_idx] = Some(choice.geometry.clone());
             }
             SaeAtomBasisKind::ProjectivePlane => {
                 atom_basis[atom_idx] = "projective_plane".to_string();
-                atom_dim[atom_idx] = choice.latent_dim;
+                atom_dim[atom_idx] = choice.geometry.intrinsic_dim();
                 geometry_overrides[atom_idx] = Some(choice.geometry.clone());
             }
             SaeAtomBasisKind::KleinBottle => {

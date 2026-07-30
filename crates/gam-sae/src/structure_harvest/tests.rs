@@ -3057,3 +3057,74 @@ fn every_registered_d2_topology_fits_at_least_once_2604() {
         refused.join("\n")
     );
 }
+
+/// `atom_dim` is the request-level INTRINSIC dimension, and every consumer of
+/// `resolve_auto_primary_atoms`' output reads it as one — `sae_build_atom_plans`
+/// checks it literally (`basis 'sphere' requires atom_dim == 2`).
+/// `PrimaryTopologyChoice::latent_dim` is the coordinate STORAGE width, and its
+/// own doc comment says which is which. The two coincide for every chart in the
+/// menu except `S²` and `RP²`, which are carried as an ambient unit 3-vector
+/// because neither admits a global 2-D chart — so writing `latent_dim` into
+/// `atom_dim` made an auto sphere winner refuse its own discovery:
+///
+///   sae_build_atom_plans: atom 1 basis 'sphere' requires atom_dim == 2, got 3
+///
+/// The gate is "the plan builder accepts whatever discovery wrote", which is the
+/// contract rather than a pinned race outcome. The fixture is a sphere because
+/// that is the case where the two readings differ; if discovery stops choosing
+/// a sphere here, this test must be re-pointed at a fixture that still reaches
+/// the ambient-cover kinds rather than relaxed.
+#[test]
+fn auto_resolution_writes_the_atom_dim_its_own_plan_builder_accepts() {
+    let target = crate::manifold::tests_topology_fixtures::sphere(240);
+    let labels = vec![0usize; target.nrows()];
+    let mut atom_basis = vec!["auto".to_string()];
+    let mut atom_dim = vec![2usize];
+    let resolved =
+        resolve_auto_primary_atoms(target.view(), &labels, &mut atom_basis, &mut atom_dim)
+            .expect("auto resolution on a sphere fixture");
+    let resolution_overrides = resolved.0;
+    let resolved_kind = crate::manifold::sae_atom_basis_kind_from_str(&atom_basis[0])
+        .expect("resolved basis token must be a native kind");
+    assert!(
+        matches!(
+            resolved_kind,
+            SaeAtomBasisKind::Sphere | SaeAtomBasisKind::ProjectivePlane
+        ),
+        "a golden-angle sphere should reach an ambient-cover kind; got {:?} — \
+         re-point this fixture rather than weakening the assertion",
+        resolved_kind,
+    );
+    assert_eq!(
+        atom_dim[0], 2,
+        "S²/RP² are intrinsically 2-D; discovery wrote {} into atom_dim, which is \
+         the ambient STORAGE width, not the intrinsic dimension the plan builder checks",
+        atom_dim[0],
+    );
+    let seed = crate::manifold::sae_pca_seed_initial_coords(
+        target.view(),
+        std::slice::from_ref(&resolved_kind),
+        &atom_dim,
+    )
+    .expect("seed for the resolved kind");
+    let plans = crate::manifold::sae_build_atom_plans(
+        target.view(),
+        &atom_basis,
+        &atom_dim,
+        seed.view(),
+        7,
+        &resolution_overrides,
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "auto winner '{}' with atom_dim {} was refused by its own plan builder: {err}",
+            atom_basis[0], atom_dim[0],
+        )
+    });
+    assert_eq!(plans.len(), 1);
+    assert_eq!(
+        plans[0].latent_dim(),
+        seed.shape()[2],
+        "the seed's storage width must match the plan the same inputs produce",
+    );
+}
