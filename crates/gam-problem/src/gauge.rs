@@ -699,6 +699,77 @@ impl Gauge {
         }
     }
 
+    /// Grow an EXISTING block by one free coordinate, appended at the end of
+    /// that block in both coordinate systems.
+    ///
+    /// [`Self::extend_with_identity`] appends whole new blocks; this is the
+    /// other shape the deployment paths need — a block whose raw width grows
+    /// while every other block, and the whole lift `T`, is untouched. It is
+    /// what `extend_with_group`'s no-refit random-effect level is: one raw
+    /// coefficient the active fit *can* move (so an identity row of `T`, not a
+    /// zero one), carrying its own reduced coordinate, inside the block that
+    /// already owns that term.
+    ///
+    /// The new raw row is zero except for a `1` against the new reduced
+    /// column, and its affine shift is `0`, so `β_raw = T · θ + a` reproduces
+    /// the new coefficient exactly from its own reduced coordinate and leaves
+    /// every pre-existing coordinate's lift bit-identical.
+    ///
+    /// Returns the reduced index the new coordinate occupies, which is where a
+    /// caller inserting into a reduced-coordinate object (an active-coordinate
+    /// Hessian, say) must insert.
+    pub fn append_free_coordinate_to_block(
+        &self,
+        block_index: usize,
+    ) -> Result<(Self, usize), String> {
+        let n_blocks = self.n_blocks();
+        if block_index >= n_blocks {
+            return Err(format!(
+                "Gauge::append_free_coordinate_to_block: block {block_index} is out of range for \
+                 a {n_blocks}-block gauge"
+            ));
+        }
+        let raw_total = self.raw_total();
+        let reduced_total = self.reduced_total();
+        let raw_at = self.block_starts_raw[block_index + 1];
+        let reduced_at = self.block_starts_reduced[block_index + 1];
+        let mut t = Array2::<f64>::zeros((raw_total + 1, reduced_total + 1));
+        for raw_old in 0..raw_total {
+            let raw_new = if raw_old < raw_at { raw_old } else { raw_old + 1 };
+            for reduced_old in 0..reduced_total {
+                let reduced_new = if reduced_old < reduced_at {
+                    reduced_old
+                } else {
+                    reduced_old + 1
+                };
+                t[[raw_new, reduced_new]] = self.t_full[[raw_old, reduced_old]];
+            }
+        }
+        t[[raw_at, reduced_at]] = 1.0;
+        let mut affine_shift = Array1::<f64>::zeros(raw_total + 1);
+        for raw_old in 0..raw_total {
+            let raw_new = if raw_old < raw_at { raw_old } else { raw_old + 1 };
+            affine_shift[raw_new] = self.affine_shift[raw_old];
+        }
+        let mut block_starts_raw = self.block_starts_raw.clone();
+        let mut block_starts_reduced = self.block_starts_reduced.clone();
+        for start in block_starts_raw.iter_mut().skip(block_index + 1) {
+            *start += 1;
+        }
+        for start in block_starts_reduced.iter_mut().skip(block_index + 1) {
+            *start += 1;
+        }
+        Ok((
+            Self {
+                t_full: t,
+                affine_shift,
+                block_starts_raw,
+                block_starts_reduced,
+            },
+            reduced_at,
+        ))
+    }
+
     /// Lift per-block reduced coefficients to per-block raw
     /// coefficients: concatenate into θ, apply `β = T · θ + a`, split at
     /// the raw partition.
@@ -1231,6 +1302,49 @@ mod tests {
     fn sum_to_zero_rejects_identity_section() {
         // A square z removes no direction — that is not a centring section.
         drop(Gauge::sum_to_zero(Array2::<f64>::eye(3)));
+    }
+
+    #[test]
+    fn append_free_coordinate_grows_one_block_and_leaves_the_others_exact() {
+        // Block 0 is genuinely reduced (2 raw ← 1 reduced); block 1 is not.
+        // Growing block 0 must widen only block 0 and must not disturb the
+        // lift of any pre-existing coordinate, in either block.
+        let mut t0 = Array2::<f64>::zeros((2, 1));
+        t0[[0, 0]] = 1.0;
+        t0[[1, 0]] = -1.0;
+        let base = Gauge::from_block_transforms(&[t0]).extend_with_identity(&[2]);
+        assert_eq!(base.raw_widths(), vec![2, 2]);
+        assert_eq!(base.reduced_widths(), vec![1, 2]);
+
+        let (grown, reduced_at) = base.append_free_coordinate_to_block(0).unwrap();
+        // The new reduced coordinate lands at the END of block 0's reduced
+        // range, which is where block 1's range used to start.
+        assert_eq!(reduced_at, 1);
+        assert_eq!(grown.n_blocks(), 2);
+        assert_eq!(grown.raw_widths(), vec![3, 2]);
+        assert_eq!(grown.reduced_widths(), vec![2, 2]);
+
+        // θ = (block0: [3, 7], block1: [1, -1]). The pre-existing block-0
+        // coordinate still lifts to (3, -3); the appended one is itself; and
+        // block 1 is bit-identical to the ungrown lift.
+        let theta = vec![Array1::from(vec![3.0, 7.0]), Array1::from(vec![1.0, -1.0])];
+        let raw = grown.lift_block_betas(&theta);
+        assert_eq!(raw[0].as_slice().unwrap(), &[3.0, -3.0, 7.0]);
+        assert_eq!(raw[1].as_slice().unwrap(), &[1.0, -1.0]);
+        let base_raw = base.lift_block_betas(&[
+            Array1::from(vec![3.0]),
+            Array1::from(vec![1.0, -1.0]),
+        ]);
+        assert_eq!(raw[1], base_raw[1]);
+        assert_eq!(raw[0][0], base_raw[0][0]);
+        assert_eq!(raw[0][1], base_raw[0][1]);
+
+        // Growing the LAST block appends at the global end of both systems.
+        let (tail_grown, tail_at) = base.append_free_coordinate_to_block(1).unwrap();
+        assert_eq!(tail_at, base.reduced_total());
+        assert_eq!(tail_grown.raw_widths(), vec![2, 3]);
+
+        assert!(base.append_free_coordinate_to_block(2).is_err());
     }
 
     #[test]

@@ -432,6 +432,53 @@ fn insert_coefficient_into_saved_fit(
         ));
     }
     fit.blocks[block_idx].beta = insert_array1(&fit.blocks[block_idx].beta, index, value);
+    // The saved geometry carries the coefficient gauge, and `UnifiedFitResult`
+    // validation requires the gauge's raw block widths to equal the saved
+    // per-block β widths. Growing `blocks[block_idx].beta` above without
+    // growing the gauge alongside it is exactly the +1 disagreement that
+    // refused nine Python deployment tests with
+    //   "geometry coefficient gauge raw block 0 has width W, expected saved
+    //    beta width W+1"
+    // (5→6, 42→43, 82→83 — always the one appended level). A new unseen
+    // random-effect level is a FREE raw coordinate: it took part in no
+    // identifiability constraint of the fit, so it enters the gauge as an
+    // identity row carrying its own reduced coordinate.
+    //
+    // That reduced coordinate's index is also the only correct insertion point
+    // for the two REDUCED-coordinate objects below. `penalized_hessian` on both
+    // `geometry` and `inference` is validated against `gauge.reduced_total()`
+    // whenever a geometry is present, so inserting at the RAW `index` is only
+    // accidentally right on an identity gauge and is out of bounds as soon as
+    // any block is genuinely reduced.
+    let (grown_gauge, reduced_index) = match fit.geometry.as_ref() {
+        Some(geometry) => {
+            if geometry.constrained_posterior.is_some() {
+                // `constrained_posterior` is the other active-frame object, and
+                // its truncation identity is stated in the pre-extension
+                // coordinates. Widening the frame underneath it would leave a
+                // posterior whose truncation refers to a coordinate system that
+                // no longer exists, so refuse instead.
+                return Err(
+                    "extend_with_group cannot extend a fit carrying an inequality-truncated \
+                     posterior geometry: the truncation identity is stated in the pre-extension \
+                     active coordinates. Refit with the new level present."
+                        .to_string(),
+                );
+            }
+            let gauge = &geometry.coefficient_gauge;
+            let raw_end = gauge.block_starts_raw[block_idx + 1];
+            if index != raw_end {
+                return Err(format!(
+                    "extend_with_group appends coefficient {index} but the saved gauge places \
+                     block {block_idx}'s raw coordinates at ..{raw_end}; the appended level would \
+                     not land in the block whose β was grown"
+                ));
+            }
+            let (grown, reduced_index) = gauge.append_free_coordinate_to_block(block_idx)?;
+            (Some(grown), reduced_index)
+        }
+        None => (None, index),
+    };
     // No-refit posterior algebra for a deployment-only block:
     //
     // The fitted posterior precision for the original coefficients is H_old.
@@ -460,7 +507,7 @@ fn insert_coefficient_into_saved_fit(
         // the result back on assignment.
         inference.penalized_hessian = insert_symmetric_array2(
             inference.penalized_hessian.as_array(),
-            index,
+            reduced_index,
             precision_diag,
         )?
         .into();
@@ -494,9 +541,15 @@ fn insert_coefficient_into_saved_fit(
         }
     }
     if let Some(geometry) = fit.geometry.as_mut() {
-        geometry.penalized_hessian =
-            insert_symmetric_array2(geometry.penalized_hessian.as_array(), index, precision_diag)?
-                .into();
+        geometry.penalized_hessian = insert_symmetric_array2(
+            geometry.penalized_hessian.as_array(),
+            reduced_index,
+            precision_diag,
+        )?
+        .into();
+        if let Some(gauge) = grown_gauge {
+            geometry.coefficient_gauge = gauge;
+        }
     }
     Ok(())
 }
