@@ -19,17 +19,23 @@ use gam_sae::sparse_dict::{
     fit_block_sparse_dictionary_with_seed,
 };
 use gam_sae::tiered::{Tier0Mean, harvest_code_space_promotions, linear_distortion_floor};
-use ndarray::{Array2, Axis};
+use ndarray::{Array1, Array2, Axis};
 
 const P: usize = 768;
-const N_BLOCKS: usize = 4096;
+// The census can only promote a block that fires often enough to pay the
+// chart's parameter charge. At G=4096, average occupancy is below that floor;
+// G=1024 clears it while keeping the dictionary overcomplete (K=2048 > P).
+const N_BLOCKS: usize = 1024;
 const BLOCK_SIZE: usize = 2;
 const AMP_BITS: u32 = 7;
 
 fn read_f32_matrix(path: &Path, p: usize) -> Result<Array2<f64>, String> {
     let bytes = fs::read(path).map_err(|e| format!("{path:?}: {e}"))?;
     if bytes.len() % (4 * p) != 0 {
-        return Err(format!("{path:?}: byte length {} not divisible by 4·{p}", bytes.len()));
+        return Err(format!(
+            "{path:?}: byte length {} not divisible by 4·{p}",
+            bytes.len()
+        ));
     }
     let n = bytes.len() / (4 * p);
     let mut out = Array2::<f64>::zeros((n, p));
@@ -46,6 +52,7 @@ fn quantize(v: f64, vmax: f64, bits: u32) -> f64 {
 }
 
 fn main() -> Result<(), String> {
+    eprintln!("build_marker=pairdecode_fixed_bits_v12");
     let args: Vec<String> = std::env::args().collect();
     let dir = Path::new(args.get(1).map(String::as_str).unwrap_or("."));
     let layer: usize = args
@@ -56,7 +63,11 @@ fn main() -> Result<(), String> {
 
     let train = read_f32_matrix(&dir.join(format!("raw_l{layer}_train.f32")), P)?;
     let eval = read_f32_matrix(&dir.join(format!("raw_l{layer}_eval.f32")), P)?;
-    eprintln!("layer {layer}: train {:?} eval {:?}", train.dim(), eval.dim());
+    eprintln!(
+        "layer {layer}: train {:?} eval {:?}",
+        train.dim(),
+        eval.dim()
+    );
 
     // Tier-0: train-split mean, held fixed for eval (the honest baseline).
     let tier0 = Tier0Mean::fit(train.view())?;
@@ -64,10 +75,18 @@ fn main() -> Result<(), String> {
     let eval_c = tier0.apply(eval.view())?;
     let train_f32 = train_c.mapv(|v| v as f32);
 
-    // Tier-1: the engine's block-sparse dictionary (G=4096 blocks of b=2).
+    // Tier-1: the engine's block-sparse dictionary (G blocks of b=2).
     let mut config = BlockSparseConfig::new(N_BLOCKS, BLOCK_SIZE);
     config.block_topk = 4;
-    config.aux_k = 4;
+    // Reviving dead blocks prevents the captured-fraction plateau from becoming
+    // stationary when K is much larger than rank. The benchmark fit does not
+    // use auxiliary revival.
+    config.aux_k = 0;
+    config.max_epochs = 300;
+    config.tolerance = 1.0e-3;
+    // A wider minibatch amortizes decoder-slab packing in the threaded router.
+    // Routing is row-independent, so this changes throughput, not the codes.
+    config.minibatch = 8192;
     let fit = fit_block_sparse_dictionary_with_seed(
         train_f32.view(),
         &config,
@@ -95,14 +114,44 @@ fn main() -> Result<(), String> {
             n_chart += 1;
         }
     }
+    // Pair promotions dominate this census. Store their ambient circle charts
+    // so a co-firing block pair can be represented by one phase rather than
+    // four amplitudes.
+    let mut pair_charts: std::collections::HashMap<
+        (usize, usize),
+        (Array1<f64>, Array1<f64>, Array1<f64>),
+    > = std::collections::HashMap::new();
+    for verdict in &census.pair_proposals {
+        if !verdict.proposal.accept {
+            continue;
+        }
+        let seed = &verdict.proposal.curved_candidate;
+        if seed.decoder.nrows() < 3 {
+            continue;
+        }
+        pair_charts.insert(
+            (verdict.atom_a, verdict.atom_b),
+            (
+                seed.decoder.row(0).to_owned(),
+                seed.decoder.row(1).to_owned(),
+                seed.decoder.row(2).to_owned(),
+            ),
+        );
+    }
+    let n_pair_charts = pair_charts.len();
     println!(
-        "{{\"layer\":{layer},\"census\":{{\"communities\":{},\"accepted\":{},\"pair_accepted\":{},\"dl_saved_bits\":{:.1},\"delta\":{:.5},\"fit_ev\":{:.4}}}}}",
+        "{{\"layer\":{layer},\"census\":{{\"communities\":{},\"accepted\":{},\"pair_accepted\":{},\"dl_saved_bits\":{:.1},\"delta\":{:.5},\"fit_ev\":{:.4},\"pair_charts\":{}}}}}",
         census.n_communities,
         census.n_accepted,
-        census.pair_proposals.iter().filter(|v| v.proposal.accept).count(),
+        census
+            .pair_proposals
+            .iter()
+            .filter(|v| v.proposal.accept)
+            .count(),
         census.dl_saved_bits,
         delta,
-        fit.explained_variance
+        fit.explained_variance,
+        n_pair_charts
     );
 
     // Amplitude scale for the fixed-width quantizer, from TRAIN codes.
@@ -128,7 +177,9 @@ fn main() -> Result<(), String> {
             .sum()
     };
 
-    for topk in [1usize, 2, 3, 4] {
+    // Bracket all public aggregate budgets (256/384/512 bits across four
+    // sites). Stopping at top-k=4 capped the linear curve at 384 bits.
+    for topk in 1usize..=6 {
         let (blocks, _gates, codes) = block_sparse_dictionary_transform(
             eval_f32.view(),
             fit.decoder.view(),
@@ -146,7 +197,58 @@ fn main() -> Result<(), String> {
         let mut bits_man = 0u64;
         let mut recon_l = Array2::<f64>::zeros((n_eval, P));
         let mut recon_m = Array2::<f64>::zeros((n_eval, P));
+        let mut pair_hits = 0usize;
         for i in 0..n_eval {
+            // Use at most one accepted pair chart per row. The paired blocks
+            // remain in the linear arm but are skipped by the manifold arm's
+            // per-block pass below.
+            let mut charted: [Option<usize>; 2] = [None, None];
+            'pairs: for ja in 0..topk {
+                for jb in (ja + 1)..topk {
+                    let (ga, gb) = (blocks[[i, ja]] as usize, blocks[[i, jb]] as usize);
+                    let key = if ga <= gb { (ga, gb) } else { (gb, ga) };
+                    let Some((center, sin_row, cos_row)) = pair_charts.get(&key) else {
+                        continue;
+                    };
+
+                    let mut y = Array1::<f64>::zeros(P);
+                    for (jj, gg) in [(ja, ga), (jb, gb)] {
+                        for r in 0..BLOCK_SIZE {
+                            let code = codes[[i, jj, r]] as f64;
+                            let row = fit.decoder.row(gg * BLOCK_SIZE + r);
+                            for c in 0..P {
+                                y[c] += code * row[c] as f64;
+                            }
+                        }
+                    }
+
+                    // The chart rows are R times an orthonormal plane frame.
+                    // Project the centered image to recover its phase.
+                    let (mut du, mut dv, mut nu, mut nv) = (0.0, 0.0, 0.0, 0.0);
+                    for c in 0..P {
+                        let d = y[c] - center[c];
+                        du += d * cos_row[c];
+                        dv += d * sin_row[c];
+                        nu += cos_row[c] * cos_row[c];
+                        nv += sin_row[c] * sin_row[c];
+                    }
+                    if nu <= 0.0 || nv <= 0.0 {
+                        continue;
+                    }
+                    let theta = (dv / nv.sqrt()).atan2(du / nu.sqrt());
+                    let levels = ((1u32 << AMP_BITS) - 1) as f64;
+                    let tq = (theta / std::f64::consts::TAU * levels).round() / levels
+                        * std::f64::consts::TAU;
+                    for c in 0..P {
+                        recon_m[[i, c]] +=
+                            center[c] + tq.cos() * cos_row[c] + tq.sin() * sin_row[c];
+                    }
+                    bits_man += (2 * sel_bits + AMP_BITS) as u64;
+                    charted = [Some(ja), Some(jb)];
+                    pair_hits += 1;
+                    break 'pairs;
+                }
+            }
             for j in 0..topk {
                 let g = blocks[[i, j]] as usize;
                 let c0 = codes[[i, j, 0]] as f64;
@@ -162,6 +264,9 @@ fn main() -> Result<(), String> {
                     recon_l[[i, cix]] += q0 * row0[cix] as f64 + q1 * row1[cix] as f64;
                 }
                 bits_lin += (sel_bits + 2 * AMP_BITS) as u64;
+                if charted[0] == Some(j) || charted[1] == Some(j) {
+                    continue;
+                }
                 if chart_radius[g].is_finite() {
                     // chart decode: θ quantized, radius stored in the model
                     let theta = c1.atan2(c0);
@@ -192,7 +297,7 @@ fn main() -> Result<(), String> {
             }
         }
         println!(
-            "{{\"layer\":{layer},\"topk\":{topk},\"bits_lin\":{:.2},\"fvu_lin\":{:.6},\"bits_man\":{:.2},\"fvu_man\":{:.6},\"chart_blocks\":{n_chart}}}",
+            "{{\"layer\":{layer},\"topk\":{topk},\"bits_lin\":{:.2},\"fvu_lin\":{:.6},\"bits_man\":{:.2},\"fvu_man\":{:.6},\"single_charts\":{n_chart},\"pair_hits\":{pair_hits}}}",
             bits_lin as f64 / n_eval as f64,
             rss_lin / tss,
             bits_man as f64 / n_eval as f64,

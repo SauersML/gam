@@ -1,0 +1,339 @@
+{
+  "protocol": {
+    "model": "GPT-2 small",
+    "sites": [
+      3,
+      5,
+      7,
+      9
+    ],
+    "train_rows_per_layer": 301752,
+    "eval_rows_per_layer": 100584,
+    "activation_width": 768,
+    "total_bit_budgets": [
+      256,
+      384,
+      512
+    ],
+    "dictionary_blocks": 1024,
+    "block_size": 2,
+    "fit_topk": 4,
+    "amplitude_bits": 7,
+    "selection_bits": 10,
+    "convergence_tolerance": 0.001,
+    "max_epochs": 300,
+    "auxiliary_revival": 0,
+    "build_marker": "pairdecode_fixed_bits_v12",
+    "job_id": 14670043,
+    "job_elapsed": "00:18:38",
+    "job_exit_code": 0
+  },
+  "profile": {
+    "note": "12-second perf sample during the identical v11 fit phase; v12 changes only evaluation top-k coverage.",
+    "advance_block_sparse_state_percent": 51.64,
+    "barrier_wait_percent": 13.52,
+    "routing_sgemm_percent": 10.36,
+    "code_row_percent": 4.59,
+    "packing_percent": 1.01
+  },
+  "diagnostics": {
+    "discarded_g4096_occupancy_over_floor": 0.42,
+    "final_g1024_occupancy_over_floor": 1.35,
+    "raw_chart_candidates_are_not_monotone": true,
+    "deployable_manifold_frontier": "lower envelope of linear and chart candidates under each bit-budget cap"
+  },
+  "layers": {
+    "3": {
+      "census": {
+        "communities": 54346,
+        "accepted": 41,
+        "pair_accepted": 40,
+        "dl_saved_bits": 1640995,
+        "delta": 0.8643,
+        "fit_ev": 0.6617,
+        "pair_charts": 40
+      },
+      "points": [
+        {
+          "layer": 3,
+          "topk": 1,
+          "bits_lin": 24,
+          "fvu_lin": 0.649447,
+          "bits_man": 23.99,
+          "fvu_man": 0.650395,
+          "single_charts": 1,
+          "pair_hits": 0
+        },
+        {
+          "layer": 3,
+          "topk": 2,
+          "bits_lin": 48,
+          "fvu_lin": 0.475126,
+          "bits_man": 46.43,
+          "fvu_man": 0.476475,
+          "single_charts": 1,
+          "pair_hits": 7388
+        },
+        {
+          "layer": 3,
+          "topk": 3,
+          "bits_lin": 72,
+          "fvu_lin": 0.38214,
+          "bits_man": 69.41,
+          "fvu_man": 0.383363,
+          "single_charts": 1,
+          "pair_hits": 12258
+        },
+        {
+          "layer": 3,
+          "topk": 4,
+          "bits_lin": 96,
+          "fvu_lin": 0.348407,
+          "bits_man": 92.48,
+          "fvu_man": 0.349356,
+          "single_charts": 1,
+          "pair_hits": 16573
+        },
+        {
+          "layer": 3,
+          "topk": 5,
+          "bits_lin": 120,
+          "fvu_lin": 0.358979,
+          "bits_man": 115.72,
+          "fvu_man": 0.359804,
+          "single_charts": 1,
+          "pair_hits": 20091
+        },
+        {
+          "layer": 3,
+          "topk": 6,
+          "bits_lin": 144,
+          "fvu_lin": 0.402842,
+          "bits_man": 139.09,
+          "fvu_man": 0.40375,
+          "single_charts": 1,
+          "pair_hits": 22875
+        }
+      ]
+    },
+    "5": {
+      "census": {
+        "communities": 68321,
+        "accepted": 42,
+        "pair_accepted": 39,
+        "dl_saved_bits": 1446606.5,
+        "delta": 1.19676,
+        "fit_ev": 0.5983,
+        "pair_charts": 39
+      },
+      "points": [
+        {
+          "layer": 5,
+          "topk": 1,
+          "bits_lin": 24,
+          "fvu_lin": 0.694617,
+          "bits_man": 23.93,
+          "fvu_man": 0.696666,
+          "single_charts": 3,
+          "pair_hits": 0
+        },
+        {
+          "layer": 5,
+          "topk": 2,
+          "bits_lin": 48,
+          "fvu_lin": 0.535482,
+          "bits_man": 46.96,
+          "fvu_man": 0.53657,
+          "single_charts": 3,
+          "pair_hits": 4758
+        },
+        {
+          "layer": 5,
+          "topk": 3,
+          "bits_lin": 72,
+          "fvu_lin": 0.448973,
+          "bits_man": 70.11,
+          "fvu_man": 0.449896,
+          "single_charts": 3,
+          "pair_hits": 8812
+        },
+        {
+          "layer": 5,
+          "topk": 4,
+          "bits_lin": 96,
+          "fvu_lin": 0.412863,
+          "bits_man": 93.26,
+          "fvu_man": 0.413715,
+          "single_charts": 3,
+          "pair_hits": 12815
+        },
+        {
+          "layer": 5,
+          "topk": 5,
+          "bits_lin": 120,
+          "fvu_lin": 0.414068,
+          "bits_man": 116.51,
+          "fvu_man": 0.415164,
+          "single_charts": 3,
+          "pair_hits": 16288
+        },
+        {
+          "layer": 5,
+          "topk": 6,
+          "bits_lin": 144,
+          "fvu_lin": 0.440677,
+          "bits_man": 139.84,
+          "fvu_man": 0.442097,
+          "single_charts": 3,
+          "pair_hits": 19285
+        }
+      ]
+    },
+    "7": {
+      "census": {
+        "communities": 71412,
+        "accepted": 40,
+        "pair_accepted": 40,
+        "dl_saved_bits": 1618654.3,
+        "delta": 1.61216,
+        "fit_ev": 0.5544,
+        "pair_charts": 40
+      },
+      "points": [
+        {
+          "layer": 7,
+          "topk": 1,
+          "bits_lin": 24,
+          "fvu_lin": 0.718104,
+          "bits_man": 24,
+          "fvu_man": 0.718104,
+          "single_charts": 0,
+          "pair_hits": 0
+        },
+        {
+          "layer": 7,
+          "topk": 2,
+          "bits_lin": 48,
+          "fvu_lin": 0.569718,
+          "bits_man": 47.04,
+          "fvu_man": 0.570259,
+          "single_charts": 0,
+          "pair_hits": 4579
+        },
+        {
+          "layer": 7,
+          "topk": 3,
+          "bits_lin": 72,
+          "fvu_lin": 0.490329,
+          "bits_man": 69.84,
+          "fvu_man": 0.491191,
+          "single_charts": 0,
+          "pair_hits": 10345
+        },
+        {
+          "layer": 7,
+          "topk": 4,
+          "bits_lin": 96,
+          "fvu_lin": 0.456702,
+          "bits_man": 92.85,
+          "fvu_man": 0.45783,
+          "single_charts": 0,
+          "pair_hits": 15100
+        },
+        {
+          "layer": 7,
+          "topk": 5,
+          "bits_lin": 120,
+          "fvu_lin": 0.454799,
+          "bits_man": 116.1,
+          "fvu_man": 0.456293,
+          "single_charts": 0,
+          "pair_hits": 18697
+        },
+        {
+          "layer": 7,
+          "topk": 6,
+          "bits_lin": 144,
+          "fvu_lin": 0.474257,
+          "bits_man": 139.49,
+          "fvu_man": 0.476276,
+          "single_charts": 0,
+          "pair_hits": 21586
+        }
+      ]
+    },
+    "9": {
+      "census": {
+        "communities": 77852,
+        "accepted": 35,
+        "pair_accepted": 34,
+        "dl_saved_bits": 1091910.8,
+        "delta": 2.24168,
+        "fit_ev": 0.5374,
+        "pair_charts": 34
+      },
+      "points": [
+        {
+          "layer": 9,
+          "topk": 1,
+          "bits_lin": 24,
+          "fvu_lin": 0.729759,
+          "bits_man": 23.97,
+          "fvu_man": 0.730964,
+          "single_charts": 1,
+          "pair_hits": 0
+        },
+        {
+          "layer": 9,
+          "topk": 2,
+          "bits_lin": 48,
+          "fvu_lin": 0.587362,
+          "bits_man": 47.43,
+          "fvu_man": 0.587951,
+          "single_charts": 1,
+          "pair_hits": 2681
+        },
+        {
+          "layer": 9,
+          "topk": 3,
+          "bits_lin": 72,
+          "fvu_lin": 0.510157,
+          "bits_man": 70.77,
+          "fvu_man": 0.510779,
+          "single_charts": 1,
+          "pair_hits": 5842
+        },
+        {
+          "layer": 9,
+          "topk": 4,
+          "bits_lin": 96,
+          "fvu_lin": 0.475916,
+          "bits_man": 94.11,
+          "fvu_man": 0.476729,
+          "single_charts": 1,
+          "pair_hits": 9012
+        },
+        {
+          "layer": 9,
+          "topk": 5,
+          "bits_lin": 120,
+          "fvu_lin": 0.472411,
+          "bits_man": 117.6,
+          "fvu_man": 0.473474,
+          "single_charts": 1,
+          "pair_hits": 11419
+        },
+        {
+          "layer": 9,
+          "topk": 6,
+          "bits_lin": 144,
+          "fvu_lin": 0.490098,
+          "bits_man": 141.21,
+          "fvu_man": 0.491521,
+          "single_charts": 1,
+          "pair_hits": 13271
+        }
+      ]
+    }
+  }
+}
