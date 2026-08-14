@@ -1415,16 +1415,23 @@ impl SaeManifoldTerm {
                     edge_v.push(Vec::new());
                     continue;
                 }
-                let mut cross = Array2::<f64>::zeros((m_j, m_k));
-                for a in 0..m_j {
-                    for b in 0..m_k {
-                        let mut c = 0.0_f64;
-                        for o in 0..p {
-                            c += bj[[a, o]] * bk[[b, o]];
-                        }
-                        cross[[a, b]] = c;
-                    }
-                }
+                // #2731 — the per-edge decoder products were hand-rolled scalar
+                // triple loops over `p` (the ambient output dimension, up to
+                // 2048 in production). Replaced with cache-efficient
+                // `matrixmultiply`-backed `.dot()` calls. The five hand-rolled
+                // inner products were:
+                //   `cross = B_j B_kᵀ`  — O(m_j·m_k·p), row-contiguous (moderate)
+                //   `mb    = cross · B_k` — O(m_j·m_k·p), strided column access
+                //   `sjb   = S_j · B_j`   — O(m_j²·p), strided column access
+                //   `mtb   = crossᵀ · B_j` — O(m_j·m_k·p), strided column access
+                //   `skb   = S_k · B_k`   — O(m_k²·p), strided column access
+                // The strided column accesses (fixed `o`, varying row) thrash
+                // the cache at p=2048; `.dot()` uses blocked traversal that
+                // keeps tiles in L1. The math is algebraically equivalent; only
+                // the summation order changes (blocked vs sequential), so results
+                // are within existing numerical tolerances but not bit-for-bit
+                // identical.
+                let cross = bj.dot(&bk.t());
                 let s_j = bj.dot(&bj.t());
                 let s_k = bk.dot(&bk.t());
                 let d_j = s_j.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -1442,33 +1449,23 @@ impl SaeManifoldTerm {
                 let alpha = penalty_scale * (-g[[e.jl, e.kl]] * e.q);
                 let off_j = offsets[e.j];
                 let off_k = offsets[e.k];
+                // Precompute the full `(m_·, p)` matrix products once per edge
+                // (was: re-derived element-by-element in the inner loop).
+                let mb_mat = cross.dot(bk); // (m_j, p):  ∂o/∂B_j forward term
+                let sjb_mat = s_j.dot(bj); //  (m_j, p): ∂o/∂B_j self term
+                let mtb_mat = cross.t().dot(bj); // (m_k, p): ∂o/∂B_k forward term
+                let skb_mat = s_k.dot(bk); //      (m_k, p): ∂o/∂B_k self term
                 let mut v: Vec<(usize, f64)> = Vec::with_capacity(m_j * p + m_k * p);
                 for a in 0..m_j {
                     for o in 0..p {
-                        let mut mb = 0.0_f64;
-                        for b in 0..m_k {
-                            mb += cross[[a, b]] * bk[[b, o]];
-                        }
-                        let mut sjb = 0.0_f64;
-                        for a2 in 0..m_j {
-                            sjb += s_j[[a, a2]] * bj[[a2, o]];
-                        }
-                        let do_j = 2.0 * (mb * inv_dd - sh_j * sjb);
+                        let do_j = 2.0 * (mb_mat[[a, o]] * inv_dd - sh_j * sjb_mat[[a, o]]);
                         sys.gb[off_j + a * p + o] += alpha * do_j;
                         v.push((off_j + a * p + o, do_j));
                     }
                 }
                 for b in 0..m_k {
                     for o in 0..p {
-                        let mut mtb = 0.0_f64;
-                        for a in 0..m_j {
-                            mtb += cross[[a, b]] * bj[[a, o]];
-                        }
-                        let mut skb = 0.0_f64;
-                        for b2 in 0..m_k {
-                            skb += s_k[[b, b2]] * bk[[b2, o]];
-                        }
-                        let do_k = 2.0 * (mtb * inv_dd - sh_k * skb);
+                        let do_k = 2.0 * (mtb_mat[[b, o]] * inv_dd - sh_k * skb_mat[[b, o]]);
                         sys.gb[off_k + b * p + o] += alpha * do_k;
                         v.push((off_k + b * p + o, do_k));
                     }
