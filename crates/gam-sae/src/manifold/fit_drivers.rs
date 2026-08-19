@@ -7287,8 +7287,16 @@ impl SaeManifoldTerm {
                 step_norm_sq += v * v;
             }
             let mut quotient_step_norm = step_norm_sq.sqrt();
+            // The framed inner solve returns δβ in the FACTORED border layout
+            // (`factored_border_dim`), not the full `beta_dim` — this guard
+            // previously demanded `beta_dim()`, so every frame-active solve
+            // silently skipped the #2267 trust region and the quotient-step
+            // norm (returning the unprojected raw step norm instead). The
+            // streaming path already sized its border correctly; this site
+            // now agrees with `quotient_newton_step_norm_sq`, which expects
+            // `factored_border_dim` and validates it itself.
             if delta_ext_coord.len() == self.n_obs() * self.assignment.row_block_dim()
-                && delta_beta.len() == self.beta_dim()
+                && delta_beta.len() == self.factored_border_dim()
             {
                 let quotient_step_norm_sq = self.quotient_newton_step_norm_sq(
                     delta_ext_coord.view(),

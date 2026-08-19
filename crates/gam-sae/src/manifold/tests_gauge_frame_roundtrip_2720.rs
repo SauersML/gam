@@ -38,7 +38,7 @@ use super::*;
 /// verbatim (same LCG, same seed) so this fixture sits on the same geometry the
 /// `1.29e-16` unframed measurement was taken on — the frame is then the ONLY
 /// thing that differs between that measurement and this one.
-fn planted_circle_cloud() -> Array2<f64> {
+pub(super) fn planted_circle_cloud() -> Array2<f64> {
     let n = 42usize;
     let p = 48usize;
     let mut state = 0x2468_ace0_1357_9bdfu64;
