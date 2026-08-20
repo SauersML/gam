@@ -1938,4 +1938,261 @@ mod tests {
             }
         }
     }
+
+    // ---- Mobius gyrogroup laws and numerical regressions ----
+    //
+    // G1 is covered above by `mobius_add_zero_is_identity_on_either_side`.
+    // This block covers G2-G6, selected derived gyration laws, a
+    // nonassociativity witness, closure, and curvature homothety/flat-limit
+    // regressions. These are fixed deterministic cases, not an exhaustive
+    // property-based audit over dimensions, curvatures, or the ball boundary.
+
+    /// Compute the Möbius gyration `gyr[u,v]w = -(u⊕v) ⊕ (u ⊕ (v ⊕ w))`.
+    ///
+    /// This is the gyroautomorphism that compensates for the associativity defect
+    /// and is the defining operation of a gyrogroup.
+    fn gyr(
+        u: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+        w: ArrayView1<'_, f64>,
+        curvature: f64,
+    ) -> Array1<f64> {
+        let uv = mobius_add(u, v, curvature).expect("u⊕v");
+        let vw = mobius_add(v, w, curvature).expect("v⊕w");
+        let u_vw = mobius_add(u, vw.view(), curvature).expect("u⊕(v⊕w)");
+        let neg_uv = uv.mapv(|x| -x);
+        mobius_add(neg_uv.view(), u_vw.view(), curvature).expect("gyr")
+    }
+
+    #[test]
+    fn mobius_add_inverse_cancels_to_origin() {
+        // Both left and right inverse: a ⊕ (-a) = 0 AND (-a) ⊕ a = 0.
+        // G2 is the left-inverse law; the right-inverse law is a derived gyrogroup identity.
+        let pts = [
+            array![0.3, -0.1, 0.05],
+            array![0.5, 0.2, -0.3],
+            array![-0.15, 0.4, 0.1],
+        ];
+        for a in &pts {
+            let neg_a = a.mapv(|x| -x);
+            let right = mobius_add(a.view(), neg_a.view(), -1.0).expect("a ⊕ (-a)");
+            let left = mobius_add(neg_a.view(), a.view(), -1.0).expect("(-a) ⊕ a");
+            for i in 0..a.len() {
+                assert!(right[i].abs() < 1.0e-14, "a ⊕ (-a) = {right:?}, expected zero");
+                assert!(left[i].abs() < 1.0e-14, "(-a) ⊕ a = {left:?}, expected zero");
+            }
+        }
+    }
+
+    #[test]
+    fn mobius_add_satisfies_left_gyroassociative_law() {
+        // a ⊕ (b ⊕ c) = (a ⊕ b) ⊕ gyr[a,b](c) — the fundamental gyrogroup identity.
+        let a = array![0.3, -0.1, 0.05];
+        let b = array![0.15, 0.2, -0.1];
+        let c = array![0.1, -0.05, 0.2];
+        let left = {
+            let bc = mobius_add(b.view(), c.view(), -1.0).expect("b⊕c");
+            mobius_add(a.view(), bc.view(), -1.0).expect("a⊕(b⊕c)")
+        };
+        let right = {
+            let ab = mobius_add(a.view(), b.view(), -1.0).expect("a⊕b");
+            let gyr_c = gyr(a.view(), b.view(), c.view(), -1.0);
+            mobius_add(ab.view(), gyr_c.view(), -1.0).expect("(a⊕b)⊕gyr[a,b]c")
+        };
+        for i in 0..a.len() {
+            assert!(
+                (left[i] - right[i]).abs() < 1.0e-12,
+                "gyrogroup identity failed at {i}: {left:?} vs {right:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gyration_is_automorphism_of_addition() {
+        // gyr[a,b](x ⊕ y) = gyr[a,b](x) ⊕ gyr[a,b](y)
+        // — the gyration is an automorphism of the gyrogroup operation.
+        // This is axiom G4: every gyration is a bijection that preserves ⊕.
+        let a = array![0.3, -0.1, 0.05];
+        let b = array![0.15, 0.2, -0.1];
+        let x = array![0.1, -0.05, 0.2];
+        let y = array![0.08, 0.12, -0.03];
+
+        let xy = mobius_add(x.view(), y.view(), -1.0).expect("x⊕y");
+        let gyr_xy = gyr(a.view(), b.view(), xy.view(), -1.0);
+        let gyr_x = gyr(a.view(), b.view(), x.view(), -1.0);
+        let gyr_y = gyr(a.view(), b.view(), y.view(), -1.0);
+        let gyr_x_plus_gyr_y = mobius_add(gyr_x.view(), gyr_y.view(), -1.0).expect("gyr_x⊕gyr_y");
+
+        for i in 0..gyr_xy.len() {
+            assert!(
+                (gyr_xy[i] - gyr_x_plus_gyr_y[i]).abs() < 1.0e-11,
+                "gyration automorphism failed at {i}: \
+                 gyr(x⊕y)={gyr_xy:?}, gyr(x)⊕gyr(y)={gyr_x_plus_gyr_y:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gyration_left_loop_property() {
+        // gyr[a⊕b, b] = gyr[a, b] — the left loop property (axiom G5).
+        // The gyration of a composed sum with its second argument
+        // collapses to the original gyration.
+        let a = array![0.3, -0.1, 0.05];
+        let b = array![0.15, 0.2, -0.1];
+        let w = array![0.1, -0.05, 0.2];
+
+        let ab = mobius_add(a.view(), b.view(), -1.0).expect("a⊕b");
+        let gyr_ab_b = gyr(ab.view(), b.view(), w.view(), -1.0);
+        let gyr_a_b = gyr(a.view(), b.view(), w.view(), -1.0);
+
+        for i in 0..w.len() {
+            assert!(
+                (gyr_ab_b[i] - gyr_a_b[i]).abs() < 1.0e-11,
+                "left loop property failed at {i}: \
+                 gyr[a⊕b,b](w)={gyr_ab_b:?}, gyr[a,b](w)={gyr_a_b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mobius_add_is_gyrocommutative() {
+        // a ⊕ b = gyr[a,b](b ⊕ a) — the gyrocommutative law.
+        // Möbius addition is NOT commutative, but the gyration exactly
+        // relates the two orderings (Ungar §2.2).
+        let a = array![0.3, -0.1, 0.05];
+        let b = array![0.15, 0.2, -0.1];
+        let ab = mobius_add(a.view(), b.view(), -1.0).expect("a⊕b");
+        let ba = mobius_add(b.view(), a.view(), -1.0).expect("b⊕a");
+        let gyr_ba = gyr(a.view(), b.view(), ba.view(), -1.0);
+        for i in 0..a.len() {
+            assert!(
+                (ab[i] - gyr_ba[i]).abs() < 1.0e-12,
+                "gyrocommutative law failed at {i}: a⊕b={ab:?}, gyr[a,b](b⊕a)={gyr_ba:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mobius_add_left_cancellation_law() {
+        let a = array![0.3, -0.1, 0.05];
+        let b = array![0.15, 0.2, -0.1];
+        let ab = mobius_add(a.view(), b.view(), -1.0).expect("a⊕b");
+        let neg_a = a.mapv(|x| -x);
+        let recovered = mobius_add(neg_a.view(), ab.view(), -1.0).expect("(-a)⊕(a⊕b)");
+        for i in 0..b.len() {
+            assert!(
+                (recovered[i] - b[i]).abs() < 1.0e-13,
+                "left-cancellation: expected {b:?}, got {recovered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gyration_inverse_is_reversed_gyration() {
+        // gyr[a,b]⁻¹ = gyr[b,a] — the gyration inversion law.
+        // Not a defining axiom but a derived property of gyrogroups.
+        let a = array![0.3, -0.1, 0.05];
+        let b = array![0.15, 0.2, -0.1];
+        let w = array![0.1, -0.05, 0.2];
+
+        let once = gyr(a.view(), b.view(), w.view(), -1.0);
+        let recovered = gyr(b.view(), a.view(), once.view(), -1.0);
+        for i in 0..w.len() {
+            assert!(
+                (recovered[i] - w[i]).abs() < 1.0e-12,
+                "gyr[b,a](gyr[a,b](w)) should recover w at {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn gyration_is_identity_when_either_generator_is_zero() {
+        // gyr[a,0] = gyr[0,a] = I (see Ungar 2008, Theorem 2.34).
+        let b = array![0.15, 0.2, -0.1];
+        let w = array![0.1, -0.05, 0.2];
+        let zero = Array1::<f64>::zeros(3);
+        let gyr_0b = gyr(zero.view(), b.view(), w.view(), -1.0);
+        let gyr_b0 = gyr(b.view(), zero.view(), w.view(), -1.0);
+        for i in 0..w.len() {
+            assert!((gyr_0b[i] - w[i]).abs() < 1.0e-13, "gyr[0,b] should be id");
+            assert!((gyr_b0[i] - w[i]).abs() < 1.0e-13, "gyr[b,0] should be id");
+        }
+    }
+
+    #[test]
+    fn mobius_add_is_not_associative() {
+        let a = array![0.3, -0.1, 0.05];
+        let b = array![0.15, 0.2, -0.1];
+        let c = array![0.1, -0.05, 0.2];
+        let left = {
+            let ab = mobius_add(a.view(), b.view(), -1.0).expect("a⊕b");
+            mobius_add(ab.view(), c.view(), -1.0).expect("(a⊕b)⊕c")
+        };
+        let right = {
+            let bc = mobius_add(b.view(), c.view(), -1.0).expect("b⊕c");
+            mobius_add(a.view(), bc.view(), -1.0).expect("a⊕(b⊕c)")
+        };
+        let max_diff = (0..a.len()).map(|i| (left[i] - right[i]).abs()).fold(0.0, f64::max);
+        assert!(
+            max_diff > 1.0e-6,
+            "Möbius add should be non-associative, associator = {max_diff:.3e}"
+        );
+    }
+
+    #[test]
+    fn mobius_add_stays_inside_ball_for_interior_points() {
+        let pts = [
+            array![0.5, 0.3],
+            array![-0.4, 0.2],
+            array![0.1, -0.6],
+            array![0.35, -0.35],
+        ];
+        for a in &pts {
+            for b in &pts {
+                let sum = mobius_add(a.view(), b.view(), -1.0).expect("a⊕b");
+                let norm: f64 = sum.iter().map(|v| v * v).sum::<f64>().sqrt();
+                assert!(norm < 1.0, "Möbius sum escaped ball: norm {norm:.6e}");
+            }
+        }
+    }
+
+    #[test]
+    fn mobius_add_curvature_scaling_relation() {
+        // Exact scaling: x ⊕_{-K} y = (1/√K)·((√K·x) ⊕_{-1} (√K·y)).
+        // This is a homothety (scaling equivalence) of the Möbius operation:
+        // the ball of radius 1/√K at curvature -K maps to the unit ball at
+        // -1 under x ↦ √K·x, but distances scale by √K so the spaces are
+        // not isometric when K ≠ 1.
+        let a = array![0.1, 0.05];
+        let b = array![0.03, -0.02];
+        let k = 4.0_f64;
+        let sqrt_k = k.sqrt();
+
+        // Scale into the unit ball, add there, scale back.
+        let a_scaled = a.mapv(|v| sqrt_k * v);
+        let b_scaled = b.mapv(|v| sqrt_k * v);
+        let unit_sum = mobius_add(a_scaled.view(), b_scaled.view(), -1.0).expect("unit ball");
+        let scaled_back = unit_sum.mapv(|v| v / sqrt_k);
+
+        // Direct sum at curvature -K.
+        let direct = mobius_add(a.view(), b.view(), -k).expect("curvature -K");
+
+        for i in 0..2 {
+            assert!(
+                (scaled_back[i] - direct[i]).abs() < 1.0e-12,
+                "curvature scaling failed at {i}: scaled={scaled_back:?}, direct={direct:?}"
+            );
+        }
+
+        // Near-flat limit: Möbius → Euclidean vector addition.
+        let euclidean = &a + &b;
+        let near_flat = mobius_add(a.view(), b.view(), -1.0e-8).expect("near-flat");
+        for i in 0..2 {
+            assert!(
+                (near_flat[i] - euclidean[i]).abs() < 1.0e-10,
+                "near-flat Möbius should ≈ Euclidean"
+            );
+        }
+    }
+
 }
