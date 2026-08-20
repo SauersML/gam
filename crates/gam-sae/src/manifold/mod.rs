@@ -110,12 +110,12 @@ use std::sync::Arc;
 pub(crate) use gam_solve::arrow_schur::{
     ArrowBetaGaugeQuotient, ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError,
     ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode, BetaPenaltyOp, CompositePenaltyOp,
-    DensePenaltyOp, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
-    FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp,
-    CoupledCarrierPenaltyOp, SparseGBlock, StreamingArrowSchur, matrix_free_arrow_inverse_apply,
-    matrix_free_arrow_operator_apply, prepare_sae_resident_frame, row_sub_floor_null_directions,
-    solve_arrow_newton_step_with_proximal_correction, solve_streaming_reduced_beta,
-    solve_with_lm_escalation_inner,
+    CoupledCarrierPenaltyOp, DensePenaltyOp, DeviceSaePcgData, DeviceSaeSmoothBlock,
+    FactoredFrameGBlock, FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp,
+    SparseBlockKroneckerPenaltyOp, SparseGBlock, StreamingArrowSchur,
+    matrix_free_arrow_inverse_apply, matrix_free_arrow_operator_apply, prepare_sae_resident_frame,
+    row_sub_floor_null_directions, solve_arrow_newton_step_with_proximal_correction,
+    solve_streaming_reduced_beta, solve_with_lm_escalation_inner,
 };
 
 pub(crate) use gam_terms::analytic_penalties::{
@@ -504,6 +504,18 @@ mod tests_gauge_frame_roundtrip_2720;
 /// `|gᵀvᵢ|` scalar every prior measurement reports cannot.
 #[cfg(test)]
 mod tests_gauge_posterior_flatness_2720;
+
+#[cfg(test)]
+mod tests_gauge_geometry_2720;
+mod tests_linear_escalation_2720;
+
+/// #2720 follow-up (PR #2772 thread) — the channel-null family's smoothness
+/// slope is carried by the sub-floor singular value (a data-fit currency the
+/// penalty never sees at emission), converted through the roughness Gram.
+/// Pins the mechanism behind the torus-cell violation the geometry sweep
+/// measured at 4.47x tolerance on 11 of 392 directions.
+#[cfg(test)]
+mod tests_channel_null_currency_2720;
 
 #[cfg(test)]
 mod tests_rho_structural_layout_2253;
