@@ -506,6 +506,9 @@ mod tests_gauge_frame_roundtrip_2720;
 mod tests_gauge_posterior_flatness_2720;
 
 #[cfg(test)]
+mod tests_gauge_baseline_2720;
+
+#[cfg(test)]
 mod tests_rho_structural_layout_2253;
 
 #[cfg(test)]
