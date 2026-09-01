@@ -34,10 +34,6 @@ pub struct PosteriorDrawMatrices {
 }
 
 impl PosteriorDrawMatrices {
-    #[inline]
-    pub fn n_draws(&self) -> usize {
-        self.eta.nrows()
-    }
 
     #[inline]
     pub fn n_rows(&self) -> usize {
@@ -62,29 +58,6 @@ pub enum PosteriorDrawPrediction {
 }
 
 impl PosteriorDrawPrediction {
-    #[inline]
-    pub const fn model_class(&self) -> PredictModelClass {
-        match self {
-            Self::Standard(_) => PredictModelClass::Standard,
-            Self::GaussianLocationScale(_) => PredictModelClass::GaussianLocationScale,
-            Self::BinomialLocationScale(_) => PredictModelClass::BinomialLocationScale,
-            Self::DispersionLocationScale(_) => PredictModelClass::DispersionLocationScale,
-            Self::BernoulliMarginalSlope(_) => PredictModelClass::BernoulliMarginalSlope,
-            Self::TransformationNormal(_) => PredictModelClass::TransformationNormal,
-        }
-    }
-
-    #[inline]
-    pub fn matrices(&self) -> &PosteriorDrawMatrices {
-        match self {
-            Self::Standard(matrices)
-            | Self::GaussianLocationScale(matrices)
-            | Self::BinomialLocationScale(matrices)
-            | Self::DispersionLocationScale(matrices)
-            | Self::BernoulliMarginalSlope(matrices)
-            | Self::TransformationNormal(matrices) => matrices,
-        }
-    }
 
     #[inline]
     pub fn into_matrices(self) -> PosteriorDrawMatrices {

@@ -366,64 +366,6 @@ fn selected_uncertainty_backend<'a>(
 /// generic prediction libraries, and applications that only retain the
 /// posterior covariance.
 pub trait UncertaintyCovarianceSource {
-    /// Build a [`PredictionCovarianceBackend`] satisfying the requested
-    /// covariance mode (or an error if the source cannot honor it). The
-    /// returned source records the exact covariance definition actually used.
-    fn select_uncertainty_backend(
-        &self,
-        expected_dim: usize,
-        mode: InferenceCovarianceMode,
-        label: &str,
-    ) -> Result<(PredictionCovarianceBackend<'_>, InferenceCovarianceMode), EstimationError>;
-    /// Optional fitted adaptive-link state (SAS / BetaLogistic / Mixture /
-    /// latent cloglog). Standard links and raw covariance sources return
-    /// `None` and are handled with the family's own `InverseLink`.
-    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState>;
-    /// Optional first-order bias-correction shift `H⁻¹ S(λ̂) β̂` applied to
-    /// the linear predictor when `options.apply_bias_correction` is set.
-    fn resolved_bias_correction_beta(&self) -> Option<ArrayView1<'_, f64>> {
-        None
-    }
-    /// Optional first-order bias-correction Jacobian `A = I + H⁻¹ S(λ̂)`. When the
-    /// predictor centre is bias-corrected (`resolved_bias_correction_beta` shifts
-    /// it to `β_BC = A·β̂`), the matching CONDITIONAL covariance is `A·V·Aᵀ`, not
-    /// the raw `Vb` the conditional backend reports. The smoothing-corrected
-    /// covariance already folds `A` in, so callers apply this ONLY on the
-    /// conditional path. `None` ⇒ no
-    /// adjustment (raw `Array2` sources, or `A` unavailable) — a safe no-op.
-    fn resolved_bias_correction_jacobian(&self) -> Option<ArrayView2<'_, f64>> {
-        None
-    }
-    /// Gaussian residual standard deviation used to widen observation
-    /// intervals for `ResponseFamily::Gaussian`. Raw-covariance sources
-    /// report `0.0`, which collapses the observation interval to the mean
-    /// interval (the only safe default when no dispersion is available).
-    fn observation_standard_deviation(&self) -> f64 {
-        0.0
-    }
-    /// Fitted dispersion/precision hint used to widen observation intervals for
-    /// dispersion-bearing families (Tweedie, Gamma, Beta). Raw covariance alone
-    /// has no observation-scale metadata, so callers that only retain `Vb` must
-    /// wrap it in [`PredictionCovarianceWithScale`] when a fitted scale is
-    /// available.
-    fn observation_phi(&self) -> Option<f64> {
-        None
-    }
-    /// Estimated Negative-Binomial overdispersion `theta` used to widen
-    /// observation intervals (`Var = mu + mu^2/theta`, issue #802). Read from the
-    /// fitted `likelihood_scale` (`EstimatedNegBinTheta`) so the interval tracks
-    /// the data's overdispersion rather than the family-enum seed. Raw-covariance
-    /// sources return `None`; estimated-NB observation intervals are omitted
-    /// unless a fitted theta is available through this path.
-    fn observation_theta(&self) -> Option<f64> {
-        None
-    }
-    /// Full fitted result when this source owns a persisted constrained
-    /// posterior. Raw covariance carriers cannot answer this because moments
-    /// alone do not identify a truncated law.
-    fn constrained_fit_result(&self) -> Option<&UnifiedFitResult> {
-        None
-    }
 }
 
 impl UncertaintyCovarianceSource for UnifiedFitResult {
@@ -475,34 +417,6 @@ impl ObservationScaleHints {
         }
     }
 
-    pub fn from_likelihood_scale(scale: LikelihoodScaleMetadata) -> Self {
-        Self {
-            observation_phi: positive_finite(scale.fixed_phi()),
-            observation_theta: positive_finite(scale.negbin_theta()),
-        }
-    }
-
-    pub fn from_fit(fit: &UnifiedFitResult) -> Self {
-        Self::from_likelihood_scale(fit.likelihood_scale.clone())
-    }
-
-    pub fn with_phi(phi: f64) -> Self {
-        Self {
-            observation_phi: positive_finite(Some(phi)),
-            observation_theta: None,
-        }
-    }
-
-    pub fn with_theta(theta: f64) -> Self {
-        Self {
-            observation_phi: None,
-            observation_theta: positive_finite(Some(theta)),
-        }
-    }
-}
-
-fn positive_finite(value: Option<f64>) -> Option<f64> {
-    value.filter(|v| v.is_finite() && *v > 0.0)
 }
 
 /// Raw coefficient covariance plus the fitted observation-scale values needed
@@ -522,98 +436,14 @@ impl<'a> PredictionCovarianceWithScale<'a> {
         Self { covariance, scale }
     }
 
-    pub fn from_fit(covariance: ArrayView2<'a, f64>, fit: &UnifiedFitResult) -> Self {
-        Self::new(covariance, ObservationScaleHints::from_fit(fit))
-    }
 }
 
 impl UncertaintyCovarianceSource for PredictionCovarianceWithScale<'_> {
-    fn select_uncertainty_backend(
-        &self,
-        expected_dim: usize,
-        mode: InferenceCovarianceMode,
-        label: &str,
-    ) -> Result<(PredictionCovarianceBackend<'_>, InferenceCovarianceMode), EstimationError> {
-        if self.covariance.nrows() != expected_dim || self.covariance.ncols() != expected_dim {
-            return Err(EstimationError::InvalidInput(format!(
-                "{label}: covariance dimension mismatch: expected {expected_dim}x{expected_dim}, got {}x{}",
-                self.covariance.nrows(),
-                self.covariance.ncols()
-            )));
-        }
-        match mode {
-            InferenceCovarianceMode::Conditional => Ok((
-                PredictionCovarianceBackend::from_dense(self.covariance),
-                InferenceCovarianceMode::Conditional,
-            )),
-            InferenceCovarianceMode::SmoothingCorrected => {
-                Err(EstimationError::InvalidInput(format!(
-                    "{label}: raw covariance source cannot provide smoothing-corrected covariance"
-                )))
-            }
-        }
-    }
 
-    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
-        // A raw covariance-plus-scale wrapper carries no fitted adaptive-link
-        // state; every link variant resolves to `None` here and is handled by
-        // the family's own `InverseLink`. Matched exhaustively (mirroring the
-        // bare `Array2` source) so a new adaptive link cannot silently slip
-        // through as `None` without review.
-        match &family.link {
-            InverseLink::Standard(_)
-            | InverseLink::LatentCLogLog(_)
-            | InverseLink::Sas(_)
-            | InverseLink::BetaLogistic(_)
-            | InverseLink::Mixture(_) => None,
-        }
-    }
-
-    fn observation_phi(&self) -> Option<f64> {
-        self.scale.observation_phi
-    }
-
-    fn observation_theta(&self) -> Option<f64> {
-        self.scale.observation_theta
-    }
 }
 
 impl UncertaintyCovarianceSource for Array2<f64> {
-    fn select_uncertainty_backend(
-        &self,
-        expected_dim: usize,
-        mode: InferenceCovarianceMode,
-        label: &str,
-    ) -> Result<(PredictionCovarianceBackend<'_>, InferenceCovarianceMode), EstimationError> {
-        if self.nrows() != expected_dim || self.ncols() != expected_dim {
-            return Err(EstimationError::InvalidInput(format!(
-                "{label}: covariance dimension mismatch: expected {expected_dim}x{expected_dim}, got {}x{}",
-                self.nrows(),
-                self.ncols()
-            )));
-        }
-        match mode {
-            InferenceCovarianceMode::Conditional => Ok((
-                PredictionCovarianceBackend::from_dense(self.view()),
-                InferenceCovarianceMode::Conditional,
-            )),
-            InferenceCovarianceMode::SmoothingCorrected => {
-                Err(EstimationError::InvalidInput(format!(
-                    "{label}: raw covariance source cannot provide smoothing-corrected covariance"
-                )))
-            }
-        }
-    }
 
-    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
-        match &family.link {
-            InverseLink::Standard(_)
-            | InverseLink::LatentCLogLog(_)
-            | InverseLink::Sas(_)
-            | InverseLink::BetaLogistic(_)
-            | InverseLink::Mixture(_) => None,
-        }
-    }
 }
 
 /// Symmetric quadratic form `g' · C · g` for an SPD posterior covariance `C`.
@@ -974,8 +804,6 @@ where
 
 pub trait FittedModelPredictExt {
     fn predictor(&self) -> Option<Box<dyn PredictableModel>>;
-    fn bernoulli_marginal_slope_predictor(&self)
-    -> Result<BernoulliMarginalSlopePredictor, String>;
     fn block_roles(&self) -> Option<Vec<BlockRole>>;
 }
 
@@ -2142,33 +1970,6 @@ where
     Ok(PredictResult { eta, mean })
 }
 
-/// Nonlinear posterior-mean prediction with coefficient uncertainty propagation.
-///
-/// For nonlinear links, returns E[g^{-1}(eta_tilde)] where eta_tilde ~ N(eta_hat, se_eta^2).
-/// For Gaussian identity, this equals the standard plug-in mean.
-pub fn predict_gam_posterior_mean<X>(
-    x: X,
-    beta: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    family: LikelihoodSpec,
-    covariance: ArrayView2<'_, f64>,
-) -> Result<PredictPosteriorMeanResult, EstimationError>
-where
-    X: Into<DesignMatrix>,
-{
-    let x = x.into();
-    let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-    let strategy = strategy_for_spec(&family);
-    predict_gam_posterior_mean_from_backend(
-        x,
-        beta,
-        offset,
-        &backend,
-        &strategy,
-        "predict_gam_posterior_mean",
-    )
-}
-
 pub fn predict_gam_posterior_meanwith_backend<X>(
     x: X,
     beta: ArrayView1<'_, f64>,
@@ -2188,34 +1989,6 @@ where
         backend,
         &strategy,
         "predict_gam_posterior_meanwith_backend",
-    )
-}
-
-/// Nonlinear posterior-mean prediction with link-state support for SAS/mixture families.
-///
-/// This mirrors `predict_gam_posterior_mean`, but also uses `fit` metadata for
-/// link families that require extra state (`BinomialSas`, `BinomialMixture`).
-pub fn predict_gam_posterior_meanwith_fit<X>(
-    x: X,
-    beta: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    family: LikelihoodSpec,
-    covariance: ArrayView2<'_, f64>,
-    fit: &UnifiedFitResult,
-) -> Result<PredictPosteriorMeanResult, EstimationError>
-where
-    X: Into<DesignMatrix>,
-{
-    let x = x.into();
-    let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-    let strategy = strategy_from_fit(&family, fit)?;
-    predict_gam_posterior_mean_from_backend(
-        x,
-        beta,
-        offset,
-        &backend,
-        &strategy,
-        "predict_gam_posterior_meanwith_fit",
     )
 }
 
@@ -3465,110 +3238,6 @@ where
             .zip(response_var.iter())
             .map(|(&se, &var)| (se.powi(2) + var).sqrt()),
     ))
-}
-
-/// Coefficient-level uncertainty and confidence intervals.
-pub fn coefficient_uncertainty(
-    fit: &UnifiedFitResult,
-    confidence_level: f64,
-    covariance_mode: InferenceCovarianceMode,
-) -> Result<CoefficientUncertaintyResult, EstimationError> {
-    coefficient_uncertaintywith_mode(fit, confidence_level, covariance_mode)
-}
-
-/// Coefficient-level uncertainty and confidence intervals with explicit covariance mode.
-pub fn coefficient_uncertaintywith_mode(
-    fit: &UnifiedFitResult,
-    confidence_level: f64,
-    covariance_mode: InferenceCovarianceMode,
-) -> Result<CoefficientUncertaintyResult, EstimationError> {
-    if !(confidence_level.is_finite() && confidence_level > 0.0 && confidence_level < 1.0) {
-        return Err(EstimationError::InvalidInput(format!(
-            "confidence_level must be in (0,1), got {}",
-            confidence_level
-        )));
-    }
-    // Coefficient SEs are extracted from either:
-    // - conditional covariance H^{-1}, or
-    // - first-order corrected covariance H^{-1} + J V_rho J^T.
-    let se = match covariance_mode {
-        InferenceCovarianceMode::Conditional => {
-            fit.beta_standard_errors().cloned().ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "fit result does not contain conditional coefficient standard errors"
-                        .to_string(),
-                )
-            })?
-        }
-        InferenceCovarianceMode::SmoothingCorrected => fit
-            .beta_standard_errors_corrected()
-            .cloned()
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "fit result does not contain smoothing-corrected coefficient standard errors"
-                        .to_string(),
-                )
-            })?,
-    };
-
-    if se.len() != fit.beta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "standard error length mismatch: beta has {}, se has {}",
-            fit.beta.len(),
-            se.len()
-        )));
-    }
-
-    if let Some(geometry) = fit.geometry.as_ref()
-        && geometry.constrained_posterior.is_some()
-    {
-        if geometry.coefficient_gauge.raw_total() != fit.beta.len() {
-            return Err(EstimationError::InvalidInput(format!(
-                "coefficient interval gauge has {} raw rows but the fit reports {} coefficients",
-                geometry.coefficient_gauge.raw_total(),
-                fit.beta.len()
-            )));
-        }
-        let law = constrained_law(fit, geometry, covariance_mode)?;
-        let mut lower = Array1::<f64>::zeros(fit.beta.len());
-        let mut upper = Array1::<f64>::zeros(fit.beta.len());
-        for coefficient in 0..fit.beta.len() {
-            let contrast = geometry
-                .coefficient_gauge
-                .t_full
-                .row(coefficient)
-                .to_owned();
-            let (active_lower, active_upper) = constrained_projection_equal_tailed_interval(
-                &law.ambient,
-                &law.geometry,
-                &contrast,
-                confidence_level,
-            )
-            .map_err(EstimationError::InvalidInput)?;
-            let shift = geometry.coefficient_gauge.affine_shift[coefficient];
-            lower[coefficient] = active_lower + shift;
-            upper[coefficient] = active_upper + shift;
-        }
-        return Ok(CoefficientUncertaintyResult {
-            estimate: fit.beta.clone(),
-            standard_error: se,
-            lower,
-            upper,
-            covariance_source: covariance_mode,
-        });
-    }
-
-    let z = standard_normal_quantile(0.5 + 0.5 * confidence_level)
-        .map_err(EstimationError::InvalidInput)?;
-    let lower = &fit.beta - &se.mapv(|s| z * s);
-    let upper = &fit.beta + &se.mapv(|s| z * s);
-    Ok(CoefficientUncertaintyResult {
-        estimate: fit.beta.clone(),
-        standard_error: se,
-        lower,
-        upper,
-        covariance_source: covariance_mode,
-    })
 }
 
 #[cfg(test)]

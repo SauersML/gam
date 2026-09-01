@@ -30,10 +30,6 @@ impl<'a> PredictionCovarianceBackend<'a> {
         Self::Dense(covariance)
     }
 
-    pub fn from_factorized_hessian(hessian: SymmetricMatrix) -> Result<Self, String> {
-        Self::from_factorized_hessian_scaled(hessian, 1.0)
-    }
-
     /// Like `from_factorized_hessian` but multiplies the resulting `H^{-1} rhs`
     /// by the supplied dispersion `φ`, so the backend returns `φ · H^{-1} rhs`
     /// (i.e. the `Vb = φ · H^{-1}` covariance application).
