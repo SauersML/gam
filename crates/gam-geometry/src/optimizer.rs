@@ -14,39 +14,7 @@ use crate::manifold::{GeometryResult, RiemannianManifold, check_len, quad_form};
 const STEIHAUG_CG_FORCING_FACTOR: f64 = 1.0e-2;
 
 pub trait RiemannianObjective {
-    fn value_gradient(&mut self, point: ArrayView1<'_, f64>) -> GeometryResult<(f64, Array1<f64>)>;
 
-    /// Riemannian Hessian–vector product `H(x)·v` for a tangent direction `v`
-    /// at `point`, returned in the same ambient/tangent coordinates as the
-    /// gradient.
-    ///
-    /// This is what upgrades the trust-region subproblem from a Cauchy-point
-    /// step (the exact minimizer of the *linear* model along the steepest
-    /// descent direction) to a Steihaug truncated-CG step that exploits real
-    /// curvature. An objective that exposes no second-order information returns
-    /// `None` (the default), and the trust region transparently falls back to
-    /// the Cauchy point — never to plain clipped steepest descent, which has no
-    /// model, no predicted/actual reduction ratio, and no accept/reject.
-    ///
-    /// The Riemannian-Hessian quadratic model the trust region builds from this
-    /// product is a valid second-order model of `f` only along a (≥)second-order
-    /// retraction (the exponential map, or any retraction with
-    /// [`RiemannianManifold::retraction_is_second_order`] `== true`). On a
-    /// manifold whose `retract` is only FIRST-order (e.g. the Stiefel/Grassmann
-    /// QR retraction) the second derivative of the pullback `f∘R_x` is not the
-    /// Riemannian Hessian, so the trust region ignores this curvature and uses
-    /// the first-order-correct Cauchy model instead (issue #956).
-    fn hessian_vector_product(
-        &mut self,
-        point: ArrayView1<'_, f64>,
-        tangent: ArrayView1<'_, f64>,
-    ) -> GeometryResult<Option<Array1<f64>>> {
-        // Validate the shapes the contract requires (a tangent at `point`), then
-        // report "no curvature available" so the trust region selects the
-        // Cauchy point. We never fabricate a Hessian here.
-        check_len("hessian_vector_product tangent", tangent.len(), point.len())?;
-        Ok(None)
-    }
 }
 
 /// Metric inner product `g_x(a, b) = aᵀ G(x) b` using the manifold metric
@@ -800,61 +768,6 @@ impl RiemannianLBFGS {
             })
         }
     }
-}
-
-/// Build the 2×D point path matrix `[p_from; p_to]` consumed by
-/// [`RiemannianManifold::parallel_transport`].
-fn transport_path(p_from: &Array1<f64>, p_to: &Array1<f64>) -> ndarray::Array2<f64> {
-    let d = p_from.len();
-    let mut path = ndarray::Array2::<f64>::zeros((2, d));
-    path.row_mut(0).assign(p_from);
-    path.row_mut(1).assign(p_to);
-    path
-}
-
-/// L-BFGS two-loop recursion in the CURRENT tangent space `T_xM`.
-///
-/// Each stored secant pair `(s_i, y_i)` lives in `T_{base_i}M`; before it can
-/// participate in the recursion it is parallel-transported into `T_xM`. All
-/// inner products use the manifold metric `g_x(·,·)` at the current point, so
-/// no two vectors from different tangent spaces are ever combined (#616).
-fn two_loop(
-    manifold: &dyn RiemannianManifold,
-    x: ArrayView1<'_, f64>,
-    grad: ArrayView1<'_, f64>,
-    history: &[SecantPair],
-) -> GeometryResult<Array1<f64>> {
-    // Transport every stored pair into the current tangent space once.
-    let mut s_cur: Vec<Array1<f64>> = Vec::with_capacity(history.len());
-    let mut y_cur: Vec<Array1<f64>> = Vec::with_capacity(history.len());
-    for pair in history {
-        let path = transport_path(&pair.base, &x.to_owned());
-        s_cur.push(manifold.parallel_transport(path.view(), pair.s.view())?);
-        y_cur.push(manifold.parallel_transport(path.view(), pair.y.view())?);
-    }
-
-    let mut q = grad.to_owned();
-    let mut alpha = vec![0.0; history.len()];
-    let mut rho = vec![0.0; history.len()];
-    for i in (0..history.len()).rev() {
-        let sy = g_inner(manifold, x, s_cur[i].view(), y_cur[i].view())?;
-        rho[i] = 1.0 / sy;
-        alpha[i] = rho[i] * g_inner(manifold, x, s_cur[i].view(), q.view())?;
-        q = &q - &(&y_cur[i] * alpha[i]);
-    }
-    let mut r = q;
-    if let (Some(s), Some(y)) = (s_cur.last(), y_cur.last()) {
-        let yy = g_inner(manifold, x, y.view(), y.view())?;
-        if yy > 1.0e-14 {
-            let sy = g_inner(manifold, x, s.view(), y.view())?;
-            r = &r * (sy / yy);
-        }
-    }
-    for i in 0..history.len() {
-        let beta = rho[i] * g_inner(manifold, x, y_cur[i].view(), r.view())?;
-        r = &r + &(&s_cur[i] * (alpha[i] - beta));
-    }
-    Ok(r)
 }
 
 #[cfg(test)]
