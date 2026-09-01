@@ -189,16 +189,10 @@ impl RowBatch {
 /// * `total_rows` / `width` are known up front (from shard headers) so callers
 ///   can size accumulators before the first read.
 pub trait CorpusRowSource {
-    /// Total rows across every shard in this source.
-    fn total_rows(&self) -> u64;
     /// Activation width `p` (columns per row).
     fn width(&self) -> usize;
-    /// Yield the next deterministic batch, or `Ok(None)` at end of corpus.
-    fn next_batch(&mut self) -> Result<Option<RowBatch>, ShardError>;
     /// Rewind to the first row so the next `next_batch` replays from the start.
     fn reset(&mut self);
-    /// Rows handed back per `next_batch` (may be smaller for the final batch).
-    fn batch_rows(&self) -> usize;
 }
 
 /// A single memory-mapped shard.
@@ -259,43 +253,6 @@ impl MappedShard {
         })
     }
 
-    /// Read a single row's `p` `f32` lanes, upcasting each to `f64`.
-    #[inline]
-    fn read_row_into(&self, local_row: usize, out: &mut [f64]) {
-        assert_eq!(out.len(), self.p);
-        let byte_start = self.data_offset + local_row * self.p * std::mem::size_of::<f32>();
-        let bytes = &self.mmap[byte_start..byte_start + self.p * std::mem::size_of::<f32>()];
-        for (c, slot) in out.iter_mut().enumerate() {
-            let b = c * std::mem::size_of::<f32>();
-            let lane = f32::from_le_bytes(bytes[b..b + 4].try_into().expect("4 bytes"));
-            *slot = f64::from(lane);
-        }
-    }
-
-    /// Bounded read-ahead: warm pages from `byte_start` up to (but not past)
-    /// `byte_start + window`, clamped to the shard payload. Advisory only.
-    fn prefetch(&self, byte_start: usize, window: usize) {
-        let payload_end = self.data_offset + self.n_rows * self.p * std::mem::size_of::<f32>();
-        let end = byte_start.saturating_add(window).min(payload_end);
-        if end <= byte_start {
-            return;
-        }
-        // Touch one byte per page so the kernel faults exactly the bounded
-        // window in our deterministic read order, never the whole shard via
-        // speculative readahead. `read_volatile` keeps the loads from being
-        // optimized away without mutating the read-only mapping.
-        let page = 4096usize;
-        let base = self.mmap.as_ptr();
-        let mut off = byte_start;
-        while off < end {
-            // SAFETY: `off < end <= mmap.len()`, so `base.add(off)` is in
-            // bounds of the live read-only mapping; we only read.
-            unsafe {
-                std::ptr::read_volatile(base.add(off));
-            }
-            off += page;
-        }
-    }
 }
 
 /// A [`CorpusRowSource`] over one or many shards with a bounded prefetch
@@ -359,57 +316,12 @@ impl MmapShardSource {
         })
     }
 
-    /// Open a source over every `*.shard` file in `dir`, ordered by file name
-    /// (the stable, OS-independent ordering that pins the deterministic global
-    /// row sequence).
-    pub fn open_dir(dir: &Path) -> Result<Self, ShardError> {
-        let mut paths: Vec<PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("shard") {
-                paths.push(path);
-            }
-        }
-        // Sort by file name bytes: deterministic and independent of the order
-        // the OS returns directory entries in.
-        paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-        if paths.is_empty() {
-            return Err(ShardError::Empty);
-        }
-        Self::open(&paths)
-    }
-
-    /// True once every row of every shard has been yielded.
-    #[inline]
-    fn at_end(&self) -> bool {
-        self.cursor_shard >= self.shards.len()
-    }
-
-    /// Advance the cursor past any fully-drained trailing shards so
-    /// `cursor_shard` either points at a shard with remaining rows or is at
-    /// `shards.len()` (end of corpus).
-    fn skip_drained_shards(&mut self) {
-        while self.cursor_shard < self.shards.len()
-            && self.cursor_local_row >= self.shards[self.cursor_shard].n_rows
-        {
-            self.cursor_shard += 1;
-            self.cursor_local_row = 0;
-        }
-    }
 }
 
 impl CorpusRowSource for MmapShardSource {
-    fn total_rows(&self) -> u64 {
-        self.total_rows
-    }
 
     fn width(&self) -> usize {
         self.p
-    }
-
-    fn batch_rows(&self) -> usize {
-        self.batch_rows
     }
 
     fn reset(&mut self) {
@@ -417,75 +329,6 @@ impl CorpusRowSource for MmapShardSource {
         self.cursor_local_row = 0;
     }
 
-    fn next_batch(&mut self) -> Result<Option<RowBatch>, ShardError> {
-        self.skip_drained_shards();
-        if self.at_end() {
-            return Ok(None);
-        }
-        // A batch never crosses a shard boundary: it stays within the current
-        // shard and is the smaller of the configured batch size and that
-        // shard's remaining rows. This keeps row reads contiguous in one
-        // mapping and keeps the prefetch window inside one shard's payload.
-        let shard_idx = self.cursor_shard;
-        let take = {
-            let shard = &self.shards[shard_idx];
-            let remaining = shard.n_rows - self.cursor_local_row;
-            self.batch_rows.min(remaining)
-        };
-
-        // Bounded prefetch over exactly the rows we are about to read, in the
-        // same deterministic order, before touching them.
-        {
-            let shard = &self.shards[shard_idx];
-            let first_byte =
-                shard.data_offset + self.cursor_local_row * shard.p * std::mem::size_of::<f32>();
-            let want = take * shard.p * std::mem::size_of::<f32>();
-            shard.prefetch(first_byte, want.min(self.prefetch_window_bytes));
-        }
-
-        let p = self.p;
-        let mut rows = Array2::<f64>::zeros((take, p));
-        let mut row_ids = Vec::with_capacity(take);
-        {
-            let shard = &self.shards[shard_idx];
-            for k in 0..take {
-                let local = self.cursor_local_row + k;
-                let mut row_view = rows.row_mut(k);
-                let slice = row_view
-                    .as_slice_mut()
-                    .expect("freshly allocated contiguous row");
-                shard.read_row_into(local, slice);
-                row_ids.push(shard.global_row_base + local as u64);
-            }
-        }
-        self.cursor_local_row += take;
-        self.skip_drained_shards();
-        Ok(Some(RowBatch { rows, row_ids }))
-    }
-}
-
-/// Serialize a `(n_rows × p)` `f64` activation matrix to the `v1` shard byte
-/// layout, downcasting each value to `f32`.
-///
-/// This is the writer counterpart to [`MmapShardSource`] — used by ingestion
-/// tooling and by the round-trip tests below to prove the reader reproduces the
-/// exact rows it was given (up to the `f32` storage rounding the format
-/// promises). Rows are written in row-major order.
-pub fn encode_shard_bytes(rows: ndarray::ArrayView2<'_, f64>) -> Vec<u8> {
-    let n_rows = rows.nrows();
-    let p = rows.ncols();
-    let mut out = Vec::with_capacity(HEADER_LEN + n_rows * p * std::mem::size_of::<f32>());
-    out.extend_from_slice(&SHARD_MAGIC);
-    out.extend_from_slice(&(n_rows as u64).to_le_bytes());
-    out.extend_from_slice(&(p as u64).to_le_bytes());
-    out.extend_from_slice(&DTYPE_F32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    for row in rows.outer_iter() {
-        for &v in row.iter() {
-            out.extend_from_slice(&(v as f32).to_le_bytes());
-        }
-    }
-    out
 }
 
 #[cfg(test)]

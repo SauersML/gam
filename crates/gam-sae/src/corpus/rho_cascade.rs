@@ -63,36 +63,6 @@ pub struct RhoStepPlan {
 }
 
 impl RhoStepPlan {
-    /// Decide whether `row_id` is in this step's subsample, and if so return its
-    /// importance weight. A full pass includes every row at weight `1.0`.
-    #[inline]
-    pub fn includes(&self, row_id: u64) -> Option<f64> {
-        if self.is_full_pass {
-            return Some(1.0);
-        }
-        if row_in_fraction(row_id, self.fraction) {
-            Some(self.importance_weight)
-        } else {
-            None
-        }
-    }
-}
-
-/// Deterministic Bernoulli inclusion of `row_id` at the given `fraction`.
-///
-/// Hashes `row_id` with the canonical `splitmix64` finalizer and includes the
-/// row iff the hash falls in the leading `fraction` of the `u64` space.
-/// `fraction <= 0` excludes everything; `fraction >= 1` includes everything.
-#[inline]
-pub fn row_in_fraction(row_id: u64, fraction: f64) -> bool {
-    if fraction >= 1.0 {
-        return true;
-    }
-    if fraction <= 0.0 {
-        return false;
-    }
-    let threshold = (fraction * HASH_SPACE) as u64;
-    splitmix64_hash(row_id) < threshold
 }
 
 /// The full subsample → full-pass ρ schedule.
@@ -170,37 +140,6 @@ impl RhoCascadeSchedule {
         &self.steps
     }
 
-    /// Plan for a specific outer step (clamped to the last step if `step`
-    /// runs past the schedule — extra ρ iterations are honest full passes).
-    pub fn step_plan(&self, step: usize) -> RhoStepPlan {
-        if let Some(plan) = self.steps.get(step) {
-            *plan
-        } else {
-            // Past the planned horizon: full pass at the final step index.
-            RhoStepPlan {
-                step,
-                fraction: 1.0,
-                importance_weight: 1.0,
-                is_full_pass: true,
-            }
-        }
-    }
-
-    pub fn total_rows(&self) -> u64 {
-        self.total_rows
-    }
-
-    /// Expected number of rows visited at a given step (for accumulator sizing
-    /// / progress reporting). Deterministic for full passes; expectation for
-    /// subsample steps.
-    pub fn expected_rows(&self, step: usize) -> u64 {
-        let plan = self.step_plan(step);
-        if plan.is_full_pass {
-            self.total_rows
-        } else {
-            (plan.fraction * self.total_rows as f64).round() as u64
-        }
-    }
 }
 
 /// Below this many rows, subsampling is not worth the bias risk: a step's

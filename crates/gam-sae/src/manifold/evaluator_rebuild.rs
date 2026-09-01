@@ -82,21 +82,6 @@ pub fn sae_periodic_basis_size(n_harmonics: usize) -> Result<usize, String> {
         })
 }
 
-/// Build per-atom Rust basis evaluators so the Newton loop can refresh
-/// `Phi_k` and `dPhi_k/dt` between steps without bouncing back to Python.
-///
-/// Every evaluator is rebuilt directly from its tagged resolution. No
-/// harmonic order, polynomial degree, or Duchon centers are inferred from a
-/// realized width or coordinate snapshot.
-pub fn build_sae_basis_evaluators(
-    geometry_plans: &[SaeAtomGeometryPlan],
-) -> Result<Vec<Arc<dyn SaeBasisSecondJet>>, String> {
-    geometry_plans
-        .iter()
-        .map(SaeAtomGeometryPlan::build_evaluator)
-        .collect()
-}
-
 /// The canonical basis tokens a caller may name. Single source of truth for
 /// both the parser and the error message that rejects everything else, so the
 /// two cannot drift apart.

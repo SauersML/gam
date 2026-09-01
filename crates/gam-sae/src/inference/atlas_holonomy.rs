@@ -208,35 +208,6 @@ impl GaussianPatchRowSplit {
         })
     }
 
-    /// Compact constructor for synthetic/analytic row populations.
-    #[must_use = "Gaussian patch row-split validation errors must be handled"]
-    pub fn from_disjoint_ranges(
-        pilot_start: usize,
-        pilot_len: usize,
-        inference_start: usize,
-        inference_len: usize,
-    ) -> Result<Self, String> {
-        if pilot_len == 0 || inference_len == 0 {
-            return Err("Gaussian PCA pilot and inference ranges must be non-empty".to_string());
-        }
-        let pilot_rows = GaussianRowSet::Contiguous {
-            start: pilot_start,
-            len: pilot_len,
-        };
-        let inference_rows = GaussianRowSet::Contiguous {
-            start: inference_start,
-            len: inference_len,
-        };
-        if pilot_rows.intersects(&inference_rows) {
-            return Err("Gaussian PCA pilot and inference ranges must be disjoint".to_string());
-        }
-        Ok(Self {
-            pilot_rows,
-            inference_rows,
-        })
-    }
-
-
 }
 
 /// Why the pilot projection may replace the ambient space in a certificate.
@@ -409,45 +380,6 @@ pub struct AtlasSignedEdge {
 }
 
 impl AtlasSignedEdge {
-    fn from_validated_analytic_sign(
-        a: usize,
-        b: usize,
-        overlap: usize,
-        sign: i8,
-    ) -> Result<Self, String> {
-        let identity = AtlasHolonomyEdgeId::new(a, b, overlap)?;
-        if !matches!(sign, -1 | 1) {
-            return Err(format!(
-                "an atlas transition sign must be +1 or -1, got {sign}"
-            ));
-        }
-        Ok(Self {
-            a: identity.a,
-            b: identity.b,
-            overlap: identity.overlap,
-            sign,
-        })
-    }
-
-    /// Extract an exact sign only from an analytically derived sphere seam.
-    /// Fitted polar factors are rejected even when their stored matrix is
-    /// perfectly orthogonal.
-    #[must_use = "analytic sphere transition provenance must be handled"]
-    pub fn from_analytic_sphere_transition(
-        transition: &SphereChartTransition,
-        overlap: usize,
-    ) -> Result<Self, String> {
-        let sign = transition.analytic_sign().ok_or_else(|| {
-            "a fitted sphere transition cannot enter an exact analytic holonomy certificate"
-                .to_string()
-        })?;
-        Self::from_validated_analytic_sign(
-            transition.from_chart(),
-            transition.to_chart(),
-            overlap,
-            sign,
-        )
-    }
 
     #[must_use]
     pub fn identity(self) -> AtlasHolonomyEdgeId {
@@ -1089,37 +1021,6 @@ impl GaussianPcaErrorModel {
         )
     }
 
-    /// Construct an authoritative Gaussian linearized-error law from an exact
-    /// caller-supplied joint covariance, including every shared-row cross block.
-    #[must_use = "Gaussian PCA error-model validation errors must be handled"]
-    pub fn certified_joint(
-        patches: &[GaussianPcaPatch],
-        cross_patch_provenance: CrossPatchCovarianceProvenance,
-        covariance: Array2<f64>,
-    ) -> Result<Self, String> {
-        Self::validate_joint(
-            patches,
-            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
-            cross_patch_provenance,
-            covariance,
-        )
-    }
-
-    /// Construct an explicitly supplied asymptotic plug-in joint covariance.
-    #[must_use = "Gaussian PCA error-model validation errors must be handled"]
-    pub fn plugin_joint(
-        patches: &[GaussianPcaPatch],
-        cross_patch_provenance: CrossPatchCovarianceProvenance,
-        covariance: Array2<f64>,
-    ) -> Result<Self, String> {
-        Self::validate_joint(
-            patches,
-            GaussianPcaCovarianceAuthority::AsymptoticPlugIn,
-            cross_patch_provenance,
-            covariance,
-        )
-    }
-
     fn validate_joint(
         patches: &[GaussianPcaPatch],
         authority: GaussianPcaCovarianceAuthority,
@@ -1561,29 +1462,6 @@ pub enum GaussBonnetCovarianceAuthority {
 }
 
 impl GaussBonnetInput {
-    #[must_use = "certified Gauss-Bonnet input validation errors must be handled"]
-    pub fn certified_independent_gaussian(
-        sources: Vec<GaussBonnetNoiseSource>,
-        contributions: Vec<GaussBonnetContribution>,
-    ) -> Result<Self, String> {
-        Self::validate(
-            GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources,
-            sources,
-            contributions,
-        )
-    }
-
-    #[must_use = "plug-in Gauss-Bonnet input validation errors must be handled"]
-    pub fn asymptotic_plugin(
-        sources: Vec<GaussBonnetNoiseSource>,
-        contributions: Vec<GaussBonnetContribution>,
-    ) -> Result<Self, String> {
-        Self::validate(
-            GaussBonnetCovarianceAuthority::AsymptoticPlugIn,
-            sources,
-            contributions,
-        )
-    }
 
     fn validate(
         covariance_authority: GaussBonnetCovarianceAuthority,

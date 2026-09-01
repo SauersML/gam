@@ -235,28 +235,6 @@ pub struct SparseDictConvergence {
 }
 
 impl SparseDictConvergence {
-    /// A certificate whose every residual is exactly zero against a positive
-    /// tolerance — i.e. a trivially converged fixed point. Used to mint
-    /// [`SparseDictFit`] values from fixed, hand-authored routings (downstream
-    /// consumers read the routing, not the fixed-point history).
-    pub fn trivially_converged() -> Self {
-        Self {
-            inner_ev_residual: 0.0,
-            inner_tolerance: 1e-6,
-            decoder_residual: 0.0,
-            decoder_tolerance: 1e-6,
-            routing_residual: 0.0,
-            routing_tolerance: 1e-6,
-            outer_rho_residual: 0.0,
-            outer_tolerance: 1e-6,
-            selected_rho: f64::INFINITY,
-            outer_iterations: 0,
-            accepted_births: 0,
-            live_atom_high_water: 0,
-            support_saturated: false,
-            certified: true,
-        }
-    }
 }
 
 impl SparseDictFit {
@@ -316,30 +294,6 @@ pub struct SparseDictTransform {
     pub codes: Array2<f32>,
     /// CPU/GPU scoring counters for this transform route.
     pub score_route_stats: ScoreRouteStats,
-}
-
-/// Out-of-sample encode: route held-out rows `x` (`M×P`, f32) against a frozen
-/// sparse dictionary `decoder` (`K×P`) and solve the per-row active-set ridge
-/// codes, returning fixed-width `(indices, codes)` each `M×active`. This is the
-/// OOS `transform` step for a fitted sparse dictionary — the tiled routing and
-/// the active-set least squares both live in the Rust core, and the route step
-/// uses the same GPU-dispatched high-`K` scorer as fitting.
-pub fn sparse_dictionary_transform(
-    x: ArrayView2<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
-    active: usize,
-    score_tile: usize,
-    code_ridge: f32,
-) -> Result<(Array2<u32>, Array2<f32>), String> {
-    let transform = sparse_dictionary_transform_with_mode(
-        x,
-        decoder,
-        active,
-        score_tile,
-        code_ridge,
-        gam_gpu::global_policy(),
-    )?;
-    Ok((transform.indices, transform.codes))
 }
 
 /// Out-of-sample encode with an explicit score routing mode and route counters.

@@ -1102,92 +1102,11 @@ pub fn isa_extract_certified_planes(
     out
 }
 
-/// Extract one certified circle plane from the JOINT split of the current
-/// captured span. This is a compatibility shim for single-birth callers; it
-/// does not perform greedy recursive separation.
-pub fn isa_extract_certified_plane(
-    residual: ArrayView2<'_, f64>,
-    parts: &IsaEigenParts,
-    config: &IsaSeedConfig,
-) -> Option<IsaPlaneCandidate> {
-    isa_extract_certified_planes(residual, parts, 1, config)
-        .into_iter()
-        .next()
-}
-
-/// Subtract an accepted plane's centered residual projection, in place. Gates
-/// certify seed evidence only; deflation removes the certified ambient SUPPORT
-/// plane from every centered row so accepted-plane covariance is actually gone
-/// before the next eigendecomposition.
-pub fn isa_deflate_fitted_curve(residual: &mut Array2<f64>, cand: &IsaPlaneCandidate) {
-    let (n, p) = residual.dim();
-    if n == 0 {
-        return;
-    }
-    let mut mean = Array1::<f64>::zeros(p);
-    for i in 0..n {
-        for j in 0..p {
-            mean[j] += residual[[i, j]];
-        }
-    }
-    mean.mapv_inplace(|v| v / n as f64);
-    for i in 0..n {
-        let (mut p1, mut p2) = (0.0_f64, 0.0_f64);
-        for j in 0..p {
-            let ri = residual[[i, j]] - mean[j];
-            p1 += ri * cand.basis[[j, 0]];
-            p2 += ri * cand.basis[[j, 1]];
-        }
-        for j in 0..p {
-            residual[[i, j]] -= p1 * cand.basis[[j, 0]] + p2 * cand.basis[[j, 1]];
-        }
-    }
-}
-
 /// The producer's harvest: the certified planes from one joint split, and
 /// whether harvest ended before hitting the caller's safety cap.
 pub struct IsaHarvest {
     pub planes: Vec<IsaPlaneCandidate>,
     pub natural_exit: bool,
-}
-
-/// Full producer run: capture an even-dimensional above-floor support span,
-/// jointly rotate every candidate plane inside that span, emit every certified
-/// plane from that joint split, then remove accepted support before the next
-/// capture round. Deflation only advances the residual snapshot between certified
-/// joint splits; it is not a greedy separator inside a captured whitened span.
-pub fn isa_deflationary_producer(
-    residual: ArrayView2<'_, f64>,
-    max_planes: usize,
-    config: &IsaSeedConfig,
-) -> Result<IsaHarvest, String> {
-    if max_planes == 0 {
-        return Ok(IsaHarvest {
-            planes: Vec::new(),
-            natural_exit: true,
-        });
-    }
-    let mut work = residual.to_owned();
-    let mut planes = Vec::new();
-    while planes.len() < max_planes {
-        let remaining = max_planes - planes.len();
-        let Some(parts) = capture_signal_span(work.view(), remaining)? else {
-            break;
-        };
-        let mut round = isa_extract_certified_planes(work.view(), &parts, remaining, config);
-        if round.is_empty() {
-            break;
-        }
-        for cand in &round {
-            isa_deflate_fitted_curve(&mut work, cand);
-        }
-        planes.append(&mut round);
-    }
-    let natural_exit = planes.len() < max_planes;
-    Ok(IsaHarvest {
-        planes,
-        natural_exit,
-    })
 }
 
 #[cfg(test)]

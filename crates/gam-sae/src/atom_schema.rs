@@ -6,55 +6,6 @@
 //! owned by the library: the CLI, Rust callers, and the Python binding all
 //! parse and emit the same tokens, and the binding is marshalling only.
 
-/// Validate harmonic metadata emitted by a native fit. A periodic atom has
-/// width `M = 2H + 1` with `H >= 1`; malformed metadata is an error rather than
-/// a load-time repair. Non-periodic atom metadata passes through unchanged.
-pub fn validated_n_harmonics(
-    basis_kinds: &[String],
-    raw_n_harmonics: &[i64],
-    decoder_widths: &[i64],
-) -> Result<Vec<i64>, String> {
-    if basis_kinds.len() != raw_n_harmonics.len() || basis_kinds.len() != decoder_widths.len() {
-        return Err(format!(
-            "harmonic metadata length mismatch: basis_kinds={}, n_harmonics={}, decoder_widths={}",
-            basis_kinds.len(),
-            raw_n_harmonics.len(),
-            decoder_widths.len()
-        ));
-    }
-    let mut validated = Vec::with_capacity(basis_kinds.len());
-    for (atom, ((basis, &harmonics), &width)) in basis_kinds
-        .iter()
-        .zip(raw_n_harmonics)
-        .zip(decoder_widths)
-        .enumerate()
-    {
-        validate_fitted_basis_kind(basis)?;
-        if basis == "periodic" {
-            if harmonics < 1 {
-                return Err(format!(
-                    "periodic atom {atom} requires n_harmonics >= 1; got {harmonics}"
-                ));
-            }
-            let expected_width = harmonics
-                .checked_mul(2)
-                .and_then(|twice| twice.checked_add(1))
-                .ok_or_else(|| {
-                    format!(
-                        "periodic atom {atom} basis width overflows i64 for n_harmonics={harmonics}"
-                    )
-                })?;
-            if width != expected_width {
-                return Err(format!(
-                    "periodic atom {atom} has decoder width {width}, but n_harmonics={harmonics} requires {expected_width}"
-                ));
-            }
-        }
-        validated.push(harmonics);
-    }
-    Ok(validated)
-}
-
 /// Validate one canonical assignment-family token.
 ///
 /// The fit, payload, and native routing paths all call this parser before
@@ -136,33 +87,6 @@ pub fn basis_to_topology(basis: &str) -> Result<String, String> {
 pub fn canonical_topology(name: &str) -> Result<String, String> {
     basis_kind_for_topology(name)?;
     Ok(name.to_string())
-}
-
-/// Structural coordinate periods for a fitted basis. `None` marks an open
-/// axis; finite values are the chart's exact wrap period.
-pub fn coordinate_periods_for_basis(
-    basis: &str,
-    latent_dim: usize,
-) -> Result<Vec<Option<f64>>, String> {
-    validate_fitted_basis_kind(basis)?;
-    match basis {
-        "periodic" if latent_dim == 1 => Ok(vec![Some(1.0)]),
-        "torus" | "klein_bottle" if latent_dim == 2 => Ok(vec![Some(1.0); 2]),
-        "cylinder" if latent_dim == 2 => Ok(vec![Some(1.0), None]),
-        "sphere" | "projective_plane" if latent_dim == 2 => {
-            Ok(vec![None, Some(std::f64::consts::TAU)])
-        }
-        // The Möbius chart is represented on its double cover: angle period 2,
-        // open width axis. Deck invariance lives in the basis parity.
-        "mobius" if latent_dim == 2 => Ok(vec![Some(2.0), None]),
-        "periodic" => Err(format!(
-            "periodic atoms require latent dimension 1; got {latent_dim}"
-        )),
-        "torus" | "cylinder" | "sphere" | "projective_plane" | "klein_bottle" | "mobius" => Err(
-            format!("{basis} atoms require latent dimension 2; got {latent_dim}"),
-        ),
-        _ => Ok(vec![None; latent_dim]),
-    }
 }
 
 /// Assignment family implied by the public flat-block gating vocabulary.

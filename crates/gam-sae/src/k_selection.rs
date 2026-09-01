@@ -113,11 +113,6 @@ impl EvVsKCurve {
         &self.points
     }
 
-    /// Smallest `K` on the curve.
-    pub fn k_min(&self) -> usize {
-        self.points[0].k
-    }
-
     /// Largest `K` on the curve.
     pub fn k_max(&self) -> usize {
         self.points[self.points.len() - 1].k

@@ -81,45 +81,6 @@ impl LedgerStore {
         Self::from_fingerprint(fp.finalize())
     }
 
-    /// Bind by a precomputed structural hash where `structural_hash` is the
-    /// raw value produced by hashing only [`TermCollectionSpec::write_structural_shape_hash`]
-    /// into a [`Fingerprinter`] and reducing to `u64` — NOT the `structural_hash`
-    /// field of [`super::warm_state::DiskRowWarmCache`], which folds an additional
-    /// namespace prefix (`"sae-corpus-row-warm-state-v1"`) before calling
-    /// `write_structural_shape_hash` and therefore produces a different value.
-    /// Passing the warm-cache's field here will silently bind a different key
-    /// than [`Self::new`] and cause a ledger miss / fresh-start on every load.
-    /// Prefer [`Self::new`] whenever a [`TermCollectionSpec`] is in scope.
-    pub fn from_structural_hash(structural_hash: u64) -> Self {
-        let mut fp = Fingerprinter::new();
-        fp.write_str("sae-structure-ledger-key-v1");
-        fp.write_u64(structural_hash);
-        Self::from_fingerprint(fp.finalize())
-    }
-
-    fn from_fingerprint(key: Fingerprint) -> Self {
-        let root = std::env::temp_dir()
-            .join("gam")
-            .join("sae_structure_ledger")
-            .join("v1");
-        let store = match WarmStartStore::open(
-            root,
-            StoreOptions {
-                size_budget_bytes: LEDGER_DISK_BUDGET_BYTES,
-                ttl: Duration::from_secs(LEDGER_DISK_TTL_SECS),
-            },
-        ) {
-            Ok(store) => Some(store),
-            Err(err) => {
-                // An unwritable tier is a supported configuration, not a fault;
-                // the ledger then lives in memory for this process only.
-                log::debug!("sae structure ledger: disk tier unavailable ({err}); in-memory only");
-                None
-            }
-        };
-        Self { key, store }
-    }
-
     /// Load this topology's ledger. Absent (or unwritable tier) ⇒ a fresh
     /// empty ledger; PRESENT-BUT-UNDECODABLE ⇒ `Err` (see module docs:
     /// silent evidence loss is the one forbidden failure mode).
@@ -134,43 +95,6 @@ impl LedgerStore {
         }
     }
 
-    /// Persist the ledger (atomic in-place overwrite of the canonical
-    /// entry). Call after every absorbed shard — the write is small and
-    /// the crash-safety contract is per-write. `iteration` is stamped
-    /// with the claim count for disk-side diagnostics.
-    pub fn save(&self, ledger: &StructureLedger) -> Result<(), String> {
-        let Some(store) = self.store.as_ref() else {
-            return Ok(());
-        };
-        let payload = serialize_ledger(ledger)?;
-        store
-            .save_overwrite(
-                &self.key,
-                LEDGER_RUN_ID,
-                &payload,
-                None,
-                Some(ledger.claims().len() as u64),
-                EntryKind::Final,
-            )
-            .map_err(|e| format!("LedgerStore::save: store write failed: {e:?}"))
-    }
-}
-
-/// Canonical ledger payload encoding (JSON via the ledger's serde derive;
-/// the store layer adds checksums, so decode failures here mean schema
-/// drift, not bit rot).
-pub fn serialize_ledger(ledger: &StructureLedger) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(ledger).map_err(|e| format!("ledger serialization failed: {e}"))
-}
-
-/// Inverse of [`serialize_ledger`].
-pub fn deserialize_ledger(bytes: &[u8]) -> Result<StructureLedger, String> {
-    serde_json::from_slice(bytes).map_err(|e| {
-        format!(
-            "ledger payload exists but failed to decode ({e}); refusing to silently reset \
-             accumulated evidence — delete the entry explicitly if a fresh start is intended"
-        )
-    })
 }
 
 #[cfg(test)]

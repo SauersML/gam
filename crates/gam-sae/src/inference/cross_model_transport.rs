@@ -191,48 +191,6 @@ pub fn fit_cross_model_transport(
     })
 }
 
-fn validate_coordinate(coord: &ModelCoordinate) -> Result<(), String> {
-    if coord.coordinate.is_empty() {
-        return Err(format!("{} coordinate is empty", coord.model));
-    }
-    if coord.coordinate.iter().any(|v| !v.is_finite()) {
-        return Err(format!(
-            "{} coordinate contains non-finite values",
-            coord.model
-        ));
-    }
-    Ok(())
-}
-
-fn universality_verdict(
-    fit: &FittedTransport,
-    circle: Option<&CircleTransportReport>,
-    gauge_defect_scale: f64,
-) -> UniversalityVerdict {
-    if !fit.topology_preserved {
-        return UniversalityVerdict::NotSharedFeature;
-    }
-
-    if let Some(report) = circle {
-        if report.class == CircleTransportClass::Mixing || !matches!(report.winding, -1 | 1) {
-            return UniversalityVerdict::NotSharedFeature;
-        }
-    }
-
-    let roundoff_scale = f64::EPSILON.sqrt();
-    let isometry_noise_scale = fit.isometry_defect_se.max(roundoff_scale);
-    let isometry_distinguished = fit.isometry_defect > isometry_noise_scale;
-    let gauge_distinguished = circle
-        .map(|report| report.defect > gauge_defect_scale)
-        .unwrap_or(false);
-
-    if isometry_distinguished || gauge_distinguished {
-        UniversalityVerdict::SharedFeatureWithMeasuredReparameterization
-    } else {
-        UniversalityVerdict::ConsistentWithSharedFeatureWithinNoise
-    }
-}
-
 fn wrap_tau(x: f64) -> f64 {
     x.rem_euclid(TAU)
 }

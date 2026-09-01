@@ -197,52 +197,6 @@ impl DiskRowWarmCache {
         }
     }
 
-    /// Anchor the disk tier under the platform temp directory, mirroring the
-    /// persistent-warm-start root resolution (which avoids the banned
-    /// `env::var` path that `dirs::cache_dir()` would take).
-    fn open_store() -> Option<WarmStartStore> {
-        let root = std::env::temp_dir()
-            .join("gam")
-            .join("sae_corpus_warm")
-            .join("v1");
-        WarmStartStore::open(
-            root,
-            StoreOptions {
-                size_budget_bytes: DISK_BUDGET_BYTES,
-                ttl: Duration::from_secs(DISK_TTL_SECS),
-            },
-        )
-        .ok()
-    }
-
-    /// Compose the full disk/LRU key for a row under this cache's topology.
-    ///
-    /// Folds the schema tag, the per-topology structural hash, and the row id
-    /// into one fingerprint, matching the existing warm-start key framing
-    /// (length-prefixed `write_*` calls on a `Fingerprinter`). The `u64`
-    /// reduction keys the in-process LRU; the full `Fingerprint` keys disk.
-    fn row_fingerprint(&self, row_id: u64) -> Fingerprint {
-        let mut fp = Fingerprinter::new();
-        fp.write_str("sae-corpus-row-warm-state-key-v1");
-        fp.write_u64(self.structural_hash);
-        fp.write_u64(row_id);
-        fp.finalize()
-    }
-
-    #[inline]
-    fn lru_key(&self, row_id: u64) -> u64 {
-        fingerprint_to_u64(&self.row_fingerprint(row_id))
-    }
-
-    /// Evict the least-recently-used LRU entry when over capacity.
-    fn evict_if_full(&mut self) {
-        if self.lru.len() <= LRU_CAPACITY {
-            return;
-        }
-        if let Some((&victim, _)) = self.lru.iter().min_by_key(|(_, e)| e.stamp) {
-            self.lru.remove(&victim);
-        }
-    }
 }
 
 impl RowWarmCache for DiskRowWarmCache {
@@ -313,26 +267,6 @@ impl RowWarmCache for DiskRowWarmCache {
             }
         }
     }
-}
-
-/// Reduce a 32-byte [`Fingerprint`] to a `u64` LRU bucket key by folding its
-/// raw leading bytes. Collisions in the `u64` space are harmless: the
-/// disk tier always re-checks the full `Fingerprint`, and an LRU bucket
-/// collision only risks a spurious in-process miss (then a correct disk hit),
-/// never a wrong-row seed.
-fn fingerprint_to_u64(fp: &Fingerprint) -> u64 {
-    // Take the first 8 raw bytes of the 32-byte fingerprint and assemble them
-    // into a u64. Using raw bytes (not the hex-string ASCII representation)
-    // gives full 8-bit entropy per lane rather than the biased 4-bit range
-    // that hex ASCII digits occupy (0x30-0x39, 0x61-0x66).
-    let bytes = fp.as_bytes();
-    let mut acc = 0u64;
-    for &b in bytes.iter().take(8) {
-        acc = acc.wrapping_shl(8) ^ u64::from(b);
-    }
-    // Mix so adjacent row ids (which share a long key prefix) spread across
-    // buckets. Reuses the canonical splitmix64 finalizer.
-    gam_linalg::utils::splitmix64_hash(acc)
 }
 
 #[cfg(test)]

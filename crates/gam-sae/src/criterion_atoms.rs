@@ -240,11 +240,6 @@ impl SaeCriterion {
         &self.atoms
     }
 
-    /// Number of ρ coordinates.
-    #[must_use]
-    pub fn n_rho(&self) -> usize {
-        self.n_rho
-    }
 }
 
 #[cfg(test)]

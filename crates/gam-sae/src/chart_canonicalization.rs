@@ -672,29 +672,6 @@ impl TorusFlowBasis {
         4 * self.freqs.len()
     }
 
-    /// Mode identities in coefficient order: for each component, for each
-    /// frequency representative, the `sin` mode then the `cos` mode. This IS
-    /// the `θ` index layout — [`Self::mode_samples`] returns samples in the
-    /// same order.
-    pub fn mode_layout(&self) -> Vec<TorusFlowModeKey> {
-        let mut keys = Vec::with_capacity(self.dim());
-        for component in 0..2 {
-            for &freq in &self.freqs {
-                keys.push(TorusFlowModeKey {
-                    component,
-                    freq,
-                    is_cos: false,
-                });
-                keys.push(TorusFlowModeKey {
-                    component,
-                    freq,
-                    is_cos: true,
-                });
-            }
-        }
-        keys
-    }
-
     /// Sample every mode (value + gradient) at chart point `t`, in `θ` order.
     pub fn mode_samples(&self, t: [f64; 2]) -> Vec<FlowModeSample> {
         let tau = std::f64::consts::TAU;
@@ -1952,18 +1929,6 @@ impl FreePatchFlowBasis {
         2 * self.exps.len()
     }
 
-    /// Mode identities in coefficient order (for each component, each monomial).
-    /// This IS the `θ` index layout — [`Self::mode_samples`] matches it.
-    pub fn mode_layout(&self) -> Vec<PatchFlowModeKey> {
-        let mut keys = Vec::with_capacity(self.dim());
-        for component in 0..2 {
-            for &exps in &self.exps {
-                keys.push(PatchFlowModeKey { component, exps });
-            }
-        }
-        keys
-    }
-
     /// Normalized patch coordinate `u = (t − center) ⊙ inv_half`.
     fn normalize(&self, t: [f64; 2]) -> [f64; 2] {
         [
@@ -2338,12 +2303,6 @@ impl SphereBoostFlowBasis {
     /// The three boost modes are always present; the dimension is fixed at 3.
     pub fn dim(&self) -> usize {
         3
-    }
-
-    /// Mode identities in coefficient order: `[Z, X, Y]`. This IS the `θ`
-    /// index layout — `Self::mode_samples` returns samples in the same order.
-    pub fn mode_layout(&self) -> [SphereBoostAxis; 3] {
-        [SphereBoostAxis::Z, SphereBoostAxis::X, SphereBoostAxis::Y]
     }
 
     /// The displacement `v_k(t)` of each boost mode at chart point `t`.
@@ -2885,132 +2844,6 @@ fn sphere_minimize_boost_defect(
         defect_initial,
         defect_final: state.defect,
     })
-}
-
-/// Scale-invariant isometry defect of a fitted `d = 2` **sphere** atom's
-/// `(lat, lon)` chart against the round-sphere reference metric (#1019 stage 2,
-/// sphere arm).
-///
-/// This is the certified objective the sphere flow-pin
-/// ([`sphere_isometry_flow_reparameterization`]) descends; it is also exposed
-/// on its own as the read-only acceptance measurement (the issue's "defect
-/// within 10% of optimum" quantity), so a chart that is already round-isometric
-/// (a true `O(3)` representative) scores `≈ 0` and a warped chart scores large.
-///
-/// # The defect functional
-///
-/// For the round sphere, the `(lat, lon)` chart's reference first fundamental
-/// form is `g_ref(lat) = diag(1, cos²lat)` (a unit-radius sphere; the lon
-/// circumference shrinks as `cos lat`). The fitted decoder's pullback metric at
-/// row `i` is `G_i = J(t_i)ᵀ J(t_i)` from the exact `(Φ, ∂Φ)` jet, exactly as
-/// in the torus path. The chart is isometric to the round sphere up to a global
-/// scale `c` iff `G_i ≡ c · g_ref(lat_i)` for all `i`. Measuring the residual
-/// with `c` analytically profiled (the exact argmin over the global scale),
-///
-/// ```text
-/// E = Σ_i ‖ Ĝ_i − c · ĝ_ref,i ‖²_F ,
-/// c = Σ_i ⟨Ĝ_i, ĝ_ref,i⟩_F / Σ_i ‖ĝ_ref,i‖²_F ,
-/// ```
-///
-/// where both metrics are normalized by the geometric-mean fitted metric scale
-/// `ḡ = exp(mean_i ½ log det G_i)` so the defect is scale-invariant (a chart
-/// isometric up to ANY global scale scores 0). The Frobenius norm on symmetric
-/// `2×2` matrices uses the `[m00, m11, m01]` storage with the off-diagonal
-/// weighted by 2 (matching the torus path).
-///
-/// Returns `None` on a degenerate chart (empty/non-finite, rank-deficient
-/// pullback metric anywhere, or a degenerate profiled scale) — an honest
-/// refusal, never a fabricated zero. The returned defect is the scale-invariant
-/// `E` above; `0` means the fitted chart is already a round-isometric `O(3)`
-/// representative.
-pub fn sphere_chart_isometry_defect(
-    evaluator: &dyn SaeBasisEvaluator,
-    decoder: ArrayView2<'_, f64>,
-    row_coords: ArrayView2<'_, f64>,
-) -> Result<Option<f64>, String> {
-    let n = row_coords.nrows();
-    let m = decoder.nrows();
-    let p = decoder.ncols();
-    if row_coords.ncols() != 2 {
-        return Err(format!(
-            "sphere_chart_isometry_defect: expected (n, 2) row coordinates; got {:?}",
-            row_coords.dim()
-        ));
-    }
-    if n == 0 || m == 0 || p == 0 {
-        return Ok(None);
-    }
-    for &t in row_coords.iter() {
-        if !t.is_finite() {
-            return Ok(None);
-        }
-    }
-
-    // Fitted pullback metric G_i = J(t_i)ᵀJ(t_i) from the exact jet — identical
-    // extraction to the torus / patch paths (axis 0 = lat, axis 1 = lon), via
-    // the shared helper. The sphere reference below differs (diag(1, cos²lat)
-    // vs flat I), so only the extraction is shared, not the normalization.
-    let Some((g_rows, g_bar)) = extract_pullback_metric_d2(
-        "sphere_chart_isometry_defect",
-        evaluator,
-        decoder,
-        row_coords,
-    )?
-    else {
-        return Ok(None);
-    };
-
-    // Reference metric ĝ_ref,i = diag(1, cos²lat_i) (round sphere, lat = axis 0).
-    // Both G and g_ref are normalized by ḡ; g_ref carries no fitted scale so the
-    // profiled `c` absorbs the absolute size. The reference's own determinant is
-    // cos²lat, which can vanish near the poles — guard it so a pole-adjacent row
-    // does not inject a degenerate reference direction.
-    let mut ghat: Vec<[f64; 3]> = Vec::with_capacity(n);
-    let mut gref: Vec<[f64; 3]> = Vec::with_capacity(n);
-    let mut gref_norm_sq = 0.0_f64;
-    let mut cross = 0.0_f64;
-    for (row, g) in g_rows.iter().enumerate() {
-        let lat = row_coords[[row, 0]];
-        let cos_lat = lat.cos();
-        let r11 = cos_lat * cos_lat;
-        // A pole-adjacent reference column (cos lat → 0) carries no transverse
-        // metric content; treating it as part of the defect would falsely
-        // reward squeezing the lon direction. Refuse charts sitting on the
-        // pole singularity rather than fabricate a defect there.
-        //
-        // NB: `cos(π/2)` is ~6.1e-17 in f64, not exactly 0, so an exactly-on-pole
-        // row gives `r11 = cos²lat ≈ 3.7e-33` — finite and strictly positive. A
-        // bare `r11 > 0.0` therefore lets it through; floor against `POLE_COS2_FLOOR`
-        // (cos lat within ~1e-6 of a pole) so the singular row is honestly refused.
-        const POLE_COS2_FLOOR: f64 = 1e-12;
-        if !(r11.is_finite() && r11 > POLE_COS2_FLOOR) {
-            return Ok(None);
-        }
-        let h = [g[0] / g_bar, g[1] / g_bar, g[2] / g_bar];
-        let r = [1.0_f64, r11, 0.0_f64];
-        cross += h[0] * r[0] + h[1] * r[1] + 2.0 * h[2] * r[2];
-        gref_norm_sq += r[0] * r[0] + r[1] * r[1] + 2.0 * r[2] * r[2];
-        ghat.push(h);
-        gref.push(r);
-    }
-    if !(gref_norm_sq.is_finite() && gref_norm_sq > 0.0) {
-        return Ok(None);
-    }
-    let c = cross / gref_norm_sq;
-    if !(c.is_finite() && c > 0.0) {
-        return Ok(None);
-    }
-    let mut defect = 0.0_f64;
-    for (h, r) in ghat.iter().zip(gref.iter()) {
-        let r00 = h[0] - c * r[0];
-        let r11 = h[1] - c * r[1];
-        let r01 = h[2] - c * r[2];
-        defect += r00 * r00 + r11 * r11 + 2.0 * r01 * r01;
-    }
-    if !defect.is_finite() {
-        return Ok(None);
-    }
-    Ok(Some(defect))
 }
 
 /// Total fitted turning `Θ = ∫ κ ds` of a `d = 1` atom's decoded curve (#1026).

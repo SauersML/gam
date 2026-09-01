@@ -37,11 +37,6 @@ impl Dual {
         Self { re, eps: 1.0 }
     }
 
-
-    pub fn with_derivative(re: f64, eps: f64) -> Self {
-        Self { re, eps }
-    }
-
     pub fn ln(self) -> Self {
         Self {
             re: self.re.ln(),
@@ -57,67 +52,6 @@ impl Dual {
         }
     }
 
-    pub fn recip(self) -> Self {
-        Self {
-            re: self.re.recip(),
-            eps: -self.eps / (self.re * self.re),
-        }
-    }
-
-    pub fn abs_with_branch(self, branches: &mut Vec<DualKinkBranchRecord>) -> Self {
-        self.choose_max_with_branch(-self, DualKinkOp::Abs, branches)
-    }
-
-    pub fn max_with_branch(self, rhs: Self, branches: &mut Vec<DualKinkBranchRecord>) -> Self {
-        self.choose_max_with_branch(rhs, DualKinkOp::Max, branches)
-    }
-
-    fn choose_max_with_branch(
-        self,
-        rhs: Self,
-        op: DualKinkOp,
-        branches: &mut Vec<DualKinkBranchRecord>,
-    ) -> Self {
-        let branch = if self.re > rhs.re {
-            DualKinkBranch::Left
-        } else if self.re < rhs.re {
-            DualKinkBranch::Right
-        } else {
-            DualKinkBranch::Tie
-        };
-        branches.push(DualKinkBranchRecord {
-            op,
-            branch,
-            left_re: self.re,
-            right_re: rhs.re,
-        });
-        if matches!(branch, DualKinkBranch::Left | DualKinkBranch::Tie) {
-            self
-        } else {
-            rhs
-        }
-    }
-
-    pub fn min_with_branch(self, rhs: Self, branches: &mut Vec<DualKinkBranchRecord>) -> Self {
-        let branch = if self.re < rhs.re {
-            DualKinkBranch::Left
-        } else if self.re > rhs.re {
-            DualKinkBranch::Right
-        } else {
-            DualKinkBranch::Tie
-        };
-        branches.push(DualKinkBranchRecord {
-            op: DualKinkOp::Min,
-            branch,
-            left_re: self.re,
-            right_re: rhs.re,
-        });
-        if matches!(branch, DualKinkBranch::Left | DualKinkBranch::Tie) {
-            self
-        } else {
-            rhs
-        }
-    }
 }
 
 #[cfg(test)]
@@ -215,51 +149,24 @@ impl Sub<f64> for Dual {
 impl Mul for Dual {
     type Output = Self;
 
-    fn mul(self, rhs: Self) -> Self::Output {
-        Self {
-            re: self.re * rhs.re,
-            eps: self.eps.mul_add(rhs.re, self.re * rhs.eps),
-        }
-    }
 }
 
 impl Mul<f64> for Dual {
     type Output = Self;
 
-    fn mul(self, rhs: f64) -> Self::Output {
-        Self {
-            re: self.re * rhs,
-            eps: self.eps * rhs,
-        }
-    }
 }
 
 impl Div for Dual {
     type Output = Self;
 
-    fn div(self, rhs: Self) -> Self::Output {
-        self * rhs.recip()
-    }
 }
 
 impl Div<f64> for Dual {
     type Output = Self;
 
-    fn div(self, rhs: f64) -> Self::Output {
-        Self {
-            re: self.re / rhs,
-            eps: self.eps / rhs,
-        }
-    }
 }
 
 impl Neg for Dual {
     type Output = Self;
 
-    fn neg(self) -> Self::Output {
-        Self {
-            re: -self.re,
-            eps: -self.eps,
-        }
-    }
 }

@@ -576,39 +576,6 @@ impl SaeManifoldTerm {
         })
     }
 
-    /// Anchor RSS `R_x` (over the `p_x` anchor columns) and the SCALED per-block
-    /// RSS (over each block's column span) of the current fitted residual. The
-    /// column offsets come from `layout` (the single owner of the stacked-column
-    /// bookkeeping), not a by-hand `off_ℓ` accumulation.
-    fn augmented_block_rss(
-        &self,
-        augmented: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        layout: &CrosscoderLayout,
-    ) -> Result<(f64, Vec<f64>), String> {
-        let residual = self.reconstruction_residual(augmented, rho)?;
-        let px = layout.anchor_dim();
-        let mut rss_x = 0.0_f64;
-        for row in residual.rows() {
-            for j in 0..px {
-                let r = row[j];
-                rss_x += r * r;
-            }
-        }
-        let mut out = Vec::with_capacity(layout.num_blocks());
-        for l in 0..layout.num_blocks() {
-            let mut rss = 0.0_f64;
-            for row in residual.rows() {
-                for j in layout.block_range(l) {
-                    let r = row[j];
-                    rss += r * r;
-                }
-            }
-            out.push(rss);
-        }
-        Ok((rss_x, out))
-    }
-
     /// Install the crosscoder stacked-column layout on the term, validating that
     /// its total width matches the atoms' output dimension
     /// (`p_x + Σ_ℓ p_ℓ == output_dim()`). Called by
@@ -694,41 +661,6 @@ impl SaeManifoldTerm {
         decoder
     }
 
-    /// Snapshot the ENTIRE mutable fit state a λ line-search trial perturbs, so a
-    /// rejected trial rolls back to a bit-identical base.
-    ///
-    /// A trial runs a full [`Self::run_joint_fit_arrow_schur`], which moves far
-    /// more than the decoder β and latent coords: it refreshes each atom's cached
-    /// `basis_values` / `basis_jacobian` while preserving or structurally
-    /// transporting the fixed reference `smooth_penalty`,
-    /// rewrites the assignment `logits`, re-derives the active-set `last_row_layout`,
-    /// and advances the Gumbel `temperature_schedule` one anneal step per inner
-    /// iteration. The canonical [`Self::snapshot_mutable_state`] captures the first
-    /// group (the same state the inner damped-Newton line search itself rolls back);
-    /// the schedule is a per-call *stateful* counter, so a rejected trial that
-    /// leaves it advanced would start the next trial at a colder temperature and
-    /// make the backtracking trials incomparable — capture it here too. (An atom
-    /// rank reduction, [`Self::reduce_atoms_to_data_supported_rank`], is idempotent
-    /// after the sweep-entry fit, so the restored decoder width always matches.)
-    fn fit_state_snapshot(&self) -> (SaeManifoldMutableState, Option<GumbelTemperatureSchedule>) {
-        (
-            self.snapshot_mutable_state(),
-            self.temperature_schedule.clone(),
-        )
-    }
-
-    /// Restore a [`Self::fit_state_snapshot`]. `restore_mutable_state` rebuilds
-    /// each atom's `basis_values` / `basis_jacobian` from the restored coordinates
-    /// (the differential snapshot stores only the cheap driving state), so the
-    /// restored state is immediately consistent for a residual/fitted read.
-    fn fit_state_restore(
-        &mut self,
-        snap: &(SaeManifoldMutableState, Option<GumbelTemperatureSchedule>),
-    ) -> Result<(), String> {
-        self.restore_mutable_state(&snap.0)?;
-        self.temperature_schedule.clone_from(&snap.1);
-        Ok(())
-    }
 }
 
 impl SaeManifoldTerm {
