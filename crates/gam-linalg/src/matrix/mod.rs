@@ -480,15 +480,6 @@ impl<'a> DenseRightProductView<'a> {
         out
     }
 
-    fn transformed_ncols(&self) -> usize {
-        if let Some(factor) = self.second {
-            factor.ncols()
-        } else if let Some(factor) = self.first {
-            factor.ncols()
-        } else {
-            self.base.ncols()
-        }
-    }
 }
 
 pub struct EmbeddedColumnBlock<'a> {
@@ -2071,15 +2062,6 @@ impl ReparamOperator {
         }
     }
 
-    /// Access the underlying original design matrix.
-    pub fn x_original(&self) -> &DesignMatrix {
-        &self.x_original
-    }
-
-    /// Access the Qs orthogonal transform.
-    pub fn qs(&self) -> &Array2<f64> {
-        &self.qs
-    }
 }
 
 impl LinearOperator for ReparamOperator {
@@ -4864,32 +4846,6 @@ impl DesignMatrix {
         Ok(out)
     }
 
-    /// Like [`Self::try_to_dense_by_chunks`] but refuses to allocate when the
-    /// dense footprint would exceed `max_bytes`. Returned `Err` is the same
-    /// shape as a densification-refused error from the resource policy, so
-    /// observability-only callers can convert it into a `warn!` and skip
-    /// without ever touching the allocator at huge `n`.
-    pub fn try_to_dense_by_chunks_budgeted(
-        &self,
-        context: &str,
-        max_bytes: usize,
-    ) -> Result<Array2<f64>, String> {
-        let n = self.nrows();
-        let p = self.ncols();
-        let dense_bytes = checked_dense_nbytes(n, p, context)?;
-        if dense_bytes > max_bytes {
-            let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-            let cap_gib = max_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-            return Err(MatrixError::DensificationRefused {
-                reason: format!(
-                    "{context}: refusing to densify {n}x{p} (~{gib:.2} GiB, cap ~{cap_gib:.2} GiB)"
-                ),
-            }
-            .into());
-        }
-        self.try_to_dense_by_chunks(context)
-    }
-
     /// Dot a single design row against a coefficient vector without allocating
     /// a standalone row buffer when the underlying storage permits.
     pub fn dot_row(&self, row: usize, beta: &Array1<f64>) -> f64 {
@@ -5559,43 +5515,6 @@ impl DesignMatrix {
         matches!(self, Self::Sparse(_))
     }
 
-    /// Zero-copy borrow when `Dense`, materialized conversion when `Sparse`.
-    ///
-    /// This avoids the unconditional clone that `to_dense()` performs on dense
-    /// matrices.  Callers that only need a `&Array2<f64>` should use this and
-    /// then call `Cow::as_ref()` or `&*cow`.
-    pub fn as_dense_cow(&self) -> Cow<'_, Array2<f64>> {
-        match self {
-            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => Cow::Borrowed(matrix.as_ref()),
-            Self::Dense(DenseDesignMatrix::Lazy(op)) => match op.as_dense_ref() {
-                Some(dense) => Cow::Borrowed(dense),
-                // SAFETY: `as_dense_cow` is the zero-copy view accessor; its
-                // contract forbids operator-backed designs that cannot expose
-                // a pre-materialized dense view. A caller that reached this
-                // arm used the borrow API on an operator representation it
-                // should have streamed through row chunks instead.
-                // SAFETY: as_dense_cow's zero-copy contract forbids operator-backed designs without a materialized view.
-                None => std::panic::panic_any(format!(
-                    "DesignMatrix::as_dense_cow called on operator-backed design ({}x{}); use row chunks or matrix-vector products",
-                    op.nrows(),
-                    op.ncols()
-                )),
-            },
-            Self::Sparse(matrix) => Cow::Owned(
-                matrix
-                    .try_to_dense_arc("DesignMatrix::as_dense_cow")
-                    // SAFETY: callers of `as_dense_cow` have accepted dense
-                    // materialization; densification failure here means the
-                    // sparse matrix exceeds the byte-cap that this accessor
-                    // contractually forbids.
-                    // SAFETY: caller of as_dense_cow has accepted dense materialization budget.
-                    .unwrap_or_else(|msg| std::panic::panic_any(msg))
-                    .as_ref()
-                    .clone(),
-            ),
-        }
-    }
-
     /// Borrow when already-materialized dense, otherwise materialize via
     /// chunks (or via the sparse conversion path) and return an owned `Cow`.
     ///
@@ -5901,43 +5820,6 @@ impl DesignMatrix {
             ridge_floor,
             ridge_policy,
         )
-    }
-
-    pub fn solve_system_matrix_free_pcg(
-        &self,
-        weights: &Array1<f64>,
-        rhs: &Array1<f64>,
-        penalty: Option<&Array2<f64>>,
-        ridge_floor: f64,
-    ) -> Result<Array1<f64>, String> {
-        <Self as LinearOperator>::solve_system_matrix_free_pcg_try(
-            self,
-            weights,
-            rhs,
-            penalty,
-            ridge_floor,
-        )
-    }
-
-    pub fn solve_system_matrix_free_pcg_with_info(
-        &self,
-        weights: &Array1<f64>,
-        rhs: &Array1<f64>,
-        penalty: Option<&Array2<f64>>,
-        ridge_floor: f64,
-    ) -> Result<(Array1<f64>, PcgSolveInfo), String> {
-        <Self as LinearOperator>::solve_system_matrix_free_pcg_with_info_try(
-            self,
-            weights,
-            rhs,
-            penalty,
-            ridge_floor,
-        )
-    }
-
-    pub fn should_use_matrix_free_pcg(&self) -> bool {
-        <Self as LinearOperator>::uses_matrix_free_pcg(self)
-            && self.ncols() >= MATRIX_FREE_PCG_MIN_P
     }
 
     pub fn factorize_system(

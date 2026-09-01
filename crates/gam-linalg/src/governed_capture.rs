@@ -72,26 +72,6 @@ thread_local! {
     static CAPTURE: RefCell<Option<Vec<GovernedDecision>>> = const { RefCell::new(None) };
 }
 
-/// Start recording governed densification decisions on this thread, discarding
-/// any prior window.
-///
-/// Rayon workers do not inherit this: a decision taken on a pool thread is not
-/// recorded. That is a real limitation rather than an oversight — the branches
-/// this exists to observe are taken on the calling thread, and inheriting into
-/// a pool would need the pool's own hook.
-pub fn begin_governed_decision_capture() {
-    CAPTURE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
-}
-
-/// Stop recording and return this thread's decisions in the order they were
-/// taken. `None` means capture was never started, which is distinct from
-/// `Some(vec![])` — "nobody was listening" versus "the branch was never
-/// reached". Conflating those two is precisely the ambiguity this module
-/// exists to remove.
-pub fn take_governed_decision_capture() -> Option<Vec<GovernedDecision>> {
-    CAPTURE.with(|slot| slot.borrow_mut().take())
-}
-
 /// Record one decision. Cheap and silent when capture is off.
 pub(crate) fn record_governed_decision(
     context: &str,

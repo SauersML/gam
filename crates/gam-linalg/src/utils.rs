@@ -854,16 +854,6 @@ impl StableSolver {
     }
 }
 
-pub fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
-    matrix
-        .diag()
-        .iter()
-        .copied()
-        .map(f64::abs)
-        .fold(0.0, f64::max)
-        .max(1.0)
-}
-
 pub fn row_mismatch_message(
     y_len: usize,
     w_len: usize,
@@ -959,18 +949,6 @@ pub fn symmetric_extremes(matrix: &Array2<f64>) -> Option<(f64, f64)> {
             .fold(f64::NEG_INFINITY, |acc, &value| acc.max(value));
         Some((min, max))
     })
-}
-
-pub fn addridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {
-    if ridge <= 0.0 {
-        return matrix.clone();
-    }
-    let mut regularized = matrix.clone();
-    let n = regularized.nrows();
-    for i in 0..n {
-        regularized[[i, i]] += ridge;
-    }
-    regularized
 }
 
 pub fn boundary_hit_step_fraction(
@@ -1145,20 +1123,6 @@ where
         rel_tol,
         max_iter,
     )
-}
-
-pub fn solve_spd_pcg<F>(
-    apply: F,
-    rhs: &Array1<f64>,
-    preconditioner_diag: &Array1<f64>,
-    rel_tol: f64,
-    max_iter: usize,
-) -> Option<Array1<f64>>
-where
-    F: Fn(&Array1<f64>) -> Array1<f64>,
-{
-    solve_spd_pcg_with_info(apply, rhs, preconditioner_diag, rel_tol, max_iter)
-        .map(|(solution, _)| solution)
 }
 
 /// Write-into variant of `solve_spd_pcg_with_info` that takes an apply closure
@@ -1423,26 +1387,6 @@ impl RankCertifiedPsdPseudoinverse {
     #[inline]
     pub const fn rank(&self) -> usize {
         self.rank
-    }
-
-    #[inline]
-    pub const fn relative_cutoff(&self) -> f64 {
-        self.relative_cutoff
-    }
-
-    #[inline]
-    pub const fn absolute_cutoff(&self) -> f64 {
-        self.absolute_cutoff
-    }
-
-    #[inline]
-    pub const fn max_eigenvalue(&self) -> f64 {
-        self.max_eigenvalue
-    }
-
-    #[inline]
-    pub fn pseudoinverse(&self) -> &Array2<f64> {
-        &self.pseudoinverse
     }
 
     #[inline]

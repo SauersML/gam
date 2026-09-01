@@ -104,18 +104,6 @@ pub enum FdVerdict {
 }
 
 impl FdDerivative {
-    /// How sharply the oracle knows its OWN answer:
-    /// `rel_tol · max(|value|, abs_floor)`.
-    ///
-    /// Deliberately independent of any analytic value. Folding the analytic
-    /// value in here would let a large analytic number widen the bar the
-    /// measurement is held to, so a ladder that returned `-3.2e2 ± 4.9e1`
-    /// (15% of itself — pure noise) would count as "resolved" merely because
-    /// the analytic side claimed `1e7`. That is how an unmeasurable component
-    /// becomes a confident `Disagree`.
-    pub fn self_band(&self, rel_tol: f64, abs_floor: f64) -> f64 {
-        rel_tol * self.value.abs().max(abs_floor)
-    }
 
     /// The tolerance band the COMPARISON is judged at:
     /// `rel_tol · max(|value|, |analytic|, abs_floor)`. This one does include
@@ -136,64 +124,6 @@ impl FdDerivative {
         self.uncertainty.is_finite() && self.uncertainty <= self.self_band(rel_tol, abs_floor)
     }
 
-    /// The largest `|analytic − value|` this measurement is compatible with at
-    /// the requested tolerance: the band widened by the oracle's own
-    /// uncertainty.
-    pub fn agreement_bound(&self, analytic: f64, rel_tol: f64, abs_floor: f64) -> f64 {
-        self.band(analytic, rel_tol, abs_floor) + self.uncertainty
-    }
-
-    /// The single place that decides whether an analytic derivative component
-    /// agrees with this measurement. Callers should route every comparison
-    /// through it rather than re-deriving the three-way rule, which is easy to
-    /// state as two-way and thereby convert every unmeasurable component into a
-    /// false violation.
-    pub fn judge(&self, analytic: f64, rel_tol: f64, abs_floor: f64) -> FdVerdict {
-        if !self.value.is_finite() || !self.resolved(rel_tol, abs_floor) {
-            return FdVerdict::Unresolved;
-        }
-        if (analytic - self.value).abs() > self.agreement_bound(analytic, rel_tol, abs_floor) {
-            FdVerdict::Disagree
-        } else {
-            FdVerdict::Agree
-        }
-    }
-
-    /// The ladder rendered for a diagnostic line: `h=… D=…` coarsest first.
-    pub fn ladder_report(&self) -> String {
-        self.ladder
-            .iter()
-            .map(|(h, d)| format!("h={h:.2e} D={d:+.10e}"))
-            .collect::<Vec<_>>()
-            .join("  ")
-    }
-}
-
-/// Self-certifying numerical derivative of `f` at `t = 0` (Ridders' method).
-///
-/// `f` must evaluate the objective along the probe line, i.e. `f(t)` is the
-/// objective at `base + t · direction`; the returned value estimates `f′(0)`.
-///
-/// The method evaluates central differences on a shrinking geometric ladder and
-/// runs a Neville extrapolation across it, so column `j` of the tableau has
-/// truncation order `2(j+1)`. It then accepts the tableau entry whose two
-/// parents agree most closely, and reports that agreement as the uncertainty.
-/// This is the standard cure for the fact that no single step is right for
-/// every objective: shrinking `h` trades truncation (`h²·f‴/6`) for noise
-/// (`ν/h`), and the crossover sits wherever the objective's third derivative
-/// and the evaluator's noise floor happen to put it — which, for a criterion
-/// evaluated through an inner solve, moves by many orders across a probe grid.
-///
-/// Cost is `2 · config.rungs` evaluations of `f`; the ladder is run to the end
-/// rather than exited early, because a criterion that is not yet in its
-/// asymptotic `O(h²)` regime at the coarse rungs produces a non-monotone error
-/// sequence there, and an early exit on the first non-improvement would accept
-/// a pre-asymptotic entry.
-pub fn ridders_derivative<F>(mut f: F, config: RiddersConfig) -> FdDerivative
-where
-    F: FnMut(f64) -> f64,
-{
-    ridders_from_stencil(|h| (f(h) - f(-h)) / (2.0 * h), config)
 }
 
 /// [`ridders_derivative`] over an arbitrary `O(h²)` derivative stencil.
