@@ -10,25 +10,6 @@ use super::*;
 
 // ─── #2568 caller-side outer stationarity requirement ──────────────
 
-/// The certificate band alone. #2688 moved the rung into the production return
-/// type on purpose, so the value-only form lives in the tests that compare
-/// bands to each other rather than beside the thing it was extracted from.
-fn outer_stationarity_band_at(config: &OuterConfig, cost_at_point: f64) -> f64 {
-    outer_stationarity_band_and_rung_at(config, cost_at_point).bound
-}
-
-/// The saturating shape this issue was filed against: an objective whose
-/// declared scale widens the engine's band by six orders, so a point nowhere
-/// near stationary clears it.
-fn wide_band_config_2568(required: Option<f64>) -> OuterConfig {
-    OuterConfig {
-        tolerance: 1e-5,
-        objective_scale: Some(1.0e6),
-        required_projected_gradient_norm: required,
-        ..Default::default()
-    }
-}
-
 #[test]
 fn a_caller_requirement_tightens_the_solver_band_2568() {
     // The load-bearing half. If the requirement did not reach the SOLVER's

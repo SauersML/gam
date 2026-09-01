@@ -846,24 +846,6 @@ impl OuterStationarityCertificate {
         }
     }
 
-    /// A stable label for which stationarity equation certified this point.
-    ///
-    /// Previously derived as `if is_fixed_point() { .. } else { "analytic_gradient" }`,
-    /// which reported an `AsymptoteRail` certificate as an analytic gradient —
-    /// a verdict wearing another route's name, in the evidence map a reader
-    /// consults precisely to find out which route ran.
-    pub fn kind_label(&self) -> &'static str {
-        match self {
-            Self::AnalyticGradient { .. } => "analytic_gradient",
-            Self::FixedPoint { .. } => "fixed_point",
-            Self::AsymptoteRail { .. } => "asymptote_rail",
-        }
-    }
-
-    pub fn is_fixed_point(&self) -> bool {
-        matches!(self, Self::FixedPoint { .. })
-    }
-
     /// The certified asymptote rails, when this is an `AsymptoteRail`.
     pub fn rails(&self) -> &[RailCoordinate] {
         match self {
@@ -1097,17 +1079,6 @@ impl CurvatureEvidence {
             | Self::NoEstimand
             | Self::CriterionContradicted => None,
         }
-    }
-
-    /// Whether a curvature question was actually answered here.
-    ///
-    /// [`Self::CriterionContradicted`] answers `false`: a Hessian was measured
-    /// there, but its verdict was withdrawn by the criterion, so no curvature
-    /// ANSWER survives. Reporting `true` would let a consumer that asked for a
-    /// real second-order guarantee read a withdrawn verdict as a delivered one,
-    /// which is the #2578 conflation one variant further along.
-    pub fn was_measured(self) -> bool {
-        matches!(self, Self::Measured { .. })
     }
 
     /// Build from a raw optional measurement: `Some` was measured, `None`
@@ -4748,37 +4719,6 @@ impl UnifiedFitResult {
             })
     }
 
-    /// Get the active-coordinate penalized Hessian as the
-    /// `UnscaledPrecision` newtype if available. Use this when constructing
-    /// newtype-aware APIs (HMC whitening, sampling) so both the dispersion
-    /// convention and the accompanying `geometry.coefficient_gauge` are
-    /// handled explicitly.
-    pub fn penalized_hessian_unscaled(
-        &self,
-    ) -> Option<&gam_problem::dispersion_cov::UnscaledPrecision> {
-        self.inference
-            .as_ref()
-            .map(|inf| &inf.penalized_hessian)
-            .or_else(|| self.geometry.as_ref().map(|geom| &geom.penalized_hessian))
-    }
-
-    /// Get owned row-wise diagonal working evidence if available.
-    pub fn working_geometry(&self) -> Option<&WorkingGeometry> {
-        self.geometry
-            .as_ref()
-            .and_then(|geometry| geometry.working.as_ref())
-    }
-
-    /// Get working weights if single diagonal row evidence is available.
-    pub fn working_weights(&self) -> Option<&Array1<f64>> {
-        self.working_geometry().map(|working| &working.weights)
-    }
-
-    /// Get working response if single diagonal row evidence is available.
-    pub fn working_response(&self) -> Option<&Array1<f64>> {
-        self.working_geometry().map(|working| &working.response)
-    }
-
     /// Smoothing-parameter uncertainty covariance contribution `J·Var(ρ)·Jᵀ`
     /// in coefficient space, on the same dispersion scale as the conditional
     /// covariance `Vb = φ·H⁻¹`. This is the exact ρ-uncertainty term assembled
@@ -4789,12 +4729,6 @@ impl UnifiedFitResult {
         self.inference
             .as_ref()
             .and_then(|inf| inf.smoothing_correction.as_ref())
-    }
-
-    pub fn smoothing_correction_method(&self) -> Option<SmoothingCorrectionMethod> {
-        self.inference
-            .as_ref()
-            .and_then(|inference| inference.smoothing_correction_method)
     }
 
     /// The exact first-order IFT smoothing-parameter-uncertainty correction,
@@ -4943,13 +4877,6 @@ impl UnifiedFitResult {
             .map(|b| b.beta.clone())
     }
 
-    /// Smoothing parameters for time block.
-    pub fn lambdas_time(&self) -> Array1<f64> {
-        self.block_by_role(BlockRole::Time)
-            .map(|b| b.lambdas.clone())
-            .unwrap_or_else(|| Array1::zeros(0))
-    }
-
     /// Smoothing parameters for threshold block.
     pub fn lambdas_threshold(&self) -> Array1<f64> {
         self.block_by_role(BlockRole::Threshold)
@@ -4964,20 +4891,9 @@ impl UnifiedFitResult {
             .unwrap_or_else(|| Array1::zeros(0))
     }
 
-    /// Smoothing parameters for link-wiggle block.
-    pub fn lambdas_linkwiggle(&self) -> Option<Array1<f64>> {
-        self.block_by_role(BlockRole::LinkWiggle)
-            .map(|b| b.lambdas.clone())
-    }
-
     /// Number of coefficient blocks.
     pub fn n_blocks(&self) -> usize {
         self.blocks.len()
-    }
-
-    /// Block roles.
-    pub fn block_roles(&self) -> Vec<BlockRole> {
-        self.blocks.iter().map(|b| b.role.clone()).collect()
     }
 
     /// Resolve the fitted link state for a given family.

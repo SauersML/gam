@@ -21,11 +21,6 @@ pub use gam_problem::RowSubsampleMask;
 /// [`RowSubsampleMask`]. The data type lives in `gam-problem`; this constructor
 /// stays in `gam-solve` because it depends on `BlockwiseFitOptions`.
 pub trait RowSubsampleMaskExt {
-    /// Build a `RowSubsampleMask` from blockwise-fit options. The outer
-    /// optimizer is the sole source of `outer_score_subsample`; inner
-    /// paths read this once at the top of each TR iteration and freeze
-    /// it for every quantity in that iteration.
-    fn from_options(options: &BlockwiseFitOptions, n: usize) -> Self;
 }
 
 impl RowSubsampleMaskExt for RowSubsampleMask {

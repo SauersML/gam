@@ -1550,7 +1550,6 @@ impl BetaPenaltyOp for SparseBlockKroneckerPenaltyOp {
         out
     }
 
-
     fn fingerprint(&self, hasher: &mut Fingerprinter) {
         hasher.write_str("sparse-block-kronecker-penalty-op-v1");
         hasher.write_usize(self.p);
@@ -1617,32 +1616,6 @@ pub struct FactoredFrameKroneckerOp {
     pub blocks: Vec<FactoredFrameGBlock>,
 }
 
-/// Frame output Gram `U_iᵀ U_j` (`r_i × r_j`) between two per-atom output
-/// frames (each `p × r`). This is the dense principal-angle cosine matrix that
-/// becomes the `w` factor of a [`FactoredFrameGBlock`]; for `i == j` with an
-/// orthonormal frame it is `I_{r_i}`. Shared with
-/// `gam_terms::sae::manifold`, which builds the same factors when
-/// profiling decoders onto Grassmann frames.
-pub fn frame_output_gram(u_i: ArrayView2<f64>, u_j: ArrayView2<f64>) -> Array2<f64> {
-    let (p_i, r_i) = u_i.dim();
-    let (p_j, r_j) = u_j.dim();
-    assert_eq!(
-        p_i, p_j,
-        "frame_output_gram: frames live in different ambient dims ({p_i} vs {p_j})"
-    );
-    let mut w = Array2::<f64>::zeros((r_i, r_j));
-    for a in 0..r_i {
-        for b in 0..r_j {
-            let mut acc = 0.0;
-            for c in 0..p_i {
-                acc += u_i[[c, a]] * u_j[[c, b]];
-            }
-            w[[a, b]] = acc;
-        }
-    }
-    w
-}
-
 impl FactoredFrameKroneckerOp {
     /// Build from per-atom ranks + basis sizes and the co-occurring blocks.
     /// Computes the β offsets (prefix sum of `M_k·r_k`) and validates that each
@@ -1705,81 +1678,6 @@ impl FactoredFrameKroneckerOp {
         })
     }
 
-    /// Convenience constructor that builds the operator directly from per-atom
-    /// output frames + the basis-space Gram block map, computing the per-pair
-    /// frame factors `W_ij = U_iᵀ U_j` itself.
-    ///
-    /// `frames[k]` is either `Some(U_k)` — a `p × r_k` (`r_k ≤ p`) output frame
-    /// (a Grassmann representative `St(p, r_k)` need not be orthonormal here; the
-    /// `W` factor carries whatever frame is supplied) — or `None`, meaning atom
-    /// `k` keeps the full ambient output (`U_k = I_p`, so `r_k = p`). For each
-    /// non-empty Gram block `(atom_i, atom_j)` the factor `W` is
-    /// `U_iᵀ U_j` (`r_i × r_j`), with the `None` frame standing in for `I_p`:
-    /// a framed×unframed cross gives `W = U_iᵀ` (`r_i × p`) and an unframed
-    /// diagonal gives `W = I_p` — exactly reproducing the `g ⊗ I_p` full-`B`
-    /// block. The resulting blocks are handed to [`Self::new`], which validates
-    /// the `(M, r)` shapes and computes the β offsets.
-    pub fn from_frames_and_blocks(
-        frames: &[Option<Array2<f64>>],
-        basis_sizes: &[usize],
-        p: usize,
-        g_blocks: &std::collections::BTreeMap<(usize, usize), Array2<f64>>,
-    ) -> Result<Self, String> {
-        if frames.len() != basis_sizes.len() {
-            return Err(format!(
-                "FactoredFrameKroneckerOp::from_frames_and_blocks: {} frames but {} basis sizes",
-                frames.len(),
-                basis_sizes.len()
-            ));
-        }
-        let n_atoms = frames.len();
-        // Per-atom rank: ncols of a supplied frame, else the ambient dim p.
-        let mut ranks = Vec::with_capacity(n_atoms);
-        for (k, frame) in frames.iter().enumerate() {
-            match frame {
-                Some(u) => {
-                    let (pr, r) = u.dim();
-                    if pr != p {
-                        return Err(format!(
-                            "FactoredFrameKroneckerOp::from_frames_and_blocks: frame {k} has {pr} rows but ambient dim is {p}"
-                        ));
-                    }
-                    if r > p {
-                        return Err(format!(
-                            "FactoredFrameKroneckerOp::from_frames_and_blocks: frame {k} has rank {r} > ambient dim {p}"
-                        ));
-                    }
-                    ranks.push(r);
-                }
-                None => ranks.push(p),
-            }
-        }
-        // Materialize each atom's frame as a `p × r_k` view source: the supplied
-        // `U_k`, or `I_p` for the unframed atoms.
-        let identity = Array2::<f64>::eye(p);
-        let frame_or_ident = |k: usize| -> ArrayView2<f64> {
-            match &frames[k] {
-                Some(u) => u.view(),
-                None => identity.view(),
-            }
-        };
-        let mut blocks = Vec::with_capacity(g_blocks.len());
-        for (&(atom_i, atom_j), g) in g_blocks {
-            if atom_i >= n_atoms || atom_j >= n_atoms {
-                return Err(format!(
-                    "FactoredFrameKroneckerOp::from_frames_and_blocks: block atom indices ({atom_i}, {atom_j}) out of range (n_atoms = {n_atoms})"
-                ));
-            }
-            let w = frame_output_gram(frame_or_ident(atom_i), frame_or_ident(atom_j));
-            blocks.push(FactoredFrameGBlock {
-                atom_i,
-                atom_j,
-                g: g.clone(),
-                w,
-            });
-        }
-        Self::new(ranks, basis_sizes.to_vec(), blocks)
-    }
 }
 
 impl BetaPenaltyOp for FactoredFrameKroneckerOp {

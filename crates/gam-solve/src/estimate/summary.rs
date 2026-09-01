@@ -322,32 +322,6 @@ pub fn compute_continuous_smoothness_order(
     }
 }
 
-fn significance_stars(p: Option<f64>) -> &'static str {
-    match p {
-        Some(v) if v.is_finite() && v < 0.001 => "***",
-        Some(v) if v.is_finite() && v < 0.01 => "**",
-        Some(v) if v.is_finite() && v < 0.05 => "*",
-        Some(v) if v.is_finite() && v < 0.1 => ".",
-        _ => "",
-    }
-}
-
-fn format_pvalue(p: Option<f64>) -> String {
-    let Some(v) = p else {
-        return "NA".to_string();
-    };
-    if !v.is_finite() {
-        return "NA".to_string();
-    }
-    if v < 2e-16 {
-        "< 2e-16".to_string()
-    } else if v < 1e-4 {
-        format!("{v:.2e}")
-    } else {
-        format!("{v:.4}")
-    }
-}
-
 impl fmt::Display for ModelSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let paramnamew = self

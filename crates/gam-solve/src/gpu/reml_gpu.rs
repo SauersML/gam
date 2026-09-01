@@ -28,33 +28,6 @@ pub struct RemlGpuEvidence {
     pub gradient_rho: Array1<f64>,
 }
 
-pub fn evidence_derivatives_gpu(input: RemlGpuInput<'_>) -> Result<RemlGpuEvidence, String> {
-    let p = input.penalized_hessian.nrows();
-    if p != input.penalized_hessian.ncols() {
-        return Err("REML GPU Hessian must be square".to_string());
-    }
-    for (j, derivative) in input.derivative_hessians.iter().enumerate() {
-        if derivative.dim() != (p, p) {
-            return Err(format!(
-                "REML derivative Hessian {j} has shape {:?}, expected {p}x{p}",
-                derivative.dim()
-            ));
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            return linux_cuda::evidence_derivatives(input);
-        }
-    }
-
-    cpu_fallback::evidence_derivatives(input)
-}
-
 #[cfg(target_os = "linux")]
 mod linux_cuda {
     use super::{RemlGpuEvidence, RemlGpuInput};

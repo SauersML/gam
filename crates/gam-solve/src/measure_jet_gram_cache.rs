@@ -108,52 +108,6 @@ impl FixedDesignGramCache {
         self.p
     }
 
-    pub fn xtwx(&self) -> ArrayView2<'_, f64> {
-        self.xtwx.view()
-    }
-
-    pub fn xtwy(&self) -> ArrayView1<'_, f64> {
-        self.xtwy.view()
-    }
-
-    pub fn ywy(&self) -> f64 {
-        self.ywy
-    }
-
-    /// Assemble `X'WX + S` for the inner solver without revisiting design rows.
-    pub fn penalized_normal_matrix(
-        &self,
-        penalty: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        if penalty.nrows() != self.p || penalty.ncols() != self.p {
-            return Err(format!(
-                "penalty shape {}x{} must match {}x{}",
-                penalty.nrows(),
-                penalty.ncols(),
-                self.p,
-                self.p
-            ));
-        }
-        let mut normal = self.xtwx.clone();
-        normal += &penalty;
-        Ok(normal)
-    }
-
-    /// Compute penalty-free weighted RSS from sufficient statistics.
-    pub fn penalized_rss(&self, beta: ArrayView1<'_, f64>) -> Result<f64, String> {
-        if beta.len() != self.p {
-            return Err(format!(
-                "beta length {} must match design column count {}",
-                beta.len(),
-                self.p
-            ));
-        }
-        // Expanding (r - Xb)'W(r - Xb) gives ywy - 2 b'X'Wr + b'X'WXb.
-        let gram_beta = self.xtwx.dot(&beta);
-        let linear = beta.dot(&self.xtwy);
-        let quadratic = beta.dot(&gram_beta);
-        Ok(self.ywy - 2.0 * linear + quadratic)
-    }
 }
 
 /// Cached fixed design rows for GLM / changing-`W` PIRLS trials.
@@ -201,83 +155,6 @@ impl FixedDesignRowCache {
         self.x.view()
     }
 
-    /// Recompute `X' diag(weights) X` over cached rows.
-    ///
-    /// This remains O(n p^2), the irreducible weighted contraction when `W`
-    /// changes. It avoids rebuilding the n-row measure-jet design.
-    pub fn xtwx(&self, weights: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
-        self.validate_changing_weights(weights)?;
-        Ok(fast_xt_diag_x(&self.x, &weights))
-    }
-
-    /// Recompute `X' diag(weights) z` over cached rows for a PIRLS response.
-    pub fn xtwz(
-        &self,
-        weights: ArrayView1<'_, f64>,
-        z: ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, String> {
-        self.validate_changing_weights(weights)?;
-        if z.len() != self.n {
-            return Err(format!(
-                "z length {} must match design row count {}",
-                z.len(),
-                self.n
-            ));
-        }
-        validate_finite_vector("z", z)?;
-        let z2 = z.insert_axis(ndarray::Axis(1));
-        let xtwz_mat = fast_xt_diag_y(&self.x, &weights, &z2);
-        Ok(xtwz_mat.column(0).to_owned())
-    }
-
-    fn validate_changing_weights(&self, weights: ArrayView1<'_, f64>) -> Result<(), String> {
-        if weights.len() != self.n {
-            return Err(format!(
-                "weights length {} must match design row count {}",
-                weights.len(),
-                self.n
-            ));
-        }
-        validate_finite_vector("weights", weights)
-    }
-}
-
-fn validate_finite_matrix(name: &str, matrix: ArrayView2<'_, f64>) -> Result<(), String> {
-    for ((row, col), value) in matrix.indexed_iter() {
-        if !(*value).is_finite() {
-            return Err(format!("{name}[{row},{col}] must be finite"));
-        }
-    }
-    Ok(())
-}
-
-fn validate_finite_vector(name: &str, vector: ArrayView1<'_, f64>) -> Result<(), String> {
-    for (index, value) in vector.iter().enumerate() {
-        if !(*value).is_finite() {
-            return Err(format!("{name}[{index}] must be finite"));
-        }
-    }
-    Ok(())
-}
-
-fn validate_nonnegative_finite_weights(weights: ArrayView1<'_, f64>) -> Result<(), String> {
-    for (index, weight) in weights.iter().enumerate() {
-        if !(*weight).is_finite() {
-            return Err(format!("weights[{index}] must be finite"));
-        }
-        if *weight < 0.0 {
-            return Err(format!("weights[{index}] must be non-negative"));
-        }
-    }
-    Ok(())
-}
-
-fn weighted_sum_squares(weights: ArrayView1<'_, f64>, values: ArrayView1<'_, f64>) -> f64 {
-    weights
-        .iter()
-        .zip(values.iter())
-        .map(|(weight, value)| *weight * *value * *value)
-        .sum()
 }
 
 #[cfg(test)]

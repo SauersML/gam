@@ -210,80 +210,6 @@ pub struct Sensitivity {
 }
 
 impl Sensitivity {
-    /// Fill a [`ThetaDirection`]'s shared inner-motion channels (`beta_dot`,
-    /// `h_dot_total`) from the one factored sensitivity operator — the #935
-    /// pass that fills AND reads them (no unread design surface).
-    ///
-    /// This is the ONE place the chain-rule data is assembled, killing the
-    /// #901-layer-2 per-consumer drift: given the direction's frozen score
-    /// derivative `f_beta_theta = ∂g/∂θ[dir]` (the `F_{βθ}` column) and the
-    /// frozen Hessian drift `h_dot_frozen = ∂H/∂θ[dir]|_{β̂}`, it produces
-    ///
-    /// ```text
-    ///   β̇(dir)      = −H⁺ · F_{βθ}[dir]            (one solve through `op`)
-    ///   Ḣ_total     = h_dot_frozen + D_βH[β̇]       (the cubic correction
-    ///                                                applied to THAT β̇)
-    /// ```
-    ///
-    /// The cubic correction `D_βH[β̇] = Xᵀ diag(c ⊙ X β̇) X` is NOT
-    /// re-implemented here — it is supplied as the caller's existing operator
-    /// `cubic_drift`, so there is exactly one assembly of it in the codebase
-    /// (the migration law's no-parallel-layer rule). Every atom that traces
-    /// `dir.h_dot_total` (the logdet, the #784 sampled block, the Jeffreys
-    /// term) then rides the SAME β̇ and the SAME drift: they structurally
-    /// cannot disagree about what `dir` means.
-    ///
-    /// `op` MUST be the operator inverting the SAME curvature `H` this
-    /// `Sensitivity`'s `kernel` describes (the #935 single-inverse contract);
-    /// a dimension mismatch against the kernel declines (`None`). Returns
-    /// `None` (declining, never approximating) if the mode-response solve
-    /// produced a non-finite β̇ — matching `FitSensitivity::mode_response`.
-    ///
-    /// [`FitSensitivity`]: crate::sensitivity::FitSensitivity
-    pub fn fill_direction<F>(
-        &self,
-        index: usize,
-        op: &crate::sensitivity::FitSensitivity<'_>,
-        f_beta_theta: &Array1<f64>,
-        h_dot_frozen: &Array2<f64>,
-        cubic_drift: F,
-    ) -> Option<ThetaDirection>
-    where
-        F: FnOnce(&Array1<f64>) -> Array2<f64>,
-    {
-        // The operator MUST invert the same curvature this Sensitivity's
-        // kernel describes (the #935 single-inverse contract): the score
-        // dimension, the operator dimension, and the kernel's basis height
-        // (`u_s.nrows()` = p) must all agree, else `dir` would mean different
-        // things to the solve and to the trace atoms. A mismatch declines.
-        let p = self.kernel.u_s.nrows();
-        if f_beta_theta.len() != p
-            || op.dim() != p
-            || h_dot_frozen.nrows() != p
-            || h_dot_frozen.ncols() != p
-        {
-            return None;
-        }
-        // β̇ = −H⁺ F_{βθ}, one batched solve through the shared operator.
-        let rhs = f_beta_theta.view().insert_axis(ndarray::Axis(1));
-        let beta_dot_col = op.mode_response(rhs)?;
-        let beta_dot = beta_dot_col.column(0).to_owned();
-        if beta_dot.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-        // Ḣ_total = ∂H/∂θ|_{β̂} + D_βH[β̇]: the frozen drift plus the cubic
-        // correction applied to THE SAME β̇ (no second β̇, no second cubic).
-        let mut h_dot_total = h_dot_frozen.clone();
-        h_dot_total += &cubic_drift(&beta_dot);
-        if h_dot_total.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-        Some(ThetaDirection {
-            index: Some(index),
-            beta_dot: Some(Arc::new(beta_dot)),
-            h_dot_total: Some(Arc::new(h_dot_total)),
-        })
-    }
 }
 
 /// Where the criterion is — and is not — differentiable.
@@ -344,8 +270,6 @@ pub trait CriterionAtom {
     // ½ tr(H⁺ Ḧ_ij)` body, in the second-order pass. Second order keeps
     // flowing through the existing assembly until then, with NO approximate
     // fallback inside the calculus.
-    /// The atom's exact ∂A/∂β̂ data, if it depends on the inner state.
-    fn beta_channel(&self) -> Option<BetaChannel>;
     /// The smoothness stratum this atom's emissions are valid on.
     fn stratum(&self) -> Option<StratumFingerprint>;
 }
@@ -369,22 +293,6 @@ pub struct CriterionSum {
 impl CriterionSum {
     pub fn value(&self) -> f64 {
         self.atoms.iter().map(|a| a.value()).sum()
-    }
-
-    /// Profiled total directional derivative — THE chain rule, applied once.
-    pub fn d1(&self, dir: &ThetaDirection) -> f64 {
-        let frozen: f64 = self.atoms.iter().map(|a| a.frozen_d1(dir)).sum();
-        let beta_dot = dir
-            .beta_dot
-            .as_ref()
-            .expect("calculus must fill beta_dot before profiled d1");
-        let mut chained = 0.0;
-        for atom in &self.atoms {
-            if let Some(channel) = atom.beta_channel() {
-                chained += channel.grad_beta.dot(beta_dot.as_ref());
-            }
-        }
-        frozen + chained
     }
 
     // First-order optimality certificate (#934): a per-atom FD audit at the
@@ -436,9 +344,6 @@ impl CriterionAtom for HessianLogdetAtom {
             .as_ref()
             .expect("calculus fills h_dot_total before logdet d1");
         0.5 * self.sensitivity.kernel.trace_projected_logdet(h_dot)
-    }
-    fn beta_channel(&self) -> Option<BetaChannel> {
-        None
     }
     fn stratum(&self) -> Option<StratumFingerprint> {
         Some(StratumFingerprint {
@@ -507,11 +412,6 @@ impl CriterionAtom for SampledBlockAtom {
             }
         }
         explicit + trace
-    }
-    fn beta_channel(&self) -> Option<BetaChannel> {
-        Some(BetaChannel {
-            grad_beta: self.g_d.clone(),
-        })
     }
     fn stratum(&self) -> Option<StratumFingerprint> {
         Some(StratumFingerprint {
@@ -737,11 +637,6 @@ impl CriterionAtom for PenaltyQuadAtom {
             _ => 0.0,
         }
     }
-    fn beta_channel(&self) -> Option<BetaChannel> {
-        Some(BetaChannel {
-            grad_beta: self.penalty_score.clone(),
-        })
-    }
     fn stratum(&self) -> Option<StratumFingerprint> {
         None
     }
@@ -900,9 +795,6 @@ impl CriterionAtom for JeffreysLogdetAtom {
         }
         self.gate_weight * 0.5 * trace
     }
-    fn beta_channel(&self) -> Option<BetaChannel> {
-        None
-    }
     fn stratum(&self) -> Option<StratumFingerprint> {
         Some(StratumFingerprint {
             kept_rank: self.stratum.kept_rank,
@@ -956,9 +848,6 @@ impl CriterionAtom for ConfiguredRhoPriorAtom {
             Some(idx) if idx < self.eval.gradient.len() => self.eval.gradient[idx],
             _ => 0.0,
         }
-    }
-    fn beta_channel(&self) -> Option<BetaChannel> {
-        None
     }
     fn stratum(&self) -> Option<StratumFingerprint> {
         None
@@ -1086,9 +975,6 @@ impl CriterionAtom for SoftRhoGuardPriorAtom {
             _ => 0.0,
         }
     }
-    fn beta_channel(&self) -> Option<BetaChannel> {
-        None
-    }
     fn stratum(&self) -> Option<StratumFingerprint> {
         None
     }
@@ -1142,9 +1028,6 @@ impl CriterionAtom for TierneyKadaneAtom {
             (Some(idx), Some(gradient)) if idx < gradient.len() => gradient[idx],
             _ => 0.0,
         }
-    }
-    fn beta_channel(&self) -> Option<BetaChannel> {
-        None
     }
     fn stratum(&self) -> Option<StratumFingerprint> {
         None
@@ -1221,9 +1104,6 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
             (Some(idx), Some(gradient)) if idx < gradient.len() => gradient[idx],
             _ => 0.0,
         }
-    }
-    fn beta_channel(&self) -> Option<BetaChannel> {
-        None
     }
     fn stratum(&self) -> Option<StratumFingerprint> {
         None

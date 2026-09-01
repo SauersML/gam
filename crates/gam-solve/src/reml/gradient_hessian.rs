@@ -458,15 +458,6 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    pub(crate) fn last_ridge_used(&self) -> Option<f64> {
-        self.cache_manager
-            .current_eval_bundle
-            .read()
-            .expect("current outer-eval bundle lock poisoned")
-            .as_ref()
-            .map(|bundle| bundle.ridge_passport.delta())
-    }
-
     pub(crate) fn dense_penalty_logdet_derivs(
         &self,
         rho: &Array1<f64>,
@@ -2463,7 +2454,6 @@ impl<'a> RemlState<'a> {
         }
     }
 
-
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
         // Keep expensive diagnostics out of the hot path unless they can
         // be surfaced. This has zero effect on optimization math.
@@ -3734,35 +3724,6 @@ impl<'a> RemlState<'a> {
         Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         })
-    }
-
-    pub(crate) fn newwith_offset<X>(
-        y: ArrayView1<'a, f64>,
-        x: X,
-        weights: ArrayView1<'a, f64>,
-        offset: ArrayView1<'_, f64>,
-        canonical_penalties: Vec<gam_terms::construction::CanonicalPenalty>,
-        p: usize,
-        config: &'a RemlConfig,
-        nullspace_dims: Option<Vec<usize>>,
-        coefficient_lower_bounds: Option<Array1<f64>>,
-        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
-    ) -> Result<Self, EstimationError>
-    where
-        X: Into<DesignMatrix>,
-    {
-        Self::newwith_offset_shared(
-            y,
-            x,
-            weights,
-            offset,
-            Arc::new(canonical_penalties),
-            p,
-            Arc::new(config.clone()),
-            nullspace_dims,
-            coefficient_lower_bounds,
-            linear_constraints,
-        )
     }
 
     pub(crate) fn newwith_offset_shared<X>(

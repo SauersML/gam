@@ -1417,67 +1417,6 @@ impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> ClosureObjective<S, Fc, Fe, Fr, Fefs,
         self
     }
 
-    /// Install the analytic λ→∞ rail-face limit hook (#2348 Inc 5).
-    pub fn with_rail_face_limit<Fface>(mut self, limit: Fface) -> Self
-    where
-        Fface: FnMut(
-                &mut S,
-                &Array1<f64>,
-                &[usize],
-            ) -> Result<RailFaceLimitOutcome, EstimationError>
-            + 'static,
-    {
-        self.rail_face_limit_fn = Some(Box::new(limit));
-        self
-    }
-
-    /// Install the soft rho-guard barrier gradient hook (#2545).
-    ///
-    /// The closure must PROJECT the barrier gradient the criterion already
-    /// added (for REML: `RemlState::soft_rho_guard_gradient`, which reads the
-    /// same `SoftRhoGuardPriorAtom` `build_prior` reads), never recompute it
-    /// from the policy constants — the barrier is evaluated at the
-    /// weight-anchored coordinate, so a raw-ρ closed form is a different
-    /// function on any weighted fit.
-    ///
-    /// The closure speaks **ρ**, not θ: it receives the leading `rho_dim`
-    /// entries of the outer point and returns one entry per ρ-coordinate.
-    /// [`OuterObjective::soft_rho_guard_gradient`] embeds that into the full θ
-    /// with exact zeros in the ψ/link block, so an objective with auxiliary
-    /// outer coordinates installs the SAME closure as one without — the layout
-    /// arithmetic that the mixture/SAS arm would otherwise have had to
-    /// hand-write (and that #2629 records as invisible when wrong) lives in one
-    /// place, driven by the declared [`OuterThetaLayout`].
-    ///
-    /// A closure whose criterion is NOT built on `RemlState` must not install
-    /// this hook at all: `None` is the correct answer for an objective that
-    /// carries no barrier, and publishing a zero array would be indistinguishable
-    /// from publishing a real one at the consumers.
-    pub fn with_soft_rho_guard_gradient<Fguard>(mut self, guard: Fguard) -> Self
-    where
-        Fguard: FnMut(&mut S, &Array1<f64>) -> Array1<f64> + 'static,
-    {
-        self.soft_rho_guard_gradient_fn = Some(Box::new(guard));
-        self
-    }
-
-    /// Publish the criterion's exact invariance directions (#2676).
-    ///
-    /// The closure receives the FULL outer point and returns orthonormal
-    /// columns in the same coordinates, so an objective with auxiliary `psi` or
-    /// link coordinates supplies the embedding itself (the rho block is what
-    /// carries the invariance; every other coordinate is exactly zero).
-    ///
-    /// An objective whose criterion is not built on a penalty map must not
-    /// install this hook: `None` is the correct answer, and publishing an empty
-    /// matrix would be indistinguishable from publishing a real one.
-    pub fn with_criterion_invariance<Finv>(mut self, invariance: Finv) -> Self
-    where
-        Finv: FnMut(&mut S, &Array1<f64>) -> Option<Array2<f64>> + 'static,
-    {
-        self.criterion_invariance_fn = Some(Box::new(invariance));
-        self
-    }
 }
 
 impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp>
@@ -1489,40 +1428,7 @@ where
     Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
     Fsp: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
 {
-    pub fn with_fixed_point_certificate<Fcert>(mut self, certificate_fn: Fcert) -> Self
-    where
-        Fcert: FnMut(&mut S, &Array1<f64>) -> Result<FixedPointCertificateEval, EstimationError>
-            + 'static,
-    {
-        self.fixed_point_certificate_fn = Some(Box::new(certificate_fn));
-        self
-    }
 
-    pub fn with_seed_inner_state<Fseed>(
-        self,
-        seed_fn: Fseed,
-    ) -> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed>
-    where
-        Fseed: FnMut(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>,
-    {
-        ClosureObjective {
-            state: self.state,
-            cap: self.cap,
-            cost_fn: self.cost_fn,
-            eval_fn: self.eval_fn,
-            eval_order_fn: self.eval_order_fn,
-            reset_fn: self.reset_fn,
-            efs_fn: self.efs_fn,
-            fixed_point_certificate_fn: self.fixed_point_certificate_fn,
-            exact_polish_fn: self.exact_polish_fn,
-            rail_face_limit_fn: self.rail_face_limit_fn,
-            soft_rho_guard_gradient_fn: self.soft_rho_guard_gradient_fn,
-            criterion_invariance_fn: self.criterion_invariance_fn,
-            screening_proxy_fn: self.screening_proxy_fn,
-            seed_fn: Some(seed_fn),
-            terminal_eval_order: self.terminal_eval_order,
-        }
-    }
 }
 /// Classify an [`EstimationError`] for the outer objective boundary and
 /// carry it across as a typed source.

@@ -341,36 +341,6 @@ fn cheb_t_prime(x: f64, n: usize) -> Vec<f64> {
     tp
 }
 
-/// Chebyshev SECOND-derivative values `T_0″..T_{n−1}″` at `x ∈ [−1, 1]` in the
-/// MAPPED coordinate (multiply by `(dx/dψ)²` for the ψ-second-derivative).
-///
-/// Differentiating the value recurrence `T_d = 2x T_{d−1} − T_{d−2}` twice in
-/// `x` gives a singularity-free three-term recurrence in lock-step with `cheb_t`
-/// / `cheb_t_prime`:
-///   `T_d′  = 2 T_{d−1} + 2x T_{d−1}′ − T_{d−2}′`,
-///   `T_d″  = 4 T_{d−1}′ + 2x T_{d−1}″ − T_{d−2}″`,
-/// with `T_0 = T_0′ = T_0″ = 0`-seeds as below. Unlike the closed form
-/// `T_n″ = n((n+1)T_n − U_n)/(x²−1)` this never divides by `x²−1`, so it stays
-/// exact at the window edges `x = ±1`.
-fn cheb_t_double_prime(x: f64, n: usize) -> Vec<f64> {
-    let mut t = vec![0.0; n];
-    let mut tp = vec![0.0; n];
-    let mut tpp = vec![0.0; n];
-    if n > 0 {
-        t[0] = 1.0; // T_0 = 1, T_0′ = T_0″ = 0
-    }
-    if n > 1 {
-        t[1] = x; // T_1 = x, T_1′ = 1, T_1″ = 0
-        tp[1] = 1.0;
-    }
-    for d in 2..n {
-        t[d] = 2.0 * x * t[d - 1] - t[d - 2];
-        tp[d] = 2.0 * t[d - 1] + 2.0 * x * tp[d - 1] - tp[d - 2];
-        tpp[d] = 4.0 * tp[d - 1] + 2.0 * x * tpp[d - 1] - tpp[d - 2];
-    }
-    tpp
-}
-
 fn kahan_scaled_add_array2(
     out: &mut Array2<f64>,
     comp: &mut Array2<f64>,
@@ -1108,34 +1078,6 @@ impl PsiGramTensor {
         ))
     }
 
-    /// Signed log-margin of the rank-`rank` claim at `psi`:
-    /// `ln(λ_rank / (PSI_GRAM_SKIP_RANK_RTOL·λ_max))`, positive exactly when the
-    /// Gram carries at least `rank` eigendirections above the rank cutoff.
-    ///
-    /// This is the CURRENCY THE BAND EDGES LIVE IN (#2408). Where the maximal-rank
-    /// band ends at a rank cliff, [`Self::rank_stable_psi_floor`] /
-    /// [`Self::rank_stable_psi_ceiling`] return a ROOT of this function, so the
-    /// edge's sensitivity to any perturbation of the tensor is
-    /// `|δψ*| ≤ sup|δ margin| / inf|d margin/dψ|` — the implicit-function bound.
-    /// It is the relative (Ostrowski/congruence) currency, not the absolute
-    /// (Weyl) one: a Gram assembled from a different number of rows is a
-    /// congruence-scale perturbation of the same continuum object, which moves
-    /// `λ_r` by a RELATIVE `O(1/n)` and therefore moves this margin additively.
-    ///
-    /// `None` for an off-window / non-finite / all-zero Gram, `rank == 0`, or
-    /// `rank` beyond the Gram order. Purely k-space (O(k³)) — independent of n.
-    pub fn rank_margin(&self, psi: f64, rank: usize) -> Option<f64> {
-        let spectrum = self.gram_spectrum(psi)?;
-        if rank == 0 || rank > spectrum.len() {
-            return None;
-        }
-        let lambda_r = spectrum[rank - 1];
-        if !(lambda_r > 0.0) {
-            return None;
-        }
-        Some((lambda_r / (PSI_GRAM_SKIP_RANK_RTOL * spectrum[0])).ln())
-    }
-
     /// Certified rank at the band-search anchor, or `None` when the anchor's own
     /// rank decision carries no margin. In the latter case there is nothing to
     /// transport, so [`Self::band_accepts`] falls back to the witness-only
@@ -1323,7 +1265,6 @@ impl PsiGramTensor {
         psi.is_finite() && psi >= self.psi_lo && psi <= self.psi_hi
     }
 
-
     /// True when `psi` lies inside the certified gradient window where the
     /// analytic ψ-derivative is bit-tight against the exact design derivative
     /// (#1033b). The n-free kappa outer loop is armed only when this covers the
@@ -1447,66 +1388,6 @@ impl PsiGramTensor {
         out
     }
 
-    /// Exact `∂²(XᵀWX)/∂ψ²` from the SAME representation as the value/gradient —
-    /// the n-free curvature that lets the outer Newton/ARC step read the τ-τ
-    /// Hessian's design-moving block without re-streaming an O(n) slab Gram
-    /// (#1033, Gaussian-identity single-ψ Hessian channel). O(Dk²) from the
-    /// direct Gram series.
-    ///
-    /// `XᵀWX(ψ) = Σ_d T_d(x) G_d` with `x = mapped(ψ)`, so by the chain rule
-    /// `d²/dψ² = T_d″(x) · (dx/dψ)²`.
-    pub fn d2gram_dpsi2(&self, psi: f64) -> Array2<f64> {
-        let x = self.mapped(psi);
-        let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
-        let dx_dpsi_sq = dx_dpsi * dx_dpsi;
-        let t = cheb_t(x, self.gram.len());
-        let tp = cheb_t_prime(x, self.gram.len());
-        let tpp = cheb_t_double_prime(x, self.gram.len());
-        let tp_scaled: Vec<f64> = tp.iter().map(|v| v * dx_dpsi).collect();
-        let tpp_scaled: Vec<f64> = tpp.iter().map(|v| v * dx_dpsi_sq).collect();
-        let g_tilde = self.contract_gram(&t);
-        let g_tilde_p = self.contract_gram(&tp_scaled);
-        let g_tilde_pp = self.contract_gram(&tpp_scaled);
-        // Second derivative of `G = D G̃ D` (#1216): with `q = p_a + p_b`,
-        // `[d²G/dψ²]_ab = α_a α_b [q² G̃_ab + 2q G̃'_ab + G̃''_ab]`.
-        let alpha = self.col_amplitudes(psi);
-        let p = &self.col_amp_slope;
-        let mut out = Array2::<f64>::zeros((self.k, self.k));
-        for a in 0..self.k {
-            for b in 0..self.k {
-                let q = p[a] + p[b];
-                out[[a, b]] = alpha[a]
-                    * alpha[b]
-                    * (q * q * g_tilde[[a, b]] + 2.0 * q * g_tilde_p[[a, b]] + g_tilde_pp[[a, b]]);
-            }
-        }
-        out
-    }
-
-    /// Exact `∂²(XᵀWz)/∂ψ²`, n-free.
-    /// `[d²c/dψ²]_a = α_a (p_a² c̃_a + 2 p_a c̃'_a + c̃''_a)` (#1216 envelope).
-    pub fn d2rhs_dpsi2(&self, psi: f64) -> Array1<f64> {
-        let x = self.mapped(psi);
-        let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
-        let dx_dpsi_sq = dx_dpsi * dx_dpsi;
-        let t = cheb_t(x, self.n_coeff);
-        let tp = cheb_t_prime(x, self.n_coeff);
-        let tpp = cheb_t_double_prime(x, self.n_coeff);
-        let tp_scaled: Vec<f64> = tp.iter().map(|v| v * dx_dpsi).collect();
-        let tpp_scaled: Vec<f64> = tpp.iter().map(|v| v * dx_dpsi_sq).collect();
-        let c_tilde = self.contract_rhs(&t);
-        let c_tilde_p = self.contract_rhs(&tp_scaled);
-        let c_tilde_pp = self.contract_rhs(&tpp_scaled);
-        let alpha = self.col_amplitudes(psi);
-        let p = &self.col_amp_slope;
-        let mut out = Array1::<f64>::zeros(self.k);
-        for a in 0..self.k {
-            out[a] =
-                alpha[a] * (p[a] * p[a] * c_tilde[a] + 2.0 * p[a] * c_tilde_p[a] + c_tilde_pp[a]);
-        }
-        out
-    }
-
     /// Assemble the Gaussian-identity sufficient-statistic cache at `psi`
     /// without touching a single data row — the bridge from this tensor into
     /// the inner PLS solver's fast path (#1033b → `GaussianFixedCache`).
@@ -1623,7 +1504,6 @@ mod tests {
         }
         design.t().dot(&wd)
     }
-
 
     /// Duchon-shaped analytic synthetic design: polyharmonic `s^p·ln s` radial
     /// columns (`s = r·e^ψ`) plus a ψ-free polynomial column — the structural

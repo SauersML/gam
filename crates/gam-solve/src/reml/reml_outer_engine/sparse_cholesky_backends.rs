@@ -1699,37 +1699,6 @@ pub fn penalty_matrix_root(s: &Array2<f64>) -> Result<Array2<f64>, String> {
     Ok(r)
 }
 
-/// Compute the exact pseudo-logdet log|S|₊ and its ρ-derivatives for a
-/// blockwise penalty structure.
-///
-/// For each block, eigendecomposes S_b = Σ λ_k S_k, identifies the positive
-/// eigenspace (structural nullspace detected from the eigenspectrum), and
-/// computes exact derivatives on that subspace:
-///
-/// - L(S) = Σ_{σ_i > ε} log σ_i
-/// - ∂/∂ρₖ L = tr(S⁺ Aₖ)
-/// - ∂²/(∂ρₖ∂ρₗ) L = δ_{kl} ∂_k L − tr(S⁺ Aₗ S⁺ Aₖ)
-///
-/// For S(ρ) = Σ exp(ρ_k) S_k with S_k ⪰ 0, the nullspace N(S) = ∩_k N(S_k)
-/// is structurally fixed (independent of ρ), so L is C∞ in ρ and these are
-/// its exact derivatives.
-///
-/// `per_block_rho[b]` contains the log-lambdas for block b.
-/// `per_block_penalties[b]` contains the penalty matrices for block b.
-/// `ridge` is an additional ridge for logdet stability (0 if not applicable).
-pub fn compute_block_penalty_logdet_derivs(
-    per_block_rho: &[Array1<f64>],
-    per_block_penalties: &[&[Array2<f64>]],
-    ridge: f64,
-) -> Result<PenaltyLogdetDerivs, String> {
-    compute_block_penalty_logdet_derivs_with_prior_factors(
-        per_block_rho,
-        per_block_penalties,
-        None,
-        ridge,
-    )
-}
-
 /// Immutable, λ-independent geometry of one fixed collection of PSD penalty
 /// components.
 ///

@@ -107,14 +107,6 @@ pub fn pg_gate_evidence(block: &GateBlock<'_>) -> Result<PgGateEvidence, String>
     evaluate(block, Lane::CurvatureCorrected)
 }
 
-/// The deterministic moment-matched comparator: `ω = E[PG(b, ψ̂)]`, one node.
-///
-/// Labelled [`PgGateLane::MomentMatched`]; this is the zeroth-order point of the
-/// independent-row expansion.
-pub fn pg_gate_evidence_moment_matched(block: &GateBlock<'_>) -> Result<PgGateEvidence, String> {
-    evaluate(block, Lane::MomentMatched)
-}
-
 enum Lane {
     CurvatureCorrected,
     MomentMatched,

@@ -13,7 +13,6 @@ pub(crate) fn as_weighted(op: &dyn HyperOperator) -> Option<&WeightedHyperOperat
 }
 
 pub(crate) trait DriftDerivTraceExt {
-    fn trace_logdet(&self, hop: &dyn HessianFactorization) -> f64;
 
     fn trace_logdet_hessian_cross(&self, rhs: &Self, hop: &dyn HessianFactorization) -> f64;
 }

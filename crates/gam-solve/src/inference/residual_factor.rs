@@ -633,17 +633,6 @@ impl StructuredResidualModel {
         RowMetric::whitened_structured(Arc::new(u), p, p)
     }
 
-    /// Convenience for the #2021 fit-path install seam: fit the structured
-    /// residual model on `input` and immediately materialize its per-row
-    /// `WhitenedStructured` [`RowMetric`] over all `input.residuals.nrows()`
-    /// rows. Equivalent to `Self::fit(input)?.row_metric(n)` — the single call
-    /// the outer alternation loop consumes when it installs the whitening metric
-    /// but does not also need the fitted factor (`factor()` / birth mining).
-    pub fn fit_row_metric(input: ResidualFactorInput<'_>) -> Result<RowMetric, String> {
-        let n = input.residuals.nrows();
-        Self::fit(input)?.row_metric(n)
-    }
-
     /// The model's isotropic (iid-MLE) dispersion: the per-coordinate average of
     /// its own fitted total residual variance,
     /// ```text

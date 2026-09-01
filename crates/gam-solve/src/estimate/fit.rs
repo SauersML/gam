@@ -371,20 +371,3 @@ where
     })
 }
 
-/// External-design GAM entrypoint for GLM-style families supported by
-/// `optimize_external_design`.
-/// Survival families such as `RoystonParmar` use survival-specific training APIs.
-pub fn fit_gam<X>(
-    x: X,
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    s_list: &[BlockwisePenalty],
-    family: gam_problem::LikelihoodSpec,
-    opts: &FitOptions,
-) -> Result<UnifiedFitResult, EstimationError>
-where
-    X: Into<DesignMatrix>,
-{
-    fit_gamwith_heuristic_lambdas(x, y, weights, offset, s_list, None, family, opts)
-}

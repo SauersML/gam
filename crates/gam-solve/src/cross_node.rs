@@ -96,56 +96,6 @@ impl CrossNodePartition {
         })
     }
 
-    /// Total number of chunks of the pass: `ceil(n_rows / chunk_size)`.
-    /// Identical to [`StreamingBorderGram::n_chunks`] for the same partition
-    /// parameters — the global tree this assignment feeds.
-    pub fn n_chunks(&self) -> usize {
-        self.n_rows.div_ceil(self.chunk_size)
-    }
-
-    /// Row range covered by global chunk `chunk_index` — the same pure function
-    /// as [`StreamingBorderGram::chunk_rows`], duplicated here so a worker can
-    /// slice its rows without constructing a coordinator-side accumulator.
-    pub fn chunk_rows(&self, chunk_index: usize) -> std::ops::Range<usize> {
-        let lo = chunk_index * self.chunk_size;
-        let hi = ((chunk_index + 1) * self.chunk_size).min(self.n_rows);
-        lo..hi
-    }
-
-    /// Which rank owns global chunk `chunk_index`: round-robin by index.
-    #[inline]
-    pub fn owner_rank(&self, chunk_index: usize) -> usize {
-        chunk_index % self.n_ranks
-    }
-
-    /// Number of chunks rank `rank` owns.
-    pub fn chunks_owned_by(&self, rank: usize) -> usize {
-        let n = self.n_chunks();
-        if rank >= self.n_ranks || n == 0 {
-            return 0;
-        }
-        // Chunks r, r + n_ranks, r + 2·n_ranks, … below n.
-        if rank < n {
-            (n - rank - 1) / self.n_ranks + 1
-        } else {
-            0
-        }
-    }
-
-    /// The `ordinal`-th (0-based) global chunk index owned by `rank`, or `None`
-    /// past the end of the rank's sequence. The worker cursor is an ordinal
-    /// into exactly this sequence.
-    pub fn owned_chunk(&self, rank: usize, ordinal: usize) -> Option<usize> {
-        if rank >= self.n_ranks {
-            return None;
-        }
-        let idx = rank + ordinal * self.n_ranks;
-        if idx < self.n_chunks() {
-            Some(idx)
-        } else {
-            None
-        }
-    }
 }
 
 /// One shipped partial: the global chunk index plus the deterministic `k·k`
@@ -241,20 +191,6 @@ impl NodeWorker {
         }
     }
 
-    /// `true` once this rank's sequence is exhausted.
-    pub fn is_done(&self) -> bool {
-        self.partition
-            .owned_chunk(self.rank, self.next_ordinal)
-            .is_none()
-    }
-
-    /// Global chunk index and row range of the next chunk to compute, or
-    /// `None` when done. The caller fetches exactly these rows.
-    pub fn next_chunk_rows(&self) -> Option<(usize, std::ops::Range<usize>)> {
-        let idx = self.partition.owned_chunk(self.rank, self.next_ordinal)?;
-        Some((idx, self.partition.chunk_rows(idx)))
-    }
-
     /// Compute the next chunk's deterministic partial from its rows and advance
     /// the cursor. `rows` must be exactly the rows of
     /// [`NodeWorker::next_chunk_rows`] (shape-validated here; content is the
@@ -328,64 +264,6 @@ impl CrossNodeGramReduction {
     /// The shared partition (workers must be constructed with an equal one).
     pub fn partition(&self) -> CrossNodePartition {
         self.partition
-    }
-
-    /// How many partials rank `rank` has had accepted — the ordinal a
-    /// replacement worker for that rank should resume from.
-    pub fn rank_cursor(&self, rank: usize) -> Option<usize> {
-        self.received_per_rank.get(rank).copied()
-    }
-
-    /// `true` once every chunk of every rank has been received and folded.
-    pub fn is_complete(&self) -> bool {
-        self.inner.is_complete()
-    }
-
-    /// Receive one shipped partial. Validates rank, ownership, and per-rank
-    /// sequence position, then folds through
-    /// [`StreamingBorderGram::submit_chunk_gram`] (which re-validates index
-    /// range, duplicates, and partial shape). A duplicate of an already-folded
-    /// chunk — the signature of an at-least-once transport retry or a worker
-    /// that resumed from a stale cursor — is rejected with an error naming the
-    /// chunk, never silently double-counted.
-    pub fn receive(&mut self, partial: NodePartial) -> Result<(), String> {
-        let NodePartial {
-            rank,
-            chunk_index,
-            gram,
-        } = partial;
-        if rank >= self.partition.n_ranks {
-            return Err(format!(
-                "CrossNodeGramReduction: rank {rank} out of range (n_ranks = {})",
-                self.partition.n_ranks
-            ));
-        }
-        if self.partition.owner_rank(chunk_index) != rank {
-            return Err(format!(
-                "CrossNodeGramReduction: chunk {chunk_index} is owned by rank {}, not rank {rank}",
-                self.partition.owner_rank(chunk_index)
-            ));
-        }
-        let cursor = self.received_per_rank[rank];
-        match self.partition.owned_chunk(rank, cursor) {
-            Some(expected) if expected == chunk_index => {}
-            Some(expected) => {
-                return Err(format!(
-                    "CrossNodeGramReduction: rank {rank} shipped chunk {chunk_index} but its \
-                     cursor expects chunk {expected} (ordinal {cursor}); a worker resumed from \
-                     a stale or future checkpoint"
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "CrossNodeGramReduction: rank {rank} shipped chunk {chunk_index} past the \
-                     end of its owned sequence"
-                ));
-            }
-        }
-        self.inner.submit_chunk_gram(chunk_index, gram)?;
-        self.received_per_rank[rank] = cursor + 1;
-        Ok(())
     }
 
     /// Serialize the full coordinator state. Resume-equals-straight-through is

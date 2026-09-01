@@ -41,7 +41,6 @@ pub use gam_problem::PRIMAL_FEASIBILITY_TOL as ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
 /// subsegment of the endpoint chord.
 pub const ACTIVE_SET_WORKING_FACE_TOL: f64 = 1e-10;
 
-
 /// Stationarity tolerance for the strong-KKT acceptance gate: the projected
 /// (working-set) gradient residual ‖∇L − Aᵀλ‖∞, either absolute or relative to
 /// `max(1, ‖∇L‖∞)`, must fall below this to certify a constrained stationary
@@ -83,7 +82,6 @@ const ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL: f64 = 1e-8;
 /// `project_point_strictly_into_feasible_cone`, which starts the inner solve
 /// strictly inside the cone so the strict tolerance is reachable.
 pub(crate) const ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL: f64 = 1e-3;
-
 
 /// KKT diagnostics for inequality-constrained Newton subproblems.
 ///
@@ -1631,7 +1629,6 @@ pub(crate) fn solve_kkt_direction(
     Ok((direction, multiplier))
 }
 
-
 /// One dependent row of the WORKING SET expressed against its representative:
 /// `a_dep ≈ coeff · a_rep`.
 ///
@@ -1963,11 +1960,6 @@ fn lift_member_row(local: ConstraintRowId, row_offset: usize) -> ConstraintRowId
 /// stays in gam-solve where the solvers consume it, keeping `gam-problem` a pure
 /// data crate. All three arms produce the same `ReducedFace` contract.
 pub trait ConstraintSetReducedFace {
-    fn reduced_face(
-        &self,
-        beta: ndarray::ArrayView1<'_, f64>,
-        membership_tol: f64,
-    ) -> Result<ReducedFace, EstimationError>;
 }
 
 impl ConstraintSetReducedFace for ConstraintSet {
@@ -2028,7 +2020,6 @@ impl ConstraintSetReducedFace for ConstraintSet {
         }
     }
 }
-
 
 fn identity_multiplier_dependence(groups: &[Vec<usize>]) -> Vec<Vec<ActiveRowDependence>> {
     groups
@@ -2273,7 +2264,6 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
     (a_out, b_out, groups_out, multiplier_dependence)
 }
 
-
 // ============================================================================
 // Operator constraint geometry and finite dual projection
 //
@@ -2325,7 +2315,6 @@ impl<'a> ConstraintSetOps<'a> {
             scaled_margin,
         })
     }
-
 
 /// Operator view of only the rows that are tight at `beta`. Inactive rows
     /// do not constrain the tangent cone, so make them vacuous by zeroing both
@@ -2380,7 +2369,6 @@ impl<'a> ConstraintSetOps<'a> {
             f64::INFINITY
         }
     }
-
 
     /// Gather the working rows as an explicit UNIT-normalized system (the
     /// per-row scale the dense path reaches via up-front canonicalization),
@@ -2581,7 +2569,6 @@ pub fn constraint_set_rows_tight_at_point(
     }
     Ok(tight)
 }
-
 
 /// Project a stationarity residual onto the normal cone of an operator-carried
 /// constraint set without materializing its complete tight face.
@@ -3858,7 +3845,6 @@ mod tests {
         Some((projected, lambda))
     }
 
-
     #[test]
     fn active_equality_certificate_rejects_public_tolerance_band_drift() {
         // The #979 production endpoint was accepted by the public 1e-8 primal
@@ -4407,7 +4393,6 @@ mod tests {
             "optimum is the vertex itself; got |d|∞ = {step:.3e}"
         );
     }
-
 
     #[test]
     fn cone_projection_preserves_original_multiplier_units_after_row_canonicalization() {
@@ -5178,7 +5163,6 @@ mod tests {
         assert!(certified.stationarity <= 1e-13);
     }
 
-
     /// A globalized CTN step can retain only a small subset of the previous
     /// endpoint face. The next H-metric projection must recover every missing
     /// independent normal direction in one separator batch, not pay one dense
@@ -5610,7 +5594,6 @@ mod tests {
         assert!((beta[0] - 0.3).abs() < 1e-10);
         assert!((beta[1] + 0.2).abs() < 1e-10);
     }
-
 
     /// The KKT diagnostic's sign convention, pinned on the exact face that
     /// produces `stat_rel = 1.000e0` in #2601.

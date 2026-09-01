@@ -357,25 +357,7 @@ pub(crate) struct WorkingBernoulliGeometry {
 /// and higher-level wrappers (custom family, GAMLSS warm starts) can share a
 /// consistent implementation.
 pub(crate) trait WorkingLikelihood {
-    fn irls_update(
-        &self,
-        y: ArrayView1<f64>,
-        eta: &Array1<f64>,
-        priorweights: ArrayView1<f64>,
-        mu: &mut Array1<f64>,
-        weights: &mut Array1<f64>,
-        z: &mut Array1<f64>,
-        integrated: Option<IntegratedWorkingInput<'_>>,
-        derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
-    ) -> Result<(), EstimationError>;
 
-    fn loglik_deviance(
-        &self,
-        y: ArrayView1<f64>,
-        eta: &Array1<f64>,
-        inverse_link: &InverseLink,
-        priorweights: ArrayView1<f64>,
-    ) -> Result<f64, EstimationError>;
 }
 
 impl WorkingLikelihood for GlmLikelihoodSpec {
