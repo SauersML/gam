@@ -1,48 +1,16 @@
-//! Does the poincaré/circle stall survive the landed #2720 two-span fix?
+//! Regression probes for the linear atom after the #2720 two-span fix.
 //!
-//! ## Background
+//! The geometry sweep found that the linear fixture reaches the same accepted
+//! criterion at 40 and 400 iterations while the accepted point retains a
+//! material derivative along the likelihood-flat dilation orbit. These tests
+//! keep two observations pinned: the accepted criterion is budget-invariant,
+//! and `descend_gauge_orbit` engages at the seed and reaches its own stopping
+//! rule before exhausting its round budget.
 //!
-//! The #2772 geometry sweep measured the poincaré atom's inner solve REFUSING
-//! on the planted-circle fixture: 94.6% of the KKT gradient inside the
-//! chart-gauge span, robust to a 10× budget escalation. The Aug-14 stall-state
-//! measurement (research/poincare-gauge-nullness, commit f026495) put the
-//! in-orbit share at 99.85% at the true stall, with a strong anti-gradient
-//! direction available (cos θ = −0.949) that the solver never banks.
+//! This module uses the planted-circle data only as a deterministic dataset.
+//! Its geometry plan is linear; it is not a Poincaré-atom test.
 //!
-//! On 2026-08-17, main landed the modelling resolution (#2720 option 3,
-//! ec18eac + 61d5f00 + 44cf16a): the chart orbit is NOT a posterior gauge, the
-//! convergence quotient is now `posterior_null_quotient_basis` (decoder nulls
-//! only, measured flat to 3e-9 over 704 directions), and the orbit moved to
-//! `likelihood_flat_block_basis`, which `descend_gauge_orbit` (#2762)
-//! minimizes over — armed once per objective-stall plateau. The fix lane's
-//! fixed-point test certified a PERIODIC fit only.
-//!
-//! ## The question this probe answers
-//!
-//! The refusal was measured on a POINCARÉ atom pre-fix. The landed mechanism
-//! claim is that `descend_gauge_orbit` is "the one mover that can take the
-//! long step the orbit needs" (44cf16a). If that mechanism is what unblocked
-//! the stall class, the poincaré/circle refusal should now either (a)
-//! disappear outright, or (b) convert into a descendent exit. If the refusal
-//! reproduces with in-orbit share still ≈0.99, the orbit mover never engaged
-//! on this fixture and the fix's coverage claim has a hole the periodic-only
-//! fixed-point test does not reach.
-//!
-//! ## Probes
-//!
-//! **A — refusal survival.** Inner solve on poincaré/circle at the #2772
-//! ARD-saddle rho, budgets 40 and 400 (the sweep's escalation arms).
-//!
-//! **B — orbit mover at the seed.** `descend_gauge_orbit` called directly at
-//! the SEEDED state (before any solve): what block dimension it engages, how
-//! much objective it banks, and the directional derivatives along the orbit it
-//! saw. If the mover cannot act on the hyperbolic chart's orbit at the state
-//! where the solver refuses, the fix's mechanism claim does not transfer to
-//! this geometry.
-//!
-//! Deterministic fixture (the real `planted_circle_cloud`), no `#[ignore]` —
-//! the ban scanner rejects it.
-//! Run: `cargo test -p gam-sae poincare_stall_postfix -- --nocapture`
+//! Run: `cargo test -p gam-sae linear_ -- --nocapture`
 
 #![cfg(test)]
 use super::*;
@@ -64,7 +32,7 @@ fn ard_saddle_rho(seed_rho: &SaeManifoldRho) -> SaeManifoldRho {
     rho
 }
 
-/// The poincaré/circle probe fixture: seeded term (d=1, unframed) + rho.
+/// The linear/circle probe fixture: seeded term (d=1, unframed) + rho.
 fn linear_circle() -> (SaeManifoldTerm, SaeManifoldRho, Array2<f64>) {
     let z = planted_circle_cloud();
     let minimal = build_sae_minimal_seed(SaeMinimalSeedRequest {
@@ -121,8 +89,8 @@ fn linear_circle() -> (SaeManifoldTerm, SaeManifoldRho, Array2<f64>) {
     (term, ard_saddle_rho(&seed.initial_rho), z)
 }
 
-/// Probe A: does the pre-fix refusal (in-orbit share ≈0.99, robust to 10×
-/// budget) survive the landed two-span fix?
+/// Probe A: is the accepted linear criterion unchanged by a 10x budget
+/// escalation?
 #[test]
 fn linear_budget_escalation_2720() {
     let mut exit_values: Vec<(usize, f64)> = Vec::new();
@@ -177,11 +145,9 @@ fn linear_budget_escalation_2720() {
     );
 }
 
-/// Does the orbit mover engage on linear at the seed? poincare banks
-/// decrease=1.9977e2 over 13 rounds at its seed; if linear's mover also
-/// engages but the exit still carries 4.21x on the dilation direction, the
-/// once-per-plateau arming is implicated; if it barely moves, the block
-/// basis construction on linear is.
+/// Probe B: does the orbit mover engage on the linear seed and finish under
+/// the round bound? This distinguishes an inactive block from later exit
+/// criterion behavior.
 #[test]
 fn linear_orbit_mover_engages_postfix_2720() {
     let (mut term, rho, z) = linear_circle();
