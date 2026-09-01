@@ -162,50 +162,6 @@ impl TotalVariationPenalty {
         }
     }
 
-    fn add_edge_diag(
-        &self,
-        target: ArrayView1<'_, f64>,
-        out: &mut Array1<f64>,
-        d: usize,
-        a: usize,
-        b: usize,
-        weight: f64,
-    ) {
-        let eps2 = self.smoothing_eps * self.smoothing_eps;
-        for j in 0..d {
-            let ia = a * d + j;
-            let ib = b * d + j;
-            let diff = target[ib] - target[ia];
-            let r = (diff * diff + eps2).sqrt();
-            let curvature = weight * eps2 / (r * r * r);
-            out[ia] += curvature;
-            out[ib] += curvature;
-        }
-    }
-
-    fn add_edge_dense(
-        &self,
-        target: ArrayView1<'_, f64>,
-        out: &mut Array2<f64>,
-        d: usize,
-        a: usize,
-        b: usize,
-        weight: f64,
-    ) {
-        let eps2 = self.smoothing_eps * self.smoothing_eps;
-        for j in 0..d {
-            let ia = a * d + j;
-            let ib = b * d + j;
-            let diff = target[ib] - target[ia];
-            let r = (diff * diff + eps2).sqrt();
-            let curvature = weight * eps2 / (r * r * r);
-            out[[ia, ia]] += curvature;
-            out[[ib, ib]] += curvature;
-            out[[ia, ib]] -= curvature;
-            out[[ib, ia]] -= curvature;
-        }
-    }
-
     pub fn diag_target(
         &self,
         target: ArrayView1<'_, f64>,
@@ -254,68 +210,6 @@ impl TotalVariationPenalty {
         out
     }
 
-    pub fn log_det_plus_lambda_i_forward_1d(
-        &self,
-        target: ArrayView1<'_, f64>,
-        rho: ArrayView1<'_, f64>,
-        lambda: f64,
-    ) -> Result<f64, String> {
-        if !matches!(&self.difference_op, DifferenceOpKind::ForwardDiff1D) {
-            return Err(
-                "TotalVariationPenalty::log_det_plus_lambda_i_forward_1d requires ForwardDiff1D"
-                    .to_string(),
-            );
-        }
-        let Some(d) = self.latent_dim(target.len()) else {
-            return Err(format!(
-                "TotalVariationPenalty target length {} is not divisible by n_eff {}",
-                target.len(),
-                self.n_eff
-            ));
-        };
-        if !(lambda.is_finite() && lambda > 0.0) {
-            return Err(format!(
-                "TotalVariationPenalty::log_det_plus_lambda_i_forward_1d requires finite λ > 0; got {lambda}"
-            ));
-        }
-        let n = self.n_eff;
-        if n == 1 {
-            return Ok((d as f64) * lambda.ln());
-        }
-        let weight = self.resolved_weight(rho);
-        let eps2 = self.smoothing_eps * self.smoothing_eps;
-        let mut total = 0.0;
-        for j in 0..d {
-            let mut edge_w = vec![0.0; n - 1];
-            for a in 0..n - 1 {
-                let diff = target[(a + 1) * d + j] - target[a * d + j];
-                let r = (diff * diff + eps2).sqrt();
-                edge_w[a] = weight * eps2 / (r * r * r);
-            }
-
-            let mut prev_pivot = lambda + edge_w[0];
-            if !prev_pivot.is_finite() || prev_pivot <= 0.0 {
-                return Err(format!(
-                    "TotalVariationPenalty log-det encountered non-positive pivot {prev_pivot:.3e}"
-                ));
-            }
-            total += prev_pivot.ln();
-            for row in 1..n {
-                let left = edge_w[row - 1];
-                let right = if row + 1 < n { edge_w[row] } else { 0.0 };
-                let diag = lambda + left + right;
-                let pivot = diag - left * left / prev_pivot;
-                if !pivot.is_finite() || pivot <= 0.0 {
-                    return Err(format!(
-                        "TotalVariationPenalty log-det encountered non-positive pivot {pivot:.3e}"
-                    ));
-                }
-                total += pivot.ln();
-                prev_pivot = pivot;
-            }
-        }
-        Ok(total)
-    }
 }
 
 impl AnalyticPenalty for TotalVariationPenalty {

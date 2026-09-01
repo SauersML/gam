@@ -371,28 +371,6 @@ pub trait AnalyticPenalty: Send + Sync {
     /// Human-readable identifier for diagnostics / logging.
     fn name(&self) -> &str;
 
-    /// Update any attached scalar weight schedule at the given REML outer
-    /// iteration. Penalties without schedules keep their stored weight.
-    fn apply_schedule(&mut self, iter: usize) {
-        // REML outer loops are bounded well below 1,000,000; a value beyond
-        // that cap signals counter corruption rather than a legitimate
-        // iteration count, so refuse to silently accept it.
-        assert!(
-            iter < 1_000_000,
-            "apply_schedule received implausible outer iteration {iter}",
-        );
-    }
-}
-
-pub(crate) fn advance_scalar_weight(
-    weight: &mut f64,
-    schedule: &mut Option<ScalarWeightSchedule>,
-    iter: usize,
-) {
-    if let Some(schedule) = schedule.as_mut() {
-        *weight = schedule.current_weight(iter);
-        schedule.iter_count = iter + 1;
-    }
 }
 
 /// Emit the standard scalar-weight-schedule builder for a penalty struct whose
@@ -418,9 +396,6 @@ macro_rules! impl_with_weight_schedule {
 /// AnalyticPenalty for …` block.
 macro_rules! impl_scalar_apply_schedule {
     ($field:ident) => {
-        fn apply_schedule(&mut self, iter: usize) {
-            advance_scalar_weight(&mut self.$field, &mut self.weight_schedule, iter);
-        }
     };
 }
 

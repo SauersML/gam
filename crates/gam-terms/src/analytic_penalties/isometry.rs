@@ -471,22 +471,6 @@ impl Clone for IsometryPenalty {
 }
 
 impl IsometryPenalty {
-    /// Attach a cached third decoder derivative
-    /// `K_n[i, a, c, d] = ∂²J_n[i, a] / ∂t_{n, c} ∂t_{n, d}`, flattened
-    /// row-major as `(n_obs, p * d * d * d)`. The Hessian-vector product
-    /// uses the full residual-curvature term in addition to the metric
-    /// Gauss-Newton piece.
-    #[must_use]
-    pub fn with_third_decoder_derivative(self, k: Arc<ndarray::Array3<f64>>) -> Self {
-        self.set_third_decoder_derivative(Some(k));
-        self
-    }
-
-    #[must_use]
-    pub fn with_reference(mut self, reference: IsometryReference) -> Self {
-        self.reference = reference;
-        self
-    }
 
     #[must_use]
     pub fn with_jacobian_cache(self, j: Arc<Array2<f64>>) -> Self {
@@ -499,7 +483,6 @@ impl IsometryPenalty {
         self.set_jacobian_second_cache(Some(h));
         self
     }
-
 
     impl_with_weight_schedule!(scalar_weight);
 

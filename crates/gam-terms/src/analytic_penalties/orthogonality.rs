@@ -1356,45 +1356,6 @@ impl OrthogonalityPenalty {
         out
     }
 
-    pub(crate) fn as_dense_with_precomputed_m(
-        &self,
-        t: ArrayView2<'_, f64>,
-        m: ArrayView2<'_, f64>,
-        scale: f64,
-    ) -> Array2<f64> {
-        let n_obs = t.nrows();
-        let d = t.ncols();
-        assert_eq!(m.dim(), (d, d), "precomputed gram dimension mismatch");
-        if m.dim() != (d, d) {
-            return Array2::<f64>::zeros((n_obs * d, n_obs * d));
-        }
-
-        let mut dense = Array2::<f64>::zeros((n_obs * d, n_obs * d));
-        let factor = 2.0 * scale;
-        for row1 in 0..n_obs {
-            for row2 in 0..n_obs {
-                let mut row_dot = 0.0;
-                for axis in 0..d {
-                    row_dot += t[[row1, axis]] * t[[row2, axis]];
-                }
-                for col1 in 0..d {
-                    let i = row1 * d + col1;
-                    for col2 in 0..d {
-                        let j = row2 * d + col2;
-                        let mut entry = t[[row1, col2]] * t[[row2, col1]];
-                        if row1 == row2 {
-                            entry += m[[col2, col1]];
-                        }
-                        if col1 == col2 {
-                            entry += row_dot;
-                        }
-                        dense[[i, j]] = factor * entry;
-                    }
-                }
-            }
-        }
-        dense
-    }
 }
 
 impl AnalyticPenalty for OrthogonalityPenalty {

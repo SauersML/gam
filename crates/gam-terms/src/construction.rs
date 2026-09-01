@@ -44,26 +44,6 @@ pub enum PenaltyRepresentation {
 }
 
 impl PenaltyRepresentation {
-    /// Side length of the square penalty block this representation expands to.
-    pub fn block_dimension(&self) -> usize {
-        match self {
-            PenaltyRepresentation::Dense(matrix) => matrix.nrows(),
-            PenaltyRepresentation::Banded { bands, offsets } => {
-                let mut dim = 0usize;
-                for (band, &offset) in bands.iter().zip(offsets.iter()) {
-                    let len = band.len();
-                    let extent = if offset >= 0 {
-                        len + offset as usize
-                    } else {
-                        len + (-offset) as usize
-                    };
-                    dim = dim.max(extent);
-                }
-                dim
-            }
-            PenaltyRepresentation::Kronecker { left, right } => left.nrows() * right.nrows(),
-        }
-    }
 
 }
 
@@ -74,61 +54,6 @@ pub struct PenaltyMatrix {
 }
 
 impl PenaltyMatrix {
-    fn accumulate_into(&self, mut dest: ArrayViewMut2<'_, f64>, weight: f64) {
-        if weight == 0.0 {
-            return;
-        }
-        match &self.representation {
-            PenaltyRepresentation::Dense(block) => {
-                dest.scaled_add(weight, block);
-            }
-            PenaltyRepresentation::Banded { bands, offsets } => {
-                let positive_offsets: HashSet<usize> = offsets
-                    .iter()
-                    .filter_map(|&off| (off >= 0).then_some(off as usize))
-                    .collect();
-                for (band, &offset) in bands.iter().zip(offsets.iter()) {
-                    let off = offset.unsigned_abs() as usize;
-                    if offset < 0 && positive_offsets.contains(&off) {
-                        continue;
-                    }
-                    for (idx, &value) in band.iter().enumerate() {
-                        let (i, j) = if offset >= 0 {
-                            (idx, idx + off)
-                        } else {
-                            (idx + off, idx)
-                        };
-                        let Some(entry_ij) = dest.get_mut((i, j)) else {
-                            continue;
-                        };
-                        *entry_ij += weight * value;
-                        if i != j
-                            && let Some(entry_ji) = dest.get_mut((j, i))
-                        {
-                            *entry_ji += weight * value;
-                        }
-                    }
-                }
-            }
-            PenaltyRepresentation::Kronecker { left, right } => {
-                let (lrows, l_cols) = left.dim();
-                let (rrows, r_cols) = right.dim();
-                for i in 0..lrows {
-                    for j in 0..l_cols {
-                        let scale = left[(i, j)] * weight;
-                        if scale == 0.0 {
-                            continue;
-                        }
-                        let mut block = dest.slice_mut(s![
-                            i * rrows..(i + 1) * rrows,
-                            j * r_cols..(j + 1) * r_cols
-                        ]);
-                        block.scaled_add(scale, right);
-                    }
-                }
-            }
-        }
-    }
 
     pub fn to_dense(&self, total_dim: usize) -> Array2<f64> {
         let mut dense = Array2::<f64>::zeros((total_dim, total_dim));
@@ -1053,22 +978,6 @@ impl CanonicalPenalty {
             .scaled_add(lambda, &self.local);
     }
 
-    /// Compute `scale * tr(M · S_k)` where M is a `p × p` dense matrix.
-    /// Only reads `M[start..end, start..end]` — O(block_dim²) not O(p²).
-    pub fn trace_product(&self, m: &Array2<f64>, scale: f64) -> f64 {
-        if self.rank() == 0 || scale == 0.0 {
-            return 0.0;
-        }
-        let r = &self.col_range;
-        let m_block = m.slice(s![r.start..r.end, r.start..r.end]);
-        let rm = self.root.dot(&m_block);
-        scale
-            * rm.iter()
-                .zip(self.root.iter())
-                .map(|(&a, &b)| a * b)
-                .sum::<f64>()
-    }
-
     /// Compute `scale * v^T S_k v` (quadratic form).
     /// Only reads `v[start..end]` — O(rank × block_dim) not O(rank × p).
     pub fn quadratic(&self, v: &Array1<f64>, scale: f64) -> f64 {
@@ -1911,11 +1820,6 @@ pub struct ReparamInvariant {
 }
 
 impl ReparamInvariant {
-    /// Returns the largest eigenvalue of the balanced penalty matrix.
-    /// This is lambda-independent and provides a natural scale for shrinkage.
-    pub const fn max_balanced_eigenvalue(&self) -> f64 {
-        self.max_balanced_eigenvalue
-    }
 }
 
 /// Precompute the lambda-invariant reparameterization structure from canonical penalties.
@@ -3135,38 +3039,6 @@ pub fn kronecker_logdet_and_derivatives(
 // (the leaf data+compute module). The byte-identical copy that the carve left
 // here is replaced by an import so the cache and this engine share one type.
 use crate::kronecker::KroneckerInvariantStructure;
-
-/// Kronecker-factored reparameterization for tensor-product penalties.
-///
-/// Instead of eigendecomposing the full p×p balanced penalty (O(p³)), this
-/// eigendecomposes each marginal penalty separately (O(Σ q_k³)) and computes
-/// the joint eigensystem as the Kronecker product of marginal eigensystems.
-pub fn kronecker_reparameterization_engine(
-    marginal_designs: &[Array2<f64>],
-    marginal_penalties: &[Array2<f64>],
-    marginal_dims: &[usize],
-    lambdas: &[f64],
-    has_double_penalty: bool,
-) -> Result<KroneckerReparamResult, EstimationError> {
-    let d = marginal_dims.len();
-    if marginal_designs.len() != d || marginal_penalties.len() != d {
-        return Err(EstimationError::LayoutError(format!(
-            "kronecker_reparameterization_engine: dimension mismatch: designs={}, penalties={}, dims={}",
-            marginal_designs.len(),
-            marginal_penalties.len(),
-            d
-        )));
-    }
-
-    let invariant =
-        KroneckerInvariantStructure::compute(marginal_designs, marginal_penalties, marginal_dims)?;
-    kronecker_reparameterization_engine_with_invariant(
-        &invariant,
-        marginal_dims,
-        lambdas,
-        has_double_penalty,
-    )
-}
 
 /// Kronecker-factored reparameterization reusing a precomputed λ-invariant
 /// structure (eigensystems, reparameterized marginals, shrinkage scale).

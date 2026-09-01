@@ -270,53 +270,6 @@ impl LatentManifold {
         }
     }
 
-    /// Per-axis weights for the Riemannian trust-region metric.
-    ///
-    /// Defaults use `1/scale²`: Circle scale is `2π`, Sphere scale is `π`,
-    /// Interval scale is `hi - lo`, and Euclidean scale is `1`. Product
-    /// manifolds recurse and concatenate; [`Self::ProductWithMetric`] uses
-    /// the caller-supplied weights directly.
-    pub fn metric_weights(&self) -> Vec<f64> {
-        match self {
-            Self::Euclidean => vec![1.0],
-            Self::Circle { period } => {
-                assert!(
-                    period.is_finite() && *period > 0.0,
-                    "LatentManifold::Circle requires a finite positive period; got {period}"
-                );
-                vec![1.0 / (period * period)]
-            }
-            Self::Sphere { dim } => {
-                let w = 1.0 / (std::f64::consts::PI * std::f64::consts::PI);
-                vec![w; *dim]
-            }
-            Self::Interval { lo, hi } => {
-                let scale = hi - lo;
-                assert!(
-                    scale.is_finite() && scale > 0.0,
-                    "LatentManifold::Interval requires finite lo < hi; got lo={lo}, hi={hi}"
-                );
-                vec![1.0 / (scale * scale)]
-            }
-            Self::Product(parts) => {
-                let mut out = Vec::with_capacity(self.ambient_dim(1));
-                for part in parts {
-                    out.extend(part.metric_weights());
-                }
-                out
-            }
-            Self::ProductWithMetric { manifolds, weights } => {
-                let expected: usize = manifolds.iter().map(|part| part.ambient_dim(1)).sum();
-                assert_eq!(
-                    weights.len(),
-                    expected,
-                    "LatentManifold::ProductWithMetric weights length must match ambient dimension"
-                );
-                weights.clone()
-            }
-        }
-    }
-
     /// Per-ambient-axis periodicity: `Some(period)` for an axis that wraps
     /// modulo a finite period (a `Circle` factor, including the longitude of
     /// the lat/lon sphere chart), `None` for a non-periodic axis (Euclidean,
@@ -738,44 +691,6 @@ impl LatentManifold {
         out
     }
 
-    /// Project every column of an ambient matrix into `T_t M`.
-    pub fn project_matrix_columns_to_tangent(
-        &self,
-        t: ArrayView1<'_, f64>,
-        matrix: ArrayView2<'_, f64>,
-    ) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros(matrix.dim());
-        self.project_matrix_columns_to_tangent_into(t, matrix, out.view_mut());
-        out
-    }
-
-    /// In-place column-wise tangent projection: writes the projection of every
-    /// column of `matrix` into the matching column of `out`. Both `matrix` and
-    /// `out` must have shape `(ambient_dim × ncols)`. Callers that project the
-    /// same `(q × p)` scratch every row hoist `out` outside the loop to avoid
-    /// reallocating an `Array2` per row; the projection itself reuses the
-    /// allocation-free [`Self::project_to_tangent`] per column.
-    pub fn project_matrix_columns_to_tangent_into(
-        &self,
-        t: ArrayView1<'_, f64>,
-        matrix: ArrayView2<'_, f64>,
-        mut out: ndarray::ArrayViewMut2<'_, f64>,
-    ) {
-        assert_eq!(
-            matrix.dim(),
-            out.dim(),
-            "project_matrix_columns_to_tangent_into: matrix {:?} != out {:?}",
-            matrix.dim(),
-            out.dim(),
-        );
-        for col_idx in 0..matrix.ncols() {
-            let col = self.project_to_tangent(t, matrix.column(col_idx));
-            for row_idx in 0..matrix.nrows() {
-                out[[row_idx, col_idx]] = col[row_idx];
-            }
-        }
-    }
-
     fn add_normal_pinning(&self, t: ArrayView1<'_, f64>, matrix: &mut Array2<f64>) {
         match self {
             Self::Sphere { dim } => {
@@ -903,10 +818,6 @@ pub struct LatentCoordValues {
 }
 
 impl LatentCoordValues {
-    /// Construct from a dense `(n_obs, latent_dim)` matrix.
-    pub fn from_matrix(matrix: ArrayView2<'_, f64>, id_mode: LatentIdMode) -> Self {
-        Self::from_matrix_with_manifold(matrix, id_mode, LatentManifold::Euclidean)
-    }
 
     /// Construct from a dense matrix and explicit latent manifold.
     pub fn from_matrix_with_manifold(
@@ -953,41 +864,6 @@ impl LatentCoordValues {
         };
         out.project_all_rows_to_manifold();
         out
-    }
-
-    /// Construct directly from a flat (`n_obs * latent_dim`) array.
-    pub fn from_flat(
-        values: Array1<f64>,
-        n_obs: usize,
-        latent_dim: usize,
-        id_mode: LatentIdMode,
-    ) -> Self {
-        Self::from_flat_with_manifold(
-            values,
-            n_obs,
-            latent_dim,
-            id_mode,
-            LatentManifold::Euclidean,
-        )
-    }
-
-    /// Construct directly from a flat array and explicit latent manifold.
-    pub fn from_flat_with_manifold(
-        values: Array1<f64>,
-        n_obs: usize,
-        latent_dim: usize,
-        id_mode: LatentIdMode,
-        manifold: LatentManifold,
-    ) -> Self {
-        Self::from_flat_with_manifold_and_retraction_and_id(
-            values,
-            n_obs,
-            latent_dim,
-            id_mode,
-            manifold,
-            LatentRetractionRegistry::all_euclidean(),
-            next_latent_coord_id(),
-        )
     }
 
     pub fn from_flat_with_manifold_and_retraction_and_id(
@@ -1056,33 +932,6 @@ impl LatentCoordValues {
 
     pub fn retraction_registry(&self) -> &LatentRetractionRegistry {
         &self.retraction_registry
-    }
-
-    /// Effective "is all Euclidean" check used by the inner solver:
-    /// returns `true` only when *both* the declared `LatentManifold` and the
-    /// optional override retraction registry are Euclidean. The registry's
-    /// own `is_all_euclidean` answers a strictly narrower question (was an
-    /// explicit non-Euclidean override installed?) and would silently miss
-    /// non-Euclidean manifolds installed via `from_matrix_with_manifold` /
-    /// `with_manifold`, which left the registry at its `all_euclidean`
-    /// default. See `retract_flat_delta` for the matching update path.
-    pub fn effective_is_all_euclidean(&self) -> bool {
-        self.manifold.is_euclidean() && self.retraction_registry.is_all_euclidean()
-    }
-
-    /// Effective per-axis trust-region metric weights. When the manifold is
-    /// non-Euclidean it is the authoritative geometric description (it
-    /// covers `Interval` and `ProductWithMetric`, which the registry's
-    /// `RetractionKind` cannot express), so we read weights from it. When
-    /// the manifold is Euclidean but an explicit override retraction was
-    /// supplied (e.g. via the JSON `retraction:` key) the registry's
-    /// weights win.
-    pub fn effective_metric_weights(&self) -> Vec<f64> {
-        if self.manifold.is_euclidean() {
-            self.retraction_registry.metric_weights(self.latent_dim)
-        } else {
-            self.manifold.metric_weights()
-        }
     }
 
     /// Effective per-axis periodicity (`Some(period)` on wrapped axes). When
@@ -1319,7 +1168,6 @@ impl LatentCoordValues {
         }
     }
 }
-
 
 fn wrap_to_period(x: f64, period: f64) -> f64 {
     assert!(

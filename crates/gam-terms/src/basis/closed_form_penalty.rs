@@ -348,55 +348,6 @@ pub(crate) fn chebyshev_eval_minus1_to_1(coeffs: &[f64], x: f64) -> f64 {
     x * d - dd + 0.5 * coeffs[0]
 }
 
-/// Riesz kernel R_j^d(r) = F^{-1}{|ρ|^{-2j}}(r) for r > 0.
-///
-/// Non-log case (j > 0, j ∉ d/2 + ℕ₀):
-///   R_j^d(r) = Γ(d/2 - j) / (4^j π^{d/2} Γ(j)) · r^{2j - d}.
-/// Log case (j = d/2 + n, n ∈ ℕ₀):
-///   R_j^d(r) = c_n · r^{2n} · (log r + A_n),
-///   c_n = (-1)^{n+1} / (2^{2j-1} π^{d/2} Γ(j) n!).
-///
-/// The finite-part constant `A_n` is chosen so the distributional
-/// recurrence `Δ R_j^d = -R_{j-1}^d` holds exactly away from the
-/// origin. This removes the previous null-space polynomial residue in
-/// log-Riesz regimes and keeps the anisotropic `(-Δ_B)^q` path analytic.
-pub fn riesz_kernel_value(d: usize, j: f64, r: f64) -> f64 {
-    assert!(d >= 1, "riesz_kernel_value: d must be ≥ 1");
-    assert!(
-        j.is_finite() && j >= 1.0,
-        "riesz_kernel_value: j must be ≥ 1, got {j}"
-    );
-    assert!(r > 0.0, "riesz_kernel_value: r must be > 0");
-
-    // Detect log case: 2j is a non-negative even integer offset of `d`.
-    // For integer `j` this is exact; for fractional `j` it never fires
-    // because `2j − d` won't be an even integer to within `LOG_EPS`.
-    let two_j = 2.0 * j;
-    const LOG_EPS: f64 = 1e-12;
-    let offset = two_j - d as f64;
-    if offset >= -LOG_EPS && (offset.round() - offset).abs() < LOG_EPS {
-        let n_f64 = (offset / 2.0).round();
-        if n_f64 >= 0.0 && (n_f64 * 2.0 - offset).abs() < LOG_EPS {
-            let n = n_f64 as usize;
-            let two_j_i = (two_j.round()) as i32;
-            let sign = if n.is_multiple_of(2) { -1.0 } else { 1.0 }; // (−1)^{n+1}
-            let denom = 2.0_f64.powi(two_j_i - 1)
-                * std::f64::consts::PI.powf(d as f64 / 2.0)
-                * gamma_fn(j)
-                * factorial_f64(n);
-            return sign / denom
-                * r.powi((2 * n) as i32)
-                * (r.ln() + log_riesz_finite_part_shift(d, n));
-        }
-    }
-
-    // Non-log case (admits fractional `j`).
-    let half_d = d as f64 / 2.0;
-    let num = gamma_fn(half_d - j);
-    let denom = 4.0_f64.powf(j) * std::f64::consts::PI.powf(half_d) * gamma_fn(j);
-    num / denom * r.powf(2.0 * j - d as f64)
-}
-
 /// Canonical log-Riesz finite-part constant for
 /// `R_{d/2+n}^d(r) = c_n r^{2n}(log r + A_n)`.
 ///
@@ -420,49 +371,6 @@ pub(crate) fn log_riesz_finite_part_shift(d: usize, n: usize) -> f64 {
         shift -= (4.0 * tf + d as f64 - 2.0) / (4.0 * tf * (tf + half_d - 1.0));
     }
     shift
-}
-
-/// Matérn building block M_ℓ^d(r; κ) = F^{-1}{(|ρ|² + κ²)^{-ℓ}}(r) for r > 0, κ > 0.
-///
-/// M_ℓ^d(r; κ) = κ^{d/2 - ℓ} / ((2π)^{d/2} · 2^{ℓ-1} · Γ(ℓ)) · r^{ℓ - d/2} · K_{ℓ - d/2}(κr).
-///
-/// For r > 0, K_ν is evaluated by the Temme/Steed order-reduced algorithm used
-/// by `bessel_k`, with the half-integer closed form retained where applicable.
-///
-/// For r → 0, returns the small-arg limit using K_ν(x) ~ Γ(|ν|)/2 · (x/2)^{-|ν|}
-/// (ν ≠ 0) or the log limit (ν = 0).
-pub fn matern_kernel_value(d: usize, ell: usize, kappa: f64, r: f64) -> f64 {
-    assert!(d >= 1, "matern_kernel_value: d must be ≥ 1");
-    assert!(ell >= 1, "matern_kernel_value: ell must be ≥ 1");
-    if !(kappa > 0.0) {
-        return f64::NAN;
-    }
-    assert!(r >= 0.0, "matern_kernel_value: r must be ≥ 0");
-
-    let nu = ell as f64 - d as f64 / 2.0;
-    let ln_pref = (d as f64 / 2.0 - ell as f64) * kappa.ln()
-        - (d as f64 / 2.0) * (2.0 * std::f64::consts::PI).ln()
-        - (ell as f64 - 1.0) * std::f64::consts::LN_2
-        - ln_gamma(ell as f64);
-    let pref = ln_pref.exp();
-
-    if r == 0.0 {
-        // M(0) = pref · lim_{r→0} r^{ℓ - d/2} K_{ℓ - d/2}(κr)
-        // For ν > 0: K_ν(x) ~ Γ(ν)/2 (x/2)^{-ν}, so r^ν K_ν(κr) → Γ(ν)/2 (κ/2)^{-ν}.
-        // For ν < 0 (i.e. ℓ < d/2): r^ν · K_{-|ν|}(κr) ~ r^ν · Γ(|ν|)/2 (κr/2)^{-|ν|}
-        //   → Γ(|ν|)/2 (κ/2)^{-|ν|} · r^{ν - |ν|} = ∞ (singular). Return ∞.
-        // For ν = 0: K_0(x) ~ -log(x/2) - γ; r^0·K_0(κr) → ∞. Return ∞.
-        if nu > 0.0 {
-            let lim = 0.5 * gamma_fn(nu) * (0.5 * kappa).powf(-nu);
-            return pref * lim;
-        } else {
-            return f64::INFINITY;
-        }
-    }
-
-    let kr = kappa * r;
-    let kv = bessel_k(nu, kr);
-    pref * r.powf(nu) * kv
 }
 
 pub(crate) const DUCHON_SMALL_CHI_SERIES_MAX: f64 = 0.125;
@@ -629,118 +537,6 @@ pub(crate) fn duchon_small_chi_riesz_series_radial_derivatives(
     }
 
     total.iter().map(|acc| acc.sum()).collect()
-}
-
-pub(crate) fn duchon_small_chi_riesz_series_value(
-    d: usize,
-    a: usize,
-    b: usize,
-    kappa: f64,
-    r: f64,
-) -> f64 {
-    duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, 0, 0)[0]
-}
-
-/// Hybrid isotropic Duchon penalty
-/// g_q^iso(R; m, s, κ) = F^{-1}{1/(ρ^{2(2m-q)} (κ² + ρ²)^{2s})}(R).
-///
-/// This returns the canonical constrained Duchon representative: polynomial
-/// nullspace components are quotiented out, and the small-κR chart evaluates
-/// the matching finite-part Riesz series directly. The ordinary
-/// partial-fraction Green's function and this representative differ by
-/// nullspace terms in low-dimensional singular regimes, but the constrained
-/// fit only sees this representative. Value, radial derivatives, and κ
-/// partials all use the same chart switch, so production never mixes a
-/// stable value formula with cancelled derivative formulas.
-///
-/// Edge cases:
-/// - s = 0: g_q^iso(R) = R_{2m-q}^d(R) (no Matérn factor).
-/// - κ = 0, s ≥ 1: g_q^iso(R) = R_{2m+2s-q}^d(R) (Riesz pure).
-/// - General: small-κR finite-part Riesz series or, outside that chart,
-///   partial-fraction decomposition with a = 2m - q, b = 2s.
-///
-/// Requires a := 2m - q ≥ 1.
-pub fn isotropic_duchon_penalty(q: usize, d: usize, m: usize, s: f64, kappa: f64, r: f64) -> f64 {
-    assert!(2 * m >= q + 1, "isotropic_duchon_penalty: need 2m - q ≥ 1");
-    assert!(
-        s.is_finite() && s >= 0.0,
-        "isotropic_duchon_penalty: s must be finite and ≥ 0, got {s}"
-    );
-    let a = 2 * m - q;
-
-    if s == 0.0 {
-        return riesz_kernel_value(d, a as f64, r);
-    }
-    if kappa == 0.0 {
-        // Pure-Riesz scale-free: fractional `s` rides directly into
-        // the kernel via `j = a + 2s`. No partial-fraction expansion
-        // needed (that path is for the hybrid Matérn-blend regime
-        // below).
-        return riesz_kernel_value(d, a as f64 + 2.0 * s, r);
-    }
-
-    // Hybrid Matérn-blend (κ > 0) uses the partial-fraction
-    // expansion with integer `b = 2s`. Fractional `s` is not yet
-    // supported on this branch — its expansion uses integer
-    // binomials and powers of `κ²` that have no clean fractional
-    // generalisation. Reject up front rather than silently
-    // truncating.
-    assert!(
-        s.fract() == 0.0,
-        "isotropic_duchon_penalty: hybrid Matérn (κ > 0) requires integer s, got {s}"
-    );
-    let s_int = s as usize;
-    let b = 2 * s_int;
-    if use_duchon_small_chi_riesz_series(kappa, r) {
-        return duchon_small_chi_riesz_series_value(d, a, b, kappa, r);
-    }
-
-    let kappa_sq = kappa * kappa;
-
-    // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
-    let mut sum = KahanSum::default();
-    for j in 1..=a {
-        let sign = if (a - j).is_multiple_of(2) { 1.0 } else { -1.0 };
-        let binom = binomial_f64(a + b - j - 1, a - j);
-        let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
-        let term = coeff * riesz_kernel_value(d, j as f64, r);
-        sum.add(term);
-    }
-
-    // B_ℓ = (-1)^a · C(a+b-ℓ-1, b-ℓ) · κ^{-2(a+b-ℓ)}, ℓ = 1..b
-    let sign_a = if a.is_multiple_of(2) { 1.0 } else { -1.0 };
-    for ell in 1..=b {
-        let binom = binomial_f64(a + b - ell - 1, b - ell);
-        let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
-        let term = coeff * matern_kernel_value(d, ell, kappa, r);
-        sum.add(term);
-    }
-
-    sum.sum()
-}
-
-/// Analytic anisotropic Duchon pair-block kernel.
-///
-/// The historical implementation evaluated the Schoenberg heat integral
-/// numerically. Production now uses the exact radial identity
-/// `g_q(z) = (-Δ_B)^q f(|z|)` with closed-form radial derivatives of the
-/// isotropic Riesz/Matérn hybrid kernel.
-pub fn anisotropic_duchon_penalty(
-    q: usize,
-    m: usize,
-    s: f64,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-) -> f64 {
-    assert_eq!(
-        eta.len(),
-        r.len(),
-        "anisotropic_duchon_penalty: eta and r dimension mismatch"
-    );
-    assert!(!r.is_empty(), "anisotropic_duchon_penalty: empty input");
-    assert!(q <= 2, "anisotropic_duchon_penalty: q must be in {{0,1,2}}");
-    anisotropic_duchon_penalty_radial(q, m, s, kappa, eta, r)
 }
 
 /// Bundled value + first/second derivatives of the anisotropic pair-block
@@ -1592,41 +1388,6 @@ pub(crate) fn riesz_kernel_coefficient_nonlog(d: usize, j: usize) -> f64 {
     num / denom
 }
 
-/// Returns the same quantity as `anisotropic_duchon_penalty` (without
-/// the J prefactor on `g_q` — caller multiplies by J) through the
-/// analytic radial `(-Δ_B)^q` chain. No numerical quadrature is used.
-///
-/// For `R = 0` the radial chain may be singular. The finite spectral
-/// self-pair is evaluated first by `schoenberg_self_pair_bundle` using
-/// the closed Gamma/Beta diagonal; smooth odd-dimensional hybrid cases
-/// use the Taylor limit. Remaining non-convergent diagonals are rejected
-/// rather than approximated by a heat quadrature.
-pub fn anisotropic_duchon_penalty_radial(
-    q: usize,
-    m: usize,
-    s: f64,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-) -> f64 {
-    assert_eq!(
-        eta.len(),
-        r.len(),
-        "anisotropic_duchon_penalty_radial: eta and r dimension mismatch"
-    );
-    assert!(
-        !r.is_empty(),
-        "anisotropic_duchon_penalty_radial: empty input"
-    );
-    assert!(
-        q <= 2,
-        "anisotropic_duchon_penalty_radial: q must be in {{0,1,2}}"
-    );
-
-    let powers = AnisoMetricPowers::new(eta);
-    anisotropic_duchon_penalty_radial_with_powers(q, m, s, kappa, eta, &powers, r)
-}
-
 pub(crate) fn anisotropic_duchon_penalty_radial_with_powers(
     q: usize,
     m: usize,
@@ -1816,16 +1577,6 @@ pub(crate) fn anisotropic_laplacian_of_radial_second(
     part_u1sq + part_s1u1 + part_s1sq + part_u2 + part_s2
 }
 
-/// Anisotropic invariants used by the radial form:
-///   R  = √(Σ b_k r_k²)         (length of axis-rescaled lag)
-///   s_p = Σ b_k^p, p ∈ {1, 2}   (anisotropy traces)
-///   u_p = Σ b_k^{p+1} r_k², p ∈ {1, 2}
-/// where b_k = exp(-2 η_k).
-pub(crate) fn aniso_invariants(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
-    let powers = AnisoMetricPowers::new(eta);
-    aniso_invariants_with_powers(&powers, r)
-}
-
 pub(crate) fn aniso_invariants_with_powers(
     powers: &AnisoMetricPowers,
     r: &[f64],
@@ -1908,38 +1659,6 @@ pub(crate) fn aniso_invariants_with_powers(
     }
 
     (r2.sqrt(), s1, s2, u1, u2)
-}
-
-/// Scalar reference implementation of `aniso_invariants` used as a
-/// baseline in the SIMD pair-block benchmark. Returns (R, s_1, s_2,
-/// u_1, u_2) with no `wide::f64x4` lane parallelism. Numerically
-/// identical to the SIMD path up to floating-point summation order
-/// (lane reductions vs sequential).
-pub fn aniso_invariants_scalar(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
-    assert_eq!(eta.len(), r.len());
-    let mut s1 = 0.0_f64;
-    let mut s2 = 0.0_f64;
-    let mut r2 = 0.0_f64;
-    let mut u1 = 0.0_f64;
-    let mut u2 = 0.0_f64;
-    for k in 0..eta.len() {
-        let b = (-2.0 * eta[k]).exp();
-        let b2 = b * b;
-        let rk2 = r[k] * r[k];
-        s1 += b;
-        s2 += b2;
-        r2 += b * rk2;
-        u1 += b2 * rk2;
-        u2 += b2 * b * rk2;
-    }
-    (r2.sqrt(), s1, s2, u1, u2)
-}
-
-/// SIMD path of `aniso_invariants` exposed under a stable name for the
-/// pair-block SIMD-vs-scalar benchmark. Forwards to the private
-/// implementation used in production hot paths.
-pub fn aniso_invariants_simd(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
-    aniso_invariants(eta, r)
 }
 
 /// κ-partial of `radial_derivatives_of_isotropic_duchon`: returns
@@ -2404,27 +2123,6 @@ pub(crate) fn aniso_invariants_eta_jacobian_with_powers(
     (big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de)
 }
 
-/// Bundled value + first/second derivatives of the radial-form
-/// anisotropic pair-block `J · g_q`.
-///
-/// Uses analytic chain rules on `(R, s_1, s_2, u_1, u_2)` for regular
-/// non-log regimes. Finite spectral self-pairs use the closed
-/// Schoenberg Gamma/Beta diagonal with exact η/κ derivatives; smooth
-/// odd-dimensional hybrid self-pairs use the Taylor limit; other
-/// singular/log-Riesz self-pairs use the analytic Schoenberg derivative
-/// bundle for the same distributional diagonal used by the value path.
-pub fn pair_block_radial_with_j_second_derivatives(
-    q: usize,
-    m: usize,
-    s: usize,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-) -> PairBlockBundle {
-    let powers = AnisoMetricPowers::new(eta);
-    pair_block_radial_with_j_second_derivatives_with_powers(q, m, s, kappa, eta, &powers, r)
-}
-
 pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
     q: usize,
     m: usize,
@@ -2660,91 +2358,6 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
         d2_eta_kappa,
         d2_kappa,
     }
-}
-
-/// Bare-kernel first derivative ∂g_q/∂η_k. The production bundle carries
-/// derivatives of `J · g_q`; this unwraps the `J` contribution.
-pub fn psi_first_derivative(
-    q: usize,
-    m: usize,
-    s: usize,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-    k: usize,
-) -> f64 {
-    assert!(
-        k < eta.len(),
-        "psi_first_derivative: axis index out of range"
-    );
-    let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
-    let big_j = eta.iter().sum::<f64>().exp();
-    (bundle.d_eta[k] - bundle.value) / big_j
-}
-
-/// Bare-kernel second derivative ∂²g_q/∂η_k∂η_l.
-pub fn psi_second_derivative(
-    q: usize,
-    m: usize,
-    s: usize,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-    k: usize,
-    l: usize,
-) -> f64 {
-    assert!(
-        k < eta.len() && l < eta.len(),
-        "psi_second_derivative: axis index out of range"
-    );
-    let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
-    let big_j = eta.iter().sum::<f64>().exp();
-    (bundle.d2_eta[k][l] - bundle.d_eta[k] - bundle.d_eta[l] + bundle.value) / big_j
-}
-
-/// Bare-kernel first derivative ∂g_q/∂κ.
-pub fn kappa_first_derivative(
-    q: usize,
-    m: usize,
-    s: usize,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-) -> f64 {
-    let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
-    bundle.d_kappa / eta.iter().sum::<f64>().exp()
-}
-
-/// Bare-kernel second derivative ∂²g_q/∂κ².
-pub fn kappa_second_derivative(
-    q: usize,
-    m: usize,
-    s: usize,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-) -> f64 {
-    let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
-    bundle.d2_kappa / eta.iter().sum::<f64>().exp()
-}
-
-/// Bare-kernel mixed derivative ∂²g_q/∂η_k∂κ.
-pub fn psi_kappa_mixed_derivative(
-    q: usize,
-    m: usize,
-    s: usize,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-    k: usize,
-) -> f64 {
-    assert!(
-        k < eta.len(),
-        "psi_kappa_mixed_derivative: axis index out of range"
-    );
-    let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
-    let big_j = eta.iter().sum::<f64>().exp();
-    (bundle.d2_eta_kappa[k] - bundle.d_kappa) / big_j
 }
 
 #[cfg(test)]

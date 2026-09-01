@@ -639,40 +639,6 @@ fn periodic_bernoulli_block(r: f64, m: usize, period: f64) -> Result<f64, BasisE
     Ok(scale * bern)
 }
 
-/// Value and log-κ derivatives ``(K_per, ∂K_per/∂ψ, ∂²K_per/∂ψ²)`` of the
-/// periodic hybrid Duchon kernel, with ``ψ = ln κ``. The ``ρ^{−2p}`` blocks are
-/// κ-independent and only the ``(κ²+ρ²)^{−s}`` factor carries ψ; differentiating
-/// the spectrum gives the exact tower relations
-///
-/// ```text
-///     ∂K^{(p,s)}/∂ψ   = −2s κ² · K^{(p,s+1)},
-///     ∂²K^{(p,s)}/∂ψ² = −4s κ² · K^{(p,s+1)} + 4s(s+1) κ⁴ · K^{(p,s+2)},
-/// ```
-///
-/// so the derivative path reuses the SAME closed-form periodization at spectral
-/// orders `s`, `s+1`, `s+2` — no separate differentiation of the cosh/sinh
-/// chains.
-pub(crate) fn periodic_hybrid_duchon_kernel_psi_triplet(
-    r: f64,
-    kappa: f64,
-    p_order: usize,
-    s_order: usize,
-    period: f64,
-) -> Result<(f64, f64, f64), BasisError> {
-    let k2 = kappa * kappa;
-    let value = periodic_hybrid_duchon_kernel_value(r, kappa, p_order, s_order, period)?;
-    if s_order == 0 {
-        // Pure polyharmonic spectrum: κ-independent, so both ψ-derivatives vanish.
-        return Ok((value, 0.0, 0.0));
-    }
-    let s = s_order as f64;
-    let k_s1 = periodic_hybrid_duchon_kernel_value(r, kappa, p_order, s_order + 1, period)?;
-    let k_s2 = periodic_hybrid_duchon_kernel_value(r, kappa, p_order, s_order + 2, period)?;
-    let d_psi = -2.0 * s * k2 * k_s1;
-    let d_psi_psi = -4.0 * s * k2 * k_s1 + 4.0 * s * (s + 1.0) * k2 * k2 * k_s2;
-    Ok((value, d_psi, d_psi_psi))
-}
-
 /// Scaled Bernoulli function ``kᵥ(t) = Bᵥ(t) / ν!`` and its first derivative
 /// ``k'ᵥ(t) = B'ᵥ(t)/ν! = Bᵥ₋₁(t)/(ν−1)! = kᵥ₋₁(t)`` for the degrees the
 /// mixed-periodicity Sobolev kernel needs (``ν ∈ {0,1,2,3,4}``).

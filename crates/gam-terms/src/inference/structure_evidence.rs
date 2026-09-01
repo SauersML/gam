@@ -177,16 +177,6 @@ impl EProcess {
         }
     }
 
-    /// Absorb one conditionally-valid e-value (NOT in log space; must be
-    /// ≥ 0; `E[e | past] ≤ 1` under H0 is the caller's contract — e.g. a
-    /// universal-inference batch ratio or a fixed-prior Bayes factor).
-    pub fn absorb(&mut self, e_value: f64) -> Result<(), String> {
-        if e_value.is_nan() || e_value < 0.0 {
-            return Err(format!("e-value must be in [0, ∞], got {e_value}"));
-        }
-        self.absorb_log(e_value.ln())
-    }
-
     /// Absorb a batch e-value supplied in log space (the only numerically
     /// honest interface for long streams).
     pub fn absorb_log(&mut self, log_e_value: f64) -> Result<(), String> {
@@ -738,32 +728,6 @@ impl StructureLedger {
         &self.claims
     }
 
-    /// The likelihood half of the probe-design loop (work-plan step 4):
-    /// after running a planned probe ([`ProbePlan`] →
-    /// `crate::inference::steering::steer_delta`), evaluate the REALIZED
-    /// outcomes under both hypotheses' predictive densities and absorb the
-    /// log-ratio into the contested claim's e-process.
-    ///
-    /// Validity contract: both predictive densities must be FROZEN before the
-    /// probe outcome is observed — which the design loop satisfies by
-    /// construction, since both hypotheses' dictionaries were fitted before
-    /// the probe was even chosen. For a composite null, the null density must
-    /// be the honest constrained fit (the same rule as
-    /// [`split_likelihood_log_e_value`], which this delegates to); for a
-    /// simple null the predictive density is the sup. Probe outcomes are new
-    /// data by construction (the model was steered to produce them), so they
-    /// compound validly with the claim's prior shard evidence.
-    pub fn absorb_probe_outcome(
-        &mut self,
-        idx: usize,
-        log_lik_alt_on_outcome: f64,
-        log_lik_null_on_outcome: f64,
-    ) -> Result<(), String> {
-        let log_e = split_likelihood_log_e_value(log_lik_alt_on_outcome, log_lik_null_on_outcome)
-            .map_err(|error| error.to_string())?;
-        self.absorb_log(idx, log_e)
-    }
-
     /// The dictionary certificate: e-BH over the ledger's CURRENT
     /// e-values at level α. FDR ≤ α over the confirmed set under arbitrary
     /// dependence — atoms sharing every token is fine — and valid at any
@@ -819,13 +783,7 @@ pub struct StructureCertificate {
 }
 
 impl StructureCertificate {
-    pub fn confirmed(&self) -> impl Iterator<Item = &CertificateEntry> {
-        self.entries.iter().filter(|e| e.confirmed)
-    }
 
-    pub fn contested(&self) -> impl Iterator<Item = &CertificateEntry> {
-        self.entries.iter().filter(|e| !e.confirmed)
-    }
 }
 
 /// Calibrate one (super)uniform p-value into a single e-value, in log

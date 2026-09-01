@@ -309,73 +309,6 @@ pub fn duchon_radial_first_derivative_nd(
     .phi_r)
 }
 
-/// N-D Duchon radial second derivative `φ''(r)` evaluated for every
-/// `(row, center)` pair.
-///
-/// Returns an `(n_rows, n_centers)` matrix whose `(n, k)` entry is the scalar
-/// radial second derivative `φ''(r_{nk})` of the Duchon kernel, where
-/// `r_{nk} = ‖t_n − c_k‖_2`.
-///
-/// This is the companion primitive to
-/// [`duchon_radial_first_derivative_nd`]. Together the two scalars reconstruct
-/// the full input-location Hessian:
-///
-/// ```text
-/// ∂²φ/∂t_a∂t_b = (φ'(r)/r) δ_ab
-///              + (φ''(r) − φ'(r)/r) (t_a − c_a)(t_b − c_b) / r².
-/// ```
-///
-/// At `r = 0`, consumers should use the isotropic collision limit
-/// `φ''(0) δ_ab`; `duchon_radial_jets` supplies that finite scalar whenever
-/// the selected Duchon order is smooth enough for the supported latent path.
-///
-/// Thin adapter over `duchon_radial_jets_nd`.
-pub fn duchon_radial_second_derivative_nd(
-    t: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    length_scale: Option<f64>,
-    nullspace_order: DuchonNullspaceOrder,
-    power: usize,
-) -> Result<Array2<f64>, BasisError> {
-    Ok(duchon_radial_jets_nd(
-        2,
-        t,
-        centers,
-        length_scale,
-        nullspace_order,
-        power,
-        "duchon_radial_second_derivative_nd",
-    )?
-    .phi_rr)
-}
-
-/// N-D Duchon radial third derivative `φ'''(r)` evaluated for every
-/// `(row, center)` pair.
-///
-/// Returns an `(n_rows, n_centers)` matrix whose `(n, k)` entry is the scalar
-/// third radial derivative `φ'''(r_{nk})` from the same
-/// `duchon_radial_jets` path used by the first/second derivative helpers.
-///
-/// Thin adapter over `duchon_radial_jets_nd`.
-pub fn duchon_radial_third_derivative_nd(
-    t: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    length_scale: Option<f64>,
-    nullspace_order: DuchonNullspaceOrder,
-    power: usize,
-) -> Result<Array2<f64>, BasisError> {
-    Ok(duchon_radial_jets_nd(
-        3,
-        t,
-        centers,
-        length_scale,
-        nullspace_order,
-        power,
-        "duchon_radial_third_derivative_nd",
-    )?
-    .phi_rrr)
-}
-
 pub(crate) fn fill_duchon_1d_polynomial_derivative(
     basis: &mut Array2<f64>,
     start_col: usize,
@@ -1578,55 +1511,6 @@ pub fn matern_radial_first_derivative_nd(
             let (_phi, phi_r, _phi_rr, _ratio) =
                 matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu)?;
             out[[n, k]] = phi_r;
-        }
-    }
-    Ok(out)
-}
-
-/// N-D Matérn radial second derivative `φ''(r)` evaluated for every
-/// `(row, center)` pair.
-///
-/// Companion to [`matern_radial_first_derivative_nd`]. Together they give
-/// the full input-location Hessian:
-///
-/// ```text
-/// ∂²φ/∂t_i∂t_j = (φ'(r)/r) (δ_ij − u_i u_j) + φ''(r) u_i u_j,
-/// ```
-/// where `u_a = (t_a − c_a) / r`. At `r = 0`, the limit reduces to the
-/// isotropic `φ''(0) δ_ij`.
-pub fn matern_radial_second_derivative_nd(
-    t: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    length_scale: f64,
-    nu: MaternNu,
-) -> Result<Array2<f64>, BasisError> {
-    let n_rows = t.nrows();
-    let n_centers = centers.nrows();
-    let dim = centers.ncols();
-    if dim == 0 {
-        crate::bail_invalid_basis!(
-            "matern_radial_second_derivative_nd: centers must have at least one column".into(),
-        );
-    }
-    if t.ncols() != dim {
-        crate::bail_invalid_basis!(
-            "matern_radial_second_derivative_nd: t has {} cols but centers have {}",
-            t.ncols(),
-            dim
-        );
-    }
-    let mut out = Array2::<f64>::zeros((n_rows, n_centers));
-    for n in 0..n_rows {
-        for k in 0..n_centers {
-            let mut r2 = 0.0_f64;
-            for a in 0..dim {
-                let dv = t[[n, a]] - centers[[k, a]];
-                r2 += dv * dv;
-            }
-            let r = r2.sqrt();
-            let (_phi, _phi_r, phi_rr, _ratio) =
-                matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu)?;
-            out[[n, k]] = phi_rr;
         }
     }
     Ok(out)
