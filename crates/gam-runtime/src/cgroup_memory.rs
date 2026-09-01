@@ -121,10 +121,6 @@ impl CgroupMemoryAvailability {
         })
     }
 
-    pub fn binding_path(&self) -> &str {
-        &self.binding_path
-    }
-
     pub const fn limit_bytes(&self) -> u64 {
         self.limit_bytes
     }
@@ -133,21 +129,10 @@ impl CgroupMemoryAvailability {
         self.current_bytes
     }
 
-    pub const fn inactive_file_bytes(&self) -> u64 {
-        self.inactive_file_bytes
-    }
-
-    pub const fn working_set_bytes(&self) -> u64 {
-        self.working_set_bytes
-    }
-
     pub const fn available_bytes(&self) -> u64 {
         self.available_bytes
     }
 
-    pub const fn inspected_levels(&self) -> usize {
-        self.inspected_levels
-    }
 }
 
 #[cfg(test)]
