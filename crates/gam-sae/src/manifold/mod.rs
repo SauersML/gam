@@ -507,6 +507,7 @@ mod tests_gauge_posterior_flatness_2720;
 
 #[cfg(test)]
 mod tests_gauge_geometry_2720;
+#[cfg(test)]
 mod tests_linear_escalation_2720;
 
 /// #2720 follow-up (PR #2772 thread) — the channel-null family's smoothness
