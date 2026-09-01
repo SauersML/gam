@@ -149,10 +149,6 @@ impl CustomFamilyHyperLayout {
         &self.design_derivative_blocks
     }
 
-    pub fn family_axes(&self) -> &[usize] {
-        &self.family_axes
-    }
-
     /// Exact non-rho coordinate values used to realize this manifest.
     ///
     /// The vector is aligned one-to-one with [`Self::axis`] and is part of the
@@ -244,71 +240,8 @@ impl CustomFamilyBlockPsiDerivative {
 
 pub trait CustomFamilyPsiDerivativeOperator: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
-    fn n_data(&self) -> usize;
     fn p_out(&self) -> usize;
-    fn transpose_mul(
-        &self,
-        axis: usize,
-        v: &ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, BasisError>;
-    fn forward_mul(&self, axis: usize, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, BasisError>;
-    fn transpose_mul_second_diag(
-        &self,
-        axis: usize,
-        v: &ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, BasisError>;
-    fn transpose_mul_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-        v: &ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, BasisError>;
-    fn forward_mul_second_diag(
-        &self,
-        axis: usize,
-        u: &ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, BasisError>;
-    fn forward_mul_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-        u: &ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, BasisError>;
-    fn row_chunk_first(&self, axis: usize, rows: Range<usize>) -> Result<Array2<f64>, BasisError>;
-    /// Single-row specialization of `row_chunk_first`. Default implementation
-    /// delegates to `row_chunk_first(axis, row..row+1)` and copies the
-    /// resulting row into the output buffer; implementations that can avoid
-    /// the temporary matrix allocation should override this method.
-    fn row_vector_first_into(
-        &self,
-        axis: usize,
-        row: usize,
-        mut out: ArrayViewMut1<'_, f64>,
-    ) -> Result<(), BasisError> {
-        let chunk = self.row_chunk_first(axis, row..row + 1)?;
-        out.assign(&chunk.row(0));
-        Ok(())
-    }
-    fn row_chunk_second_diag(
-        &self,
-        axis: usize,
-        rows: Range<usize>,
-    ) -> Result<Array2<f64>, BasisError>;
-    fn row_chunk_second_cross(
-        &self,
-        axis_d: usize,
-        axis_e: usize,
-        rows: Range<usize>,
-    ) -> Result<Array2<f64>, BasisError>;
 
-    /// Optional upcast to the dense materialization surface. Production exact
-    /// paths should prefer the analytic matvec / row-chunk methods above and
-    /// avoid forming the full derivative matrix; implementations that *do*
-    /// support dense materialization (used by diagnostics, tests, and
-    /// small-data fallbacks) should override this to return `Some(self)`.
-    fn as_materializable(&self) -> Option<&dyn MaterializablePsiDerivativeOperator> {
-        None
-    }
 }
 
 /// Diagnostic / small-data extension that exposes dense materialization of
@@ -316,7 +249,6 @@ pub trait CustomFamilyPsiDerivativeOperator: Send + Sync + Any {
 /// on dense second-derivative materialization; second-order paths use the
 /// row-chunk and matvec methods on [`CustomFamilyPsiDerivativeOperator`].
 pub trait MaterializablePsiDerivativeOperator: CustomFamilyPsiDerivativeOperator {
-    fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, BasisError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

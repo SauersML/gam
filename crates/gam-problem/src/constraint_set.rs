@@ -201,11 +201,6 @@ impl ContractFeasibleStep {
         blocking_scaled_drift: 0.0,
     };
 
-    /// True when a row drove the fraction to exactly zero — the direction is
-    /// blocked by an active face and needs a projection, not a shorter step.
-    pub fn is_blocked_by_active_face(&self) -> bool {
-        self.fraction == 0.0
-    }
 }
 
 /// Why the contract-feasible ratio test could not answer.

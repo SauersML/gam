@@ -136,16 +136,6 @@ impl OuterScoreSubsample {
         self.mask.is_empty()
     }
 
-    /// True when at least two retained rows have different per-row weights.
-    /// Consumers that previously applied a single post-sum scalar must
-    /// switch to per-row weighting whenever this returns true.
-    pub fn has_variable_weights(&self) -> bool {
-        let mut iter = self.rows.iter();
-        let Some(first) = iter.next() else {
-            return false;
-        };
-        iter.any(|r| (r.weight - first.weight).abs() > 0.0)
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

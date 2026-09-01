@@ -124,11 +124,6 @@ impl PhiScaledCovariance {
         &self.0
     }
 
-    /// Consume the wrapper and return the raw `φ · H⁻¹` matrix.
-    #[inline]
-    pub fn into_array(self) -> Array2<f64> {
-        self.0
-    }
 }
 
 impl From<Array2<f64>> for PhiScaledCovariance {
@@ -154,10 +149,6 @@ impl Deref for PhiScaledCovariance {
 }
 
 impl DerefMut for PhiScaledCovariance {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Array2<f64> {
-        &mut self.0
-    }
 }
 
 /// Raw penalised Hessian `H = X' W_H X + S(lambda)` with NO dispersion
@@ -183,11 +174,6 @@ impl UnscaledPrecision {
         &self.0
     }
 
-    /// Consume the wrapper and return the raw `H` matrix.
-    #[inline]
-    pub fn into_array(self) -> Array2<f64> {
-        self.0
-    }
 }
 
 impl From<Array2<f64>> for UnscaledPrecision {
@@ -213,10 +199,6 @@ impl Deref for UnscaledPrecision {
 }
 
 impl DerefMut for UnscaledPrecision {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Array2<f64> {
-        &mut self.0
-    }
 }
 
 #[cfg(test)]

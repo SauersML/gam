@@ -160,27 +160,6 @@ impl Dispersion {
         self.phi.sqrt()
     }
 
-    /// Rescale an estimated dispersion in place.
-    ///
-    /// Fixed dispersions are left unchanged and return `Ok(false)`. The product
-    /// is checked before mutation so this operation is atomic on error.
-    pub fn rescale_estimate(&mut self, multiplier: f64) -> Result<bool, DispersionError> {
-        if !(multiplier.is_finite() && multiplier > 0.0) {
-            return Err(DispersionError::InvalidMultiplier { multiplier });
-        }
-        if !self.is_estimated() {
-            return Ok(false);
-        }
-        let phi = self.phi * multiplier;
-        if !phi.is_finite() || (self.phi > 0.0 && phi == 0.0) {
-            return Err(DispersionError::RescaleNotRepresentable {
-                phi: self.phi,
-                multiplier,
-            });
-        }
-        self.phi = phi;
-        Ok(true)
-    }
 }
 
 impl From<Dispersion> for DispersionWire {

@@ -67,29 +67,6 @@ impl Display for NonFiniteFloat {
 
 impl std::error::Error for NonFiniteFloat {}
 
-/// Walk `value` through `serde`'s data model and fail on the FIRST non-finite
-/// `f32`/`f64` that a serializer would emit, reporting its path.
-///
-/// This is the write-side counterpart of the load-side type error: it converts
-/// "a `null` will silently appear in the output" into a typed refusal at the
-/// point of origin.
-pub fn ensure_serialized_floats_are_finite<T>(value: &T) -> Result<(), NonFiniteFloat>
-where
-    T: Serialize + ?Sized,
-{
-    let mut walker = FloatWalker { path: String::new() };
-    match value.serialize(&mut walker) {
-        Ok(()) => Ok(()),
-        Err(WalkError::NonFinite(found)) => Err(found),
-        // `Custom` can only arise from a `Serialize` impl that itself reports an
-        // error (e.g. a map with an unrepresentable key). Such a value cannot be
-        // serialized to JSON either, so there is no float verdict to give and
-        // the writer downstream will surface the same failure with its own
-        // message. Treat it as "nothing non-finite found here".
-        Err(WalkError::Custom(_)) => Ok(()),
-    }
-}
-
 /// Error channel of the walking serializer.
 #[derive(Debug)]
 enum WalkError {
@@ -131,21 +108,6 @@ impl FloatWalker {
         restore
     }
 
-    fn push_index(&mut self, index: usize) -> usize {
-        let restore = self.path.len();
-        // `fmt::Write` for `String` never returns `Err`, so this names an
-        // invariant of the sink rather than hiding a failure mode. Do not
-        // "remove the Result" by writing `push_str(&index.to_string())`: that
-        // allocates once per sequence element and breaks this module's
-        // no-allocation-per-scalar promise.
-        write!(self.path, "[{index}]").expect("`String`'s `fmt::Write` impl is infallible");
-        restore
-    }
-
-    fn pop_to(&mut self, restore: usize) {
-        self.path.truncate(restore);
-    }
-
     fn check(&self, value: f64) -> Result<(), WalkError> {
         if value.is_finite() {
             Ok(())
@@ -164,26 +126,7 @@ impl FloatWalker {
 struct KeyRenderer;
 
 impl KeyRenderer {
-    /// A key serde offered as a compound value. JSON object keys are strings,
-    /// so there is no spelling for it; name the shape that was offered so the
-    /// `<key>` placeholder that lands in the path can be traced back to the type
-    /// that produced it.
-    fn not_a_scalar(shape: impl Display) -> WalkError {
-        WalkError::Custom(format!("map key is not a scalar: {shape}"))
-    }
 
-    /// Spelling of an enum variant used as a map key. `variant` is what the JSON
-    /// writer emits as the object key, so it is what the path segment must be —
-    /// but `derive` is not the only source of `Serialize` impls, and an empty
-    /// name would splice an invisible segment into the path. Fall back to the
-    /// enum and the variant index, which serde always supplies.
-    fn variant_key(name: &'static str, variant_index: u32, variant: &'static str) -> String {
-        if variant.is_empty() {
-            format!("{name}#{variant_index}")
-        } else {
-            variant.to_string()
-        }
-    }
 }
 
 impl Serializer for KeyRenderer {
@@ -197,194 +140,6 @@ impl Serializer for KeyRenderer {
     type SerializeStruct = Impossible<String, WalkError>;
     type SerializeStructVariant = Impossible<String, WalkError>;
 
-    fn serialize_str(self, value: &str) -> Result<String, WalkError> {
-        Ok(value.to_string())
-    }
-
-    fn serialize_bool(self, value: bool) -> Result<String, WalkError> {
-        Ok(value.to_string())
-    }
-
-    fn serialize_i64(self, value: i64) -> Result<String, WalkError> {
-        Ok(value.to_string())
-    }
-
-    fn serialize_i128(self, value: i128) -> Result<String, WalkError> {
-        Ok(value.to_string())
-    }
-
-    fn serialize_u64(self, value: u64) -> Result<String, WalkError> {
-        Ok(value.to_string())
-    }
-
-    fn serialize_u128(self, value: u128) -> Result<String, WalkError> {
-        Ok(value.to_string())
-    }
-
-    fn serialize_i8(self, value: i8) -> Result<String, WalkError> {
-        self.serialize_i64(i64::from(value))
-    }
-
-    fn serialize_i16(self, value: i16) -> Result<String, WalkError> {
-        self.serialize_i64(i64::from(value))
-    }
-
-    fn serialize_i32(self, value: i32) -> Result<String, WalkError> {
-        self.serialize_i64(i64::from(value))
-    }
-
-    fn serialize_u8(self, value: u8) -> Result<String, WalkError> {
-        self.serialize_u64(u64::from(value))
-    }
-
-    fn serialize_u16(self, value: u16) -> Result<String, WalkError> {
-        self.serialize_u64(u64::from(value))
-    }
-
-    fn serialize_u32(self, value: u32) -> Result<String, WalkError> {
-        self.serialize_u64(u64::from(value))
-    }
-
-    fn serialize_f32(self, value: f32) -> Result<String, WalkError> {
-        Ok(value.to_string())
-    }
-
-    fn serialize_f64(self, value: f64) -> Result<String, WalkError> {
-        Ok(value.to_string())
-    }
-
-    fn serialize_char(self, value: char) -> Result<String, WalkError> {
-        Ok(value.to_string())
-    }
-
-    fn serialize_bytes(self, value: &[u8]) -> Result<String, WalkError> {
-        // Byte strings have no JSON object-key spelling. The length is the one
-        // property that distinguishes two such keys in the path without
-        // rendering an unbounded blob into it.
-        Ok(format!("<{} bytes>", value.len()))
-    }
-
-    fn serialize_none(self) -> Result<String, WalkError> {
-        Ok("null".to_string())
-    }
-
-    fn serialize_some<T>(self, value: &T) -> Result<String, WalkError>
-    where
-        T: Serialize + ?Sized,
-    {
-        value.serialize(self)
-    }
-
-    fn serialize_unit(self) -> Result<String, WalkError> {
-        Ok("null".to_string())
-    }
-
-    fn serialize_unit_struct(self, name: &'static str) -> Result<String, WalkError> {
-        Ok(name.to_string())
-    }
-
-    fn serialize_unit_variant(
-        self,
-        name: &'static str,
-        variant_index: u32,
-        variant: &'static str,
-    ) -> Result<String, WalkError> {
-        Ok(Self::variant_key(name, variant_index, variant))
-    }
-
-    fn serialize_newtype_struct<T>(self, name: &'static str, value: &T) -> Result<String, WalkError>
-    where
-        T: Serialize + ?Sized,
-    {
-        // A newtype struct is transparent in JSON: the key is the inner value's
-        // spelling. If the inner value has no spelling, name the wrapper — that
-        // is the type the caller wrote, and the only one they can act on.
-        value
-            .serialize(self)
-            .map_err(|inner| WalkError::Custom(format!("inside newtype struct `{name}`: {inner}")))
-    }
-
-    fn serialize_newtype_variant<T>(
-        self,
-        name: &'static str,
-        variant_index: u32,
-        variant: &'static str,
-        value: &T,
-    ) -> Result<String, WalkError>
-    where
-        T: Serialize + ?Sized,
-    {
-        // Two entries keyed by the same variant but carrying different payloads
-        // are distinct keys, so the payload belongs in the spelling. Dropping it
-        // (as this did) collapsed them onto one path segment.
-        let inner = value.serialize(KeyRenderer)?;
-        Ok(format!(
-            "{}({inner})",
-            Self::variant_key(name, variant_index, variant)
-        ))
-    }
-
-    fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, WalkError> {
-        Err(Self::not_a_scalar(match len {
-            Some(len) => format!("a sequence of {len} elements"),
-            None => "a sequence of unannounced length".to_string(),
-        }))
-    }
-
-    fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, WalkError> {
-        Err(Self::not_a_scalar(format_args!("a {len}-tuple")))
-    }
-
-    fn serialize_tuple_struct(
-        self,
-        name: &'static str,
-        len: usize,
-    ) -> Result<Self::SerializeTupleStruct, WalkError> {
-        Err(Self::not_a_scalar(format_args!(
-            "tuple struct `{name}` with {len} fields"
-        )))
-    }
-
-    fn serialize_tuple_variant(
-        self,
-        name: &'static str,
-        variant_index: u32,
-        variant: &'static str,
-        len: usize,
-    ) -> Result<Self::SerializeTupleVariant, WalkError> {
-        Err(Self::not_a_scalar(format_args!(
-            "tuple variant `{name}::{variant}` (variant #{variant_index}) with {len} fields"
-        )))
-    }
-
-    fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, WalkError> {
-        Err(Self::not_a_scalar(match len {
-            Some(len) => format!("a map of {len} entries"),
-            None => "a map of unannounced length".to_string(),
-        }))
-    }
-
-    fn serialize_struct(
-        self,
-        name: &'static str,
-        len: usize,
-    ) -> Result<Self::SerializeStruct, WalkError> {
-        Err(Self::not_a_scalar(format_args!(
-            "struct `{name}` with {len} fields"
-        )))
-    }
-
-    fn serialize_struct_variant(
-        self,
-        name: &'static str,
-        variant_index: u32,
-        variant: &'static str,
-        len: usize,
-    ) -> Result<Self::SerializeStructVariant, WalkError> {
-        Err(Self::not_a_scalar(format_args!(
-            "struct variant `{name}::{variant}` (variant #{variant_index}) with {len} fields"
-        )))
-    }
 }
 
 impl<'a> Serializer for &'a mut FloatWalker {
@@ -398,17 +153,6 @@ impl<'a> Serializer for &'a mut FloatWalker {
     type SerializeStruct = StructWalker<'a>;
     type SerializeStructVariant = StructWalker<'a>;
 
-    fn serialize_f64(self, value: f64) -> Result<(), WalkError> {
-        self.check(value)
-    }
-
-    fn serialize_f32(self, value: f32) -> Result<(), WalkError> {
-        // Widen for the verdict AND the message: `f32::NAN as f64` is still
-        // NaN and `f32::INFINITY as f64` is still infinite, so the class is
-        // preserved exactly.
-        self.check(f64::from(value))
-    }
-
     // The integer widths and `char` carry no finiteness verdict, and saying so
     // once per width states that decision fourteen times over. The narrow widths
     // widen losslessly into the widest one of their signedness — the shape
@@ -416,209 +160,6 @@ impl<'a> Serializer for &'a mut FloatWalker {
     // decided in one place per signedness, and a future verdict (a range check,
     // say) has one place to live.
 
-    fn serialize_bool(self, _: bool) -> Result<(), WalkError> {
-        Ok(())
-    }
-
-    fn serialize_i8(self, value: i8) -> Result<(), WalkError> {
-        self.serialize_i64(i64::from(value))
-    }
-
-    fn serialize_i16(self, value: i16) -> Result<(), WalkError> {
-        self.serialize_i64(i64::from(value))
-    }
-
-    fn serialize_i32(self, value: i32) -> Result<(), WalkError> {
-        self.serialize_i64(i64::from(value))
-    }
-
-    fn serialize_i64(self, value: i64) -> Result<(), WalkError> {
-        self.serialize_i128(i128::from(value))
-    }
-
-    fn serialize_i128(self, _: i128) -> Result<(), WalkError> {
-        Ok(())
-    }
-
-    fn serialize_u8(self, value: u8) -> Result<(), WalkError> {
-        self.serialize_u64(u64::from(value))
-    }
-
-    fn serialize_u16(self, value: u16) -> Result<(), WalkError> {
-        self.serialize_u64(u64::from(value))
-    }
-
-    fn serialize_u32(self, value: u32) -> Result<(), WalkError> {
-        self.serialize_u64(u64::from(value))
-    }
-
-    fn serialize_u64(self, value: u64) -> Result<(), WalkError> {
-        self.serialize_u128(u128::from(value))
-    }
-
-    fn serialize_u128(self, _: u128) -> Result<(), WalkError> {
-        Ok(())
-    }
-
-    fn serialize_char(self, value: char) -> Result<(), WalkError> {
-        // JSON writes a `char` as the one-character string it encodes to.
-        self.serialize_str(value.encode_utf8(&mut [0u8; 4]))
-    }
-
-    fn serialize_str(self, _: &str) -> Result<(), WalkError> {
-        Ok(())
-    }
-
-    fn serialize_bytes(self, _: &[u8]) -> Result<(), WalkError> {
-        Ok(())
-    }
-
-    fn serialize_none(self) -> Result<(), WalkError> {
-        Ok(())
-    }
-
-    fn serialize_some<T>(self, value: &T) -> Result<(), WalkError>
-    where
-        T: Serialize + ?Sized,
-    {
-        value.serialize(self)
-    }
-
-    fn serialize_unit(self) -> Result<(), WalkError> {
-        Ok(())
-    }
-
-    fn serialize_unit_struct(self, _: &'static str) -> Result<(), WalkError> {
-        Ok(())
-    }
-
-    fn serialize_unit_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-    ) -> Result<(), WalkError> {
-        Ok(())
-    }
-
-    fn serialize_newtype_struct<T>(self, _: &'static str, value: &T) -> Result<(), WalkError>
-    where
-        T: Serialize + ?Sized,
-    {
-        value.serialize(self)
-    }
-
-    fn serialize_newtype_variant<T>(
-        self,
-        name: &'static str,
-        variant_index: u32,
-        variant: &'static str,
-        value: &T,
-    ) -> Result<(), WalkError>
-    where
-        T: Serialize + ?Sized,
-    {
-        // Externally tagged enums serialize as `{"Variant": payload}`, so the
-        // variant name IS a path segment in the emitted JSON — and an empty one
-        // would splice an invisible segment into the reported path.
-        assert!(
-            !variant.is_empty(),
-            "`{name}` variant #{variant_index} has an empty name; \
-             its path segment would be invisible"
-        );
-        let restore = self.push_field(variant);
-        let outcome = value.serialize(&mut *self);
-        self.pop_to(restore);
-        outcome
-    }
-
-    fn serialize_seq(self, len: Option<usize>) -> Result<SeqWalker<'a>, WalkError> {
-        Ok(SeqWalker::new(self, len, Origin::plain("a sequence")))
-    }
-
-    fn serialize_tuple(self, len: usize) -> Result<SeqWalker<'a>, WalkError> {
-        Ok(SeqWalker::new(self, Some(len), Origin::plain("a tuple")))
-    }
-
-    fn serialize_tuple_struct(
-        self,
-        name: &'static str,
-        len: usize,
-    ) -> Result<SeqWalker<'a>, WalkError> {
-        Ok(SeqWalker::new(self, Some(len), Origin::plain(name)))
-    }
-
-    fn serialize_tuple_variant(
-        self,
-        name: &'static str,
-        variant_index: u32,
-        variant: &'static str,
-        len: usize,
-    ) -> Result<VariantSeqWalker<'a>, WalkError> {
-        let origin = Origin::variant(name, variant_index, variant);
-        let restore = self.push_field(variant);
-        Ok(VariantSeqWalker {
-            seq: SeqWalker::new(self, Some(len), origin),
-            restore,
-        })
-    }
-
-    fn serialize_map(self, len: Option<usize>) -> Result<MapWalker<'a>, WalkError> {
-        Ok(MapWalker {
-            walker: self,
-            restore: None,
-            announced: len,
-            entries: 0,
-            origin: Origin::plain("a map"),
-        })
-    }
-
-    fn serialize_struct(
-        self,
-        name: &'static str,
-        len: usize,
-    ) -> Result<StructWalker<'a>, WalkError> {
-        Ok(StructWalker {
-            walker: self,
-            restore: None,
-            announced: len,
-            fields: 0,
-            origin: Origin::plain(name),
-        })
-    }
-
-    fn serialize_struct_variant(
-        self,
-        name: &'static str,
-        variant_index: u32,
-        variant: &'static str,
-        len: usize,
-    ) -> Result<StructWalker<'a>, WalkError> {
-        let origin = Origin::variant(name, variant_index, variant);
-        let restore = self.push_field(variant);
-        Ok(StructWalker {
-            walker: self,
-            restore: Some(restore),
-            announced: len,
-            fields: 0,
-            origin,
-        })
-    }
-
-    fn collect_str<T>(self, _: &T) -> Result<(), WalkError>
-    where
-        T: Display + ?Sized,
-    {
-        Ok(())
-    }
-
-    fn is_human_readable(&self) -> bool {
-        // The format this guard protects is JSON. Types whose `Serialize` impl
-        // branches on this (e.g. compact binary encodings) must be walked in the
-        // same shape the JSON writer will use, or the guard would inspect a
-        // different set of floats than the one persisted.
-        true
-    }
 }
 
 /// What opened a compound, named for the length-coverage assertion below.
@@ -660,21 +201,6 @@ impl Display for Origin {
     }
 }
 
-/// serde's contract: a compound that announces a length emits exactly that many
-/// elements. The guard's whole claim — *every* float the writer emits is
-/// checked — rests on the walk seeing the same elements the writer will, so a
-/// compound that emits a different number than it announced has subtrees the
-/// walk never visited. That is precisely the silent coverage loss this module
-/// exists to prevent (#2601), so announced lengths are checked, not ignored.
-fn assert_announced_len(origin: &Origin, announced: Option<usize>, emitted: usize) {
-    if let Some(announced) = announced {
-        assert_eq!(
-            emitted, announced,
-            "{origin} announced {announced} elements but emitted {emitted}"
-        );
-    }
-}
-
 /// Sequence / tuple cursor: elements are addressed by position.
 struct SeqWalker<'a> {
     walker: &'a mut FloatWalker,
@@ -693,25 +219,11 @@ impl<'a> SeqWalker<'a> {
         }
     }
 
-    fn finish(&self) {
-        assert_announced_len(&self.origin, self.announced, self.index);
-    }
 }
 
 impl SerializeSeq for SeqWalker<'_> {
     type Ok = ();
     type Error = WalkError;
-
-    fn serialize_element<T>(&mut self, value: &T) -> Result<(), WalkError>
-    where
-        T: Serialize + ?Sized,
-    {
-        let restore = self.walker.push_index(self.index);
-        let outcome = value.serialize(&mut *self.walker);
-        self.walker.pop_to(restore);
-        self.index += 1;
-        outcome
-    }
 
     fn end(self) -> Result<(), WalkError> {
         self.finish();
@@ -723,13 +235,6 @@ impl SerializeTuple for SeqWalker<'_> {
     type Ok = ();
     type Error = WalkError;
 
-    fn serialize_element<T>(&mut self, value: &T) -> Result<(), WalkError>
-    where
-        T: Serialize + ?Sized,
-    {
-        SerializeSeq::serialize_element(self, value)
-    }
-
     fn end(self) -> Result<(), WalkError> {
         SerializeSeq::end(self)
     }
@@ -738,13 +243,6 @@ impl SerializeTuple for SeqWalker<'_> {
 impl SerializeTupleStruct for SeqWalker<'_> {
     type Ok = ();
     type Error = WalkError;
-
-    fn serialize_field<T>(&mut self, value: &T) -> Result<(), WalkError>
-    where
-        T: Serialize + ?Sized,
-    {
-        SerializeSeq::serialize_element(self, value)
-    }
 
     fn end(self) -> Result<(), WalkError> {
         SerializeSeq::end(self)
@@ -760,13 +258,6 @@ struct VariantSeqWalker<'a> {
 impl SerializeTupleVariant for VariantSeqWalker<'_> {
     type Ok = ();
     type Error = WalkError;
-
-    fn serialize_field<T>(&mut self, value: &T) -> Result<(), WalkError>
-    where
-        T: Serialize + ?Sized,
-    {
-        SerializeSeq::serialize_element(&mut self.seq, value)
-    }
 
     fn end(self) -> Result<(), WalkError> {
         self.seq.finish();
@@ -836,17 +327,6 @@ impl SerializeStruct for StructWalker<'_> {
     type Ok = ();
     type Error = WalkError;
 
-    fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> Result<(), WalkError>
-    where
-        T: Serialize + ?Sized,
-    {
-        let restore = self.walker.push_field(key);
-        let outcome = value.serialize(&mut *self.walker);
-        self.walker.pop_to(restore);
-        self.fields += 1;
-        outcome
-    }
-
     fn end(self) -> Result<(), WalkError> {
         assert_announced_len(&self.origin, Some(self.announced), self.fields);
         if let Some(restore) = self.restore {
@@ -859,13 +339,6 @@ impl SerializeStruct for StructWalker<'_> {
 impl SerializeStructVariant for StructWalker<'_> {
     type Ok = ();
     type Error = WalkError;
-
-    fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> Result<(), WalkError>
-    where
-        T: Serialize + ?Sized,
-    {
-        SerializeStruct::serialize_field(self, key, value)
-    }
 
     fn end(self) -> Result<(), WalkError> {
         SerializeStruct::end(self)

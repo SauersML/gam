@@ -159,15 +159,6 @@ impl PenaltyMatrix {
         }
     }
 
-    /// Returns a reference to the inner matrix if this is a Dense variant.
-    pub fn as_dense_ref(&self) -> Option<&Array2<f64>> {
-        match self {
-            Self::Dense(m) => Some(m),
-            Self::Fixed { inner, .. } => inner.as_dense_ref(),
-            Self::KroneckerFactored { .. } | Self::Blockwise { .. } | Self::Labeled { .. } => None,
-        }
-    }
-
     pub fn with_precision_label(self, label: impl Into<String>) -> Self {
         Self::Labeled {
             label: label.into(),
@@ -269,45 +260,6 @@ impl PenaltyMatrix {
             }
             Self::Labeled { inner, .. } | Self::Fixed { inner, .. } => {
                 inner.add_scaled_to(lambda, target)
-            }
-        }
-    }
-
-    /// Add λ * diag(self) to a mutable diagonal accumulator.
-    pub fn add_scaled_diag_to(&self, lambda: f64, target: &mut Array1<f64>) {
-        match self {
-            Self::Dense(m) => {
-                let p = m.nrows().min(target.len());
-                for j in 0..p {
-                    target[j] += lambda * m[[j, j]];
-                }
-            }
-            Self::KroneckerFactored { left, right } => {
-                let p_left = left.nrows();
-                let p_right = right.nrows();
-                assert_eq!(target.len(), p_left * p_right);
-                for i_left in 0..p_left {
-                    let left_diag = left[[i_left, i_left]];
-                    if left_diag == 0.0 {
-                        continue;
-                    }
-                    let scaled_left = lambda * left_diag;
-                    for i_right in 0..p_right {
-                        target[i_left * p_right + i_right] +=
-                            scaled_left * right[[i_right, i_right]];
-                    }
-                }
-            }
-            Self::Blockwise {
-                local, col_range, ..
-            } => {
-                let width = local.nrows().min(col_range.len());
-                for local_idx in 0..width {
-                    target[col_range.start + local_idx] += lambda * local[[local_idx, local_idx]];
-                }
-            }
-            Self::Labeled { inner, .. } | Self::Fixed { inner, .. } => {
-                inner.add_scaled_diag_to(lambda, target)
             }
         }
     }

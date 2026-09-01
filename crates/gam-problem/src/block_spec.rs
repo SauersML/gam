@@ -55,32 +55,6 @@ pub trait FamilyChannelHessian: Send + Sync {
     /// Number of output channels `n_outputs` (= K in the row Jacobian).
     fn n_outputs(&self) -> usize;
 
-    /// Number of subjects (rows).
-    fn n_subjects(&self) -> usize;
-
-    /// Fill the `n_outputs × n_outputs` per-subject channel Hessian `W_i`
-    /// into `out` (row-major, length `n_outputs * n_outputs`) for subject `i`.
-    /// Negative eigenvalues must be clamped to zero (PSD projection) before
-    /// or inside this call.
-    fn fill_subject(&self, i: usize, out: &mut [f64]);
-
-    /// Materialise the full `(n_subjects × n_outputs × n_outputs)` tensor.
-    /// Default implementation calls `fill_subject` for each row.
-    fn evaluate_full(&self) -> ndarray::Array3<f64> {
-        let n = self.n_subjects();
-        let k = self.n_outputs();
-        let mut out = ndarray::Array3::<f64>::zeros((n, k, k));
-        let mut buf = vec![0.0_f64; k * k];
-        for i in 0..n {
-            self.fill_subject(i, &mut buf);
-            for a in 0..k {
-                for b in 0..k {
-                    out[[i, a, b]] = buf[a * k + b];
-                }
-            }
-        }
-        out
-    }
 }
 
 /// β-linearization state passed to [`BlockEffectiveJacobian::effective_jacobian_at`].
@@ -875,10 +849,6 @@ pub enum CoefficientCoordinate {
 }
 
 impl CoefficientCoordinate {
-    /// Is this coordinate free to be reparameterised?
-    pub fn is_spanning(self) -> bool {
-        matches!(self, Self::Spanning)
-    }
 
     /// Does this coordinate carry model structure a reparameterisation would
     /// destroy?

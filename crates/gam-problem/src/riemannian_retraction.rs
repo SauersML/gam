@@ -116,24 +116,6 @@ impl RetractionKind {
         }
     }
 
-    pub fn metric_weights(&self) -> Vec<f64> {
-        match self {
-            Self::Euclidean { dim } => vec![1.0; *dim],
-            Self::Circle => vec![1.0 / (TWO_PI * TWO_PI)],
-            Self::Sphere { dim } => {
-                let weight = 1.0 / (std::f64::consts::PI * std::f64::consts::PI);
-                vec![weight; *dim]
-            }
-            Self::Product(product) => {
-                let mut out = Vec::with_capacity(product.ambient_dim());
-                for part in &product.parts {
-                    out.extend(part.metric_weights());
-                }
-                out
-            }
-        }
-    }
-
     /// Per-ambient-axis periodicity, mirroring
     /// `gam_terms::latent::LatentManifold::axis_periods`. A `Circle`
     /// retraction wraps modulo `2π`; an embedded `Sphere` retraction is smooth
@@ -191,12 +173,6 @@ impl LatentRetractionRegistry {
         self.block
             .as_ref()
             .map_or(fallback_dim, RetractionKind::ambient_dim)
-    }
-
-    pub fn metric_weights(&self, fallback_dim: usize) -> Vec<f64> {
-        self.block
-            .as_ref()
-            .map_or_else(|| vec![1.0; fallback_dim], RetractionKind::metric_weights)
     }
 
     /// Per-ambient-axis periodicity for the override retraction, falling back

@@ -160,70 +160,10 @@ pub trait BlockExcessTarget {
     fn block_dim(&self) -> usize;
     /// Number of outer ρ coordinates the gradient is reported against.
     fn rho_dim(&self) -> usize;
-    /// Block curvatures `λ_r` (the H-eigenvalues of the integrated directions),
-    /// length `block_dim()`.
-    fn block_curvatures(&self) -> &Array1<f64>;
     /// Non-Gaussian remainder `ΔF(t)` at whitened block displacement `t`
     /// (length `block_dim()`).
     fn excess(&self, t: &Array1<f64>) -> f64;
-    /// ρ-gradient `∂ΔF/∂ρ_k` at the same `t`, length `rho_dim()` — the explicit
-    /// penalty-score channel (a).
-    fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64>;
-    /// Per-row displaced score `∂(D(η̂+s(t))/2φ)/∂η` evaluated at `η̂ + s(t)`
-    /// (length = number of observation rows): the only per-draw ingredient of
-    /// the exact-gradient channels (b)–(d) the assembly side cannot reconstruct.
-    /// A row-domain failure rejects the complete score atomically.
-    fn displaced_neg_score(&self, t: &Array1<f64>) -> Result<Array1<f64>, String>;
-    /// The same per-row score channel at the undisplaced mode `η̂`.
-    fn base_neg_score(&self) -> Result<Array1<f64>, String>;
 
-    /// Fused `(excess(t), displaced_neg_score(t))`. The returned score is `None`
-    /// exactly when the excess is non-finite (an infeasible draw the sampler
-    /// discards before reading the score). The default preserves the two-call
-    /// behavior; implementors override to share the displacement + jet.
-    fn excess_with_displaced_neg_score(&self, t: &Array1<f64>) -> (f64, Option<Array1<f64>>) {
-        let excess = self.excess(t);
-        if excess.is_finite() {
-            match self.displaced_neg_score(t) {
-                Ok(score) => (excess, Some(score)),
-                Err(_) => (f64::INFINITY, None),
-            }
-        } else {
-            (excess, None)
-        }
-    }
-
-    /// Batched [`Self::excess_with_displaced_neg_score`] over many whitened draws
-    /// (one draw per COLUMN, shape `block_dim() × n_draws`). Batching may only
-    /// change HOW the shared linear algebra is computed (one BLAS-3 product over
-    /// all columns), never WHAT is computed. The default preserves the per-column
-    /// behavior exactly; the GLM implementor overrides it.
-    fn excess_with_displaced_neg_score_batch(
-        &self,
-        draws: &Array2<f64>,
-    ) -> Vec<(f64, Option<Array1<f64>>)> {
-        let n_draws = draws.ncols();
-        let mut out = Vec::with_capacity(n_draws);
-        let mut t = Array1::<f64>::zeros(draws.nrows());
-        for s in 0..n_draws {
-            t.assign(&draws.column(s));
-            out.push(self.excess_with_displaced_neg_score(&t));
-        }
-        out
-    }
-
-    /// Batched excess-only evaluation for a matrix of quadrature nodes. The
-    /// coarse error rule does not consume score moments, so requiring them
-    /// would duplicate the expensive row-score work solely to discard it.
-    fn excess_batch(&self, nodes: &Array2<f64>) -> Vec<f64> {
-        let mut out = Vec::with_capacity(nodes.ncols());
-        let mut t = Array1::<f64>::zeros(nodes.nrows());
-        for column in nodes.columns() {
-            t.assign(&column);
-            out.push(self.excess(&t));
-        }
-        out
-    }
 }
 
 // ───────────────────────── injected sampler traits ───────────────────────────
@@ -236,23 +176,7 @@ pub trait BlockExcessTarget {
 /// estimator installs the deterministic quadrature implementation; alternate
 /// embeddings may install another implementation before process initialization.
 pub trait LaplaceMarginalCorrector: Send + Sync {
-    /// Per-direction standardized cubic skewness `γ_r` of the local posterior:
-    /// returns `(max_r |γ_r|, γ)`. Pure eigen-diagnostic (no sampling), but kept
-    /// behind the trait because it lives in the sampler module up-tier.
-    fn directional_cubic_diagnostic(
-        &self,
-        hessian: &Array2<f64>,
-        design: &DesignMatrix,
-        c_weights: &Array1<f64>,
-        refine_supremum: bool,
-    ) -> Result<(f64, Array1<f64>), String>;
 
-    /// Integrate `Δ_b` and its ρ-gradient against the local Laplace Gaussian,
-    /// contracting the caller-supplied [`BlockExcessTarget`].
-    fn block_quadrature_marginal_correction(
-        &self,
-        target: &dyn BlockExcessTarget,
-    ) -> Result<BlockQuadratureMarginal, String>;
 }
 
 // ───────────────────────── process-level injection registry ──────────────────
