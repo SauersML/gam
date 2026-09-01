@@ -2670,26 +2670,11 @@ impl SaeManifoldTerm {
     /// pinned by `tests_channel_null_currency_2720` — so
     /// [`Self::decoder_channel_null_quotient_directions`] admits only the
     /// directions whose closed-form slope is within tolerance.
-    /// decoder's realised column span (ambient-channel deficiency). The β-null
-    /// family is flat for both terms by construction; the channel-null family's
-    /// flatness is kind-dependent (see
-    /// [`Self::decoder_channel_null_quotient_directions`]), so it is screened at
-    /// admission rather than assumed. `tests_gauge_posterior_flatness_2720`
-    /// measures the whole penalized objective flat along every ADMITTED
-    /// direction.
     ///
     /// The chart reparametrisation orbit is deliberately NOT here; see
     /// [`Self::quotient_residual_norm_sq`] for the measurement and the modelling
     /// argument. It lives in [`Self::likelihood_flat_block_basis`], which is
     /// what the descent block minimizes over.
-    ///
-    /// The channel-null family is screened here (#2720): a sub-floor
-    /// singular channel is flat for the DATA FIT but the smoothness prior
-    /// sees it through `λ·(S B c)[col]` (kind-dependent — see
-    /// [`Self::decoder_channel_null_quotient_directions`]), so only the
-    /// directions that are flat for the PENALIZED objective at the accept
-    /// path's own tolerance are removed. The raw family stays in
-    /// [`Self::likelihood_flat_block_basis`] for the descent block.
     ///
     /// Order is load-bearing (Gram--Schmidt is order-dependent) and is the
     /// historical one within these two families: the penalized joint decoder
