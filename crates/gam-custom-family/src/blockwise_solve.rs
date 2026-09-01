@@ -1625,7 +1625,6 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
 /// method — which produces a `Box<dyn ParameterBlockUpdater>` (a gam-crate trait) — must be
 /// an extension trait rather than an inherent impl on the foreign type.
 pub(crate) trait BlockWorkingSetUpdaterExt {
-    fn updater(&self) -> Box<dyn ParameterBlockUpdater + '_>;
 }
 
 impl BlockWorkingSetUpdaterExt for BlockWorkingSet {
