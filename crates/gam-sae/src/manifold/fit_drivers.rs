@@ -7288,7 +7288,7 @@ impl SaeManifoldTerm {
             }
             let mut quotient_step_norm = step_norm_sq.sqrt();
             if delta_ext_coord.len() == self.n_obs() * self.assignment.row_block_dim()
-                && delta_beta.len() == self.beta_dim()
+                && delta_beta.len() == self.factored_border_dim()
             {
                 let quotient_step_norm_sq = self.quotient_newton_step_norm_sq(
                     delta_ext_coord.view(),
