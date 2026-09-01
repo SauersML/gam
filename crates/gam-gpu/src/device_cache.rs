@@ -42,33 +42,6 @@ mod linux {
     }
 
     impl DeviceArena {
-        #[inline]
-        pub fn bucket_of(elements: usize) -> usize {
-            elements.max(1).next_power_of_two()
-        }
-
-        /// Allocate a device slice of at least `elements` f64s. Returns the
-        /// bucket size actually allocated so the caller can release into the
-        /// same bucket on drop. `label` is woven into the error message if
-        /// the underlying `alloc_zeros` fails so failures stay attributable
-        /// to the originating backend (matching the pre-extraction wording).
-        pub fn alloc(
-            &mut self,
-            stream: &Arc<CudaStream>,
-            elements: usize,
-            label: &'static str,
-        ) -> Result<(usize, CudaSlice<f64>), GpuError> {
-            let bucket = Self::bucket_of(elements);
-            if let Some(bucket_vec) = self.free.get_mut(&bucket)
-                && let Some(slot) = bucket_vec.pop()
-            {
-                return Ok((bucket, slot));
-            }
-            let fresh = stream
-                .alloc_zeros::<f64>(bucket)
-                .gpu_ctx_with(|err| format!("{label} arena alloc_zeros<{bucket}>: {err}"))?;
-            Ok((bucket, fresh))
-        }
 
         pub fn release(&mut self, bucket: usize, slab: CudaSlice<f64>) {
             self.free.entry(bucket).or_default().push(slab);

@@ -6,10 +6,6 @@
 
 use ndarray::{Array2, ArrayView2};
 
-pub fn solver_backend_status() -> Result<super::CudaBackendStatus, super::GpuError> {
-    super::cuda_backend_status()
-}
-
 /// Outcome reported by [`iterative_refinement_cholesky_solve`].
 #[derive(Clone, Debug)]
 pub struct RefinementOutcome {
@@ -150,48 +146,6 @@ mod cuda {
     pub(crate) trait CholScalar:
         cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy
     {
-        /// cuSOLVER `*potrf_bufferSize`: `(handle, uplo, n, A, lda, *lwork)`.
-        ///
-        /// `a` is a live `n*n` column-major device buffer of type `Self`,
-        /// `lwork` is a host out-param. The unsafe FFI call is contained in the
-        /// method body.
-        fn potrf_buffer_size(
-            handle: cusolver_sys::cusolverDnHandle_t,
-            uplo: cusolver_sys::cublasFillMode_t,
-            n: i32,
-            a: *mut Self,
-            lda: i32,
-            lwork: *mut i32,
-        ) -> cusolver_sys::cusolverStatus_t;
-        /// cuSOLVER `*potrf`: `(handle, uplo, n, A, lda, work, lwork, info)`.
-        ///
-        /// Pointer args must reference live device buffers of the documented
-        /// shape; the unsafe FFI call is contained in the method body.
-        fn potrf(
-            handle: cusolver_sys::cusolverDnHandle_t,
-            uplo: cusolver_sys::cublasFillMode_t,
-            n: i32,
-            a: *mut Self,
-            lda: i32,
-            work: *mut Self,
-            lwork: i32,
-            info: *mut i32,
-        ) -> cusolver_sys::cusolverStatus_t;
-        /// cuSOLVER `*potrs`: `(handle, uplo, n, nrhs, A, lda, B, ldb, info)`.
-        ///
-        /// Pointer args must reference live device buffers of the documented
-        /// shape; the unsafe FFI call is contained in the method body.
-        fn potrs(
-            handle: cusolver_sys::cusolverDnHandle_t,
-            uplo: cusolver_sys::cublasFillMode_t,
-            n: i32,
-            nrhs: i32,
-            a: *const Self,
-            lda: i32,
-            b: *mut Self,
-            ldb: i32,
-            info: *mut i32,
-        ) -> cusolver_sys::cusolverStatus_t;
         /// Symbol name fragment for error messages (e.g. `"Dpotrf"`).
         const POTRF_NAME: &'static str;
         const POTRS_NAME: &'static str;
@@ -990,18 +944,6 @@ pub fn iterative_refinement_cholesky_solve(
     }
 }
 
-pub fn cholesky_solve_gpu(
-    hessian: ArrayView2<'_, f64>,
-    rhs: ArrayView2<'_, f64>,
-) -> Result<(Array2<f64>, f64), String> {
-    // Route through iterative refinement. The function falls back to fp64
-    // internally, so callers always get a valid result; the refinement
-    // outcome metadata is intentionally not surfaced by this thin wrapper.
-    // This wrapper returns the logdet, so it must request it (`need_logdet`).
-    let result = iterative_refinement_cholesky_solve(hessian, rhs, /*need_logdet=*/ true)?;
-    Ok((result.0, result.1))
-}
-
 /// Solution-only mixed-precision solve: like [`cholesky_solve_gpu`] but skips
 /// the redundant fp64 POTRF when the fp32 + refinement path succeeds, since the
 /// caller does not consume the log-determinant. This is the path that delivers
@@ -1014,28 +956,6 @@ pub fn cholesky_solve_only_gpu(
 ) -> Result<Array2<f64>, String> {
     let result = iterative_refinement_cholesky_solve(hessian, rhs, /*need_logdet=*/ false)?;
     Ok(result.0)
-}
-
-pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let (rows, cols) = hessian.dim();
-        return Err(format!(
-            "CUDA support not compiled for Cholesky factorization; hessian={rows}x{cols}"
-        ));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        super::device_runtime::GpuRuntime::require().map_err(|error| {
-            let (rows, cols) = hessian.dim();
-            format!(
-                "CUDA runtime unavailable for Cholesky factorization; \
-                 hessian={rows}x{cols}: {error}"
-            )
-        })?;
-        cuda::cholesky_lower(hessian)
-    }
 }
 
 #[cfg(target_os = "linux")]

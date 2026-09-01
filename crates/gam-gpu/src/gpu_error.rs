@@ -135,14 +135,7 @@ macro_rules! gpu_bail {
 /// drop-the-import regression that broke the Linux build in #302.
 #[cfg(target_os = "linux")]
 pub trait GpuResultExt<T> {
-    /// Map the error to `GpuError::DriverCallFailed { reason: format!("{prefix}: {err}") }`.
-    fn gpu_ctx(self, prefix: &str) -> Result<T, GpuError>;
 
-    /// Map the error using a closure that takes the underlying error
-    /// (as `&dyn Display`) and returns the reason string.
-    fn gpu_ctx_with<F>(self, f: F) -> Result<T, GpuError>
-    where
-        F: FnOnce(&dyn std::fmt::Display) -> String;
 }
 
 #[cfg(target_os = "linux")]

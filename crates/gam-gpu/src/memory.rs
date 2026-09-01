@@ -6,9 +6,6 @@ pub struct DeviceBuffer<T> {
 }
 
 impl<T> DeviceBuffer<T> {
-    pub const fn from_host_shadow(host_shadow: Vec<T>) -> Self {
-        Self { host_shadow }
-    }
 
     pub const fn len(&self) -> usize {
         self.host_shadow.len()
@@ -18,9 +15,6 @@ impl<T> DeviceBuffer<T> {
         self.host_shadow.len() == 0
     }
 
-    pub fn host_shadow(&self) -> &[T] {
-        &self.host_shadow
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -30,12 +24,6 @@ pub struct DeviceVector {
 }
 
 impl DeviceVector {
-    pub fn from_array(array: &Array1<f64>) -> Self {
-        Self {
-            len: array.len(),
-            data: DeviceBuffer::from_host_shadow(array.to_vec()),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -47,14 +35,6 @@ pub struct DeviceMatrix {
 }
 
 impl DeviceMatrix {
-    pub fn from_array(array: &Array2<f64>) -> Self {
-        Self {
-            rows: array.nrows(),
-            cols: array.ncols(),
-            data: DeviceBuffer::from_host_shadow(array.iter().copied().collect()),
-            column_major: false,
-        }
-    }
 
     pub const fn bytes(&self) -> usize {
         self.rows

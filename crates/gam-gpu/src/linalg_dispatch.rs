@@ -161,29 +161,6 @@ fn invalid_gpu_request(operation: &'static str, reason: &'static str) -> ! {
     panic!("GPU operation '{operation}' received invalid input: {reason}");
 }
 
-/// Policy-explicit variant of [`decline_gpu`] for the `_with_policy` entry
-/// points on platforms without the CUDA backend: the CALLER's policy — not the
-/// process-global one — owns the Required contract at that boundary, so a
-/// caller-passed `Required` must fail loudly here instead of silently falling
-/// back to CPU while `decline_gpu` consults an unrelated global. Only compiled
-/// off-Linux because every Linux path consumes the policy through
-/// `route_through_gpu_with_policy` before any decline.
-#[cfg(not(target_os = "linux"))]
-#[inline]
-#[track_caller]
-fn decline_gpu_with_policy<T>(
-    operation: &'static str,
-    reason: &'static str,
-    gpu_policy: GpuPolicy,
-) -> Option<T> {
-    if gpu_policy == GpuPolicy::Required {
-        // SAFETY: this legacy `Option` hook has no typed error channel and
-        // `None` explicitly authorizes CPU execution, which Required forbids.
-        panic!("gpu=required operation '{operation}' cannot execute on the GPU: {reason}");
-    }
-    None
-}
-
 /// A malformed device result is an execution fault, never an Auto decline.
 #[cfg(target_os = "linux")]
 #[inline]

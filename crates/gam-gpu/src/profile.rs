@@ -36,16 +36,6 @@ pub fn record(stat: KernelStat) {
     }
 }
 
-pub fn snapshot() -> KernelStatsSnapshot {
-    if let Ok(guard) = stats().lock() {
-        KernelStatsSnapshot {
-            stats: guard.iter().cloned().collect(),
-        }
-    } else {
-        KernelStatsSnapshot::default()
-    }
-}
-
 pub fn clear() {
     if let Ok(mut guard) = stats().lock() {
         guard.clear();
