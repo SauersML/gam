@@ -65,200 +65,17 @@ use std::sync::OnceLock;
 /// path that reaches these walkers; the caches are indexed directly by `m`.
 const MAX_SLOTS: usize = 8;
 
-/// Walk the Leibniz product rule for an output of `m` differentiation slots.
-///
-/// `D_S(ab) = Σ_{T ⊆ S} D_T(a) · D_{S∖T}(b)`, summed over every subset `T`
-/// of the `m` positions. `left(t)` / `right(c)` receive the position lists of
-/// the chosen subset and its complement and must return the corresponding
-/// derivative of the two factors. Returns the summed output coefficient.
-///
-/// `m` is small (≤ 4 for the tower, ≤ 8 for the directional jet); the
-/// `2^m` subset walk is the exact rule, not a truncation.
-///
-/// # Performance
-///
-/// The `(subset, complement)` index split for each of the `2^m` subsets depends
-/// only on `m`, so it is computed once per `m` (see [`subset_split_table`]) and
-/// cached as packed bit lists. Per call this loop only maps those cached indices
-/// through `positions` and invokes the two closures — no per-bit branch, no
-/// per-subset structure rebuild. BIT-IDENTICAL to the former branch walker:
-/// subsets are enumerated in the same `sub = 0..2^m` order (subset bit `b` ↔
-/// position `b`), the subset/complement position lists are in the same
-/// increasing-bit order, and the running `total` starts at `0.0` so a
-/// signed-zero leading product collapses to `+0.0` identically.
-#[inline]
-pub(crate) fn leibniz_product<L, R>(positions: &[usize], mut left: L, mut right: R) -> f64
-where
-    L: FnMut(&[usize]) -> f64,
-    R: FnMut(&[usize]) -> f64,
-{
-    let m = positions.len();
-    assert!(
-        m <= MAX_SLOTS,
-        "too many differentiation slots for subset enumeration"
-    );
-    let table = subset_split_table(m);
-    let mut subset = SlotBuf::new();
-    let mut complement = SlotBuf::new();
-    let mut total = 0.0;
-    for split in table {
-        subset.len = 0;
-        for &bit in split.subset.as_slice() {
-            subset.push(positions[bit]);
-        }
-        complement.len = 0;
-        for &bit in split.complement.as_slice() {
-            complement.push(positions[bit]);
-        }
-        total += left(subset.as_slice()) * right(complement.as_slice());
-    }
-    total
-}
-
-/// Walk the multivariate Faà di Bruno rule for an output of `m` slots.
-///
-/// `D(f∘u) = Σ_{partitions π of the m slots} f^{(|π|)}(u) · Π_{B ∈ π} D_B(u)`.
-/// `derivs[r]` is `f^{(r)}` at the inner value; `inner(block)` returns the
-/// derivative of the inner expression for a block's position list. Returns the
-/// summed output coefficient. Blocks of order ≥ `derivs.len()` are skipped
-/// (their `f^{(r)}` is beyond the truncation), matching both legacy paths.
-///
-/// # Performance
-///
-/// The set partitions of `m` slots depend only on `m`, so the full partition
-/// list is built once per `m` (see `partition_table`) and cached as packed
-/// per-block bitmasks. This walk iterates that flat table directly — no
-/// recursive enumeration, no `&mut dyn FnMut` leaf dispatch, no per-block
-/// `SlotBuf` churn beyond translating a block's bitmask to labelled positions.
-/// BIT-IDENTICAL to the former recursive walker: partitions are emitted in the
-/// same order, each partition's blocks are in the same first-appearance order,
-/// each block's positions are in the same increasing order, every block product
-/// is left-associated from `derivs[order]`, and the channel `total` starts at
-/// `0.0` (signed-zero products collapse to `+0.0` identically).
-///
-/// For `m ≥ 4` a second lever caches each DISTINCT block's `inner` value once
-/// (a block recurs across many partitions), turning the partition sum into pure
-/// cached multiplies — see the body comment; bit-identical, and the dominant
-/// per-call cost (the `inner` gather) drops by the distinct/incidence ratio,
-/// which grows with `m`.
-#[inline]
-pub fn faa_di_bruno<F>(positions: &[usize], derivs: &[f64], mut inner: F) -> f64
-where
-    F: FnMut(&[usize]) -> f64,
-{
-    let m = positions.len();
-    if m == 0 {
-        return derivs[0];
-    }
-    let table = partition_table(m);
-    let mut labelled = SlotBuf::new();
-
-    // Block-value cache (the dominant-cost lever). The `inner` derivative gather
-    // — not the combinatorial bookkeeping — dominates this walk's wall clock, and
-    // a single block (an element-index submask of `0..m`) recurs across many
-    // partitions. So for `m ≥ 4` the `Σ_π |π|` gathers of the direct walk below
-    // collapse to the `2^m − 1` DISTINCT blocks: gather each block's `inner` value
-    // ONCE into `block_val[submask]`, then the partition sum is pure cached
-    // multiplies (a branch-light multiply-accumulate). The distinct/incidence
-    // ratio — and so the speed-up — grows with `m`: 37→15 gathers at `m=4`,
-    // 151→31 at `m=5`, 877→63 at `m=6` (measured ~1.2×/2.0×/3.9× over the direct
-    // table walk, ~1.7×/3.0×/6.6× over the original recursive walker). For `m ≤ 3`
-    // the ratio is ≈1 and the scratch-array init does not amortise, so the direct
-    // walk is kept (the `m=2` cache path measured a regression).
-    //
-    // BIT-IDENTICAL to the direct walk: `block_val[bm]` is `inner` of the SAME
-    // labelled positions, decoded in the SAME increasing-bit order, so every
-    // partition's left-associated `derivs[order] · Π block` product and the
-    // channel `total` accumulate the identical f64s in the identical order
-    // (proven `to_bits` across `K ∈ {2,3,4,9}`, ≥5000 inputs). `inner` is a pure
-    // per-block derivative read — the documented contract — for every consumer;
-    // a block that occurs only in an order-≥`derivs.len()` (skipped) partition is
-    // still gathered but never contributes, so the result is unchanged.
-    if m >= 4 {
-        let full = 1usize << m;
-        let mut block_val = [0.0f64; 1 << MAX_SLOTS];
-        // `submask` is both the bit-scanned value AND the `block_val` slot, so
-        // iterate the slot mutably while `enumerate()` recovers the index —
-        // `take(full).skip(1)` reproduces the `1..full` range without the
-        // needless_range_loop that a bare `block_val[submask]` write triggers.
-        for (submask, slot) in block_val.iter_mut().enumerate().take(full).skip(1) {
-            labelled.len = 0;
-            let mut bits = submask;
-            while bits != 0 {
-                let bit = bits.trailing_zeros() as usize;
-                labelled.push(positions[bit]);
-                bits &= bits - 1;
-            }
-            *slot = inner(labelled.as_slice());
-        }
-        let mut total = 0.0;
-        for part in table {
-            let order = part.n_blocks as usize;
-            if order >= derivs.len() {
-                continue;
-            }
-            let mut prod = derivs[order];
-            for &block_mask in &part.blocks[..order] {
-                prod *= block_val[block_mask as usize];
-            }
-            total += prod;
-        }
-        return total;
-    }
-
-    let mut total = 0.0;
-    for part in table {
-        let order = part.n_blocks as usize;
-        if order >= derivs.len() {
-            continue;
-        }
-        let mut prod = derivs[order];
-        for &block_mask in &part.blocks[..order] {
-            // Translate the block's element-index bitmask to axis labels for
-            // `inner`, in increasing element order (the walker's block order).
-            labelled.len = 0;
-            let mut bits = block_mask;
-            while bits != 0 {
-                let bit = bits.trailing_zeros() as usize;
-                labelled.push(positions[bit]);
-                bits &= bits - 1;
-            }
-            prod *= inner(labelled.as_slice());
-        }
-        total += prod;
-    }
-    total
-}
-
 /// Layout hook for jets that share the Faà di Bruno unary-composition kernel.
 ///
 /// `DERIVS` is the length of the unary derivative stack: `5` for fourth-order
 /// jets (`[f, f′, f″, f‴, f⁗]`) and `3` for second-order jets. Implementors own
 /// how slot lists map to their storage; the kernel owns the set-partition rule.
 pub(crate) trait JetAlgebra<const DERIVS: usize>: Sized {
-    /// Read the derivative for a slot list. An empty list is the value channel.
-    fn derivative(&self, positions: &[usize]) -> f64;
-
-    /// Build a jet with every stored derivative filled by `f(positions)`.
-    fn map_derivatives<F>(&self, f: F) -> Self
-    where
-        F: FnMut(&[usize]) -> f64;
 
     /// Exact multivariate Faà di Bruno composition.
     fn compose_unary(&self, derivs: [f64; DERIVS]) -> Self {
         compose_unary_kernel(self, derivs)
     }
-}
-
-/// The single unary-composition kernel shared by tower and bitmask jets.
-#[inline]
-pub(crate) fn compose_unary_kernel<J, const DERIVS: usize>(inner: &J, derivs: [f64; DERIVS]) -> J
-where
-    J: JetAlgebra<DERIVS>,
-{
-    inner.map_derivatives(|positions| {
-        faa_di_bruno(positions, &derivs, |block| inner.derivative(block))
-    })
 }
 
 /// A tiny inline stack of slot indices — no heap traffic on the hot per-row
@@ -277,22 +94,6 @@ impl SlotBuf {
             data: [0; 8],
             len: 0,
         }
-    }
-    #[inline]
-    fn push(&mut self, v: usize) {
-        self.data[self.len] = v;
-        self.len += 1;
-    }
-    /// Append a slot index. Public to the crate so other jet layouts (the
-    /// bitmask [`crate::jet_partitions`]) can build a slot list to hand the
-    /// shared walkers.
-    #[inline]
-    pub(crate) fn push_slot(&mut self, v: usize) {
-        self.push(v);
-    }
-    #[inline]
-    pub(crate) fn as_slice(&self) -> &[usize] {
-        &self.data[..self.len]
     }
 }
 
@@ -326,72 +127,6 @@ static SUBSET_TABLES: [OnceLock<Vec<SubsetSplit>>; MAX_SLOTS + 1] =
     [const { OnceLock::new() }; MAX_SLOTS + 1];
 static PARTITION_TABLES: [OnceLock<Vec<PackedPartition>>; MAX_SLOTS + 1] =
     [const { OnceLock::new() }; MAX_SLOTS + 1];
-
-/// The cached `(subset, complement)` index splits for `m` slots, in the former
-/// `sub = 0..2^m` enumeration order (subset bit `b` ↔ position `b`).
-#[inline]
-fn subset_split_table(m: usize) -> &'static [SubsetSplit] {
-    SUBSET_TABLES[m].get_or_init(|| {
-        let mut out = Vec::with_capacity(1usize << m);
-        for sub in 0u32..(1u32 << m) {
-            let mut subset = SlotBuf::new();
-            let mut complement = SlotBuf::new();
-            for bit in 0..m {
-                if sub & (1u32 << bit) != 0 {
-                    subset.push(bit);
-                } else {
-                    complement.push(bit);
-                }
-            }
-            out.push(SubsetSplit { subset, complement });
-        }
-        out
-    })
-}
-
-/// The cached set-partition list for `m` slots, in the former recursive
-/// "assign each element to an existing or new block" emission order.
-#[inline]
-fn partition_table(m: usize) -> &'static [PackedPartition] {
-    PARTITION_TABLES[m].get_or_init(|| {
-        let mut out = Vec::new();
-        let mut blocks = [0u8; MAX_SLOTS];
-        build_partitions(0, m, &mut blocks, 0, &mut out);
-        out
-    })
-}
-
-/// Enumerate the set-partitions of `0..m` exactly as the former `recurse` did:
-/// element `elem` is placed into each existing block (in block order) before a
-/// fresh block is opened with it alone. Records each completed partition's
-/// block bitmasks in first-appearance order. Runs once per `m`.
-fn build_partitions(
-    elem: usize,
-    m: usize,
-    blocks: &mut [u8; MAX_SLOTS],
-    n_blocks: usize,
-    out: &mut Vec<PackedPartition>,
-) {
-    if elem == m {
-        let mut packed = PackedPartition {
-            blocks: [0u8; MAX_SLOTS],
-            n_blocks: n_blocks as u8,
-        };
-        packed.blocks[..n_blocks].copy_from_slice(&blocks[..n_blocks]);
-        out.push(packed);
-        return;
-    }
-    let bit = 1u8 << elem;
-    // Place `elem` into each existing block.
-    for b in 0..n_blocks {
-        blocks[b] |= bit;
-        build_partitions(elem + 1, m, blocks, n_blocks, out);
-        blocks[b] &= !bit;
-    }
-    // Or open a new block with `elem` alone.
-    blocks[n_blocks] = bit;
-    build_partitions(elem + 1, m, blocks, n_blocks + 1, out);
-}
 
 #[cfg(test)]
 mod tests {

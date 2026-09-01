@@ -3046,21 +3046,6 @@ impl<'a> AffineRemlProfile<'a> {
         ))
     }
 
-    pub fn maximize(
-        &self,
-        lo: f64,
-        hi: f64,
-        resolution: f64,
-    ) -> Result<ScoreSearchResult, ScoreSearchError<AffineRemlError>> {
-        maximize_score_1d(
-            lo,
-            hi,
-            resolution,
-            |x| self.evaluate(x),
-            |a, b| self.enclose(a.x, b.x),
-        )
-    }
-
     /// Isolate every finite stationary candidate and tighten location
     /// resolution until the selected exact score is globally orderable at the
     /// point evaluator's certified comparison resolution.

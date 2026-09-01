@@ -134,29 +134,6 @@ impl MultiDirJet {
         out
     }
 
-    pub fn linear(n_dirs: usize, base: f64, first: &[f64]) -> Self {
-        let mut out = Self::constant(n_dirs, base);
-        for (idx, &value) in first.iter().take(n_dirs).enumerate() {
-            out.coeffs[1usize << idx] = value;
-        }
-        out
-    }
-
-    pub fn with_coeffs(n_dirs: usize, coeffs: &[(usize, f64)]) -> Self {
-        let mut out = Self::zero(n_dirs);
-        for &(mask, value) in coeffs {
-            if mask < out.coeffs.len() {
-                out.coeffs[mask] = value;
-            }
-        }
-        out
-    }
-
-    #[inline]
-    pub fn coeff(&self, mask: usize) -> f64 {
-        self.coeffs[mask]
-    }
-
     pub fn add(&self, other: &Self) -> Self {
         Self {
             coeffs: self
@@ -221,22 +198,6 @@ impl MultiDirJet {
         Self { coeffs: out }
     }
 
-    /// The pre-#perf shared-walker product, retained verbatim as the scalar-case
-    /// implementation and as the bit-exact reference for `mul`.
-    fn mul_reference(&self, other: &Self) -> Self {
-        let count = self.coeffs.len();
-        let mut out = vec![0.0; count];
-        for (mask, slot) in out.iter_mut().enumerate() {
-            let bits = bit_positions(mask);
-            *slot = crate::jet_algebra::leibniz_product(
-                bits.as_slice(),
-                |t| self.coeffs[mask_of(t)],
-                |c| other.coeffs[mask_of(c)],
-            );
-        }
-        Self { coeffs: out }
-    }
-
     /// Exact (order-4 truncated) unary composition `f(self)` from the Taylor
     /// stack `[f, f', f'', f''', f'''']` at `self.coeff(0)`.
     ///
@@ -270,39 +231,6 @@ thread_local! {
     /// demand and never freed, so a steady-state `compose_unary` does zero heap
     /// work beyond the owned output `Vec`.
     static COMPOSE_SCRATCH: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
-}
-
-#[inline]
-fn compose_unary_coefficients_into(
-    coefficients: &[f64],
-    derivs: [f64; DERIVS],
-    scratch: &mut [f64],
-    out: &mut [f64],
-) {
-    let count = coefficients.len();
-    assert!(count > 1 && count.is_power_of_two());
-    assert!(scratch.len() == 4 * count && out.len() == count);
-    let (vbuf, tail) = scratch.split_at_mut(count);
-    let (p2, tail) = tail.split_at_mut(count);
-    let (p3, p4) = tail.split_at_mut(count);
-
-    // v is the non-constant part of the input. The k=0 Taylor term owns the
-    // constant coefficient, so the zero mask must not enter any power.
-    vbuf.copy_from_slice(coefficients);
-    vbuf[0] = 0.0;
-
-    // The three multilinear powers, by the pointed recurrence (module header).
-    multilinear_powers_into(vbuf, p2, p3, p4);
-    // `1/k!` undoes the ordered-tuple overcount of each k-fold subset power
-    // relative to the unordered set-partition sum.
-    let coefficients_by_order = [
-        derivs[1],
-        derivs[2] * 0.5,
-        derivs[3] * (1.0 / 6.0),
-        derivs[4] * (1.0 / 24.0),
-    ];
-    combine_powers(vbuf, p2, p3, p4, coefficients_by_order, out);
-    out[0] = derivs[0];
 }
 
 /// Branchless TwoSum: returns `(s, e)` with `s = fl(a+b)` and `a+b = s+e`
@@ -339,176 +267,8 @@ fn scaled_compensated(k: f64, s: f64, c: f64) -> f64 {
     hi + (lo + k * c)
 }
 
-/// The multilinear powers `v^{⊛2}`, `v^{⊛3}`, `v^{⊛4}` of the non-constant part
-/// `v`, by the **pointed (lowest-set-bit) recurrence** derived in the module
-/// header:
-///
-/// ```text
-/// v^{⊛k}[mask] = k · Σ_{t ⊊ mask, ℓ ∉ t} v[mask \ t] · v^{⊛(k-1)}[t]
-/// ```
-///
-/// with `ℓ` the lowest set bit of `mask`. Pinning the block that owns `ℓ` counts
-/// each partition once instead of `k` times, and the surviving `t` range over
-/// submasks of `mask ^ ℓ` rather than of `mask` — together an exactly 4× shorter
-/// walk than the three full subset convolutions this replaced, at every
-/// `K ≤ 4` (see `compose_unary_work_model_matches_the_closed_form`).
-///
-/// All three powers share **one** descending walk over the submasks of
-/// `mask ^ ℓ`, because their term sets are nested: `v^{⊛(k-1)}[t]` vanishes
-/// below `popcount(t) = k - 1`, so the `k = 3` and `k = 4` chains are the
-/// `popcount ≥ 2` and `popcount ≥ 3` suffixes of the `k = 2` chain. Sharing the
-/// walk also shares the `v[mask \ t]` load and gives three independent Dot2
-/// dependency chains to interleave, which is what the old kernel's four-way
-/// unroll was buying separately.
-///
-/// Every accumulation is a compensated Dot2, so the rounding of `v²` cannot
-/// compound through `v³`/`v⁴`. Masks below popcount `k` are left at zero: the
-/// `k`-fold multilinear power vanishes there, so the prune is exact.
-#[inline]
-fn multilinear_powers_into(v: &[f64], p2: &mut [f64], p3: &mut [f64], p4: &mut [f64]) {
-    let count = v.len();
-    // SAFETY precondition for the `get_unchecked` loads below, pinned once per
-    // call (negligible next to the walk): all four buffers are `count` long.
-    // Every index read is either `t` or `mask ^ t` for `t ⊆ mask < count`, and
-    // both are submasks of `mask`, hence `< count`. The per-load bounds checks
-    // LLVM cannot elide (the indices are data-dependent) are a real cost across
-    // the exponential walk, and eliding them measured ~20% on the kernel this
-    // replaced.
-    assert!(p2.len() == count && p3.len() == count && p4.len() == count);
-    if count > 0 {
-        p2[0] = 0.0;
-        p3[0] = 0.0;
-        p4[0] = 0.0;
-    }
-    for mask in 1..count {
-        // `v^{⊛k}` vanishes below popcount k, so a popcount-1 mask is all-zero
-        // in every power and never enters a walk.
-        let lowest = mask & mask.wrapping_neg();
-        let rest = mask ^ lowest;
-        if rest == 0 {
-            p2[mask] = 0.0;
-            p3[mask] = 0.0;
-            p4[mask] = 0.0;
-            continue;
-        }
-        let (mut s2, mut c2) = (0.0f64, 0.0f64);
-        let (mut s3, mut c3) = (0.0f64, 0.0f64);
-        let (mut s4, mut c4) = (0.0f64, 0.0f64);
-        // Descending submask walk `t = (t - 1) & rest` over the NONZERO submasks
-        // of `rest` (the classic Gosper-style enumeration). `t = 0` is skipped
-        // because it is the one term whose complement is the whole mask, and
-        // `v^{⊛(k-1)}[0] = 0` for every `k ≥ 2`.
-        let mut t = rest;
-        while t != 0 {
-            // SAFETY: `t ⊆ rest ⊂ mask < count` and `mask ^ t ⊆ mask < count`,
-            // and all four buffers are `count` long (asserted above).
-            unsafe {
-                let block = *v.get_unchecked(mask ^ t);
-                dot2_step(&mut s2, &mut c2, block, *v.get_unchecked(t));
-                let popcount = (t as u64).count_ones();
-                if popcount >= 2 {
-                    dot2_step(&mut s3, &mut c3, block, *p2.get_unchecked(t));
-                    if popcount >= 3 {
-                        dot2_step(&mut s4, &mut c4, block, *p3.get_unchecked(t));
-                    }
-                }
-            }
-            t = (t - 1) & rest;
-        }
-        // The pointed recurrence's multiplicity. `v^{⊛k}[mask]` must be written
-        // before the `k+1` chain of any LATER mask reads it, and `t < mask`
-        // strictly for every `t ⊆ mask ^ ℓ`, so writing all three here keeps the
-        // recurrence's read-before-write order across the ascending mask loop.
-        p2[mask] = scaled_compensated(2.0, s2, c2);
-        p3[mask] = scaled_compensated(3.0, s3, c3);
-        p4[mask] = scaled_compensated(4.0, s4, c4);
-    }
-}
-
-/// `out[mask] = c[0]·p1 + c[1]·p2 + c[2]·p3 + c[3]·p4` for `mask ≥ 1`, with a
-/// Neumaier-compensated four-term accumulation (the powers span growing
-/// magnitudes, so the compensation recovers the bits a naive `+=` would drop)
-/// and a `wide::f64x4` body over four masks at a time. `out[0]` is overwritten
-/// by the caller with the value channel.
-#[inline]
-fn combine_powers(p1: &[f64], p2: &[f64], p3: &[f64], p4: &[f64], c: [f64; 4], out: &mut [f64]) {
-    let n = out.len();
-    let (c1, c2, c3, c4) = (c[0], c[1], c[2], c[3]);
-    let (v1, v2, v3, v4) = (
-        f64x4::splat(c1),
-        f64x4::splat(c2),
-        f64x4::splat(c3),
-        f64x4::splat(c4),
-    );
-    let mut mask = 0usize;
-    // Vector body: four contiguous masks per step. Neumaier compensation is
-    // applied lane-wise; pick the larger magnitude to subtract first.
-    while mask + 4 <= n {
-        let load = |p: &[f64]| f64x4::new([p[mask], p[mask + 1], p[mask + 2], p[mask + 3]]);
-        let mut s = v1 * load(p1);
-        let mut comp = f64x4::splat(0.0);
-        for (cv, pv) in [(v2, p2), (v3, p3), (v4, p4)] {
-            let term = cv * load(pv);
-            let t = s + term;
-            let big_s = s.abs().simd_ge(term.abs());
-            let lost = big_s.blend((s - t) + term, (term - t) + s);
-            comp += lost;
-            s = t;
-        }
-        let res = s + comp;
-        out[mask..mask + 4].copy_from_slice(&res.to_array());
-        mask += 4;
-    }
-    // Scalar tail (and the small-K path where `n < 4`).
-    while mask < n {
-        let mut s = c1 * p1[mask];
-        let mut comp = 0.0f64;
-        for (cv, pv) in [(c2, p2), (c3, p3), (c4, p4)] {
-            let term = cv * pv[mask];
-            let (t, e) = two_sum(s, term);
-            comp += e;
-            s = t;
-        }
-        out[mask] = s + comp;
-        mask += 1;
-    }
-}
-
 impl crate::jet_algebra::JetAlgebra<DERIVS> for MultiDirJet {
-    #[inline]
-    fn derivative(&self, slots: &[usize]) -> f64 {
-        self.coeffs[mask_of(slots)]
-    }
 
-    fn map_derivatives<F>(&self, mut f: F) -> Self
-    where
-        F: FnMut(&[usize]) -> f64,
-    {
-        let mut out = vec![0.0; self.coeffs.len()];
-        for (mask, value) in out.iter_mut().enumerate() {
-            let bits = bit_positions(mask);
-            *value = f(bits.as_slice());
-        }
-        Self { coeffs: out }
-    }
-}
-
-/// The set-bit positions of `mask`, low to high — the differentiation slots of
-/// that coefficient.
-fn bit_positions(mask: usize) -> crate::jet_algebra::SlotBuf {
-    let mut out = crate::jet_algebra::SlotBuf::new();
-    let mut m = mask;
-    while m != 0 {
-        let bit = m.trailing_zeros() as usize;
-        out.push_slot(bit);
-        m &= m - 1;
-    }
-    out
-}
-
-/// Combine a slot-group (list of bit positions) back into a sub-mask.
-fn mask_of(slots: &[usize]) -> usize {
-    slots.iter().fold(0usize, |acc, &b| acc | (1usize << b))
 }
 
 // #932-2 cutover: `MultiDirJet::bilinear` (the 4-coeff `[base, d1, d2, d12]`
@@ -521,11 +281,6 @@ fn mask_of(slots: &[usize]) -> usize {
 // carry no dead-code cost because `pub` items are part of the crate's public API.
 // Bodies are byte-identical to their former gated form.
 impl MultiDirJet {
-    pub fn bilinear(base: f64, d1: f64, d2: f64, d12: f64) -> Self {
-        Self {
-            coeffs: vec![base, d1, d2, d12],
-        }
-    }
 
     pub fn sub(&self, other: &Self) -> Self {
         Self {

@@ -69,230 +69,7 @@
 /// dense, low rank, structured, or matrix free). Jet scalars own the one
 /// derivative rule for `x' A x`; callers never spell its chain rule.
 pub trait SymmetricQuadraticCoefficients {
-    /// Input-space dimension of the symmetric operator.
-    fn dimension(&self) -> usize;
 
-    /// Compute `output = A * input` without materializing `A`.
-    fn multiply(&self, input: &[f64], output: &mut [f64]);
-
-    /// One symmetric coefficient `A[row, column]`.
-    fn coefficient(&self, row: usize, column: usize) -> f64;
-
-    /// Visit the operator's input-space upper triangle without materializing a
-    /// dense matrix. The default probes one basis direction at a time through
-    /// [`Self::multiply`], preserving matrix-free operators. Representations
-    /// with direct structure should override this hook so a packed curvature
-    /// lowering is O(K), O(K²), or O(K²R) as appropriate instead of performing
-    /// K full operator applications.
-    ///
-    /// `direction` and `projected` are caller-owned scratch of exact length
-    /// [`Self::dimension`]. Every `(row, column)` with `row <= column` is
-    /// visited exactly once, including structural zeros.
-    fn visit_upper_triangle(
-        &self,
-        direction: &mut [f64],
-        projected: &mut [f64],
-        mut visit: impl FnMut(usize, usize, f64),
-    ) {
-        let dimension = self.dimension();
-        assert_eq!(direction.len(), dimension);
-        assert_eq!(projected.len(), dimension);
-        direction.fill(0.0);
-        for column in 0..dimension {
-            direction[column] = 1.0;
-            self.multiply(direction, projected);
-            direction[column] = 0.0;
-            for row in 0..=column {
-                visit(row, column, projected[row]);
-            }
-        }
-    }
-
-    /// Evaluate the primal quadratic form without materializing the input as a
-    /// separate `f64` vector. Structured operators should override this to
-    /// preserve their representation's natural complexity (for example O(KR)
-    /// for a K-by-R low-rank factor).
-    fn quadratic_value<T, F>(&self, inputs: &[T], value: F) -> f64
-    where
-        F: Fn(&T) -> f64,
-    {
-        assert_eq!(
-            inputs.len(),
-            self.dimension(),
-            "symmetric quadratic-form dimension mismatch"
-        );
-        let mut out = 0.0;
-        for row in 0..inputs.len() {
-            let row_value = value(&inputs[row]);
-            out += self.coefficient(row, row) * row_value * row_value;
-            for column in row + 1..inputs.len() {
-                out += 2.0 * self.coefficient(row, column) * row_value * value(&inputs[column]);
-            }
-        }
-        out
-    }
-}
-
-fn symmetric_quadratic_form_default<T, C>(
-    inputs: &[T],
-    coefficients: &C,
-    constant: impl Fn(f64) -> T,
-    add: impl Fn(&T, &T) -> T,
-    mul: impl Fn(&T, &T) -> T,
-    scale: impl Fn(&T, f64) -> T,
-) -> T
-where
-    C: SymmetricQuadraticCoefficients,
-{
-    assert_eq!(
-        inputs.len(),
-        coefficients.dimension(),
-        "symmetric quadratic-form dimension mismatch"
-    );
-    let mut out = constant(0.0);
-    for row in 0..inputs.len() {
-        let diagonal = mul(&inputs[row], &inputs[row]);
-        out = add(&out, &scale(&diagonal, coefficients.coefficient(row, row)));
-        for column in row + 1..inputs.len() {
-            let cross = mul(&inputs[row], &inputs[column]);
-            out = add(
-                &out,
-                &scale(&cross, 2.0 * coefficients.coefficient(row, column)),
-            );
-        }
-    }
-    out
-}
-
-fn linear_combination_default<T>(
-    inputs: &[T],
-    weights: &[f64],
-    constant: impl Fn(f64) -> T,
-    add: impl Fn(&T, &T) -> T,
-    scale: impl Fn(&T, f64) -> T,
-) -> T {
-    assert_eq!(
-        inputs.len(),
-        weights.len(),
-        "linear-combination dimension mismatch"
-    );
-    inputs
-        .iter()
-        .zip(weights)
-        .fold(constant(0.0), |sum, (input, &weight)| {
-            add(&sum, &scale(input, weight))
-        })
-}
-
-fn multiply_add_default<T>(
-    left: &T,
-    right: &T,
-    addend: &T,
-    mul: impl Fn(&T, &T) -> T,
-    add: impl Fn(&T, &T) -> T,
-) -> T {
-    add(&mul(left, right), addend)
-}
-
-fn composed_sum_default<T>(
-    inputs: &[T],
-    derivative_stacks: &[[f64; 5]],
-    constant: impl Fn(f64) -> T,
-    add: impl Fn(&T, &T) -> T,
-    compose: impl Fn(&T, [f64; 5]) -> T,
-) -> T {
-    assert_eq!(
-        inputs.len(),
-        derivative_stacks.len(),
-        "composed-sum term-count mismatch"
-    );
-    inputs
-        .iter()
-        .zip(derivative_stacks)
-        .fold(constant(0.0), |sum, (input, &stack)| {
-            add(&sum, &compose(input, stack))
-        })
-}
-
-fn affine_compose_default<T>(
-    input: &T,
-    input_scale: f64,
-    input_shift: f64,
-    derivative_stack: [f64; 5],
-    scale: impl Fn(&T, f64) -> T,
-    add_constant: impl Fn(&T, f64) -> T,
-    compose: impl Fn(&T, [f64; 5]) -> T,
-) -> T {
-    compose(
-        &add_constant(&scale(input, input_scale), input_shift),
-        derivative_stack,
-    )
-}
-
-fn affine_composed_sum_default<T>(
-    inputs: &[T],
-    input_scales: &[f64],
-    derivative_stacks: &[[f64; 5]],
-    constant: impl Fn(f64) -> T,
-    add: impl Fn(&T, &T) -> T,
-    scale: impl Fn(&T, f64) -> T,
-    add_constant: impl Fn(&T, f64) -> T,
-    compose: impl Fn(&T, [f64; 5]) -> T,
-) -> T {
-    assert_eq!(inputs.len(), input_scales.len());
-    assert_eq!(inputs.len(), derivative_stacks.len());
-    inputs.iter().zip(input_scales).zip(derivative_stacks).fold(
-        constant(0.0),
-        |sum, ((input, &input_scale), &stack)| {
-            add(
-                &sum,
-                &affine_compose_default(
-                    input,
-                    input_scale,
-                    0.0,
-                    stack,
-                    &scale,
-                    &add_constant,
-                    &compose,
-                ),
-            )
-        },
-    )
-}
-
-fn shared_multiply_add_affine_composed_sum_default<T, const N: usize>(
-    lefts: &[&T; N],
-    right: &T,
-    addend: &T,
-    addend_scales: &[f64; N],
-    input_scales: &[f64; N],
-    derivative_stacks: &[[f64; 5]; N],
-    constant: impl Fn(f64) -> T,
-    add: impl Fn(&T, &T) -> T,
-    mul: impl Fn(&T, &T) -> T,
-    scale: impl Fn(&T, f64) -> T,
-    multiply_add: impl Fn(&T, &T, &T) -> T,
-    affine_compose: impl Fn(&T, f64, f64, [f64; 5]) -> T,
-) -> T {
-    let (representatives, term_sources, source_count) =
-        canonical_shared_source_schedule(|term, representative| {
-            std::ptr::eq(lefts[term], lefts[representative])
-                && addend_scales[term] == addend_scales[representative]
-        });
-    let (value, source_derivatives) =
-        aggregate_shared_source_derivatives(&term_sources, input_scales, derivative_stacks);
-    (0..source_count).fold(constant(value), |sum, source| {
-        let term = representatives[source];
-        let inner = if addend_scales[term] == 0.0 {
-            mul(lefts[term], right)
-        } else if addend_scales[term] == 1.0 {
-            multiply_add(lefts[term], right, addend)
-        } else {
-            multiply_add(lefts[term], right, &scale(addend, addend_scales[term]))
-        };
-        let composed = affine_compose(&inner, 1.0, 0.0, source_derivatives[source]);
-        add(&sum, &composed)
-    })
 }
 
 /// Canonical representatives for repeated inner sources in a shared composed sum.
@@ -366,133 +143,9 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
     /// the scalar-specific [`OneSeed::seed_direction`] / [`TwoSeed::seed`].)
     fn variable(x: f64, axis: usize) -> Self;
 
-    /// Evaluate `inputs' A inputs` from one universal semantic primitive.
-    /// Order-specific scalars may lower the mechanically derived channels
-    /// directly; the default is the exact scalar program over `mul/add/scale`.
-    fn symmetric_quadratic_form<C: SymmetricQuadraticCoefficients>(
-        inputs: &[Self],
-        coefficients: &C,
-    ) -> Self {
-        symmetric_quadratic_form_default(
-            inputs,
-            coefficients,
-            Self::constant,
-            crate::nested_dual::JetField::add,
-            crate::nested_dual::JetField::mul,
-            crate::nested_dual::JetField::scale,
-        )
-    }
-
-    /// Evaluate `sum_i weights[i] * inputs[i]` in one semantic primitive.
-    fn linear_combination(inputs: &[Self], weights: &[f64]) -> Self {
-        linear_combination_default(
-            inputs,
-            weights,
-            Self::constant,
-            crate::nested_dual::JetField::add,
-            crate::nested_dual::JetField::scale,
-        )
-    }
-
     /// Add a primal constant without changing derivative channels.
     fn add_constant(&self, constant: f64) -> Self {
         self.add(&Self::constant(constant))
-    }
-
-    /// Evaluate `self * right + addend` in one semantic primitive.
-    fn multiply_add(&self, right: &Self, addend: &Self) -> Self {
-        multiply_add_default(
-            self,
-            right,
-            addend,
-            crate::nested_dual::JetField::mul,
-            crate::nested_dual::JetField::add,
-        )
-    }
-
-    /// Sum unary compositions directly from certified derivative stacks.
-    fn composed_sum(inputs: &[Self], derivative_stacks: &[[f64; 5]]) -> Self {
-        composed_sum_default(
-            inputs,
-            derivative_stacks,
-            Self::constant,
-            crate::nested_dual::JetField::add,
-            crate::nested_dual::JetField::compose_unary,
-        )
-    }
-
-    /// Exact product as an explicit compiled graph node.
-    fn product(&self, right: &Self) -> Self {
-        self.mul(right)
-    }
-
-    /// Compose a certified outer stack after the affine map
-    /// `u = input_scale * self + input_shift`.
-    fn affine_compose(
-        &self,
-        input_scale: f64,
-        input_shift: f64,
-        derivative_stack: [f64; 5],
-    ) -> Self {
-        affine_compose_default(
-            self,
-            input_scale,
-            input_shift,
-            derivative_stack,
-            crate::nested_dual::JetField::scale,
-            Self::add_constant,
-            crate::nested_dual::JetField::compose_unary,
-        )
-    }
-
-    /// Sum unary compositions whose inputs each carry an affine scale.
-    fn affine_composed_sum(
-        inputs: &[Self],
-        input_scales: &[f64],
-        derivative_stacks: &[[f64; 5]],
-    ) -> Self {
-        affine_composed_sum_default(
-            inputs,
-            input_scales,
-            derivative_stacks,
-            Self::constant,
-            crate::nested_dual::JetField::add,
-            crate::nested_dual::JetField::scale,
-            Self::add_constant,
-            crate::nested_dual::JetField::compose_unary,
-        )
-    }
-
-    /// Evaluate
-    /// `Σ_i f_i(input_scale_i · (left_i · right + addend_scale_i · addend))`
-    /// from the certified derivative stack of each `f_i`. The shared operands
-    /// make expression-level common subexpressions explicit, so optimized
-    /// backends apply their inherited derivative channels once. Expression
-    /// arity is part of the type, and borrowed operands never copy a full tower.
-    /// An exact-zero addend scale (either sign of IEEE zero) removes that addend
-    /// from the corresponding term entirely.
-    fn shared_multiply_add_affine_composed_sum<const N: usize>(
-        lefts: &[&Self; N],
-        right: &Self,
-        addend: &Self,
-        addend_scales: &[f64; N],
-        input_scales: &[f64; N],
-        derivative_stacks: &[[f64; 5]; N],
-    ) -> Self {
-        shared_multiply_add_affine_composed_sum_default(
-            lefts,
-            right,
-            addend,
-            addend_scales,
-            input_scales,
-            derivative_stacks,
-            Self::constant,
-            crate::nested_dual::JetField::add,
-            crate::nested_dual::JetField::mul,
-            crate::nested_dual::JetField::scale,
-            Self::multiply_add,
-            Self::affine_compose,
-        )
     }
 
     // The scalar-field algebra — `value`, `add`, `sub`, `mul`, `neg`, `scale`,
@@ -559,14 +212,6 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
         ])
     }
 
-    /// `ln Γ(self)`. Caller guarantees a positive argument. Uses the SAME
-    /// hand-certified derivative stack [`crate::jet_tower::Tower4::ln_gamma`]
-    /// consumes ([`crate::jet_tower::ln_gamma_derivative_stack`]), so any
-    /// program written over both matches term-for-term.
-    fn ln_gamma(&self) -> Self {
-        self.compose_unary(crate::jet_tower::ln_gamma_derivative_stack(self.value()))
-    }
-
     /// `ψ(self) = d/dx ln Γ(x)` (digamma). Caller guarantees a positive
     /// argument. Same hand-certified stack
     /// [`crate::jet_tower::digamma_derivative_stack`].
@@ -628,143 +273,11 @@ pub trait RuntimeJetScalar<'arena>: Clone {
     /// Replace only the primal value, preserving every derivative channel.
     fn with_value(&self, value: f64) -> Self;
 
-    /// Evaluate `inputs' A inputs` from the same universal semantic primitive
-    /// as [`JetScalar::symmetric_quadratic_form`].
-    fn symmetric_quadratic_form<C: SymmetricQuadraticCoefficients>(
-        inputs: &[Self],
-        coefficients: &C,
-        dimension: usize,
-        workspace: &'arena Self::Workspace,
-    ) -> Self {
-        symmetric_quadratic_form_default(
-            inputs,
-            coefficients,
-            |value| Self::constant(value, dimension, workspace),
-            Self::add,
-            Self::mul,
-            Self::scale,
-        )
-    }
-
-    /// Evaluate `sum_i weights[i] * inputs[i]` in one semantic primitive.
-    fn linear_combination(
-        inputs: &[Self],
-        weights: &[f64],
-        dimension: usize,
-        workspace: &'arena Self::Workspace,
-    ) -> Self {
-        linear_combination_default(
-            inputs,
-            weights,
-            |value| Self::constant(value, dimension, workspace),
-            Self::add,
-            Self::scale,
-        )
-    }
-
     /// Add a primal constant without changing derivative channels.
     fn add_constant(&self, constant: f64) -> Self {
         self.with_value(self.value() + constant)
     }
 
-    /// Evaluate `self * right + addend` in one semantic primitive.
-    fn multiply_add(&self, right: &Self, addend: &Self) -> Self {
-        multiply_add_default(self, right, addend, Self::mul, Self::add)
-    }
-
-    /// Sum unary compositions directly from certified derivative stacks.
-    fn composed_sum(
-        inputs: &[Self],
-        derivative_stacks: &[[f64; 5]],
-        dimension: usize,
-        workspace: &'arena Self::Workspace,
-    ) -> Self {
-        composed_sum_default(
-            inputs,
-            derivative_stacks,
-            |value| Self::constant(value, dimension, workspace),
-            Self::add,
-            Self::compose_unary,
-        )
-    }
-
-    /// Exact product as an explicit compiled graph node.
-    fn product(&self, right: &Self) -> Self {
-        self.mul(right)
-    }
-
-    /// Compose a certified outer stack after an affine input map.
-    fn affine_compose(
-        &self,
-        input_scale: f64,
-        input_shift: f64,
-        derivative_stack: [f64; 5],
-    ) -> Self {
-        affine_compose_default(
-            self,
-            input_scale,
-            input_shift,
-            derivative_stack,
-            Self::scale,
-            |value, constant| value.add_constant(constant),
-            Self::compose_unary,
-        )
-    }
-
-    /// Sum unary compositions whose inputs each carry an affine scale.
-    fn affine_composed_sum(
-        inputs: &[Self],
-        input_scales: &[f64],
-        derivative_stacks: &[[f64; 5]],
-        dimension: usize,
-        workspace: &'arena Self::Workspace,
-    ) -> Self {
-        affine_composed_sum_default(
-            inputs,
-            input_scales,
-            derivative_stacks,
-            |value| Self::constant(value, dimension, workspace),
-            Self::add,
-            Self::scale,
-            |value, constant| value.add_constant(constant),
-            Self::compose_unary,
-        )
-    }
-
-    /// Runtime-dimension lowering of
-    /// `Σ_i f_i(input_scale_i · (left_i · right + addend_scale_i · addend))`
-    /// from certified derivative stacks. Const expression arity replaces an
-    /// implementation-specific term cap, while shared operands expose universal
-    /// common-subexpression elimination. If every addend scale is exact zero
-    /// (including `-0.0`), the addend has no dimension, workspace, or
-    /// derivative-channel obligations.
-    fn shared_multiply_add_affine_composed_sum<const N: usize>(
-        lefts: &[&Self; N],
-        right: &Self,
-        addend: &Self,
-        addend_scales: &[f64; N],
-        input_scales: &[f64; N],
-        derivative_stacks: &[[f64; 5]; N],
-        dimension: usize,
-        workspace: &'arena Self::Workspace,
-    ) -> Self {
-        shared_multiply_add_affine_composed_sum_default(
-            lefts,
-            right,
-            addend,
-            addend_scales,
-            input_scales,
-            derivative_stacks,
-            |value| Self::constant(value, dimension, workspace),
-            Self::add,
-            Self::mul,
-            Self::scale,
-            Self::multiply_add,
-            |input, scale, shift, stack| input.affine_compose(scale, shift, stack),
-        )
-    }
-    /// Number of primary derivative axes carried by this scalar.
-    fn dimension(&self) -> usize;
     /// Value channel.
     fn value(&self) -> f64;
     /// Exact truncated sum.
@@ -1293,14 +806,6 @@ impl DynamicJetArena {
         }
     }
 
-    /// Create an arena with a row-program-selected initial byte capacity.
-    #[must_use]
-    pub fn with_capacity(bytes: usize) -> Self {
-        Self {
-            bump: bumpalo::Bump::with_capacity(bytes),
-        }
-    }
-
     /// Reclaim all scalar outputs and compact a fragmented high-water mark
     /// into one retained chunk.
     ///
@@ -1319,13 +824,6 @@ impl DynamicJetArena {
         }
     }
 
-    /// Bytes currently reserved from the global allocator. A warm-reset-warm
-    /// benchmark uses this to prove the second row requires no arena growth.
-    #[must_use]
-    pub fn allocated_bytes(&self) -> usize {
-        self.bump.allocated_bytes()
-    }
-
     #[inline(always)]
     fn zeros(&self, len: usize) -> &mut [f64] {
         self.bump.alloc_slice_fill_copy(len, 0.0)
@@ -1341,9 +839,6 @@ impl DynamicJetArena {
 }
 
 impl Default for DynamicJetArena {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Runtime-sized packed first-order scalar: value plus arena-backed gradient.
@@ -1364,18 +859,6 @@ impl DynamicOrder1<'_> {
         self.g
     }
 
-    #[inline]
-    fn assert_compatible(&self, o: &Self) {
-        assert_eq!(
-            self.g.len(),
-            o.g.len(),
-            "dynamic first-order jet dimension mismatch"
-        );
-        assert!(
-            std::ptr::eq(self.arena, o.arena),
-            "dynamic jets belong to different arenas"
-        );
-    }
 }
 
 impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder1<'arena> {
@@ -1417,9 +900,6 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder1<'arena> {
         }
     }
 
-    fn dimension(&self) -> usize {
-        self.g.len()
-    }
     fn value(&self) -> f64 {
         self.v
     }
@@ -1554,13 +1034,6 @@ impl DynamicOrder2<'_> {
     #[must_use]
     pub fn h(&self) -> &[f64] {
         self.h
-    }
-
-    /// Hessian entry `(row, col)`.
-    #[inline]
-    #[must_use]
-    pub fn h_at(&self, row: usize, col: usize) -> f64 {
-        self.h[row * self.dimension() + col]
     }
 
     #[inline(always)]
@@ -2334,12 +1807,6 @@ impl DynamicJetBatchWorkspace {
     pub fn reset(&mut self, lanes: usize) {
         self.arena.reset();
         self.lanes = lanes;
-    }
-
-    /// Bytes retained by the bump allocator after the largest evaluation.
-    #[must_use]
-    pub fn allocated_bytes(&self) -> usize {
-        self.arena.allocated_bytes()
     }
 
     /// Allocate a primary array in the same arena as every scalar channel.
@@ -3134,23 +2601,6 @@ pub trait HessianPattern<const K: usize, const H: usize> {
     const PAIR_BITS: [[u128; K]; K];
 }
 
-/// Build the symmetric axis-pair → patterned-slot lookup used by dependency
-/// propagation in [`PatternedOrder2`].
-pub const fn hessian_pair_bits<const K: usize, const H: usize>(
-    pairs: [(usize, usize); H],
-) -> [[u128; K]; K] {
-    let mut table = [[0u128; K]; K];
-    let mut slot = 0;
-    while slot < H {
-        let (i, j) = pairs[slot];
-        let bit = 1u128 << slot;
-        table[i][j] = bit;
-        table[j][i] = bit;
-        slot += 1;
-    }
-    table
-}
-
 /// Exact order-two jet with a dense gradient and a compile-time patterned
 /// upper-triangle Hessian.
 ///
@@ -3201,22 +2651,6 @@ where
         dense
     }
 
-    #[inline]
-    fn pair_mask_between(left: u128, right: u128) -> u128 {
-        let mut result = 0u128;
-        let mut left_axes = left;
-        while left_axes != 0 {
-            let i = left_axes.trailing_zeros() as usize;
-            left_axes &= left_axes - 1;
-            let mut right_axes = right;
-            while right_axes != 0 {
-                let j = right_axes.trailing_zeros() as usize;
-                right_axes &= right_axes - 1;
-                result |= P::PAIR_BITS[i][j];
-            }
-        }
-        result
-    }
 }
 
 impl<P, const K: usize, const H: usize> JetScalar<K> for PatternedOrder2<P, K, H>
@@ -3833,10 +3267,6 @@ pub trait Order2AtomChannels<const N: usize> {
     const GRADIENT_BITS: u128;
     /// Structurally live packed upper-Hessian channels.
     const HESSIAN_BITS: u128;
-    /// Local gradient entry.
-    fn gradient_at(&self, axis: usize) -> f64;
-    /// Local Hessian entry.
-    fn hessian_at(&self, row: usize, column: usize) -> f64;
 }
 
 impl<const N: usize> Order2AtomChannels<N> for Order2<N> {
@@ -3868,14 +3298,6 @@ impl<const N: usize, const H: usize, const G: u128, const Q: u128> Order2AtomCha
     #[inline(always)]
     fn hessian_at(&self, row: usize, column: usize) -> f64 {
         StaticOrder2Atom::hessian_at(self, row, column)
-    }
-}
-
-const fn low_mask(channels: usize) -> u128 {
-    if channels >= 128 {
-        u128::MAX
-    } else {
-        (1u128 << channels) - 1
     }
 }
 
@@ -3986,17 +3408,7 @@ impl<const K: usize> MappedOrder2Accumulator<K> {
 /// caller's term type, so several terms that share an inner scalar may be fused
 /// before entering [`DynamicOrder2Accumulator`].
 pub trait DynamicOrder2Term {
-    /// Outer first derivative `f'(q)` for this already-fused source.
-    fn outer_first(&self) -> f64;
 
-    /// Outer second derivative `f''(q)` for this already-fused source.
-    fn outer_second(&self) -> f64;
-
-    /// Inner first derivative `q_i`.
-    fn inner_gradient(&self, axis: usize) -> f64;
-
-    /// Inner second derivative `q_ij`.
-    fn inner_hessian(&self, row: usize, column: usize) -> f64;
 }
 
 /// Allocation-minimal runtime-width lowering of an additive order-two program.
@@ -4110,40 +3522,16 @@ pub trait Lane: Copy {
     /// How many rows one value of this field carries: 1 for the `f64` oracle,
     /// 4 for [`wide::f64x4`]. [`Lane::lane`] indices are bounded by this.
     const LANES: usize;
-    /// Broadcast a scalar to every lane.
-    fn splat(x: f64) -> Self;
     /// Lane-wise `self + o`.
     fn add(self, o: Self) -> Self;
     /// Lane-wise `self - o`.
     fn sub(self, o: Self) -> Self;
     /// Lane-wise `self * o`.
     fn mul(self, o: Self) -> Self;
-    /// The `f64` in lane `i`. Panics when `i >= LANES` — a row index past the
-    /// end of the field is a caller bug, not a value to silently substitute.
-    fn lane(self, i: usize) -> f64;
-    /// Build the order-≤2 derivative stack `[f(u), f′(u), f″(u)]` **per lane**
-    /// from the lane value `u`, via the SAME scalar `stack` closure the
-    /// per-row path runs (so the transcendental/rational stack is bit-identical
-    /// to the scalar evaluation — only the subsequent tensor composition is
-    /// vectorised).
-    fn unary3(self, stack: impl Fn(f64) -> [f64; 3]) -> [Self; 3];
-    /// Build the order-≤4 derivative stack `[f, f′, f″, f‴, f⁗]` **per lane**
-    /// from the lane value `u`, via the SAME scalar `stack` closure the per-row
-    /// path runs. The one-/two-seed scalars ([`OneSeedLane`] / [`TwoSeedLane`])
-    /// need outer derivatives one / two orders beyond their order-2 base, so
-    /// they build their composition stack through this five-entry variant. As
-    /// with [`unary3`](Lane::unary3), only the transcendental/rational stack is
-    /// evaluated per lane (bit-identically to the scalar path); the subsequent
-    /// tensor composition is vectorised.
-    fn unary5(self, stack: impl Fn(f64) -> [f64; 5]) -> [Self; 5];
 }
 
 impl Lane for f64 {
     const LANES: usize = 1;
-    #[inline]
-    fn splat(x: f64) -> Self {
-        x
-    }
     #[inline]
     fn add(self, o: Self) -> Self {
         self + o
@@ -4155,22 +3543,6 @@ impl Lane for f64 {
     #[inline]
     fn mul(self, o: Self) -> Self {
         self * o
-    }
-    #[inline]
-    fn lane(self, i: usize) -> f64 {
-        assert!(
-            i < <Self as Lane>::LANES,
-            "the f64 Lane carries one row; lane {i} does not exist"
-        );
-        self
-    }
-    #[inline]
-    fn unary3(self, stack: impl Fn(f64) -> [f64; 3]) -> [Self; 3] {
-        stack(self)
-    }
-    #[inline]
-    fn unary5(self, stack: impl Fn(f64) -> [f64; 5]) -> [Self; 5] {
-        stack(self)
     }
 }
 
@@ -4191,28 +3563,6 @@ impl Lane for wide::f64x4 {
     #[inline]
     fn mul(self, o: Self) -> Self {
         self * o
-    }
-    #[inline]
-    fn lane(self, i: usize) -> f64 {
-        self.to_array()[i]
-    }
-    #[inline]
-    fn unary3(self, stack: impl Fn(f64) -> [f64; 3]) -> [Self; 3] {
-        let a = self.to_array();
-        let mut d0 = [0.0_f64; 4];
-        let mut d1 = [0.0_f64; 4];
-        let mut d2 = [0.0_f64; 4];
-        for i in 0..4 {
-            let s = stack(a[i]);
-            d0[i] = s[0];
-            d1[i] = s[1];
-            d2[i] = s[2];
-        }
-        [
-            wide::f64x4::new(d0),
-            wide::f64x4::new(d1),
-            wide::f64x4::new(d2),
-        ]
     }
     #[inline]
     fn unary5(self, stack: impl Fn(f64) -> [f64; 5]) -> [Self; 5] {
@@ -4440,21 +3790,6 @@ impl<L: Lane, const K: usize> Order2Lane<L, K> {
 }
 
 impl<const K: usize> Order2Batch<K> {
-    /// Extract lane `i`'s `(v, g, H)` as a production [`Order2<K>`] scalar.
-    /// Lane `i` is `to_bits`-identical to evaluating the same program at
-    /// [`Order2<K>`] on row `i` (see `batch_tests`).
-    #[inline]
-    #[must_use]
-    pub fn lane(&self, i: usize) -> Order2<K> {
-        let mut t = crate::jet_tower::Tower2::<K>::constant(self.v.lane(i));
-        for a in 0..K {
-            t.g[a] = self.g[a].lane(i);
-            for b in 0..K {
-                t.h[a][b] = self.h[a][b].lane(i);
-            }
-        }
-        Order2(t)
-    }
 }
 
 // ── Order1<K>: value / gradient only (doc §A.1, first-order prune) ──────
@@ -4957,17 +4292,6 @@ impl<L: Lane, const K: usize> OneSeedLane<L, K> {
         self.compose_unary(d)
     }
 
-    /// `ln Γ(self)`; caller guarantees positivity (matches [`JetScalar::ln_gamma`],
-    /// same hand-certified stack).
-    #[inline]
-    pub fn ln_gamma(&self) -> Self {
-        let d = self
-            .base
-            .v
-            .unary5(crate::jet_tower::ln_gamma_derivative_stack);
-        self.compose_unary(d)
-    }
-
     /// `ψ(self)` digamma; caller guarantees positivity (matches
     /// [`JetScalar::digamma`], same hand-certified stack).
     #[inline]
@@ -4981,17 +4305,6 @@ impl<L: Lane, const K: usize> OneSeedLane<L, K> {
 }
 
 impl<const K: usize> OneSeedBatch<K> {
-    /// Extract lane `i`'s parts as a production [`OneSeed<K>`]. Lane `i` is
-    /// `to_bits`-identical to evaluating the same program at [`OneSeed<K>`] on
-    /// row `i` (see `batch_tests`).
-    #[inline]
-    #[must_use]
-    pub fn lane(&self, i: usize) -> OneSeed<K> {
-        OneSeed {
-            base: self.base.lane(i),
-            eps: self.eps.lane(i),
-        }
-    }
 }
 
 // ── TwoSeed<K>: two-seed, contracted fourth (doc §A.3) ──────────────────
@@ -5374,16 +4687,6 @@ impl<L: Lane, const K: usize> TwoSeedLane<L, K> {
         self.compose_unary(d)
     }
 
-    /// `ln Γ(self)`; caller guarantees positivity (matches [`JetScalar::ln_gamma`]).
-    #[inline]
-    pub fn ln_gamma(&self) -> Self {
-        let d = self
-            .base
-            .v
-            .unary5(crate::jet_tower::ln_gamma_derivative_stack);
-        self.compose_unary(d)
-    }
-
     /// `ψ(self)` digamma; caller guarantees positivity (matches
     /// [`JetScalar::digamma`]).
     #[inline]
@@ -5397,19 +4700,6 @@ impl<L: Lane, const K: usize> TwoSeedLane<L, K> {
 }
 
 impl<const K: usize> TwoSeedBatch<K> {
-    /// Extract lane `i`'s parts as a production [`TwoSeed<K>`]. Lane `i` is
-    /// `to_bits`-identical to evaluating the same program at [`TwoSeed<K>`] on
-    /// row `i` (see `batch_tests`).
-    #[inline]
-    #[must_use]
-    pub fn lane(&self, i: usize) -> TwoSeed<K> {
-        TwoSeed {
-            base: self.base.lane(i),
-            eps: self.eps.lane(i),
-            del: self.del.lane(i),
-            eps_del: self.eps_del.lane(i),
-        }
-    }
 }
 
 // ── Tower3<K>: value / gradient / Hessian / third tensor ────────────────

@@ -159,8 +159,6 @@ impl GraphTape {
 
 trait HessianSink<const K: usize> {
     fn reset(&mut self);
-    fn add_upper(&mut self, row: usize, column: usize, value: f64);
-    fn reflect_upper(&mut self);
 }
 
 struct ArrayHessianSink<'a, const K: usize>(&'a mut [[f64; K]; K]);
@@ -220,9 +218,6 @@ pub struct Order2GraphWorkspace {
 }
 
 impl Default for Order2GraphWorkspace {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Order2GraphWorkspace {
@@ -511,32 +506,6 @@ pub struct Order2Graph<'arena, const K: usize> {
 }
 
 impl<'arena, const K: usize> Order2Graph<'arena, K> {
-    /// Lower this scalar output to the ordinary packed order-2 channels.
-    #[must_use]
-    pub fn into_order2(self) -> Order2<K> {
-        let mut out = crate::jet_tower::Tower2::zero();
-        let mut hessian = ArrayHessianSink(&mut out.h);
-        out.v = self
-            .workspace
-            .lower_into(self.node, &mut out.g, &mut hessian);
-        Order2(out)
-    }
-
-    /// Lower into caller-owned gradient and row-major Hessian storage.
-    ///
-    /// Both slices are completely overwritten, including structurally-zero
-    /// channels. Reusing them therefore requires no caller-side clearing.
-    #[must_use]
-    pub fn lower_into(self, gradient: &mut [f64], hessian_row_major: &mut [f64]) -> f64 {
-        assert_eq!(gradient.len(), K, "compiled graph gradient width mismatch");
-        assert_eq!(
-            hessian_row_major.len(),
-            K * K,
-            "compiled graph Hessian width mismatch"
-        );
-        let mut hessian = RowMajorHessianSink::<K>(hessian_row_major);
-        self.workspace.lower_into(self.node, gradient, &mut hessian)
-    }
 
     #[inline(always)]
     fn assert_compatible(&self, other: &Self) {
