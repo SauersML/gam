@@ -1491,16 +1491,7 @@ impl SaeManifoldTerm {
                     edge_v.push(Vec::new());
                     continue;
                 }
-                let mut cross = Array2::<f64>::zeros((m_j, m_k));
-                for a in 0..m_j {
-                    for b in 0..m_k {
-                        let mut c = 0.0_f64;
-                        for o in 0..p {
-                            c += bj[[a, o]] * bk[[b, o]];
-                        }
-                        cross[[a, b]] = c;
-                    }
-                }
+                let cross = bj.dot(&bk.t());
                 let s_j = bj.dot(&bj.t());
                 let s_k = bk.dot(&bk.t());
                 let d_j = s_j.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -1518,18 +1509,15 @@ impl SaeManifoldTerm {
                 let alpha = penalty_scale * (-g[[e.jl, e.kl]] * e.q);
                 let off_j = offsets[e.j];
                 let off_k = offsets[e.k];
+                let mb_mat = cross.dot(bk);
+                let sjb_mat = s_j.dot(bj);
+                let mtb_mat = cross.t().dot(bj);
+                let skb_mat = s_k.dot(bk);
                 let mut run_j: Vec<f64> = Vec::with_capacity(m_j * p);
                 for a in 0..m_j {
                     for o in 0..p {
-                        let mut mb = 0.0_f64;
-                        for b in 0..m_k {
-                            mb += cross[[a, b]] * bk[[b, o]];
-                        }
-                        let mut sjb = 0.0_f64;
-                        for a2 in 0..m_j {
-                            sjb += s_j[[a, a2]] * bj[[a2, o]];
-                        }
-                        let do_j = 2.0 * (mb * inv_dd - sh_j * sjb);
+                        let do_j =
+                            2.0 * (mb_mat[[a, o]] * inv_dd - sh_j * sjb_mat[[a, o]]);
                         sys.gb[off_j + a * p + o] += alpha * do_j;
                         run_j.push(do_j);
                     }
@@ -1537,15 +1525,8 @@ impl SaeManifoldTerm {
                 let mut run_k: Vec<f64> = Vec::with_capacity(m_k * p);
                 for b in 0..m_k {
                     for o in 0..p {
-                        let mut mtb = 0.0_f64;
-                        for a in 0..m_j {
-                            mtb += cross[[a, b]] * bj[[a, o]];
-                        }
-                        let mut skb = 0.0_f64;
-                        for b2 in 0..m_k {
-                            skb += s_k[[b, b2]] * bk[[b2, o]];
-                        }
-                        let do_k = 2.0 * (mtb * inv_dd - sh_k * skb);
+                        let do_k =
+                            2.0 * (mtb_mat[[b, o]] * inv_dd - sh_k * skb_mat[[b, o]]);
                         sys.gb[off_k + b * p + o] += alpha * do_k;
                         run_k.push(do_k);
                     }
