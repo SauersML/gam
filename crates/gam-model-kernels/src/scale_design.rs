@@ -273,43 +273,6 @@ pub fn build_scale_deviation_transform(
     .map_err(|e| e.to_string())
 }
 
-pub fn apply_scale_deviation_transform(
-    primary_design: &Array2<f64>,
-    rawnoise_design: &Array2<f64>,
-    transform: &ScaleDeviationTransform,
-) -> Result<Array2<f64>, String> {
-    apply_scale_deviation_transform_typed(primary_design, rawnoise_design, transform)
-        .map_err(|e| e.to_string())
-}
-
-fn apply_scale_deviation_transform_typed(
-    primary_design: &Array2<f64>,
-    rawnoise_design: &Array2<f64>,
-    transform: &ScaleDeviationTransform,
-) -> Result<Array2<f64>, ScaleDesignError> {
-    if primary_design.nrows() != rawnoise_design.nrows() {
-        return Err(dim_err("scale deviation apply row mismatch"));
-    }
-    if primary_design.ncols() != transform.projection_coef.nrows()
-        || rawnoise_design.ncols() != transform.projection_coef.ncols()
-    {
-        return Err(dim_err("scale deviation apply column mismatch"));
-    }
-    let n = rawnoise_design.nrows();
-    let p_primary = primary_design.ncols();
-    let p_noise = rawnoise_design.ncols();
-    let chunk_rows = scale_design_row_chunk_size(n, p_primary.max(p_noise));
-    let mut out = Array2::<f64>::zeros((n, p_noise));
-    for start in (0..n).step_by(chunk_rows) {
-        let end = (start + chunk_rows).min(n);
-        let primary_chunk = primary_design.slice(s![start..end, ..]).to_owned();
-        let noise_chunk = rawnoise_design.slice(s![start..end, ..]).to_owned();
-        let chunk = apply_scale_deviation_reparam_chunk(&primary_chunk, &noise_chunk, transform);
-        out.slice_mut(s![start..end, ..]).assign(&chunk);
-    }
-    Ok(out)
-}
-
 #[derive(Clone)]
 struct ScaleDeviationOperator {
     primary_design: DesignMatrix,
