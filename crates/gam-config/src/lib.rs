@@ -98,14 +98,6 @@ pub fn parse_fit_request_json(request_json: &str) -> Result<ResolvedFitRequest, 
     resolve_fit_request_document(FitRequestDocument::from_json(request_json)?)
 }
 
-/// Validate a fit request through the production resolver and serialize it in
-/// the one canonical byte representation used by every frontend.
-pub fn canonicalize_fit_request_json(request_json: &str) -> Result<String, String> {
-    let request = FitRequestDocument::from_json(request_json)?;
-    resolve_fit_request_document(request.clone())?;
-    request.to_canonical_json()
-}
-
 pub fn resolve_fit_request_document(
     request: FitRequestDocument,
 ) -> Result<ResolvedFitRequest, String> {
