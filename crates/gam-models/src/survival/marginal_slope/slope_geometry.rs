@@ -74,50 +74,6 @@ pub(crate) trait SlopeRowGeometry<const P: usize>: Copy + Send + Sync + 'static 
     /// Human-readable name used in diagnostics.
     const NAME: &'static str;
 
-    /// The nine semantic features at this frame's primaries.
-    ///
-    /// Generic over the scalar so the value path, every compile-time jet, and
-    /// the higher-order towers all read one expression. A frame that needs a
-    /// zero of the carrier builds it with `JetField::constant_like`, which
-    /// inherits the derivative width from a primary rather than requiring the
-    /// caller to supply one.
-    fn feature_frame<T: JetField + Clone>(
-        primaries: &[T; P],
-        inputs: &RigidRowInputs,
-    ) -> [T; RIGID_FEATURE_DIMENSION];
-
-    /// `∂feature/∂primary`, one row per feature. `as_flattened()` gives exactly
-    /// the `[feature * P + primary]` layout [`order2_feature_pullback_into`]
-    /// indexes.
-    fn feature_jacobian(
-        primaries: &[f64; P],
-        inputs: &RigidRowInputs,
-    ) -> [[f64; P]; RIGID_FEATURE_DIMENSION];
-
-    /// How many features primary `axis` actually reaches.
-    fn active_feature_count(axis: usize) -> usize;
-
-    /// The `slot`-th feature primary `axis` reaches.
-    fn active_feature(axis: usize, slot: usize) -> usize;
-
-    /// Accumulate `Σ_f g_f · ∂²f/∂p_a∂p_b` into the flat `P×P` primary Hessian.
-    ///
-    /// Every entry is a constant multiple of the score covariance because the
-    /// location features are linear in the slope and the variance features are
-    /// quadratic — there is no third-or-higher structure in the map itself.
-    fn add_feature_curvature(
-        feature_gradient: &[f64; RIGID_FEATURE_DIMENSION],
-        inputs: &RigidRowInputs,
-        hessian: &mut [f64],
-    );
-
-    /// `∂feature/∂z_sum` at fixed primaries, and `∂/∂z_sum` of the Jacobian
-    /// column of primary `axis`. Together these are everything the Murphy–Topel
-    /// generated-regressor correction needs from the frame (gam#2768).
-    fn score_sensitivity(
-        primaries: &[f64; P],
-        inputs: &RigidRowInputs,
-    ) -> ScoreSensitivity<P>;
 }
 
 /// The frame's dependence on the latent score value itself.
@@ -351,7 +307,6 @@ impl SlopeRowGeometry<DYNAMIC_SLOPE_PRIMARIES> for DynamicSlopeGeometry {
         ScoreSensitivity { feature, jacobian }
     }
 }
-
 
 /// Run a block in whichever primary frame the family's slope layout selects.
 ///

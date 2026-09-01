@@ -14,22 +14,6 @@ use gam_row_macros::row_atom;
 // expression retains the production extreme-value semantics while build-time
 // differentiation emits exact observed H, contracted t3, and contracted t4.
 row_atom! {
-    fn gaussian_normalized_row [generic, order2_at_zero, third_at_zero, fourth_at_zero](
-        delta_mu,
-        delta_eta;
-        obs_weight: f64,
-        standardized_residual: f64,
-        inv_sigma: f64,
-        kappa: f64
-    ) {
-        obs_weight * ln((1.0 - kappa) + kappa * exp(delta_eta))
-            + 0.5
-                * obs_weight
-                * (standardized_residual - delta_mu * inv_sigma)
-                * (standardized_residual - delta_mu * inv_sigma)
-                / ((1.0 - kappa) + kappa * exp(delta_eta))
-                / ((1.0 - kappa) + kappa * exp(delta_eta))
-    }
 }
 
 pub(crate) struct LocationScaleJointPsiDirection {
@@ -684,16 +668,6 @@ impl<'a> GaussianJointRowProgram<'a> {
     /// Bind the generic row program to one certified production scalar batch.
     pub fn new(rows: &'a GaussianJointRowScalars) -> Self {
         Self { rows }
-    }
-
-    fn require_row(&self, row: usize) -> Result<(), String> {
-        if row >= self.rows.obs_weight.len() {
-            return Err(format!(
-                "GaussianJointRowProgram row {row} out of range for {} rows",
-                self.rows.obs_weight.len()
-            ));
-        }
-        Ok(())
     }
 
     /// Symbolically lowered value/gradient/Hessian for one certified row.

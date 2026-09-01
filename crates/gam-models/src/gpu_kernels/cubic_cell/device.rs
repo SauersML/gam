@@ -304,21 +304,6 @@ mod tests {
     use gam_gpu::gpu_error::GpuError;
     use gam_gpu::gpu_error::GpuResultExt;
 
-    /// Test-only DtoH helper for cubic-cell device residency parity tests.
-    fn download_moments(
-        backend: &CubicCellGpuBackend,
-        d_moments: &cudarc::driver::CudaSlice<f64>,
-    ) -> Result<Vec<f64>, GpuError> {
-        let stream = &backend.inner.stream;
-        let host = stream
-            .clone_dtoh(d_moments)
-            .gpu_ctx("cubic_cell tests::download_moments DtoH")?;
-        stream
-            .synchronize()
-            .gpu_ctx("cubic_cell tests::download_moments sync")?;
-        Ok(host)
-    }
-
     /// Phase 4 parity test: device-resident moments must match the CPU
     /// `evaluate_cell_derivative_moments_uncached` reference across all
     /// three branches (`Affine`, `NonAffineFinite`, `AffineTail`) at the

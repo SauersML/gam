@@ -8,14 +8,6 @@ impl BinomialLocationScaleFamily {
     pub const BLOCK_T: usize = 0;
     pub const BLOCK_LOG_SIGMA: usize = 1;
 
-    pub fn parameternames() -> &'static [&'static str] {
-        &["threshold", "log_sigma"]
-    }
-
-    pub fn parameter_links() -> &'static [ParameterLink] {
-        &[ParameterLink::InverseLink, ParameterLink::Log]
-    }
-
     pub fn metadata() -> FamilyMetadata {
         FamilyMetadata {
             name: "binomial_location_scale",
@@ -2124,23 +2116,6 @@ impl BinomialLocationScaleFamily {
         Ok(out)
     }
 
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
-    ///
-    /// The two-output map is (η_threshold, η_log_sigma):
-    /// - block 0 (threshold):  output 0 = design rows, output 1 = zeros
-    /// - block 1 (log_sigma):  output 0 = zeros, output 1 = design rows
-    pub fn block_effective_jacobian(
-        specs: &[ParameterBlockSpec],
-        block_idx: usize,
-    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-        crate::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
-            family: "BinomialLocationScaleFamily",
-            n_outputs: 2,
-            additive_blocks: &[Self::BLOCK_T, Self::BLOCK_LOG_SIGMA],
-            wiggle_block: None,
-        }
-        .block_effective_jacobian(specs, block_idx)
-    }
 }
 
 impl CustomFamily for BinomialLocationScaleFamily {
@@ -2772,29 +2747,4 @@ impl CustomFamily for BinomialLocationScaleFamily {
 }
 
 impl CustomFamilyGenerative for BinomialLocationScaleFamily {
-    fn generativespec(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<GenerativeSpec, String> {
-        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
-        let eta_t = &block_states[Self::BLOCK_T].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        if eta_t.len() != self.y.len() || eta_ls.len() != self.y.len() {
-            return Err(GamlssError::DimensionMismatch {
-                reason: "BinomialLocationScaleFamily generative size mismatch".to_string(),
-            }
-            .into());
-        }
-        let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
-            let sigma = exp_sigma_from_eta_scalar(eta_ls[i]);
-            let q = binomial_location_scale_q0(eta_t[i], sigma);
-            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
-                .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
-            Ok(jet.mu)
-        })?;
-        Ok(GenerativeSpec {
-            mean,
-            noise: NoiseModel::Bernoulli,
-        })
-    }
 }

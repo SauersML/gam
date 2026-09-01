@@ -111,33 +111,6 @@ pub(crate) fn gamlss_projected_trace_chunk_rows(
     )
 }
 
-pub(crate) fn gamlss_rowwise_map<F>(n: usize, f: F) -> Array1<f64>
-where
-    F: Fn(usize) -> f64 + Sync,
-{
-    if n >= GAMLSS_ROWWISE_PAR_MIN_N {
-        Array1::from((0..n).into_par_iter().map(&f).collect::<Vec<f64>>())
-    } else {
-        Array1::from_iter((0..n).map(f))
-    }
-}
-
-pub(crate) fn gamlss_rowwise_map_result<F>(n: usize, f: F) -> Result<Array1<f64>, String>
-where
-    F: Fn(usize) -> Result<f64, String> + Sync,
-{
-    if n >= GAMLSS_ROWWISE_PAR_MIN_N {
-        let values: Result<Vec<f64>, String> = (0..n).into_par_iter().map(&f).collect();
-        Ok(Array1::from(values?))
-    } else {
-        let mut out = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            out[i] = f(i)?;
-        }
-        Ok(out)
-    }
-}
-
 pub(crate) enum DenseOrOperator<'a> {
     Borrowed(&'a Array2<f64>),
     Owned(Array2<f64>),

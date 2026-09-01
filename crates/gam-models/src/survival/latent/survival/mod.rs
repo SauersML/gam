@@ -380,14 +380,6 @@ impl LatentSurvivalFamily {
     pub const BLOCK_MEAN: usize = 1;
     pub const BLOCK_LOG_SIGMA: usize = 2;
 
-    pub fn parameter_names() -> &'static [&'static str] {
-        &["time_transform", "mean"]
-    }
-
-    pub fn parameter_links() -> &'static [ParameterLink] {
-        &[ParameterLink::Identity, ParameterLink::Identity]
-    }
-
     pub fn metadata() -> FamilyMetadata {
         FamilyMetadata {
             name: "latent_survival",
@@ -2223,33 +2215,6 @@ type LatentTermBuffer = SmallVec<[LatentKernelPrimaryTerm; LATENT_TERM_INLINE_CA
 const LATENT_A_BASIS_MAX_RUNG: usize = 12;
 const LATENT_A_BASIS_MAX_TAU_EXP: usize = 12;
 const LATENT_A_BASIS_MAX_QDOT_POWER: usize = 4;
-
-/// Signed Stirling numbers of the first kind: the coefficients of the falling
-/// factorial `(x)_k = x(x−1)···(x−k+1) = Σ_j s(k,j) x^j`.
-///
-/// These are the weights that re-express a kernel rung in the `∂_a^j K_0` basis,
-/// because `m^k K_k = (−1)^k (∂_a)_k K_0` (#2610). Built by the standard
-/// recurrence `(x)_{k+1} = (x)_k · (x − k)` in integers so every entry converts
-/// to f64 exactly.
-const fn latent_falling_factorial_table()
--> [[i64; LATENT_A_BASIS_MAX_RUNG + 1]; LATENT_A_BASIS_MAX_RUNG + 1] {
-    let mut table = [[0_i64; LATENT_A_BASIS_MAX_RUNG + 1]; LATENT_A_BASIS_MAX_RUNG + 1];
-    table[0][0] = 1;
-    let mut rung = 0usize;
-    while rung < LATENT_A_BASIS_MAX_RUNG {
-        let mut power = 0usize;
-        while power <= rung {
-            let value = table[rung][power];
-            if value != 0 {
-                table[rung + 1][power + 1] += value;
-                table[rung + 1][power] -= (rung as i64) * value;
-            }
-            power += 1;
-        }
-        rung += 1;
-    }
-    table
-}
 
 const LATENT_FALLING_FACTORIAL: [[i64; LATENT_A_BASIS_MAX_RUNG + 1];
     LATENT_A_BASIS_MAX_RUNG + 1] = latent_falling_factorial_table();
@@ -7103,7 +7068,6 @@ mod log_sigma_curvature_certificate;
 pub use log_sigma_curvature_certificate::{
     CertifiedLogSigmaCurvature, latent_survival_log_sigma_curvature_certified,
 };
-
 
 #[cfg(test)]
 mod tests;

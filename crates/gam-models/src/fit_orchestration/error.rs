@@ -1,11 +1,7 @@
 pub(crate) trait WorkflowCauseCountResult {
-    fn into_workflow_result(self) -> Result<usize, String>;
 }
 
 impl WorkflowCauseCountResult for usize {
-    fn into_workflow_result(self) -> Result<usize, String> {
-        Ok(self)
-    }
 }
 
 impl<E: ToString> WorkflowCauseCountResult for Result<usize, E> {

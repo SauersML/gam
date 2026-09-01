@@ -184,15 +184,6 @@ impl<'row> MultinomialLogitRowProgram<'row> {
         })
     }
 
-    fn require_row(row: usize) -> Result<(), String> {
-        if row != 0 {
-            return Err(format!(
-                "MultinomialLogitRowProgram holds exactly one row; got row {row}"
-            ));
-        }
-        Ok(())
-    }
-
     /// Stable shift shared by the semantic row expression and its compiled
     /// probability/Fisher schedule. Including the reference logit zero keeps
     /// every exponential argument non-positive.
@@ -313,18 +304,6 @@ impl<'row> MultinomialLogitRowProgram<'row> {
             gradient[axis] = self.weight * (probabilities[axis] - self.response[axis]);
         }
         self.negative_log_likelihood_from_normalization(shift, log_centered_denominator)
-    }
-
-    /// Diagonal-only structure-compiled Hessian lowering. This preserves the
-    /// O(M) preconditioner path without reintroducing a second softmax formula.
-    pub(crate) fn hessian_diagonal_into(&self, probabilities: &mut [f64], diagonal: &mut [f64]) {
-        let active_classes = self.eta.len();
-        assert_eq!(diagonal.len(), active_classes);
-        self.probabilities_into(probabilities);
-        for axis in 0..active_classes {
-            let probability = probabilities[axis];
-            diagonal[axis] = self.weight * probability * (1.0 - probability);
-        }
     }
 
     /// Structure-compiled value/gradient/Hessian lowering of the semantic row.
@@ -465,7 +444,6 @@ trait FisherPerturbation: JetScalar<0> {
 
     fn seed(direction: FisherDirection) -> Self;
     fn coefficient(&self) -> f64;
-    fn from_channels(base: f64, channels: Self::Channels) -> Self;
     /// Normalize one perturbed mass by the shared reciprocal denominator and
     /// store the live nilpotent coefficients, applying the weight iff
     /// [`Self::WEIGHT_IN_CHANNELS`].

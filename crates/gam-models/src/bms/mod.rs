@@ -96,9 +96,6 @@ impl Default for DeviationBlockConfig {
 }
 
 impl DeviationBlockConfig {
-    pub fn triple_penalty_default() -> Self {
-        Self::default()
-    }
 }
 
 impl From<WigglePenaltyConfig> for DeviationBlockConfig {

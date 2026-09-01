@@ -51,9 +51,6 @@ impl SharedTangentPenalty {
         }
     }
 
-    pub fn column_end(&self) -> usize {
-        self.column_start + self.matrix.ncols()
-    }
 }
 
 /// Owned request for a shared-tangent REML fit.
@@ -89,27 +86,6 @@ impl SharedTangentRemlRequest {
         }
     }
 
-    /// Convenience constructor for an owned dense design.
-    pub fn from_dense(
-        design: Array2<f64>,
-        response: Array2<f64>,
-        weights: Array1<f64>,
-        fisher_metric: Option<Array3<f64>>,
-        penalties: Vec<SharedTangentPenalty>,
-    ) -> Self {
-        Self::new(
-            DesignMatrix::from(design),
-            response,
-            weights,
-            fisher_metric,
-            penalties,
-        )
-    }
-
-    pub fn with_initial_log_lambdas(mut self, initial: Array1<f64>) -> Self {
-        self.initial_log_lambdas = Some(initial);
-        self
-    }
 }
 
 /// A converged, serializable shared-tangent model.
@@ -144,10 +120,6 @@ impl SharedTangentRemlFit {
         predict_from_coefficients(design, &self.coefficients)
     }
 
-    /// Convenience prediction entry point for an owned dense design.
-    pub fn predict_dense(&self, design: Array2<f64>) -> Result<Array2<f64>, EstimationError> {
-        self.predict(&DesignMatrix::from(design))
-    }
 }
 
 /// Typed curvature-as-estimand record carried by a response-geometry archive.
@@ -346,21 +318,6 @@ impl ResponseGeometryModel {
         Ok(())
     }
 
-    /// Serialize the complete typed archive as UTF-8 JSON bytes.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ResponseGeometryModelError> {
-        self.validate()?;
-        serde_json::to_vec(self)
-            .map_err(|error| ResponseGeometryModelError::Serialization(error.to_string()))
-    }
-
-    /// Restore and validate a complete typed archive from UTF-8 JSON bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ResponseGeometryModelError> {
-        let model: Self = serde_json::from_slice(bytes)
-            .map_err(|error| ResponseGeometryModelError::Serialization(error.to_string()))?;
-        model.validate()?;
-        Ok(model)
-    }
-
     pub fn metadata(&self) -> ResponseGeometryMetadata {
         self.metadata.clone()
     }
@@ -382,12 +339,6 @@ impl ResponseGeometryModel {
         }
     }
 
-    /// Predict tangent coordinates from the supplied already-materialized
-    /// template design. Geometry exp-map dispatch intentionally remains in the
-    /// geometry/FFI layer.
-    pub fn predict_tangent(&self, design: &DesignMatrix) -> Result<Array2<f64>, EstimationError> {
-        self.shared_tangent_fit.predict(design)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -835,7 +786,6 @@ impl PreparedSharedTangent {
             penalty_beta.push(z);
         }
 
-
         // REML profiles the scale out as `φ̂ = D_p/rdf` with `D_p` the PENALIZED
         // deviance, so the criterion's data term is `rdf·ln(D_p)` and its
         // ρ-derivative is `rdf·(β̂ᵗλⱼSⱼβ̂)/D_p` — exactly `deviance_first[j]/D_p`.
@@ -953,7 +903,6 @@ impl PreparedSharedTangent {
             deviance_first[index] = beta.dot(&z);
             penalty_beta.push(z);
         }
-
 
         // REML profiles the scale out as `φ̂ = D_p/rdf` with `D_p` the PENALIZED
         // deviance, so the criterion's data term is `rdf·ln(D_p)` and its
@@ -1609,52 +1558,6 @@ fn validate_evaluation(
         return Err(EstimationError::RemlOptimizationFailed(format!(
             "{FIT_CONTEXT}: objective evaluation produced non-finite value or derivatives"
         )));
-    }
-    Ok(())
-}
-
-fn validate_archived_tangent_fit(
-    fit: &SharedTangentRemlFit,
-) -> Result<(), ResponseGeometryModelError> {
-    if fit.n_observations == 0
-        || fit.n_outputs == 0
-        || fit.coefficients.nrows() == 0
-        || fit.coefficients.ncols() != fit.n_outputs
-        || fit.fitted.dim() != (fit.n_observations, fit.n_outputs)
-    {
-        return Err(ResponseGeometryModelError::InvalidMetadata(
-            "shared tangent fit has inconsistent dimensions".to_string(),
-        ));
-    }
-    if fit.lambdas.len() != fit.edf_by_penalty.len() {
-        return Err(ResponseGeometryModelError::InvalidMetadata(
-            "shared tangent lambda and EDF vectors are misaligned".to_string(),
-        ));
-    }
-    if fit.coefficients.iter().any(|value| !value.is_finite())
-        || fit.fitted.iter().any(|value| !value.is_finite())
-        || fit
-            .lambdas
-            .iter()
-            .any(|value| !value.is_finite() || *value < 0.0)
-        || fit
-            .edf_by_penalty
-            .iter()
-            .any(|value| !value.is_finite() || *value < 0.0)
-        || !fit.sigma2.is_finite()
-        || fit.sigma2 <= 0.0
-        || !fit.edf_total.is_finite()
-        || fit.edf_total < 0.0
-        || !fit.reml_score.is_finite()
-    {
-        return Err(ResponseGeometryModelError::InvalidMetadata(
-            "shared tangent fit contains invalid numerical values".to_string(),
-        ));
-    }
-    if !fit.outer_certificate.certifies() {
-        return Err(ResponseGeometryModelError::InvalidMetadata(
-            "shared tangent fit lacks a valid convergence certificate".to_string(),
-        ));
     }
     Ok(())
 }

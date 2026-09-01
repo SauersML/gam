@@ -133,18 +133,6 @@ impl GaussianLocationScaleWiggleFamily {
     pub const BLOCK_LOG_SIGMA: usize = 1;
     pub const BLOCK_WIGGLE: usize = 2;
 
-    pub fn parameternames() -> &'static [&'static str] {
-        &["mu", "log_sigma", "wiggle"]
-    }
-
-    pub fn parameter_links() -> &'static [ParameterLink] {
-        &[
-            ParameterLink::Identity,
-            ParameterLink::Log,
-            ParameterLink::Wiggle,
-        ]
-    }
-
     pub fn metadata() -> FamilyMetadata {
         FamilyMetadata {
             name: "gaussian_location_scalewiggle",
@@ -329,27 +317,6 @@ impl GaussianLocationScaleWiggleFamily {
         Ok(None)
     }
 
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
-    ///
-    /// The wiggle block (block 2) modulates the inverse link nonlinearly and
-    /// does not contribute a linear additive term to any output η; its
-    /// Jacobian is an `(2 * n, p_wiggle)` zero matrix.
-    ///
-    /// - block 0 (mu):        output 0 = design rows, output 1 = zeros
-    /// - block 1 (log_sigma): output 0 = zeros, output 1 = design rows
-    /// - block 2 (wiggle):    all zeros (nonlinear link modulation)
-    pub fn block_effective_jacobian(
-        specs: &[ParameterBlockSpec],
-        block_idx: usize,
-    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-        crate::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
-            family: "GaussianLocationScaleWiggleFamily",
-            n_outputs: 2,
-            additive_blocks: &[Self::BLOCK_MU, Self::BLOCK_LOG_SIGMA],
-            wiggle_block: Some(Self::BLOCK_WIGGLE),
-        }
-        .block_effective_jacobian(specs, block_idx)
-    }
 }
 
 /// Row-coefficient bundle for the GLS Wiggle joint second directional
@@ -2913,32 +2880,5 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
 }
 
 impl CustomFamilyGenerative for GaussianLocationScaleWiggleFamily {
-    fn generativespec(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<GenerativeSpec, String> {
-        validate_block_count::<GamlssError>(
-            "GaussianLocationScaleWiggleFamily",
-            3,
-            block_states.len(),
-        )?;
-        let eta_mu = &block_states[Self::BLOCK_MU].eta;
-        let eta_wiggle = &block_states[Self::BLOCK_WIGGLE].eta;
-        let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let n = eta_mu.len();
-        let mean = gamlss_rowwise_map(n, |i| eta_mu[i] + eta_wiggle[i]);
-        let sigma = gamlss_rowwise_map(n, |i| logb_sigma_from_eta_scalar(eta_log_sigma[i]));
-        Ok(GenerativeSpec {
-            mean,
-            noise: NoiseModel::Gaussian { sigma },
-        })
-    }
 }
 
-pub(crate) fn expect_single_block<'a>(
-    block_states: &'a [ParameterBlockState],
-    family_name: &str,
-) -> Result<&'a ParameterBlockState, String> {
-    validate_block_count::<GamlssError>(family_name, 1, block_states.len())?;
-    Ok(&block_states[0])
-}

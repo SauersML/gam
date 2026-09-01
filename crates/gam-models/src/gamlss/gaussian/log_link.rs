@@ -12,14 +12,6 @@ pub struct PoissonLogFamily {
 impl PoissonLogFamily {
     pub const BLOCK_ETA: usize = 0;
 
-    pub fn parameternames() -> &'static [&'static str] {
-        &["eta"]
-    }
-
-    pub fn parameter_links() -> &'static [ParameterLink] {
-        &[ParameterLink::Log]
-    }
-
     pub fn metadata() -> FamilyMetadata {
         FamilyMetadata {
             name: "poisson_log",
@@ -46,23 +38,9 @@ pub(crate) struct DiagonalIrlsRow {
 /// for the family-specific math: validating `y[i]` and producing the
 /// per-row triple `(ℓ_increment, observed_weight, working_step)`.
 trait LogLinkDiagonalIrlsFamily {
-    /// Short, human-readable name used in size-mismatch errors.
-    fn family_label(&self) -> &'static str;
 
     /// Read access to the shared (y, prior weights) buffers.
     fn y(&self) -> &Array1<f64>;
-    fn prior_weights(&self) -> &Array1<f64>;
-
-    /// Optional pre-loop validation hook for parameters outside the
-    /// (y, weights, eta) triple (e.g. Gamma shape > 0).
-    fn validate_self(&self) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Validate `y[i]` and return an error message if rejected. Default
-    /// implementation enforces only finiteness; concrete families override
-    /// to add domain constraints.
-    fn validate_yi(&self, yi: f64, idx: usize) -> Result<(), String>;
 
     /// Family-specific row math.  A positive-weight row must either return a
     /// fully representable likelihood/score/curvature triple or refuse it.
@@ -75,92 +53,9 @@ trait LogLinkDiagonalIrlsFamily {
     ) -> Result<DiagonalIrlsRow, String>;
 }
 
-/// Shared IRLS driver for [`LogLinkDiagonalIrlsFamily`]. Centralises the
-/// validation, exact row-domain certification, and assembly.  Rows are first
-/// certified into a temporary buffer; no working array is mutated until every
-/// row has succeeded, so the smallest invalid row is reported deterministically.
-fn evaluate_log_link_diagonal_irls<F: LogLinkDiagonalIrlsFamily + ?Sized>(
-    family: &F,
-    block_states: &[ParameterBlockState],
-) -> Result<FamilyEvaluation, String> {
-    let label = family.family_label();
-    let eta = &expect_single_block(block_states, label)?.eta;
-    let y = family.y();
-    let prior_weights = family.prior_weights();
-    let n = y.len();
-    if eta.len() != n || prior_weights.len() != n {
-        return Err(GamlssError::DimensionMismatch {
-            reason: format!("{label} input size mismatch"),
-        }
-        .into());
-    }
-    family.validate_self()?;
-
-    let mut rows = Vec::with_capacity(n);
-    for i in 0..n {
-        let yi = y[i];
-        family.validate_yi(yi, i)?;
-        let e = eta[i];
-        if !e.is_finite() {
-            return Err(GamlssError::NonFinite {
-                reason: format!("{label} requires finite eta; found eta[{i}]={e}"),
-            }
-            .into());
-        }
-        let prior_w = prior_weights[i];
-        if !prior_w.is_finite() || prior_w < 0.0 {
-            return Err(GamlssError::InvalidInput {
-                reason: format!(
-                    "{label} requires finite non-negative prior weights; found weight[{i}]={prior_w}"
-                ),
-            }
-            .into());
-        }
-        rows.push(family.row_kernel(i, yi, e, prior_w)?);
-    }
-
-    let mut ll = 0.0;
-    for (i, row) in rows.iter().enumerate() {
-        ll += row.log_lik_increment;
-        if !ll.is_finite() {
-            return Err(GamlssError::RowGeometryUnrepresentable {
-                row: i,
-                quantity: "cumulative log likelihood",
-                eta: eta[i],
-                value: ll,
-            }
-            .into());
-        }
-    }
-    let z = Array1::from_iter(rows.iter().map(|row| row.working_response));
-    let w = Array1::from_iter(rows.iter().map(|row| row.observed_weight));
-
-    Ok(FamilyEvaluation {
-        log_likelihood: ll,
-        blockworking_sets: vec![BlockWorkingSet::diagonal_checked(z, w)?],
-    })
-}
-
 impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
-    fn family_label(&self) -> &'static str {
-        "PoissonLogFamily"
-    }
     fn y(&self) -> &Array1<f64> {
         &self.y
-    }
-    fn prior_weights(&self) -> &Array1<f64> {
-        &self.weights
-    }
-    fn validate_yi(&self, yi: f64, idx: usize) -> Result<(), String> {
-        if !yi.is_finite() || yi < 0.0 {
-            return Err(GamlssError::InvalidInput {
-                reason: format!(
-                    "PoissonLogFamily requires non-negative finite y; found y[{idx}]={yi}"
-                ),
-            }
-            .into());
-        }
-        Ok::<(), _>(())
     }
     #[inline]
     fn row_kernel(
@@ -251,21 +146,6 @@ impl CustomFamily for PoissonLogFamily {
 }
 
 impl CustomFamilyGenerative for PoissonLogFamily {
-    fn generativespec(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<GenerativeSpec, String> {
-        let eta = &expect_single_block(block_states, "PoissonLogFamily")?.eta;
-        // Prediction follows the public log inverse link over IEEE-754: finite
-        // predictors may legitimately map to zero or +infinity.  Fitting has a
-        // narrower certified geometry because its divisions and Hessian must be
-        // representable; prediction must not inherit that fitting restriction.
-        let mean = gamlss_rowwise_map(eta.len(), |i| eta[i].exp());
-        Ok(GenerativeSpec {
-            mean,
-            noise: NoiseModel::Poisson,
-        })
-    }
 }
 
 /// Built-in Gamma log-link family (single parameter block, fixed shape).
@@ -279,14 +159,6 @@ pub struct GammaLogFamily {
 impl GammaLogFamily {
     pub const BLOCK_ETA: usize = 0;
 
-    pub fn parameternames() -> &'static [&'static str] {
-        &["eta"]
-    }
-
-    pub fn parameter_links() -> &'static [ParameterLink] {
-        &[ParameterLink::Log]
-    }
-
     pub fn metadata() -> FamilyMetadata {
         FamilyMetadata {
             name: "gamma_log",
@@ -297,32 +169,8 @@ impl GammaLogFamily {
 }
 
 impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
-    fn family_label(&self) -> &'static str {
-        "GammaLogFamily"
-    }
     fn y(&self) -> &Array1<f64> {
         &self.y
-    }
-    fn prior_weights(&self) -> &Array1<f64> {
-        &self.weights
-    }
-    fn validate_self(&self) -> Result<(), String> {
-        if !self.shape.is_finite() || self.shape <= 0.0 {
-            return Err(GamlssError::NonFinite {
-                reason: "GammaLogFamily shape must be finite and > 0".to_string(),
-            }
-            .into());
-        }
-        Ok(())
-    }
-    fn validate_yi(&self, yi: f64, idx: usize) -> Result<(), String> {
-        if !yi.is_finite() || yi <= 0.0 {
-            return Err(GamlssError::InvalidInput {
-                reason: format!("GammaLogFamily requires positive finite y; found y[{idx}]={yi}"),
-            }
-            .into());
-        }
-        Ok::<(), _>(())
     }
     #[inline]
     fn row_kernel(
@@ -500,29 +348,6 @@ impl CustomFamily for GammaLogFamily {
 }
 
 impl CustomFamilyGenerative for GammaLogFamily {
-    fn generativespec(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<GenerativeSpec, String> {
-        let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
-        let mean = gamlss_rowwise_map(eta.len(), |i| eta[i].exp());
-        let shape = ndarray::Array1::from_elem(mean.len(), self.shape);
-        Ok(GenerativeSpec {
-            mean,
-            noise: NoiseModel::Gamma { shape },
-        })
-    }
-}
-
-#[inline]
-fn row_geometry_error(row: usize, quantity: &'static str, eta: f64, value: f64) -> String {
-    GamlssError::RowGeometryUnrepresentable {
-        row,
-        quantity,
-        eta,
-        value,
-    }
-    .into()
 }
 
 /// Exact power-of-two decomposition `x = mantissa * 2^exponent` for a positive

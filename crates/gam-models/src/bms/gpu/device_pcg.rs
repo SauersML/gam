@@ -174,10 +174,6 @@ mod pcg_device {
         }
     }
 
-    fn launch_blocks(p: usize, threads: u32) -> u32 {
-        ((p as u32) + threads - 1) / threads
-    }
-
     /// PCG against the row-Hessian operator with Jacobi preconditioner from
     /// `diag(H)`. All vectors remain on the device for the duration of the
     /// loop; only the squared residual norm crosses the host boundary each
@@ -608,23 +604,6 @@ mod pcg_device {
     }
 }
 
-/// Device-resident PCG against the BMS-FLEX row-Hessian operator.
-///
-/// Block 9 Phase 5: every PCG vector — `x`, `r`, `z`, `p`, `q` — stays on
-/// the device for the entire loop; only the squared residual norm (one f64)
-/// is downloaded per iteration for the convergence check. Bit-equal output
-/// to a host-side reference PCG against the same operator + preconditioner
-/// when the tolerance is tight; differences only show up at the floating-
-/// point reduction-order level.
-///
-/// Linux-only. See [`DeviceResidentPcgInput`] for parameters.
-#[cfg(target_os = "linux")]
-pub fn run_pcg_against_row_hessian_device(
-    input: DeviceResidentPcgInput<'_>,
-) -> Result<DeviceResidentPcgOutput, String> {
-    pcg_device::run(input)
-}
-
 /// Block 9 Phase 5 — V100 parity for `run_pcg_against_row_hessian_device`.
 ///
 /// Builds a small `(n=64, r=20, p=44)` BMS-FLEX row-Hessian fixture, computes
@@ -636,93 +615,6 @@ mod pcg_device_parity_tests {
     use super::*;
     use crate::bms::gpu::row::{BmsFlexBlockLayout, BmsFlexPrimaryLayout, DeviceResidentRowHess};
     use ndarray::Array2;
-
-    /// Dense oracle for `H_full = Σ_i P_iᵀ H_i P_i` consistent with
-    /// `cpu_oracle_bms_flex_row_hvp`'s pullback math.
-    fn cpu_dense_joint_hessian(
-        row_hessians: &[f64],
-        marginal: &[f64],
-        slope: &[f64],
-        block: &BmsFlexBlockLayout,
-        primary: &BmsFlexPrimaryLayout,
-        n: usize,
-    ) -> Array2<f64> {
-        let p_total = block.p_total;
-        let r = primary.r;
-        let p_m = block.p_m;
-        let p_g = block.p_g;
-        let h_block_start = block.h.as_ref().map(|r| r.start).unwrap_or(0);
-        let h_block_len = block.h.as_ref().map(|r| r.len()).unwrap_or(0);
-        let w_block_start = block.w.as_ref().map(|r| r.start).unwrap_or(0);
-        let w_block_len = block.w.as_ref().map(|r| r.len()).unwrap_or(0);
-        let h_primary_start = primary.h.as_ref().map(|r| r.start).unwrap_or(0);
-        let w_primary_start = primary.w.as_ref().map(|r| r.start).unwrap_or(0);
-        let mut h_dense = Array2::<f64>::zeros((p_total, p_total));
-        // For each row build P_i columns as length-p_total vectors.
-        let mut phi = vec![vec![0.0_f64; p_total]; r];
-        for row in 0..n {
-            for col in phi.iter_mut() {
-                col.iter_mut().for_each(|v| *v = 0.0);
-            }
-            let mrow = &marginal[row * p_m..(row + 1) * p_m];
-            let grow = &slope[row * p_g..(row + 1) * p_g];
-            for k in 0..p_m {
-                phi[0][k] = mrow[k];
-            }
-            for k in 0..p_g {
-                phi[1][p_m + k] = grow[k];
-            }
-            for k in 0..h_block_len {
-                phi[h_primary_start + k][h_block_start + k] = 1.0;
-            }
-            for k in 0..w_block_len {
-                phi[w_primary_start + k][w_block_start + k] = 1.0;
-            }
-            let h_row = &row_hessians[row * r * r..(row + 1) * r * r];
-            for u in 0..r {
-                for v in 0..r {
-                    let huv = h_row[u * r + v];
-                    if huv == 0.0 {
-                        continue;
-                    }
-                    for m in 0..p_total {
-                        let phim = phi[u][m];
-                        if phim == 0.0 {
-                            continue;
-                        }
-                        let scaled = huv * phim;
-                        for nn in 0..p_total {
-                            h_dense[[m, nn]] += scaled * phi[v][nn];
-                        }
-                    }
-                }
-            }
-        }
-        h_dense
-    }
-
-    /// Reference oracle: host PCG against the dense joint H + diag(H)
-    /// preconditioner, with a tolerance two decades tighter than the GPU
-    /// PCG's. Comparing GPU PCG to host PCG (rather than to a Cholesky
-    /// solve) keeps the comparison numerically apples-to-apples — only
-    /// reduction order differs between the two paths.
-    fn cpu_pcg_oracle(h: &Array2<f64>, b: &[f64], rel_tol: f64) -> Vec<f64> {
-        let p = b.len();
-        let diag: ndarray::Array1<f64> =
-            ndarray::Array1::from_vec((0..p).map(|i| h[[i, i]]).collect());
-        let rhs = ndarray::Array1::from_vec(b.to_vec());
-        let h_owned = h.clone();
-        let apply = move |v: &ndarray::Array1<f64>| h_owned.dot(v);
-        let (x, info) =
-            gam_linalg::utils::solve_spd_pcg_with_info(apply, &rhs, &diag, rel_tol, 4 * p)
-                .expect("host PCG oracle must converge on SPD fixture");
-        assert!(
-            info.converged,
-            "host PCG oracle failed to converge: iters={} rel_res={}",
-            info.iterations, info.relative_residual_norm
-        );
-        x.to_vec()
-    }
 
     #[test]
     fn pcg_device_matches_dense_oracle_at_n64_r20_p44() {

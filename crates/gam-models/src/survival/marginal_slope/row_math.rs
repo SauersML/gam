@@ -505,35 +505,6 @@ pub(crate) struct NonRigidPilot {
     pub(crate) slope_beta: Array1<f64>,
 }
 
-pub fn survival_marginal_slope_vector_scale(
-    slopes: &[f64],
-    covariance: &MarginalSlopeCovariance,
-    probit_scale: f64,
-) -> Result<f64, String> {
-    marginal_slope_preserving_scale(slopes, covariance, probit_scale)
-}
-
-pub fn survival_marginal_slope_vector_eta(
-    q: f64,
-    z: &[f64],
-    slopes: &[f64],
-    covariance: &MarginalSlopeCovariance,
-    probit_scale: f64,
-) -> Result<f64, String> {
-    if z.len() != covariance.dim() {
-        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: format!(
-                "survival marginal-slope vector eta: score/covariance dimension mismatch: z={}, covariance={}",
-                z.len(),
-                covariance.dim()
-            ),
-        }
-        .into());
-    }
-    marginal_slope_probit_eta(q, z, slopes, covariance, probit_scale)
-        .map_err(|err| format!("survival marginal-slope vector eta: {err}"))
-}
-
 /// Allocation-free value-only workspace bound to one score-covariance FIELD
 /// whose shape, finiteness, symmetry, and positive-semidefinite contract were
 /// validated at covariance admission. Per-row evaluation uses that row's cached
@@ -1060,11 +1031,6 @@ pub(crate) fn static_slope_feature_frame<T: Clone>(
 // piecewise-constant `b` those contributions do not telescope into any survival
 // function; the slope has to move inside the row program.
 row_program! {
-    pub(crate) fn rigid_feature_program(
-        q0, q1, qd1, linear0, linear1, dlinear1, variance0, variance1, dvariance1;
-        wi, di, probit_scale
-    )
-    emit [generic, runtime, order2, third, fourth, witnesses, cuda];
     leaves {
         sqrt => unary_derivatives_sqrt => d_sqrt,
         inverse_sqrt => unary_derivatives_inverse_sqrt => d_inverse_sqrt,

@@ -334,12 +334,6 @@ impl ScoreCovarianceField {
         self.model.as_deref()
     }
 
-    /// Rows the field was materialised for, when it is conditional. A caller
-    /// that indexes past this has mixed two samples.
-    #[inline]
-    pub fn materialised_rows(&self) -> Option<usize> {
-        self.per_row.as_ref().map(|stack| stack.len())
-    }
 }
 
 /// Affine evaluation `coeffs·[1 | a]`, clamped to the training range of that
@@ -435,14 +429,6 @@ impl ConditionalScoreCovariance {
             }
         }
         Ok(())
-    }
-
-    /// `Σ(a)` as a dense symmetric matrix. Diagnostics and tests; the row
-    /// program consumes [`Self::row_covariances`].
-    pub fn dense_at(&self, a_row: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
-        let mut factor = Array2::<f64>::zeros((self.score_dim, self.score_dim));
-        self.factor_into(a_row, &mut factor)?;
-        Ok(factor.dot(&factor.t()))
     }
 
     /// One admitted [`MarginalSlopeCovariance`] per row of `a_block`, in the

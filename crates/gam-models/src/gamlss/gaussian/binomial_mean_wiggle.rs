@@ -651,30 +651,12 @@ impl BinomialMeanWiggleFamily {
         ))))
     }
 
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
-    ///
-    /// `BinomialMeanWiggle` has a single location output (n_outputs = 1):
-    /// - block 0 (eta):    output 0 = design rows
-    /// - block 1 (wiggle): all zeros (nonlinear link modulation)
-    pub fn block_effective_jacobian(
-        specs: &[ParameterBlockSpec],
-        block_idx: usize,
-    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-        crate::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
-            family: "BinomialMeanWiggleFamily",
-            n_outputs: 1,
-            additive_blocks: &[Self::BLOCK_ETA],
-            wiggle_block: Some(Self::BLOCK_WIGGLE),
-        }
-        .block_effective_jacobian(specs, block_idx)
-    }
 }
 
 impl CustomFamily for BinomialMeanWiggleFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }
-
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // The mean-wiggle Hessian is exposed as a row-coefficient operator,
@@ -1807,29 +1789,6 @@ impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
 }
 
 impl CustomFamilyGenerative for BinomialMeanWiggleFamily {
-    fn generativespec(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<GenerativeSpec, String> {
-        validate_block_count::<GamlssError>("BinomialMeanWiggleFamily", 2, block_states.len())?;
-        let eta = &block_states[Self::BLOCK_ETA].eta;
-        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
-        if eta.len() != self.y.len() || etaw.len() != self.y.len() {
-            return Err(GamlssError::DimensionMismatch {
-                reason: "BinomialMeanWiggleFamily generative size mismatch".to_string(),
-            }
-            .into());
-        }
-        let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
-            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, eta[i] + etaw[i])
-                .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
-            Ok(jet.mu)
-        })?;
-        Ok(GenerativeSpec {
-            mean,
-            noise: NoiseModel::Bernoulli,
-        })
-    }
 }
 
 #[cfg(test)]

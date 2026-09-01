@@ -243,35 +243,4 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
 }
 
 impl CustomFamilyGenerative for BinomialLocationScaleWiggleFamily {
-    fn generativespec(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<GenerativeSpec, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleWiggleFamily",
-            3,
-            block_states.len(),
-        )?;
-        let eta_t = &block_states[Self::BLOCK_T].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
-        if eta_t.len() != self.y.len() || eta_ls.len() != self.y.len() || etaw.len() != self.y.len()
-        {
-            return Err(GamlssError::DimensionMismatch {
-                reason: "BinomialLocationScaleWiggleFamily generative size mismatch".to_string(),
-            }
-            .into());
-        }
-        let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
-            let sigma = exp_sigma_from_eta_scalar(eta_ls[i]);
-            let q0 = binomial_location_scale_q0(eta_t[i], sigma);
-            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q0 + etaw[i])
-                .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
-            Ok(jet.mu)
-        })?;
-        Ok(GenerativeSpec {
-            mean,
-            noise: NoiseModel::Bernoulli,
-        })
-    }
 }

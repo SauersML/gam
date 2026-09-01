@@ -167,24 +167,10 @@ impl CtnTransformTable {
         self.h.nrows()
     }
 
-    /// The shared, strictly increasing response grid the transform is tabulated
-    /// on. Its first and last entries are the fitted support `[y_lo, y_hi]`, the
-    /// two points the affine tails are anchored at.
-    pub fn grid_y(&self) -> ArrayView1<'_, f64> {
-        self.grid_y.view()
-    }
-
     /// `h[[i, k]] = h(grid_y[k] | x_i)` — the model's own latent, on the scale
     /// the standard normal is compared against.
     pub fn latent(&self) -> ArrayView2<'_, f64> {
         self.h.view()
-    }
-
-    /// `(h'(y_lo | x_i), h'(y_hi | x_i))` — the slopes of row `i`'s two affine
-    /// tails, which are just the end columns of the derivative table.
-    pub fn tail_slopes(&self, row: usize) -> (f64, f64) {
-        let last = self.grid_y.len() - 1;
-        (self.h_prime[[row, 0]], self.h_prime[[row, last]])
     }
 
     /// `h(y | x_row)` — the tabulated transform itself, by the same rule

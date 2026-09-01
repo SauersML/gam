@@ -100,14 +100,6 @@ impl GaussianLocationScaleFamily {
         Ok(rows)
     }
 
-    pub fn parameternames() -> &'static [&'static str] {
-        &["mu", "log_sigma"]
-    }
-
-    pub fn parameter_links() -> &'static [ParameterLink] {
-        &[ParameterLink::Identity, ParameterLink::Log]
-    }
-
     pub fn metadata() -> FamilyMetadata {
         FamilyMetadata {
             name: "gaussian_location_scale",
@@ -888,24 +880,6 @@ impl GaussianLocationScaleFamily {
         )
     }
 
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx` given the
-    /// realised block specs.  Returns an [`AdditiveBlockJacobian`] encoding the
-    /// linear map η_r\[i\] = X_r\[i,:\] · β_r:
-    ///
-    /// - block 0 (mu):       output 0 = design rows, output 1 = zeros
-    /// - block 1 (log_sigma): output 0 = zeros, output 1 = design rows
-    pub fn block_effective_jacobian(
-        specs: &[ParameterBlockSpec],
-        block_idx: usize,
-    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-        crate::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
-            family: "GaussianLocationScaleFamily",
-            n_outputs: 2,
-            additive_blocks: &[Self::BLOCK_MU, Self::BLOCK_LOG_SIGMA],
-            wiggle_block: None,
-        }
-        .block_effective_jacobian(specs, block_idx)
-    }
 }
 
 /// Weighted residual sum of squares `Σ wᵢ (yᵢ − μᵢ)²` at the fitted means —
@@ -1221,7 +1195,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
     fn has_explicit_joint_hessian(&self) -> bool {
         true
     }
-
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
@@ -1583,19 +1556,4 @@ impl CustomFamily for GaussianLocationScaleFamily {
 }
 
 impl CustomFamilyGenerative for GaussianLocationScaleFamily {
-    fn generativespec(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<GenerativeSpec, String> {
-        validate_block_count::<GamlssError>("GaussianLocationScaleFamily", 2, block_states.len())?;
-        let mu = block_states[Self::BLOCK_MU].eta.clone();
-        let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let sigma = gamlss_rowwise_map(eta_log_sigma.len(), |i| {
-            logb_sigma_from_eta_scalar(eta_log_sigma[i])
-        });
-        Ok(GenerativeSpec {
-            mean: mu,
-            noise: NoiseModel::Gaussian { sigma },
-        })
-    }
 }

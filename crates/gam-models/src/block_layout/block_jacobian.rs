@@ -38,49 +38,4 @@ pub struct AdditiveWiggleBlockLayout<'a> {
 }
 
 impl AdditiveWiggleBlockLayout<'_> {
-    /// Build the [`BlockEffectiveJacobian`] for `block_idx` under this layout.
-    ///
-    /// * An additive block returns an [`AdditiveBlockJacobian`] over its
-    ///   effective design with `own_output = block_idx` and
-    ///   `n_family_outputs = n_outputs`.
-    /// * The wiggle block returns an [`AdditiveBlockJacobian`] over an
-    ///   `(n × p_wiggle)` zero design anchored at `own_output = 0`, with `n`
-    ///   read from the first additive block's design.
-    pub fn block_effective_jacobian(
-        &self,
-        specs: &[ParameterBlockSpec],
-        block_idx: usize,
-    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-        if block_idx >= specs.len() {
-            return Err(format!(
-                "{}::block_effective_jacobian: block_idx {} out of range ({})",
-                self.family,
-                block_idx,
-                specs.len()
-            ));
-        }
-        if self.additive_blocks.contains(&block_idx) {
-            let context = format!("{}::block_effective_jacobian", self.family);
-            let design = specs[block_idx].effective_design(&context)?;
-            return Ok(Box::new(AdditiveBlockJacobian {
-                design,
-                own_output: block_idx,
-                n_family_outputs: self.n_outputs,
-            }));
-        }
-        if self.wiggle_block == Some(block_idx) {
-            let first_additive = self.additive_blocks[0];
-            let n = specs[first_additive].design.nrows();
-            let p = specs[block_idx].design.ncols();
-            return Ok(Box::new(AdditiveBlockJacobian {
-                design: ndarray::Array2::<f64>::zeros((n, p)),
-                own_output: 0,
-                n_family_outputs: self.n_outputs,
-            }));
-        }
-        Err(format!(
-            "{}::block_effective_jacobian: unknown block_idx {}",
-            self.family, block_idx
-        ))
-    }
 }

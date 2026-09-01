@@ -625,21 +625,9 @@ fn sls_outer_plan<const ORDER: usize>(
 }
 
 row_atom! {
-    fn sls_index [generic, order2](h, eta_t, eta_ls) {
-        h - eta_t * exp(-eta_ls)
-    }
 }
 
 row_atom! {
-    fn sls_event_rate [generic, order2](
-        hdot,
-        eta_t,
-        eta_t_deriv,
-        eta_ls,
-        eta_ls_deriv
-    ) {
-        hdot + exp(-eta_ls) * (eta_t * eta_ls_deriv - eta_t_deriv)
-    }
 }
 
 /// Whether a composition stack is exactly zero in every entry. Such a stack
@@ -678,36 +666,6 @@ fn sls_program_outer_stack(
 }
 
 row_program! {
-    fn sls_row_program(
-        h0,
-        h1,
-        hdot,
-        eta_t_exit,
-        eta_t_entry,
-        eta_t_deriv,
-        eta_ls_exit,
-        eta_ls_entry,
-        eta_ls_deriv;
-        u0_active,
-        u0_value,
-        u0_first,
-        u0_second,
-        u0_third,
-        u0_fourth,
-        u1_active,
-        u1_value,
-        u1_first,
-        u1_second,
-        u1_third,
-        u1_fourth,
-        g_active,
-        g_value,
-        g_first,
-        g_second,
-        g_third,
-        g_fourth
-    )
-    emit [generic, order2, third, fourth];
     leaves {
         exponential => sls_program_exp_stack => sls_program_exp_stack_cuda,
         outer => sls_program_outer_stack => sls_program_outer_stack_cuda,
@@ -872,7 +830,6 @@ fn sls_row_fourth_generated(
     )
 }
 
-
 /// Hessian-only lowering of the same build-time symbolic atoms used by
 /// [`sls_row_vgh_compiled`]. Only the 24 structurally live upper-triangle
 /// channels exist in the output; no 9×9 primary Hessian is materialized.
@@ -984,20 +941,6 @@ pub(crate) fn design_dense_row(d: &DesignMatrix, row: usize) -> Array1<f64> {
     d.axpy_row_into(row, 1.0, &mut out.view_mut())
         .expect("design_dense_row: ncols-sized buffer matches design width");
     out
-}
-
-/// Accumulate `alpha * jac[row, :]` into the coefficient slice `out` for a dense
-/// time Jacobian (the survival time block is materialized densely as
-/// `time_jac_*`, so it has no sparse axpy primitive).
-#[inline]
-pub(crate) fn axpy_dense_row_into(jac: &Array2<f64>, row: usize, alpha: f64, out: &mut [f64]) {
-    if alpha == 0.0 {
-        return;
-    }
-    let jr = jac.row(row);
-    for (o, &j) in out.iter_mut().zip(jr.iter()) {
-        *o += alpha * j;
-    }
 }
 
 pub(crate) fn row_set_from_survival_mask(
@@ -3165,18 +3108,6 @@ const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
     (7, 7),
     (8, 8),
 ];
-
-const fn sls_hessian_pair_slots() -> [[usize; SLS_ROW_K]; SLS_ROW_K] {
-    let mut slots = [[SLS_HESSIAN_PAIRS.len(); SLS_ROW_K]; SLS_ROW_K];
-    let mut slot = 0;
-    while slot < SLS_HESSIAN_PAIRS.len() {
-        let (row, column) = SLS_HESSIAN_PAIRS[slot];
-        slots[row][column] = slot;
-        slots[column][row] = slot;
-        slot += 1;
-    }
-    slots
-}
 
 const SLS_HESSIAN_PAIR_SLOTS: [[usize; SLS_ROW_K]; SLS_ROW_K] = sls_hessian_pair_slots();
 
