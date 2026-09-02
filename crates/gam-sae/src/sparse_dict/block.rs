@@ -326,9 +326,6 @@ pub struct BlockSparseConvergence {
     pub certified: bool,
 }
 
-impl BlockSparseConvergence {
-}
-
 impl BlockSparseFit {
     /// Dense reconstruction `N×P` from the sparse block routing:
     /// `x̂_i = Σ_{g∈S_i} z_{ig} D_g`. Allocates the data-size `N×P`, not `N×K`.

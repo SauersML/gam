@@ -106,9 +106,6 @@ pub struct PencilFit {
     pub holds: bool,
 }
 
-impl PencilFit {
-}
-
 /// What a ladder says about the objective that produced it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SoftRhoGuardFloor {

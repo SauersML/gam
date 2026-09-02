@@ -207,9 +207,6 @@ pub struct SparseDictConvergence {
     pub certified: bool,
 }
 
-impl SparseDictConvergence {
-}
-
 impl SparseDictFit {
     /// Dense reconstruction `N×P` of the training rows from the sparse routing.
     ///

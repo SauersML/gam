@@ -69,7 +69,7 @@ use gam_solve::mixture_link::{
 };
 use gam_solve::model_types::{FitGeometry, FittedLinkState, UnifiedFitResult};
 use gam_solve::quadrature::QuadratureContext;
-use gam_spec::{InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
+use gam_spec::{InverseLink, LikelihoodSpec, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -498,6 +498,47 @@ impl<'a> PredictionCovarianceWithScale<'a> {
 
 impl UncertaintyCovarianceSource for PredictionCovarianceWithScale<'_> {
 
+    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
+        // A raw covariance-plus-scale wrapper carries no fitted adaptive-link
+        // state; every link variant resolves to `None` here and is handled by
+        // the family's own `InverseLink`. Matched exhaustively (mirroring the
+        // bare `Array2` source) so a new adaptive link cannot silently slip
+        // through as `None` without review.
+        match &family.link {
+            InverseLink::Standard(_)
+            | InverseLink::LatentCLogLog(_)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_)
+            | InverseLink::Mixture(_) => None,
+        }
+    }
+
+    fn select_uncertainty_backend(
+        &self,
+        expected_dim: usize,
+        mode: InferenceCovarianceMode,
+        label: &str,
+    ) -> Result<(PredictionCovarianceBackend<'_>, InferenceCovarianceMode), EstimationError> {
+        if self.covariance.nrows() != expected_dim || self.covariance.ncols() != expected_dim {
+            return Err(EstimationError::InvalidInput(format!(
+                "{label}: covariance dimension mismatch: expected {expected_dim}x{expected_dim}, got {}x{}",
+                self.covariance.nrows(),
+                self.covariance.ncols()
+            )));
+        }
+        match mode {
+            InferenceCovarianceMode::Conditional => Ok((
+                PredictionCovarianceBackend::from_dense(self.covariance),
+                InferenceCovarianceMode::Conditional,
+            )),
+            InferenceCovarianceMode::SmoothingCorrected => {
+                Err(EstimationError::InvalidInput(format!(
+                    "{label}: raw covariance source cannot provide smoothing-corrected covariance"
+                )))
+            }
+        }
+    }
+
     fn observation_phi(&self) -> Option<f64> {
         self.scale.observation_phi
     }
@@ -508,6 +549,42 @@ impl UncertaintyCovarianceSource for PredictionCovarianceWithScale<'_> {
 }
 
 impl UncertaintyCovarianceSource for Array2<f64> {
+
+    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
+        match &family.link {
+            InverseLink::Standard(_)
+            | InverseLink::LatentCLogLog(_)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_)
+            | InverseLink::Mixture(_) => None,
+        }
+    }
+
+    fn select_uncertainty_backend(
+        &self,
+        expected_dim: usize,
+        mode: InferenceCovarianceMode,
+        label: &str,
+    ) -> Result<(PredictionCovarianceBackend<'_>, InferenceCovarianceMode), EstimationError> {
+        if self.nrows() != expected_dim || self.ncols() != expected_dim {
+            return Err(EstimationError::InvalidInput(format!(
+                "{label}: covariance dimension mismatch: expected {expected_dim}x{expected_dim}, got {}x{}",
+                self.nrows(),
+                self.ncols()
+            )));
+        }
+        match mode {
+            InferenceCovarianceMode::Conditional => Ok((
+                PredictionCovarianceBackend::from_dense(self.view()),
+                InferenceCovarianceMode::Conditional,
+            )),
+            InferenceCovarianceMode::SmoothingCorrected => {
+                Err(EstimationError::InvalidInput(format!(
+                    "{label}: raw covariance source cannot provide smoothing-corrected covariance"
+                )))
+            }
+        }
+    }
 
 }
 
@@ -875,6 +952,10 @@ pub trait FittedModelPredictExt {
 }
 
 impl FittedModelPredictExt for FittedModel {
+
+    fn block_roles(&self) -> Option<Vec<BlockRole>> {
+        self.predictor().map(|p| p.block_roles())
+    }
     fn predictor(&self) -> Option<Box<dyn PredictableModel>> {
         let runtime = self.saved_prediction_runtime().ok()?;
         match self.predict_model_class() {

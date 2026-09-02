@@ -1138,9 +1138,6 @@ pub struct AtomInnerFit {
     pub mode_design_row: Array1<f64>,
 }
 
-impl FittedAtom {
-}
-
 /// Descriptive penalty-debiased POINT summaries of one fitted atom's decoder
 /// curve (#1097, narrowed under #1115). Each field is a scalar functional of the
 /// atom's inner smooth `g_k(t)`, reported as a plug-in value and a one-step
@@ -1482,9 +1479,6 @@ pub struct FrameInnerRotationGauge {
     pub per_atom_ranks: Vec<usize>,
     /// Total group dimension `Σ_k r_k (r_k − 1) / 2` (`dim O(r) = r(r−1)/2`).
     pub dim: usize,
-}
-
-impl FrameInnerRotationGauge {
 }
 
 /// What the certificate's reported `pinning_rank` is a rank OF — a property of

@@ -745,9 +745,6 @@ impl JointEncodeResult {
     }
 }
 
-impl EncodeResult {
-}
-
 /// The honest cost breakdown of the encode tax (reviewer condition #3). Every
 /// (row, atom) encode lands in exactly one of three tiers, in ascending cost:
 ///

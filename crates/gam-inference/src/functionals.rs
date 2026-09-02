@@ -1,8 +1,4 @@
-use faer::Side;
-use gam_linalg::faer_ndarray::FaerCholesky;
-use gam_solve::model_types::EstimationError;
-use gam_solve::sensitivity::FitSensitivity;
-use ndarray::{Array1, ArrayView1, ArrayView2};
+use ndarray::{ArrayView1, ArrayView2};
 
 #[derive(Clone, Debug)]
 pub struct FunctionalEstimate {

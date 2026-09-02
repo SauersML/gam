@@ -35,12 +35,8 @@ use gam_problem::types::{
     ResolvedLikelihoodScale, ResponseFamily, RhoPrior, StandardLink, is_valid_tweedie_power,
 };
 use gam_solve::estimate::reml::FirthDenseOperator;
-use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use gam_solve::estimate::{UnifiedFitResult, validate_explicit_dense_hessian_for_whitening};
 use gam_solve::model_types::InferenceCovarianceMode;
-use gam_solve::mixture_link::{
-    InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
-};
 use gam_terms::construction::CanonicalPenalty;
 use general_mcmc::generic_hmc::HamiltonianTarget;
 pub use general_mcmc::generic_nuts::NUTSMassMatrixConfig;
@@ -636,14 +632,6 @@ fn validate_hmc_arrays(
     Ok(())
 }
 
-fn first_non_finite<'a>(values: impl IntoIterator<Item = &'a f64>) -> Option<(usize, f64)> {
-    values
-        .into_iter()
-        .copied()
-        .enumerate()
-        .find(|(_, value)| !value.is_finite())
-}
-
 /// Whitened-coordinate target for the No-U-Turn HMC sampler.
 ///
 /// The posterior over β is reparameterized via `β = L z` where `L Lᵀ = H⁻¹`
@@ -687,6 +675,7 @@ pub struct NutsPosterior {
 }
 
 impl NutsPosterior {
+
     /// Creates a new posterior target from ndarray data.
     ///
     /// # Arguments
@@ -1077,11 +1066,8 @@ fn exact_glm_logp_and_grad_into(
     exact_glm_logp_and_grad_for_likelihood_into(&data.likelihood, data, eta, residual)
 }
 
-#[derive(Clone, Debug)]
-struct BinomialLinkTerms {
-    log_mu: f64,
-    log1m_mu: f64,
-    dmu_dlink: Vec<f64>,
+fn default_nuts_seed() -> u64 {
+    42
 }
 
 #[cfg(test)]
@@ -1179,19 +1165,6 @@ mod tests {
             let mut residual = Array1::<f64>::zeros(self.data.n_samples);
             let mut grad = Array1::<f64>::zeros(z.len());
             let logp = self.compute_logp_and_grad_nd_into(z, &mut residual, &mut grad);
-            (logp, grad)
-        }
-    }
-
-    impl JointBetaRhoPosterior {
-        /// Test-only allocation wrapper around `compute_joint_logp_and_grad_into`.
-        pub(super) fn compute_joint_logp_and_grad(
-            &self,
-            params: &Array1<f64>,
-        ) -> (f64, Array1<f64>) {
-            let total_dim = self.n_beta + self.n_rho + self.n_link_params;
-            let mut grad = Array1::<f64>::zeros(total_dim);
-            let logp = self.compute_joint_logp_and_grad_into(params, &mut grad);
             (logp, grad)
         }
     }
@@ -5978,320 +5951,6 @@ pub struct JointBetaRhoResult {
     pub trigger_skewness: f64,
 }
 
-/// Joint (β, ρ) posterior target for NUTS.
-///
-/// Samples from p(β, ρ | y) ∝ p(y|β) p(β|ρ) p(ρ) directly,
-/// completely bypassing the Laplace approximation.
-///
-/// The parameter vector is [z_β; ρ] where z_β = L⁻¹(β - μ) is the
-/// whitened β, ρ is the raw log-smoothing parameters, and adaptive inverse-link
-/// parameters follow when the binomial link has fitted shape/mixing parameters.
-struct JointBetaRhoPosterior {
-    data: SharedData,
-    /// L where LL' = H⁻¹ (whitening for β block)
-    chol: Array2<f64>,
-    /// L' for chain rule
-    chol_t: Array2<f64>,
-    /// Joint likelihood specification (response + parameterized link).
-    likelihood: LikelihoodSpec,
-    /// Weight of every quadratic penalty relative to the fitted likelihood.
-    /// This is `1 / coefficient_covariance_scale`: non-unit only for the
-    /// profiled Gaussian convention whose stored Hessian is scale-free.
-    penalty_scale: f64,
-    /// Dimension of β
-    n_beta: usize,
-    /// Dimension of ρ
-    n_rho: usize,
-    /// Dimension of adaptive inverse-link parameters
-    n_link_params: usize,
-    /// LAML-converged adaptive inverse-link parameters (used only to initialize chains)
-    link_param_mode: Array1<f64>,
-    /// Canonical penalties in the transformed basis.
-    penalty_canonical: Vec<gam_terms::construction::CanonicalPenalty>,
-    /// Fixed prior on rho used by the sampled target.
-    rho_prior: RhoPrior,
-    /// LAML-converged ρ (used only to initialize chains)
-    rho_mode: Array1<f64>,
-    /// Whether to add the identifiable-subspace Jeffreys/Firth term to the
-    /// target
-    firth_enabled: bool,
-    /// One-deep cache for the structural penalty pseudo-logdet and its
-    /// ρ-gradient. NUTS tree-doubling and U-turn checks repeatedly evaluate
-    /// the joint log-posterior at the same `rho` bytes, so a single-slot
-    /// cache keyed on the exact f64 bit pattern of `rho` avoids redundant
-    /// SVD/eigendecompositions inside `PenaltyPseudologdet::from_penalties`.
-    /// `Mutex` (not `RefCell`) because chains share the target via
-    /// `Arc<Target>` and run in parallel via rayon.
-    penalty_logdet_cache: Mutex<Option<(u64, f64, Array1<f64>)>>,
-}
-
-impl JointBetaRhoPosterior {
-    fn new(
-        x: ArrayView2<f64>,
-        y: ArrayView1<f64>,
-        weights: ArrayView1<f64>,
-        mode: ArrayView1<f64>,
-        hessian: ArrayView2<f64>,
-        penalty_canonical: Vec<gam_terms::construction::CanonicalPenalty>,
-        rho_mode: ArrayView1<f64>,
-        likelihood: GlmLikelihoodSpec,
-        dispersion: gam_solve::model_types::Dispersion,
-        offset: Option<ArrayView1<f64>>,
-        rho_prior: RhoPrior,
-        firth_enabled: bool,
-    ) -> Result<Self, String> {
-        let n_samples = x.nrows();
-        let n_beta = x.ncols();
-        let n_rho = penalty_canonical.len();
-
-        if y.len() != n_samples
-            || weights.len() != n_samples
-            || mode.len() != n_beta
-            || hessian.dim() != (n_beta, n_beta)
-        {
-            return Err(HmcError::DimensionMismatch {
-                reason: format!(
-                    "Joint HMC geometry mismatch: X={}x{}, y={}, weights={}, mode={}, hessian={:?}",
-                    n_samples,
-                    n_beta,
-                    y.len(),
-                    weights.len(),
-                    mode.len(),
-                    hessian.dim(),
-                ),
-            }
-            .into());
-        }
-        for (label, invalid) in [
-            ("design", first_non_finite(x.iter())),
-            ("mode", first_non_finite(mode.iter())),
-            ("hessian", first_non_finite(hessian.iter())),
-        ] {
-            if let Some((index, value)) = invalid {
-                return Err(HmcError::NonFiniteState {
-                    reason: format!(
-                        "Joint HMC {label} has non-finite value {value} at flat index {index}"
-                    ),
-                }
-                .into());
-            }
-        }
-        if let Some((row, weight)) = weights
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, weight)| !(weight.is_finite() && *weight >= 0.0))
-        {
-            return Err(HmcError::InvalidConfig {
-                reason: format!(
-                    "Joint HMC weight at row {row} must be finite and non-negative, got {weight}"
-                ),
-            }
-            .into());
-        }
-        for (index, penalty) in penalty_canonical.iter().enumerate() {
-            if penalty.total_dim != n_beta
-                || penalty.col_range.end > n_beta
-                || penalty.col_range.start > penalty.col_range.end
-                || penalty.root.ncols() != penalty.col_range.len()
-            {
-                return Err(HmcError::DimensionMismatch {
-                    reason: format!(
-                        "Joint HMC penalty {index} has total_dim={}, range={:?}, root={:?}, expected total dimension {n_beta}",
-                        penalty.total_dim,
-                        penalty.col_range,
-                        penalty.root.dim(),
-                    ),
-                }
-                .into());
-            }
-            if let Some((flat_index, value)) = first_non_finite(penalty.root.iter()) {
-                return Err(HmcError::NonFiniteState {
-                    reason: format!(
-                        "Joint HMC penalty {index} root has non-finite value {value} at flat index {flat_index}"
-                    ),
-                }
-                .into());
-            }
-        }
-
-        if let Some(offset) = offset.as_ref() {
-            if offset.len() != n_samples {
-                return Err(HmcError::DimensionMismatch {
-                    reason: format!(
-                        "Joint HMC offset length {} does not match {} observations",
-                        offset.len(),
-                        n_samples
-                    ),
-                }
-                .into());
-            }
-            if !offset.iter().all(|v| v.is_finite()) {
-                return Err(HmcError::NonFiniteState {
-                    reason: "Joint HMC offset contains NaN or Inf values".to_string(),
-                }
-                .into());
-            }
-        }
-
-        if rho_mode.len() != n_rho {
-            return Err(HmcError::DimensionMismatch {
-                reason: format!(
-                    "rho_mode length {} != penalty count {}",
-                    rho_mode.len(),
-                    n_rho
-                ),
-            }
-            .into());
-        }
-
-        match (&likelihood.spec.response, &likelihood.spec.link) {
-            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {}
-            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {}
-            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {}
-            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {}
-            (ResponseFamily::Binomial, InverseLink::Sas(_)) => {}
-            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {}
-            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {}
-            (ResponseFamily::Binomial, InverseLink::Standard(other)) => {
-                return Err(HmcError::LinkMismatch {
-                    reason: format!(
-                        "Joint HMC binomial response requires a binomial-compatible inverse link; got {:?}",
-                        other
-                    ),
-                }
-                .into());
-            }
-            (ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)) => {}
-            (ResponseFamily::Gaussian, _) => {
-                return Err(HmcError::LinkMismatch {
-                    reason: "Joint HMC Gaussian requires an identity inverse link".to_string(),
-                }
-                .into());
-            }
-            (
-                ResponseFamily::Poisson
-                | ResponseFamily::Tweedie { .. }
-                | ResponseFamily::NegativeBinomial { .. }
-                | ResponseFamily::Gamma,
-                InverseLink::Standard(StandardLink::Log),
-            ) => {}
-            (
-                ResponseFamily::Poisson
-                | ResponseFamily::Tweedie { .. }
-                | ResponseFamily::NegativeBinomial { .. }
-                | ResponseFamily::Gamma,
-                _,
-            ) => {
-                return Err(HmcError::LinkMismatch {
-                    reason: "Joint HMC log-link family requires a log inverse link".to_string(),
-                }
-                .into());
-            }
-            (ResponseFamily::Beta { .. }, InverseLink::Standard(StandardLink::Logit)) => {}
-            (ResponseFamily::Beta { .. }, _) => {
-                return Err(HmcError::LinkMismatch {
-                    reason: "Joint HMC Beta requires a logit inverse link".to_string(),
-                }
-                .into());
-            }
-            (ResponseFamily::RoystonParmar, _) => {
-                return Err(HmcError::UnsupportedFamily {
-                    reason: "Joint HMC fallback is not implemented for RoystonParmar".to_string(),
-                }
-                .into());
-            }
-        }
-
-        validate_firth_likelihood_support(&likelihood.spec, firth_enabled).map_err(String::from)?;
-        if matches!(
-            likelihood.spec.response,
-            ResponseFamily::NegativeBinomial { .. }
-        ) {
-            validate_count_responses("negative-binomial joint HMC", &y, &weights)
-                .map_err(String::from)?;
-        }
-        if likelihood.spec.is_binomial() {
-            validate_binary_responses("binomial joint HMC", &y, &weights).map_err(String::from)?;
-        }
-        let (likelihood, cov_scale) =
-            resolve_hmc_likelihood(likelihood, dispersion).map_err(String::from)?;
-        let mut eta_at_mode = x.dot(&mode);
-        if let Some(offset) = offset.as_ref() {
-            eta_at_mode += offset;
-        }
-        let mut score_at_mode = Array1::zeros(n_samples);
-        gam_solve::pirls::eta_log_likelihood_value_and_score_into(
-            y,
-            &eta_at_mode,
-            &likelihood,
-            &likelihood.spec.link,
-            weights,
-            &mut score_at_mode,
-        )
-        .map_err(|error| format!("joint HMC likelihood is invalid at the fitted mode: {error}"))?;
-
-        let whitening = hessian_whitening_transform(
-            hessian,
-            n_beta,
-            cov_scale,
-            "Joint HMC: Hessian Cholesky failed",
-        )?;
-        let chol = whitening.chol;
-        let chol_t = whitening.chol_t;
-
-        let data = SharedData {
-            x: Arc::new(x.to_owned()),
-            y: Arc::new(y.to_owned()),
-            weights: Arc::new(weights.to_owned()),
-            mode: Arc::new(mode.to_owned()),
-            // The fit's offset and dispersion are fixed likelihood state: the
-            // joint target must retain both or it samples a different model —
-            // hard-coding φ = 1 gave a Gaussian fit with σ² = 4 four times its
-            // true likelihood curvature, and dropping the offset shifted every
-            // offset model's posterior (finding 18, #2245). The family kernels
-            // consume the exact resolved metadata below; no scalar default or
-            // family-parameter side channel exists.
-            offset: offset.map(|o| Arc::new(o.to_owned())),
-            likelihood: likelihood.clone(),
-            n_samples,
-            dim: n_beta,
-        };
-        let link_param_mode = Self::link_param_mode(&likelihood.spec.link);
-
-        Ok(Self {
-            data,
-            chol,
-            chol_t,
-            likelihood: likelihood.spec,
-            penalty_scale: 1.0 / cov_scale,
-            n_beta,
-            n_rho,
-            n_link_params: link_param_mode.len(),
-            link_param_mode,
-            penalty_canonical,
-            rho_prior,
-            rho_mode: rho_mode.to_owned(),
-            firth_enabled,
-            penalty_logdet_cache: Mutex::new(None),
-        })
-    }
-
-    fn link_param_mode(inverse_link: &InverseLink) -> Array1<f64> {
-        match inverse_link {
-            InverseLink::Sas(state) | InverseLink::BetaLogistic(state) => {
-                Array1::from_vec(vec![state.epsilon, state.log_delta])
-            }
-            InverseLink::Mixture(state) => state.rho.clone(),
-            InverseLink::Standard(_) | InverseLink::LatentCLogLog(_) => Array1::zeros(0),
-        }
-    }
-
-}
-
-impl HamiltonianTarget<Array1<f64>> for JointBetaRhoPosterior {
-}
-
 /// Inputs for joint (β, ρ) sampling.
 pub struct JointBetaRhoInputs<'a> {
     pub x: ArrayView2<'a, f64>,
@@ -6350,6 +6009,7 @@ mod survival_hmc {
     }
 
     impl SurvivalPosterior {
+
         /// Creates a new survival posterior target.
         pub fn new(
             age_entry: ArrayView1<'_, f64>,

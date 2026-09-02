@@ -1507,57 +1507,6 @@ pub struct CellMomentStateRef<'a> {
     pub moments: &'a [f64],
 }
 
-#[derive(Clone, Debug)]
-pub struct CellMomentScratch {
-    moments: Vec<f64>,
-}
-
-impl Default for CellMomentScratch {
-    fn default() -> Self {
-        // Pre-size to the codebase's max moment degree so steady-state
-        // `prepare_moments` calls never reallocate. Calls with `len`
-        // exceeding this still reserve lazily.
-        Self {
-            moments: Vec::with_capacity(MAX_AFFINE_ANCHOR_DEGREE + 1),
-        }
-    }
-}
-
-impl CellMomentScratch {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_capacity(max_degree: usize) -> Self {
-        Self {
-            moments: Vec::with_capacity(max_degree + 1),
-        }
-    }
-
-    #[inline]
-    fn prepare_moments(&mut self, len: usize) -> &mut [f64] {
-        if self.moments.capacity() < len {
-            CELL_MOMENT_REALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.moments.reserve(len - self.moments.capacity());
-        }
-        // Grow monotonically: shorter requests should not truncate the backing
-        // storage and then zero the old tail when a later request grows again.
-        // Only the active prefix is scratch for this evaluation.
-        if self.moments.len() < len {
-            self.moments.resize(len, 0.0);
-        }
-        let out = &mut self.moments[..len];
-        out.fill(0.0);
-        out
-    }
-}
-
-/// Counter for moment-buffer reallocations in `prepare_moments`. Production
-/// code increments this on every buffer growth; the test mod inspects it to
-/// assert the steady-state hot loop allocates exactly once per row buffer.
-pub(crate) static CELL_MOMENT_REALLOCS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// Canonical 20-point Gauss–Legendre nodes on [-1, 1] (Abramowitz & Stegun
 /// 25.4), tabulated to f64 precision. Used here for the Drezner–Wesolowsky
 /// bivariate normal CDF representation — 20 points give >30-digit accuracy for

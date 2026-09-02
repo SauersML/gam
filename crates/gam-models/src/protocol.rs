@@ -19,9 +19,6 @@ pub enum LatentScoreSemantics {
     EmpiricalLatentMeasure { normalize_location_scale: bool },
 }
 
-impl LatentScoreSemantics {
-}
-
 #[derive(Clone, Debug)]
 pub struct MarginalSlopeCalibrationProtocol {
     pub base_link: InverseLink,
@@ -53,7 +50,6 @@ impl MarginalSlopeCalibrationProtocol {
         }
     }
 
-
 }
 
 #[derive(Clone, Debug)]
@@ -62,5 +58,3 @@ pub struct SurvivalMarginalSlopeProtocol {
     pub baseline_target: SurvivalBaselineTarget,
 }
 
-impl SurvivalMarginalSlopeProtocol {
-}

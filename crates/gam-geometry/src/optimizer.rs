@@ -596,9 +596,6 @@ impl Default for RiemannianLBFGS {
     }
 }
 
-impl RiemannianLBFGS {
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

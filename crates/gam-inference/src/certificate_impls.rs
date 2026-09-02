@@ -17,4 +17,3 @@
 //! gam-solve impls; they are re-exported here so existing
 //! `crate::certificate_impls::*` paths resolve unchanged.
 
-pub use gam_solve::inference::certificate_impls::{coreset_race_verdict, enclosure_margin_verdict};

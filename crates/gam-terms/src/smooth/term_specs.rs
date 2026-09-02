@@ -6541,9 +6541,6 @@ pub fn build_random_effect_block(
     })
 }
 
-impl SmoothDesign {
-}
-
 pub struct LocalSmoothTermBuild {
     pub dim: usize,
     pub design: DesignMatrix,

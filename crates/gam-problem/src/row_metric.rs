@@ -880,6 +880,39 @@ impl RowMetric {
     }
 }
 
+/// Pack a harvest-emitted probe stack into the row-major factor layout
+/// [`RowMetric::behavioral_fisher`] expects.
+///
+/// The harvest boundary (the model-interaction side) emits, per token, `s`
+/// probe vectors `vₖ = J_nᵀ F_n^{1/2} uₖ ∈ ℝ^p` — the natural shape is
+/// `probes[n, i, k] = (vₖ)ᵢ`, an `(n_rows, p, probes)` stack. This assembles the
+/// `(n_rows, p · probes)` row-major matrix `u[n, i·probes + k] = probes[n, i, k]`
+/// that the constructor consumes so that column `k` of the per-row factor `U_n`
+/// is exactly probe `vₖ` and `M_n = U_n U_nᵀ = Σₖ vₖ vₖᵀ ≈ G_n`.
+///
+/// This is a pure repack of the standard C-order flattening; it exists so the
+/// harvest → metric seam is a single named, validated Rust surface rather than
+/// an ad-hoc reshape at each call site. Errors on non-finite entries so the
+/// failure is caught here rather than deep in [`normalize_fisher_rao_blocks`].
+pub fn pack_probe_factors(probes: ndarray::ArrayView3<'_, f64>) -> Result<Array2<f64>, String> {
+    let (n_rows, p, s) = probes.dim();
+    if s == 0 {
+        return Err("pack_probe_factors: need at least one probe (s == 0)".to_string());
+    }
+    if !probes.iter().all(|v| v.is_finite()) {
+        return Err("pack_probe_factors: probe entries must be finite".to_string());
+    }
+    let mut u = Array2::<f64>::zeros((n_rows, p * s));
+    for n in 0..n_rows {
+        for i in 0..p {
+            for k in 0..s {
+                u[[n, i * s + k]] = probes[[n, i, k]];
+            }
+        }
+    }
+    Ok(u)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

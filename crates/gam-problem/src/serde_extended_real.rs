@@ -31,7 +31,7 @@
 //! Encoding them as `null` too would make the codec lossy in the one direction
 //! that matters — it would turn a bug into a legitimate-looking `+∞`.
 
-use serde::de::{Deserializer, Error as DeError, SeqAccess, Visitor};
+use serde::de::{Deserializer, Visitor};
 use serde::ser::{SerializeSeq, Serializer};
 use std::fmt;
 

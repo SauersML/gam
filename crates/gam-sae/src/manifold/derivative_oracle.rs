@@ -24,9 +24,6 @@ pub enum PivotBranch {
     NonFinite,
 }
 
-impl PivotBranch {
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EigenDerivativeRoute {
     IndividualEigenpairs,
@@ -117,9 +114,6 @@ pub struct ExactTraceReport {
     pub channels: Vec<ExactTraceChannel>,
     pub total_value: f64,
     pub total_derivative: f64,
-}
-
-impl ExactTraceReport {
 }
 
 #[cfg(test)]

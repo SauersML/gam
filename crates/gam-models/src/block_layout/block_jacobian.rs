@@ -35,5 +35,3 @@ pub struct AdditiveWiggleBlockLayout<'a> {
     pub wiggle_block: Option<usize>,
 }
 
-impl AdditiveWiggleBlockLayout<'_> {
-}

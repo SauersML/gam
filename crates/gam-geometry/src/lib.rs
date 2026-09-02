@@ -11,21 +11,52 @@ pub mod sinkhorn_barycenter;
 // Re-export each manifold submodule at the crate root so the historical paths
 // (`gam_geometry::sphere::SphereManifold`, …) keep resolving after the
 // `manifolds/` regrouping.
-pub use manifolds::{
-    circle, constant_curvature, euclidean, grassmann, lie_so, poincare, product, simplex, spd,
-    sphere, stiefel, torus,
-};
+pub use manifolds::{circle, constant_curvature, euclidean, grassmann, lie_so, poincare, product, simplex, spd, sphere, stiefel, torus};
 
 pub use closure_family::{ClosureFamily, ClosureProfileCi};
-pub use curvature_estimand::{CurvatureVerdict, DesignCoordKappaJet, FlatnessTest, KappaEstimateSupport, KappaProfileCi, flatness_lr_test, profile_ci_walk, wald_half_width};
+pub use curvature_estimand::{
+    CurvatureVerdict,
+    DesignCoordKappaJet,
+    FlatnessTest,
+    KappaEstimateSupport,
+    KappaProfileCi,
+    flatness_lr_test,
+    profile_ci_walk,
+    wald_half_width,
+};
 pub use integrator::GeodesicIntegrator;
 pub use latent_seed::laplacian_eigenmap_coords;
 pub use manifold::{GeometryError, GeometryResult, ManifoldSpec, RiemannianManifold};
-pub use manifolds::{CircleManifold, ConstantCurvature, EuclideanManifold, GrassmannManifold, ProductManifold, SpdManifold, SphereManifold, StiefelManifold, TorusManifold, constant_curvature_dirichlet_penalty, constant_curvature_dirichlet_penalty_kappa_derivative, distance_kappa_jet};
-pub use optimizer::{
-    RiemannianLBFGS, RiemannianObjective, RiemannianTrustRegion, TrustRegionTermination,
+pub use manifolds::{
+    CircleManifold,
+    ConstantCurvature,
+    EuclideanManifold,
+    GrassmannManifold,
+    ProductManifold,
+    SpdManifold,
+    SphereManifold,
+    StiefelManifold,
+    TorusManifold,
+    constant_curvature_dirichlet_penalty,
+    constant_curvature_dirichlet_penalty_kappa_derivative,
+    distance_kappa_jet,
 };
-pub use response_geometry::{ResponseCurvatureFit, ResponseGeometryError, ResponseManifold, fit_response_curvature, response_curvature_criterion, response_exp_map, response_frechet_mean, response_log_map};
+pub use optimizer::{
+    RiemannianLBFGS,
+    RiemannianObjective,
+    RiemannianTrustRegion,
+    TrustRegionTermination,
+};
+pub use response_geometry::{
+    ResponseCurvatureFit,
+    ResponseGeometryError,
+    ResponseManifold,
+    fit_response_curvature,
+    response_curvature_criterion,
+    response_exp_map,
+    response_frechet_mean,
+    response_log_map,
+};
 
 use ndarray::{Array1, ArrayView1};
 

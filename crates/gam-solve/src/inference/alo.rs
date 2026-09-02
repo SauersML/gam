@@ -15,6 +15,9 @@ use opt::{BacktrackConfig, backtracking_line_search};
 use std::convert::Infallible;
 use std::fmt;
 use std::ops::Range;
+use crate::estimate::UnifiedFitResult;
+use crate::estimate::FitGeometry;
+use crate::estimate::WorkingGeometry;
 
 /// Typed error variants for the ALO (approximate leave-one-out) diagnostics
 /// module.
@@ -651,6 +654,38 @@ pub struct AloInput<'a> {
 }
 
 impl<'a> AloInput<'a> {
+
+    /// Build an `AloInput` from `FitGeometry` and an already active-coordinate
+    /// design. Raw saved designs must first be restricted through
+    /// `geom.coefficient_gauge`; keeping this constructor crate-private makes
+    /// that frame transition explicit at the public fit boundary.
+    fn from_active_geometry(
+        geom: &'a FitGeometry,
+        working: &'a WorkingGeometry,
+        design: &'a Array2<f64>,
+        eta: &'a Array1<f64>,
+        offset: &'a Array1<f64>,
+        phi: f64,
+    ) -> Self {
+        // FitGeometry stores one working-weight vector, so this constructor is
+        // exact only when the score- and Hessian-side IRLS weights coincide
+        // (canonical-link case where Fisher == Observed). In that path the
+        // diagonal is the Fisher weight `h'²/(φ V(μ)) ≥ 0`, so the PSD
+        // obligation is discharged algebraically without a runtime scan;
+        // `as_signed()` re-views the same buffer for the Hessian-side slot.
+        let psd_w = PsdWeightsView::from_view_unchecked(working.weights.view());
+        Self {
+            design,
+            penalized_hessian: &geom.penalized_hessian,
+            hessian_weights: psd_w.as_signed(),
+            score_weights: psd_w,
+            working_response: &working.response,
+            eta,
+            offset,
+            phi,
+            score_curvature: None,
+        }
+    }
 
     /// Build an `AloInput` from an exact saved penalized Hessian plus externally
     /// supplied working weights / working response.
@@ -2445,4 +2480,53 @@ mod tests {
         assert!((result.eta_tilde[0][0] - 1.0).abs() <= roundoff);
         assert!((result.eta_tilde[0][1] + 1.0).abs() <= roundoff);
     }
+}
+
+/// Compute ALO diagnostics from a `UnifiedFitResult`.
+///
+/// Extracts `FitGeometry` from `unified.geometry`, pulls the raw row design
+/// into the persisted active frame, and delegates to `compute_alo_from_input`.
+/// This avoids requiring a full `UnifiedFitResult` with PIRLS artifacts.
+pub fn compute_alo_diagnostics_from_unified(
+    unified: &UnifiedFitResult,
+    design: &Array2<f64>,
+    eta: &Array1<f64>,
+    offset: &Array1<f64>,
+    phi: f64,
+) -> Result<AloDiagnostics, EstimationError> {
+    let geom = unified
+        .geometry
+        .as_ref()
+        .ok_or_else(|| AloError::InvalidInput {
+            reason: "UnifiedFitResult does not contain working-set geometry; \
+             ALO diagnostics require geometry at convergence"
+                .to_string(),
+        })
+        .map_err(EstimationError::from)?;
+    let working = geom.working.as_ref().ok_or_else(|| {
+        EstimationError::from(AloError::InvalidInput {
+            reason: "UnifiedFitResult coefficient geometry has no owned single-diagonal working evidence; ALO diagnostics are unavailable for Exact-Newton and multi-parameter terminal geometry"
+                .to_string(),
+        })
+    })?;
+    geom.coefficient_gauge
+        .validate()
+        .map_err(|reason| AloError::InvalidInput {
+            reason: format!("UnifiedFitResult ALO coefficient gauge is invalid: {reason}"),
+        })
+        .map_err(EstimationError::from)?;
+    if design.ncols() != geom.coefficient_gauge.raw_total() {
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "UnifiedFitResult ALO raw design has {} columns; coefficient gauge requires {}",
+                design.ncols(),
+                geom.coefficient_gauge.raw_total(),
+            ),
+        }
+        .into());
+    }
+    let active_design = geom.coefficient_gauge.restrict_design(design);
+    let input =
+        AloInput::from_active_geometry(geom, working, &active_design, eta, offset, phi);
+    compute_alo_from_input(&input)
 }

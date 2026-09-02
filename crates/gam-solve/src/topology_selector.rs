@@ -1816,9 +1816,6 @@ pub struct UnionRungResult {
     pub winner_index: usize,
 }
 
-impl UnionRungResult {
-}
-
 /// A selection-time predictive-density provider: given the row indices to TRAIN
 /// on and the row indices to EVALUATE on, it returns the per-eval-row held-out
 /// log predictive density `log p(y_eval | train)`. This is the decoupled seam

@@ -231,9 +231,6 @@ pub struct TerraciniReport {
     pub flag_margin: f64,
 }
 
-impl TerraciniReport {
-}
-
 /// Bounded-state aggregator over sampled parse certificates.
 #[derive(Debug, Clone)]
 pub struct TerraciniAggregator {

@@ -30,9 +30,6 @@ pub struct CoefficientLabel {
     pub column: usize,
 }
 
-impl CoefficientLabel {
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct CoefficientGroupSpec {
     pub label: String,

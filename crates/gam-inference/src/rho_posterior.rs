@@ -51,7 +51,6 @@
 
 use gam_solve::estimate::EstimationError;
 use gam_solve::psis::pareto_smooth_weights;
-use gam_solve::rho_optimizer::OuterObjective;
 use ndarray::{Array1, Array2};
 
 // The `ρ`-posterior certificate/escalation DATA types were contract-downed to
@@ -290,7 +289,6 @@ pub(crate) fn enumerate_gh_product(
 struct NormalizedQuadratureNode {
     rho: Array1<f64>,
     cost: f64,
-    gradient: Option<Array1<f64>>,
     weight: f64,
     log_weight: f64,
 }
@@ -358,22 +356,18 @@ where
             }
             rho[i] += acc;
         }
-        let (cost, gradient, log_weight) = match eval_node(&rho)? {
-            Some((cost, gradient)) if cost.is_finite() => {
+        let (cost, log_weight) = match eval_node(&rho)? {
+            Some((cost, _)) if cost.is_finite() => {
                 let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
-                (
-                    cost,
-                    gradient,
-                    log_base_weight - cost + cost_hat + half_norm_sq,
-                )
+                (cost, log_base_weight - cost + cost_hat + half_norm_sq)
             }
             // Infeasible node: zero importance weight, never fatal.
-            _ => (f64::INFINITY, None, f64::NEG_INFINITY),
+            _ => (f64::INFINITY, f64::NEG_INFINITY),
         };
         if log_weight.is_finite() {
             max_log_weight = max_log_weight.max(log_weight);
         }
-        raw_nodes.push((rho, cost, gradient, log_weight));
+        raw_nodes.push((rho, cost, log_weight));
     }
     if !max_log_weight.is_finite() {
         return Err(EstimationError::RemlOptimizationFailed(
@@ -382,7 +376,7 @@ where
     }
     let mut total = 0.0;
     let mut scaled = Vec::with_capacity(raw_nodes.len());
-    for (_, _, _, log_weight) in &raw_nodes {
+    for (_, _, log_weight) in &raw_nodes {
         let w = if log_weight.is_finite() {
             (*log_weight - max_log_weight).exp()
         } else {
@@ -399,13 +393,12 @@ where
 
     let mut nodes = Vec::with_capacity(raw_nodes.len());
     let mut sum_sq = 0.0;
-    for ((rho, cost, gradient, log_weight), scaled_weight) in raw_nodes.into_iter().zip(scaled) {
+    for ((rho, cost, log_weight), scaled_weight) in raw_nodes.into_iter().zip(scaled) {
         let weight = scaled_weight / total;
         sum_sq += weight * weight;
         nodes.push(NormalizedQuadratureNode {
             rho,
             cost,
-            gradient,
             weight,
             log_weight: log_weight - max_log_weight - total.ln(),
         });

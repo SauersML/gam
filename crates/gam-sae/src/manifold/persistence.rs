@@ -1530,9 +1530,6 @@ pub struct AtlasNerveReport {
     pub covering_side: AtlasCoveringSide,
 }
 
-impl AtlasNerveReport {
-}
-
 fn nerve_find(parent: &mut [usize], x: usize) -> usize {
     let mut root = x;
     while parent[root] != root {

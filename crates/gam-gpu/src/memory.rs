@@ -28,9 +28,6 @@ pub struct DeviceVector {
     pub data: DeviceBuffer<f64>,
 }
 
-impl DeviceVector {
-}
-
 #[derive(Clone, Debug)]
 pub struct DeviceMatrix {
     pub rows: usize,

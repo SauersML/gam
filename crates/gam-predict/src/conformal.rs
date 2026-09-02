@@ -98,16 +98,10 @@
 //! about `Y` directly rather than relying on a delta-method linearization that
 //! the coverage proof does not need.
 
-use crate::PredictUncertaintyResult;
 use crate::interval_policy::ResponseBounds;
 use gam_math::quantile::order_statistic;
-use gam_models::family_runtime::FamilyStrategy;
-use gam_models::family_runtime::strategy_for_spec;
 use gam_problem::EstimationError;
-use gam_solve::inference::alo::compute_alo_diagnostics_from_unified;
-use gam_solve::model_types::UnifiedFitResult;
-use gam_spec::LikelihoodSpec;
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, ArrayView1};
 
 fn effective_scale(scale: f64, idx: usize, role: &str) -> Result<f64, EstimationError> {
     if !(scale.is_finite() && scale >= 0.0) {
@@ -202,7 +196,6 @@ pub fn conformal_multiplier(
 pub struct ConformalCalibrator {
     q_hat: f64,
     alpha: f64,
-    n_calibration: usize,
 }
 
 impl ConformalCalibrator {
@@ -225,7 +218,6 @@ impl ConformalCalibrator {
         Ok(Self {
             q_hat,
             alpha,
-            n_calibration: scores.len(),
         })
     }
 

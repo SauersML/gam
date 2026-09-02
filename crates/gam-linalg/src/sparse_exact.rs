@@ -39,9 +39,6 @@ impl crate::matrix::FactorizedSystem for SparseExactFactor {
     }
 }
 
-impl SparseExactFactor {
-}
-
 /// Convert a dense symmetric matrix to sparse CSC storing only the upper triangle.
 ///
 /// This encoding is required by sparse SPD routines in this module that interpret
