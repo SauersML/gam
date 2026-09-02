@@ -1,8 +1,6 @@
 use gam_linalg::roundoff::accumulation_band;
 use ndarray::{Array1, ArrayView1};
-use opt::{
-    BacktrackConfig, ExpandConfig, TrustRegionPolicy, bidirectional_line_search, constants,
-};
+use opt::TrustRegionPolicy;
 
 use crate::manifold::{GeometryResult, RiemannianManifold, check_len, quad_form};
 
@@ -596,16 +594,6 @@ impl Default for RiemannianLBFGS {
             grad_tol: 1.0e-8,
         }
     }
-}
-
-/// One stored secant pair, kept with its base point so the two-loop recursion
-/// can transport it into whatever the current tangent space is. `s` and `y`
-/// both live in `T_{base}M`.
-#[derive(Clone)]
-struct SecantPair {
-    base: Array1<f64>,
-    s: Array1<f64>,
-    y: Array1<f64>,
 }
 
 impl RiemannianLBFGS {

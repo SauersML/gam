@@ -48,12 +48,6 @@
 //! meeting the target. There is no CPU fallback inside the measurement: a
 //! caller that wants the CPU oracle runs it separately for parity.
 
-use std::hint::black_box;
-use std::time::{Duration, Instant};
-
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-
-use super::linalg_dispatch::ResidentDesignGram;
 use super::policy::GpuThroughputVerdict;
 
 /// A representative LLM/SAE batched-solve work cell: `n` design rows, `p` wide
@@ -106,15 +100,6 @@ pub struct ResidentSolveThroughput {
     /// The verdict comparing `measured_rows_per_sec` against
     /// [`super::policy::GPU_THROUGHPUT_TARGET_ROWS_PER_SEC`].
     pub verdict: GpuThroughputVerdict,
-}
-
-/// Deterministic LCG in `[-1, 1)` — no `rand` dependency, fully reproducible
-/// across runs so the measured fixture is stable.
-fn lcg(state: &mut u64) -> f64 {
-    *state = state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (*state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
 }
 
 // ===========================================================================

@@ -83,11 +83,6 @@ mod cuda {
         Ok(cholesky_logdet_from_col_major(&factor_col, p))
     }
 
-    pub(super) fn cholesky_lower(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-        let (_, stream) = context_and_stream()?;
-        cholesky_lower_on_stream(hessian, &stream)
-    }
-
     pub(super) fn cholesky_lower_on_ordinal(
         ordinal: usize,
         hessian: ArrayView2<'_, f64>,

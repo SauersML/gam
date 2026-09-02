@@ -1,4 +1,3 @@
-use ndarray::{Array1, Array2};
 
 #[derive(Clone, Debug)]
 pub struct DeviceBuffer<T> {

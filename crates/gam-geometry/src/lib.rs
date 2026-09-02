@@ -16,31 +16,16 @@ pub use manifolds::{
     sphere, stiefel, torus,
 };
 
-pub use closure_family::{
-    ClosureFamily, ClosureProfileCi, boundary_conductance, conductance_penalty_jet,
-    profile_ci_from_grid,
-};
-pub use curvature_estimand::{
-    CurvatureVerdict, DesignCoordKappaJet, FlatnessTest, KappaEstimateSupport, KappaProfileCi,
-    design_coord_kappa_derivative, flatness_lr_test, profile_ci_walk, wald_half_width,
-};
+pub use closure_family::{ClosureFamily, ClosureProfileCi};
+pub use curvature_estimand::{CurvatureVerdict, DesignCoordKappaJet, FlatnessTest, KappaEstimateSupport, KappaProfileCi, flatness_lr_test, profile_ci_walk, wald_half_width};
 pub use integrator::GeodesicIntegrator;
 pub use latent_seed::laplacian_eigenmap_coords;
 pub use manifold::{GeometryError, GeometryResult, ManifoldSpec, RiemannianManifold};
-pub use manifolds::{
-    CircleManifold, ConstantCurvature, EuclideanManifold, GrassmannManifold, ProductManifold,
-    SpdManifold, SphereManifold, StiefelManifold, TorusManifold,
-    constant_curvature_dirichlet_penalty, constant_curvature_dirichlet_penalty_kappa_derivative,
-    distance_kappa_jet, exp_map_kappa_jet, log_map_kappa_jet, spd_frechet_mean,
-};
+pub use manifolds::{CircleManifold, ConstantCurvature, EuclideanManifold, GrassmannManifold, ProductManifold, SpdManifold, SphereManifold, StiefelManifold, TorusManifold, constant_curvature_dirichlet_penalty, constant_curvature_dirichlet_penalty_kappa_derivative, distance_kappa_jet};
 pub use optimizer::{
     RiemannianLBFGS, RiemannianObjective, RiemannianTrustRegion, TrustRegionTermination,
 };
-pub use response_geometry::{
-    ResponseCurvatureFit, ResponseGeometryError, ResponseManifold, fit_response_curvature,
-    response_curvature_criterion, response_exp_map, response_frechet_mean, response_log_map,
-    response_projection_residual,
-};
+pub use response_geometry::{ResponseCurvatureFit, ResponseGeometryError, ResponseManifold, fit_response_curvature, response_curvature_criterion, response_exp_map, response_frechet_mean, response_log_map};
 
 use ndarray::{Array1, ArrayView1};
 

@@ -48,10 +48,7 @@
 //! The API here is intentionally allocation-light and stateless so the seam can
 //! call it per row inside the design build without owning any outer state.
 
-use ndarray::{Array1, ArrayView1};
-
-use super::manifold::GeometryResult;
-use crate::manifolds::constant_curvature::{ConstantCurvature, log_map_kappa_jet};
+use ndarray::Array1;
 
 use super::closure_family::inv_std_normal;
 

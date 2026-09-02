@@ -25,10 +25,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use opt::{BacktrackConfig, armijo_roundoff_cushion, backtracking_line_search, constants};
 use std::{convert::Infallible, fmt};
 
-use crate::manifold::{
-    GEOMETRY_EPS, RiemannianManifold, flatten, from_flat, jacobi_symmetric, spectral_map_symmetric,
-    sym,
-};
+use crate::manifold::RiemannianManifold;
 use crate::manifolds::constant_curvature::{ConstantCurvature, cs_stacks3, distance_kappa_jet};
 use crate::{GeometryError, GeometryResult, GrassmannManifold, SpdManifold, StiefelManifold};
 
