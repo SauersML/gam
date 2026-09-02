@@ -87,7 +87,6 @@ pub fn canonical_standard_fit_options(
     }
 }
 
-
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
     let request = request;
     // Each `fit_*_model` helper still returns `Result<_, String>` internally;
@@ -2217,102 +2216,6 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
     Some(SplineScanInputs { x, y, w, order })
 }
 
-/// Formula-level direct entry for the exact O(n) smoothing-spline scan.
-///
-/// Materializes the formula exactly like [`fit_from_formula`], then runs the
-/// [`spline_scan_fast_path`] detection on the resulting standard request.
-/// This public entry point is for library callers that specifically need the
-/// specialized [`gam_solve::spline_scan::SplineScanFit`] rather than the
-/// [`FitResult::SplineScan`] sum-type returned by the canonical workflow. When
-/// detection fires the fit is routed through
-/// [`gam_solve::spline_scan::fit_spline_scan`] — the exact diffuse
-/// REML Kalman/RTS scan — and the full in-memory posterior
-/// ([`gam_solve::spline_scan::SplineScanFit`]: knots, smoothed
-/// states, pointwise variances, lag-one gains, σ², log λ, exact EDF, and an
-/// exact `predict`) is returned. `Ok(None)` means the model is not the
-/// scan-eligible shape; the direct caller then chooses another estimator.
-/// Persistence-bearing workflows do not call this probe: [`fit_from_formula`]
-/// returns [`FitResult::SplineScan`], and the shared
-/// [`crate::inference::model_payload_builders::assemble_spline_scan_payload`]
-/// authority writes the exact scan state for both CLI and FFI consumers.
-pub fn fit_spline_scan_from_formula(
-    formula: &str,
-    data: &Dataset,
-    config: &FitConfig,
-) -> Result<Option<gam_solve::spline_scan::SplineScanFit>, WorkflowError> {
-    let mat = materialize(formula, data, config)?;
-    let FitRequest::Standard(request) = mat.request else {
-        return Ok(None);
-    };
-    let Some(inputs) = spline_scan_fast_path(&request) else {
-        return Ok(None);
-    };
-    gam_solve::spline_scan::fit_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
-        .map(Some)
-        .map_err(|reason| WorkflowError::IntegrationFailed {
-            reason: reason.to_string(),
-        })
-}
-
-/// #1464 diagnostic entry point: evaluate the exact production fixed-κ
-/// profiled-REML criterion (`fixed_kappa_profiled_reml_score`) at a list of
-/// pinned κ values for the first constant-curvature term of `formula`,
-/// materialised from `data`/`config` exactly like [`fit_from_formula`]. The
-/// scorer runs a complete production fit independently at every pinned κ and
-/// returns `(κ, V_p(κ))` pairs.
-///
-/// This is a raw pinned-fit diagnostic, not the curvature estimand objective.
-/// Curvature point estimation, confidence intervals, and flatness inference use
-/// the separate continuously differentiable Gaussian REML curvature profile.
-/// Here κ-optimisation is disabled and each
-/// complete fit profiles only its smoothing parameters, so every returned score
-/// is the canonical negative log evidence of that independently pinned model.
-pub fn constant_curvature_profiled_reml_scores(
-    formula: &str,
-    data: &Dataset,
-    config: &FitConfig,
-    kappas: &[f64],
-) -> Result<Vec<(f64, f64)>, WorkflowError> {
-    let mat = materialize(formula, data, config)?;
-    let FitRequest::Standard(request) = mat.request else {
-        return Err(WorkflowError::IntegrationFailed {
-            reason: "constant_curvature_profiled_reml_scores: formula did not materialise to a \
-                     standard fit request"
-                .to_string(),
-        });
-    };
-    let term_idx =
-        *crate::fit_orchestration::drivers::constant_curvature_term_indices(&request.spec)
-            .first()
-            .ok_or_else(|| WorkflowError::IntegrationFailed {
-                reason:
-                    "constant_curvature_profiled_reml_scores: formula has no constant-curvature \
-                     curv() term"
-                        .to_string(),
-            })?;
-    let mut out = Vec::with_capacity(kappas.len());
-    for &kappa in kappas {
-        let score = crate::fit_orchestration::drivers::fixed_kappa_profiled_reml_score(
-            request.data.view(),
-            request.y.view(),
-            request.weights.view(),
-            request.offset.view(),
-            &request.spec,
-            term_idx,
-            kappa,
-            request.family.clone(),
-            &request.options,
-        )
-        .map_err(|e| WorkflowError::IntegrationFailed {
-            reason: format!(
-                "constant_curvature_profiled_reml_scores: fixed-κ fit at κ={kappa} failed: {e}"
-            ),
-        })?;
-        out.push((kappa, score));
-    }
-    Ok(out)
-}
-
 /// Derived dense-kernel cliff: the cascade auto-route fires only once the dense
 /// radial basis the smooth would otherwise use has SATURATED at its center cap
 /// (`default_num_centers == K_MAX`), so the dense `O(n·K² + K³)` kernel solve
@@ -2473,42 +2376,6 @@ pub fn residual_cascade_fast_path(
         w,
         metric,
         sobolev_s,
-    })
-}
-
-/// Formula-level library entry for the O(n log n) residual-cascade fast path
-/// (issue #1032).
-///
-/// Materializes the formula exactly like [`fit_from_formula`], runs the
-/// [`residual_cascade_fast_path`] detection, and — when it fires and the
-/// cascade supplies every required proof — returns the
-/// certified [`ResidualCascadeFit`](gam_solve::residual_cascade::ResidualCascadeFit).
-/// `Ok(None)` means only that the model is not the cascade-eligible shape.
-/// Once the route is selected, a proof/convergence failure is returned rather
-/// than silently changing estimators.
-pub fn fit_residual_cascade_from_formula(
-    formula: &str,
-    data: &Dataset,
-    config: &FitConfig,
-) -> Result<Option<gam_solve::residual_cascade::ResidualCascadeFit>, WorkflowError> {
-    let mat = materialize(formula, data, config)?;
-    let FitRequest::Standard(request) = mat.request else {
-        return Ok(None);
-    };
-    let Some(inputs) = residual_cascade_fast_path(&request) else {
-        return Ok(None);
-    };
-    let coord_refs: Vec<&[f64]> = inputs.coords.iter().map(Vec::as_slice).collect();
-    gam_solve::residual_cascade::fit_residual_cascade(
-        &coord_refs,
-        &inputs.y,
-        &inputs.w,
-        &inputs.metric,
-        inputs.sobolev_s,
-    )
-    .map(Some)
-    .map_err(|reason| WorkflowError::IntegrationFailed {
-        reason: reason.to_string(),
     })
 }
 
@@ -2870,4 +2737,136 @@ mod sz_factor_smooth_recovery_tests {
             sz_resid / fs_resid,
         );
     }
+}
+
+/// #1464 diagnostic entry point: evaluate the exact production fixed-κ
+/// profiled-REML criterion (`fixed_kappa_profiled_reml_score`) at a list of
+/// pinned κ values for the first constant-curvature term of `formula`,
+/// materialised from `data`/`config` exactly like [`fit_from_formula`]. The
+/// scorer runs a complete production fit independently at every pinned κ and
+/// returns `(κ, V_p(κ))` pairs.
+///
+/// This is a raw pinned-fit diagnostic, not the curvature estimand objective.
+/// Curvature point estimation, confidence intervals, and flatness inference use
+/// the separate continuously differentiable Gaussian REML curvature profile.
+/// Here κ-optimisation is disabled and each
+/// complete fit profiles only its smoothing parameters, so every returned score
+/// is the canonical negative log evidence of that independently pinned model.
+pub fn constant_curvature_profiled_reml_scores(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+    kappas: &[f64],
+) -> Result<Vec<(f64, f64)>, WorkflowError> {
+    let mat = materialize(formula, data, config)?;
+    let FitRequest::Standard(request) = mat.request else {
+        return Err(WorkflowError::IntegrationFailed {
+            reason: "constant_curvature_profiled_reml_scores: formula did not materialise to a \
+                     standard fit request"
+                .to_string(),
+        });
+    };
+    let term_idx =
+        *crate::fit_orchestration::drivers::constant_curvature_term_indices(&request.spec)
+            .first()
+            .ok_or_else(|| WorkflowError::IntegrationFailed {
+                reason:
+                    "constant_curvature_profiled_reml_scores: formula has no constant-curvature \
+                     curv() term"
+                        .to_string(),
+            })?;
+    let mut out = Vec::with_capacity(kappas.len());
+    for &kappa in kappas {
+        let score = crate::fit_orchestration::drivers::fixed_kappa_profiled_reml_score(
+            request.data.view(),
+            request.y.view(),
+            request.weights.view(),
+            request.offset.view(),
+            &request.spec,
+            term_idx,
+            kappa,
+            request.family.clone(),
+            &request.options,
+        )
+        .map_err(|e| WorkflowError::IntegrationFailed {
+            reason: format!(
+                "constant_curvature_profiled_reml_scores: fixed-κ fit at κ={kappa} failed: {e}"
+            ),
+        })?;
+        out.push((kappa, score));
+    }
+    Ok(out)
+}
+
+/// Formula-level library entry for the O(n log n) residual-cascade fast path
+/// (issue #1032).
+///
+/// Materializes the formula exactly like [`fit_from_formula`], runs the
+/// [`residual_cascade_fast_path`] detection, and — when it fires and the
+/// cascade supplies every required proof — returns the
+/// certified [`ResidualCascadeFit`](gam_solve::residual_cascade::ResidualCascadeFit).
+/// `Ok(None)` means only that the model is not the cascade-eligible shape.
+/// Once the route is selected, a proof/convergence failure is returned rather
+/// than silently changing estimators.
+pub fn fit_residual_cascade_from_formula(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<Option<gam_solve::residual_cascade::ResidualCascadeFit>, WorkflowError> {
+    let mat = materialize(formula, data, config)?;
+    let FitRequest::Standard(request) = mat.request else {
+        return Ok(None);
+    };
+    let Some(inputs) = residual_cascade_fast_path(&request) else {
+        return Ok(None);
+    };
+    let coord_refs: Vec<&[f64]> = inputs.coords.iter().map(Vec::as_slice).collect();
+    gam_solve::residual_cascade::fit_residual_cascade(
+        &coord_refs,
+        &inputs.y,
+        &inputs.w,
+        &inputs.metric,
+        inputs.sobolev_s,
+    )
+    .map(Some)
+    .map_err(|reason| WorkflowError::IntegrationFailed {
+        reason: reason.to_string(),
+    })
+}
+
+/// Formula-level direct entry for the exact O(n) smoothing-spline scan.
+///
+/// Materializes the formula exactly like [`fit_from_formula`], then runs the
+/// [`spline_scan_fast_path`] detection on the resulting standard request.
+/// This public entry point is for library callers that specifically need the
+/// specialized [`gam_solve::spline_scan::SplineScanFit`] rather than the
+/// [`FitResult::SplineScan`] sum-type returned by the canonical workflow. When
+/// detection fires the fit is routed through
+/// [`gam_solve::spline_scan::fit_spline_scan`] — the exact diffuse
+/// REML Kalman/RTS scan — and the full in-memory posterior
+/// ([`gam_solve::spline_scan::SplineScanFit`]: knots, smoothed
+/// states, pointwise variances, lag-one gains, σ², log λ, exact EDF, and an
+/// exact `predict`) is returned. `Ok(None)` means the model is not the
+/// scan-eligible shape; the direct caller then chooses another estimator.
+/// Persistence-bearing workflows do not call this probe: [`fit_from_formula`]
+/// returns [`FitResult::SplineScan`], and the shared
+/// [`crate::inference::model_payload_builders::assemble_spline_scan_payload`]
+/// authority writes the exact scan state for both CLI and FFI consumers.
+pub fn fit_spline_scan_from_formula(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<Option<gam_solve::spline_scan::SplineScanFit>, WorkflowError> {
+    let mat = materialize(formula, data, config)?;
+    let FitRequest::Standard(request) = mat.request else {
+        return Ok(None);
+    };
+    let Some(inputs) = spline_scan_fast_path(&request) else {
+        return Ok(None);
+    };
+    gam_solve::spline_scan::fit_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
+        .map(Some)
+        .map_err(|reason| WorkflowError::IntegrationFailed {
+            reason: reason.to_string(),
+        })
 }

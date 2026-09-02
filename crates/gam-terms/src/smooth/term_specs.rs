@@ -1,7 +1,4 @@
-use coefficient_transforms::{
-    convex_derivative_control_transform_matrix, cumulative_exp, cumulative_sum_transform_matrix,
-    second_cumulative_exp,
-};
+use coefficient_transforms::{convex_derivative_control_transform_matrix, cumulative_sum_transform_matrix};
 
 pub use error::SmoothError;
 
@@ -1010,41 +1007,6 @@ pub struct SmoothTerm {
 }
 
 impl SmoothTerm {
-    /// Apply the joint-null absorption rotation to a raw new-data design
-    /// matrix, returning `X_new_raw · Q` when this term was rotated at
-    /// fit time, or `X_new_raw` unchanged when no rotation was applied.
-    ///
-    /// Callers in the prediction path: after building the smooth's basis
-    /// at new data via the *raw* basis builder (the same builder used at
-    /// fit time, applied to `x_new` instead of the training rows), call
-    /// this method on the resulting matrix before forming `X · β`. The
-    /// fitted `β` lives in `γ`-coordinates if Q was applied; multiplying
-    /// the un-rotated `X_new_raw` by `β` would give a wrong η.
-    ///
-    /// Returns an error if the raw design's column count does not match
-    /// the rotation's `p_local`. The width invariant must hold: the raw
-    /// basis builder MUST emit the same `p_local` columns that the
-    /// fit-time builder did, and the rotation is `(p_local × p_local)`.
-    pub fn apply_rotation_to_predict(
-        &self,
-        x_new_raw: Array2<f64>,
-    ) -> Result<Array2<f64>, BasisError> {
-        let Some(rot) = self.joint_null_rotation.as_ref() else {
-            return Ok(x_new_raw);
-        };
-        let p_local = rot.rotation.nrows();
-        if x_new_raw.ncols() != p_local {
-            crate::bail_dim_basis!(
-                "joint-null rotation replay for term '{}': raw design has {} columns, \
-                 rotation expects {} (the raw basis builder must emit the same column \
-                 count as at fit time)",
-                self.name,
-                x_new_raw.ncols(),
-                p_local,
-            );
-        }
-        Ok(gam_linalg::faer_ndarray::fast_ab(&x_new_raw, &rot.rotation))
-    }
 
     /// Dimension of the **joint** null space of this term's active penalties:
     /// the coefficient directions penalized by *no* penalty. The smooth-component
@@ -1188,9 +1150,6 @@ pub struct RawSmoothDesign {
 }
 
 impl RawSmoothDesign {
-    pub fn total_smooth_cols(&self) -> usize {
-        self.term_designs.iter().map(DesignMatrix::ncols).sum()
-    }
     pub fn nrows(&self) -> usize {
         self.term_designs.first().map_or(0, DesignMatrix::nrows)
     }
@@ -1285,11 +1244,6 @@ impl LinearTermSpec {
         } else {
             self.feature_cols.clone()
         }
-    }
-
-    /// True when this term is a Wilkinson-Rogers `:` interaction (multi-col).
-    pub fn is_interaction(&self) -> bool {
-        self.feature_cols.len() > 1 || !self.categorical_levels.is_empty()
     }
 
     /// Realize this linear term's `(n,)` design column from `data`.
@@ -2297,11 +2251,6 @@ impl BlockwisePenalty {
         }
     }
 
-    pub fn with_prior_mean(mut self, prior_mean: gam_problem::CoefficientPriorMean) -> Self {
-        self.prior_mean = prior_mean;
-        self
-    }
-
     /// Attach an op-form penalty handle bit-equivalent to `local`.
     pub fn with_op(
         mut self,
@@ -2475,30 +2424,6 @@ impl KroneckerPenaltySystem {
         self.marginal_dims.len() + if self.has_double_penalty { 1 } else { 0 }
     }
 
-    /// Compute `log|S|₊` and its first/second derivatives w.r.t. `ρ_k = log(λ_k)`.
-    ///
-    /// Iterates over the ∏q_j multi-index grid. Cost: O(d · ∏q_j), no O(p²) storage.
-    pub fn logdet_and_derivatives(
-        &self,
-        lambdas: &[f64],
-        objective_ridge: f64,
-    ) -> (f64, Array1<f64>, Array2<f64>) {
-        let n_pen = self.num_penalties();
-        assert_eq!(lambdas.len(), n_pen, "lambda count mismatch");
-        let marginal_evals: Vec<_> = self
-            .marginal_eigensystems
-            .iter()
-            .map(|(evals, _)| evals.view())
-            .collect();
-        kronecker_logdet_and_derivatives(
-            &marginal_evals,
-            &self.marginal_dims,
-            lambdas,
-            self.has_double_penalty,
-            objective_ridge,
-        )
-    }
-
     pub fn logdet_rank_and_derivatives(
         &self,
         lambdas: &[f64],
@@ -2583,7 +2508,6 @@ impl KroneckerPenaltySystem {
         (logdet, rank, grad, hess)
     }
 }
-
 
 #[derive(Clone, Debug)]
 pub struct TermCollectionDesign {
@@ -2765,12 +2689,6 @@ impl TermCollectionDesign {
             .iter()
             .map(|bp| bp.to_penalty_matrix(p))
             .collect()
-    }
-
-    /// Number of penalty blocks.
-    #[inline]
-    pub fn num_penalties(&self) -> usize {
-        self.penalties.len()
     }
 
     /// Resolve coefficient groups against this design's global coefficient
@@ -4111,7 +4029,6 @@ pub fn spatial_term_psi_search_box(
     }
     Ok((psi_lo, psi_hi))
 }
-
 
 /// Data-derived ψ seed for a spatial term when the user has not set an
 /// explicit length_scale on its basis spec. Uses the geometric mean of the
@@ -6427,7 +6344,6 @@ pub fn build_tensor_bspline_basis(
     })
 }
 
-
 pub fn tensor_product_design_from_marginals(
     marginal_designs: &[Array2<f64>],
 ) -> Result<Array2<f64>, BasisError> {
@@ -6625,28 +6541,6 @@ pub fn build_random_effect_block(
         num_groups: q,
         kept_levels,
     })
-}
-
-
-impl SmoothDesign {
-    /// Map an unconstrained term coefficient vector to its constrained shape space.
-    /// This is useful for nonlinear fits that optimize unconstrained parameters.
-    pub fn map_term_coefficients(
-        unconstrained: &Array1<f64>,
-        shape: ShapeConstraint,
-    ) -> Result<Array1<f64>, BasisError> {
-        if unconstrained.is_empty() {
-            crate::bail_invalid_basis!("unconstrained coefficient vector cannot be empty");
-        }
-        let mapped = match shape {
-            ShapeConstraint::None => unconstrained.clone(),
-            ShapeConstraint::MonotoneIncreasing => cumulative_exp(unconstrained, 1.0),
-            ShapeConstraint::MonotoneDecreasing => cumulative_exp(unconstrained, -1.0),
-            ShapeConstraint::Convex => second_cumulative_exp(unconstrained, 1.0),
-            ShapeConstraint::Concave => second_cumulative_exp(unconstrained, -1.0),
-        };
-        Ok(mapped)
-    }
 }
 
 pub struct LocalSmoothTermBuild {
@@ -7187,7 +7081,6 @@ pub fn build_pca_smooth_basis(
     })
 }
 
-
 /// A factor-level `by=` wrapper owns the model-space centering of its inner
 /// smooth: it gates the raw/structurally-constrained basis to the level rows
 /// and then centers that gated block exactly once against the level indicator
@@ -7534,7 +7427,6 @@ fn canonical_nullspace_directions(z: &Array2<f64>) -> Result<Array2<f64>, BasisE
     }
     Ok(canonical)
 }
-
 
 /// Build a factor-smooth interaction basis (`bs="fs"`/`"sz"`/`"re"`).
 ///
@@ -8919,29 +8811,6 @@ pub fn build_single_local_smooth_term(
         box_reparam: use_box_reparam,
         kronecker_factored: kron_factored,
     })
-}
-
-pub fn build_smooth_design(
-    data: ArrayView2<'_, f64>,
-    terms: &[SmoothTermSpec],
-) -> Result<RawSmoothDesign, BasisError> {
-    let mut ws = crate::basis::BasisWorkspace::new();
-    build_smooth_design_withworkspace(data, terms, &mut ws)
-}
-
-/// Like `build_smooth_design`, but honors the caller workspace policy while
-/// building each planned smooth term with an independent per-term workspace.
-///
-/// Independent workspaces avoid shared mutable distance-cache state during the
-/// parallel term build; the final design, penalties, and metadata are assembled
-/// in the original smooth-term order.
-pub fn build_smooth_design_withworkspace(
-    data: ArrayView2<'_, f64>,
-    terms: &[SmoothTermSpec],
-    workspace: &mut crate::basis::BasisWorkspace,
-) -> Result<RawSmoothDesign, BasisError> {
-    validate_smooth_terms_finite_inputs(data, terms)?;
-    build_smooth_design_withworkspace_unvalidated(data, terms, workspace)
 }
 
 pub fn build_smooth_design_withworkspace_unvalidated(

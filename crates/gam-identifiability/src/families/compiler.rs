@@ -18,10 +18,7 @@ use ndarray::{Array1, Array2, Array3, Axis, s};
 
 use faer::Side;
 use gam_linalg::decision::{RankDecision, certified_rank, equilibrate_gram};
-use gam_linalg::faer_ndarray::{
-    FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb, fast_xt_diag_y,
-    rrqr_with_permutation,
-};
+use gam_linalg::faer_ndarray::{FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_with_permutation};
 
 /// Slack factor (multiples of machine ε) for the rank-revealing eigenvalue
 /// threshold used when pseudo-inverting a Gram matrix or selecting the
@@ -352,45 +349,6 @@ pub fn compile_protected(
     compile_with_dual_metric_protected(operators, row_hess, &id_struct, ordering, protected)
 }
 
-/// Compile a sequence of row-Jacobian operators using *separate* metrics
-/// for structural rank decisions and curvature-aware orthogonalisation.
-///
-/// - `row_hess` is the curvature row metric `K^H_i` (a PSD-clamped Hessian
-///   of `−log L_i(u_i)` at a pilot β).
-/// - `row_structural` is the structural row metric `K^S_i` — typically an
-///   [`IdentityRowHessian`] — used only to decide which columns survive
-///   block-against-block residualisation. A direction that the curvature
-///   `K^H` happens to see as zero at a bad pilot β is *not* dropped here
-///   as long as it is structurally non-degenerate.
-///
-/// Per-block algorithm (left-to-right walk over `ordering`):
-///
-/// 1. Residualise the block in the structural metric against the
-///    cumulative structural anchor; eigendecompose the structural residual
-///    Gram and drop only structural-zero eigenvalues → kept basis `D`
-///    (raw-block selector).
-/// 2. Residualise `W^H_b · D` in the curvature metric against the
-///    cumulative curvature anchor → curvature anchor correction
-///    `M^H_inner` and residual `R^H`.
-/// 3. Eigendecompose the curvature Gram of `R^H` and drop curvature-zero
-///    directions (a *within*-structurally-kept curvature alias is a true
-///    redundancy) → rotation/selector `T_inner`.
-/// 4. Compose: `V = D · T_inner`; compiled anchor correction is
-///    `M^H_inner · T_inner` so the predict-time row contribution stays
-///    `(C(x) · V − A(x) · anchor_correction) · β`.
-///
-/// When `row_structural` and `row_hess` represent the same metric (e.g.
-/// `compile()` with an identity row Hessian on both sides), the two
-/// passes collapse to the single-metric loop.
-pub fn compile_with_dual_metric(
-    operators: &[Arc<dyn RowJacobianOperator>],
-    row_hess: &dyn RowHessian,
-    row_structural: &dyn RowHessian,
-    ordering: &[BlockOrder],
-) -> Result<CompiledBlocks, CompilerError> {
-    compile_with_dual_metric_protected(operators, row_hess, row_structural, ordering, &[])
-}
-
 /// Variant of [`compile_with_dual_metric`] that keeps designated blocks at full
 /// raw width (see [`compile_protected`] / [`compile_from_raw_grams_protected`]
 /// for the motivation). `protected[b] == true` replaces block `b`'s structural
@@ -710,16 +668,6 @@ pub fn compile_with_dual_metric_protected(
         joint_rank,
         dropped,
     })
-}
-
-/// Build `W_b = stack_i sqrt(H_i) · J_b,i` flattened to `(n*K, ncols)` from a
-/// materialised `(n, p, K)` tensor. Thin wrapper over
-/// [`scale_jacobian_by_sqrt_h_with`] that reads the tensor element-wise.
-fn scale_block_by_sqrt_h(jb: &Array3<f64>, h_full: &Array3<f64>) -> Array2<f64> {
-    let n = jb.shape()[0];
-    let p = jb.shape()[1];
-    let k = jb.shape()[2];
-    scale_jacobian_by_sqrt_h_with(n, p, k, h_full, |i, a, c| jb[[i, a, c]])
 }
 
 /// Build `W_b = stack_i sqrt(H_i) · J_b,i` flattened to `(n*K, ncols)` without
@@ -1109,256 +1057,6 @@ pub struct PrimaryChannelBlocks {
     pub blocks: Vec<Vec<Option<Array2<f64>>>>,
 }
 
-/// Closed-form Gram builder: `K^H[a, b] = Σ_{c,d} (X_a^(c))ᵀ · diag(h_{cd}) · X_b^(d)`.
-///
-/// Inputs:
-/// - `channel_blocks`: per-block channel decomposition of the row Jacobian.
-/// - `row_hess`: `(n × K × K)` per-row PSD Hessian (typically clamped to PSD
-///   by the family upstream).
-/// - `raw_block_ranges`: `[start, end)` column ranges of each block inside
-///   the full `p_total`-wide coefficient vector. Must be contiguous and
-///   non-overlapping; their union spans `0..p_total`.
-///
-/// Returns the symmetric `(p_total × p_total)` Gram matrix.
-pub fn build_raw_grams_from_channel_blocks(
-    channel_blocks: &PrimaryChannelBlocks,
-    row_hess: &dyn RowHessian,
-    raw_block_ranges: &[std::ops::Range<usize>],
-) -> Result<Array2<f64>, CompilerError> {
-    let num_blocks = channel_blocks.blocks.len();
-    if num_blocks != raw_block_ranges.len() {
-        return Err(CompilerError::DimensionMismatch(format!(
-            "channel_blocks ({num_blocks}) and raw_block_ranges ({}) length mismatch",
-            raw_block_ranges.len()
-        )));
-    }
-    if num_blocks == 0 {
-        return Ok(Array2::<f64>::zeros((0, 0)));
-    }
-    let k = row_hess.k();
-    let n = row_hess.nrows();
-    let p_total: usize = raw_block_ranges.iter().map(|r| r.end - r.start).sum();
-    let expected_total = raw_block_ranges.last().map(|r| r.end).unwrap_or(0);
-    if expected_total != p_total {
-        return Err(CompilerError::DimensionMismatch(format!(
-            "raw_block_ranges must be contiguous from 0; got p_total={p_total} but last end={expected_total}"
-        )));
-    }
-    // Per-block channel-slot shape sanity.
-    for (b, slots) in channel_blocks.blocks.iter().enumerate() {
-        if slots.len() != k {
-            return Err(CompilerError::DimensionMismatch(format!(
-                "block {b}: expected {k} channel slots, got {}",
-                slots.len()
-            )));
-        }
-        let p_b = raw_block_ranges[b].end - raw_block_ranges[b].start;
-        for (c, mat) in slots.iter().enumerate() {
-            if let Some(x) = mat.as_ref() {
-                if x.nrows() != n {
-                    return Err(CompilerError::DimensionMismatch(format!(
-                        "block {b} channel {c}: nrows={} but row Hessian nrows={n}",
-                        x.nrows()
-                    )));
-                }
-                if x.ncols() != p_b {
-                    return Err(CompilerError::DimensionMismatch(format!(
-                        "block {b} channel {c}: ncols={} but block width={p_b}",
-                        x.ncols()
-                    )));
-                }
-            }
-        }
-    }
-
-    // Materialise H once and slice it into K·K length-n vectors h_{cd}.
-    let h_full = row_hess.evaluate_full();
-    if h_full.shape() != &[n, k, k] {
-        return Err(CompilerError::DimensionMismatch(format!(
-            "row Hessian evaluate_full shape {:?} != [n={n}, k={k}, k={k}]",
-            h_full.shape()
-        )));
-    }
-    // h_pairs[c * k + d] = length-n vector of H_i[c, d].
-    let mut h_pairs: Vec<Array1<f64>> = Vec::with_capacity(k * k);
-    for c in 0..k {
-        for d in 0..k {
-            let mut v = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                v[i] = h_full[[i, c, d]];
-            }
-            h_pairs.push(v);
-        }
-    }
-
-    let mut gram = Array2::<f64>::zeros((p_total, p_total));
-    // Accumulate upper triangle (a ≤ b) then symmetrise.
-    for a in 0..num_blocks {
-        let range_a = raw_block_ranges[a].clone();
-        for b in a..num_blocks {
-            let range_b = raw_block_ranges[b].clone();
-            let mut block_acc =
-                Array2::<f64>::zeros((range_a.end - range_a.start, range_b.end - range_b.start));
-            for c in 0..k {
-                let Some(x_a_c) = channel_blocks.blocks[a][c].as_ref() else {
-                    continue;
-                };
-                for d in 0..k {
-                    let Some(x_b_d) = channel_blocks.blocks[b][d].as_ref() else {
-                        continue;
-                    };
-                    let h_cd = &h_pairs[c * k + d];
-                    // (X_a^(c))ᵀ · diag(h_cd) · X_b^(d)  →  (p_a × p_b).
-                    let contrib = fast_xt_diag_y(x_a_c, h_cd, x_b_d);
-                    block_acc += &contrib;
-                }
-            }
-            // Write into upper triangle (and the diagonal block itself).
-            gram.slice_mut(s![range_a.start..range_a.end, range_b.start..range_b.end])
-                .assign(&block_acc);
-        }
-    }
-    // Symmetrise: copy upper triangle to lower. Diagonal blocks are
-    // themselves p_a × p_a — symmetrise within them too.
-    for i in 0..p_total {
-        for j in 0..i {
-            let v = gram[[j, i]];
-            gram[[i, j]] = v;
-        }
-    }
-    Ok(gram)
-}
-
-/// Structural Gram `K^S`: same shape as [`build_raw_grams_from_channel_blocks`]
-/// but with the per-row Hessian replaced by the K×K identity. Used by the
-/// dual-metric compiler as the un-weighted reference geometry.
-///
-/// `K^S[a, b] = Σ_c (X_a^(c))ᵀ · X_b^(c)` (cross-channel terms vanish under
-/// `H_i = I_K`).
-pub fn build_raw_grams_structural(
-    channel_blocks: &PrimaryChannelBlocks,
-    raw_block_ranges: &[std::ops::Range<usize>],
-) -> Array2<f64> {
-    let num_blocks = channel_blocks.blocks.len();
-    assert_eq!(
-        num_blocks,
-        raw_block_ranges.len(),
-        "channel_blocks ({num_blocks}) and raw_block_ranges ({}) length mismatch",
-        raw_block_ranges.len()
-    );
-    if num_blocks == 0 {
-        return Array2::<f64>::zeros((0, 0));
-    }
-    let p_total = raw_block_ranges.last().map(|r| r.end).unwrap_or(0);
-    let mut gram = Array2::<f64>::zeros((p_total, p_total));
-    for a in 0..num_blocks {
-        let range_a = raw_block_ranges[a].clone();
-        for b in a..num_blocks {
-            let range_b = raw_block_ranges[b].clone();
-            let p_a = range_a.end - range_a.start;
-            let p_b = range_b.end - range_b.start;
-            let k_a = channel_blocks.blocks[a].len();
-            let k_b = channel_blocks.blocks[b].len();
-            assert_eq!(
-                k_a, k_b,
-                "structural Gram: block {a} has {k_a} channels but block {b} has {k_b}",
-            );
-            let mut block_acc = Array2::<f64>::zeros((p_a, p_b));
-            for c in 0..k_a {
-                let (Some(x_a_c), Some(x_b_c)) = (
-                    channel_blocks.blocks[a][c].as_ref(),
-                    channel_blocks.blocks[b][c].as_ref(),
-                ) else {
-                    continue;
-                };
-                let contrib = if a == b {
-                    // Diagonal block, same channel — symmetric XᵀX.
-                    fast_ata(x_a_c)
-                } else {
-                    fast_atb(x_a_c, x_b_c)
-                };
-                block_acc += &contrib;
-            }
-            gram.slice_mut(s![range_a.start..range_a.end, range_b.start..range_b.end])
-                .assign(&block_acc);
-        }
-    }
-    for i in 0..p_total {
-        for j in 0..i {
-            let v = gram[[j, i]];
-            gram[[i, j]] = v;
-        }
-    }
-    gram
-}
-
-/// Build the primary-state curvature Gram `K^H` and structural Gram `K^S`
-/// for a block decomposition, preferring the device (GPU) path when
-/// available and falling back to the CPU closed-form builders otherwise.
-///
-/// The GPU path is only attempted for survival-family geometry
-/// (`K = CHANNELS = 4`) — that is the case the GPU kernel
-/// (`crate::families::gpu::try_primary_state_gram_cuda`)
-/// is specialised for via the packed-symmetric `n × 10` weight layout.
-/// For any other `K` the CPU builders are used unconditionally.
-///
-/// Returns `(gram_h, gram_struct)` with the same shape and semantics as
-/// [`build_raw_grams_from_channel_blocks`] + [`build_raw_grams_structural`].
-pub fn build_primary_grams_gpu_or_cpu(
-    channel_blocks: &PrimaryChannelBlocks,
-    row_hess: &dyn RowHessian,
-    raw_block_ranges: &[std::ops::Range<usize>],
-) -> Result<(Array2<f64>, Array2<f64>), CompilerError> {
-    let k = row_hess.k();
-    if k == crate::families::gpu::CHANNELS {
-        let gpu_blocks: Vec<Vec<Option<Array2<f64>>>> = channel_blocks
-            .blocks
-            .iter()
-            .map(|slots| slots.iter().cloned().collect())
-            .collect();
-        if let Some(h_packed) = pack_row_hessian_symmetric(row_hess) {
-            if let Some(bundle) = crate::families::gpu::try_primary_state_gram_cuda(
-                &gpu_blocks,
-                &h_packed,
-                raw_block_ranges,
-            )
-            .map_err(|error| CompilerError::GpuFailure(error.to_string()))?
-            {
-                log::info!("[identifiability_compile] gram path = gpu");
-                return Ok((bundle.gram_h, bundle.gram_struct));
-            }
-        }
-    }
-    log::info!("[identifiability_compile] gram path = cpu");
-    let gram_h = build_raw_grams_from_channel_blocks(channel_blocks, row_hess, raw_block_ranges)?;
-    let gram_struct = build_raw_grams_structural(channel_blocks, raw_block_ranges);
-    Ok((gram_h, gram_struct))
-}
-
-/// Pack a per-row symmetric `K = 4` Hessian into the `n × 10`
-/// upper-triangular row-major layout consumed by the GPU kernel
-/// (`packed_index(c, d)` for `c ≤ d`). Returns `None` when `K != 4`.
-fn pack_row_hessian_symmetric(row_hess: &dyn RowHessian) -> Option<Array2<f64>> {
-    use crate::families::gpu::{CHANNELS, PACKED_LEN, packed_index};
-    if row_hess.k() != CHANNELS {
-        return None;
-    }
-    let n = row_hess.nrows();
-    let h_full = row_hess.evaluate_full();
-    if h_full.shape() != [n, CHANNELS, CHANNELS] {
-        return None;
-    }
-    let mut packed = Array2::<f64>::zeros((n, PACKED_LEN));
-    for i in 0..n {
-        for c in 0..CHANNELS {
-            for d in c..CHANNELS {
-                packed[[i, packed_index(c, d)]] = h_full[[i, c, d]];
-            }
-        }
-    }
-    Some(packed)
-}
-
 /// Closed-form Gram-based compile output: a single `p_raw × p_compiled`
 /// reparam matrix `T` mapping compiled coordinates back to raw width.
 /// `T · θ` lifts a fitted compiled-width β back to raw width; predict-time
@@ -1384,14 +1082,15 @@ pub struct CompiledMap {
 /// `CompiledMap` (which lives ABOVE `gam-problem`). This `impl` supplies
 /// the inverted dependency edge.
 impl gam_problem::gauge::CompiledBlockMap for CompiledMap {
+
+    fn compiled_block_ranges(&self) -> &[std::ops::Range<usize>] {
+        &self.compiled_block_ranges
+    }
     fn raw_from_compiled(&self) -> &Array2<f64> {
         &self.raw_from_compiled
     }
     fn raw_block_ranges(&self) -> &[std::ops::Range<usize>] {
         &self.raw_block_ranges
-    }
-    fn compiled_block_ranges(&self) -> &[std::ops::Range<usize>] {
-        &self.compiled_block_ranges
     }
 }
 
@@ -1656,129 +1355,6 @@ impl CompiledMap {
         self.raw_from_compiled.nrows()
     }
 
-    /// Compiled (reduced) coefficient width (`p_compiled`).
-    pub fn p_compiled(&self) -> usize {
-        self.raw_from_compiled.ncols()
-    }
-
-    /// Reparameterise a raw design into compiled coordinates:
-    /// `X_compiled = X_raw · T` (`n × p_compiled`). Because the lift is
-    /// `β_raw = T β_compiled`, the compiled design predicts identically to the
-    /// raw design on every compiled coefficient: `X_compiled · θ = X_raw · (T θ)`.
-    /// Families that build directly in reduced coordinates feed this compiled
-    /// design (and the [`reduce_penalties_with_map`] penalties) to the solver;
-    /// the rank-deficient raw basis never reaches Newton.
-    pub fn reduce_design(&self, raw_design: &Array2<f64>) -> Result<Array2<f64>, String> {
-        if raw_design.ncols() != self.p_raw() {
-            return Err(format!(
-                "CompiledMap::reduce_design: raw_design has {} columns, expected p_raw {}",
-                raw_design.ncols(),
-                self.p_raw()
-            ));
-        }
-        Ok(fast_ab(raw_design, &self.raw_from_compiled))
-    }
-
-    /// Lift a fitted compiled-width coefficient vector back to raw width:
-    /// `β_raw = T · β_compiled`. This is the exact inverse direction of the
-    /// quotient reduction — the reduced coordinates are what Newton/REML
-    /// operate in, and this map carries the final estimate (and any linear
-    /// functional of it) back to the original parameterisation so reported
-    /// coefficients and predictions match the raw design.
-    pub fn lift_coefficients(&self, beta_compiled: &Array1<f64>) -> Result<Array1<f64>, String> {
-        if beta_compiled.len() != self.p_compiled() {
-            return Err(format!(
-                "CompiledMap::lift_coefficients: beta_compiled len {} != p_compiled {}",
-                beta_compiled.len(),
-                self.p_compiled()
-            ));
-        }
-        Ok(self.raw_from_compiled.dot(beta_compiled))
-    }
-
-    /// The rows of `T` belonging to raw block `b` (`T[raw_block_ranges[b], :]`,
-    /// shape `p_b_raw × p_compiled`). A raw-block penalty `S_b` acts only on
-    /// these raw columns, so the penalty's reduced-coordinate form depends on
-    /// `T` only through this slice.
-    fn raw_block_rows(&self, block_idx: usize) -> Result<Array2<f64>, String> {
-        let range = self.raw_block_ranges.get(block_idx).ok_or_else(|| {
-            format!(
-                "CompiledMap::raw_block_rows: block {block_idx} out of range {}",
-                self.raw_block_ranges.len()
-            )
-        })?;
-        Ok(self
-            .raw_from_compiled
-            .slice(s![range.start..range.end, ..])
-            .to_owned())
-    }
-}
-
-/// Transform a per-block raw-width penalty into the compiled (reduced)
-/// coordinate frame defined by `map`.
-///
-/// `raw_penalties[b]` is the penalty matrix `S_b` acting on raw block `b`
-/// (shape `p_b_raw × p_b_raw`), or `None` for an unpenalised block. The
-/// returned `reduced[b]` is the **full** `(p_compiled × p_compiled)` penalty
-/// `Tᵀ Ŝ_b T`, where `Ŝ_b` embeds `S_b` into the `p_raw × p_raw` zero matrix
-/// at block `b`'s position. Because `Ŝ_b` is zero outside block `b`'s rows and
-/// columns, this equals `T_bᵀ S_b T_b` with `T_b = T[raw_block_ranges[b], :]`,
-/// so the reduced penalty is computed from the block's lift rows alone — no
-/// dense `p_raw × p_raw` embedding is materialised.
-///
-/// Exactness: for any compiled coefficient `θ` with raw lift `β = T θ`, the raw
-/// penalty energy `βᵀ Ŝ_b β = (T θ)ᵀ Ŝ_b (T θ) = θᵀ (Tᵀ Ŝ_b T) θ`, so the
-/// reduced penalty reproduces the raw penalty energy on every lifted point.
-/// A compiled block that absorbed to zero width simply contributes a zero
-/// column range; its raw penalty (if any) projects onto the surviving
-/// compiled directions through `T_b`, never lost.
-pub fn reduce_penalties_with_map(
-    map: &CompiledMap,
-    raw_penalties: &[Option<Array2<f64>>],
-) -> Result<Vec<Option<Array2<f64>>>, String> {
-    if raw_penalties.len() != map.raw_block_ranges.len() {
-        return Err(format!(
-            "reduce_penalties_with_map: raw_penalties ({}) != blocks ({})",
-            raw_penalties.len(),
-            map.raw_block_ranges.len()
-        ));
-    }
-    let p_compiled = map.p_compiled();
-    let mut reduced: Vec<Option<Array2<f64>>> = Vec::with_capacity(raw_penalties.len());
-    for (block_idx, raw_penalty) in raw_penalties.iter().enumerate() {
-        let Some(s_b) = raw_penalty.as_ref() else {
-            reduced.push(None);
-            continue;
-        };
-        let p_b_raw = map.raw_block_ranges[block_idx].len();
-        if s_b.shape() != [p_b_raw, p_b_raw] {
-            return Err(format!(
-                "reduce_penalties_with_map: block {block_idx} penalty shape {:?} != [{p_b_raw}, {p_b_raw}]",
-                s_b.shape()
-            ));
-        }
-        // T_b = T[raw rows of block b, :]  (p_b_raw × p_compiled)
-        let t_b = map.raw_block_rows(block_idx)?;
-        // S_compiled = T_bᵀ S_b T_b  (p_compiled × p_compiled)
-        let s_t_b = fast_ab(s_b, &t_b); // (p_b_raw × p_compiled)
-        let s_compiled_raw = fast_atb(&t_b, &s_t_b); // (p_compiled × p_compiled)
-        let mut s_compiled = symmetrise(&s_compiled_raw);
-        if s_compiled.shape() != [p_compiled, p_compiled] {
-            return Err(format!(
-                "reduce_penalties_with_map: block {block_idx} reduced penalty shape {:?} != [{p_compiled}, {p_compiled}]",
-                s_compiled.shape()
-            ));
-        }
-        for v in s_compiled.iter_mut() {
-            if !v.is_finite() {
-                return Err(format!(
-                    "reduce_penalties_with_map: block {block_idx} reduced penalty has non-finite entry"
-                ));
-            }
-        }
-        reduced.push(Some(s_compiled));
-    }
-    Ok(reduced)
 }
 
 /// Per-block exact orthogonal reparameterisation of structural confounds.
@@ -3669,4 +3245,14 @@ mod tests {
             );
         }
     }
+}
+
+/// Build `W_b = stack_i sqrt(H_i) · J_b,i` flattened to `(n*K, ncols)` from a
+/// materialised `(n, p, K)` tensor. Thin wrapper over
+/// [`scale_jacobian_by_sqrt_h_with`] that reads the tensor element-wise.
+fn scale_block_by_sqrt_h(jb: &Array3<f64>, h_full: &Array3<f64>) -> Array2<f64> {
+    let n = jb.shape()[0];
+    let p = jb.shape()[1];
+    let k = jb.shape()[2];
+    scale_jacobian_by_sqrt_h_with(n, p, k, h_full, |i, a, c| jb[[i, a, c]])
 }

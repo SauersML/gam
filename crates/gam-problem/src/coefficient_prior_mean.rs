@@ -85,28 +85,6 @@ impl CoefficientPriorMean {
         Self::Constant(values)
     }
 
-    pub fn functional(
-        metadata: Array1<f64>,
-        evaluator: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
-    ) -> Self {
-        Self::Functional {
-            metadata,
-            evaluator,
-        }
-    }
-
-    pub fn kernel_basis(
-        covariates: Array1<f64>,
-        amplitude: f64,
-        kernel: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
-    ) -> Self {
-        Self::KernelBasis {
-            covariates,
-            amplitude,
-            kernel,
-        }
-    }
-
     pub fn evaluate(&self, block_dim: usize, context: &str) -> Result<Array1<f64>, PriorMeanError> {
         let values = match self {
             Self::Zero => Array1::zeros(block_dim),

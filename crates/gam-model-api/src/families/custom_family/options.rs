@@ -487,21 +487,6 @@ pub fn joint_coupled_coefficient_hessian_cost(n: u64, specs: &[ParameterBlockSpe
     n.saturating_mul(p_total.saturating_mul(p_total))
 }
 
-/// Default coefficient-space gradient cost: half the Hessian cost.
-///
-/// The first-order analytic gradient in the unified evaluator runs the same
-/// inner Newton solve as the second-order path but skips the `K`-fold
-/// pairwise Hessian assembly (`B_{j,k}` blocks) and the `K`-fold inner
-/// derivative solves; what remains is the inner solve plus a single
-/// gradient-only sweep through the data. Empirically this is roughly half
-/// the per-evaluation arithmetic of forming the dense Hessian, hence the
-/// `/2` default. Families whose gradient assembly differs structurally
-/// (e.g. matrix-free Hv operators with no dense Hessian assembly to halve)
-/// should override [`CustomFamily::coefficient_gradient_cost`] explicitly.
-pub fn default_coefficient_gradient_cost(specs: &[ParameterBlockSpec]) -> u64 {
-    default_coefficient_hessian_cost(specs) / 2
-}
-
 /// Compute β-block column ranges from a slice of `ParameterBlockSpec`s.
 ///
 /// Returns one `Range<usize>` per spec, covering the spec's columns in the

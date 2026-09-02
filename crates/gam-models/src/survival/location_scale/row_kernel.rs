@@ -851,7 +851,6 @@ fn sls_row_fourth_generated(
     )
 }
 
-
 /// Hessian-only lowering of the same build-time symbolic atoms used by
 /// [`sls_row_vgh_compiled`]. Only the 24 structurally live upper-triangle
 /// channels exist in the output; no 9×9 primary Hessian is materialized.

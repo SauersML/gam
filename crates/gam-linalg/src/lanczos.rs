@@ -84,32 +84,6 @@ pub struct SymmetricLanczosEigenpairs {
     pub residual_norm: f64,
 }
 
-pub fn symmetric_lanczos_log_quadrature(
-    eigenpairs: &SymmetricLanczosEigenpairs,
-    spd_context: &str,
-) -> Result<f64, String> {
-    let k = eigenpairs.eigenvalues.len();
-    if eigenpairs.eigenvectors.nrows() == 0 || eigenpairs.eigenvectors.ncols() != k {
-        return Err(format!(
-            "{spd_context}: Lanczos eigenvector shape mismatch: got ({}, {}), expected first row and {k} columns",
-            eigenpairs.eigenvectors.nrows(),
-            eigenpairs.eigenvectors.ncols(),
-        ));
-    }
-    let mut quad = 0.0_f64;
-    for j in 0..k {
-        let theta = eigenpairs.eigenvalues[j];
-        if !theta.is_finite() || theta <= 0.0 {
-            return Err(format!(
-                "{spd_context}: expected positive finite Ritz value {j}, got {theta:.3e}"
-            ));
-        }
-        let weight = eigenpairs.eigenvectors[[0, j]] * eigenpairs.eigenvectors[[0, j]];
-        quad += weight * theta.ln();
-    }
-    Ok(quad)
-}
-
 #[inline]
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
@@ -523,6 +497,32 @@ pub fn symmetric_extreme_lanczos_eigenpairs(
          (worst relative residual {last_worst_relative_residual:.3e}, tolerance {:.3e})",
         options.target_rank, steps, options.relative_residual_tol
     ))
+}
+
+pub fn symmetric_lanczos_log_quadrature(
+    eigenpairs: &SymmetricLanczosEigenpairs,
+    spd_context: &str,
+) -> Result<f64, String> {
+    let k = eigenpairs.eigenvalues.len();
+    if eigenpairs.eigenvectors.nrows() == 0 || eigenpairs.eigenvectors.ncols() != k {
+        return Err(format!(
+            "{spd_context}: Lanczos eigenvector shape mismatch: got ({}, {}), expected first row and {k} columns",
+            eigenpairs.eigenvectors.nrows(),
+            eigenpairs.eigenvectors.ncols(),
+        ));
+    }
+    let mut quad = 0.0_f64;
+    for j in 0..k {
+        let theta = eigenpairs.eigenvalues[j];
+        if !theta.is_finite() || theta <= 0.0 {
+            return Err(format!(
+                "{spd_context}: expected positive finite Ritz value {j}, got {theta:.3e}"
+            ));
+        }
+        let weight = eigenpairs.eigenvectors[[0, j]] * eigenpairs.eigenvectors[[0, j]];
+        quad += weight * theta.ln();
+    }
+    Ok(quad)
 }
 
 #[cfg(test)]

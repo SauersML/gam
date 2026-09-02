@@ -36,19 +36,34 @@ pub(crate) use gam_problem::{bail_dim_custom, bail_invalid_estim};
 
 // --- crate-internal (gam-solve) imports ---------------------------------
 pub(crate) use crate::custom_family_persistent_warm_start::{
-    capture_fit_artifact, consume_fit_artifact, load_persistent_custom_family_warm_start,
-    store_persistent_custom_family_warm_start, update_custom_outer_inner_cap_from_warm_start,
+    capture_fit_artifact,
+    consume_fit_artifact,
+    load_persistent_custom_family_warm_start,
+    store_persistent_custom_family_warm_start,
+    update_custom_outer_inner_cap_from_warm_start,
 };
 pub(crate) use gam_solve::active_set::project_stationarity_residual_on_constraint_cone;
 pub(crate) use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 pub(crate) use gam_solve::estimate::reml::reml_outer_engine::{
-    ActiveConstraintTangentGeometry, BlockCoupledOperator, CompositeHyperOperator,
-    DenseSpectralOperator, DispersionHandling, ExactJeffreysTerm, HessianDerivativeProvider,
-    HessianFactorization, MatrixFreeSpdOperator, OuterHessianDerivativeKernel,
-    PenaltySubspaceTrace, StochasticTraceState, active_constraint_face_geometry,
+    ActiveConstraintTangentGeometry,
+    BlockCoupledOperator,
+    CompositeHyperOperator,
+    DenseSpectralOperator,
+    DispersionHandling,
+    ExactJeffreysTerm,
+    HessianDerivativeProvider,
+    HessianFactorization,
+    MatrixFreeSpdOperator,
+    OuterHessianDerivativeKernel,
+    PenaltySubspaceTrace,
+    StochasticTraceState,
+    active_constraint_face_geometry,
     active_constraint_tangent_geometry,
-    compute_block_penalty_logdet_derivs_with_prior_factors, compute_efs_update,
-    compute_hybrid_efs_update, exact_pseudo_logdet, hessian_factorization_geometric_scale,
+    compute_block_penalty_logdet_derivs_with_prior_factors,
+    compute_efs_update,
+    compute_hybrid_efs_update,
+    exact_pseudo_logdet,
+    hessian_factorization_geometric_scale,
     positive_eigenvalue_threshold,
 };
 // `ActiveLinearConstraintBlock`, `FitGeometry`, and `ProjectedKktResidual` are
@@ -56,7 +71,10 @@ pub(crate) use gam_solve::estimate::reml::reml_outer_engine::{
 // crate-root `model_types` module; `EstimationError` already descended to
 // `gam-problem` and arrives via the `gam_problem::*` glob below.
 pub(crate) use gam_solve::model_types::{
-    ActiveLinearConstraintBlock, FitGeometry, ProjectedKktResidual, WorkingGeometry,
+    ActiveLinearConstraintBlock,
+    FitGeometry,
+    ProjectedKktResidual,
+    WorkingGeometry,
 };
 pub(crate) use gam_solve::pirls::solve_newton_directionwith_lower_bounds;
 
@@ -64,7 +82,10 @@ pub(crate) use gam_solve::pirls::solve_newton_directionwith_lower_bounds;
 pub(crate) use faer::Side;
 pub(crate) use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_atb, fast_av};
 pub(crate) use gam_linalg::matrix::{
-    DesignMatrix, FiniteSignedWeightsView, LinearOperator, SymmetricMatrix,
+    DesignMatrix,
+    FiniteSignedWeightsView,
+    LinearOperator,
+    SymmetricMatrix,
 };
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
 pub(crate) use std::any::Any;
@@ -92,14 +113,26 @@ pub(crate) use gam_problem::*;
 // gam-models' own `gam_model_api`/`gam_problem` globs — they do not introduce an
 // E0659 ambiguity in the gam-models facade.
 pub use gam_model_api::families::custom_family::{
-    BlockwiseFitOptions, CustomFamily, FamilyEvaluation, OuterDerivativePilotSchedule,
+    BlockwiseFitOptions,
+    CustomFamily,
+    FamilyEvaluation,
+    OuterDerivativePilotSchedule,
     exact_newton_outer_geometry_supports_second_order_solver,
 };
 pub use gam_problem::{
-    AdditiveBlockJacobian, BlockEffectiveJacobian, BlockGeometryDirectionalDerivative,
-    BlockWorkingSet, CustomFamilyBlockPsiDerivative, CustomFamilyHyperAxis,
-    CustomFamilyHyperLayout, CustomFamilyPsiDerivativeOperator, ExactNewtonOuterObjective,
-    FamilyLinearizationState, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    AdditiveBlockJacobian,
+    BlockEffectiveJacobian,
+    BlockGeometryDirectionalDerivative,
+    BlockWorkingSet,
+    CustomFamilyBlockPsiDerivative,
+    CustomFamilyHyperAxis,
+    CustomFamilyHyperLayout,
+    CustomFamilyPsiDerivativeOperator,
+    ExactNewtonOuterObjective,
+    FamilyLinearizationState,
+    ParameterBlockSpec,
+    ParameterBlockState,
+    PenaltyMatrix,
     SharedCustomFamilyHyperLayout,
 };
 
@@ -116,7 +149,6 @@ mod custom_family_persistent_warm_start;
 mod assembly;
 mod block_spec;
 mod blockwise_solve;
-mod coefficient_groups;
 mod covariance;
 mod fit;
 mod inner_blockwise_fit;
@@ -134,20 +166,24 @@ mod warm_start;
 pub(crate) use self::block_spec::custom_family_block_role;
 pub use self::block_spec::validate_blockspecs;
 pub use self::block_spec::{
-    CoefficientBlockSelector, CoefficientGroupSpec, CoefficientLabel, RealizedCoefficientGroup,
-    RealizedCoefficientGroupSpecs, coefficient_label,
+    CoefficientBlockSelector,
+    CoefficientGroupSpec,
+    CoefficientLabel,
+    RealizedCoefficientGroup,
+    RealizedCoefficientGroupSpecs,
 };
 pub use assembly::*;
 pub(crate) use blockwise_solve::*;
-pub use coefficient_groups::*;
 pub(crate) use covariance::*;
 // Two covariance helpers are part of the public flat-namespace API consumed by
 // the relocated families (`crate::{use_joint_matrix_free_path,
 // projected_linear_constraint_stationarity_vector}`); surface them publicly
 // (the `pub(crate) use covariance::*` glob above keeps them crate-internal).
 pub use covariance::{
-    JOINT_MATRIX_FREE_MIN_DIM, joint_exact_analytic_outer_hessian_available,
-    projected_linear_constraint_stationarity_vector, use_joint_matrix_free_path,
+    JOINT_MATRIX_FREE_MIN_DIM,
+    joint_exact_analytic_outer_hessian_available,
+    projected_linear_constraint_stationarity_vector,
+    use_joint_matrix_free_path,
 };
 pub use fit::*;
 pub(crate) use inner_blockwise_fit::*;

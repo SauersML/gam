@@ -107,16 +107,7 @@ use ndarray::{
 
 use std::sync::Arc;
 
-pub(crate) use gam_solve::arrow_schur::{
-    ArrowBetaGaugeQuotient, ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError,
-    ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode, BetaPenaltyOp, CompositePenaltyOp,
-    CoupledCarrierPenaltyOp, DensePenaltyOp, DeviceSaePcgData, DeviceSaeSmoothBlock,
-    FactoredFrameGBlock, FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp,
-    SparseBlockKroneckerPenaltyOp, SparseGBlock, StreamingArrowSchur,
-    matrix_free_arrow_inverse_apply, matrix_free_arrow_operator_apply, prepare_sae_resident_frame,
-    row_sub_floor_null_directions, solve_arrow_newton_step_with_proximal_correction,
-    solve_streaming_reduced_beta, solve_with_lm_escalation_inner,
-};
+pub(crate) use gam_solve::arrow_schur::{ArrowBetaGaugeQuotient, ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode, BetaPenaltyOp, CompositePenaltyOp, CoupledCarrierPenaltyOp, DensePenaltyOp, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock, StreamingArrowSchur, matrix_free_arrow_inverse_apply, matrix_free_arrow_operator_apply, prepare_sae_resident_frame, row_sub_floor_null_directions, solve_arrow_newton_step_with_proximal_correction, solve_with_lm_escalation_inner};
 
 pub(crate) use gam_terms::analytic_penalties::{
     AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DecoderIncoherencePenalty,
@@ -131,20 +122,11 @@ pub use gam_terms::analytic_penalties::resolve_learnable_weight;
 pub use gam_terms::latent::LatentManifold;
 pub(crate) use gam_terms::latent::{LatentCoordValues, LatentIdMode};
 
-pub(crate) use crate::criterion_atoms::SaeCriterion;
-
-pub(crate) use gam_linalg::faer_ndarray::{
-    FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_abt, fast_atb,
-    with_nested_parallel,
-};
+pub(crate) use gam_linalg::faer_ndarray::{FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_atb, with_nested_parallel};
 
 pub(crate) use gam_linalg::triangular::cholesky_solve_vector;
 
-pub(crate) use gam_solve::arrow_schur::{
-    ArrowFactorCache, ArrowRowGaugeDeflation, RowDeflationSpectrum, RowSpectralConditioning,
-    arrow_factor_max_pivot, arrow_factor_min_pivot, probe_undamped_evidence_row_factors,
-    solve_arrow_newton_step_with_options,
-};
+pub(crate) use gam_solve::arrow_schur::{ArrowFactorCache, ArrowRowGaugeDeflation, RowDeflationSpectrum, RowSpectralConditioning, arrow_factor_max_pivot, arrow_factor_min_pivot, probe_undamped_evidence_row_factors, solve_arrow_newton_step_with_options};
 
 // #988 memory-matrix-free criterion log-det: the reduced-Schur SLQ entry point
 // and its shared tuning constants, used when the dense k×k Schur exceeds budget.
@@ -163,8 +145,6 @@ pub(crate) use gam_solve::arrow_schur::{
 
 pub(crate) use gam_solve::estimate::EstimationError;
 
-pub(crate) use gam_solve::evidence::arrow_log_det_from_cache;
-
 pub(crate) use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, HessianValue, OuterEval};
 pub(crate) use gam_solve::rho_optimizer::{
     OuterCapability, OuterConvergedVia, OuterEvalOrder, OuterObjective, SeedOutcome,
@@ -181,7 +161,6 @@ pub use crate::assignment::*;
 pub use crate::basis::*;
 pub use crate::frames::*;
 
-mod amortized_routing;
 mod arrow_solver;
 mod atlas_topology;
 mod atom;
@@ -236,7 +215,6 @@ mod minimal_seed;
 mod oos_entry;
 mod oos_logit_seed;
 mod outer_objective;
-mod pair_kappa;
 mod pair_phase;
 mod pca_seed;
 mod penalties;
@@ -266,7 +244,6 @@ mod terracini;
 pub(crate) mod tests_topology_fixtures;
 mod transport_law;
 mod wbic_audit;
-mod wbic_dynamics;
 mod weight_frame_catalog;
 
 #[cfg(test)]
@@ -637,7 +614,6 @@ pub use loss::*;
 pub use minimal_seed::*;
 pub use oos_entry::*;
 pub use outer_objective::*;
-pub use pair_kappa::*;
 pub use pair_phase::*;
 pub use pca_seed::*;
 pub use penalties::*;
@@ -659,5 +635,4 @@ pub use term::*;
 pub use terracini::*;
 pub use transport_law::*;
 pub use wbic_audit::*;
-pub use wbic_dynamics::*;
 pub use weight_frame_catalog::*;

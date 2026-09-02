@@ -185,26 +185,6 @@ impl std::fmt::Display for CurvatureResolutionError {
 
 impl std::error::Error for CurvatureResolutionError {}
 
-/// The error model of a central second difference at step `h`:
-/// `4·ε_f/h² + (h²/12)·M₄`.
-///
-/// Exposed because it is the object [`CurvatureResolution::finite_difference`]
-/// minimises, so the closed forms for `h*` and `δσ_min` can be gated against
-/// it numerically rather than asserted.
-///
-/// Returns `f64::INFINITY` for a non-positive step, which is the correct limit
-/// of the noise term rather than a sentinel.
-pub fn finite_difference_error_bound(
-    evaluation_error: f64,
-    fourth_derivative: f64,
-    step: f64,
-) -> f64 {
-    if !step.is_finite() || step <= 0.0 {
-        return f64::INFINITY;
-    }
-    4.0 * evaluation_error / (step * step) + step * step * fourth_derivative / 12.0
-}
-
 /// One **measured** component of `‖δH‖₂`, carrying the name of the identity
 /// that measured it.
 ///
@@ -357,12 +337,6 @@ impl CurvatureResolution {
         })
     }
 
-    /// The measured component that set this resolution, when it was built from
-    /// a named set of them.
-    pub fn dominant_source(&self) -> Option<&'static str> {
-        self.dominant_source
-    }
-
     /// Which law produced this resolution.
     pub fn law(&self) -> CurvatureLaw {
         self.law
@@ -372,16 +346,6 @@ impl CurvatureResolution {
     /// distinguishable from zero by the route that produced them.
     pub fn resolution(&self) -> f64 {
         self.resolution
-    }
-
-    /// The step at which a central second difference attains this resolution,
-    /// `(48·ε_f/M₄)^{1/4}`.
-    ///
-    /// `None` under [`CurvatureLaw::AnalyticWeyl`], where there is no step —
-    /// which is the type-level statement that the two laws are not
-    /// interchangeable.
-    pub fn optimal_step(&self) -> Option<f64> {
-        self.optimal_step
     }
 
     /// Whether a measured curvature is resolved by the route that produced it,

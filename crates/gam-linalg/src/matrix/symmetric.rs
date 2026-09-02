@@ -176,33 +176,6 @@ impl SymmetricMatrix {
         }
     }
 
-    pub fn addridge(&self, ridge: f64) -> Result<Self, String> {
-        if ridge == 0.0 {
-            return Ok(self.clone());
-        }
-        match self {
-            Self::Dense(mat) => {
-                let mut out = mat.clone();
-                for i in 0..out.nrows() {
-                    out[[i, i]] += ridge;
-                }
-                Ok(Self::Dense(out))
-            }
-            Self::Sparse(mat) => {
-                let n = mat.nrows();
-                let mut trip = Vec::with_capacity(n);
-                for i in 0..n {
-                    trip.push(Triplet::new(i, i, ridge));
-                }
-                let diagonal = SparseColMat::<usize, f64>::try_new_from_triplets(n, n, &trip)
-                    .map_err(|_| {
-                        "SymmetricMatrix::addridge failed to assemble sparse diagonal".to_string()
-                    })?;
-                Ok(Self::Sparse(add_sparse_symmetric_upper(mat, &diagonal)?))
-            }
-        }
-    }
-
     pub fn nrows(&self) -> usize {
         match self {
             Self::Dense(m) => m.nrows(),
@@ -239,32 +212,6 @@ impl SymmetricMatrix {
                     }
                 }
                 out
-            }
-        }
-    }
-
-    /// Maximum absolute value on the diagonal.
-    pub fn max_abs_diag(&self) -> f64 {
-        match self {
-            Self::Dense(mat) => {
-                let n = mat.nrows().min(mat.ncols());
-                (0..n).map(|i| mat[[i, i]].abs()).fold(0.0_f64, f64::max)
-            }
-            Self::Sparse(mat) => {
-                let (symbolic, values) = mat.parts();
-                let col_ptr = symbolic.col_ptr();
-                let row_idx = symbolic.row_idx();
-                let mut max_val = 0.0_f64;
-                for col in 0..mat.ncols() {
-                    let start = col_ptr[col];
-                    let end = col_ptr[col + 1];
-                    for idx in start..end {
-                        if row_idx[idx] == col {
-                            max_val = max_val.max(values[idx].abs());
-                        }
-                    }
-                }
-                max_val
             }
         }
     }
@@ -441,19 +388,6 @@ pub fn symmetrization_defect_2norm(matrix: &Array2<f64>) -> f64 {
             .sqrt(),
         Err(_) => 0.0,
     }
-}
-
-/// PSD-precondition Gram: `XᵀWX` with `w ≥ 0`.
-///
-/// Use for Fisher-scoring / canonical-link IRLS, where the working weights are
-/// guaranteed nonneg by construction. The `w ≥ 0` precondition is discharged
-/// at the `PsdWeightsView::try_new` constructor; the kernel below performs no
-/// further scan. Numeric path is identical to `xt_diag_x_signed`.
-pub fn xt_diag_x_psd(
-    design: &DesignMatrix,
-    diag: PsdWeightsView<'_>,
-) -> Result<SymmetricMatrix, String> {
-    xt_diag_x_symmetric(design, &diag.view().to_owned())
 }
 
 pub fn xt_diag_x_symmetric(
@@ -937,7 +871,6 @@ mod tests {
             }
         }
     }
-
 
     // ── symmetrization_defect_2norm (#2748) ──────────────────────────────────
 

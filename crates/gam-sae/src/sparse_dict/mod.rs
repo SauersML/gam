@@ -45,50 +45,23 @@ mod update;
 #[cfg(test)]
 mod tests;
 
-pub use block::{
-    BlockSeedPolicy, BlockSparseConfig, BlockSparseConvergence, BlockSparseFit,
-    BlockSparseFitError, block_gates, block_projections_row, block_sparse_dictionary_block_coords,
-    block_sparse_dictionary_lift_block, block_sparse_dictionary_project_residual,
-    block_sparse_dictionary_transform, coordinate_partition_frames, fit_block_sparse_dictionary,
-    fit_block_sparse_dictionary_with_seed, reconstruct_block_sparse_rows, reconstruct_row,
-    route_row_blocks, row_loss,
-};
-pub use block_chart::{
-    BlockChartComposeConfig, BlockChartComposeResult, BlockChartRecord, BlockSeedManifest,
-    BlockSeedManifestConfig, BlockSeedRecord, CHART_FDR_ALPHA, ChartEvidence, MdlFeaturizerRow,
-    block_sparse_dictionary_firings, block_sparse_dictionary_seed_manifest,
-    compose_block_coordinate_charts,
-};
-pub use block_scoring_gpu::{
-    BlockRoutePath, block_gate_block_cpu, block_gate_row_cpu, route_blocks_cpu,
-};
+pub use block::{BlockSeedPolicy, BlockSparseConfig, BlockSparseConvergence, BlockSparseFit, BlockSparseFitError, block_gates, block_projections_row, block_sparse_dictionary_block_coords, block_sparse_dictionary_lift_block, block_sparse_dictionary_project_residual, block_sparse_dictionary_transform, coordinate_partition_frames, fit_block_sparse_dictionary, fit_block_sparse_dictionary_with_seed, reconstruct_block_sparse_rows, route_row_blocks};
+pub use block_chart::{BlockChartComposeConfig, BlockChartComposeResult, BlockChartRecord, BlockSeedManifest, BlockSeedManifestConfig, BlockSeedRecord, CHART_FDR_ALPHA, ChartEvidence, MdlFeaturizerRow, block_sparse_dictionary_firings, block_sparse_dictionary_seed_manifest, compose_block_coordinate_charts};
+pub use block_scoring_gpu::{BlockRoutePath, block_gate_row_cpu, route_blocks_cpu};
 #[cfg(target_os = "linux")]
 pub use block_scoring_gpu::{DEVICE_BLOCK_GATE_MIN_ELEMS, route_blocks_required};
-pub use block_stream::{
-    BlockEpochStats, BlockShardStats, BlockSparseStreamArtifact, BlockSparseStreamState,
-};
+pub use block_stream::{BlockEpochStats, BlockShardStats, BlockSparseStreamArtifact, BlockSparseStreamState};
 pub use codes::SparseCode;
-pub use cofit::{CofitConfig, CofitReport, CofitRound, cofit_block_and_curved};
-pub use coordinate::{
-    BlockCoordinateReport, BlockMeasureCoordinateReport, FiringCoordinate, MeasureSpikeCoordinate,
-    MeasureValuedCode, block_firing_coordinates, block_measure_valued_codes,
-    block_route_firing_coordinates, explained_variance_from_reconstruction,
-    harmonic_firing_coordinates, harmonic_measure_coordinates, harmonic_route_firing_coordinates,
-    reconstruct_measure_valued_rows, reconstruct_single_coordinate_rows, recover_measure_from_code,
-};
+pub use cofit::{CofitConfig, CofitReport, CofitRound};
+pub use coordinate::{BlockCoordinateReport, BlockMeasureCoordinateReport, FiringCoordinate, MeasureSpikeCoordinate, MeasureValuedCode, block_route_firing_coordinates, harmonic_measure_coordinates, harmonic_route_firing_coordinates, recover_measure_from_code};
 pub use scoring::{ScoreRoutePath, ScoreRouteResult, ScoreRouteStats, TileScorer, top_s_online};
 #[cfg(target_os = "linux")]
-pub use scoring_gpu::{
-    DEVICE_SCORE_BLOCK_MIN_ELEMS, ScoreBlockPath, score_block_cpu, score_block_required,
-};
+pub use scoring_gpu::{DEVICE_SCORE_BLOCK_MIN_ELEMS, ScoreBlockPath};
 pub use split_lr_fdr::{
     FdrCertificate, crossfit_ui_log_evalue, family_fdr_certificate, shell_vs_ring_log_evalue,
 };
 pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
-pub use update::{
-    DecoderSolveStats, LinearBlockRemlStats, SparseDictionaryError, linear_block_reml_stats,
-    linear_shared_rho_fs_step,
-};
+pub use update::{DecoderSolveStats, LinearBlockRemlStats, SparseDictionaryError, linear_shared_rho_fs_step};
 
 use ndarray::{Array2, ArrayView2};
 
@@ -242,33 +215,6 @@ pub struct SparseDictConvergence {
     pub certified: bool,
 }
 
-impl SparseDictConvergence {
-    /// A certificate whose every residual is exactly zero against a positive
-    /// tolerance — i.e. a trivially converged fixed point. Used to mint
-    /// [`SparseDictFit`] values from fixed, hand-authored routings (downstream
-    /// consumers read the routing, not the fixed-point history).
-    pub fn trivially_converged() -> Self {
-        Self {
-            inner_ev_residual: 0.0,
-            inner_tolerance: 1e-6,
-            decoder_residual: 0.0,
-            decoder_tolerance: 1e-6,
-            routing_residual: 0.0,
-            routing_tolerance: 1e-6,
-            outer_rho_residual: 0.0,
-            outer_tolerance: 1e-6,
-            selected_rho: f64::INFINITY,
-            outer_iterations: 0,
-            seeded_inner_runs: 0,
-            continued_inner_runs: 0,
-            accepted_births: 0,
-            live_atom_high_water: 0,
-            support_saturated: false,
-            certified: true,
-        }
-    }
-}
-
 impl SparseDictFit {
     /// Dense reconstruction `N×P` of the training rows from the sparse routing.
     ///
@@ -326,30 +272,6 @@ pub struct SparseDictTransform {
     pub codes: Array2<f32>,
     /// CPU/GPU scoring counters for this transform route.
     pub score_route_stats: ScoreRouteStats,
-}
-
-/// Out-of-sample encode: route held-out rows `x` (`M×P`, f32) against a frozen
-/// sparse dictionary `decoder` (`K×P`) and solve the per-row active-set ridge
-/// codes, returning fixed-width `(indices, codes)` each `M×active`. This is the
-/// OOS `transform` step for a fitted sparse dictionary — the tiled routing and
-/// the active-set least squares both live in the Rust core, and the route step
-/// uses the same GPU-dispatched high-`K` scorer as fitting.
-pub fn sparse_dictionary_transform(
-    x: ArrayView2<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
-    active: usize,
-    score_tile: usize,
-    code_ridge: f32,
-) -> Result<(Array2<u32>, Array2<f32>), String> {
-    let transform = sparse_dictionary_transform_with_mode(
-        x,
-        decoder,
-        active,
-        score_tile,
-        code_ridge,
-        gam_gpu::global_policy(),
-    )?;
-    Ok((transform.indices, transform.codes))
 }
 
 /// Out-of-sample encode with an explicit score routing mode and route counters.

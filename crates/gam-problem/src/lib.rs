@@ -78,49 +78,84 @@ pub use basis_error::BasisError;
 pub use block_count_error::BlockCountMismatch;
 pub use block_role::BlockRole;
 pub use block_spec::{
-    AdditiveBlockJacobian, BlockEffectiveJacobian, BlockGeometryDirectionalDerivative,
-    BlockWorkingSet, CoefficientCoordinate, FamilyChannelHessian, FamilyLinearizationState,
-    GaugeComposedJacobian, ParameterBlockSpec, ParameterBlockState, RowScaledJacobian,
+    AdditiveBlockJacobian,
+    BlockEffectiveJacobian,
+    BlockGeometryDirectionalDerivative,
+    BlockWorkingSet,
+    CoefficientCoordinate,
+    FamilyChannelHessian,
+    FamilyLinearizationState,
+    GaugeComposedJacobian,
+    ParameterBlockSpec,
+    ParameterBlockState,
+    RowScaledJacobian,
 };
 pub use coefficient_prior_mean::{CoefficientPriorMean, PriorMeanError};
 pub use constraint_set::{
-    ConstraintRowId, ConstraintSet, ContractFeasibleStep, ContractFeasibleStepError,
-    KhatriRaoConeConstraints, PRIMAL_FEASIBILITY_TOL, PlacedConstraintBlock,
+    ConstraintRowId,
+    ConstraintSet,
+    ContractFeasibleStep,
+    ContractFeasibleStepError,
+    KhatriRaoConeConstraints,
+    PRIMAL_FEASIBILITY_TOL,
+    PlacedConstraintBlock,
     feasibility_quantities_are_finite,
 };
 pub use custom_family_blockwise::{
-    CUSTOM_FAMILY_RIDGE_FLOOR, ExactNewtonOuterCurvature, validate_blockspec_consistency,
+    CUSTOM_FAMILY_RIDGE_FLOOR,
+    ExactNewtonOuterCurvature,
+    validate_blockspec_consistency,
 };
 pub use custom_family_error::{
-    CustomFamilyError, InnerConvergenceTerminalState, JointNewtonTerminalReason,
+    CustomFamilyError,
+    InnerConvergenceTerminalState,
+    JointNewtonTerminalReason,
     relative_stationarity,
 };
 pub use dispersion::{Dispersion, DispersionError};
 pub use dispersion_cov::{
-    CovarianceStandardErrorError, PhiScaledCovariance, UnscaledPrecision, se_from_covariance,
+    CovarianceStandardErrorError,
+    PhiScaledCovariance,
+    UnscaledPrecision,
+    se_from_covariance,
 };
 pub use estimation_error::{
-    EstimationError, FixedLambdaCheckpoint, FixedLambdaResidualKind, FixedLambdaSolverStage,
-    FixedLambdaStallReason, FixedLambdaStationarityEvidence, StationarityRung,
+    EstimationError,
+    FixedLambdaCheckpoint,
+    FixedLambdaResidualKind,
+    FixedLambdaSolverStage,
+    FixedLambdaStallReason,
+    FixedLambdaStationarityEvidence,
+    StationarityRung,
     StationarityStandard,
 };
 pub use estimation_error::FitStationarityEvidence;
 pub use execution_path::ExecutionPath;
 pub use family_options::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
 pub use finite_validation::{
-    bail_if_cached_beta_non_finite, ensure_finite_scalar, ensure_finite_scalar_estimation,
-    validate_all_finite, validate_all_finite_estimation, validate_all_finite_trial_point,
+    bail_if_cached_beta_non_finite,
+    ensure_finite_scalar,
+    ensure_finite_scalar_estimation,
+    validate_all_finite,
+    validate_all_finite_estimation,
+    validate_all_finite_trial_point,
 };
 pub use serde_finite::{NonFiniteFloat, ensure_serialized_floats_are_finite};
 pub use fisher_rao::{
-    FisherRaoDefiniteness, normalize_fisher_rao_blocks, normalize_fisher_rao_blocks_pd,
+    FisherRaoDefiniteness,
+    normalize_fisher_rao_blocks,
+    normalize_fisher_rao_blocks_pd,
 };
 pub use roundoff::{roundoff_growth_factor, weighted_residual_is_at_roundoff_floor};
 use gam_linalg::dense;
 pub use gam_linalg::faer_ndarray::{in_nested_parallel_region, with_nested_parallel};
 pub use gauge::Gauge;
 pub use identifiability_audit::{
-    AliasedPair, BlockIdentity, DroppedColumn, IdentifiabilityAudit, JointRankCertificate,
+    AliasedPair,
+    BlockIdentity,
+    DroppedColumn,
+    IdentifiabilityAudit,
+    JointRankCertificate,
     MapUniquenessError,
 };
 pub use indexed_response::{
@@ -131,32 +166,58 @@ pub use indexed_response::{
 pub use joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec};
 pub use linear_constraints::LinearInequalityConstraints;
 pub use log_strength::{
-    IndexedLogStrengthDomainError, LOG_STRENGTH_MAX, LOG_STRENGTH_MIN, LogStrengthDomainError,
-    PhysicalStrengthDomainError, checked_exp_log_strength, checked_exp_log_strengths,
-    checked_log_strength, validate_log_strength, validate_log_strengths,
+    IndexedLogStrengthDomainError,
+    LOG_STRENGTH_MAX,
+    LOG_STRENGTH_MIN,
+    LogStrengthDomainError,
+    PhysicalStrengthDomainError,
+    checked_exp_log_strength,
+    checked_exp_log_strengths,
+    checked_log_strength,
+    validate_log_strength,
+    validate_log_strengths,
 };
 pub use monotone_root_error::MonotoneRootError;
 pub use penalty_coordinate::{PenaltyCoordinate, project_block_root_out_of_null_directions};
 pub use penalty_matrix::PenaltyMatrix;
 pub use pseudo_logdet::PseudoLogdetMode;
 pub use psi_design_contract::{
-    CustomFamilyBlockPsiDerivative, CustomFamilyHyperAxis, CustomFamilyHyperLayout,
-    CustomFamilyPsiDerivativeOperator, JointHessianSourcePreference,
-    MaterializablePsiDerivativeOperator, MaterializationIntent, SharedCustomFamilyHyperLayout,
+    CustomFamilyBlockPsiDerivative,
+    CustomFamilyHyperAxis,
+    CustomFamilyHyperLayout,
+    CustomFamilyPsiDerivativeOperator,
+    JointHessianSourcePreference,
+    MaterializablePsiDerivativeOperator,
+    MaterializationIntent,
+    SharedCustomFamilyHyperLayout,
 };
 pub use psi_terms::{
-    ExactNewtonJointPsiSecondOrderContracted, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+    ExactNewtonJointPsiSecondOrderContracted,
+    ExactNewtonJointPsiSecondOrderTerms,
+    ExactNewtonJointPsiTerms,
+    ExactNewtonJointPsiWorkspace,
 };
 pub use row_metric::{
-    FisherFactorKind, MetricProvenance, RowMetric, WeightField, pack_probe_factors,
+    FisherFactorKind,
+    MetricProvenance,
+    RowMetric,
+    WeightField,
+    pack_probe_factors,
 };
 pub use schedule::{GumbelTemperatureSchedule, ScheduleKind};
 pub use seeding::{OrderedRhoBounds, SeedConfig, SeedRiskProfile};
 pub use solver_contract::{
-    DeclaredHessianForm, Derivative, EfsEval, FixedPointCertificateEval,
-    FixedPointCoordinateCertificate, HessianMaterialization, HessianOperator, HessianValue,
-    ObjectiveEvalError, OuterEval, OuterStrategyError,
+    DeclaredHessianForm,
+    Derivative,
+    EfsEval,
+    FixedPointCertificateEval,
+    FixedPointCoordinateCertificate,
+    HessianMaterialization,
+    HessianOperator,
+    HessianValue,
+    ObjectiveEvalError,
+    OuterEval,
+    OuterStrategyError,
 };
 pub use types::*;
 

@@ -88,23 +88,19 @@ pub use frame_curvature::{
 };
 
 use crate::chart_canonicalization::CanonicalChartTopology;
-use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
+use crate::inference::layer_transport::TransportLadderReport;
 use crate::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use faer::Side;
-use gam_linalg::faer_ndarray::{
-    FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
-};
+use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha};
 use gam_math::score_opt::{
     AffineRemlProfile, ScoreOptimumLocation, certified_exp_representative, certified_ln_positive,
 };
 use gam_problem::{MetricProvenance, RowMetric};
-use gam_terms::inference::structure_evidence::{StructureCertificate, StructureLedger};
+use gam_terms::inference::structure_evidence::StructureCertificate;
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};
-use std::f64::consts::TAU;
 
 // At two or more independent ladders, each fit is pure and order-independent; fan
 // them out unless this call is already running inside a rayon worker.
-const ATOM_TRANSPORT_LADDER_PARALLEL_MIN: usize = 2;
 
 /// Smoothed column-2-norm of the decoder Jacobian.
 ///
@@ -359,40 +355,6 @@ pub fn derive_ivae_aux_scale(
             let z = (aux[[row, col]] - mean) / safe_std;
             let log_sigma = log_amplitude * (freq * z).tanh();
             out[[row, col]] = log_sigma.exp();
-        }
-    }
-    out
-}
-
-/// Helper: evaluate a piecewise-linear "smooth" `f(u)` columnwise, given a
-/// (k_centres, latent_dim) coefficient table and a (n_rows,) auxiliary vector
-/// `u`. Used by the Python wrapper to back the iVAE per-latent (μ_i(u), σ_i(u))
-/// without having to round-trip through gam's full Smooth machinery for the
-/// minimal experiments. Centres are assumed evenly spaced in [u_min, u_max].
-pub fn piecewise_linear_eval(
-    u: ArrayView1<f64>,
-    coeffs: ArrayView2<f64>,
-    u_min: f64,
-    u_max: f64,
-) -> Array2<f64> {
-    let (k, d) = coeffs.dim();
-    assert!(k >= 2, "piecewise_linear_eval: need ≥2 centres");
-    let n = u.len();
-    let mut out = Array2::<f64>::zeros((n, d));
-    let step = (u_max - u_min) / (k - 1) as f64;
-    for (row, &val) in u.iter().enumerate() {
-        // Clamp `pos` to the exact endpoint `(k-1)`, not `(k-1) - 1e-12`,
-        // so `val = u_max` evaluates to exactly `coeffs[k-1, col]` instead
-        // of `coeffs[k-1, col] + 1e-12 · (coeffs[k-2, col] − coeffs[k-1,
-        // col])`. The historical `1e-12` shift was there to keep `lo + 1`
-        // in range, but capping `lo` at `k − 2` achieves the same
-        // structural guarantee without perturbing the endpoint value.
-        let pos = ((val - u_min) / step).clamp(0.0, (k - 1) as f64);
-        let lo = (pos.floor() as usize).min(k - 2);
-        let hi = lo + 1;
-        let frac = pos - lo as f64;
-        for col in 0..d {
-            out[[row, col]] = coeffs[[lo, col]] * (1.0 - frac) + coeffs[[hi, col]] * frac;
         }
     }
     out
@@ -1176,16 +1138,6 @@ pub struct AtomInnerFit {
     pub mode_design_row: Array1<f64>,
 }
 
-impl FittedAtom {
-    /// Attach the inner-decoder-smooth byproducts harvested at fit time. The
-    /// term builder calls this so [`dictionary_report`] can produce the three
-    /// post-PIRLS atom inference reports.
-    pub fn with_inner_fit(mut self, inner_fit: AtomInnerFit) -> Self {
-        self.inner_fit = Some(inner_fit);
-        self
-    }
-}
-
 /// Descriptive penalty-debiased POINT summaries of one fitted atom's decoder
 /// curve (#1097, narrowed under #1115). Each field is a scalar functional of the
 /// atom's inner smooth `g_k(t)`, reported as a plug-in value and a one-step
@@ -1529,27 +1481,6 @@ pub struct FrameInnerRotationGauge {
     pub dim: usize,
 }
 
-impl FrameInnerRotationGauge {
-    /// Enumerate the gauge from the active frame ranks.
-    pub fn from_ranks(per_atom_ranks: Vec<usize>) -> Self {
-        let dim = frame_inner_rotation_dim(&per_atom_ranks);
-        Self {
-            per_atom_ranks,
-            dim,
-        }
-    }
-}
-
-/// `Σ_k r_k (r_k − 1) / 2` — the dimension of the #972 inner-rotation gauge
-/// group `∏_k O(r_k)` over the active frame ranks. Rank-1 frames contribute
-/// `0` (`O(1)` is finite, a sign — absorbed by the orientation gauge), so a
-/// dictionary of single-direction atoms reports a zero-dimensional inner
-/// gauge, matching the intuition that one direction has no inner rotation to
-/// fix.
-pub fn frame_inner_rotation_dim(ranks: &[usize]) -> usize {
-    ranks.iter().map(|&r| r * r.saturating_sub(1) / 2).sum()
-}
-
 /// What the certificate's reported `pinning_rank` is a rank OF — a property of
 /// the MEASUREMENT, declared rather than inferred (#2757).
 ///
@@ -1657,22 +1588,6 @@ impl ResidualGaugeReport {
         }
     }
 
-    /// Attach the #972 frame inner-rotation enumeration to the certificate
-    /// (consumed by frame-factored dictionaries; `ranks` are the active frame
-    /// ranks `r_k`, one per factored atom). Extends the summary so the
-    /// one-line report names the enumerated-but-convention-fixed gauge.
-    pub fn with_frame_inner_rotation(mut self, ranks: Vec<usize>) -> Self {
-        let gauge = FrameInnerRotationGauge::from_ranks(ranks);
-        if gauge.dim > 0 {
-            self.summary.push_str(&format!(
-                "; frame inner-rotation gauge ∏O(r_k) of dim {} enumerated \
-                 (exact reparameterization, fixed by the canonical orientation gauge)",
-                gauge.dim
-            ));
-        }
-        self.frame_inner_rotation = Some(gauge);
-        self
-    }
 }
 
 /// Compact, order-independent signature of the unpinned generator families and
@@ -2591,88 +2506,6 @@ fn exact_orbit_verdicts(
     Ok(out)
 }
 
-/// The stacked curvature root `R` of the pinning operator, in the fit's
-/// metric: `(m, param_dim)` with `H = H_data + H_isometry = RᵀR`.
-///
-/// We assemble `R = [ W^{½} J ; R_isom ]` whose row space is
-/// `range(H_data) + range(H_isometry)`, where `W^{½} J` is the metric-whitened
-/// decoder Jacobian (the metric whitening is the `RowMetric`'s
-/// `whiten_residual_row` applied to each output residual basis vector — i.e.
-/// each Jacobian row is whitened in the same inner product the likelihood
-/// sums). The caller derives both faces from this one object: the pinning
-/// RANK (RRQR on `Rᵀ`, the audit's leverage-scaled rank decision) and the
-/// per-generator relative curvature `‖R ξ̂‖² / σ_max(R)²` — magnitudes kept,
-/// not orthonormalized away, so the statistic survives a full-rank span.
-fn stacked_curvature_root(model: &FittedSaeManifold) -> Result<Array2<f64>, String> {
-    let param_dim = model.param_dim();
-    if param_dim == 0 {
-        return Ok(Array2::<f64>::zeros((0, 0)));
-    }
-    let p = model.metric.p_out();
-    // Metric-whitened Jacobian rows: each row's Jacobian J_n ∈ ℝ^{p × param_dim}
-    // is whitened to U_nᵀ J_n ∈ ℝ^{rank × param_dim} so that the resulting rows
-    // span the same directions the metric-whitened residual gives cost to. We
-    // build the stacked matrix `R` with one block of whitened rows per metric
-    // row, then the isometry-penalty root beneath it.
-    let mut stacked_rows: Vec<Array1<f64>> = Vec::new();
-    for (n, j_flat) in model.jacobian_rows.iter().enumerate() {
-        if j_flat.len() != p * param_dim {
-            return Err(format!(
-                "stacked_curvature_root: jacobian_rows[{n}] has len {} but expected p*param_dim = {}*{} = {}",
-                j_flat.len(),
-                p,
-                param_dim,
-                p * param_dim
-            ));
-        }
-        // Whiten each parameter column's p-vector of output sensitivities.
-        // Column c of J_n is the p-vector (j_flat[i*param_dim + c])_i. Whitening
-        // it through the metric row (U_nᵀ ·) maps each column to a
-        // `whit_len`-vector; the resulting `whit_len × param_dim` block's rows
-        // are the metric-whitened Jacobian rows whose span the data gives cost
-        // to. For Euclidean provenance `whiten_residual_row` is the identity, so
-        // `whit_len == p` and the block is J_n unchanged (bit-for-bit the
-        // isotropic data span).
-        let mut cols_whitened: Vec<Vec<f64>> = Vec::with_capacity(param_dim);
-        for c in 0..param_dim {
-            let mut col = vec![0.0_f64; p];
-            for i in 0..p {
-                col[i] = j_flat[i * param_dim + c];
-            }
-            cols_whitened.push(model.metric.whiten_residual_row(n, ArrayView1::from(&col)));
-        }
-        let whit_len = cols_whitened.first().map_or(0, |c| c.len());
-        for r in 0..whit_len {
-            let mut row = Array1::<f64>::zeros(param_dim);
-            for (c, col) in cols_whitened.iter().enumerate() {
-                row[c] = col[r];
-            }
-            stacked_rows.push(row);
-        }
-    }
-    // Append isometry-penalty root rows.
-    if model.isometry_penalty_root.ncols() != 0 {
-        if model.isometry_penalty_root.ncols() != param_dim {
-            return Err(format!(
-                "stacked_curvature_root: isometry_penalty_root has {} cols but param_dim = {param_dim}",
-                model.isometry_penalty_root.ncols()
-            ));
-        }
-        for r in 0..model.isometry_penalty_root.nrows() {
-            stacked_rows.push(model.isometry_penalty_root.row(r).to_owned());
-        }
-    }
-    if stacked_rows.is_empty() {
-        return Ok(Array2::<f64>::zeros((0, param_dim)));
-    }
-    let m = stacked_rows.len();
-    let mut r_mat = Array2::<f64>::zeros((m, param_dim));
-    for (i, row) in stacked_rows.iter().enumerate() {
-        r_mat.row_mut(i).assign(row);
-    }
-    Ok(r_mat)
-}
-
 /// The curvature `H = H_data + H_isometry`, reduced to exactly the three things
 /// the certificate reads off it: the pinning rank, the stiffness scale
 /// `σ_max(R)²`, and the quadratic form `ξᵀHξ` along a unit generator.
@@ -2688,13 +2521,8 @@ fn stacked_curvature_root(model: &FittedSaeManifold) -> Result<Array2<f64>, Stri
 /// * [`Self::DualRoot`] — `H = RᵀR` with `R` having fewer rows `m` than
 ///   columns. `spec(RᵀR) = spec(RRᵀ) ∪ {0}^{param_dim − m}`, so the same
 ///   spectral decisions come from an `m × m` eigenproblem.
-/// * [`Self::Gram`] / [`Self::Root`] — the unstructured fallbacks.
+/// * [`Self::Gram`] — the unstructured fallback.
 enum CurvatureReduction {
-    Root {
-        pinning_rank: usize,
-        sigma_max_sq: f64,
-        root: Array2<f64>,
-    },
     Gram {
         pinning_rank: usize,
         sigma_max_sq: f64,
@@ -2792,45 +2620,6 @@ fn gram_spectral_rank(spectrum: &[f64], root_rows: usize, param_dim: usize) -> (
 }
 
 impl CurvatureReduction {
-    /// Theorem A, made empirical: `root` is the stacked curvature root `R`
-    /// whose row space is `range(H) = range(H_data) + range(H_isometry)`, the
-    /// pullback of the Terracini border-block Jacobian into this fit's own
-    /// metric. The RRQR rank of `Rᵀ` below is *the same* penalty-aware,
-    /// leverage-scaled rank decision [`gam_identifiability::audit::audit_identifiability`]
-    /// uses on stacked design columns, applied here to the enumerated symmetry
-    /// generators instead — so "pinning rank" is a genuine empirical measurement
-    /// of the realised tangent dimension `Σ_k(d_k+1)` Terracini predicts, not a
-    /// nominal count: rank-deficient curvature (fewer independent directions
-    /// resolved than atoms enumerate) is exactly a failure of the generic-point
-    /// hypothesis Terracini's theorem requires, and shows up here as a smaller
-    /// `pinning_rank` than the generator count.
-    fn from_model(model: &FittedSaeManifold) -> Result<Self, String> {
-        let root = stacked_curvature_root(model)?;
-        if root.nrows() == 0 {
-            return Ok(Self::Root {
-                pinning_rank: 0,
-                sigma_max_sq: 0.0,
-                root,
-            });
-        }
-        let r_t = root.t().to_owned();
-        // RRQR-pinned rank of Rᵀ = the empirical tangent-independence
-        // certificate: this is the rank machinery deciding how many of the
-        // Terracini-predicted tangent directions the fit's curvature actually
-        // resolves as independent, i.e. how much of `Σ_k dim Isom(M_k)` etc. is
-        // a genuine, separately-identified direction versus collapsed noise.
-        let rrqr = rrqr_with_permutation(&r_t, default_rrqr_rank_alpha())
-            .map_err(|e| format!("residual_gauge: RRQR on Rᵀ failed: {e:?}"))?;
-        let (_u, sv, _vt) = root
-            .svd(false, false)
-            .map_err(|e| format!("residual_gauge: SVD of curvature root failed: {e}"))?;
-        let smax = sv.iter().cloned().fold(0.0_f64, f64::max);
-        Ok(Self::Root {
-            pinning_rank: rrqr.rank,
-            sigma_max_sq: smax * smax,
-            root,
-        })
-    }
 
     /// Reduce whichever representation the streaming builder produced.
     ///
@@ -3056,8 +2845,7 @@ impl CurvatureReduction {
 
     fn pinning_rank(&self) -> usize {
         match self {
-            Self::Root { pinning_rank, .. }
-            | Self::Gram { pinning_rank, .. }
+            Self::Gram { pinning_rank, .. }
             | Self::OutputBlockRoots { pinning_rank, .. }
             | Self::DualRoot { pinning_rank, .. } => *pinning_rank,
         }
@@ -3065,8 +2853,7 @@ impl CurvatureReduction {
 
     fn sigma_max_sq(&self) -> f64 {
         match self {
-            Self::Root { sigma_max_sq, .. }
-            | Self::Gram { sigma_max_sq, .. }
+            Self::Gram { sigma_max_sq, .. }
             | Self::OutputBlockRoots { sigma_max_sq, .. }
             | Self::DualRoot { sigma_max_sq, .. } => *sigma_max_sq,
         }
@@ -3074,7 +2861,7 @@ impl CurvatureReduction {
 
     fn unit_generator_energy(&self, unit: &Array1<f64>) -> f64 {
         match self {
-            Self::Root { root, .. } | Self::DualRoot { root, .. } => {
+            Self::DualRoot { root, .. } => {
                 let r_xi = root.dot(unit);
                 r_xi.iter().map(|c| c * c).sum::<f64>()
             }
@@ -3118,54 +2905,6 @@ impl CurvatureReduction {
     }
 }
 
-/// Evaluate the identifiability rank machinery on the symmetry generators of a
-/// fitted SAE-manifold model and certify which gauge group the fit is identified
-/// up to.
-///
-/// # Method
-///
-/// 1. Enumerate the symmetry generators as tangent directions on the flattened
-///    decoder frames: per-atom `Isom(M_k)` generators
-///    (`atom_isometry_generators`), equal-ARD rotations
-///    (`equal_ard_rotation_generators`), global output-frame rotations
-///    (`frame_rotation_generators`), and exchangeable-atom permutations
-///    (`atom_permutation_generators`).
-/// 2. Build the stacked curvature root `R` of the pinning operator
-///    `H = H_data + H_isometry = RᵀR` in the fit's [`RowMetric`]
-///    (`stacked_curvature_root`); the pinning RANK is the audit's RRQR rank
-///    of `R`, reported alongside.
-/// 3. For each generator `ξ`, the **relative curvature fraction**
-///    `‖R ξ̂‖² / σ_max(R)²` measures the curvature the converged objective has
-///    along the unit generator, relative to the model's stiffest direction.
-///    `ξ` is **unpinned** (a residual gauge freedom) iff that fraction is at
-///    or below the calibrated tolerance
-///    `max(`[`GENERATOR_FLAT_ENERGY_TOL`]`, lowering_error_scale)` — flat up
-///    to numerical noise and the mean-frame lowering's own resolution
-///    ([`FittedAtom::lowering_error`], #995). Any larger fraction — including
-///    the *mixed* regime where `ξ` carries both a curved and a flat component
-///    — means the orbit costs objective, the exact group element is broken,
-///    and the generator is **pinned**. (A span-membership or rank-increase
-///    test degenerates when `R` is full-rank, which production fits always
-///    are: every direction is "in the span", so verdicts would collapse to
-///    all-pinned regardless of magnitudes. Keeping the curvature magnitudes
-///    is what lets a genuinely flat direction stay visible inside a full-rank
-///    span.) The fraction and the calibration scale are reported per
-///    generator so partial flatness stays visible.
-///
-/// # Escalations
-///
-/// * When the isometry pin is inactive (`isometry_penalty_root` has no rows) the
-///   report sets `diffeomorphism_unpinned = true`: with no metric pin the model
-///   is only identified up to an arbitrary diffeomorphism of the latent
-///   manifolds, so every isometry generator is a residual freedom.
-/// * Under [`MetricProvenance::OutputFisher`] the `Sym(F)` permutation subgroup
-///   is checked for triviality: every atom-exchange generator must be pinned
-///   (the output-Fisher metric separates the atoms behaviorally). The result is
-///   carried in `sym_f_trivial_under_output_fisher`.
-pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, String> {
-    residual_gauge_inner(model, None, CurvatureAccess::FromModel)
-}
-
 /// How this certificate reaches the curvature.
 ///
 /// The three arms are not three algorithms — they are three *availabilities*.
@@ -3177,7 +2916,6 @@ enum CurvatureAccess<'a> {
     /// Build `R` from the model's retained per-row Jacobian blocks. The general
     /// path, for callers that hand-build a model whose Jacobian is not
     /// frame-structured.
-    FromModel,
     /// A curvature the producer already reduced.
     Reduced(CurvatureReduction),
     /// A curvature that is never materialized.
@@ -3364,34 +3102,6 @@ fn measure_streamed(
     })
 }
 
-/// The #998 full-resolution certificate: within-atom gauge families are
-/// realised as **exact orbits** in the model's own (decoder, coordinate)
-/// parameter space for every atom that supplies an [`AtomParameterView`],
-/// while cross-atom families (output-frame rotations, atom permutations) and
-/// any unviewed atom (e.g. spheres, whose chart action is nonlinear) keep the
-/// frame-space path with its #995 lowering-error calibration.
-///
-/// For a viewed atom the compensated orbit is a data-null **by construction**
-/// when the basis family is closed under the group action — the verdict
-/// carries no calibration (`lowering_error_scale = 0`), the compensation
-/// residual is the computed closure, and all pinning of true model-class
-/// symmetries flows through the per-atom [`OrbitPenaltyOperator`] channel
-/// (the isometry pin / ARD prior — rungs 2 and 4 of the #981 ladder).
-///
-/// `views` and `penalty_ops` are aligned with `model.atoms`; a `None` view
-/// keeps that atom entirely on the frame path. Supplying a view for an atom
-/// whose pin is active without also supplying its penalty operator would
-/// over-claim freedom, so callers must pass the operator (or no view) for
-/// pinned atoms.
-pub fn residual_gauge_exact(
-    model: &FittedSaeManifold,
-    views: &[Option<AtomParameterView>],
-    penalty_ops: &[Option<OrbitPenaltyOperator>],
-) -> Result<ResidualGaugeReport, String> {
-    let exact = residual_gauge_exact_inputs(model, views, penalty_ops)?;
-    residual_gauge_inner(model, Some(exact), CurvatureAccess::FromModel)
-}
-
 /// Exact-orbit residual-gauge certificate with a pre-reduced streamed
 /// curvature `H = RᵀR`.
 ///
@@ -3552,31 +3262,6 @@ fn enumerate_generators(
     gens
 }
 
-/// The unit directions [`residual_gauge`] would test, in the order it tests
-/// them, for the model and exact-orbit split a caller is about to certify with.
-///
-/// `views` is the same slice handed to [`residual_gauge_exact`]: an atom with a
-/// view has its within-atom families realised as exact orbits (#998) and is
-/// therefore absent from this list, exactly as it is absent from the
-/// curvature-tested block of the report.
-///
-/// The alignment is positional and it is the whole reason this is public: the
-/// report's first `len()` verdicts are the verdicts on these directions, in this
-/// order, so a caller that wants to re-derive a measured energy — or check one
-/// against its own construction of `Rξ̂` — can do it without re-implementing the
-/// enumeration and hoping the two agree. `None` marks a structurally trivial
-/// generator, which carries no direction and is vetoed rather than measured.
-pub fn enumerated_unit_generators(
-    model: &FittedSaeManifold,
-    views: &[Option<AtomParameterView>],
-) -> Vec<Option<Array1<f64>>> {
-    let mask: Vec<bool> = views.iter().map(|view| view.is_some()).collect();
-    enumerate_generators(model, Some(&mask))
-        .into_iter()
-        .map(|generator| generator.unit)
-        .collect()
-}
-
 fn residual_gauge_inner(
     model: &FittedSaeManifold,
     exact: Option<(Vec<bool>, Vec<GeneratorVerdict>)>,
@@ -3602,9 +3287,6 @@ fn residual_gauge_inner(
     let measurement = match access {
         CurvatureAccess::Streamed(operator) => measure_streamed(operator, &gens)?,
         CurvatureAccess::Reduced(curvature) => measure_reduced(&curvature, &gens),
-        CurvatureAccess::FromModel => {
-            measure_reduced(&CurvatureReduction::from_model(model)?, &gens)
-        }
     };
     let pinning_rank = measurement.pinning_rank;
     let pinning_rank_support = measurement.pinning_rank_support;
@@ -4197,199 +3879,15 @@ pub(crate) fn atom_inference_reports(model: &FittedSaeManifold) -> Vec<AtomInfer
         .collect()
 }
 
-/// Produce the paired certificate for a fitted model: the residual-gauge
-/// report computed here plus the anytime-valid structure certificate from
-/// the discovery run's evidence ledger at level `alpha`. The ledger is the
-/// one the structure search absorbed its shard evidence into
-/// (`structure_evidence::StructureLedger`); certifying at any
-/// data-dependent stopping time is sound — that is the ledger's whole
-/// design.
-pub fn dictionary_report(
-    model: &FittedSaeManifold,
-    ledger: &StructureLedger,
-    alpha: f64,
-) -> Result<DictionaryReport, String> {
-    Ok(DictionaryReport {
-        gauge: residual_gauge(model)?,
-        structure: ledger.certify(alpha).map_err(|error| error.to_string())?,
-        transport_ladders: Vec::new(),
-        atom_inference: atom_inference_reports(model),
-    })
-}
-
 // --- #1100: closed-loop probe runner FFI ---------------------------------
 // Top-level entry points exposing the steering→structure-evidence probe loop
 // (`crate::inference::probe_runner::ProbeRunner`) beside `dictionary_report`, so
 // the Python driver can design and absorb interventional probes against the same
 // fitted term and evidence ledger the certificate is built from.
 
-/// Produce the paired certificate plus #1096 per-atom layer-transport ladders.
-///
-/// This is the strict wiring seam for callers that already have canonical
-/// per-layer atom coordinates. It validates atom indices, topology/coordinate
-/// lengths, finite coordinates, and the circle-period convention before calling
-/// [`transport_ladder`]. Single-layer inputs are refused: no transport estimand
-/// exists without at least one adjacent layer pair.
-pub fn dictionary_report_with_transport_ladders(
-    model: &FittedSaeManifold,
-    ledger: &StructureLedger,
-    alpha: f64,
-    ladders: &[AtomTransportLadderInput],
-) -> Result<DictionaryReport, String> {
-    let mut report = dictionary_report(model, ledger, alpha)?;
-    report.transport_ladders = atom_transport_ladder_reports(model, ladders)?;
-    Ok(report)
-}
-
-/// Fit #1096 transport ladders for the supplied atom/layer coordinate blocks.
-pub fn atom_transport_ladder_reports(
-    model: &FittedSaeManifold,
-    ladders: &[AtomTransportLadderInput],
-) -> Result<Vec<AtomTransportLadderReport>, String> {
-    if ladders.len() >= ATOM_TRANSPORT_LADDER_PARALLEL_MIN
-        && rayon::current_thread_index().is_none()
-    {
-        use rayon::prelude::*;
-
-        let fitted: Vec<Result<AtomTransportLadderReport, String>> = ladders
-            .par_iter()
-            .map(|input| fit_atom_transport_ladder_report(model, input))
-            .collect();
-        fitted.into_iter().collect()
-    } else {
-        ladders
-            .iter()
-            .map(|input| fit_atom_transport_ladder_report(model, input))
-            .collect()
-    }
-}
-
-fn fit_atom_transport_ladder_report(
-    model: &FittedSaeManifold,
-    input: &AtomTransportLadderInput,
-) -> Result<AtomTransportLadderReport, String> {
-    let atom = model.atoms.get(input.atom_index).ok_or_else(|| {
-        format!(
-            "atom transport ladder index {} out of range for {} fitted atoms",
-            input.atom_index,
-            model.atoms.len()
-        )
-    })?;
-    let depth = input.layers.len();
-    if depth < 2 {
-        return Err(format!(
-            "atom transport ladder for atom {} ('{}') needs at least two layers, got {depth}",
-            input.atom_index, atom.name
-        ));
-    }
-    if input.coords.len() != depth || input.topologies.len() != depth {
-        return Err(format!(
-            "atom transport ladder for atom {} ('{}') has {} layers, {} coordinate blocks, {} topologies",
-            input.atom_index,
-            atom.name,
-            depth,
-            input.coords.len(),
-            input.topologies.len()
-        ));
-    }
-
-    let mut coords = Vec::with_capacity(depth);
-    let mut topologies = Vec::with_capacity(depth);
-    for (layer_pos, (coord, topology)) in
-        input.coords.iter().zip(input.topologies.iter()).enumerate()
-    {
-        coords.push(canonical_coords_for_transport(
-            coord,
-            topology,
-            input.atom_index,
-            &atom.name,
-            input.layers[layer_pos],
-        )?);
-        topologies.push(ChartTopology::from(topology));
-    }
-
-    let report = transport_ladder(&input.layers, &coords, &topologies).map_err(|e| {
-        format!(
-            "atom transport ladder for atom {} ('{}') failed: {e}",
-            input.atom_index, atom.name
-        )
-    })?;
-    Ok(AtomTransportLadderReport {
-        atom_index: input.atom_index,
-        atom_name: atom.name.clone(),
-        report,
-    })
-}
-
-fn canonical_coords_for_transport(
-    coords: &Array1<f64>,
-    topology: &CanonicalChartTopology,
-    atom_index: usize,
-    atom_name: &str,
-    layer: usize,
-) -> Result<Array1<f64>, String> {
-    if coords.iter().any(|v| !v.is_finite()) {
-        return Err(format!(
-            "atom transport ladder for atom {atom_index} ('{atom_name}') layer {layer} has non-finite coordinates"
-        ));
-    }
-    match topology {
-        CanonicalChartTopology::Circle { period } => {
-            if !(period.is_finite() && *period > 0.0) {
-                return Err(format!(
-                    "atom transport ladder for atom {atom_index} ('{atom_name}') layer {layer} has invalid circle period {period}"
-                ));
-            }
-            Ok(coords.mapv(|t| (t / *period) * TAU))
-        }
-        CanonicalChartTopology::Interval => Ok(coords.clone()),
-    }
-}
-
 // ----------------------------------------------------------------------------
 // #1102 cross-checkpoint atom-dynamics FFI entry (new top-level block).
 // ----------------------------------------------------------------------------
-
-/// Run #1102 cross-checkpoint Riesz-debiased atom-trajectory dynamics for the
-/// fitted dictionary's atoms.
-///
-/// `decoder_grid` is `[n_checkpoints, n_atoms, n_grid, ambient_dim]` and
-/// `atom_names`/`checkpoint_ids`/`latent_grid` label its axes; see
-/// [`crate::inference::checkpoint_dynamics`] for the estimator and the honest
-/// accounting of which Riesz inputs the bare grid supports. This entry binds
-/// the atom axis to the fitted model: `atom_names` must name exactly the
-/// model's atoms in order, so trajectories are reported against real atoms.
-pub fn atom_checkpoint_dynamics(
-    model: &FittedSaeManifold,
-    decoder_grid: ndarray::ArrayView4<'_, f64>,
-    checkpoint_ids: &[String],
-    atom_names: &[String],
-    latent_grid: ArrayView1<'_, f64>,
-) -> Result<Vec<crate::inference::checkpoint_dynamics::AtomTrajectory>, String> {
-    if atom_names.len() != model.atoms.len() {
-        return Err(format!(
-            "atom_checkpoint_dynamics: {} atom names supplied for {} fitted atoms",
-            atom_names.len(),
-            model.atoms.len()
-        ));
-    }
-    for (idx, (supplied, fitted)) in atom_names.iter().zip(model.atoms.iter()).enumerate() {
-        if supplied != &fitted.name {
-            return Err(format!(
-                "atom_checkpoint_dynamics: atom {idx} name '{supplied}' does not match fitted atom '{}'",
-                fitted.name
-            ));
-        }
-    }
-    crate::inference::checkpoint_dynamics::checkpoint_atom_dynamics(
-        &crate::inference::checkpoint_dynamics::CheckpointDynamicsInput {
-            decoder_grid,
-            checkpoint_ids,
-            atom_names,
-            latent_grid,
-        },
-    )
-}
 
 #[cfg(test)]
 mod tests {

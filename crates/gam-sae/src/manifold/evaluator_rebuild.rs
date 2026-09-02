@@ -3,9 +3,7 @@
 //! Widths are derived only from constructor-validated [`SaeAtomGeometryPlan`]s.
 //! There is intentionally no evaluator reconstruction from realized widths.
 
-use std::sync::Arc;
-
-use super::{SaeAtomBasisKind, SaeAtomGeometryPlan, SaeBasisSecondJet};
+use super::SaeAtomBasisKind;
 
 /// Default per-axis harmonic order for a torus atom (Φ has `(2H+1)^d`
 /// columns). Three harmonics per axis gives a 7-column 1-D factor and a
@@ -80,21 +78,6 @@ pub fn sae_periodic_basis_size(n_harmonics: usize) -> Result<usize, String> {
         .ok_or_else(|| {
             format!("sae_build_periodic_atom: basis size overflows for n_harmonics={n_harmonics}")
         })
-}
-
-/// Build per-atom Rust basis evaluators so the Newton loop can refresh
-/// `Phi_k` and `dPhi_k/dt` between steps without bouncing back to Python.
-///
-/// Every evaluator is rebuilt directly from its tagged resolution. No
-/// harmonic order, polynomial degree, or Duchon centers are inferred from a
-/// realized width or coordinate snapshot.
-pub fn build_sae_basis_evaluators(
-    geometry_plans: &[SaeAtomGeometryPlan],
-) -> Result<Vec<Arc<dyn SaeBasisSecondJet>>, String> {
-    geometry_plans
-        .iter()
-        .map(SaeAtomGeometryPlan::build_evaluator)
-        .collect()
 }
 
 /// The canonical basis tokens a caller may name. Single source of truth for

@@ -58,13 +58,6 @@ pub struct CrossFitConfig {
     pub seed: u64,
 }
 
-impl CrossFitConfig {
-    /// A standard 5-fold configuration.
-    pub fn five_fold(seed: u64) -> Self {
-        CrossFitConfig { k_folds: 5, seed }
-    }
-}
-
 /// Deterministic partition of `0..n` into `k` folds by a seeded permutation.
 ///
 /// Uses a splitmix64 hash of `(seed, row)` to assign each row a fold, giving a
@@ -72,7 +65,6 @@ impl CrossFitConfig {
 #[derive(Debug, Clone)]
 pub struct KFoldAssignment {
     fold_of_row: Vec<usize>,
-    k_folds: usize,
 }
 
 impl KFoldAssignment {
@@ -100,13 +92,7 @@ impl KFoldAssignment {
         }
         Ok(KFoldAssignment {
             fold_of_row,
-            k_folds,
         })
-    }
-
-    /// Number of folds.
-    pub fn k_folds(&self) -> usize {
-        self.k_folds
     }
 
     /// Rows held OUT in fold `f` (the evaluation rows).
@@ -200,24 +186,6 @@ where
     })
 }
 
-/// Fit the top-`q` principal subspace of every row in `data`.
-///
-/// Returns `(mean, basis)` where `mean` is the length-`p` column mean over the
-/// data and `basis` is `(q × p)` with orthonormal rows spanning the centered
-/// top-`q` right-singular subspace. `q` is capped at `min(n, p)`. This is the
-/// linear model nested inside the curved torch SAE: its constant decoder rows
-/// reproduce the PCA projection exactly before any harmonic curvature is fit.
-pub fn fit_principal_subspace(
-    data: ArrayView2<'_, f64>,
-    q: usize,
-) -> Result<(Array1<f64>, Array2<f64>), String> {
-    if data.iter().any(|value| !value.is_finite()) {
-        return Err("fit_principal_subspace: data must be finite".to_string());
-    }
-    let rows = (0..data.nrows()).collect::<Vec<_>>();
-    fit_subspace(data, &rows, q)
-}
-
 /// Row-subset implementation shared by the public full-data PCA seed and the
 /// honest cross-fit scorer below.
 pub(crate) fn fit_subspace(
@@ -298,142 +266,6 @@ pub(crate) fn subspace_reconstruction_ev(
     reconstruction_explained_variance(target.view(), fitted.view())
 }
 
-/// A selected-feature OLS predictor: the honest minimal analog of a **selected**
-/// structure whose optimism is the sharpest — the columns themselves are chosen
-/// from the training data (a discrete selection), which is exactly the
-/// post-selection inference trap the naive in-sample R² falls into and the
-/// dose-forecast headline is exposed to.
-pub(crate) struct SelectedRegression {
-    /// Feature columns selected (top-`q` by |correlation| with the response on
-    /// the training rows).
-    pub cols: Vec<usize>,
-    /// OLS intercept.
-    pub intercept: f64,
-    /// OLS slope per selected column, aligned with [`Self::cols`].
-    pub coef: Vec<f64>,
-}
-
-/// Fit [`SelectedRegression`] on `rows`: select the `q` feature columns of `x`
-/// most correlated (in absolute value) with `y`, then fit an intercept + slopes
-/// by ordinary least squares on those columns.
-pub(crate) fn fit_selected_regression(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    rows: &[usize],
-    q: usize,
-) -> Result<SelectedRegression, String> {
-    let p = x.ncols();
-    let n = rows.len();
-    if n == 0 || p == 0 {
-        return Err("fit_selected_regression: empty selection".to_string());
-    }
-    let q = q.min(p).min(n.saturating_sub(1)).max(1);
-    // Column and response means over the training rows.
-    let mut xbar = vec![0.0_f64; p];
-    let mut ybar = 0.0_f64;
-    for &r in rows {
-        ybar += y[r];
-        for c in 0..p {
-            xbar[c] += x[[r, c]];
-        }
-    }
-    ybar /= n as f64;
-    for v in xbar.iter_mut() {
-        *v /= n as f64;
-    }
-    // |corr(x_c, y)| via centered cross-products.
-    let mut score = vec![0.0_f64; p];
-    let mut yvar = 0.0_f64;
-    for &r in rows {
-        let dy = y[r] - ybar;
-        yvar += dy * dy;
-        for c in 0..p {
-            score[c] += (x[[r, c]] - xbar[c]) * dy;
-        }
-    }
-    let mut xvar = vec![0.0_f64; p];
-    for &r in rows {
-        for c in 0..p {
-            let dx = x[[r, c]] - xbar[c];
-            xvar[c] += dx * dx;
-        }
-    }
-    let mut order: Vec<usize> = (0..p).collect();
-    order.sort_by(|&a, &b| {
-        let ca = score[a].abs() / (xvar[a].sqrt() * yvar.sqrt()).max(f64::MIN_POSITIVE);
-        let cb = score[b].abs() / (xvar[b].sqrt() * yvar.sqrt()).max(f64::MIN_POSITIVE);
-        cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let cols: Vec<usize> = order.into_iter().take(q).collect();
-    // OLS with intercept on the selected columns: design D = [1, x_cols].
-    let d = cols.len() + 1;
-    let mut xtx = Array2::<f64>::zeros((d, d));
-    let mut xty = Array1::<f64>::zeros(d);
-    for &r in rows {
-        let mut drow = vec![0.0_f64; d];
-        drow[0] = 1.0;
-        for (j, &c) in cols.iter().enumerate() {
-            drow[j + 1] = x[[r, c]];
-        }
-        for a in 0..d {
-            xty[a] += drow[a] * y[r];
-            for b in 0..d {
-                xtx[[a, b]] += drow[a] * drow[b];
-            }
-        }
-    }
-    // Ridge-stabilize the normal equations by a whisker so a degenerate fold is
-    // still solvable (does not bias the demonstration; ε is tiny relative to the
-    // Gram diagonal). Not a tuned constant — it is the SPD floor that keeps the
-    // Cholesky well-posed.
-    for a in 0..d {
-        xtx[[a, a]] += 1e-10 * (1.0 + xtx[[a, a]].abs());
-    }
-    let chol = xtx
-        .cholesky(Side::Lower)
-        .map_err(|e| format!("fit_selected_regression: normal-equation Cholesky: {e:?}"))?;
-    let beta = chol.solvevec(&xty);
-    Ok(SelectedRegression {
-        cols,
-        intercept: beta[0],
-        coef: beta.iter().skip(1).copied().collect(),
-    })
-}
-
-/// Out-of-sample `R²` of a fitted [`SelectedRegression`] on `rows`, against the
-/// response's own mean over those rows (so a predictor no better than the mean
-/// scores 0, and one worse than the mean scores negative — the honest sign that
-/// a selected-on-noise structure does not generalize).
-pub(crate) fn selected_regression_r2(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    rows: &[usize],
-    fit: &SelectedRegression,
-) -> Option<f64> {
-    if rows.is_empty() {
-        return None;
-    }
-    let n = rows.len();
-    let ybar = rows.iter().map(|&r| y[r]).sum::<f64>() / n as f64;
-    let mut ssr = 0.0_f64;
-    let mut sst = 0.0_f64;
-    for &r in rows {
-        let mut pred = fit.intercept;
-        for (j, &c) in fit.cols.iter().enumerate() {
-            pred += fit.coef[j] * x[[r, c]];
-        }
-        let e = y[r] - pred;
-        ssr += e * e;
-        let dm = y[r] - ybar;
-        sst += dm * dm;
-    }
-    if sst > f64::MIN_POSITIVE && ssr.is_finite() && sst.is_finite() {
-        Some(1.0 - ssr / sst)
-    } else {
-        None
-    }
-}
-
 /// Cross-fitted reconstruction explained variance — the honest, optimism-free
 /// companion to the in-sample reconstruction EV the SAE headline reports.
 ///
@@ -455,36 +287,6 @@ pub fn cross_fit_reconstruction_ev(
         config,
         |train| fit_subspace(data, train, q),
         |(mean, basis), test| subspace_reconstruction_ev(data, test, mean.view(), basis.view()),
-    )
-}
-
-/// Cross-fitted `R²` of a selected-feature linear forecast — the honest
-/// companion to the in-sample forecast fit (the dose-forecast headline's
-/// analog), which is exposed to post-SELECTION optimism because the predictor
-/// columns are themselves chosen from the data.
-///
-/// Selects and fits on each fold-complement, scores held-out `R²`, aggregates.
-/// The naive/cross-fit/optimism split in the returned [`CrossFitReport`] is the
-/// direct, reportable measure of how much the naive in-sample forecast overstates
-/// generalization.
-pub fn cross_fit_selected_forecast_r2(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    config: CrossFitConfig,
-    q: usize,
-) -> Result<CrossFitReport, String> {
-    let n = x.nrows();
-    if y.len() != n {
-        return Err(format!(
-            "cross_fit_selected_forecast_r2: x has {n} rows but y has {}",
-            y.len()
-        ));
-    }
-    cross_fit_scalar(
-        n,
-        config,
-        |train| fit_selected_regression(x, y, train, q),
-        |fit, test| selected_regression_r2(x, y, test, fit),
     )
 }
 

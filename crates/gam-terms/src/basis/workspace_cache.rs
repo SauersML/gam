@@ -710,26 +710,6 @@ fn validate_spherical_wahba_gram_request(
     Ok(())
 }
 
-/// Build a Wahba S² kernel matrix with the untruncated Sobolev kernel.
-///
-/// Untruncated Sobolev `m = 1` is refused because its coincident-point value
-/// diverges; use [`SphereWahbaKernel::SobolevTruncated`] with
-/// [`spherical_wahba_kernel_matrix_with_kind`] to state a finite resolution.
-pub fn spherical_wahba_kernel_matrix(
-    data: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    penalty_order: usize,
-    radians: bool,
-) -> Result<Array2<f64>, BasisError> {
-    spherical_wahba_kernel_matrix_with_kind(
-        data,
-        centers,
-        penalty_order,
-        radians,
-        SphereWahbaKernel::Sobolev,
-    )
-}
-
 /// Build a Wahba S² kernel matrix with an explicit kernel family.
 ///
 /// Untruncated [`SphereWahbaKernel::Sobolev`] at `m = 1` is refused before
@@ -767,27 +747,6 @@ pub fn spherical_wahba_kernel_matrix_with_kind(
         })?;
         return Ok(gpu_matrix);
     }
-    spherical_wahba_kernel_matrix_cpu_validated(data, centers, penalty_order, radians, kernel)
-}
-
-/// CPU oracle for the Wahba S² kernel design matrix — the bit-defining
-/// reference the GPU truncated path is held to. Always evaluates on host,
-/// regardless of the GPU dispatch decision, so parity tests and any caller that
-/// needs the deterministic reference can bypass device routing entirely.
-///
-/// It enforces the same kernel/order contract as
-/// [`spherical_wahba_kernel_matrix_with_kind`]; bypassing device routing does
-/// not bypass mathematical validation.
-pub fn spherical_wahba_kernel_matrix_cpu(
-    data: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    penalty_order: usize,
-    radians: bool,
-    kernel: SphereWahbaKernel,
-) -> Result<Array2<f64>, BasisError> {
-    validate_spherical_wahba_gram_request(penalty_order, kernel)?;
-    validate_lat_lon_matrix(data, "spherical spline data", radians)?;
-    validate_lat_lon_matrix(centers, "spherical spline centers", radians)?;
     spherical_wahba_kernel_matrix_cpu_validated(data, centers, penalty_order, radians, kernel)
 }
 

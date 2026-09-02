@@ -93,44 +93,6 @@ pub fn fit_term_collection_with_coefficient_groups(
     Ok(fitted)
 }
 
-pub fn fit_term_collection_with_penalty_block_gamma_prior_callback<F>(
-    data: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    spec: &TermCollectionSpec,
-    callback: F,
-    family: LikelihoodSpec,
-    options: &FitOptions,
-) -> Result<FittedTermCollection, EstimationError>
-where
-    F: FnMut(&PenaltyBlockGammaPriorMetadata<'_>) -> Option<(f64, f64)>,
-{
-    let design = build_term_collection_design_with_policy(data, spec, &options.resource_policy)?;
-    let effective_offset = design
-        .compose_offset(offset, "penalty-prior callback fit")
-        .map_err(EstimationError::BasisError)?;
-    let mut fit_opts = adaptive_fit_options_base(options, &design);
-    fit_opts.rho_prior = realize_penalty_block_gamma_priors(&design, callback)
-        .map_err(EstimationError::BasisError)?;
-    let fitted = FittedTermCollection {
-        fit: fit_gamwith_heuristic_lambdas(
-            design.design.clone(),
-            y,
-            weights,
-            effective_offset.view(),
-            &design.penalties,
-            None,
-            family.clone(),
-            &fit_opts,
-        )?,
-        design,
-        adaptive_diagnostics: None,
-    };
-    enforce_term_constraint_feasibility(&fitted.design, &fitted.fit)?;
-    Ok(fitted)
-}
-
 pub fn fit_term_collection_with_penalty_block_gamma_priors(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -3019,7 +2981,6 @@ fn relax_smoothing_rho_prior(
     gam_spec::RhoPrior::Independent(per_coord)
 }
 
-
 /// Standard deviation of the wide, weakly-informative symmetric `Normal` prior
 /// placed on a relaxable smooth's log-λ coordinates when the fit is
 /// under-determined (`n < 2·p`); see [`relax_smoothing_rho_prior`].
@@ -3033,7 +2994,6 @@ fn relax_smoothing_rho_prior(
 /// #1392 under-smoothing drag; widening it further weakens termination
 /// curvature without further benefit.
 const RELAX_UNDERDETERMINED_RHO_SD: f64 = 15.0;
-
 
 fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign) -> FitOptions {
     FitOptions {
@@ -8549,4 +8509,42 @@ mod glm_eta_observation_fd_tests {
             );
         }
     }
+}
+
+pub fn fit_term_collection_with_penalty_block_gamma_prior_callback<F>(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    callback: F,
+    family: LikelihoodSpec,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError>
+where
+    F: FnMut(&PenaltyBlockGammaPriorMetadata<'_>) -> Option<(f64, f64)>,
+{
+    let design = build_term_collection_design_with_policy(data, spec, &options.resource_policy)?;
+    let effective_offset = design
+        .compose_offset(offset, "penalty-prior callback fit")
+        .map_err(EstimationError::BasisError)?;
+    let mut fit_opts = adaptive_fit_options_base(options, &design);
+    fit_opts.rho_prior = realize_penalty_block_gamma_priors(&design, callback)
+        .map_err(EstimationError::BasisError)?;
+    let fitted = FittedTermCollection {
+        fit: fit_gamwith_heuristic_lambdas(
+            design.design.clone(),
+            y,
+            weights,
+            effective_offset.view(),
+            &design.penalties,
+            None,
+            family.clone(),
+            &fit_opts,
+        )?,
+        design,
+        adaptive_diagnostics: None,
+    };
+    enforce_term_constraint_feasibility(&fitted.design, &fitted.fit)?;
+    Ok(fitted)
 }

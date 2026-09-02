@@ -1,4 +1,4 @@
-use ndarray::{Array2, ArrayView2};
+use ndarray::ArrayView2;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -140,29 +140,6 @@ pub fn draw_bands_from_matrices(
     Ok((eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper))
 }
 
-/// Posterior eta matrix (n_draws x n_rows) -> per-row bands.
-///
-/// Requires at least one posterior draw. Link-scale credible bounds are
-/// quantiles of eta draws; response-scale credible bounds are quantiles of the
-/// inverse-link-transformed draws. Direct response quantiles intentionally do
-/// not reuse transformed eta quantiles: finite-sample interpolated quantiles do
-/// not commute with nonlinear inverse links.
-/// The response-scale **point estimate** is the posterior mean of the
-/// response-scale draws — i.e. `E[g^{-1}(eta)]`, **not** `g^{-1}(E[eta])`.
-/// For nonlinear inverse links (logit, log, probit, cloglog) the two differ
-/// by Jensen's inequality, and consumers of the `"mean"` field expect the
-/// former (it should equal the per-row posterior mean of `predict_draws`'
-/// `mean` matrix). Computing it as `g^{-1}(mean(eta))` instead would give
-/// the *median* of the response-scale draws under a monotone link, which is
-/// a different summary and silently biases reported response-scale means.
-pub fn eta_bands_from_matrix(
-    eta: ArrayView2<'_, f64>,
-    family_kind: &str,
-    level: f64,
-) -> Result<PosteriorBands, String> {
-    eta_bands_from_matrix_link(eta, LinkSelector::Tag(family_kind), level)
-}
-
 /// Spec-aware sibling of [`eta_bands_from_matrix`]: identical band/mean
 /// semantics, but the response-scale push-through goes through a
 /// [`LinkSelector`] so the parameterized links (`Sas`, `Mixture`,
@@ -222,62 +199,6 @@ pub fn eta_bands_from_matrix_link(
         response_lower,
         response_upper,
     ))
-}
-
-pub fn posterior_eta_bands(
-    eta_flat: Vec<f64>,
-    n_draws: usize,
-    n_rows: usize,
-    family_kind: &str,
-    level: f64,
-) -> Result<PosteriorPredictBandsPayload, String> {
-    posterior_eta_bands_link(
-        eta_flat,
-        n_draws,
-        n_rows,
-        LinkSelector::Tag(family_kind),
-        level,
-    )
-}
-
-/// Spec-aware sibling of [`posterior_eta_bands`]. When `link` is a
-/// [`LinkSelector::Spec`] the parameterized inverse links are evaluated from
-/// their fitted state; the emitted `family_kind` is the link's display name.
-pub fn posterior_eta_bands_link(
-    eta_flat: Vec<f64>,
-    n_draws: usize,
-    n_rows: usize,
-    link: LinkSelector<'_>,
-    level: f64,
-) -> Result<PosteriorPredictBandsPayload, String> {
-    if eta_flat.len() != n_draws * n_rows {
-        return Err(format!(
-            "posterior_eta_bands shape mismatch: got {} floats, expected {} * {}",
-            eta_flat.len(),
-            n_draws,
-            n_rows
-        ));
-    }
-    let family_kind = match link {
-        LinkSelector::Tag(tag) => tag.to_string(),
-        LinkSelector::Spec(spec) => spec.link_function().name().to_string(),
-    };
-    let eta = Array2::<f64>::from_shape_vec((n_draws, n_rows), eta_flat)
-        .map_err(|err| format!("failed to reshape eta matrix: {err}"))?;
-    let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
-        eta_bands_from_matrix_link(eta.view(), link, level)?;
-    Ok(PosteriorPredictBandsPayload {
-        linear_predictor: eta_mean,
-        linear_predictor_lower: eta_lower,
-        linear_predictor_upper: eta_upper,
-        mean,
-        mean_lower,
-        mean_upper,
-        n_rows,
-        n_draws,
-        model_class: String::new(),
-        family_kind,
-    })
 }
 
 #[cfg(test)]

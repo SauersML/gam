@@ -3301,25 +3301,6 @@ impl SaeManifoldTerm {
         Ok(hessian)
     }
 
-    /// Analytic SAE penalized quasi-Laplace outer-ρ gradient components at the already converged
-    /// inner state represented by `loss` and `cache`.
-    ///
-    /// The returned gradient is the assembled analytic outer derivative:
-    /// explicit penalty terms, direct logdet traces, Occam terms, and the #1006
-    /// implicit-state third-order correction.
-    pub(crate) fn analytic_outer_rho_gradient_components(
-        &self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        loss: &SaeManifoldLoss,
-        cache: &ArrowFactorCache,
-        solver: &DeflatedArrowSolver<'_>,
-    ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
-        self.analytic_outer_rho_gradient_components_with_bundle(
-            target, rho, loss, cache, solver, None, None,
-        )
-    }
-
     /// #2080 forward plumbing — the analytic outer-ρ gradient with an OPTIONAL
     /// low-rank representation of the reduced-logdet derivative.
     ///
@@ -4071,7 +4052,6 @@ impl SaeManifoldTerm {
         // "Shared by ch4 and ch5"; ch4 had kept inline copies of both (#2500).
         let g = self.materialize_joint_inverse(cache, &solver)?;
         let h_bd = self.materialize_block_diag_t_inverse(cache);
-
 
         // #2500 — ch4 and ch5 read ONE operator map. The doc on
         // `penalty_curvature_operators_by_flat` has always claimed it was

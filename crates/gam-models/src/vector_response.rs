@@ -41,65 +41,6 @@ pub enum VectorNoise {
     },
 }
 
-impl VectorNoise {
-    /// Per-output precision vector (1/σ_m²) for the Isotropic / Diagonal cases.
-    /// LowRank returns the diagonal piece only; the low-rank correction is
-    /// applied separately by the Piece 5 weight code.
-    pub fn diag_precision(&self, m: usize) -> Result<Array1<f64>, EstimationError> {
-        match self {
-            Self::Isotropic(sigma) => {
-                if !sigma.is_finite() || *sigma <= 0.0 {
-                    crate::bail_invalid_estim!(
-                        "VectorNoise::Isotropic: σ must be > 0 and finite (got {sigma})",
-                    );
-                }
-                let p = 1.0 / (sigma * sigma);
-                Ok(Array1::from_elem(m, p))
-            }
-            Self::Diagonal(sigma) => {
-                if sigma.len() != m {
-                    crate::bail_invalid_estim!(
-                        "VectorNoise::Diagonal: σ length {} ≠ M={m}",
-                        sigma.len()
-                    );
-                }
-                let mut out = Array1::<f64>::zeros(m);
-                for j in 0..m {
-                    let s = sigma[j];
-                    if !s.is_finite() || s <= 0.0 {
-                        crate::bail_invalid_estim!(
-                            "VectorNoise::Diagonal: σ[{j}] must be > 0 and finite (got {s})",
-                        );
-                    }
-                    out[j] = 1.0 / (s * s);
-                }
-                Ok(out)
-            }
-            Self::LowRank { diag, .. } => {
-                if diag.len() != m {
-                    crate::bail_invalid_estim!(
-                        "VectorNoise::LowRank: diag length {} ≠ M={m}",
-                        diag.len()
-                    );
-                }
-                let mut out = Array1::<f64>::zeros(m);
-                for j in 0..m {
-                    let d = diag[j];
-                    if !d.is_finite() || d <= 0.0 {
-                        crate::bail_invalid_estim!(
-                            "VectorNoise::LowRank: diag[{j}] must be > 0 (got {d})",
-                        );
-                    }
-                    // `diag` is the PRECISION diagonal (W = diag(d) + F·Fᵀ).
-                    // Pass it through unchanged.
-                    out[j] = d;
-                }
-                Ok(out)
-            }
-        }
-    }
-}
-
 /// Vector-valued response target.
 ///
 /// `y` is `(N, M)`; `row_weights` (if present) is length `N` and scales the
@@ -122,12 +63,6 @@ impl VectorResponseTarget {
             noise,
             row_weights: None,
         }
-    }
-
-    pub fn with_row_weights(mut self, w: Array1<f64>) -> Result<Self, EstimationError> {
-        validate_row_weights(&w, self.y.nrows())?;
-        self.row_weights = Some(w);
-        Ok(self)
     }
 
     pub fn n(&self) -> usize {
@@ -320,37 +255,6 @@ pub struct GaussianVectorLikelihood {
 }
 
 impl GaussianVectorLikelihood {
-    pub fn from_target(target: &VectorResponseTarget) -> Result<Self, EstimationError> {
-        if let Some(weights) = target.row_weights.as_ref() {
-            validate_row_weights(weights, target.n())?;
-        }
-        let precision = target.noise.diag_precision(target.m())?;
-        let factor = match &target.noise {
-            VectorNoise::LowRank { factor, .. } => {
-                if factor.nrows() != target.m() {
-                    crate::bail_invalid_estim!(
-                        "VectorNoise::LowRank: factor has {} rows but M={}",
-                        factor.nrows(),
-                        target.m()
-                    );
-                }
-                for ((row, col), value) in factor.indexed_iter() {
-                    if !value.is_finite() {
-                        crate::bail_invalid_estim!(
-                            "VectorNoise::LowRank: factor[{row},{col}] must be finite (got {value})"
-                        );
-                    }
-                }
-                Some(factor.clone())
-            }
-            _ => None,
-        };
-        Ok(Self {
-            precision,
-            factor,
-            row_weights: target.row_weights.clone(),
-        })
-    }
 
     #[inline]
     fn row_weight(&self, n: usize) -> f64 {

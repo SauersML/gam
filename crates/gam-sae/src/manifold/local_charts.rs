@@ -830,107 +830,6 @@ impl LocalAtlas {
         AtlasOrientability::Orientable
     }
 
-    /// The directed rotation `from → to` (`Some` iff the two patches share a
-    /// registered transition), together with its orientation sign. Stored
-    /// transitions are canonical (`from < to`); the reverse direction returns the
-    /// inverse rotation `Rᵀ` (an orthogonal inverse), whose determinant — and thus
-    /// the sign — is unchanged.
-    #[must_use]
-    pub fn directed_rotation(&self, from: usize, to: usize) -> Option<(Array2<f64>, i8)> {
-        self.transitions.iter().find_map(|t| {
-            if t.from_patch == from && t.to_patch == to {
-                Some((t.rotation.clone(), t.sign))
-            } else if t.from_patch == to && t.to_patch == from {
-                Some((transpose(&t.rotation), t.sign))
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Frobenius defect of the transition cocycle around the triangle `a→b→c→a`:
-    /// `‖R_ca · R_bc · R_ab − I‖_F`. `Some` iff all three pairwise transitions
-    /// exist. A closed cocycle (contractible loop, coherent frames) returns ~0.
-    #[must_use]
-    pub fn triangle_cocycle_defect(&self, a: usize, b: usize, c: usize) -> Option<f64> {
-        let (r_ab, _) = self.directed_rotation(a, b)?;
-        let (r_bc, _) = self.directed_rotation(b, c)?;
-        let (r_ca, _) = self.directed_rotation(c, a)?;
-        let product = matmul(&r_ca, &matmul(&r_bc, &r_ab));
-        let d = product.nrows();
-        let mut acc = 0.0;
-        for i in 0..d {
-            for j in 0..d {
-                let target = if i == j { 1.0 } else { 0.0 };
-                let diff = product[[i, j]] - target;
-                acc += diff * diff;
-            }
-        }
-        Some(acc.sqrt())
-    }
-
-    /// Product of the orientation signs around the triangle `a→b→c→a`. `Some` iff
-    /// all three pairwise transitions exist. Gauge-invariant: `+1` on an orientable
-    /// loop, `-1` on a Möbius loop.
-    #[must_use]
-    pub fn triangle_sign_product(&self, a: usize, b: usize, c: usize) -> Option<i8> {
-        let (_, s_ab) = self.directed_rotation(a, b)?;
-        let (_, s_bc) = self.directed_rotation(b, c)?;
-        let (_, s_ca) = self.directed_rotation(c, a)?;
-        Some(s_ab * s_bc * s_ca)
-    }
-
-    /// Chart pairs that redundantly represent the SAME manifold — the #2280
-    /// gluing-consistency / #2080 anti-collapse detector.
-    ///
-    /// A well-conditioned transition is flagged when BOTH hold: its mutual
-    /// coverage (`|shared| / min(patch sizes)`) is at least `coverage_threshold`
-    /// (the two charts cover nearly the same rows), AND its Procrustes residual is
-    /// at most `residual_threshold` (they glue by one smooth transition ⇒ one
-    /// manifold). A high-coverage pair whose residual EXCEEDS the threshold is
-    /// genuinely distinct co-located structure and is deliberately NOT flagged —
-    /// that is the whole discrimination the mechanism turns on. Degenerate
-    /// (ill-conditioned) transitions carry no verdict and are skipped, exactly as
-    /// they are excluded from the observed sign cocycle. Returned sorted by the
-    /// underlying overlap id (deterministic).
-    ///
-    /// This is a diagnostic of the fitted atlas, not a promotion or a merge: it
-    /// names the collapse candidates a confinement/ownership solution acts on; it
-    /// does not itself merge or confine anything.
-    #[must_use]
-    pub fn co_collapse_candidates(
-        &self,
-        coverage_threshold: f64,
-        residual_threshold: f64,
-    ) -> Vec<CoCollapseCandidate> {
-        let mut out = Vec::new();
-        for transition in &self.transitions {
-            if !matches!(
-                transition.conditioning,
-                TransitionConditioning::WellConditioned
-            ) {
-                continue;
-            }
-            let members_from = self.patches[transition.from_patch].members.len();
-            let members_to = self.patches[transition.to_patch].members.len();
-            let smaller = members_from.min(members_to);
-            if smaller == 0 {
-                continue;
-            }
-            let mutual_coverage = transition.shared_rows.len() as f64 / smaller as f64;
-            if mutual_coverage >= coverage_threshold && transition.residual <= residual_threshold {
-                out.push(CoCollapseCandidate {
-                    from_patch: transition.from_patch,
-                    to_patch: transition.to_patch,
-                    overlap_id: transition.overlap_id,
-                    mutual_coverage,
-                    transition_residual: transition.residual,
-                });
-            }
-        }
-        out.sort_by_key(|candidate| candidate.overlap_id);
-        out
-    }
 }
 
 /// Every ambient row ordered by ascending Euclidean distance to `center`, ties
@@ -1355,16 +1254,6 @@ fn signed_identity(d: usize, sign: i8) -> Array2<f64> {
         m[[d - 1, d - 1]] = -1.0;
     }
     m
-}
-
-/// General square-matrix multiply `A · B`.
-fn matmul(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
-    a.dot(b)
-}
-
-/// Transpose of a square matrix.
-fn transpose(a: &Array2<f64>) -> Array2<f64> {
-    a.t().to_owned()
 }
 
 /// Determinant of a small square matrix by Gaussian elimination with partial

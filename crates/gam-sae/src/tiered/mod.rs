@@ -68,13 +68,10 @@ pub use fit::{
 };
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
-use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array1, Array2, ArrayView2, Axis};
 
-use crate::basis::{AnchorIndicatorEvaluator, SaeBasisEvaluator};
-use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom, finite_set_rank_charge};
+use crate::manifold::SaeManifoldAtom;
 use crate::sparse_dict::{SparseDictConfig, SparseDictFit};
 
 /// Tier-0: the single shared mean μ (length `p`). The global DC lives here, not
@@ -265,9 +262,6 @@ impl SinkAnchor {
         }
     }
 
-    fn is_sink(self) -> bool {
-        !matches!(self, Self::Semantic)
-    }
 }
 
 /// Flag-gated Tier-0.5 sink-atom configuration.
@@ -295,14 +289,6 @@ impl Tier05SinkAtomConfig {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
-            include_position_zero: true,
-            delimiter_classes: Vec::new(),
-        }
-    }
-
-    pub fn position_zero() -> Self {
-        Self {
-            enabled: true,
             include_position_zero: true,
             delimiter_classes: Vec::new(),
         }
@@ -353,190 +339,6 @@ impl Tier05SinkAtom {
         self.atom.basis_values.dot(self.atom.decoder_coefficients())
     }
 
-    /// Peel the sink from a same-row residual matrix before semantic charting.
-    pub fn residual_after_sink(
-        &self,
-        residual: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        let expected = (self.atom.basis_values.nrows(), self.atom.output_dim());
-        if residual.dim() != expected {
-            return Err(format!(
-                "Tier05SinkAtom::residual_after_sink: residual shape {:?} incompatible with atom rows/output ({}, {})",
-                residual.dim(),
-                self.atom.basis_values.nrows(),
-                self.atom.output_dim()
-            ));
-        }
-        Ok(&residual - &self.reconstruction())
-    }
-
-    /// Add the sink contribution back to a semantic reconstruction.
-    pub fn reconstruct_with_sink(
-        &self,
-        semantic_recon: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        let expected = (self.atom.basis_values.nrows(), self.atom.output_dim());
-        if semantic_recon.dim() != expected {
-            return Err(format!(
-                "Tier05SinkAtom::reconstruct_with_sink: reconstruction shape {:?} incompatible with atom rows/output ({}, {})",
-                semantic_recon.dim(),
-                self.atom.basis_values.nrows(),
-                self.atom.output_dim()
-            ));
-        }
-        Ok(&semantic_recon + &self.reconstruction())
-    }
-}
-
-/// Fit the Tier-0.5 sink atom on a post-Tier-0 residual.
-///
-/// `positions` are within-sequence token positions. `delimiter_classes` is either
-/// empty (no delimiter support supplied) or length `N`; entries not listed in
-/// `config.delimiter_classes` remain in the semantic reference anchor. Position
-/// 0 takes precedence over delimiter labels, because the measured confound is
-/// the first-token sink itself.
-pub fn fit_tier05_sink_atom(
-    residual: ArrayView2<'_, f64>,
-    positions: &[i64],
-    delimiter_classes: &[Option<SinkDelimiterClass>],
-    config: &Tier05SinkAtomConfig,
-) -> Result<Option<Tier05SinkAtom>, String> {
-    if !config.enabled {
-        return Ok(None);
-    }
-    let n = residual.nrows();
-    let p = residual.ncols();
-    if n == 0 || p == 0 {
-        return Err("fit_tier05_sink_atom: residual must be a non-empty N×P matrix".to_string());
-    }
-    if positions.len() != n {
-        return Err(format!(
-            "fit_tier05_sink_atom: positions length {} != N {n}",
-            positions.len()
-        ));
-    }
-    if !delimiter_classes.is_empty() && delimiter_classes.len() != n {
-        return Err(format!(
-            "fit_tier05_sink_atom: delimiter_classes length {} must be 0 or N {n}",
-            delimiter_classes.len()
-        ));
-    }
-    if !config.delimiter_classes.is_empty() && delimiter_classes.is_empty() {
-        return Err(
-            "fit_tier05_sink_atom: delimiter classes configured but no per-row delimiter labels supplied"
-                .to_string(),
-        );
-    }
-
-    let anchors = config.anchors()?;
-    let delimiter_set: BTreeSet<SinkDelimiterClass> =
-        config.delimiter_classes.iter().copied().collect();
-    let mut anchor_lookup = BTreeMap::new();
-    for (idx, anchor) in anchors.iter().copied().enumerate() {
-        anchor_lookup.insert(anchor, idx);
-    }
-
-    let mut coords = Array2::<f64>::zeros((n, 1));
-    let mut counts = vec![0usize; anchors.len()];
-    for row in 0..n {
-        let delimiter = if delimiter_classes.is_empty() {
-            None
-        } else {
-            delimiter_classes[row]
-        };
-        let anchor = if config.include_position_zero && positions[row] == 0 {
-            SinkAnchor::PositionZero
-        } else if let Some(class) = delimiter {
-            if delimiter_set.contains(&class) {
-                SinkAnchor::Delimiter(class)
-            } else {
-                SinkAnchor::Semantic
-            }
-        } else {
-            SinkAnchor::Semantic
-        };
-        let idx = anchor_lookup.get(&anchor).copied().ok_or_else(|| {
-            format!(
-                "fit_tier05_sink_atom: support anchor {} was not configured",
-                anchor.label()
-            )
-        })?;
-        coords[[row, 0]] = idx as f64;
-        counts[idx] += 1;
-    }
-
-    let sink_rows: usize = anchors
-        .iter()
-        .zip(counts.iter())
-        .filter(|(anchor, _count)| anchor.is_sink())
-        .map(|(_anchor, &count)| count)
-        .sum();
-    if sink_rows == 0 {
-        return Err(
-            "fit_tier05_sink_atom: enabled sink atom has no sink-supported rows".to_string(),
-        );
-    }
-
-    let evaluator = Arc::new(AnchorIndicatorEvaluator::new(anchors.len())?);
-    let (basis_values, basis_jacobian) = evaluator.evaluate(coords.view())?;
-    let mut decoder = Array2::<f64>::zeros((anchors.len(), p));
-    for row in 0..n {
-        let anchor = coords[[row, 0]] as usize;
-        for col in 0..p {
-            decoder[[anchor, col]] += residual[[row, col]];
-        }
-    }
-    for anchor in 0..anchors.len() {
-        if counts[anchor] > 0 {
-            let scale = 1.0 / counts[anchor] as f64;
-            for col in 0..p {
-                decoder[[anchor, col]] *= scale;
-            }
-        }
-    }
-    let smooth_penalty = Array2::<f64>::zeros((anchors.len(), anchors.len()));
-    let atom = SaeManifoldAtom::new_with_provided_function_gram(
-        "tier0_5_attention_sink",
-        SaeAtomBasisKind::FiniteSet,
-        1,
-        basis_values,
-        basis_jacobian,
-        decoder,
-        smooth_penalty,
-    )?
-    .with_basis_second_jet(evaluator);
-
-    let reconstruction = atom.basis_values.dot(atom.decoder_coefficients());
-    let mut rss = 0.0f64;
-    let mut tss = 0.0f64;
-    for row in 0..n {
-        for col in 0..p {
-            let r = residual[[row, col]] - reconstruction[[row, col]];
-            rss += r * r;
-            let v = residual[[row, col]];
-            tss += v * v;
-        }
-    }
-    let variance_absorbed = if tss <= 0.0 { 0.0 } else { 1.0 - rss / tss };
-
-    Ok(Some(Tier05SinkAtom {
-        atom,
-        anchors,
-        anchor_counts: counts,
-        rank_charge: finite_set_rank_charge(anchor_lookup.len()),
-        variance_absorbed,
-    }))
-}
-
-/// Position-only convenience wrapper for the measured position-0 sink.
-pub fn fit_position0_sink_atom(
-    residual: ArrayView2<'_, f64>,
-    positions: &[i64],
-) -> Result<Tier05SinkAtom, String> {
-    let config = Tier05SinkAtomConfig::position_zero();
-    fit_tier05_sink_atom(residual, positions, &[], &config)?.ok_or_else(|| {
-        "fit_position0_sink_atom: position-0 sink config unexpectedly disabled".to_string()
-    })
 }
 
 /// Pre-chart residual after Tier-0 and optional Tier-0.5 peeling.
@@ -547,7 +349,6 @@ pub struct TieredPrechartResidual {
     /// Residual handed to semantic Tier-1/Tier-2 charting.
     pub residual: Array2<f64>,
 }
-
 
 /// Knobs for a composed tiered fit.
 #[derive(Clone, Debug)]
@@ -604,110 +405,6 @@ pub struct InterferenceSubspace {
     pub q_perp: Array2<f64>,
     /// Singular values of the usage-weighted decoder along `q`, length `r`.
     pub scale: Array1<f64>,
-}
-
-/// Compute Tier-1's [`InterferenceSubspace`] from a fitted sparse dictionary.
-///
-/// DIAGNOSTIC span report — how much of `ℝ^P` the linear dictionary already
-/// spans. It must NOT weight or gate the Tier-2 fit (see [`InterferenceSubspace`]
-/// for why `q_perp`-weighting is blind to curvature).
-///
-/// Forms the usage-weighted decoder Gram `G = Σ_k w_k d_k d_kᵀ` (`P×P`), where
-/// `d_k` is atom `k`'s decoder row and `w_k = Σ_i codes[i,k]²` is its total fired
-/// energy (so dead atoms contribute nothing and `Q` is genuinely the *active*
-/// subspace). The eigenvectors of `G` split into the top-`r` (the active subspace
-/// `Q`) and the trailing `P−r` (`Q⊥`); `scale = √eval` along `Q`.
-///
-/// `rank`: `Some(r)` pins `r = min(r, P)`; `None` keeps the smallest `r` whose
-/// eigen-energy reaches 99% of the total (at least 1).
-pub fn interference_subspace(
-    fit: &SparseDictFit,
-    rank: Option<usize>,
-) -> Result<InterferenceSubspace, String> {
-    let decoder = fit.decoder.view();
-    let k = decoder.nrows();
-    let p = decoder.ncols();
-    if k == 0 || p == 0 {
-        return Err("interference_subspace: empty decoder".to_string());
-    }
-
-    // Per-atom fired energy w_k = Σ_i codes[i,k]².
-    let mut weight = vec![0.0f64; k];
-    for (idx_row, code_row) in fit.indices.rows().into_iter().zip(fit.codes.rows()) {
-        for (&atom_u32, &code) in idx_row.iter().zip(code_row.iter()) {
-            let atom = atom_u32 as usize;
-            if atom < k {
-                weight[atom] += (code as f64) * (code as f64);
-            }
-        }
-    }
-
-    // Usage-weighted decoder `Dw` (K×P), Dw_k = √w_k · d_k, then G = Dwᵀ Dw (P×P)
-    // via a single GEMM rather than K rank-1 updates.
-    let mut dw = Array2::<f64>::zeros((k, p));
-    for atom in 0..k {
-        let sw = weight[atom].max(0.0).sqrt();
-        if sw == 0.0 {
-            continue;
-        }
-        let src = decoder.row(atom);
-        let mut dst = dw.row_mut(atom);
-        for c in 0..p {
-            dst[c] = sw * (src[c] as f64);
-        }
-    }
-    let gram = dw.t().dot(&dw);
-
-    // Symmetric eigendecomposition: ascending eigenvalues, columns are the
-    // orthonormal eigenvectors (leading direction is the LAST column).
-    let (evals, evecs) = gram
-        .eigh(faer::Side::Lower)
-        .map_err(|err| format!("interference_subspace eigensolve failed: {err}"))?;
-    let total: f64 = evals.iter().map(|&e| e.max(0.0)).sum();
-    if total <= 0.0 {
-        return Err(
-            "interference_subspace: Tier-1 decoder carries no fired energy (all atoms dead)"
-                .to_string(),
-        );
-    }
-
-    // Choose r (columns are ascending, so the active subspace is the TAIL).
-    let r = match rank {
-        Some(r) => r.min(p).max(1),
-        None => {
-            // Smallest r whose top-r eigen-energy reaches 99% of the total.
-            // 0.99 is a REPORTING tolerance for this span DIAGNOSTIC only (how
-            // many directions to list); it gates/weights no fit and prices no
-            // atom — decisions stay with the rank-charge evidence criterion.
-            let mut acc = 0.0f64;
-            let mut chosen = 1usize;
-            for (taken, &e) in evals.iter().rev().enumerate() {
-                acc += e.max(0.0);
-                chosen = taken + 1;
-                if acc >= 0.99 * total {
-                    break;
-                }
-            }
-            chosen.min(p).max(1)
-        }
-    };
-
-    // q = last r columns (largest eigenvalues), scale = √eval along q.
-    let mut q = Array2::<f64>::zeros((p, r));
-    let mut scale = Array1::<f64>::zeros(r);
-    for j in 0..r {
-        let col = p - 1 - j; // descending: p-1 is the largest
-        q.column_mut(j).assign(&evecs.column(col));
-        scale[j] = evals[col].max(0.0).sqrt();
-    }
-    // q_perp = the leading (p − r) columns (smallest eigenvalues), the complement.
-    let pr = p - r;
-    let mut q_perp = Array2::<f64>::zeros((p, pr));
-    for j in 0..pr {
-        q_perp.column_mut(j).assign(&evecs.column(j));
-    }
-
-    Ok(InterferenceSubspace { q, q_perp, scale })
 }
 
 /// Mode-B hand-off: the RAW post-Tier-1 shared residual handed to the Tier-2
@@ -767,26 +464,6 @@ pub struct TieredSaeFit<T2> {
 /// question about the same quantity.
 pub fn explained_variance_from_sums(rss: f64, tss: f64) -> f64 {
     if tss > 0.0 { 1.0 - rss / tss } else { f64::NAN }
-}
-
-/// Explained variance `1 − RSS/TSS` of `recon` against `z`, with the total sum of
-/// squares taken about the supplied Tier-0 `mean` (the honest tiered baseline: a
-/// model must beat "predict the shared mean", not "predict zero").
-pub fn explained_variance_vs_mean(
-    z: ArrayView2<'_, f64>,
-    recon: ArrayView2<'_, f64>,
-    mean: &Array1<f64>,
-) -> f64 {
-    let mut rss = 0.0f64;
-    for (zr, rr) in z.rows().into_iter().zip(recon.rows()) {
-        for c in 0..z.ncols() {
-            let d = zr[c] - rr[c];
-            rss += d * d;
-        }
-    }
-    let baseline = &z - &mean.view().insert_axis(Axis(0));
-    let tss: f64 = baseline.iter().map(|&v| v * v).sum();
-    explained_variance_from_sums(rss, tss)
 }
 
 #[cfg(test)]

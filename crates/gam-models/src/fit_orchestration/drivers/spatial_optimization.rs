@@ -2066,94 +2066,6 @@ impl SingleBlockLatentCoordDesignCache {
     }
 }
 
-/// Diagnostic fixed-κ profiled-REML score: pin κ on one constant-curvature
-/// term, disable spatial-hyperparameter optimization, and run the complete
-/// production term-collection fit so only its smoothing parameters are
-/// profiled. The returned value is the fitted model's canonical REML/LAML
-/// negative log evidence.
-///
-/// This deliberately has no basis-local shortcut. Global identifiability,
-/// every active penalty block and penalty chart, weights, offsets, constraints,
-/// persisted rotations, adaptive semantics, priors, and all [`FitOptions`] must
-/// be realized by the same production path as an independently pinned model.
-///
-/// Curvature point estimation and inference use a separate continuously
-/// differentiable Gaussian REML curvature profile. This raw pinned-fit score is
-/// a diagnostic for comparing complete fixed production fits; it is not the
-/// point-estimation, confidence-interval, or flatness-test objective.
-///
-/// `pub` so diagnostics can compare complete production fits at selected κ and
-/// routing regressions can prove that this helper remains identical to an
-/// independently pinned invocation.
-pub fn fixed_kappa_profiled_reml_score(
-    data: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    resolvedspec: &TermCollectionSpec,
-    term_idx: usize,
-    kappa: f64,
-    family: LikelihoodSpec,
-    options: &FitOptions,
-) -> Result<f64, EstimationError> {
-    if !kappa.is_finite() {
-        crate::bail_invalid_estim!("fixed-κ profiled score probed a non-finite κ = {kappa}");
-    }
-    if y.len() != data.nrows() || weights.len() != data.nrows() || offset.len() != data.nrows() {
-        crate::bail_invalid_estim!(
-            "fixed-κ profiled score row mismatch: data={}, y={}, weights={}, offset={}",
-            data.nrows(),
-            y.len(),
-            weights.len(),
-            offset.len(),
-        );
-    }
-    // Pin only the requested curvature coordinate. Disabling the spatial outer
-    // optimizer below makes this an ordinary production fit of that exact
-    // cloned model; no modeled component is reimplemented or discarded here.
-    // Keep `kappa_fixed` unchanged: it records whether the user pinned the
-    // original model, while `enabled: false` is the production execution
-    // authority that pins this diagnostic invocation.
-    let mut probe_spec = resolvedspec.clone();
-    match probe_spec
-        .smooth_terms
-        .get_mut(term_idx)
-        .map(|t| &mut t.basis)
-    {
-        Some(SmoothBasisSpec::ConstantCurvature { spec, .. }) => spec.kappa = kappa,
-        _ => {
-            crate::bail_invalid_estim!(
-                "fixed-κ profiled score: term {term_idx} is not a constant-curvature smooth"
-            )
-        }
-    }
-    let fixed_kappa_options = SpatialLengthScaleOptimizationOptions {
-        enabled: false,
-        ..SpatialLengthScaleOptimizationOptions::default()
-    };
-    let fit = fit_term_collectionwith_spatial_length_scale_optimization(
-        data,
-        y.to_owned(),
-        weights.to_owned(),
-        offset.to_owned(),
-        &probe_spec,
-        family,
-        options,
-        &fixed_kappa_options,
-    )?;
-    let Some(score) = fit.fit.reml_score() else {
-        crate::bail_invalid_estim!(
-            "fixed-κ profiled fit at κ={kappa} has no REML/LAML score to profile against"
-        );
-    };
-    if !score.is_finite() {
-        crate::bail_invalid_estim!(
-            "fixed-κ profiled fit at κ={kappa} returned a non-finite REML/LAML score"
-        );
-    }
-    Ok(score)
-}
-
 /// Default half-width of the joint `[ρ, ψ]` search box in `log λ`.
 ///
 /// A PRIOR, not a constraint: the joint solve is better conditioned inside
@@ -9583,4 +9495,92 @@ mod nfree_gate_tests {
              skip the row lane without the reduced-basis witness"
         );
     }
+}
+
+/// Diagnostic fixed-κ profiled-REML score: pin κ on one constant-curvature
+/// term, disable spatial-hyperparameter optimization, and run the complete
+/// production term-collection fit so only its smoothing parameters are
+/// profiled. The returned value is the fitted model's canonical REML/LAML
+/// negative log evidence.
+///
+/// This deliberately has no basis-local shortcut. Global identifiability,
+/// every active penalty block and penalty chart, weights, offsets, constraints,
+/// persisted rotations, adaptive semantics, priors, and all [`FitOptions`] must
+/// be realized by the same production path as an independently pinned model.
+///
+/// Curvature point estimation and inference use a separate continuously
+/// differentiable Gaussian REML curvature profile. This raw pinned-fit score is
+/// a diagnostic for comparing complete fixed production fits; it is not the
+/// point-estimation, confidence-interval, or flatness-test objective.
+///
+/// `pub` so diagnostics can compare complete production fits at selected κ and
+/// routing regressions can prove that this helper remains identical to an
+/// independently pinned invocation.
+pub fn fixed_kappa_profiled_reml_score(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    term_idx: usize,
+    kappa: f64,
+    family: LikelihoodSpec,
+    options: &FitOptions,
+) -> Result<f64, EstimationError> {
+    if !kappa.is_finite() {
+        crate::bail_invalid_estim!("fixed-κ profiled score probed a non-finite κ = {kappa}");
+    }
+    if y.len() != data.nrows() || weights.len() != data.nrows() || offset.len() != data.nrows() {
+        crate::bail_invalid_estim!(
+            "fixed-κ profiled score row mismatch: data={}, y={}, weights={}, offset={}",
+            data.nrows(),
+            y.len(),
+            weights.len(),
+            offset.len(),
+        );
+    }
+    // Pin only the requested curvature coordinate. Disabling the spatial outer
+    // optimizer below makes this an ordinary production fit of that exact
+    // cloned model; no modeled component is reimplemented or discarded here.
+    // Keep `kappa_fixed` unchanged: it records whether the user pinned the
+    // original model, while `enabled: false` is the production execution
+    // authority that pins this diagnostic invocation.
+    let mut probe_spec = resolvedspec.clone();
+    match probe_spec
+        .smooth_terms
+        .get_mut(term_idx)
+        .map(|t| &mut t.basis)
+    {
+        Some(SmoothBasisSpec::ConstantCurvature { spec, .. }) => spec.kappa = kappa,
+        _ => {
+            crate::bail_invalid_estim!(
+                "fixed-κ profiled score: term {term_idx} is not a constant-curvature smooth"
+            )
+        }
+    }
+    let fixed_kappa_options = SpatialLengthScaleOptimizationOptions {
+        enabled: false,
+        ..SpatialLengthScaleOptimizationOptions::default()
+    };
+    let fit = fit_term_collectionwith_spatial_length_scale_optimization(
+        data,
+        y.to_owned(),
+        weights.to_owned(),
+        offset.to_owned(),
+        &probe_spec,
+        family,
+        options,
+        &fixed_kappa_options,
+    )?;
+    let Some(score) = fit.fit.reml_score() else {
+        crate::bail_invalid_estim!(
+            "fixed-κ profiled fit at κ={kappa} has no REML/LAML score to profile against"
+        );
+    };
+    if !score.is_finite() {
+        crate::bail_invalid_estim!(
+            "fixed-κ profiled fit at κ={kappa} returned a non-finite REML/LAML score"
+        );
+    }
+    Ok(score)
 }

@@ -89,7 +89,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
-use crate::grid_spline_2d::{GridSpline2dDesign, axis_basis_at};
+use crate::grid_spline_2d::axis_basis_at;
 use crate::inference::smooth_test::{
     SmoothTestInput, SmoothTestResult, SmoothTestScale, wood_smooth_test,
 };
@@ -219,17 +219,6 @@ pub fn anova_blocks(
 pub struct ChildDecoder {
     pub constant: f64,
     pub centered_coeffs: Array1<f64>,
-}
-
-impl ChildDecoder {
-    /// Fold the constant back into raw basis coefficients for a
-    /// partition-of-unity basis (`Σ_j φ_j ≡ 1`, e.g. B-splines):
-    /// `constant + φ̃ᵀa = φᵀ(a + (constant − mᵀa)·1)`. For non-PoU bases
-    /// keep the explicit-constant form instead.
-    pub fn raw_coeffs_partition_of_unity(&self, means: ArrayView1<'_, f64>) -> Array1<f64> {
-        let shift = self.constant - means.dot(&self.centered_coeffs);
-        self.centered_coeffs.mapv(|v| v) + Array1::from_elem(self.centered_coeffs.len(), shift)
-    }
 }
 
 /// The lossless-on-the-additive-part split: child atoms inheriting the
@@ -870,22 +859,6 @@ pub fn carve_input_from_fitted_atom(
     })
 }
 
-/// Engine cap on knot cells per axis (the grid engine's dense-Cholesky
-/// sizing contract: `p = (K+3)² ≤ 1225`).
-const PAIR_COMPONENT_MAX_CELLS: usize = 32;
-/// Floor on knot cells per axis — below 4 cells the cubic tensor basis has
-/// too little resolution to carry a pair interaction worth carving.
-const PAIR_COMPONENT_MIN_CELLS: usize = 4;
-
-/// Knot cells per axis for the raw-coordinate pair component, chosen from
-/// the sample size alone (magic by default — no knob): `K ≈ n^(1/3)`
-/// clamped to `[4, 32]`. The cube-root growth keeps the basis comfortably
-/// inside the data's resolution (p = (K+3)² ≪ n for all n ≥ ~300) while
-/// REML owns the actual smoothness; the cap is the engine's sizing contract.
-fn pair_component_cells(n: usize) -> usize {
-    ((n as f64).cbrt().ceil() as usize).clamp(PAIR_COMPONENT_MIN_CELLS, PAIR_COMPONENT_MAX_CELLS)
-}
-
 /// Which estimator produced a [`PairSurfaceFit`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairSurfaceBackend {
@@ -962,164 +935,6 @@ impl PairSurfaceFit {
             }
         }
         Ok((mean, self.surface.residual_cross_cov[[dim, dim]] * quad))
-    }
-}
-
-/// THE pair-component estimator (#1031): fit the Layer-B ANOVA pair
-/// interaction surface from RAW coordinates, auto-routed with no knobs.
-///
-/// Estimator. A `(K+3)²` tensor of uniform cubic B-splines over the data's
-/// bounding box, penalized by the FULL anisotropic biharmonic energy
-/// `∫∫ a₁²f₁₁² + 2a₁a₂f₁₂² + a₂²f₂₂²` (mixed term included — the roughness
-/// functional no `te()` Kronecker-marginal penalty matches, which is
-/// exactly why this is exposed as its own estimator instead of an
-/// auto-route through the formula smooths: routing `te`/Duchon through it
-/// would silently change their posteriors). One λ is shared across response
-/// dimensions (one surface smoothness), selected by the pooled exact REML
-/// criterion. `K` grows as `n^(1/3)` (capped by the engine's sizing
-/// contract); the metric is pinned to `a_i = L_i²` (squared bounding-box
-/// span per axis), which makes the penalty — and hence the estimator —
-/// invariant to per-axis rescaling of the coordinates, with the leftover
-/// global constant absorbed by λ.
-///
-/// Route. The streaming grid engine evaluates this estimator EXACTLY in
-/// O(n): one scatter-add pass, banded sufficient statistics, exact
-/// log-determinant REML, exact posterior summary. When its solve
-/// degenerates (non-PD penalized system, `n − edf < 1`), the same basis
-/// falls back to the dense ridge path ([`fit_tensor_surface`]) — a
-/// different (heavier, isotropic-in-coefficients) penalty but the same
-/// surface class, so every input that admits a pair component gets one.
-///
-/// The returned bases and fit feed [`CarveInput`] directly (B-splines are
-/// partition-of-unity, so the default `kernel_a`/`kernel_b` gauge applies).
-pub fn fit_pair_surface(
-    x1: &[f64],
-    x2: &[f64],
-    responses: ArrayView2<'_, f64>,
-) -> Result<PairSurfaceFit, String> {
-    let n = x1.len();
-    let d_dims = responses.ncols();
-    if x2.len() != n || responses.nrows() != n {
-        return Err(format!(
-            "fit_pair_surface: sample sizes disagree (x1 {n}, x2 {}, responses {})",
-            x2.len(),
-            responses.nrows()
-        ));
-    }
-    if d_dims == 0 {
-        return Err("fit_pair_surface: no response dimensions".to_string());
-    }
-    // Axis-rescaling-invariant metric a_i = L_i² (see the doc comment).
-    let mut span = [0.0_f64; 2];
-    for (ax, xs) in [x1, x2].into_iter().enumerate() {
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for &v in xs {
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
-        if !(hi > lo && hi.is_finite() && lo.is_finite()) {
-            return Err(format!(
-                "fit_pair_surface: axis {} is degenerate or non-finite ([{lo}, {hi}]); \
-                 no pair surface exists over a collapsed axis",
-                ax + 1
-            ));
-        }
-        span[ax] = hi - lo;
-    }
-    let metric = [span[0] * span[0], span[1] * span[1]];
-    let k = pair_component_cells(n);
-
-    let columns: Vec<Vec<f64>> = (0..d_dims).map(|d| responses.column(d).to_vec()).collect();
-    let column_refs: Vec<&[f64]> = columns.iter().map(Vec::as_slice).collect();
-    let weights = vec![1.0_f64; n];
-    let design = GridSpline2dDesign::build_multi(x1, x2, &column_refs, &weights, k, metric)?;
-
-    // The factor bases on the sample — shared by both routes and by the
-    // carve (one empirical measure end to end).
-    let lower_corner = design.lower_corner();
-    let cell_widths = design.cell_widths();
-    let m = design.basis_per_axis();
-    let mut phi_a = Array2::<f64>::zeros((n, m));
-    let mut phi_b = Array2::<f64>::zeros((n, m));
-    for r in 0..n {
-        let (j0, vals) = design.axis_basis(0, x1[r])?;
-        for (i, &v) in vals.iter().enumerate() {
-            phi_a[[r, j0 + i]] = v;
-        }
-        let (j0, vals) = design.axis_basis(1, x2[r])?;
-        for (i, &v) in vals.iter().enumerate() {
-            phi_b[[r, j0 + i]] = v;
-        }
-    }
-
-    match design
-        .fit_reml()
-        .and_then(|fit| design.posterior(&fit).map(|post| (fit, post)))
-    {
-        Ok((fit, post)) => {
-            let mm = m * m;
-            let mut unit_covariance = Array2::<f64>::zeros((mm, mm));
-            for i in 0..mm {
-                for j in 0..mm {
-                    unit_covariance[[i, j]] = post.unit_covariance[i * mm + j];
-                }
-            }
-            let mut residual_cross_cov = Array2::<f64>::zeros((d_dims, d_dims));
-            for d in 0..d_dims {
-                for e in 0..d_dims {
-                    residual_cross_cov[[d, e]] = post.residual_cross_cov[d * d_dims + e];
-                }
-            }
-            let mut coeffs = Vec::with_capacity(d_dims);
-            let mut coeff_covariance = Vec::with_capacity(d_dims);
-            for d in 0..d_dims {
-                // Engine flat order g = j1·(K+3) + j2 IS the carve's
-                // row-major (j·M₂ + k) vec convention.
-                let mut c = Array2::<f64>::zeros((m, m));
-                for j in 0..m {
-                    for kk in 0..m {
-                        c[[j, kk]] = fit.coeffs[d][j * m + kk];
-                    }
-                }
-                coeffs.push(c);
-                coeff_covariance.push(&unit_covariance * residual_cross_cov[[d, d]]);
-            }
-            Ok(PairSurfaceFit {
-                phi_a,
-                phi_b,
-                surface: TensorSurfaceFit {
-                    coeffs,
-                    coeff_covariance,
-                    residual_cross_cov,
-                    unit_covariance,
-                    lambda: gam_problem::checked_exp_log_strength(fit.log_lambda)
-                        .map_err(|error| format!("ANOVA pair-surface log strength: {error}"))?,
-                    edf: post.edf,
-                    residual_df: post.residual_df,
-                },
-                backend: PairSurfaceBackend::GridExact,
-                lower_corner,
-                cell_widths,
-            })
-        }
-        Err(grid_err) => {
-            let surface =
-                fit_tensor_surface(phi_a.view(), phi_b.view(), responses).map_err(|dense_err| {
-                    format!(
-                        "fit_pair_surface: grid engine degenerated ({grid_err}) and the dense \
-                         ridge fallback failed too ({dense_err})"
-                    )
-                })?;
-            Ok(PairSurfaceFit {
-                phi_a,
-                phi_b,
-                surface,
-                backend: PairSurfaceBackend::DenseRidge,
-                lower_corner,
-                cell_widths,
-            })
-        }
     }
 }
 

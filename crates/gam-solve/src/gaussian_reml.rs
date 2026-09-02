@@ -10,10 +10,7 @@ use gam_problem::{
 };
 use gam_terms::construction::CanonicalPenalty;
 use gam_terms::smooth::BlockwisePenalty;
-use ndarray::{
-    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayViewMut1, ArrayViewMut2, Axis,
-    s,
-};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use opt::{RidgeSchedule, escalate_ridge};
 use rayon::prelude::*;
 use std::sync::Once;
@@ -866,15 +863,6 @@ pub struct GaussianRemlWarmStart {
     pub eigen_cache: Option<GaussianRemlEigenCache>,
 }
 
-impl GaussianRemlWarmStart {
-    pub fn from_multi_result(result: &GaussianRemlMultiResult) -> Self {
-        Self {
-            lambda: Some(result.lambda),
-            eigen_cache: Some(result.cache.clone()),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct GaussianRemlResult {
     pub lambda: f64,
@@ -969,19 +957,6 @@ impl GaussianRemlNoAllocWorkspace {
         }
     }
 
-    fn validate(&self, p: usize, d: usize) -> Result<(), EstimationError> {
-        if self.xtwy.dim() != (p, d)
-            || self.ywy.len() != d
-            || self.projected_rhs.dim() != (p, d)
-            || self.projected_rhs_squared.dim() != (p, d)
-            || self.scaled_projected_rhs.dim() != (p, d)
-        {
-            crate::bail_invalid_estim!(
-                "Gaussian REML no-alloc workspace shape mismatch: expected p={p}, d={d}"
-            );
-        }
-        Ok::<(), _>(())
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1375,41 +1350,6 @@ pub struct GaussianRemlPointEval {
     pub coefficients: Array1<f64>,
 }
 
-/// Evaluate the scalar closed-form Gaussian REML objective at a fixed `rho`
-/// (`= ln λ`). This is the analytic score/edf/σ²/β the profiled search sees at
-/// that point; it performs no search. Diagnostic surface for cross-tool
-/// λ-selection audits — the production optimizer is unchanged.
-pub fn gaussian_reml_point_eval_at_rho(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    penalty: ArrayView2<'_, f64>,
-    nullspace_dim: Option<usize>,
-    weights: Option<ArrayView1<'_, f64>>,
-    rho: f64,
-) -> Result<GaussianRemlPointEval, EstimationError> {
-    let lambda = gam_problem::checked_exp_log_strength(rho)
-        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-    let y2 = y.insert_axis(Axis(1));
-    let prepared = prepare_gaussian_reml(x, y2.view(), penalty, nullspace_dim, weights, None)?;
-    validate_reml_profile_residuals(
-        &prepared.cache,
-        prepared.ywy.view(),
-        prepared.projected_rhs_squared.view(),
-        rho,
-    )?;
-    let eval = prepared.evaluate(rho);
-    let coefficients = prepared.coefficients(lambda).column(0).to_owned();
-    let sigma2 = prepared.sigma2(rho)[0];
-    Ok(GaussianRemlPointEval {
-        rho,
-        lambda,
-        reml_score: eval.cost,
-        edf: eval.edf,
-        sigma2,
-        coefficients,
-    })
-}
-
 /// Successful finite-window certificate for the profiled Gaussian REML
 /// ρ-objective.
 ///
@@ -1654,39 +1594,6 @@ pub fn gaussian_reml_multi_closed_form_with_nullspace_dim(
     )
 }
 
-pub fn gaussian_reml_multi_closed_form_warm_started(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    penalty: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-    warm_start: Option<&GaussianRemlWarmStart>,
-) -> Result<GaussianRemlMultiResult, EstimationError> {
-    gaussian_reml_multi_closed_form_warm_started_with_nullspace_dim(
-        x, y, penalty, None, weights, warm_start,
-    )
-}
-
-pub fn gaussian_reml_multi_closed_form_warm_started_with_nullspace_dim(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    penalty: ArrayView2<'_, f64>,
-    nullspace_dim: Option<usize>,
-    weights: Option<ArrayView1<'_, f64>>,
-    warm_start: Option<&GaussianRemlWarmStart>,
-) -> Result<GaussianRemlMultiResult, EstimationError> {
-    let init_lambda = warm_start.and_then(|start| start.lambda);
-    let eigen_cache = warm_start.and_then(|start| start.eigen_cache.as_ref());
-    gaussian_reml_multi_closed_form_from_parts(
-        x,
-        y,
-        penalty,
-        nullspace_dim,
-        weights,
-        init_lambda,
-        eigen_cache,
-    )
-}
-
 pub fn gaussian_reml_multi_closed_form_with_cache(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -1704,157 +1611,6 @@ pub fn gaussian_reml_multi_closed_form_with_cache(
         init_lambda,
         eigen_cache,
     )
-}
-
-pub fn gaussian_reml_multi_closed_form_with_cache_no_alloc(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    penalty: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-    init_lambda: Option<f64>,
-    eigen_cache: &GaussianRemlEigenCache,
-    workspace: &mut GaussianRemlNoAllocWorkspace,
-    mut coefficients: ArrayViewMut2<'_, f64>,
-    mut fitted: ArrayViewMut2<'_, f64>,
-    mut sigma2: ArrayViewMut1<'_, f64>,
-) -> Result<GaussianRemlNoAllocFit, EstimationError> {
-    // Match the symmetric-S contract used by the cache builder: the
-    // fingerprint check below compares against a fingerprint computed on the
-    // canonicalized penalty, so the input must be canonicalized first.
-    let penalty_owned = canonicalize_penalty(penalty);
-    let penalty = penalty_owned.view();
-    let n = x.nrows();
-    let p = x.ncols();
-    let d = y.ncols();
-    validate_gaussian_reml_design(x, penalty, weights)?;
-    validate_gaussian_reml_eigen_cache(eigen_cache, p)?;
-    if y.nrows() != n {
-        crate::bail_invalid_estim!(
-            "Gaussian REML row mismatch: X has {n} rows but Y has {}",
-            y.nrows()
-        );
-    }
-    if y.iter().any(|value| !value.is_finite()) {
-        crate::bail_invalid_estim!("Gaussian REML inputs must be finite");
-    }
-    let n_effective = match weights {
-        Some(w) => effective_observation_count(w),
-        None => n,
-    };
-    if n_effective <= eigen_cache.nullity {
-        crate::bail_invalid_estim!(
-            "Gaussian REML requires more positive-weight rows than the nullspace dimension; got n_effective={n_effective}, nullity={}",
-            eigen_cache.nullity
-        );
-    }
-    let penalty_fingerprint = matrix_fingerprint(penalty);
-    if eigen_cache.penalty_fingerprint != penalty_fingerprint {
-        crate::bail_invalid_estim!("Gaussian REML eigen cache penalty mismatch");
-    }
-    workspace.validate(p, d)?;
-    if coefficients.dim() != (p, d) || fitted.dim() != (n, d) || sigma2.len() != d {
-        crate::bail_invalid_estim!(
-            "Gaussian REML no-alloc output shape mismatch: expected coefficients=({p},{d}), fitted=({n},{d}), sigma2={d}"
-        );
-    }
-    if let Some(lambda) = init_lambda {
-        validate_initial_lambda(lambda)?;
-    }
-
-    fill_weighted_rhs_no_alloc(x, y, weights, workspace)?;
-    project_rhs_no_alloc(eigen_cache, workspace);
-
-    let init_rho = init_lambda.map(f64::ln);
-    let rho = optimize_rho_no_alloc(
-        eigen_cache,
-        workspace.ywy.view(),
-        workspace.projected_rhs_squared.view(),
-        n_effective,
-        d,
-        init_rho,
-    )?;
-    let eval = evaluate_reml_parts(
-        eigen_cache,
-        workspace.ywy.view(),
-        workspace.projected_rhs_squared.view(),
-        n_effective,
-        d,
-        rho,
-    );
-    let lambda = gam_problem::checked_exp_log_strength(rho)
-        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-    fill_coefficients_no_alloc(eigen_cache, workspace, lambda, coefficients.view_mut());
-    fill_fitted_no_alloc(x, coefficients.view(), fitted.view_mut());
-    fill_sigma2_no_alloc(
-        eigen_cache,
-        workspace.ywy.view(),
-        workspace.projected_rhs_squared.view(),
-        n_effective,
-        d,
-        lambda,
-        sigma2.view_mut(),
-    );
-    let (reml_grad_lambda, reml_hess_lambda) =
-        rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
-    Ok(GaussianRemlNoAllocFit {
-        lambda,
-        rho,
-        reml_score: eval.cost,
-        reml_grad_lambda,
-        reml_hess_lambda,
-        reml_grad_rho: eval.grad,
-        reml_hess_rho: eval.hess,
-        edf: eval.edf,
-    })
-}
-
-pub fn gaussian_reml_multi_closed_form_batch<'a>(
-    problems: &[GaussianRemlMultiBatchProblem<'a>],
-    penalty: ArrayView2<'a, f64>,
-    nullspace_dim: Option<usize>,
-) -> Result<Vec<GaussianRemlMultiResult>, EstimationError> {
-    if problems.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Phase A: par_iter compute X'WX per problem (the only per-fit step that
-    // depends on `n_b`; remaining work is `O(p)` and can amortize through
-    // `_with_cache`).
-    let xtwx_per_problem: Vec<Array2<f64>> = problems
-        .par_iter()
-        .map(|problem| {
-            let weight = match problem.weights.as_ref() {
-                Some(w) => w.to_owned(),
-                None => Array1::ones(problem.x.nrows()),
-            };
-            dense_xt_diag_x(problem.x.view(), weight.view())
-        })
-        .collect();
-    // Phase B: one batched cuSOLVER Cholesky when policy approves uniform p
-    // and K aggregate FLOPs; otherwise the cache builder uses the normal
-    // per-fit non-GPU factorization path.
-    let caches =
-        build_gaussian_reml_eigen_cache_batched(xtwx_per_problem, penalty.view(), nullspace_dim);
-    // Phase C: par_iter finish each fit with its prebuilt cache. A cache-build
-    // error is a real per-problem error, not a signal to rebuild through a
-    // second path.
-    let fits: Vec<Result<GaussianRemlMultiResult, EstimationError>> = problems
-        .par_iter()
-        .zip(caches.into_par_iter())
-        .map(|(problem, cache_result)| {
-            let init_lambda = problem.init_rho.map(f64::exp);
-            let cache = cache_result?;
-            gaussian_reml_multi_closed_form_from_parts(
-                problem.x.view(),
-                problem.y.view(),
-                penalty.view(),
-                nullspace_dim,
-                problem.weights.as_ref().map(|weights| weights.view()),
-                init_lambda,
-                Some(&cache),
-            )
-        })
-        .collect();
-    fits.into_iter().collect()
 }
 
 struct BlockOrthogonalEval {
@@ -4273,14 +4029,6 @@ fn batched_whitened_penalty_transforms(
     )
 }
 
-pub fn build_gaussian_reml_eigen_cache(
-    x: ArrayView2<'_, f64>,
-    penalty: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<GaussianRemlEigenCache, EstimationError> {
-    build_gaussian_reml_eigen_cache_with_nullspace_dim(x, penalty, None, weights)
-}
-
 pub fn build_gaussian_reml_eigen_cache_with_nullspace_dim(
     x: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
@@ -5851,57 +5599,6 @@ fn optimize_rho(
     Ok(enumerate_and_select_rho(eval, enclose, init_rho, None)?.rho)
 }
 
-fn fill_weighted_rhs_no_alloc(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-    workspace: &mut GaussianRemlNoAllocWorkspace,
-) -> Result<(), EstimationError> {
-    let d = y.ncols();
-
-    // XᵀWY and YᵀWY via faer BLAS. Both `fast_xt_diag_y` and `fast_atb`
-    // dispatch to faer's SIMD-optimized GEMM (with chunked weight scaling
-    // when weights are present), replacing the previous scalar triple loop
-    // over (n, p, d). For YᵀWY we only need the diagonal entries, but d is
-    // small (typically 1–10) so computing the full d×d Gram is negligible.
-    let (xtwy, ywy_full) = match weights {
-        Some(w) => (fast_xt_diag_y(&x, &w, &y), fast_xt_diag_y(&y, &w, &y)),
-        None => (fast_atb(&x, &y), fast_atb(&y, &y)),
-    };
-    workspace.xtwy.assign(&xtwy);
-    for output in 0..d {
-        workspace.ywy[output] = ywy_full[[output, output]];
-    }
-
-    if workspace
-        .xtwy
-        .iter()
-        .chain(workspace.ywy.iter())
-        .any(|value| !value.is_finite())
-    {
-        crate::bail_invalid_estim!("Gaussian REML weighted cross-products must be finite");
-    }
-    Ok(())
-}
-
-fn project_rhs_no_alloc(
-    cache: &GaussianRemlEigenCache,
-    workspace: &mut GaussianRemlNoAllocWorkspace,
-) {
-    // projected_rhs = coefficient_basisᵀ · xtwy, computed via faer BLAS
-    // (was previously a scalar triple loop over (p, d, p)).
-    let projected = fast_atb(&cache.coefficient_basis, &workspace.xtwy);
-    workspace.projected_rhs.assign(&projected);
-    let p = cache.penalty_eigenvalues.len();
-    let d = workspace.ywy.len();
-    for eig in 0..p {
-        for output in 0..d {
-            let value = workspace.projected_rhs[[eig, output]];
-            workspace.projected_rhs_squared[[eig, output]] = value * value;
-        }
-    }
-}
-
 fn evaluate_reml_parts(
     cache: &GaussianRemlEigenCache,
     ywy: ArrayView1<'_, f64>,
@@ -5955,116 +5652,6 @@ fn evaluate_reml_profile(
         );
     }
     eval
-}
-
-/// Select ρ̂ by the same grid-free enumeration as [`optimize_rho`], driven from
-/// raw cache/rhs parts with zero heap allocation (the DFS stack is a fixed-size
-/// on-stack array and both closures capture only borrowed views). Reduces
-/// through the shared `enumerate_and_select_rho`, so it returns a bit-identical
-/// ρ to the allocating path on identical inputs.
-fn optimize_rho_no_alloc(
-    cache: &GaussianRemlEigenCache,
-    ywy: ArrayView1<'_, f64>,
-    projected_rhs_squared: ArrayView2<'_, f64>,
-    n_effective: usize,
-    n_outputs: usize,
-    init_rho: Option<f64>,
-) -> Result<f64, EstimationError> {
-    validate_reml_profile_residuals(cache, ywy.view(), projected_rhs_squared.view(), RHO_LOWER)?;
-    if cache.penalty_rank == 0 {
-        return Ok(init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER));
-    }
-    let eval = |rho: f64| {
-        evaluate_reml_parts(
-            cache,
-            ywy,
-            projected_rhs_squared,
-            n_effective,
-            n_outputs,
-            rho,
-        )
-    };
-    let enclose = |a: f64, b: f64| {
-        reml_deriv_enclosure(
-            cache,
-            ywy,
-            projected_rhs_squared,
-            n_effective,
-            n_outputs,
-            a,
-            b,
-        )
-    };
-    Ok(enumerate_and_select_rho(eval, enclose, init_rho, None)?.rho)
-}
-
-fn fill_coefficients_no_alloc(
-    cache: &GaussianRemlEigenCache,
-    workspace: &mut GaussianRemlNoAllocWorkspace,
-    lambda: f64,
-    mut coefficients: ArrayViewMut2<'_, f64>,
-) {
-    let p = cache.penalty_eigenvalues.len();
-    let d = workspace.ywy.len();
-    let spectrum = PenaltyRangeSpectrum::of(cache);
-    for eig in 0..p {
-        let scale = 1.0 / (1.0 + lambda * spectrum.get(eig));
-        for output in 0..d {
-            workspace.scaled_projected_rhs[[eig, output]] =
-                workspace.projected_rhs[[eig, output]] * scale;
-        }
-    }
-
-    for col in 0..p {
-        for output in 0..d {
-            let mut value = 0.0;
-            for eig in 0..p {
-                value += cache.coefficient_basis[[col, eig]]
-                    * workspace.scaled_projected_rhs[[eig, output]];
-            }
-            coefficients[[col, output]] = value;
-        }
-    }
-}
-
-fn fill_fitted_no_alloc(
-    x: ArrayView2<'_, f64>,
-    coefficients: ArrayView2<'_, f64>,
-    mut fitted: ArrayViewMut2<'_, f64>,
-) {
-    let n = x.nrows();
-    let p = x.ncols();
-    let d = coefficients.ncols();
-    for row in 0..n {
-        for output in 0..d {
-            let mut value = 0.0;
-            for col in 0..p {
-                value += x[[row, col]] * coefficients[[col, output]];
-            }
-            fitted[[row, output]] = value;
-        }
-    }
-}
-
-fn fill_sigma2_no_alloc(
-    cache: &GaussianRemlEigenCache,
-    ywy: ArrayView1<'_, f64>,
-    projected_rhs_squared: ArrayView2<'_, f64>,
-    n_effective: usize,
-    n_outputs: usize,
-    lambda: f64,
-    mut sigma2: ArrayViewMut1<'_, f64>,
-) {
-    let nu = n_effective as f64 - cache.nullity as f64;
-    let spectrum = PenaltyRangeSpectrum::of(cache);
-    for output in 0..n_outputs {
-        let mut fitted_quadratic = 0.0;
-        for eig in 0..spectrum.len() {
-            let denom = 1.0 + lambda * spectrum.get(eig);
-            fitted_quadratic += projected_rhs_squared[[eig, output]] / denom;
-        }
-        sigma2[output] = (ywy[output] - fitted_quadratic) / nu;
-    }
 }
 
 fn invert_lower_triangular(lower: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
@@ -9373,7 +8960,6 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
             nullity: 3,
         }
     }
-
 
     /// The classification and the rank are the same question asked once.
     #[test]

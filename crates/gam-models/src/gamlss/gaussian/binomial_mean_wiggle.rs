@@ -666,23 +666,6 @@ impl BinomialMeanWiggleFamily {
         ))))
     }
 
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
-    ///
-    /// `BinomialMeanWiggle` has a single location output (n_outputs = 1):
-    /// - block 0 (eta):    output 0 = design rows
-    /// - block 1 (wiggle): all zeros (nonlinear link modulation)
-    pub fn block_effective_jacobian(
-        specs: &[ParameterBlockSpec],
-        block_idx: usize,
-    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-        crate::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
-            family: "BinomialMeanWiggleFamily",
-            n_outputs: 1,
-            additive_blocks: &[Self::BLOCK_ETA],
-            wiggle_block: Some(Self::BLOCK_WIGGLE),
-        }
-        .block_effective_jacobian(specs, block_idx)
-    }
 }
 
 impl CustomFamily for BinomialMeanWiggleFamily {
@@ -707,7 +690,6 @@ impl CustomFamily for BinomialMeanWiggleFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }
-
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // The mean-wiggle Hessian is exposed as a row-coefficient operator,

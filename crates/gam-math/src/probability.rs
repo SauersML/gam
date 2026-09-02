@@ -279,17 +279,6 @@ pub fn normal_cdf(x: f64) -> f64 {
     0.5 * erfc(-x / std::f64::consts::SQRT_2)
 }
 
-/// Standard normal survival probability `P(Z > x)`.
-///
-/// This is evaluated as `½·erfc(x/√2)`, not as `1 − Φ(x)`. The latter loses
-/// relative accuracy as soon as `Φ(x)` approaches one and becomes identically
-/// zero for every representable `x` above roughly `8.3`, while the direct
-/// complementary form retains the full representable tail.
-#[inline]
-pub fn normal_sf(x: f64) -> f64 {
-    0.5 * erfc(x / std::f64::consts::SQRT_2)
-}
-
 /// Two-sided standard-normal probability `P(|Z| ≥ |z|)`.
 ///
 /// The exact symmetric identity is `erfc(|z|/√2)`. Evaluating that identity
@@ -330,21 +319,6 @@ pub fn student_t_two_sided_probability(t: f64, degrees_of_freedom: f64) -> f64 {
     regularized_beta_lower_from_log_x(log_x, half_df, 0.5)
 }
 
-/// Student-t survival probability `P(T_ν > t)`.
-///
-/// The small tail is always obtained from
-/// [`student_t_two_sided_probability`]. For negative `t`, subtracting its
-/// half-tail from one constructs the large probability, where subtraction is
-/// well conditioned.
-pub fn student_t_sf(t: f64, degrees_of_freedom: f64) -> f64 {
-    let two_sided = student_t_two_sided_probability(t, degrees_of_freedom);
-    if t < 0.0 {
-        1.0 - 0.5 * two_sided
-    } else {
-        0.5 * two_sided
-    }
-}
-
 /// Chi-squared survival probability `P(X_ν > statistic)`.
 ///
 /// Uses the regularized upper incomplete gamma directly instead of
@@ -366,124 +340,6 @@ pub fn chi_square_sf(statistic: f64, degrees_of_freedom: f64) -> f64 {
         return 0.0;
     }
     gamma_ur(half_df, 0.5 * statistic)
-}
-
-/// Survival probability `P(Σ_j w_j Z_j² > statistic)` for independent standard
-/// normals `Z_j` and non-negative weights `w`.
-///
-/// This is the exact null law of every quadratic form `u'Au` in a standard
-/// normal vector — `w` being the eigenvalues of the symmetric part of `A` — and
-/// it is the reference distribution a *penalized* likelihood-ratio statistic is
-/// actually drawn from. Only the degenerate all-weights-equal case reduces to a
-/// (scaled) χ²; matching a χ² to the mean `Σ w_j` alone leaves the reference
-/// over-dispersed whenever the weights differ, because `Var = 2Σ w_j²` while the
-/// mean-matched χ² carries `2 Σ w_j`, and `Σ w_j² ≤ (max_j w_j)·Σ w_j`.
-///
-/// # Method
-///
-/// Imhof's (1961) exact inversion of the characteristic function, in the central
-/// one-degree-of-freedom-per-weight form:
-///
-/// ```text
-/// P(Q > x) = 1/2 + (1/π) ∫_0^∞ sin θ(u) / (u ρ(u)) du,
-/// θ(u) = ½ Σ_j arctan(w_j u) − ½ x u,
-/// ρ(u) = Π_j (1 + w_j² u²)^{1/4}.
-/// ```
-///
-/// The integrand is bounded (`sin θ(u)/u → (Σ w_j − x)/2` as `u → 0`) and is
-/// integrated on panels of one full oscillation of the `−xu/2` phase with a
-/// fixed 16-node Gauss–Legendre rule, which is exact for the amplitude to well
-/// past the resolution of the phase.
-///
-/// # Truncation, and why the bound is the oscillatory one
-///
-/// The naive tail bound `∫_U^∞ du/(u ρ(u))` decays only like `U^{-m/2}` in the
-/// number `m` of weights that are *active* at `U` (i.e. `w_j U ≳ 1`), which is
-/// useless when one weight dominates. The integrand is an oscillation, though:
-/// once `φ'(u) = ½ Σ_j w_j/(1 + w_j²u²)` has fallen below `x/4`, the phase
-/// `θ` is strictly decreasing with `|θ'| ≥ x/4`, so substituting the phase as
-/// the integration variable turns the tail into `∫ G(t) sin(θ(U) − t) dt` with
-/// `G` positive and decreasing from `G(0) ≤ 4/(x U ρ(U))`. The alternating
-/// half-period sum of such an integral is bounded by `4 G(0)`, giving
-///
-/// ```text
-/// |tail(U)| ≤ 16 / (x · U · ρ(U)),
-/// ```
-///
-/// which is the stopping rule. This is a bound on the answer, not a guess about
-/// it: the loop runs until the bound is under [`WEIGHTED_CHI_SQUARE_TOLERANCE`],
-/// and `ρ` is non-decreasing so it always terminates.
-///
-/// # Exact special cases
-///
-/// * no positive weight — `Q ≡ 0`;
-/// * all positive weights bit-identical — `Q = w χ²_q` exactly, so the
-///   incomplete-gamma path is both faster and more accurate than any quadrature
-///   (this also covers the single-weight and the classical unpenalized
-///   `w ≡ 1 ⇒ χ²_q` cases).
-///
-/// Returns `NaN` if any weight is negative or non-finite, or if `statistic` is
-/// `NaN`.
-pub fn weighted_chi_square_sf(weights: &[f64], statistic: f64) -> f64 {
-    weighted_chi_square_sf_with_bound(weights, statistic).0
-}
-
-/// [`weighted_chi_square_sf`] together with the certified absolute bound on its
-/// own truncation error, so a consumer (or a test) can see the accuracy rather
-/// than trust it.
-///
-/// The bound is `0.0` on the exact closed-form branches. On the Imhof branch it
-/// is `16/(x·U·ρ(U))` at the truncation point `U` actually reached, which is at
-/// or below [`WEIGHTED_CHI_SQUARE_TOLERANCE`] unless the panel backstop
-/// [`IMHOF_MAX_PANELS`] bound first.
-pub fn weighted_chi_square_sf_with_bound(weights: &[f64], statistic: f64) -> (f64, f64) {
-    weighted_chi_square_sf_to_tolerance(weights, statistic, WEIGHTED_CHI_SQUARE_TOLERANCE)
-}
-
-/// [`weighted_chi_square_sf_with_bound`] at a caller-chosen absolute accuracy.
-///
-/// # Why this is a parameter and not a constant
-///
-/// The truncation point `U` needed for a bound `ε` grows like `ε^{-2/(2+m)}` in
-/// the number `m` of weights *active* there, and the panel count like `U·x/4π`.
-/// With one dominant weight over a tail of small ones — which is the shape of a
-/// shrunk penalized smooth, not a corner case — `m = 1` over the whole useful
-/// range and the cost is `ε^{-2/3}`. Measured on `w = 1 − p²` for
-/// `p = (0, 10⁻³, 10⁻⁵, 10⁻⁷, 10⁻⁹)` at `x = 3Σw`:
-///
-/// ```text
-/// ε = 1e-11    467,919 panels   1.73 s
-/// ε = 1e-9      74,433 panels   237 ms
-/// ε = 1e-7      10,519 panels    46 ms
-/// ```
-///
-/// with the three answers agreeing to `1.0e-9` absolute — i.e. the certified
-/// bound is two orders pessimistic, and the top row buys nothing but time. A
-/// caller that knows what its answer is *for* can say so, and one that does not
-/// still gets [`WEIGHTED_CHI_SQUARE_TOLERANCE`] through the entry point above.
-///
-/// A non-positive or non-finite `absolute_tolerance` is treated as
-/// [`WEIGHTED_CHI_SQUARE_TOLERANCE`]: the contract is "at least this accurate",
-/// and a caller that asks for nonsense gets the strictest answer rather than the
-/// loosest. The returned bound is always the one actually achieved, which may be
-/// tighter than requested (the sweep stops at a panel boundary) or looser (the
-/// [`IMHOF_MAX_PANELS`] backstop bound first).
-pub fn weighted_chi_square_sf_to_tolerance(
-    weights: &[f64],
-    statistic: f64,
-    absolute_tolerance: f64,
-) -> (f64, f64) {
-    let mut terms = Vec::with_capacity(weights.len());
-    for &weight in weights {
-        if !weight.is_finite() || weight < 0.0 {
-            return (f64::NAN, f64::NAN);
-        }
-        terms.push(WeightedChiSquareTerm {
-            weight,
-            degrees_of_freedom: 1.0,
-        });
-    }
-    signed_weighted_chi_square_sf_to_tolerance(&terms, statistic, absolute_tolerance)
 }
 
 /// One `λ_j · χ²_{h_j}` term of a linear combination of independent
@@ -511,17 +367,6 @@ pub struct WeightedChiSquareTerm {
     /// `h_j > 0`. Real rather than integral: a two-moment summary of a spectrum
     /// is a chi-square with a fractional shape, and this type is what carries it.
     pub degrees_of_freedom: f64,
-}
-
-/// Survival probability `P(Σ_j λ_j χ²_{h_j} > statistic)` for independent
-/// central chi-squares, with weights of EITHER SIGN, at
-/// [`WEIGHTED_CHI_SQUARE_TOLERANCE`].
-///
-/// See [`WeightedChiSquareTerm`] for why the sign and the multiplicity are
-/// worth carrying, and [`signed_weighted_chi_square_sf_to_tolerance`] for the
-/// accuracy contract.
-pub fn signed_weighted_chi_square_sf(terms: &[WeightedChiSquareTerm], statistic: f64) -> f64 {
-    signed_weighted_chi_square_sf_to_tolerance(terms, statistic, WEIGHTED_CHI_SQUARE_TOLERANCE).0
 }
 
 /// [`signed_weighted_chi_square_sf`] at a caller-chosen absolute accuracy,
@@ -1707,126 +1552,6 @@ pub fn standard_normal_quantile_from_log_cdf(log_p: f64) -> Result<f64, String> 
         }
     }
     Ok(x)
-}
-
-/// Log of the standardized one-sided truncated-Gaussian boundary factor for
-/// the constrained-LAML cone correction (gam#2306 §4).
-///
-/// For a constraint coordinate with Lagrange multiplier `μ ≥ 0`, normal
-/// curvature `h > 0`, and signed interior slack `s ≥ 0`, the exact 1-D
-/// boundary integral is
-///
-/// ```text
-///   ∫_{−s}^{∞} exp(−μ·u − ½·h·u²) du
-///     = √(2π/h) · exp(μ²/(2h)) · Φ(s·√h − μ/√h),
-/// ```
-///
-/// and the correction of the Laplace criterion RELATIVE to the unrestricted
-/// Gaussian factor `√(2π/h)` is, in the standardized arguments
-/// `a = μ/√h ≥ 0`, `b = s·√h ≥ 0`:
-///
-/// ```text
-///   corr(a, b) = a²/2 + ln Φ(b − a).
-/// ```
-///
-/// Key limits (the #2306 derivation's continuity contract): an activating
-/// row (`a = 0`, `b = 0`) contributes exactly `ln ½` (the half-Gaussian); a
-/// deep interior row (`b − a → ∞`) contributes `→ 0`, reducing byte-exactly
-/// to the unrestricted LAML; a hard-pushed active row (`a → ∞`, `b = 0`)
-/// follows the exact linear-decay limit `corr → −ln(a·√(2π))`.
-///
-/// Evaluated FUSED: computing `a²/2` and `ln Φ(b−a)` as two separate f64
-/// terms cancels catastrophically once `a ≳ 10⁴` (both grow like `±a²/2`).
-/// On the `b < a` branch the sum collapses analytically to
-/// `a·b − b²/2 + ln(erfcx((a−b)/√2)/2)`, which is cancellation-free (for an
-/// active row, `b = 0`, it is a single `erfcx` evaluation).
-#[must_use]
-pub fn cone_boundary_log_factor(mu_over_sqrt_h: f64, slack_times_sqrt_h: f64) -> f64 {
-    let a = mu_over_sqrt_h;
-    let b = slack_times_sqrt_h;
-    if !(a.is_finite() && b.is_finite()) || a < 0.0 || b < 0.0 {
-        return f64::NAN;
-    }
-    let xi = b - a;
-    if xi >= 0.0 {
-        // Interior-dominant: ln Φ(ξ) is a small negative number and a²/2 is
-        // exact; no cancellation between them (a ≤ b here, so a²/2 ≤ ab −
-        // b²/2 + O(1) stays modest whenever the factor itself is modest).
-        0.5 * a * a + normal_logcdf(xi)
-    } else {
-        // Active-dominant: fused analytic collapse of a²/2 + ln Φ(−(a−b)).
-        let u = (a - b) / std::f64::consts::SQRT_2;
-        a * b - 0.5 * b * b + (0.5 * erfcx_nonnegative(u)).ln()
-    }
-}
-
-/// [`cone_boundary_log_factor`] together with its exact partial derivatives
-/// in the standardized arguments — the pieces the outer ρ-gradient chains
-/// through `(μ̃, h̃, s)(ρ)` (gam#2306 §4 "the g-factors differentiate in
-/// closed form"). With `ξ = b − a` and the Mills ratio `λ(ξ) = φ(ξ)/Φ(ξ)`:
-///
-/// ```text
-///   ∂corr/∂a = a − λ(ξ),      ∂corr/∂b = λ(ξ).
-/// ```
-///
-/// `∂corr/∂b = λ(ξ)` is a single `erfcx` evaluation and needs nothing further.
-///
-/// `∂corr/∂a` does. Written literally as `a − λ(ξ)` it is a subtraction of two
-/// quantities that both grow like `a`, because `λ(−t) = t + q(t)` with
-/// `q(t) ~ 1/t`: the answer is the SMALL correction `q`, and forming it by
-/// subtraction destroys `log₁₀(a²·ε)` digits of it. The value
-/// [`cone_boundary_log_factor`] is fused precisely to dodge the twin of this
-/// cancellation, and the gradient has to be fused the same way rather than
-/// re-derived from a `λ` that has already lost the digits.
-///
-/// So on the active branch the correction is taken directly from the Laplace
-/// continued fraction (`mills_correction_continued_fraction`), the same one
-/// the left-tail log-CDF derivatives use, under the substitution
-///
-/// ```text
-///   ξ = b − a,  t = −ξ = a − b  ⇒  ∂corr/∂a = a − λ(ξ) = a − (t + q(t)) = b − q(t),
-/// ```
-///
-/// which is cancellation-free for every `a`: `b ≥ 0` and `q(t) ∈ (0, ¼]`. The
-/// deep-active limit `∂corr/∂a → −1/a` then holds to full relative precision
-/// instead of to none, and the sign is right (the factor is strictly decreasing
-/// in `a`, so `∂corr/∂a < 0` whenever `b = 0`).
-///
-/// Measured on `a ∈ [10⁻², 10¹⁴] × b ∈ {0, …, 10³}` against a 250-digit
-/// reference: the subtractive form reaches `6.1e6` relative error and turns
-/// positive past `a ≈ 2e8`; this form is within `7.5e-16` — about 3 ulp — of
-/// the truth, measured against the magnitudes entering the subtraction rather
-/// than against the result. That is the right denominator because `∂corr/∂a`
-/// genuinely passes through ZERO along the curve `b = q(a − b)` (the factor is
-/// increasing in `a` for slack rows and decreasing for active ones), and no
-/// representation carries relative precision across its own root; near it the
-/// error is bounded in absolute terms by `ε·b`, which is what a gradient
-/// consumer needs.
-#[must_use]
-pub fn cone_boundary_log_factor_and_derivatives(
-    mu_over_sqrt_h: f64,
-    slack_times_sqrt_h: f64,
-) -> (f64, f64, f64) {
-    let a = mu_over_sqrt_h;
-    let b = slack_times_sqrt_h;
-    let value = cone_boundary_log_factor(a, b);
-    if value.is_nan() {
-        // The value's domain guard (finite, non-negative `a` and `b`) is the
-        // function's domain; a gradient off it is not defined either, and
-        // returning a finite one next to a NaN value would read as usable.
-        return (value, f64::NAN, f64::NAN);
-    }
-    let xi = b - a;
-    let (_, mills) = signed_probit_logcdf_and_mills_ratio(xi);
-    let d_a = if xi <= LEFT_CONTINUED_FRACTION_SWITCH {
-        b - mills_correction_continued_fraction(-xi).value
-    } else {
-        // `|ξ| < 4`, so `λ(ξ) < λ(−4) ≈ 4.26` and `a = b − ξ` is bounded by it:
-        // the subtraction is between two `O(1)` quantities and loses nothing
-        // that matters.
-        a - mills
-    };
-    (value, d_a, mills)
 }
 
 #[cfg(test)]
@@ -3729,6 +3454,32 @@ mod weighted_chi_square_tests {
 
 /// The SIGNED, multiplicity-carrying form — the generalization the estimated-
 /// scale references need (gam#2672).
+/// Standard normal survival probability `P(Z > x)`.
+///
+/// This is evaluated as `½·erfc(x/√2)`, not as `1 − Φ(x)`. The latter loses
+/// relative accuracy as soon as `Φ(x)` approaches one and becomes identically
+/// zero for every representable `x` above roughly `8.3`, while the direct
+/// complementary form retains the full representable tail.
+#[inline]
+pub fn normal_sf(x: f64) -> f64 {
+    0.5 * erfc(x / std::f64::consts::SQRT_2)
+}
+
+/// Student-t survival probability `P(T_ν > t)`.
+///
+/// The small tail is always obtained from
+/// [`student_t_two_sided_probability`]. For negative `t`, subtracting its
+/// half-tail from one constructs the large probability, where subtraction is
+/// well conditioned.
+pub fn student_t_sf(t: f64, degrees_of_freedom: f64) -> f64 {
+    let two_sided = student_t_two_sided_probability(t, degrees_of_freedom);
+    if t < 0.0 {
+        1.0 - 0.5 * two_sided
+    } else {
+        0.5 * two_sided
+    }
+}
+
 #[cfg(test)]
 mod signed_weighted_chi_square_tests {
     use super::*;

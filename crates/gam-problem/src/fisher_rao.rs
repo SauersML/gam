@@ -49,19 +49,6 @@ pub fn normalize_fisher_rao_blocks(
     )
 }
 
-/// Broadcast and validate Fisher–Rao weight blocks requiring each block to be
-/// **positive-definite**, as the Cholesky-whitening REML path needs (a singular
-/// block has no `L Lᵀ = W` factor). Same broadcasting rules as
-/// [`normalize_fisher_rao_blocks`]; the difference is the per-block spectrum
-/// must be strictly positive rather than merely non-negative.
-pub fn normalize_fisher_rao_blocks_pd(
-    arr: ArrayViewD<'_, f64>,
-    n_rows: usize,
-    dim: usize,
-) -> Result<Array3<f64>, String> {
-    normalize_fisher_rao_blocks_with(arr, n_rows, dim, FisherRaoDefiniteness::PositiveDefinite)
-}
-
 fn normalize_fisher_rao_blocks_with(
     arr: ArrayViewD<'_, f64>,
     n_rows: usize,
@@ -197,6 +184,19 @@ fn validate_block_definiteness(
         }
     }
     Ok(())
+}
+
+/// Broadcast and validate Fisher–Rao weight blocks requiring each block to be
+/// **positive-definite**, as the Cholesky-whitening REML path needs (a singular
+/// block has no `L Lᵀ = W` factor). Same broadcasting rules as
+/// [`normalize_fisher_rao_blocks`]; the difference is the per-block spectrum
+/// must be strictly positive rather than merely non-negative.
+pub fn normalize_fisher_rao_blocks_pd(
+    arr: ArrayViewD<'_, f64>,
+    n_rows: usize,
+    dim: usize,
+) -> Result<Array3<f64>, String> {
+    normalize_fisher_rao_blocks_with(arr, n_rows, dim, FisherRaoDefiniteness::PositiveDefinite)
 }
 
 #[cfg(test)]

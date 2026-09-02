@@ -121,100 +121,6 @@ impl AtomOccupancy {
         self.active.len()
     }
 
-    /// Size of the dormant reservoir `K − K_active`.
-    pub fn n_dormant(&self) -> usize {
-        self.dormant.len()
-    }
-
-}
-
-/// Effective occupancy `N_eff,k` of every capacity slot from a sparse block
-/// routing: `blocks[N,k]` (which slots fired) and `gates[N,k]` (their group-ℓ₂
-/// presence), the exact pair the block lane exposes on its fit.
-///
-/// `N_eff,k = (Σ_i g_{ik})² / Σ_i g_{ik}²` — the participation number (inverse
-/// Simpson / Kish effective sample size) of the slot's gate mass. It equals the
-/// firing count when the gates are equal, is invariant to the overall code scale
-/// `γ` (numerator and denominator are both degree-2 homogeneous), and — unlike a
-/// raw count — refuses to count rows whose gate is negligible against the slot's
-/// own mass. A slot with no gate mass gets `N_eff = 0`.
-pub fn effective_occupancy(
-    blocks: ArrayView2<'_, u32>,
-    gates: ArrayView2<'_, f32>,
-    capacity: usize,
-) -> Result<Vec<f64>, String> {
-    if blocks.dim() != gates.dim() {
-        return Err(format!(
-            "effective_occupancy: blocks {:?} and gates {:?} must have the same N×k shape",
-            blocks.dim(),
-            gates.dim()
-        ));
-    }
-    let mut sum = vec![0.0_f64; capacity];
-    let mut sum_sq = vec![0.0_f64; capacity];
-    for row in 0..blocks.nrows() {
-        for slot in 0..blocks.ncols() {
-            let index = blocks[[row, slot]] as usize;
-            if index >= capacity {
-                return Err(format!(
-                    "effective_occupancy: routed block {index} exceeds capacity {capacity}"
-                ));
-            }
-            let gate = gates[[row, slot]] as f64;
-            if !gate.is_finite() {
-                return Err("effective_occupancy: routing gates must be finite".to_string());
-            }
-            let gate = gate.abs();
-            if gate == 0.0 {
-                // Padded slot of a row with fewer than `k` live blocks.
-                continue;
-            }
-            sum[index] += gate;
-            sum_sq[index] += gate * gate;
-        }
-    }
-    Ok((0..capacity)
-        .map(|k| {
-            if sum_sq[k] <= 0.0 {
-                0.0
-            } else {
-                sum[k] * sum[k] / sum_sq[k]
-            }
-        })
-        .collect())
-}
-
-/// Partition capacity slots into the active model and the dormant reservoir.
-pub fn classify_occupancy(
-    effective_rows: &[f64],
-    threshold: OccupancyThreshold,
-) -> Result<AtomOccupancy, String> {
-    let minimum = threshold.min_effective_rows();
-    if !(minimum.is_finite() && minimum > 0.0) {
-        return Err(format!(
-            "classify_occupancy: threshold must demand a positive effective-row count, got {minimum}"
-        ));
-    }
-    let mut active = Vec::new();
-    let mut dormant = Vec::new();
-    for (slot, &n_eff) in effective_rows.iter().enumerate() {
-        if !n_eff.is_finite() || n_eff < 0.0 {
-            return Err(format!(
-                "classify_occupancy: slot {slot} has invalid effective occupancy {n_eff}"
-            ));
-        }
-        if n_eff >= minimum {
-            active.push(slot);
-        } else {
-            dormant.push(slot);
-        }
-    }
-    Ok(AtomOccupancy {
-        active,
-        dormant,
-        effective_rows: effective_rows.to_vec(),
-        threshold,
-    })
 }
 
 /// Scalar fixed-point residuals of the ACTIVE state under one replayed alternation.
@@ -314,13 +220,6 @@ pub enum CapacityVerdict {
     NotConverged(NotConvergedReason),
 }
 
-impl CapacityVerdict {
-    /// Whether the verdict certifies a fixed point.
-    pub fn is_converged(&self) -> bool {
-        matches!(self, CapacityVerdict::Converged)
-    }
-}
-
 /// The checkable certificate: the five conditions, their evidence, and the verdict.
 #[derive(Clone, Debug)]
 pub struct DormantCapacityCertificate {
@@ -360,10 +259,6 @@ impl DormantCapacityCertificate {
         self.occupancy.n_active()
     }
 
-    /// Size of the dormant reservoir.
-    pub fn n_dormant(&self) -> usize {
-        self.occupancy.n_dormant()
-    }
 }
 
 /// Gauge-invariant Grassmann-projector displacement of ONE capacity slot between

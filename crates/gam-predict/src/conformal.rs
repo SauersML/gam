@@ -98,16 +98,10 @@
 //! about `Y` directly rather than relying on a delta-method linearization that
 //! the coverage proof does not need.
 
-use crate::PredictUncertaintyResult;
 use crate::interval_policy::ResponseBounds;
 use gam_math::quantile::order_statistic;
-use gam_models::family_runtime::FamilyStrategy;
-use gam_models::family_runtime::strategy_for_spec;
 use gam_problem::EstimationError;
-use gam_solve::inference::alo::compute_alo_diagnostics_from_unified;
-use gam_solve::model_types::UnifiedFitResult;
-use gam_spec::LikelihoodSpec;
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, ArrayView1};
 
 fn effective_scale(scale: f64, idx: usize, role: &str) -> Result<f64, EstimationError> {
     if !(scale.is_finite() && scale >= 0.0) {
@@ -202,30 +196,13 @@ pub fn conformal_multiplier(
 pub struct ConformalCalibrator {
     q_hat: f64,
     alpha: f64,
-    n_calibration: usize,
 }
 
 impl ConformalCalibrator {
-    /// The conformal multiplier `q̂`.
-    pub fn q_hat(&self) -> f64 {
-        self.q_hat
-    }
 
     /// The nominal miscoverage `α` (so the nominal coverage is `1 − α`).
     pub fn alpha(&self) -> f64 {
         self.alpha
-    }
-
-    /// The number of held-out calibration points behind `q̂`.
-    pub fn n_calibration(&self) -> usize {
-        self.n_calibration
-    }
-
-    /// Whether the calibration set was large enough to certify finite
-    /// intervals at the requested level (`q̂` finite). When `false` the
-    /// honest interval is unbounded.
-    pub fn certifies_finite(&self) -> bool {
-        self.q_hat.is_finite()
     }
 
     /// Build a calibrator directly from held-out residuals and per-point
@@ -241,7 +218,6 @@ impl ConformalCalibrator {
         Ok(Self {
             q_hat,
             alpha,
-            n_calibration: scores.len(),
         })
     }
 
@@ -296,65 +272,6 @@ impl ConformalCalibrator {
         Self::from_residuals_and_scales(residuals.view(), scales.view(), alpha)
     }
 
-    /// Build a calibrator from a fitted model and its training data.
-    ///
-    /// Computes first-order approximate-leave-one-out diagnostics (held-out
-    /// linear predictors `η̃_i` and per-point posterior SE `se_bayes_i`), maps
-    /// both onto the response scale through the fitted family's inverse link,
-    /// forms the response-scale held-out residuals `r_i = y_i − g⁻¹(η̃_i)` and
-    /// scales `s_i = |dμ/dη(η̃_i)| · se_bayes_i`, applies the shared
-    /// effective-scale transform, and returns the resulting `q̂`.
-    ///
-    /// This ALO path is a calibrated heuristic. It has the split-conformal
-    /// finite-sample marginal coverage guarantee only insofar as these
-    /// first-order ALO scores match true leave-one-out exchangeable scores; it
-    /// is not itself a distribution-free finite-sample guarantee.
-    ///
-    /// `design`, `offset`, `phi` mirror the arguments
-    /// [`compute_alo_diagnostics_from_unified`] requires; `eta` is the fitted
-    /// in-sample linear predictor `Xβ̂ + offset`.
-    pub fn from_fit(
-        fit: &UnifiedFitResult,
-        family: &LikelihoodSpec,
-        design: &Array2<f64>,
-        eta: &Array1<f64>,
-        offset: &Array1<f64>,
-        y: ArrayView1<'_, f64>,
-        phi: f64,
-        alpha: f64,
-    ) -> Result<Self, EstimationError> {
-        let alo = compute_alo_diagnostics_from_unified(fit, design, eta, offset, phi)?;
-        if alo.eta_tilde.len() != y.len() {
-            return Err(EstimationError::InvalidInput(format!(
-                "conformal calibration: ALO produced {} held-out predictors but y has length {}",
-                alo.eta_tilde.len(),
-                y.len()
-            )));
-        }
-        let strategy = strategy_for_spec(family);
-        let n = y.len();
-        let mut residuals = Array1::<f64>::zeros(n);
-        let mut scales = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let eta_tilde = alo.eta_tilde[i];
-            let jet = strategy.inverse_link_jet(eta_tilde)?;
-            let mu_tilde = jet.mu;
-            // Response-scale held-out residual.
-            residuals[i] = y[i] - mu_tilde;
-            // Response-scale held-out SE: |dμ/dη| · se_bayes (delta method on
-            // the held-out posterior SE), then the same effective-scale map
-            // used by the prediction interval.
-            let dmu_deta = jet.d1.abs();
-            let scale = effective_scale(
-                dmu_deta * alo.se_bayes[i],
-                i,
-                "conformal ALO response-scale SE",
-            )?;
-            scales[i] = scale;
-        }
-        Self::from_residuals_and_scales(residuals.view(), scales.view(), alpha)
-    }
-
     /// Calibrated response-scale interval `μ̂(x) ± q̂·s_eff(x)`, clamped to the
     /// family support `bounds`.
     ///
@@ -391,23 +308,6 @@ impl ConformalCalibrator {
         Ok((lower, upper))
     }
 
-    /// Overwrite the response-scale bounds of a model-based
-    /// [`PredictUncertaintyResult`] with the conformal interval, using the
-    /// result's own `mean` and `mean_standard_error` (the same response-scale
-    /// SE source the calibration scales came from). This is the real
-    /// predict-path application: the model-based point/SE are kept, only the
-    /// `mean_lower` / `mean_upper` bounds become the conformal ones.
-    pub fn apply_to_uncertainty_result(
-        &self,
-        result: &mut PredictUncertaintyResult,
-        bounds: ResponseBounds,
-    ) -> Result<(), EstimationError> {
-        let (lower, upper) =
-            self.calibrated_interval(&result.mean, &result.mean_standard_error, bounds)?;
-        result.mean_lower = lower;
-        result.mean_upper = upper;
-        Ok(())
-    }
 }
 
 #[cfg(test)]

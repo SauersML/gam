@@ -1,24 +1,23 @@
-use crate::estimate::{
-    EstimationError, FitGeometry, UnifiedFitResult, WorkingGeometry, dispersion_from_likelihood,
-};
-use crate::pirls;
+use crate::estimate::EstimationError;
 use faer::Mat as FaerMat;
 use faer::linalg::matmul::matmul;
 use faer::prelude::ReborrowMut;
 use faer::{Accum, Par};
-use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky};
+use gam_linalg::faer_ndarray::FaerArrayView;
 use gam_linalg::matrix::{DesignMatrix, PsdWeightsView, SignedWeightsView};
 use gam_linalg::utils::{
     CertifiedSpdFactor, certified_spd_factorize, symmetric_extremes,
     validate_finite_symmetric_matrix,
 };
 use gam_math::probability::signed_log_sum_exp;
-use gam_problem::{Dispersion, LikelihoodScaleMetadata, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder, s};
 use opt::{BacktrackConfig, backtracking_line_search};
 use std::convert::Infallible;
 use std::fmt;
 use std::ops::Range;
+use crate::estimate::UnifiedFitResult;
+use crate::estimate::FitGeometry;
+use crate::estimate::WorkingGeometry;
 
 /// Typed error variants for the ALO (approximate leave-one-out) diagnostics
 /// module.
@@ -580,10 +579,6 @@ fn finite_signed_product(
     Ok(value)
 }
 
-const LEVERAGE_HIGH_THRESHOLD: f64 = 0.99;
-const LEVERAGE_VERY_HIGH_THRESHOLD: f64 = 0.999;
-const LEVERAGE_RATE_THRESHOLDS: [f64; 3] = [0.90, 0.95, 0.99];
-const LEVERAGE_PERCENTILES: [f64; 3] = [0.50, 0.95, 0.99];
 const MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Number of observation columns solved per blocked right-hand-side batch in the
@@ -613,377 +608,6 @@ fn alo_rhs_block_cols(n: usize, p: usize) -> usize {
 /// systems themselves use an operation-count-derived formation and solve bound;
 /// see [`identity_minus_product_lu_tolerance`].
 const LOCAL_DELETE_SOLVE_ROUNDOFF_FACTOR: f64 = 8.0;
-
-#[inline]
-fn percentile_index(sample_size: usize, quantile: f64) -> usize {
-    if sample_size <= 1 {
-        return 0;
-    }
-    let max_index = sample_size - 1;
-    ((quantile * max_index as f64).round() as usize).min(max_index)
-}
-
-#[inline]
-fn percentile_from_sorted(sorted: &[f64], quantile: f64) -> f64 {
-    if sorted.is_empty() {
-        0.0
-    } else {
-        sorted[percentile_index(sorted.len(), quantile)]
-    }
-}
-
-#[inline]
-fn compute_alo_diagnostics_from_pirls_impl(
-    base: &pirls::PirlsResult,
-    y: ArrayView1<f64>,
-) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_inner(base, y).map_err(EstimationError::from)
-}
-
-/// Resolve the multiplier on `H^-1` from the likelihood metadata and the
-/// converged profiled-Gaussian residual geometry. This is deliberately not a
-/// link switch: Gamma, Tweedie, Beta, NB, Poisson, Binomial, and fixed-scale
-/// Gaussian already carry their full scale in the working Hessian and therefore
-/// all have coefficient-covariance multiplier one.
-fn alo_covariance_scale(base: &pirls::PirlsResult) -> Result<f64, AloError> {
-    let dispersion = match (&base.likelihood.spec.response, base.likelihood.scale) {
-        (ResponseFamily::Gaussian, LikelihoodScaleMetadata::ProfiledGaussian) => {
-            let rss = base.deviance;
-            if !(rss.is_finite() && rss >= 0.0) {
-                return Err(AloError::InvalidInput {
-                    reason: format!(
-                        "ALO requires a finite non-negative profiled-Gaussian residual sum of squares; got {rss}"
-                    ),
-                });
-            }
-            let mut positive_rows = 0usize;
-            for (row, &weight) in base.finalweights.iter().enumerate() {
-                if !weight.is_finite() || weight < 0.0 {
-                    return Err(AloError::WeightInvalid {
-                        reason: format!(
-                            "profiled-Gaussian ALO requires finite non-negative converged weights; row {row} has {weight}"
-                        ),
-                    });
-                }
-                positive_rows += usize::from(weight > 0.0);
-            }
-            let residual_dof = positive_rows as f64 - base.edf;
-            if !(residual_dof.is_finite() && residual_dof > 0.0) {
-                return Err(AloError::InvalidInput {
-                    reason: format!(
-                        "profiled-Gaussian ALO requires positive residual degrees of freedom; positive_rows={positive_rows}, edf={}, residual_dof={residual_dof}",
-                        base.edf
-                    ),
-                });
-            }
-            let phi = rss / residual_dof;
-            if !phi.is_finite() || (rss > 0.0 && phi == 0.0) {
-                return Err(AloError::InvalidInput {
-                    reason: format!(
-                        "profiled-Gaussian ALO residual variance is not representable: rss={rss}, residual_dof={residual_dof}, phi={phi}"
-                    ),
-                });
-            }
-            Dispersion::estimated(phi).map_err(|error| AloError::InvalidInput {
-                reason: format!("invalid profiled-Gaussian ALO dispersion: {error}"),
-            })?
-        }
-        _ => dispersion_from_likelihood(&base.likelihood, None).map_err(|error| {
-            AloError::InvalidInput {
-                reason: format!("ALO could not resolve likelihood scale metadata: {error}"),
-            }
-        })?,
-    };
-    let scale = base
-        .likelihood
-        .coefficient_covariance_scale(dispersion.phi())
-        .map_err(|error| AloError::InvalidInput {
-            reason: format!("ALO could not resolve coefficient-covariance scale: {error}"),
-        })?;
-    if !(scale.is_finite() && scale > 0.0) {
-        return Err(AloError::InvalidInput {
-            reason: format!(
-                "ALO coefficient covariance is unavailable at non-positive or non-finite scale {scale}"
-            ),
-        });
-    }
-    Ok(scale)
-}
-
-/// True when the fitted GLM uses a *curved* canonical link, so that the row NLL
-/// score and curvature satisfy `ℓ_i'(η) = c_i(μ(η)−y_i)` and `ℓ_i''(η) = c_i μ'(η)`
-/// with a single per-row scale `c_i = (prior weight)/φ`. This is the exact
-/// condition under which the frozen-curvature ALO scalar fixed point matches
-/// the leave-`i`-out refit; only these families enable the exact refinement.
-///
-/// Gaussian identity is canonical too, but its per-row curvature is *constant*
-/// (`μ'(η) ≡ 1`), so the classical Sherman–Morrison one-step ALO is already the
-/// exact frozen-Hessian leave-`i`-out solution. Routing it through the scalar
-/// Newton closure would only add an O(n) nonlinear solve to diagnostics and
-/// quality sweeps without changing the answer, so it is excluded here and falls
-/// back to the (exact, for this family) one-step formula.
-fn alo_link_needs_exact_curvature_refinement(likelihood: &gam_problem::GlmLikelihoodSpec) -> bool {
-    use gam_problem::ResponseFamily;
-    matches!(
-        (&likelihood.spec.response, likelihood.link_function()),
-        (ResponseFamily::Binomial, LinkFunction::Logit)
-            | (ResponseFamily::Poisson, LinkFunction::Log)
-    )
-}
-
-fn compute_alo_diagnostics_from_pirls_inner(
-    base: &pirls::PirlsResult,
-    y: ArrayView1<f64>,
-) -> Result<AloDiagnostics, AloError> {
-    let x_dense_arc = base
-        .x_transformed
-        .try_to_dense_arc("ALO diagnostics require dense transformed design")
-        .map_err(|reason| AloError::DesignDegenerate { reason })?;
-    let x_dense = x_dense_arc.as_ref();
-    let n = x_dense.nrows();
-    if y.len() != n {
-        return Err(AloError::InvalidInput {
-            reason: format!(
-                "ALO response length must match the design row count; got {} responses for {n} rows",
-                y.len()
-            ),
-        });
-    }
-    if alo_link_needs_exact_curvature_refinement(&base.likelihood) {
-        for (row, &response) in y.iter().enumerate() {
-            let valid = response.is_finite()
-                && match &base.likelihood.spec.response {
-                    ResponseFamily::Binomial => (0.0..=1.0).contains(&response),
-                    ResponseFamily::Poisson => response >= 0.0,
-                    _ => true,
-                };
-            if !valid {
-                return Err(AloError::InvalidInput {
-                    reason: format!(
-                        "ALO canonical refinement received an invalid response at row {row}: {response}"
-                    ),
-                });
-            }
-        }
-    }
-
-    let phi = alo_covariance_scale(base)?;
-
-    // ALO needs the exact penalized Hessian materialized densely for chunked,
-    // residual-certified SPD solves. The PIRLS export path validates the matrix
-    // instead of falling back to a numerical Hessian approximation.
-    let h_dense_for_alo = base
-        .dense_stabilizedhessian_transformed(
-            "ALO diagnostics require exact dense stabilized penalized Hessian",
-        )
-        .map_err(|e| match e {
-            EstimationError::InvalidInput(reason) => AloError::InvalidInput { reason },
-            other => AloError::InvalidInput {
-                reason: format!("{other:?}"),
-            },
-        })?;
-
-    // Exact frozen-curvature ALO refinement for canonical-link GLMs.
-    //
-    // For a canonical link the row NLL score and curvature are
-    //   ℓ_i'(η)  = c_i · (μ(η) − y_i),     ℓ_i''(η) = c_i · μ'(η),
-    // with c_i = (prior weight)/φ recovered from the converged geometry as
-    // c_i = W_H[i] / μ'(η̂_i) (since W_H[i] = c_i μ'(η̂_i) at convergence).
-    // Supplying this evaluator lets `compute_alo_from_input_inner` solve the
-    // leave-i-out scalar fixed point η = η̂_i + a_ii ℓ_i'(η) exactly instead of
-    // taking a single Newton step, removing the first-order linearization error
-    // that dominates on small-n, strongly curved likelihoods (binomial logit).
-    //
-    // Restricted to canonical links because only there does the observed
-    // curvature carried by the frozen Hessian (W_H) coincide with c_i μ'(η) for
-    // every trial η; non-canonical links retain the classical one-step ALO.
-    // Per-row scale c_i = W_H[i]/μ'(η̂_i). This is an exact ratio, not a
-    // thresholded one: tiny positive curvature remains informative. If both
-    // numerator and derivative are exactly zero, the row has no representable
-    // local influence and c_i is exactly zero; every other nonrepresentable
-    // ratio is an explicit error.
-    let canonical_scale: Option<Array1<f64>> = if alo_link_needs_exact_curvature_refinement(
-        &base.likelihood,
-    ) {
-        let mut c = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let dmu = base.solve_dmu_deta[i];
-            let w_h = base.finalweights[i];
-            if !dmu.is_finite() || !w_h.is_finite() || dmu < 0.0 || w_h < 0.0 {
-                return Err(AloError::WeightInvalid {
-                    reason: format!(
-                        "canonical ALO requires finite non-negative local derivative and curvature; row {i} has dmu_deta={dmu}, weight={w_h}"
-                    ),
-                });
-            }
-            let scale = if dmu == 0.0 {
-                if w_h == 0.0 {
-                    0.0
-                } else {
-                    return Err(AloError::LooComputationFailed {
-                        reason: format!(
-                            "canonical ALO scale is undefined at row {i}: nonzero curvature {w_h} divided by zero inverse-link derivative"
-                        ),
-                    });
-                }
-            } else {
-                w_h / dmu
-            };
-            if !scale.is_finite() || scale < 0.0 || (w_h > 0.0 && scale == 0.0) {
-                return Err(AloError::LooComputationFailed {
-                    reason: format!(
-                        "canonical ALO scale is not representable at row {i}: weight={w_h}, dmu_deta={dmu}, scale={scale}"
-                    ),
-                });
-            }
-            c[i] = scale;
-        }
-        Some(c)
-    } else {
-        None
-    };
-
-    let inv_link_for_closure = base.likelihood.spec.link.clone();
-    let score_curvature_closure = canonical_scale.as_ref().map(|scale| {
-        move |i: usize, eta: f64| -> Result<(f64, f64), AloError> {
-            let (mu, dmu) = crate::mixture_link::inverse_link_mu_d1_for_inverse_link(
-                &inv_link_for_closure,
-                eta,
-            )
-            .map_err(|error| AloError::LooComputationFailed {
-                reason: format!(
-                    "ALO inverse-link evaluation failed at row {i}, eta={eta}: {error}"
-                ),
-            })?;
-            let c_i = scale[i];
-            let score = c_i * (mu - y[i]);
-            let curvature = c_i * dmu;
-            if !score.is_finite() || !curvature.is_finite() {
-                return Err(AloError::LooComputationFailed {
-                    reason: format!(
-                        "ALO canonical row geometry is not representable at row {i}, eta={eta}: score={score}, curvature={curvature}"
-                    ),
-                });
-            }
-            Ok((score, curvature))
-        }
-    });
-    let score_curvature_ref: Option<&AloScalarScoreCurvature> = score_curvature_closure
-        .as_ref()
-        .map(|f| f as &AloScalarScoreCurvature);
-
-    // Build model-agnostic AloInput from PIRLS geometry, then delegate.
-    // #1868: the PIRLS row fields are now shared `ArcArray1`; `AloInput` borrows
-    // `&Array1`, so materialise owned copies for this cold post-fit inference
-    // path (ALO runs once after the fit, not per κ trial).
-    let alo_working_response = base.solveworking_response.to_owned();
-    let alo_final_eta = base.final_eta.to_owned();
-    let alo_final_offset = base.final_offset.to_owned();
-    let input = AloInput {
-        design: x_dense,
-        penalized_hessian: &h_dense_for_alo,
-        hessian_weights: base.final_weights_signed(),
-        score_weights: base.solve_weights_psd(),
-        working_response: &alo_working_response,
-        eta: &alo_final_eta,
-        offset: &alo_final_offset,
-        phi,
-        score_curvature: score_curvature_ref,
-    };
-
-    let result = compute_alo_from_input_inner(&input)?;
-
-    // PIRLS-specific post-hoc leverage diagnostics logging.
-    log_leverage_diagnostics(&result.leverage, phi);
-
-    Ok(result)
-}
-
-/// Log detailed leverage percentile diagnostics for a completed ALO computation.
-fn log_leverage_diagnostics(leverage: &Array1<f64>, phi: f64) {
-    let n = leverage.len();
-    if n == 0 {
-        return;
-    }
-
-    let mut invalid_count = 0usize;
-    let mut high_leverage_count = 0usize;
-    let mut threshold_counts = [0usize; LEVERAGE_RATE_THRESHOLDS.len()];
-    let mut finite_leverage = Vec::with_capacity(n);
-
-    for (obs, &ai) in leverage.iter().enumerate() {
-        if ai.is_finite() {
-            finite_leverage.push(ai);
-        }
-
-        // Signed observed curvature permits exact negative row leverages for
-        // non-canonical links. They are not invalid: the corresponding ALO
-        // denominator `1-a_ii` is more strongly positive. Non-finite values
-        // remain invalid, while positive near-one leverage is the instability
-        // diagnostic of interest.
-        if !ai.is_finite() {
-            invalid_count += 1;
-            log::warn!("[GAM ALO] invalid leverage at i={}, a_ii={:.6e}", obs, ai);
-        } else if ai > LEVERAGE_HIGH_THRESHOLD {
-            high_leverage_count += 1;
-            if ai > LEVERAGE_VERY_HIGH_THRESHOLD {
-                log::warn!("[GAM ALO] very high leverage at i={}, a_ii={:.6e}", obs, ai);
-            }
-        }
-
-        for (idx, threshold) in LEVERAGE_RATE_THRESHOLDS.iter().enumerate() {
-            if ai > *threshold {
-                threshold_counts[idx] += 1;
-            }
-        }
-    }
-
-    if invalid_count > 0 || high_leverage_count > 0 {
-        log::warn!(
-            "[GAM ALO] leverage diagnostics: {} invalid values, {} high values (>0.99)",
-            invalid_count,
-            high_leverage_count
-        );
-    }
-
-    finite_leverage.sort_by(f64::total_cmp);
-
-    let finite_n = finite_leverage.len();
-    let a_mean = if finite_n > 0 {
-        finite_leverage.iter().copied().sum::<f64>() / finite_n as f64
-    } else {
-        0.0
-    };
-    let a_median = percentile_from_sorted(&finite_leverage, LEVERAGE_PERCENTILES[0]);
-    let a_p95 = percentile_from_sorted(&finite_leverage, LEVERAGE_PERCENTILES[1]);
-    let a_p99 = percentile_from_sorted(&finite_leverage, LEVERAGE_PERCENTILES[2]);
-    let a_max = finite_leverage.last().copied().unwrap_or(0.0);
-
-    // Routine per-ALO leverage summary: a diagnostic snapshot, not an
-    // anomaly. Emitted at `info!` so it is visible when the host raises
-    // verbosity (CLI `-v`; `gamfit.set_log_level("info")`) but silent at the
-    // default `Warn` level (genuine anomalies — invalid / very
-    // high leverage — are logged at `warn!` above and stay visible). This
-    // line fires once per ALO computation, which recurs across the outer
-    // smoothing loop, so at `warn!` it was a dominant source of stderr noise
-    // on perfectly healthy fits (#1689).
-    log::info!(
-        "[GAM ALO] leverage: n={}, mean={:.3e}, median={:.3e}, p95={:.3e}, p99={:.3e}, max={:.3e}",
-        n,
-        a_mean,
-        a_median,
-        a_p95,
-        a_p99,
-        a_max
-    );
-    log::info!(
-        "[GAM ALO] high-leverage: a>0.90: {:.2}%, a>0.95: {:.2}%, a>0.99: {:.2}%, dispersion phi={:.3e}",
-        100.0 * (threshold_counts[0] as f64) / n as f64,
-        100.0 * (threshold_counts[1] as f64) / n as f64,
-        100.0 * (threshold_counts[2] as f64) / n as f64,
-        phi
-    );
-}
 
 /// Model-agnostic input for ALO diagnostics.
 ///
@@ -1030,6 +654,7 @@ pub struct AloInput<'a> {
 }
 
 impl<'a> AloInput<'a> {
+
     /// Build an `AloInput` from `FitGeometry` and an already active-coordinate
     /// design. Raw saved designs must first be restricted through
     /// `geom.coefficient_gauge`; keeping this constructor crate-private makes
@@ -1343,149 +968,6 @@ fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), 
         });
     }
     Ok(())
-}
-
-/// Compute ALO diagnostics (eta_tilde, SE, leverage) from a fitted GAM result.
-pub fn compute_alo_diagnostics_from_fit(
-    fit: &UnifiedFitResult,
-    y: ArrayView1<f64>,
-) -> Result<AloDiagnostics, EstimationError> {
-    let pirls = fit
-        .artifacts
-        .pirls
-        .as_ref()
-        .ok_or_else(|| AloError::InvalidInput {
-            reason:
-                "ALO diagnostics require a PIRLS-backed fit; this fit does not expose PIRLS geometry"
-                    .to_string(),
-        })
-        .map_err(EstimationError::from)?;
-    compute_alo_diagnostics_from_pirls_impl(pirls, y)
-}
-
-/// Compute ALO diagnostics from a `UnifiedFitResult`.
-///
-/// Extracts `FitGeometry` from `unified.geometry`, pulls the raw row design
-/// into the persisted active frame, and delegates to `compute_alo_from_input`.
-/// This avoids requiring a full `UnifiedFitResult` with PIRLS artifacts.
-pub fn compute_alo_diagnostics_from_unified(
-    unified: &UnifiedFitResult,
-    design: &Array2<f64>,
-    eta: &Array1<f64>,
-    offset: &Array1<f64>,
-    phi: f64,
-) -> Result<AloDiagnostics, EstimationError> {
-    let geom = unified
-        .geometry
-        .as_ref()
-        .ok_or_else(|| AloError::InvalidInput {
-            reason: "UnifiedFitResult does not contain working-set geometry; \
-             ALO diagnostics require geometry at convergence"
-                .to_string(),
-        })
-        .map_err(EstimationError::from)?;
-    let working = geom.working.as_ref().ok_or_else(|| {
-        EstimationError::from(AloError::InvalidInput {
-            reason: "UnifiedFitResult coefficient geometry has no owned single-diagonal working evidence; ALO diagnostics are unavailable for Exact-Newton and multi-parameter terminal geometry"
-                .to_string(),
-        })
-    })?;
-    geom.coefficient_gauge
-        .validate()
-        .map_err(|reason| AloError::InvalidInput {
-            reason: format!("UnifiedFitResult ALO coefficient gauge is invalid: {reason}"),
-        })
-        .map_err(EstimationError::from)?;
-    if design.ncols() != geom.coefficient_gauge.raw_total() {
-        return Err(AloError::InvalidInput {
-            reason: format!(
-                "UnifiedFitResult ALO raw design has {} columns; coefficient gauge requires {}",
-                design.ncols(),
-                geom.coefficient_gauge.raw_total(),
-            ),
-        }
-        .into());
-    }
-    let active_design = geom.coefficient_gauge.restrict_design(design);
-    let input =
-        AloInput::from_active_geometry(geom, working, &active_design, eta, offset, phi);
-    compute_alo_from_input(&input)
-}
-
-/// Compute ALO diagnostics from a PIRLS result for lower-level callers.
-pub fn compute_alo_diagnostics_from_pirls(
-    base: &pirls::PirlsResult,
-    y: ArrayView1<f64>,
-) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_impl(base, y)
-}
-
-/// Exact (one-step) case-deletion influence from a converged PIRLS fit, via
-/// the one `FitSensitivity` operator (#935).
-///
-/// This is the diagnostic the sensitivity operator's `case_deletion` channel
-/// was built to expose but had no production entry point for: per-observation
-/// dfbetas `β̂ − β̂₍ᵢ₎`, hat-value leverage `h_ii = w_i x_iᵀ H⁻¹ x_i`, and
-/// Cook's distance. It is the same factored inverse the REML gradient (IFT),
-/// ALO, and the Riesz debias already contract — built once at the optimum,
-/// asked in the leave-one-out direction — so no call site can disagree about
-/// which `H⁻¹` is meant (the bug class #935 dismantles).
-///
-/// The penalized Hessian, design, working weights `w_i = W_H[i]` and working
-/// residual `z_i − η̂_i` are read straight from the converged geometry — the
-/// same PIRLS state [`compute_alo_diagnostics_from_pirls`] consumes — so the
-/// IRLS reduction `scale = w_i r_i / (1 − h_ii)` is exact for the Gaussian
-/// identity link and the one-step Newton deletion for canonical-link GLMs.
-/// Returns `None` (rather than emitting `∞`) for any observation whose
-/// leverage is one, or if the dense Hessian / design is unavailable.
-pub fn compute_case_deletion_from_pirls(
-    base: &pirls::PirlsResult,
-) -> Result<Option<crate::sensitivity::CaseDeletionInfluence>, EstimationError> {
-    let x_dense_arc = base
-        .x_transformed
-        .try_to_dense_arc("case-deletion diagnostics require dense transformed design")
-        .map_err(|reason| EstimationError::InvalidInput(reason))?;
-    let x_dense = x_dense_arc.as_ref();
-    let n = x_dense.nrows();
-    let p = x_dense.ncols();
-    if n == 0 || p == 0 {
-        return Ok(None);
-    }
-
-    let phi = alo_covariance_scale(base).map_err(EstimationError::from)?;
-
-    // The same dense stabilized penalized Hessian ALO materializes; the one
-    // factored inverse every sensitivity channel shares.
-    let h_dense = base
-        .dense_stabilizedhessian_transformed(
-            "case-deletion diagnostics require exact dense stabilized penalized Hessian",
-        )
-        .map_err(|e| match e {
-            EstimationError::InvalidInput(reason) => EstimationError::InvalidInput(reason),
-            other => EstimationError::InvalidInput(format!("{other:?}")),
-        })?;
-
-    let factor = match h_dense.cholesky(faer::Side::Lower) {
-        Ok(f) => f,
-        // A non-SPD stabilized Hessian means the optimum is rank-deficient in a
-        // way the dense Cholesky case-deletion path cannot invert; decline
-        // rather than fabricate an influence diagnostic.
-        Err(_) => return Ok(None),
-    };
-
-    // Working weights and working residual straight from the IRLS reduction:
-    // w_i = W_H[i] and r_i = z_i − η̂_i, so w_i r_i is the working score the
-    // closed-form deletion `scale = w_i r_i / (1 − h_ii)` consumes.
-    let working_weights = base.finalweights.clone();
-    let working_residual = &base.solveworking_response - &base.final_eta;
-
-    let sensitivity = crate::sensitivity::FitSensitivity::from_faer_cholesky(&factor, p);
-    Ok(sensitivity.case_deletion(
-        x_dense,
-        working_weights.view(),
-        working_residual.view(),
-        phi,
-    ))
 }
 
 // Multi-block ALO for multi-predictor models (GAMLSS, survival, joint)
@@ -2998,4 +2480,53 @@ mod tests {
         assert!((result.eta_tilde[0][0] - 1.0).abs() <= roundoff);
         assert!((result.eta_tilde[0][1] + 1.0).abs() <= roundoff);
     }
+}
+
+/// Compute ALO diagnostics from a `UnifiedFitResult`.
+///
+/// Extracts `FitGeometry` from `unified.geometry`, pulls the raw row design
+/// into the persisted active frame, and delegates to `compute_alo_from_input`.
+/// This avoids requiring a full `UnifiedFitResult` with PIRLS artifacts.
+pub fn compute_alo_diagnostics_from_unified(
+    unified: &UnifiedFitResult,
+    design: &Array2<f64>,
+    eta: &Array1<f64>,
+    offset: &Array1<f64>,
+    phi: f64,
+) -> Result<AloDiagnostics, EstimationError> {
+    let geom = unified
+        .geometry
+        .as_ref()
+        .ok_or_else(|| AloError::InvalidInput {
+            reason: "UnifiedFitResult does not contain working-set geometry; \
+             ALO diagnostics require geometry at convergence"
+                .to_string(),
+        })
+        .map_err(EstimationError::from)?;
+    let working = geom.working.as_ref().ok_or_else(|| {
+        EstimationError::from(AloError::InvalidInput {
+            reason: "UnifiedFitResult coefficient geometry has no owned single-diagonal working evidence; ALO diagnostics are unavailable for Exact-Newton and multi-parameter terminal geometry"
+                .to_string(),
+        })
+    })?;
+    geom.coefficient_gauge
+        .validate()
+        .map_err(|reason| AloError::InvalidInput {
+            reason: format!("UnifiedFitResult ALO coefficient gauge is invalid: {reason}"),
+        })
+        .map_err(EstimationError::from)?;
+    if design.ncols() != geom.coefficient_gauge.raw_total() {
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "UnifiedFitResult ALO raw design has {} columns; coefficient gauge requires {}",
+                design.ncols(),
+                geom.coefficient_gauge.raw_total(),
+            ),
+        }
+        .into());
+    }
+    let active_design = geom.coefficient_gauge.restrict_design(design);
+    let input =
+        AloInput::from_active_geometry(geom, working, &active_design, eta, offset, phi);
+    compute_alo_from_input(&input)
 }

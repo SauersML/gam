@@ -89,10 +89,6 @@
 
 use ndarray::{Array2, ArrayView1};
 
-use gam_linalg::utils::splitmix64_hash;
-
-use super::shard_reader::CorpusRowSource;
-
 /// A cheap, no-inner-solve per-row residual energy under the current dictionary.
 ///
 /// The value must be a finite, non-negative scalar: the energy of row `x` that
@@ -117,11 +113,6 @@ pub struct SpanResidualEnergy {
 }
 
 impl SpanResidualEnergy {
-    /// Build from a `p × r` matrix whose columns are (assumed) orthonormal.
-    /// An empty basis (`r == 0`) yields the raw-energy `‖x‖²` cold-start screen.
-    pub fn new(basis: Array2<f64>) -> Self {
-        Self { basis }
-    }
 
     /// The activation width `p` this screen expects.
     pub fn width(&self) -> usize {
@@ -143,55 +134,6 @@ impl RowResidualEnergy for SpanResidualEnergy {
             explained += proj * proj;
         }
         (full - explained).max(0.0)
-    }
-}
-
-/// Number of IEEE-754 binary-exponent bins (biased exponent is 11 bits).
-const N_EXPONENT_BINS: usize = 1 << 11;
-
-/// Bounded streaming summary of the residual-energy distribution: one accumulator
-/// per IEEE-754 biased exponent. `O(2048)` memory regardless of `N`, so the
-/// screen never risks OOM (SPEC.md §9). Populated in a single streaming pass.
-#[derive(Debug, Clone)]
-struct EnergyExponentHistogram {
-    count: Vec<u64>,
-    sum: Vec<f64>,
-    sumsq: Vec<f64>,
-    total_rows: u64,
-}
-
-impl EnergyExponentHistogram {
-    fn new() -> Self {
-        Self {
-            count: vec![0; N_EXPONENT_BINS],
-            sum: vec![0.0; N_EXPONENT_BINS],
-            sumsq: vec![0.0; N_EXPONENT_BINS],
-            total_rows: 0,
-        }
-    }
-
-    /// Biased base-2 exponent bin for a non-negative energy. Zero / subnormal /
-    /// non-finite / negative energies fall in bin `0` (the low-energy floor).
-    #[inline]
-    fn bin_of(energy: f64) -> usize {
-        if !energy.is_finite() || energy <= 0.0 {
-            return 0;
-        }
-        ((energy.to_bits() >> 52) & 0x7ff) as usize
-    }
-
-    #[inline]
-    fn observe(&mut self, energy: f64) {
-        let e = if energy.is_finite() && energy > 0.0 {
-            energy
-        } else {
-            0.0
-        };
-        let bin = Self::bin_of(e);
-        self.count[bin] += 1;
-        self.sum[bin] += e;
-        self.sumsq[bin] += e * e;
-        self.total_rows += 1;
     }
 }
 
@@ -223,7 +165,6 @@ pub struct StratumDesign {
     strata: Vec<Stratum>,
     /// `bin_to_stratum[exp]` is the stratum index owning exponent bin `exp`
     /// (`usize::MAX` for an empty bin — no row maps there).
-    bin_to_stratum: Vec<usize>,
     total_rows: u64,
     budget: usize,
 }
@@ -240,29 +181,6 @@ impl StratumDesign {
 
     pub fn budget(&self) -> usize {
         self.budget
-    }
-
-    /// The uniform baseline sampling rate `f = budget / N` — the floor every
-    /// stratum's rate clears.
-    pub fn uniform_rate(&self) -> f64 {
-        if self.total_rows == 0 {
-            0.0
-        } else {
-            (self.budget as f64 / self.total_rows as f64).min(1.0)
-        }
-    }
-
-    /// Sampling rate `π_h` for a row of the given residual energy, and whether
-    /// its stratum was censused. An energy outside every occupied band (should
-    /// not happen for a row seen in pass A) falls back to the uniform rate.
-    fn rate_for_energy(&self, energy: f64) -> f64 {
-        let bin = EnergyExponentHistogram::bin_of(energy);
-        let s = self.bin_to_stratum[bin];
-        if s == usize::MAX {
-            self.uniform_rate()
-        } else {
-            self.strata[s].pi
-        }
     }
 
 }
@@ -297,9 +215,19 @@ pub struct RowStratum {
     pub std_energy: f64,
 }
 
+/// Biased base-2 exponent bin for a non-negative energy. Zero / subnormal /
+/// non-finite / negative energies fall in bin `0` (the low-energy floor).
+#[inline]
+fn energy_exponent_bin(energy: f64) -> usize {
+    if !energy.is_finite() || energy <= 0.0 {
+        return 0;
+    }
+    ((energy.to_bits() >> 52) & 0x7ff) as usize
+}
+
 /// Stratify a set of per-row residual energies into factor-of-two energy bands,
 /// returning the row-index groups ASCENDING in energy. Reuses the same IEEE-754
-/// binary-exponent bins (`EnergyExponentHistogram::bin_of`) and Sturges cap
+/// binary-exponent bins (`energy_exponent_bin`) and Sturges cap
 /// (`sturges_stratum_cap`) as the streaming design; adjacent lowest-energy bands
 /// are merged to the cap so the high-energy tail (where rare discoverable structure
 /// concentrates) keeps its resolution. Empty / non-finite / negative energies fall
@@ -319,7 +247,7 @@ pub fn stratify_row_energies(energies: &[f64]) -> Vec<RowStratum> {
         std::collections::BTreeMap::new();
     for (i, &e) in energies.iter().enumerate() {
         bin_rows
-            .entry(EnergyExponentHistogram::bin_of(e))
+            .entry(energy_exponent_bin(e))
             .or_default()
             .push(i);
     }
@@ -384,222 +312,6 @@ impl Default for RowStratum {
     }
 }
 
-/// Build the strata from the exponent histogram: one stratum per occupied
-/// exponent band, then merge adjacent **low-energy** bands until at most
-/// `K_max` strata remain (preserving high-energy tail resolution).
-fn build_strata(hist: &EnergyExponentHistogram) -> (Vec<Stratum>, Vec<usize>) {
-    // Occupied exponent bins, ascending.
-    let mut strata: Vec<Stratum> = Vec::new();
-    for (exp, &c) in hist.count.iter().enumerate() {
-        if c == 0 {
-            continue;
-        }
-        let n = c as f64;
-        let mean = hist.sum[exp] / n;
-        // Population variance; clamp round-off negatives (energies span decades).
-        let var = (hist.sumsq[exp] / n - mean * mean).max(0.0);
-        strata.push(Stratum {
-            exp_lo: exp,
-            exp_hi: exp,
-            n_rows: c,
-            mean_energy: mean,
-            std_energy: var.sqrt(),
-            pi: 0.0,
-            censused: false,
-        });
-    }
-
-    let k_max = sturges_stratum_cap(hist.total_rows);
-    // Merge adjacent lowest-energy strata until within the cap. Tail (high
-    // energy, discovery-relevant) resolution is preserved by only ever merging
-    // the two lowest.
-    while strata.len() > k_max && strata.len() >= 2 {
-        let merged = merge_stratum(&strata[0], &strata[1]);
-        strata[1] = merged;
-        strata.remove(0);
-    }
-
-    // Exponent → stratum lookup.
-    let mut bin_to_stratum = vec![usize::MAX; N_EXPONENT_BINS];
-    for (idx, s) in strata.iter().enumerate() {
-        for exp in s.exp_lo..=s.exp_hi {
-            bin_to_stratum[exp] = idx;
-        }
-    }
-    (strata, bin_to_stratum)
-}
-
-/// Combine two adjacent strata, recovering the pooled mean/variance from their
-/// counts and per-stratum moments (no raw data retained).
-fn merge_stratum(a: &Stratum, b: &Stratum) -> Stratum {
-    let na = a.n_rows as f64;
-    let nb = b.n_rows as f64;
-    let n = na + nb;
-    // Pooled first moment.
-    let sum = a.mean_energy * na + b.mean_energy * nb;
-    let mean = if n > 0.0 { sum / n } else { 0.0 };
-    // Pooled second moment: Σx² = Σ(var + mean²)·n per part.
-    let sumsq_a = (a.std_energy * a.std_energy + a.mean_energy * a.mean_energy) * na;
-    let sumsq_b = (b.std_energy * b.std_energy + b.mean_energy * b.mean_energy) * nb;
-    let var = if n > 0.0 {
-        ((sumsq_a + sumsq_b) / n - mean * mean).max(0.0)
-    } else {
-        0.0
-    };
-    Stratum {
-        exp_lo: a.exp_lo.min(b.exp_lo),
-        exp_hi: a.exp_hi.max(b.exp_hi),
-        n_rows: a.n_rows + b.n_rows,
-        mean_energy: mean,
-        std_energy: var.sqrt(),
-        pi: 0.0,
-        censused: false,
-    }
-}
-
-/// Solve the census + Neyman + floor allocation in place, writing `pi` /
-/// `censused` on each stratum. See the module docs for the derivation.
-fn allocate_rates(strata: &mut [Stratum], total_rows: u64, budget: usize) {
-    let k = strata.len();
-    if k == 0 || total_rows == 0 {
-        return;
-    }
-    let n_total = total_rows as f64;
-    let uniform_rate = (budget as f64 / n_total).min(1.0);
-
-    if budget as u64 >= total_rows {
-        // Full pass: everything censused at π = 1 (exact, bit-for-bit).
-        for s in strata.iter_mut() {
-            s.pi = 1.0;
-            s.censused = true;
-        }
-        return;
-    }
-
-    // --- Census water-filling: peel off strata that fit their equal share. ---
-    for s in strata.iter_mut() {
-        s.censused = false;
-    }
-    loop {
-        let remaining: Vec<usize> = (0..k).filter(|&i| !strata[i].censused).collect();
-        if remaining.is_empty() {
-            break;
-        }
-        let censused_pop: u64 = strata.iter().filter(|s| s.censused).map(|s| s.n_rows).sum();
-        let budget_left = budget as f64 - censused_pop as f64;
-        if budget_left <= 0.0 {
-            break;
-        }
-        let share = budget_left / remaining.len() as f64;
-        // Census any not-yet-censused stratum whose whole population fits its
-        // equal share. Take the smallest first for a deterministic fixed point.
-        let mut newly = false;
-        for &i in &remaining {
-            if (strata[i].n_rows as f64) <= share {
-                strata[i].censused = true;
-                newly = true;
-            }
-        }
-        if !newly {
-            break;
-        }
-    }
-
-    // --- Neyman allocation of the leftover budget over the big strata. ---
-    let censused_pop: u64 = strata.iter().filter(|s| s.censused).map(|s| s.n_rows).sum();
-    let budget_left = (budget as f64 - censused_pop as f64).max(0.0);
-    let neyman_mass: f64 = strata
-        .iter()
-        .filter(|s| !s.censused)
-        .map(|s| s.n_rows as f64 * s.std_energy)
-        .sum();
-    let big_pop: f64 = strata
-        .iter()
-        .filter(|s| !s.censused)
-        .map(|s| s.n_rows as f64)
-        .sum();
-
-    for s in strata.iter_mut() {
-        if s.censused {
-            s.pi = 1.0;
-            continue;
-        }
-        let n_h = s.n_rows as f64;
-        let target = if neyman_mass > 0.0 {
-            // Neyman: n_h = B' · (N_h S_h) / Σ N_g S_g ⇒ π_h = n_h / N_h.
-            budget_left * (n_h * s.std_energy / neyman_mass) / n_h
-        } else if big_pop > 0.0 {
-            // No residual variation ⇒ proportional (uniform rate on the big
-            // strata), recovering the plain uniform design.
-            budget_left / big_pop
-        } else {
-            uniform_rate
-        };
-        // Floor at the uniform rate; cap at 1.
-        s.pi = target.max(uniform_rate).min(1.0);
-    }
-}
-
-/// Design a residual-energy-stratified subsample from the streamed energies.
-///
-/// One streaming pass over `source` under `energy` builds the bounded exponent
-/// histogram; the strata and their sampling rates are then solved. This is the
-/// *design* step — no rows are materialized here. `budget ≥ N` yields an
-/// all-censused (full, exact) design.
-pub fn design_stratified_subsample(
-    source: &mut dyn CorpusRowSource,
-    energy: &dyn RowResidualEnergy,
-    budget: usize,
-) -> Result<StratumDesign, String> {
-    let total_rows = source.total_rows();
-    let mut hist = EnergyExponentHistogram::new();
-
-    source.reset();
-    while let Some(batch) = source
-        .next_batch()
-        .map_err(|e| format!("design_stratified_subsample: shard read failed: {e}"))?
-    {
-        for k in 0..batch.rows.nrows() {
-            hist.observe(energy.energy(batch.rows.row(k)));
-        }
-    }
-    if hist.total_rows != total_rows {
-        return Err(format!(
-            "design_stratified_subsample: streamed {} rows but source declared {total_rows}",
-            hist.total_rows
-        ));
-    }
-
-    let (mut strata, bin_to_stratum) = build_strata(&hist);
-    allocate_rates(&mut strata, total_rows, budget);
-    Ok(StratumDesign {
-        strata,
-        bin_to_stratum,
-        total_rows,
-        budget,
-    })
-}
-
-/// Salt mixing the per-row inclusion hash so it never collides with any other
-/// `splitmix64_hash` use of the same `row_id` in the crate.
-const STRATIFY_SALT: u64 = 0x5372_4154_1F9E_0B25;
-
-/// Deterministic per-row inclusion at rate `pi`: hash `(row_id, seed)` and
-/// include iff the hash falls in the leading `pi` fraction of the `u64` space.
-/// No clock randomness; the same `(row_id, seed, pi)` always decides the same.
-#[inline]
-fn row_included(row_id: u64, seed: u64, pi: f64) -> bool {
-    if pi >= 1.0 {
-        return true;
-    }
-    if pi <= 0.0 {
-        return false;
-    }
-    let h = splitmix64_hash(row_id ^ seed.wrapping_mul(STRATIFY_SALT) ^ STRATIFY_SALT);
-    let threshold = (pi * (u64::MAX as f64 + 1.0)) as u64;
-    h < threshold
-}
-
 /// The collected stratified row set: the dense fit target the birth producer
 /// runs on, plus the honesty weights that keep every criterion unbiased.
 #[derive(Debug, Clone)]
@@ -629,69 +341,6 @@ impl StratifiedCorpusTarget {
         self.row_ids.is_empty()
     }
 
-    /// `Σ 1/π_i` over the selected rows — the Horvitz–Thompson estimate of the
-    /// corpus row count (exactly `N` in expectation). A consumer can sanity-gate
-    /// the design by checking this lands near `N`.
-    pub fn estimated_corpus_rows(&self) -> f64 {
-        self.likelihood_weights.iter().sum()
-    }
-}
-
-/// Collect a residual-energy-stratified target from a streaming source.
-///
-/// Two cheap streaming passes: pass A ([`design_stratified_subsample`]) builds
-/// the design; pass B recomputes each row's energy (cheap, no inner solve),
-/// maps it to its stratum rate `π_h`, includes the row iff `row_included`, and
-/// materializes exactly the selected rows with their `1/π_h` weights. Memory is
-/// `O(budget)` for the collected rows plus `O(2048)` for the histogram — never
-/// `O(N)` (SPEC.md §9).
-///
-/// The result is a valid unbiased design (module-doc Horvitz–Thompson estimator):
-/// hand `likelihood_weights` to the term's `√w` honesty seam and every criterion
-/// — REML/LAML, evidence, `φ̂` — is unbiased for the full-corpus criterion, so the
-/// accept decision is unchanged; only *which* rare structures reach the birth
-/// producer changes.
-pub fn collect_stratified_target(
-    source: &mut dyn CorpusRowSource,
-    energy: &dyn RowResidualEnergy,
-    budget: usize,
-    seed: u64,
-) -> Result<StratifiedCorpusTarget, String> {
-    let design = design_stratified_subsample(source, energy, budget)?;
-    let corpus_rows = source.total_rows();
-    let p = source.width();
-
-    let mut rows_out: Vec<f64> = Vec::new();
-    let mut row_ids: Vec<u64> = Vec::new();
-    let mut likelihood_weights: Vec<f64> = Vec::new();
-
-    source.reset();
-    while let Some(batch) = source
-        .next_batch()
-        .map_err(|e| format!("collect_stratified_target: shard read failed: {e}"))?
-    {
-        for k in 0..batch.rows.nrows() {
-            let rid = batch.row_ids[k];
-            let e = energy.energy(batch.rows.row(k));
-            let pi = design.rate_for_energy(e);
-            if row_included(rid, seed, pi) {
-                rows_out.extend(batch.rows.row(k).iter().copied());
-                row_ids.push(rid);
-                likelihood_weights.push(1.0 / pi);
-            }
-        }
-    }
-
-    let n_sel = row_ids.len();
-    let target = Array2::from_shape_vec((n_sel, p), rows_out)
-        .map_err(|e| format!("collect_stratified_target: target assembly failed: {e}"))?;
-    Ok(StratifiedCorpusTarget {
-        target,
-        row_ids,
-        likelihood_weights,
-        design,
-        corpus_rows,
-    })
 }
 
 #[cfg(test)]

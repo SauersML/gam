@@ -237,20 +237,6 @@ impl FrameColumnLayout {
         slot.offset + output * slot.axes + slot.axis
     }
 
-    /// The output coordinate a parameter index drives, or `None` when the
-    /// index is out of range.
-    pub fn output_of(&self, column: usize) -> Option<usize> {
-        let slot = self
-            .atoms
-            .iter()
-            .rev()
-            .find(|slot| slot.axes > 0 && column >= slot.offset)?;
-        if column >= slot.offset + self.p * slot.axes {
-            return None;
-        }
-        Some((column - slot.offset) / slot.axes)
-    }
-
     /// Gather the `D` entries of `v` that live on output coordinate `output`
     /// into `out` (length `D`), in local-axis order.
     #[inline]
@@ -744,15 +730,6 @@ impl BlockPlusRowsSpectrum {
         Ok(hi)
     }
 
-    /// The largest block eigenvalue, i.e. `λ_max(B)`.
-    pub fn block_lambda_max(&self) -> f64 {
-        self.block_lambda_max
-    }
-
-    /// The rank of the symmetric update.
-    pub fn update_rank(&self) -> usize {
-        self.update_rank
-    }
 }
 
 /// The residual-gauge curvature `H = RᵀR` as the streaming builder produced it.
@@ -816,22 +793,6 @@ impl ResidualGaugeCurvature {
         }
     }
 
-    /// How many `f64` this representation holds.
-    ///
-    /// The certificate's cost claim is a claim about this number: the
-    /// output-coordinate roots are `p·D²` scalars where the dense Gram is
-    /// `(p·D)²`, a factor of `p`. It is exact and load-immune, which is what
-    /// makes it the regression gate a wall-clock threshold cannot be.
-    pub fn stored_scalars(&self) -> usize {
-        match self {
-            Self::OutputBlockRoots {
-                roots, dense_rows, ..
-            } => roots.len() + dense_rows.len(),
-            Self::DualRoot { root, .. } => root.len(),
-            Self::DenseGram { gram, .. } => gram.len(),
-        }
-    }
-
     /// Whether every stored entry is finite.
     ///
     /// The certificate's refusal contract: a non-finite curvature must produce
@@ -847,15 +808,6 @@ impl ResidualGaugeCurvature {
         }
     }
 
-    /// A stable tag for the representation, for diagnostics and gates.
-    pub fn structure_tag(&self) -> &'static str {
-        match self {
-            Self::OutputBlockRoots { .. } => "output_block_roots",
-            Self::DualRoot { .. } => "dual_root",
-            Self::DenseGram { .. } => "dense_gram",
-        }
-    }
-
     /// The parameter dimension this curvature is defined over.
     pub fn param_dim(&self) -> usize {
         match self {
@@ -865,45 +817,7 @@ impl ResidualGaugeCurvature {
         }
     }
 
-    /// Materialize the dense Gram this curvature represents.
-    ///
-    /// **Not for production use** — it is exactly the `param_dim²` object the
-    /// structured forms exist to avoid. It is the equivalence witness: a test
-    /// can assert that a structured curvature and the dense path agree entry by
-    /// entry, which is what makes "the off-block entries are structurally zero"
-    /// a checked claim rather than an argued one.
-    pub fn to_dense_gram(&self) -> Array2<f64> {
-        match self {
-            Self::OutputBlockRoots {
-                roots,
-                dense_rows,
-                layout,
-                ..
-            } => {
-                let n = layout.param_dim();
-                let d = layout.block_dim();
-                let mut gram = Array2::<f64>::zeros((n, n));
-                for i in 0..layout.output_dim() {
-                    let block = roots.slice(s![i, .., ..]);
-                    let dense = block.t().dot(&block);
-                    for a in 0..d {
-                        let ca = layout.column(i, a);
-                        for b in 0..d {
-                            gram[[ca, layout.column(i, b)]] = dense[[a, b]];
-                        }
-                    }
-                }
-                if dense_rows.nrows() > 0 {
-                    gram = gram + dense_rows.t().dot(dense_rows);
-                }
-                gram
-            }
-            Self::DualRoot { root, .. } => root.t().dot(root),
-            Self::DenseGram { gram, .. } => gram.clone(),
-        }
-    }
 }
-
 
 // ============================================================================
 // #2757 — the curvature as an OPERATOR, for the branch where no materialized

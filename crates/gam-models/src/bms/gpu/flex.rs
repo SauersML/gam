@@ -4,7 +4,6 @@ use std::sync::OnceLock;
 
 use gam_gpu::gpu_error::GpuError;
 #[cfg(target_os = "linux")]
-use gam_gpu::gpu_error::GpuResultExt;
 use gam_gpu::{GpuDecision, GpuKernel, decide};
 
 #[cfg(target_os = "linux")]
@@ -128,56 +127,6 @@ impl BmsFlexGpuBackend {
         self.inner
             .module
             .get_or_compile(&self.inner.ctx, "bms_flex", PROBE_KERNEL_SOURCE)
-    }
-
-    /// Launch the probe kernel and synchronize. Used by tests and by the
-    /// dispatcher's policy gate to verify the full host-orchestration
-    /// path before the real row kernel is dispatched.
-    #[cfg(target_os = "linux")]
-    pub fn launch_probe(&self) -> Result<(), GpuError> {
-        use cudarc::driver::LaunchConfig;
-        let module = self.compile_probe_module()?;
-        let func = module
-            .load_function("bms_flex_probe")
-            .gpu_ctx("bms_flex probe load_function")?;
-        let cfg = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (1, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut builder = self.inner.stream.launch_builder(&func);
-        // SAFETY: probe kernel takes no arguments and does no memory
-        // access, so launch parameters and lack of args are trivially
-        // valid for any device.
-        unsafe { builder.launch(cfg) }.gpu_ctx("bms_flex probe launch")?;
-        self.inner
-            .stream
-            .synchronize()
-            .gpu_ctx("bms_flex probe synchronize")?;
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn launch_probe(&self) -> Result<(), GpuError> {
-        Err(GpuError::DriverLibraryUnavailable {
-            reason: "bms_flex GPU backend is Linux-only".to_string(),
-        })
-    }
-
-    /// Round-trip the arena: allocate a slab, immediately release it.
-    /// Used by the device-side smoke test to verify the arena code path
-    /// is exercised; production milestones will hold slabs across the
-    /// whole row sweep instead.
-    #[cfg(target_os = "linux")]
-    pub fn arena_round_trip(&self, elements: usize) -> Result<usize, GpuError> {
-        let mut guard = self
-            .inner
-            .arena
-            .lock()
-            .gpu_ctx("bms_flex arena mutex poisoned")?;
-        let (bucket, slab) = guard.alloc(&self.inner.stream, elements, "bms_flex")?;
-        guard.release(bucket, slab);
-        Ok(bucket)
     }
 
     /// Return a short string describing the backend state, for logs.

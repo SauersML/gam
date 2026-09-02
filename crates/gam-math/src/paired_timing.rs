@@ -213,9 +213,6 @@
 //! That is the property to copy when building the next gate here, more than any
 //! particular statistic in this module.
 
-use std::hint::black_box;
-use std::time::Instant;
-
 /// Paired per-repetition timings for two implementations of one computation.
 ///
 /// `a_ns[i]` and `b_ns[i]` were measured adjacent in time within repetition `i`,
@@ -328,71 +325,6 @@ impl PairedTiming {
             self.first_position_bias(),
             self.ratios.len(),
         )
-    }
-}
-
-/// Time two implementations against each other, interleaved per repetition with
-/// a randomised order.
-///
-/// Each arm is a closure taking a perturbation seeded from the running checksum
-/// and returning a value folded back into it, so consecutive iterations carry a
-/// data dependence the optimizer cannot hoist across. Both closures must compute
-/// the SAME quantity — this measures speed and assumes agreement has already
-/// been established by a separate parity assertion.
-///
-/// `seed` fixes the order sequence, so a run is reproducible; vary it to check a
-/// verdict is not an artifact of one particular order sequence.
-///
-/// # Panics
-///
-/// If `reps` or `iterations` is zero, or if either arm's accumulated checksum is
-/// not finite — a non-finite checksum means the timed body degenerated (NaN
-/// short-circuits are often much faster) and the timing is meaningless.
-pub fn paired_interleaved<A, B>(
-    reps: usize,
-    iterations: usize,
-    seed: u64,
-    mut arm_a: A,
-    mut arm_b: B,
-) -> PairedTiming
-where
-    A: FnMut(f64) -> f64,
-    B: FnMut(f64) -> f64,
-{
-    assert!(reps > 0, "paired_interleaved needs at least one repetition");
-    assert!(
-        iterations > 0,
-        "paired_interleaved needs at least one iteration per repetition"
-    );
-
-    let mut a_ns = Vec::with_capacity(reps);
-    let mut b_ns = Vec::with_capacity(reps);
-    let mut ratios = Vec::with_capacity(reps);
-    let mut a_went_first = Vec::with_capacity(reps);
-    let mut rng = SplitMix64::new(seed);
-
-    for _ in 0..reps {
-        let a_first = rng.next_bool();
-        let (ta, tb) = if a_first {
-            let ta = time_arm(iterations, &mut arm_a);
-            let tb = time_arm(iterations, &mut arm_b);
-            (ta, tb)
-        } else {
-            let tb = time_arm(iterations, &mut arm_b);
-            let ta = time_arm(iterations, &mut arm_a);
-            (ta, tb)
-        };
-        ratios.push(tb / ta);
-        a_ns.push(ta);
-        b_ns.push(tb);
-        a_went_first.push(a_first);
-    }
-
-    PairedTiming {
-        a_ns,
-        b_ns,
-        ratios,
-        a_went_first,
     }
 }
 
@@ -512,17 +444,6 @@ impl SpeedGate {
         self.record(verdict, cell, timing, a, b);
     }
 
-    /// Record a cell whose contract is "A is not measurably slower than B",
-    /// measurable meaning beyond the paired measurement's own resolution.
-    pub fn not_slower(&mut self, cell: &str, timing: &PairedTiming, a: &str, b: &str) {
-        let verdict = if timing.median_ratio() + timing.ratio_resolution() >= 1.0 {
-            "pass"
-        } else {
-            "FAIL: A is slower than B beyond the measurement's resolution"
-        };
-        self.record(verdict, cell, timing, a, b);
-    }
-
     /// Assert that every recorded cell met its contract, naming all that did
     /// not. Consumes the gate.
     pub fn finish(mut self) {
@@ -594,28 +515,6 @@ pub fn batched<F: FnMut(f64) -> f64>(rows: usize, mut arm: F) -> impl FnMut(f64)
     }
 }
 
-/// Nanoseconds per iteration for one arm of one repetition.
-///
-/// The `checksum * 1e-18` perturbation is a feedback barrier, not a nudge: it
-/// makes iteration `n + 1` depend on the result of iteration `n`, which is what
-/// prevents the loop being hoisted or vectorised into something that is not the
-/// per-call cost being claimed. The scale is small enough that the arithmetic
-/// stays in the intended regime.
-fn time_arm<F: FnMut(f64) -> f64>(iterations: usize, arm: &mut F) -> f64 {
-    let mut checksum = 0.0_f64;
-    let started = Instant::now();
-    for _ in 0..iterations {
-        checksum += arm(black_box(checksum * 1e-18));
-    }
-    let elapsed = started.elapsed().as_secs_f64();
-    assert!(
-        black_box(checksum).is_finite(),
-        "timed arm accumulated a non-finite checksum, so the loop it timed is \
-         not the computation being compared"
-    );
-    elapsed * 1e9 / iterations as f64
-}
-
 fn median(values: &[f64]) -> f64 {
     if values.is_empty() {
         return f64::NAN;
@@ -643,29 +542,6 @@ fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
     let hi = pos.ceil() as usize;
     let frac = pos - lo as f64;
     sorted[lo] * (1.0 - frac) + sorted[hi] * frac
-}
-
-/// SplitMix64 — a deterministic order sequence, so the interleave is randomised
-/// but a run is reproducible. Deliberately not a dependency: the harness must
-/// not be able to perturb the timing through an allocation or a dynamic call.
-struct SplitMix64(u64);
-
-impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn next_bool(&mut self) -> bool {
-        self.next_u64() & 1 == 1
-    }
 }
 
 #[cfg(test)]

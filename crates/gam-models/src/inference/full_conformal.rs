@@ -724,108 +724,6 @@ pub struct DiscreteFullConformalSet {
     pub upper_tail_unresolved: Option<f64>,
 }
 
-/// Walk an EXHAUSTIVE discrete support (e.g. Bernoulli `{0, 1}`). The
-/// returned set is the exact full-conformal set, period — no tail
-/// semantics, because there is nothing outside the support.
-pub fn discrete_full_conformal_exhaustive<M: SymmetricAugmentedFit>(
-    fit: &mut M,
-    support: &[f64],
-    alpha: f64,
-) -> Result<DiscreteFullConformalSet, String> {
-    let mut set = discrete_walk(fit, support, alpha)?;
-    set.lower_tail_unresolved = None;
-    set.upper_tail_unresolved = None;
-    Ok(set)
-}
-
-/// Walk a WINDOW of an unbounded discrete support (e.g. Poisson counts
-/// `lo..=hi`). Exact ON THE WINDOW; the tail flags report honestly whether
-/// the retained set continues through either edge (edge candidate retained
-/// ⇒ contiguous tail unresolved). An excluded edge resolves only that
-/// contiguous continuation. Without a monotone-tail theorem for the fitting
-/// map, callers must not interpret cleared flags as a global proof that no
-/// non-contiguous retained candidates exist farther outside the window.
-pub fn discrete_full_conformal_window<M: SymmetricAugmentedFit>(
-    fit: &mut M,
-    window: &[f64],
-    alpha: f64,
-) -> Result<DiscreteFullConformalSet, String> {
-    discrete_walk(fit, window, alpha)
-}
-
-/// Bernoulli convenience arm: the support is `{0, 1}`, so the honest
-/// (ρ-re-selecting) full-conformal set costs exactly two cold fits.
-pub fn bernoulli_full_conformal<M: SymmetricAugmentedFit>(
-    fit: &mut M,
-    alpha: f64,
-) -> Result<DiscreteFullConformalSet, String> {
-    discrete_full_conformal_exhaustive(fit, &[0.0, 1.0], alpha)
-}
-
-fn discrete_walk<M: SymmetricAugmentedFit>(
-    fit: &mut M,
-    candidates: &[f64],
-    alpha: f64,
-) -> Result<DiscreteFullConformalSet, String> {
-    if candidates.is_empty() {
-        return Err("discrete full conformal: empty candidate list".to_string());
-    }
-    if !(0.0..1.0).contains(&alpha) {
-        return Err(format!(
-            "discrete full conformal: alpha must be in [0, 1), got {alpha}"
-        ));
-    }
-    if candidates.windows(2).any(|w| !(w[0] < w[1])) {
-        return Err("discrete full conformal: candidates must be strictly increasing".to_string());
-    }
-
-    let mut out = Vec::with_capacity(candidates.len());
-    let mut members = Vec::new();
-    let mut n_augmented = 0usize;
-    for &z in candidates {
-        let scores = fit.scores(z)?;
-        let n1 = scores.len();
-        if n1 < 2 {
-            return Err(
-                "discrete full conformal: fitting map must score at least two rows".to_string(),
-            );
-        }
-        if n_augmented == 0 {
-            n_augmented = n1;
-        } else if n_augmented != n1 {
-            return Err(format!(
-                "discrete full conformal: fitting map returned {n1} scores after returning \
-                 {n_augmented}; the augmented row count cannot change across candidates"
-            ));
-        }
-        if scores.iter().any(|s| !s.is_finite()) {
-            return Err(format!(
-                "discrete full conformal: non-finite nonconformity score at candidate {z}; \
-                 refusing to rank garbage"
-            ));
-        }
-        let e_star = scores[n1 - 1];
-        let count = scores.iter().take(n1 - 1).filter(|&&e| e >= e_star).count();
-        let p_value = (1.0 + count as f64) / (n1 as f64);
-        let member = p_value > alpha;
-        if member {
-            members.push(z);
-        }
-        out.push(DiscreteCandidate { z, p_value, member });
-    }
-
-    let lower_tail_unresolved = out.first().filter(|c| c.member).map(|c| c.z);
-    let upper_tail_unresolved = out.last().filter(|c| c.member).map(|c| c.z);
-    Ok(DiscreteFullConformalSet {
-        members,
-        candidates: out,
-        alpha,
-        n_augmented,
-        lower_tail_unresolved,
-        upper_tail_unresolved,
-    })
-}
-
 /// Layer-3 verdict for the frozen-ρ shortcut. Produced by comparing the
 /// grid-checked ρ-excursion bound against the exact engine's
 /// `boundary_margin` (see module doc). `Certified` is conditional on the
@@ -1019,11 +917,6 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         })
     }
 
-    /// `rank(S)` as detected at construction.
-    pub fn rank_s(&self) -> usize {
-        self.rank_s
-    }
-
     /// Closed-form REML evaluation at `ρ`. `z = Some(_)` augments with the
     /// test row; `z = None` is the original-data criterion (used for ρ̂₀).
     fn eval(&self, rho: f64, z: Option<f64>) -> Result<RemlEval, String> {
@@ -1125,11 +1018,6 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         })
     }
 
-    /// Public, value-only REML criterion (for FD verification of the gradient).
-    pub fn penalized_laml_criterion(&self, rho: f64, z: Option<f64>) -> Result<f64, String> {
-        Ok(self.eval(rho, z)?.value)
-    }
-
     /// `dρ̂/dz` at a stationary `(ρ, z)` via the outer IFT.
     pub fn drho_dz(&self, rho: f64, z: f64) -> Result<f64, String> {
         let ev = self.eval(rho, Some(z))?;
@@ -1170,36 +1058,6 @@ impl<'a> GaussianRemlRhoResponse<'a> {
             }
         }
         Ok(rho)
-    }
-
-    /// Honest membership at candidate `z`: re-select ρ̂(z) on the augmented
-    /// data, fit, and apply the conformal rank rule. This IS the honest
-    /// (ρ-re-selecting) full-conformal map, computed exactly per candidate.
-    pub fn honest_membership(&self, z: f64, alpha: f64) -> Result<bool, String> {
-        let rho = self.select_rho(Some(z))?;
-        let lambda = gam_problem::checked_exp_log_strength(rho)
-            .map_err(|error| format!("gaussian REML conformal response: {error}"))?;
-        let p = self.p;
-        let mut a = self.xtx.clone();
-        for i in 0..p {
-            for j in 0..p {
-                a[[i, j]] += lambda * self.s[[i, j]] + self.x_star[i] * self.x_star[j];
-            }
-        }
-        let chol = a
-            .cholesky(Side::Lower)
-            .map_err(|e| format!("gaussian reml response: honest A(λ) not SPD: {e:?}"))?;
-        let mut c = self.xty.clone();
-        for j in 0..p {
-            c[j] += self.x_star[j] * z;
-        }
-        let beta = chol.solvevec(&c);
-        let e_star = (z - self.x_star.dot(&beta)).abs();
-        let xb = fast_av(self.x, &beta);
-        let count = (0..self.n)
-            .filter(|&i| (self.y[i] - xb[i]).abs() >= e_star)
-            .count();
-        Ok((1.0 + count as f64) > alpha * (self.n as f64 + 1.0))
     }
 
     /// Run the certificate-first procedure: build the frozen-ρ exact set, then
@@ -2236,14 +2094,6 @@ pub struct JackknifePlusInterval {
     pub n: usize,
 }
 
-impl JackknifePlusInterval {
-    /// Whether both endpoints are finite (enough points to certify the
-    /// requested level).
-    pub fn certifies_finite(&self) -> bool {
-        self.lo.is_finite() && self.hi.is_finite()
-    }
-}
-
 /// The jackknife+ interval assembly of Barber et al. (2021), exact order
 /// statistics:
 ///
@@ -2321,75 +2171,6 @@ pub fn jackknife_plus_interval(
         lower[rank_lo - 1]
     };
     Ok(JackknifePlusInterval { lo, hi, alpha, n })
-}
-
-/// EXACT jackknife+ for the penalized Gaussian-identity fit at frozen `Sλ`,
-/// with the leave-one-out quantities computed in closed form (no refits):
-/// the LOO fit is a rank-one Sherman–Morrison downdate of the single
-/// factored normal matrix `M = XᵀX + Sλ`, so
-///
-/// ```text
-///   rᵢ = yᵢ − xᵢᵀβ̂ ,  hᵢ = xᵢᵀM⁻¹xᵢ ,
-///   Rᵢ = |rᵢ| / (1 − hᵢ) ,                    (exact LOO residual)
-///   μ̂₋ᵢ(x_*) = x_*ᵀβ̂ − (x_*ᵀM⁻¹xᵢ)·rᵢ/(1 − hᵢ)   (exact LOO test prediction)
-/// ```
-///
-/// — the same factored-Hessian leave-one-out algebra the ALO module
-/// (src/inference/alo.rs) applies on the working-response scale, specialized
-/// here to the Gaussian-identity case where it is exact rather than
-/// approximate. Unit prior weights are required for the exchangeability
-/// guarantee, as everywhere in this module.
-pub fn gaussian_jackknife_plus(
-    x: &Array2<f64>,
-    y: &Array1<f64>,
-    prior_weights: &Array1<f64>,
-    s_lambda: &Array2<f64>,
-    x_star: &Array1<f64>,
-    alpha: f64,
-) -> Result<JackknifePlusInterval, String> {
-    let n = x.nrows();
-    let p = x.ncols();
-    if y.len() != n || prior_weights.len() != n {
-        return Err("gaussian jackknife+: row-count mismatch".to_string());
-    }
-    if s_lambda.nrows() != p || s_lambda.ncols() != p || x_star.len() != p {
-        return Err("gaussian jackknife+: column-count mismatch".to_string());
-    }
-    if prior_weights.iter().any(|&w| (w - 1.0).abs() > 1e-12) {
-        return Err(
-            "gaussian jackknife+ requires unit prior weights: a reweighted training row \
-             is not exchangeable with the test row, so the finite-sample coverage proof \
-             does not apply"
-                .to_string(),
-        );
-    }
-    let m = x.t().dot(x) + s_lambda;
-    let chol = m
-        .cholesky(Side::Lower)
-        .map_err(|e| format!("gaussian jackknife+: normal matrix not SPD: {e:?}"))?;
-    let beta = chol.solvevec(&x.t().dot(y));
-    let mu = fast_av(x, &beta);
-    let mu_star = x_star.dot(&beta);
-    let b = chol.solvevec(x_star);
-    let xt = x.t().as_standard_layout().into_owned();
-    let minv_xt = chol.solve_mat(&xt);
-    let mut loo_preds = Array1::<f64>::zeros(n);
-    let mut loo_resids = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let h_i = x.row(i).dot(&minv_xt.column(i));
-        let one_minus_h = 1.0 - h_i;
-        if !(one_minus_h > 1e-10) {
-            return Err(format!(
-                "gaussian jackknife+: leverage hᵢ = {h_i} at row {i} leaves no leave-one-out \
-                 information (1 − hᵢ ≤ 1e-10); the rank-one downdate is exact only for hᵢ < 1"
-            ));
-        }
-        let r_i = y[i] - mu[i];
-        let c_i = x.row(i).dot(&b); // x_*ᵀ M⁻¹ xᵢ by symmetry
-        loo_resids[i] = (r_i / one_minus_h).abs();
-        loo_preds[i] = mu_star - c_i * r_i / one_minus_h;
-    }
-    jackknife_plus_interval(&loo_preds, &loo_resids, alpha)
 }
 
 /// Test-point-independent sufficient statistics for the exact penalized

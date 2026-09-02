@@ -95,24 +95,6 @@ pub struct AffineDesign {
     pub eta_gradient: AffineEtaGradient,
 }
 
-impl AffineDesign {
-    /// `∂η/∂β` at the fitted coefficients, in exactly `coefficient_frame`.
-    ///
-    /// This — not [`AffineDesign::matrix`] — is the operator that pairs with
-    /// `covariances`: `Var(η) = G · V · Gᵀ`, and a coefficient contrast `c`
-    /// moves the fitted predictor by `G · c`.  For a predictor that is linear
-    /// in its coefficients the two coincide; for a fitted link wiggle the
-    /// value operator's Mean block is missing the warp slope `dq/dq0`, so
-    /// using it for variance would silently disagree with the standard errors
-    /// `predict` reports.
-    pub fn eta_gradient_matrix(&self) -> &DesignMatrix {
-        match &self.eta_gradient {
-            AffineEtaGradient::Design => &self.matrix,
-            AffineEtaGradient::Distinct(gradient) => gradient,
-        }
-    }
-}
-
 fn fitted_covariances(fit: &gam_solve::estimate::UnifiedFitResult) -> AffineCovariances {
     AffineCovariances {
         conditional: fit.beta_covariance().cloned(),

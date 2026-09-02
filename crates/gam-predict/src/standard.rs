@@ -186,6 +186,7 @@ impl StandardPredictor {
 /// boundary/OOD inflation, smoothing-corrected backend selection), which are
 /// the canonical standard engines, not duplicated boilerplate.
 impl PredictionTransform for StandardPredictor {
+
     fn point_state(&self, input: &PredictInput) -> Result<LinearState, EstimationError> {
         let with_se = self.predict_with_uncertainty(input)?;
         Ok(LinearState {

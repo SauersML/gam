@@ -52,10 +52,8 @@
 //! `(seed, row)`. Host sampling delegates to upstream, so CPU/GPU acceptance
 //! compares distributions rather than implementation-specific draw sequences.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, ArrayView1};
 use std::{convert::Infallible, sync::OnceLock};
-
-use gam_linalg::triangular::{back_substitution_lower_transpose, cholesky_solve_vector};
 
 use crate::polya_gamma::PolyaGamma;
 
@@ -220,12 +218,17 @@ impl XorwowState {
 /// caller. The CUDA kernel keeps its own device-side transforms; this bridge is
 /// only for the host distribution oracle.
 impl rand::TryRng for XorwowState {
-    type Error = Infallible;
+
+    #[inline]
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+        rand::rand_core::utils::fill_bytes_via_next_word(dest, || Ok(XorwowState::next_u32(self)))
+    }
 
     #[inline]
     fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
         Ok(XorwowState::next_u32(self))
     }
+    type Error = Infallible;
 
     #[inline]
     fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
@@ -234,10 +237,6 @@ impl rand::TryRng for XorwowState {
         Ok((high << 32) | low)
     }
 
-    #[inline]
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
-        rand::rand_core::utils::fill_bytes_via_next_word(dest, || Ok(XorwowState::next_u32(self)))
-    }
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -279,128 +278,6 @@ pub fn pg_convolution_cpu_oracle(state: &mut XorwowState, b: u32, tilt: f64) -> 
 // log density gives a tight acceptance ratio across the full b range. The
 // host implementation here is also the *oracle* used to validate the
 // device sp_kernel.
-
-/// Solve K'(t) = x for the saddlepoint t given x in (0, 1). K'(t) is a
-/// continuous strictly increasing function of t on the appropriate
-/// branch; the math team’s parameterisation eliminates v = sqrt(|2t|) so
-/// the Newton iteration is on a monotone bounded variable.
-///
-/// Branch:
-/// * `x < 1`  → `K'(t) = tanh(v)/v` with `v = sqrt(-2t)`, t ≤ 0.
-/// * `x ≥ 1`  → `K'(t) = tan(v)/v`  with `v = sqrt( 2t)`, t > 0.
-pub fn saddlepoint_solve(x: f64) -> f64 {
-    // Six iterations is the math team’s target (§9). The function is
-    // analytic; Newton on tanh(v)/v or tan(v)/v converges quadratically
-    // from the closed-form initial guess `v0 = sqrt(3(1 - x))` (Taylor of
-    // `tanh(v)/v = 1 - v²/3 + 2v⁴/15 - ...`).
-    if (x - 1.0).abs() < 1e-9 {
-        return 0.0;
-    }
-    if x < 1.0 {
-        // Negative-t branch, work in v = sqrt(-2t). `tanh(v)/v` is monotone
-        // decreasing in v on (0, ∞), with two well-separated asymptotic
-        // regimes:
-        //
-        //   * x ≈ 1 (v small): Taylor expansion tanh(v)/v ≈ 1 - v²/3 gives
-        //     `v₀ = sqrt(3(1 - x))`, which is the ~quadratic starting point
-        //     used historically.
-        //   * x ≈ 0 (v large): `tanh(v) → 1`, so `tanh(v)/v ≈ 1/v` and the
-        //     root sits near `v ≈ 1/x`. The Taylor seed `sqrt(3(1-x)) ≤ √3`
-        //     is bounded above by ~1.73, which leaves Newton walking the
-        //     plateau at ~`tanh(v)/v ≈ 0.55` and converging linearly to the
-        //     true root (≈ 20 at x = 0.05); six Newton steps are not enough
-        //     to drive the relative error to 1e-6 from there.
-        //
-        // Take the maximum of the two seeds so each regime gets a starting
-        // point in its quadratic-convergence basin; the function is monotone
-        // so overshooting the root from above just trades a couple of
-        // descending Newton steps for the missing factor-of-ten distance.
-        // 16 Newton iterations is comfortable even when the initial seed
-        // overshoots and Newton has to recover via several linear steps
-        // before settling into the quadratic regime.
-        let v_taylor = (3.0 * (1.0 - x)).sqrt();
-        let v_asym = 1.0 / x.max(1e-12);
-        let mut v = v_taylor.max(v_asym).max(1e-6);
-        for _ in 0..16 {
-            let tanh_v = v.tanh();
-            let f = tanh_v / v - x;
-            // d/dv [tanh(v)/v] = (1 - tanh²v)/v - tanh(v)/v²
-            //                  = ((1 - tanh²v) - tanh(v)/v) / v.
-            let sech_sq = 1.0 - tanh_v * tanh_v;
-            let df = (sech_sq - tanh_v / v) / v;
-            v -= f / df;
-            if v.abs() < 1e-12 {
-                break;
-            }
-        }
-        -0.5 * v * v
-    } else {
-        // Positive-t branch, work in v = sqrt(2t). The pole of tan is at
-        // v = π/2; the relevant root sits in (0, π/2). Two regimes:
-        //
-        //   * x ≈ 1 (v small): Taylor tan(v)/v ≈ 1 + v²/3 gives
-        //     `v₀ = sqrt(3(x - 1))` — the historical seed.
-        //   * x large (v near π/2): tan(v) ≈ 1/(π/2 - v), so the root sits
-        //     near `v ≈ π/2 - 2/(x π)`. Seeding from the 0.49 π cap leaves
-        //     Newton inside the very steep tail of the pole, where each
-        //     Newton step descends by a fraction of the remaining distance;
-        //     six steps left x = 3 stuck at rel ≈ 1.5e-4 above 1e-6.
-        //
-        // The cap stays at 0.499 π to keep `tan(v)` finite; the analytic
-        // pole-tail seed is honoured when it sits below that cap. Bumping
-        // the iteration cap mirrors the negative branch.
-        let v_taylor = (3.0 * (x - 1.0)).sqrt();
-        let v_pole = FRAC_PI_2 - 2.0 / (x.max(1e-12) * PI);
-        let mut v = v_taylor.max(v_pole).min(0.499 * PI).max(1e-6);
-        for _ in 0..16 {
-            let tan_v = v.tan();
-            let f = tan_v / v - x;
-            // d/dv [tan(v)/v] = (1 + tan²v)/v - tan(v)/v².
-            let sec_sq = 1.0 + tan_v * tan_v;
-            let df = (sec_sq - tan_v / v) / v;
-            v = (v - f / df).max(1e-6).min(0.499_999 * PI);
-            if !v.is_finite() {
-                v = (3.0 * (x - 1.0)).sqrt().min(0.49 * PI);
-                break;
-            }
-        }
-        0.5 * v * v
-    }
-}
-
-/// Saddlepoint approximation K''(t), the variance of the tilted distribution
-/// from K'(t) = x. K''(t) is variance, so positive on both branches.
-///
-/// Derivation. From `saddlepoint_solve` the saddlepoint parameterisation is
-///   negative branch (t ≤ 0): K'(t) = tanh(v)/v with v = sqrt(-2t),
-///   positive branch (t > 0): K'(t) = tan(v)/v  with v = sqrt( 2t).
-/// Chain rule with dv/dt = ±1/v (sign matches the branch) yields
-///   negative branch:  K''(t) = tanh(v)/v³ - sech²(v)/v²
-///   positive branch:  K''(t) = sec²(v)/v²  - tan(v)/v³
-/// As v → 0 both branches reduce to the same Taylor limit 2/3, which is the
-/// continuous value of K''(0).
-///
-/// The previous form returned `sech²(v)/v² - tanh(v)/v³` on the negative
-/// branch — the algebraic negative of the chain-rule derivative — and a
-/// hardcoded `1/3` at t = 0 that did not match either one-sided limit. The
-/// negative-branch sign error produced K''(-2) ≈ -0.103, which the test
-/// `saddlepoint_kpp_is_positive` correctly flagged (variance must be > 0).
-pub fn saddlepoint_kpp(t: f64) -> f64 {
-    if t.abs() < 1e-14 {
-        return 2.0 / 3.0;
-    }
-    if t < 0.0 {
-        let v = (-2.0 * t).sqrt();
-        let tanh_v = v.tanh();
-        let sech_sq = 1.0 - tanh_v * tanh_v;
-        (tanh_v / (v * v * v)) - (sech_sq / (v * v))
-    } else {
-        let v = (2.0 * t).sqrt();
-        let tan_v = v.tan();
-        let sec_sq = 1.0 + tan_v * tan_v;
-        (sec_sq / (v * v)) - (tan_v / (v * v * v))
-    }
-}
 
 /// Saddlepoint host draw for PG(b, c) with `13 < b ≤ 170`. This is the
 /// reference the device sp_kernel matches in distribution; both fall
@@ -522,134 +399,6 @@ pub fn draw_batch(input: PolyaGammaBatchInput<'_>) -> Result<Array1<f64>, String
 // ────────────────────────────────────────────────────────────────────────
 // Phase 5: synthetic logistic Gibbs harness (validation oracle only)
 // ────────────────────────────────────────────────────────────────────────
-
-/// Single Gibbs step for the synthetic Bernoulli-logistic model
-/// `y_i | β ~ Bernoulli(σ(x_iᵀ β))` with prior `β ~ N(0, Q_0⁻¹)`.
-///
-/// Steps (math block 7 §11):
-///
-/// 1. `ψ = X β` (length n).
-/// 2. `ω_i ~ PG(1, ψ_i)` for all i (uses [`draw_batch`]).
-/// 3. `z_i = (y_i − 1/2) / ω_i` (working response).
-/// 4. `Q_ω = Xᵀ Ω X + Q_0`, `m_ω = Xᵀ Ω z`.
-/// 5. Cholesky `Q_ω = L Lᵀ`, mean `μ = (Q_ω)⁻¹ m_ω = L⁻ᵀ L⁻¹ m_ω`.
-/// 6. `β ← μ + L⁻ᵀ η` with `η ~ N(0, I_p)`.
-///
-/// This is a *primitive validation harness*; it deliberately runs entirely
-/// on host except for the PG draws, which are the thing under test. The
-/// posterior-inference path that ships with `gam` is NUTS, not this Gibbs
-/// loop, and this module does not export the Gibbs sampler as a fit method.
-pub fn logistic_gibbs_step(
-    design: ArrayView2<'_, f64>,
-    targets: ArrayView1<'_, u8>,
-    prior_precision: ArrayView2<'_, f64>,
-    beta: ArrayView1<'_, f64>,
-    seed: PgSeed,
-    norm_seed: u64,
-) -> Result<Array1<f64>, String> {
-    let (n, p) = design.dim();
-    if targets.len() != n {
-        return Err(format!(
-            "logistic_gibbs_step: y.len()={} != n={n}",
-            targets.len()
-        ));
-    }
-    if prior_precision.dim() != (p, p) {
-        return Err(format!(
-            "logistic_gibbs_step: Q_0 shape {:?} != ({p}, {p})",
-            prior_precision.dim()
-        ));
-    }
-    if beta.len() != p {
-        return Err(format!(
-            "logistic_gibbs_step: beta.len()={} != p={p}",
-            beta.len()
-        ));
-    }
-
-    // Step 1: ψ = X β  (host matvec — n×p × p).
-    let mut psi = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let mut acc = 0.0;
-        for j in 0..p {
-            acc += design[[i, j]] * beta[j];
-        }
-        psi[i] = acc;
-    }
-
-    // Step 2: ω_i ~ PG(1, ψ_i).
-    let shapes = Array1::<u32>::from_elem(n, 1);
-    let omega = draw_batch(PolyaGammaBatchInput {
-        shapes: shapes.view(),
-        tilts: psi.view(),
-        seed,
-    })?;
-
-    // Step 3: z_i = (y_i − 1/2) / ω_i  — but we never form z explicitly;
-    //   m_ω = Xᵀ (y − 1/2)  (the ω cancels) is the standard PSW shortcut.
-    let mut m = Array1::<f64>::zeros(p);
-    for i in 0..n {
-        let r = targets[i] as f64 - 0.5;
-        for j in 0..p {
-            m[j] += design[[i, j]] * r;
-        }
-    }
-
-    // Step 4: Q_ω = Xᵀ Ω X + Q_0  (symmetric p × p; O(n p²)).
-    let mut q = prior_precision.to_owned();
-    for i in 0..n {
-        let w = omega[i];
-        for a in 0..p {
-            let xa = design[[i, a]];
-            for b in 0..p {
-                q[[a, b]] += w * xa * design[[i, b]];
-            }
-        }
-    }
-
-    // Step 5: Cholesky L Lᵀ = Q_ω.
-    let l = cholesky_lower_inplace(q.clone())
-        .map_err(|e| format!("logistic_gibbs_step Cholesky: {e}"))?;
-    // μ = (Q_ω)⁻¹ m via L y = m, Lᵀ μ = y.
-    let mean = cholesky_solve_vector(&l, &m);
-
-    // Step 6: β ← μ + L⁻ᵀ η.
-    let mut norm_state = XorwowState::new(norm_seed, 0);
-    let mut eta = Array1::<f64>::zeros(p);
-    for j in 0..p {
-        eta[j] = norm_state.next_norm();
-    }
-    let perturb = back_substitution_lower_transpose(&l, &eta);
-    let mut beta_new = Array1::<f64>::zeros(p);
-    for j in 0..p {
-        beta_new[j] = mean[j] + perturb[j];
-    }
-    Ok(beta_new)
-}
-
-fn cholesky_lower_inplace(mut a: Array2<f64>) -> Result<Array2<f64>, String> {
-    let n = a.nrows();
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = a[[i, j]];
-            for k in 0..j {
-                sum -= a[[i, k]] * a[[j, k]];
-            }
-            if i == j {
-                if sum <= 0.0 {
-                    return Err(format!("non-SPD diagonal {sum} at row {i}"));
-                }
-                a[[i, j]] = sum.sqrt();
-            } else {
-                a[[i, j]] = sum / a[[j, j]];
-            }
-        }
-        for j in (i + 1)..n {
-            a[[i, j]] = 0.0;
-        }
-    }
-    Ok(a)
-}
 
 /// Render the mathematical constants consumed by the CUDA-only Devroye
 /// implementation. Values are derived from `std` constants at assembly time,

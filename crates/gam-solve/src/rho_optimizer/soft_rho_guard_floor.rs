@@ -38,11 +38,6 @@
 //! [`OuterObjective::soft_rho_guard_gradient`]: super::OuterObjective::soft_rho_guard_gradient
 //! [`SoftRhoGuardPriorAtom`]: crate::estimate::reml::atoms::SoftRhoGuardPriorAtom
 
-use ndarray::Array1;
-
-use crate::estimate::reml::atoms::SoftRhoGuardPriorAtom;
-use crate::estimate::{RHO_BOUND, RHO_SOFT_PRIOR_SHARPNESS, RHO_SOFT_PRIOR_WEIGHT};
-
 /// The saturated-ρ ladder #2450 established and #2545/#2629 measure on.
 ///
 /// `ρ ≥ 21` is where the REML part's own ρ-derivative was measured below
@@ -111,38 +106,6 @@ pub struct PencilFit {
     pub holds: bool,
 }
 
-impl PencilFit {
-    fn from_residuals(ladder: &[GuardLadderRung], residual: impl Fn(&GuardLadderRung) -> f64) -> Self {
-        let pencil: Vec<f64> = ladder
-            .iter()
-            .map(|rung| residual(rung) * rung.rho.exp())
-            .collect();
-        let constant = if pencil.is_empty() {
-            0.0
-        } else {
-            pencil.iter().sum::<f64>() / pencil.len() as f64
-        };
-        let all_finite = pencil.iter().all(|c| c.is_finite());
-        let all_positive = pencil.iter().all(|c| *c > 0.0);
-        let all_negative = pencil.iter().all(|c| *c < 0.0);
-        let single_signed = all_finite && (all_positive || all_negative);
-        let (spread, holds) = if !single_signed {
-            (f64::INFINITY, false)
-        } else {
-            let max = pencil.iter().fold(0.0f64, |acc, c| acc.max(c.abs()));
-            let min = pencil.iter().fold(f64::MAX, |acc, c| acc.min(c.abs()));
-            let spread = (max - min) / max;
-            (spread, spread <= PENCIL_CONSTANCY_TOL)
-        };
-        Self {
-            pencil,
-            constant,
-            spread,
-            holds,
-        }
-    }
-}
-
 /// What a ladder says about the objective that produced it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SoftRhoGuardFloor {
@@ -203,20 +166,6 @@ pub enum SoftRhoGuardFloor {
 }
 
 impl SoftRhoGuardFloor {
-    /// `true` for both absence verdicts — the question the trait's `None`
-    /// default answers.
-    pub fn is_absent(&self) -> bool {
-        matches!(
-            self,
-            Self::AbsentDecayingFace { .. } | Self::AbsentBelowTheFloor { .. }
-        )
-    }
-
-    /// `true` when the criterion demonstrably adds the barrier and therefore
-    /// owes the seam a publication.
-    pub fn is_carried(&self) -> bool {
-        matches!(self, Self::Carried { .. })
-    }
 
     /// A one-line rendering suitable for a refusal message or a test failure.
     pub fn summary(&self) -> String {
@@ -254,139 +203,6 @@ impl SoftRhoGuardFloor {
                  without-floor pencil spread {:.3e})",
                 with_floor.spread, without_floor.spread
             ),
-        }
-    }
-}
-
-/// The soft ρ-guard barrier's own gradient emission at `rho`, from the SAME
-/// atom `RemlState::build_prior` adds.
-///
-/// Not a re-derivation: this calls [`SoftRhoGuardPriorAtom::evaluate_anchored`]
-/// with the shipped policy constants, so a change to the weight, the sharpness,
-/// or the bound moves the criterion and this classifier together. A closed form
-/// written here would be a second copy of the thing #931 collapsed into one
-/// atom, and it would silently disagree the moment the anchor is nonzero.
-///
-/// `anchor` is `RemlState::rho_weight_anchor()` — exactly `0.0` for an
-/// unweighted fit, `log g(w)` otherwise (#877). Passing `0.0` for a weighted
-/// state measures the wrong function, and does so quietly: that is the failure
-/// mode #2545's doc calls out, so it is a required argument rather than a
-/// default.
-pub fn soft_rho_guard_emission_at(rho: f64, anchor: f64) -> f64 {
-    SoftRhoGuardPriorAtom::evaluate_anchored(
-        &Array1::from_elem(1, rho),
-        RHO_SOFT_PRIOR_WEIGHT,
-        RHO_SOFT_PRIOR_SHARPNESS,
-        RHO_BOUND,
-        anchor,
-    )
-    .gradient()[0]
-}
-
-/// Classify one ρ-coordinate's saturated ladder.
-///
-/// See the module docs for the discrimination. In short: fit `ĉ = r·e^{ρ}` under
-/// both hypotheses (`r = g − guard` and `r = g`) and accept the one whose pencil
-/// is a single-signed constant. If the gradient is smaller than the floor
-/// itself, report absence on that ground alone. If neither hypothesis holds,
-/// report [`SoftRhoGuardFloor::Indeterminate`] with both fits rather than
-/// rounding to the nearer one.
-///
-/// `anchor` is the weight anchor the criterion's barrier was evaluated at; see
-/// [`soft_rho_guard_emission_at`].
-pub fn classify_soft_rho_guard_floor(
-    ladder: &[GuardLadderRung],
-    anchor: f64,
-) -> SoftRhoGuardFloor {
-    let empty = || PencilFit {
-        pencil: Vec::new(),
-        constant: 0.0,
-        spread: f64::INFINITY,
-        holds: false,
-    };
-    if ladder.len() < 3 {
-        return SoftRhoGuardFloor::Indeterminate {
-            with_floor: empty(),
-            without_floor: empty(),
-            reason: format!(
-                "a ladder of {} rung(s) cannot show a pencil to be CONSTANT — \
-                 three rungs are the minimum that makes constancy an observation \
-                 rather than a definition",
-                ladder.len()
-            ),
-        };
-    }
-    if let Some(bad) = ladder
-        .iter()
-        .find(|rung| !rung.rho.is_finite() || !rung.rho_gradient.is_finite())
-    {
-        return SoftRhoGuardFloor::Indeterminate {
-            with_floor: empty(),
-            without_floor: empty(),
-            reason: format!(
-                "the ladder carries a non-finite rung (rho={}, g={})",
-                bad.rho, bad.rho_gradient
-            ),
-        };
-    }
-
-    let guard: Vec<f64> = ladder
-        .iter()
-        .map(|rung| soft_rho_guard_emission_at(rung.rho, anchor))
-        .collect();
-    let with_floor = PencilFit::from_residuals(ladder, |rung| {
-        rung.rho_gradient - soft_rho_guard_emission_at(rung.rho, anchor)
-    });
-    let without_floor = PencilFit::from_residuals(ladder, |rung| rung.rho_gradient);
-
-    // Order matters, and it is not arbitrary. `with_floor` is checked first
-    // because it is the *stronger* claim — it requires the residual under a
-    // known constant to be a clean face — and because a criterion that carries
-    // the floor cannot also satisfy `without_floor` (its raw pencil grows by
-    // `e^{Δρ}` across the ladder, a factor 8100 here, five orders past the bar).
-    match (with_floor.holds, without_floor.holds) {
-        (true, false) => SoftRhoGuardFloor::Carried {
-            face: with_floor,
-            guard,
-        },
-        (false, true) => SoftRhoGuardFloor::AbsentDecayingFace {
-            face: without_floor,
-            guard,
-        },
-        (true, true) => SoftRhoGuardFloor::Indeterminate {
-            with_floor,
-            without_floor,
-            reason: "both hypotheses fit, which is geometrically impossible for a \
-                     nonzero floor (the floor is constant, so it cannot be a \
-                     c*e^-rho tail as well) — the ladder is degenerate"
-                .to_string(),
-        },
-        (false, false) => {
-            // Neither SHAPE fits. The magnitude argument is independent of shape
-            // and is the one that survives when the face has decayed into
-            // roundoff, where the raw pencil is noise times `e^{30}`.
-            let max_abs_gradient = ladder
-                .iter()
-                .fold(0.0f64, |acc, rung| acc.max(rung.rho_gradient.abs()));
-            let min_guard = guard.iter().fold(f64::MAX, |acc, g| acc.min(g.abs()));
-            if max_abs_gradient <= ABSENCE_MAGNITUDE_FRACTION * min_guard {
-                return SoftRhoGuardFloor::AbsentBelowTheFloor {
-                    max_abs_gradient,
-                    min_guard,
-                };
-            }
-            SoftRhoGuardFloor::Indeterminate {
-                reason: format!(
-                    "neither pencil is a single-signed constant, and max|g|={max_abs_gradient:.6e} \
-                     is not below the floor's own {min_guard:.6e} either — this ladder does not \
-                     answer the question. Check that the ladder is deep enough (the criterion's \
-                     own tail must be small next to the floor), that the inner solve converged at \
-                     every rung, and that no OTHER non-decaying term (a configured rho-prior) is \
-                     in the criterion"
-                ),
-                with_floor,
-                without_floor,
-            }
         }
     }
 }

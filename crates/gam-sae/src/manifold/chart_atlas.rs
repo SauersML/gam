@@ -16,7 +16,6 @@
 //! over-tiles can still be physically fused; seams that must survive are stored
 //! here with their exact unit-speed affine transition.
 
-use ndarray::{Array1, ArrayView1};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::SaeManifoldTerm;
@@ -223,22 +222,6 @@ impl SphereChartTransition {
     #[must_use]
     pub fn provenance(&self) -> SphereTransitionProvenance {
         self.provenance
-    }
-
-    #[must_use = "analytic transition validation errors must be handled"]
-    pub fn new_analytic(
-        from_chart: usize,
-        to_chart: usize,
-        rotation: [[f64; 3]; 3],
-        seam_kind: AtlasSeamKind,
-    ) -> Result<Self, String> {
-        Self::validate(
-            from_chart,
-            to_chart,
-            rotation,
-            seam_kind,
-            SphereTransitionProvenance::Analytic,
-        )
     }
 
     #[must_use = "fitted transition validation errors must be handled"]
@@ -741,50 +724,6 @@ impl ManifoldChartAtlas {
         Some(AtlasOrientability::Orientable)
     }
 
-    /// Factor the chart gates on one row into `(atlas activation, partition of
-    /// unity)`.  The returned weights follow [`Self::charts`] and sum exactly to
-    /// one whenever the atlas is active.  This is an algebraic refactoring of
-    /// the existing reconstruction, not an approximate router.
-    #[must_use = "partition errors must be handled"]
-    pub fn partition_of_unity(
-        &self,
-        row_assignments: ArrayView1<'_, f64>,
-    ) -> Result<(f64, Array1<f64>), String> {
-        if let Some(&bad) = self
-            .charts
-            .iter()
-            .find(|&&chart| chart >= row_assignments.len())
-        {
-            return Err(format!(
-                "atlas chart {bad} is outside assignment row width {}",
-                row_assignments.len()
-            ));
-        }
-        let activation: f64 = self
-            .charts
-            .iter()
-            .map(|&chart| row_assignments[chart])
-            .sum();
-        if !(activation.is_finite() && activation >= 0.0) {
-            return Err(format!(
-                "atlas activation must be finite and nonnegative, got {activation}"
-            ));
-        }
-        let mut weights = Array1::<f64>::zeros(self.charts.len());
-        if activation > 0.0 {
-            for (slot, &chart) in self.charts.iter().enumerate() {
-                let weight = row_assignments[chart] / activation;
-                if !(weight.is_finite() && weight >= 0.0) {
-                    return Err(format!(
-                        "atlas partition weight for chart {chart} must be finite and nonnegative, got {weight}"
-                    ));
-                }
-                weights[slot] = weight;
-            }
-        }
-        Ok((activation, weights))
-    }
-
     pub(crate) fn remap(&mut self, old_to_new: &[Option<usize>]) -> Result<(), String> {
         let mut charts = Vec::with_capacity(self.charts.len());
         for &chart in &self.charts {
@@ -842,20 +781,6 @@ impl SaeManifoldTerm {
     #[must_use]
     pub fn chart_atlases(&self) -> &[ManifoldChartAtlas] {
         &self.chart_atlases
-    }
-
-    /// Number of semantic atoms after quotienting local charts that belong to
-    /// one registered atlas.  Raw decoder blocks remain available through
-    /// [`SaeManifoldTerm::k_atoms`]; this count is the topology-aware dictionary
-    /// size used for reporting a multi-chart atom as one object.
-    #[must_use]
-    pub fn semantic_atom_count(&self) -> usize {
-        self.k_atoms()
-            - self
-                .chart_atlases
-                .iter()
-                .map(|atlas| atlas.charts.len() - 1)
-                .sum::<usize>()
     }
 
     /// Whether two numerical chart blocks have already been quotiented into the
@@ -995,24 +920,6 @@ impl SaeManifoldTerm {
             "cannot refresh unregistered sphere chart transition {}->{}",
             transition.from_chart, transition.to_chart
         ))
-    }
-
-    /// Atlas activation and partition weights for one assignment row.
-    #[must_use = "partition errors must be handled"]
-    pub fn atlas_partition_of_unity(
-        &self,
-        atlas_index: usize,
-        row_assignments: ArrayView1<'_, f64>,
-    ) -> Result<(f64, Array1<f64>), String> {
-        self.chart_atlases
-            .get(atlas_index)
-            .ok_or_else(|| {
-                format!(
-                    "atlas index {atlas_index} is outside {} registered atlases",
-                    self.chart_atlases.len()
-                )
-            })?
-            .partition_of_unity(row_assignments)
     }
 
     pub(crate) fn remap_chart_atlases(

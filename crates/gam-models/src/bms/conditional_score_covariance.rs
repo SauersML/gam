@@ -437,14 +437,6 @@ impl ConditionalScoreCovariance {
         Ok(())
     }
 
-    /// `Σ(a)` as a dense symmetric matrix. Diagnostics and tests; the row
-    /// program consumes [`Self::row_covariances`].
-    pub fn dense_at(&self, a_row: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
-        let mut factor = Array2::<f64>::zeros((self.score_dim, self.score_dim));
-        self.factor_into(a_row, &mut factor)?;
-        Ok(factor.dot(&factor.t()))
-    }
-
     /// One admitted [`MarginalSlopeCovariance`] per row of `a_block`, in the
     /// `Σ = L Lᵀ` low-rank representation whose quadratic forms are exact sums
     /// of squares.

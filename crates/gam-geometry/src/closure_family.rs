@@ -46,7 +46,7 @@
 //! (`γ` pinned at 0 with collapsed effective range ⇒ a "not a smooth 1-D
 //! topology" diagnostic handed to the mixture rung).
 
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array2, ArrayView1};
 use wide::f64x4;
 
 /// The continuous closure family on the window `[0, window]`.
@@ -115,74 +115,6 @@ impl ClosureFamily {
         1 + 2 * self.harmonics
     }
 
-    /// Write the value / `∂Φ/∂γ` / `∂²Φ/∂γ²` columns of one row directly into
-    /// caller-provided slices (each length `raw_dim`, pre-zeroed).
-    ///
-    /// ## Why this beats the per-harmonic transcendental
-    ///
-    /// With `u = 2π·s/window`, the angle `θ_m = m·γ·u` is **affine in γ**
-    /// (`∂θ_m/∂γ = m·u`, `∂²θ_m/∂γ² =
-    /// 0`), so the entire γ-jet of a column is a fixed scaling of its value:
-    /// `cos` column `(cos θ_m, −sin θ_m·m·u, −cos θ_m·(m·u)²)`, `sin` column
-    /// `(sin θ_m, cos θ_m·m·u, −sin θ_m·(m·u)²)`. The only transcendental work is
-    /// therefore the `cos θ_m`/`sin θ_m` ladder for `m = 1..=H`.
-    ///
-    /// The earlier form called `sin_cos` once **per harmonic** — `H` libm
-    /// transcendentals per row, each on the progressively larger argument
-    /// `m·γ·u`. We instead seed a single `sin_cos(φ/2)` (`φ = γ·u`) and run the
-    /// numerically stable trigonometric recurrence (Singleton / Numerical
-    /// Recipes §5.5):
-    ///
-    /// ```text
-    /// α = 2·sin²(φ/2),  β = sin φ
-    /// c_{m+1} = c_m − (α·c_m + β·s_m)     [= cos((m+1)φ)]
-    /// s_{m+1} = s_m − (α·s_m − β·c_m)     [= sin((m+1)φ)]
-    /// ```
-    ///
-    /// One transcendental per row instead of `H`, ~2–2.6× faster. Because the
-    /// recurrence never forms the large argument `m·γ·u` (whose unavoidable f64
-    /// rounding is `ε·m·γ·u`), it is in fact **more accurate** than the old
-    /// per-harmonic libm calls: across 2000 inputs × `H ∈ {4,8,16,32,64,128}`
-    /// its max absolute error vs an extended-precision (double-double) reference
-    /// is 0.72–0.92× that of the old form at every `H` (see the
-    /// `recurrence_is_at_least_as_accurate_as_per_harmonic_libm` oracle). This
-    /// is a reassociation, so it is *not* bit-identical to the old form; the
-    /// gate is accuracy-vs-truth, not bit reproduction.
-    #[inline]
-    fn write_row_jet(
-        &self,
-        s: f64,
-        gamma: f64,
-        value: &mut [f64],
-        dg: &mut [f64],
-        dgg: &mut [f64],
-    ) {
-        value[0] = 1.0;
-        if self.harmonics == 0 {
-            return;
-        }
-        let u = closure_coordinate(s, self.window);
-        let (alpha, beta, mut cs, mut sn) = recurrence_seed(gamma * u);
-        for m in 1..=self.harmonics {
-            let ms = m as f64 * u; // ∂θ_m/∂γ
-            let ci = 2 * m - 1;
-            let si = 2 * m;
-            // cos column: v=cos, ∂γ=-sin·θ_g, ∂²γ=-cos·θ_g².
-            value[ci] = cs;
-            dg[ci] = -sn * ms;
-            dgg[ci] = (-cs * ms) * ms;
-            // sin column: v=sin, ∂γ=cos·θ_g, ∂²γ=-sin·θ_g².
-            value[si] = sn;
-            dg[si] = cs * ms;
-            dgg[si] = (-sn * ms) * ms;
-            // Advance the stable recurrence to (m+1).
-            let cn = cs - (alpha * cs + beta * sn);
-            let sn1 = sn - (alpha * sn - beta * cs);
-            cs = cn;
-            sn = sn1;
-        }
-    }
-
     /// Value-only fast path: the `cos`/`sin` of one row (no γ-derivatives), via
     /// the same stable trigonometric recurrence as [`Self::write_row_jet`].
     #[inline]
@@ -201,27 +133,6 @@ impl ClosureFamily {
             cs = cn;
             sn = sn1;
         }
-    }
-
-    /// Raw design row `Φ(s; γ) = [1, cos(γu), sin(γu), cos(2γu), …]`
-    /// and its γ-jet, where `u = 2π·s/window`.
-    ///
-    /// Returns `(value, d/dγ, d²/dγ²)` per column — the support-moving basis and
-    /// its exact first/second closure derivatives in one pass. The constant
-    /// column is γ-independent.
-    pub fn row_jet(&self, s: f64, gamma: f64) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-        let d = self.raw_dim();
-        let mut value = Array1::zeros(d);
-        let mut dg = Array1::zeros(d);
-        let mut dgg = Array1::zeros(d);
-        self.write_row_jet(
-            s,
-            gamma,
-            value.as_slice_mut().expect("contiguous"),
-            dg.as_slice_mut().expect("contiguous"),
-            dgg.as_slice_mut().expect("contiguous"),
-        );
-        (value, dg, dgg)
     }
 
     /// Assemble the raw design `Φ(γ)` (n × raw_dim) over coordinates `s`.
@@ -285,79 +196,6 @@ impl ClosureFamily {
         phi
     }
 
-    /// Assemble the raw design and its first/second γ-derivative matrices in one
-    /// pass: `(Φ, ∂Φ/∂γ, ∂²Φ/∂γ²)`, each n × raw_dim. Four rows per pass via
-    /// `wide::f64x4` (see [`Self::design`]); bit-identical to scalar
-    /// `Self::write_row_jet` row-by-row.
-    pub fn design_jet(
-        &self,
-        s: ArrayView1<'_, f64>,
-        gamma: f64,
-    ) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
-        let n = s.len();
-        let d = self.raw_dim();
-        let h = self.harmonics;
-        let mut phi = Array2::zeros((n, d));
-        let mut dphi = Array2::zeros((n, d));
-        let mut ddphi = Array2::zeros((n, d));
-        let pv = phi.as_slice_mut().expect("contiguous design");
-        let dv = dphi.as_slice_mut().expect("contiguous d/dγ");
-        let ddv = ddphi.as_slice_mut().expect("contiguous d²/dγ²");
-        let mut i = 0;
-        if h > 0 {
-            while i + 4 <= n {
-                let u4 = [
-                    closure_coordinate(s[i], self.window),
-                    closure_coordinate(s[i + 1], self.window),
-                    closure_coordinate(s[i + 2], self.window),
-                    closure_coordinate(s[i + 3], self.window),
-                ];
-                let (alpha, beta, mut cc, mut sn) = seed_lanes(gamma, &u4);
-                let uvec = f64x4::from(u4);
-                for l in 0..4 {
-                    pv[(i + l) * d] = 1.0;
-                }
-                for m in 1..=h {
-                    let (ci, si) = (2 * m - 1, 2 * m);
-                    let ms = uvec * f64x4::splat(m as f64); // ∂θ_m/∂γ
-                    // Same per-lane association as the scalar hand-fold.
-                    let cca = cc.to_array();
-                    let sna = sn.to_array();
-                    let dgc = (-sn * ms).to_array();
-                    let dgs = (cc * ms).to_array();
-                    let ddc = ((-cc * ms) * ms).to_array();
-                    let dds = ((-sn * ms) * ms).to_array();
-                    for l in 0..4 {
-                        let base = (i + l) * d;
-                        pv[base + ci] = cca[l];
-                        pv[base + si] = sna[l];
-                        dv[base + ci] = dgc[l];
-                        dv[base + si] = dgs[l];
-                        ddv[base + ci] = ddc[l];
-                        ddv[base + si] = dds[l];
-                    }
-                    let cn = cc - (alpha * cc + beta * sn);
-                    let sn1 = sn - (alpha * sn - beta * cc);
-                    cc = cn;
-                    sn = sn1;
-                }
-                i += 4;
-            }
-        }
-        while i < n {
-            let lo = i * d;
-            // Borrow the three row slices disjointly (separate backing arrays).
-            self.write_row_jet(
-                s[i],
-                gamma,
-                &mut pv[lo..lo + d],
-                &mut dv[lo..lo + d],
-                &mut ddv[lo..lo + d],
-            );
-            i += 1;
-        }
-        (phi, dphi, ddphi)
-    }
 }
 
 /// Seed four independent recurrence lanes for canonical base angles
@@ -388,41 +226,6 @@ fn seed_lanes(gamma: f64, u4: &[f64; 4]) -> (f64x4, f64x4, f64x4, f64x4) {
     )
 }
 
-/// The smooth penalty closure-coefficient `c(γ)` for the boundary-conductance
-/// MVP `S(γ) = S_open + c(γ)·S_wrap`, with `c(0)=0, c(1)=1`, and its γ-jet.
-///
-/// A monotone `C²` interpolant that is flat through second order at both
-/// endpoints (so a box-constrained closure Hessian agrees with the constant
-/// extension outside `[0, 1]`): the quintic smootherstep
-/// `c(γ) = 6γ⁵ − 15γ⁴ + 10γ³`. Returns `(c, c′, c″)`.
-pub fn boundary_conductance(gamma: f64) -> (f64, f64, f64) {
-    let g = gamma.clamp(0.0, 1.0);
-    let one_minus_g = 1.0 - g;
-    let c = g * g * g * (10.0 + g * (-15.0 + 6.0 * g));
-    let cp = 30.0 * g * g * one_minus_g * one_minus_g;
-    let cpp = 60.0 * g * one_minus_g * (1.0 - 2.0 * g);
-    (c, cp, cpp)
-}
-
-/// The boundary-conductance penalty `S(γ) = S_open + c(γ)·S_wrap` and its
-/// first/second γ-derivatives, given the open and wrap penalty pieces.
-///
-/// `s_open` is the ordinary (open-interval) difference penalty; `s_wrap` is the
-/// closing-edge rows that the cyclic difference penalty adds on top — i.e.
-/// `S_circle = S_open + S_wrap`. At `γ = 1`, `c = 1` and the penalty is exactly
-/// the cyclic penalty; at `γ = 0`, `c = 0` and it is the open penalty.
-pub fn conductance_penalty_jet(
-    s_open: &Array2<f64>,
-    s_wrap: &Array2<f64>,
-    gamma: f64,
-) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
-    let (c, cp, cpp) = boundary_conductance(gamma);
-    let s = s_open + &(s_wrap * c);
-    let ds = s_wrap * cp;
-    let dds = s_wrap * cpp;
-    (s, ds, dds)
-}
-
 /// A profile-likelihood interval for the closure parameter.
 ///
 /// `gamma_hat` is the profile minimiser of `V(γ) = V(θ̂(γ), γ)`; `ci_lo/ci_hi`
@@ -447,124 +250,6 @@ pub struct ClosureProfileCi {
     pub ci_includes_interval: bool,
     /// γ̂ pinned at the singular cluster boundary — hand to the mixture rung.
     pub singular_boundary: bool,
-}
-
-/// χ²₁ quantile at the requested two-sided coverage `level` (e.g. 0.95).
-///
-/// `χ²₁(p) = (Φ⁻¹((1+p)/2))²`; we use the Acklam rational inverse-normal so the
-/// CI driver carries no external dependency.
-fn chi2_1_quantile(level: f64) -> f64 {
-    let z = inv_std_normal(0.5 * (1.0 + level));
-    z * z
-}
-
-/// Build a profile-likelihood CI from a grid of `(γ, V(γ))` profile evaluations.
-///
-/// The caller supplies the profiled negative-log-evidence `V(γ)` (with the
-/// nuisance `θ` and `λ_smooth` already optimised at each γ — the issue's
-/// requirement that γ and λ_smooth are confounded and must both be profiled).
-/// The grid must be sorted ascending in γ and lie in `[0, 1]`.
-/// `interval_boundary_support_collapsed` is an independent rank/effective-range
-/// diagnostic at `γ = 0`: collapse cannot be inferred from the scalar profile
-/// values, because an ordinary regular one-sided optimum has the same monotone
-/// score shape.
-pub fn profile_ci_from_grid(
-    grid: &[(f64, f64)],
-    level: f64,
-    interval_boundary_support_collapsed: bool,
-) -> Result<ClosureProfileCi, String> {
-    if grid.len() < 2 {
-        return Err("closure profile CI needs at least two grid points".into());
-    }
-    if !(level.is_finite() && level > 0.0 && level < 1.0) {
-        return Err("closure profile CI level must lie in (0, 1)".into());
-    }
-    for (index, &(gamma, value)) in grid.iter().enumerate() {
-        if !gamma.is_finite() || !value.is_finite() {
-            return Err("closure profile grid has non-finite entries".into());
-        }
-        if !(0.0..=1.0).contains(&gamma) {
-            return Err(format!(
-                "closure profile gamma at index {index} lies outside [0, 1]: {gamma}"
-            ));
-        }
-        if index > 0 && gamma <= grid[index - 1].0 {
-            return Err(format!(
-                "closure profile gamma grid must be strictly increasing; indices {} and {index} are {} and {gamma}",
-                index - 1,
-                grid[index - 1].0
-            ));
-        }
-    }
-    let half_chi2 = 0.5 * chi2_1_quantile(level);
-
-    // Profile minimiser (ties keep the first occurrence, so `hat_idx` is a
-    // single well-defined grid index to walk outward from below).
-    let mut hat_idx = 0usize;
-    let (mut gamma_hat, mut v_min) = (grid[0].0, grid[0].1);
-    for (idx, &(g, v)) in grid.iter().enumerate() {
-        if v < v_min {
-            v_min = v;
-            gamma_hat = g;
-            hat_idx = idx;
-        }
-    }
-
-    // Wilks set: the CI is the single connected component of
-    // `{γ : V(γ) − V̂ ≤ χ²/2}` that contains γ̂, found by walking outward from
-    // `hat_idx` in each direction and stopping (with a linearly-interpolated
-    // crossing) at the first rejected neighbour. A profile that dips back
-    // in-set further out (e.g. a second, shallower local minimum) must NOT be
-    // unioned into the reported interval — that would report a "confidence
-    // interval" spanning clearly-rejected γ in between, which is not a
-    // confidence set at all.
-    let in_set = |v: f64| v - v_min <= half_chi2 + 1e-12;
-    let target = v_min + half_chi2;
-
-    let mut ci_lo = gamma_hat;
-    let mut i = hat_idx;
-    while i > 0 {
-        let (g0, v0) = grid[i - 1];
-        let (g1, v1) = grid[i];
-        if in_set(v0) {
-            ci_lo = g0;
-            i -= 1;
-        } else {
-            let t = ((target - v1) / (v0 - v1)).clamp(0.0, 1.0);
-            ci_lo = g1 + t * (g0 - g1);
-            break;
-        }
-    }
-
-    let mut ci_hi = gamma_hat;
-    let mut i = hat_idx;
-    while i + 1 < grid.len() {
-        let (g0, v0) = grid[i];
-        let (g1, v1) = grid[i + 1];
-        if in_set(v1) {
-            ci_hi = g1;
-            i += 1;
-        } else {
-            let t = ((target - v0) / (v1 - v0)).clamp(0.0, 1.0);
-            ci_hi = g0 + t * (g1 - g0);
-            break;
-        }
-    }
-    ci_lo = ci_lo.clamp(0.0, 1.0);
-    ci_hi = ci_hi.clamp(0.0, 1.0);
-
-    let ci_includes_circle = ci_hi >= 1.0 - 1e-9;
-    let ci_includes_interval = ci_lo <= 1e-9;
-    let singular_boundary = gamma_hat <= 1e-9 && interval_boundary_support_collapsed;
-
-    Ok(ClosureProfileCi {
-        gamma_hat,
-        ci_lo,
-        ci_hi,
-        ci_includes_circle,
-        ci_includes_interval,
-        singular_boundary,
-    })
 }
 
 /// Acklam's rational approximation to the inverse standard-normal CDF, refined

@@ -90,15 +90,6 @@ impl DeclaredHessianForm {
         !matches!(self, DeclaredHessianForm::Unavailable)
     }
 
-    /// True when the declaration commits to a matrix-free path.
-    pub const fn is_operator_only(self) -> bool {
-        matches!(self, DeclaredHessianForm::Operator { .. })
-    }
-
-    /// True when the declaration commits to a dense path.
-    pub const fn is_dense_only(self) -> bool {
-        matches!(self, DeclaredHessianForm::Dense)
-    }
 }
 
 /// Shared outer-objective result used by optimizer-facing objective
@@ -204,13 +195,6 @@ pub struct EfsEval {
     /// state again.  Fixed-point runners may terminate on that certificate even
     /// when the raw update keeps moving along an objective-flat parameter ridge.
     pub consecutive_restored_incumbents: Option<usize>,
-}
-
-impl EfsEval {
-    pub fn with_logdet_enclosure_gap(mut self, gap: Option<f64>) -> Self {
-        self.logdet_enclosure_gap = gap;
-        self
-    }
 }
 
 /// One coordinate of an objective-supplied final fixed-point certificate.

@@ -176,14 +176,6 @@ impl MemoryAvailability {
         }
     }
 
-    pub const fn host_available_bytes(&self) -> u64 {
-        self.host_available_bytes
-    }
-
-    pub const fn host_total_bytes(&self) -> u64 {
-        self.host_total_bytes
-    }
-
     /// The stationary ceiling on memory this process could ever address:
     /// `min(host total, binding cgroup hard limit)`, or zero when the cgroup
     /// probe failed closed. Unlike [`Self::available_bytes`] this does not move
@@ -191,11 +183,6 @@ impl MemoryAvailability {
     /// threshold (#2684).
     pub const fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
-    }
-
-
-    pub const fn cgroup(&self) -> &CgroupMemoryObservation {
-        &self.cgroup
     }
 
     pub const fn available_bytes(&self) -> u64 {
@@ -206,9 +193,6 @@ impl MemoryAvailability {
         usize::try_from(self.available_bytes).unwrap_or(usize::MAX)
     }
 
-    pub const fn limiting_source(&self) -> MemoryAvailabilitySource {
-        self.limiting_source
-    }
 }
 
 impl std::fmt::Display for MemoryAvailability {
@@ -231,17 +215,6 @@ impl std::fmt::Display for MemoryAvailability {
             ),
         }
     }
-}
-
-/// Number of completed OS/cgroup availability probes in this process.
-///
-/// Every [`resample_memory_availability`] call opens and parses `/proc/meminfo`
-/// plus the four to five cgroup files behind `detect_cgroup_memory`, so this
-/// counter is a direct census of that syscall traffic. It exists so a planner
-/// can assert *in a test* that its budget decisions cost a bounded number of
-/// probes rather than one per unit of work (#2560).
-pub fn memory_availability_probe_count() -> u64 {
-    MEMORY_AVAILABILITY_PROBES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static MEMORY_AVAILABILITY_PROBES: std::sync::atomic::AtomicU64 =
@@ -449,17 +422,6 @@ impl MemoryGovernor {
         }
     }
 
-    /// Total bytes this process's ledger may ever have reserved at once: 3/4 of
-    /// its stationary capacity. Two processes launched the same way on the same
-    /// box derive the same number, whatever else is resident (#2702).
-    pub fn budget_bytes(&self) -> usize {
-        self.ledger.budget_bytes
-    }
-
-    pub fn availability(&self) -> MemoryAvailability {
-        self.ledger.availability.clone()
-    }
-
     pub fn reserved_bytes(&self) -> usize {
         self.ledger
             .reserved_bytes
@@ -604,7 +566,6 @@ impl MemoryReservation {
     pub fn bind<T>(self, value: T) -> Governed<T> {
         Governed {
             value,
-            reservation: self,
         }
     }
 }
@@ -618,13 +579,6 @@ impl MemoryReservation {
 #[must_use = "the governed value owns a live process-wide memory reservation"]
 pub struct Governed<T> {
     value: T,
-    reservation: MemoryReservation,
-}
-
-impl<T> Governed<T> {
-    pub fn reserved_bytes(&self) -> usize {
-        self.reservation.bytes()
-    }
 }
 
 impl<T> std::ops::Deref for Governed<T> {
@@ -805,16 +759,6 @@ impl ResourcePolicy {
             return Self::analytic_operator_required();
         }
         Self::default_library()
-    }
-
-    /// Permissive mode for small-data usage and tests. Admission still uses
-    /// the same process ledger; only the streaming chunk geometry differs.
-    pub fn permissive_small_data() -> Self {
-        let base = Self::default_library();
-        Self {
-            row_chunk_target_bytes: 64 * 1024 * 1024,
-            ..base
-        }
     }
 
     pub const fn material_policy(&self) -> MaterializationPolicy {

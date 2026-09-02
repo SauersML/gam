@@ -62,11 +62,7 @@ mod alo_replay;
 pub mod deviation_runtime;
 pub mod gpu;
 pub(crate) use alo_replay::exact_runtime_from_saved;
-pub use alo_replay::{
-    BernoulliMarginalSlopeAloRowGeometry, BernoulliMarginalSlopeAloRowInput,
-    BernoulliMarginalSlopeSavedAloReplay, BernoulliMarginalSlopeSavedAloRowGeometry,
-    bernoulli_marginal_slope_alo_row_geometry,
-};
+pub use alo_replay::{BernoulliMarginalSlopeAloRowGeometry, BernoulliMarginalSlopeAloRowInput, BernoulliMarginalSlopeSavedAloReplay, BernoulliMarginalSlopeSavedAloRowGeometry};
 pub(crate) use alo_replay::{
     BernoulliMarginalSlopeSavedAloReplayInput, replay_saved_bernoulli_marginal_slope_alo,
 };
@@ -92,12 +88,6 @@ pub struct DeviationBlockConfig {
 impl Default for DeviationBlockConfig {
     fn default() -> Self {
         WigglePenaltyConfig::cubic_triple_operator_default().into()
-    }
-}
-
-impl DeviationBlockConfig {
-    pub fn triple_penalty_default() -> Self {
-        Self::default()
     }
 }
 
@@ -2859,10 +2849,7 @@ pub use block_specs::fit_bernoulli_marginal_slope_terms;
 pub use conditional_score_covariance::{
     ConditionalScoreCoordinate, ConditionalScoreCovariance, ScoreCovarianceField,
 };
-pub use gradient_paths::{
-    MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
-    marginal_slope_preserving_scale, marginal_slope_probit_eta, padded_deviation_seed,
-};
+pub use gradient_paths::{MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores, padded_deviation_seed};
 pub use install_flex::CrossBlockIdentifiabilityWarning;
 pub(crate) use install_flex::FlexCompileOutcome;
 

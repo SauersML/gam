@@ -20,7 +20,6 @@ use crate::wiggle::{monotone_wiggle_basis_with_derivative_order, split_wiggle_pe
 use gam_linalg::matrix::{
     DenseDesignMatrix, DesignMatrix, SparseDesignMatrix, symmetrize_in_place,
 };
-use gam_problem::outer_subsample::RowSet;
 use gam_problem::{InverseLink, StandardLink};
 use gam_terms::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
@@ -726,9 +725,6 @@ enum BaselineDerivativeContract {
     /// Cost + analytic gradient, no analytic Hessian. Routes to BFGS, which
     /// builds its own quasi-Newton curvature from successive gradients.
     GradientOnly,
-    /// Cost + analytic gradient + analytic Hessian. Search uses BFGS while the
-    /// terminal mint certificate evaluates the analytic Hessian once.
-    GradientHessian,
 }
 
 impl BaselineDerivativeContract {
@@ -747,11 +743,6 @@ impl BaselineDerivativeContract {
             BaselineDerivativeContract::GradientOnly => problem
                 .with_gradient(Derivative::Analytic)
                 .with_hessian(DeclaredHessianForm::Unavailable)
-                .with_tolerance(1e-4)
-                .with_max_iter(240),
-            BaselineDerivativeContract::GradientHessian => problem
-                .with_gradient(Derivative::Analytic)
-                .with_hessian(DeclaredHessianForm::Either)
                 .with_tolerance(1e-4)
                 .with_max_iter(240),
         }
@@ -918,35 +909,6 @@ where
                 cost,
                 gradient,
                 hessian: HessianValue::Unavailable,
-                inner_beta_hint: None,
-            })
-        },
-    )
-}
-
-/// Gradient + Hessian outer baseline-config optimizer. Thin adapter over
-/// `run_baseline_theta_optimizer` under the
-/// `BaselineDerivativeContract::GradientHessian` contract, which advertises
-/// an analytic θ-Hessian so terminal mint certification can audit it.
-pub fn optimize_survival_baseline_config_with_gradient<F>(
-    initial: &SurvivalBaselineConfig,
-    context: &str,
-    mut objective: F,
-) -> Result<SurvivalBaselineConfig, String>
-where
-    F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>, Array2<f64>), String>,
-{
-    use gam_problem::{HessianValue, OuterEval};
-    run_baseline_theta_optimizer_with_eval(
-        initial,
-        context,
-        BaselineDerivativeContract::GradientHessian,
-        move |cfg| {
-            let (cost, gradient, hessian) = objective(cfg)?;
-            Ok(OuterEval {
-                cost,
-                gradient,
-                hessian: HessianValue::Dense(hessian),
                 inner_beta_hint: None,
             })
         },
@@ -3048,106 +3010,6 @@ pub fn marginal_slope_baseline_offset_theta_partials(
     ))
 }
 
-/// Contract marginal-slope offset residuals and channel curvatures into the
-/// exact Hessian with respect to baseline θ-parameters.
-pub fn marginal_slope_baseline_chain_rule_hessian(
-    age_entry: ndarray::ArrayView1<'_, f64>,
-    age_exit: ndarray::ArrayView1<'_, f64>,
-    cfg: &SurvivalBaselineConfig,
-    residuals: &crate::survival::OffsetChannelResiduals,
-    curvatures: &crate::survival::OffsetChannelCurvatures,
-) -> Result<Option<Array2<f64>>, String> {
-    let n = age_exit.len();
-    if age_entry.len() != n
-        || residuals.exit.len() != n
-        || residuals.entry.len() != n
-        || residuals.derivative.len() != n
-        || curvatures.rows.len() != n
-    {
-        return Err(format!(
-            "marginal_slope_baseline_chain_rule_hessian: length mismatch (age_entry={}, age_exit={}, r_exit={}, r_entry={}, r_deriv={}, h_rows={})",
-            age_entry.len(),
-            n,
-            residuals.exit.len(),
-            residuals.entry.len(),
-            residuals.derivative.len(),
-            curvatures.rows.len(),
-        ));
-    }
-    let probe_age = age_exit.iter().copied().find(|v| v.is_finite() && *v > 0.0);
-    let dim = match probe_age {
-        Some(t) => match marginal_slope_baseline_offset_theta_geometry(t, cfg)? {
-            None => return Ok(None),
-            Some(parts) => parts.first.len(),
-        },
-        None => {
-            return Err(
-                "marginal_slope_baseline_chain_rule_hessian: no valid positive age for dim probe"
-                    .to_string(),
-            );
-        }
-    };
-    // Per-row Hessian contractions are independent. Each row contributes a
-    // dim×dim increment combining second partials (exit/entry channels) with
-    // the curvature-weighted outer product of the (entry, exit, derivative)
-    // first-partial Jacobians. Fixed row chunks are combined in chunk-index
-    // order so floating-point addition stays deterministic across Rayon
-    // scheduling decisions.
-    let hessian = RowSet::All.par_try_reduce_fold(
-        n,
-        || Array2::<f64>::zeros((dim, dim)),
-        |mut acc, i, _| -> Result<Array2<f64>, String> {
-            let exit_parts = marginal_slope_baseline_offset_theta_geometry(age_exit[i], cfg)?
-                .ok_or_else(|| {
-                    "unexpected None from marginal-slope second partials at exit".to_string()
-                })?;
-            if exit_parts.first.len() != dim {
-                return Err(
-                    "marginal_slope_baseline_chain_rule_hessian: theta_dim drifted".to_string(),
-                );
-            }
-            let mut entry_parts = None;
-            if residuals.entry[i] != 0.0 {
-                entry_parts = Some(
-                    marginal_slope_baseline_offset_theta_geometry(age_entry[i], cfg)?.ok_or_else(
-                        || {
-                            "unexpected None from marginal-slope second partials at entry"
-                                .to_string()
-                        },
-                    )?,
-                );
-            }
-            for a in 0..dim {
-                for b in 0..dim {
-                    let j_exit_a = exit_parts.first[a].0;
-                    let j_exit_b = exit_parts.first[b].0;
-                    let j_deriv_a = exit_parts.first[a].1;
-                    let j_deriv_b = exit_parts.first[b].1;
-                    let mut value = residuals.exit[i] * exit_parts.second[a][b].0
-                        + residuals.derivative[i] * exit_parts.second[a][b].1;
-                    if let Some(parts) = entry_parts.as_ref() {
-                        value += residuals.entry[i] * parts.second[a][b].0;
-                    }
-                    let curv = curvatures.rows[i];
-                    let j_entry_a = entry_parts.as_ref().map_or(0.0, |parts| parts.first[a].0);
-                    let j_entry_b = entry_parts.as_ref().map_or(0.0, |parts| parts.first[b].0);
-                    let ja = [j_entry_a, j_exit_a, j_deriv_a];
-                    let jb = [j_entry_b, j_exit_b, j_deriv_b];
-                    for u in 0..3 {
-                        for v in 0..3 {
-                            value += ja[u] * curv[u][v] * jb[v];
-                        }
-                    }
-                    acc[[a, b]] += value;
-                }
-            }
-            Ok(acc)
-        },
-        |a, b| Ok(a + b),
-    )?;
-    Ok(Some(hessian))
-}
-
 /// Complete analytic baseline chart at one age for survival marginal-slope.
 ///
 /// `value` is `(q(t), dq(t)/dt)`. `first[k]` and `second[k][l]` are the
@@ -3749,18 +3611,6 @@ impl SurvivalMarginalSlopeFrozenOffsetChart {
     /// cannot silently choose a different domain.
     pub fn theta_bounds(&self) -> (&Array1<f64>, &Array1<f64>) {
         (&self.lower_theta, &self.upper_theta)
-    }
-
-    pub fn fixed_offsets(&self) -> (&Array1<f64>, &Array1<f64>, &Array1<f64>) {
-        (
-            &self.fixed_offset_entry,
-            &self.fixed_offset_exit,
-            &self.fixed_derivative_offset_exit,
-        )
-    }
-
-    pub fn evaluate_initial(&self) -> Result<SurvivalMarginalSlopeOffsetGeometry, String> {
-        self.evaluate(&self.initial_theta)
     }
 
     pub fn evaluate(

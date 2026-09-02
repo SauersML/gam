@@ -687,14 +687,6 @@ impl BinomialLocationScaleWiggleFamily {
         Ok((n, eta_t, eta_ls, etaw))
     }
 
-    pub fn initializewiggle_knots_from_q(
-        q_seed: ArrayView1<'_, f64>,
-        degree: usize,
-        num_internal_knots: usize,
-    ) -> Result<Array1<f64>, String> {
-        gam_terms::basis::initializewiggle_knots_from_seed(q_seed, degree, num_internal_knots)
-    }
-
     pub(crate) fn wiggle_basiswith_options(
         &self,
         q0: ArrayView1<'_, f64>,
@@ -2684,26 +2676,6 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(out)
     }
 
-    /// Build a turnkey wiggle block from a q-seed vector and knot settings.
-    /// Returns both the block input and the generated knot vector.
-    pub fn buildwiggle_block_input(
-        q_seed: ArrayView1<'_, f64>,
-        degree: usize,
-        num_internal_knots: usize,
-        penalty_order: usize,
-        double_penalty: bool,
-    ) -> Result<(ParameterBlockInput, Array1<f64>), String> {
-        let knots = Self::initializewiggle_knots_from_q(q_seed, degree, num_internal_knots)?;
-        let block = buildwiggle_block_input_from_knots(
-            q_seed,
-            &knots,
-            degree,
-            penalty_order,
-            double_penalty,
-        )?;
-        Ok((block, knots))
-    }
-
     /// Lower the canonical runtime-width row program to the eight structured
     /// order-two coefficient channels consumed by dense and matrix-free paths.
     pub(crate) fn wiggle_order2_rows(
@@ -3012,30 +2984,6 @@ impl BinomialWiggleSecondDirectionalRows {
         out.slice_mut(s![pt + pls.., pt + pls..]).assign(&h_ww);
         mirror_upper_to_lower(&mut out);
         Ok(out)
-    }
-}
-
-impl BinomialLocationScaleWiggleFamily {
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
-    ///
-    /// The two-output map is (η_threshold, η_log_sigma).
-    /// The wiggle block operates on the combined linear predictor through the
-    /// nonlinear inverse link and has a zero effective linear Jacobian.
-    ///
-    /// - block 0 (threshold):  output 0 = design rows, output 1 = zeros
-    /// - block 1 (log_sigma):  output 0 = zeros, output 1 = design rows
-    /// - block 2 (wiggle):     all zeros (nonlinear link modulation)
-    pub fn block_effective_jacobian(
-        specs: &[ParameterBlockSpec],
-        block_idx: usize,
-    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-        crate::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
-            family: "BinomialLocationScaleWiggleFamily",
-            n_outputs: 2,
-            additive_blocks: &[Self::BLOCK_T, Self::BLOCK_LOG_SIGMA],
-            wiggle_block: Some(Self::BLOCK_WIGGLE),
-        }
-        .block_effective_jacobian(specs, block_idx)
     }
 }
 

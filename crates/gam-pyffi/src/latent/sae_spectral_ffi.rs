@@ -17,11 +17,7 @@
 // paths and the Python surface is a thin wrapper (SPEC rule 8): every number is
 // computed in Rust, the FFI only marshals arrays and dicts.
 
-use gam::terms::sae::inference::sparse_audit::{
-    atlas_nerve_from_sparse_route, atlas_refusal_code, run_sparse_sae_audit,
-    AbsorptionAuditReport, AuditAtlasReport, AuditTopologyRecord, SparseSaeAuditConfig,
-    SparseSaeAuditReport, SparseSaeAuditRequest, StandingCalibrationConfig,
-};
+use gam::terms::sae::inference::sparse_audit::{atlas_refusal_code, AbsorptionAuditReport, AuditAtlasReport, AuditTopologyRecord, SparseSaeAuditConfig, SparseSaeAuditReport, SparseSaeAuditRequest, StandingCalibrationConfig, atlas_nerve_from_sparse_route, run_sparse_sae_audit};
 use gam::terms::sae::null_sampler::AuditSparseRoute;
 
 /// Build the fit-report sub-dict for a [`DualCertificateReport`] — the lane's

@@ -95,27 +95,10 @@
 //! against [`super::construction::realised_rank_charge_dof`] for both resolved
 //! and weak-signal atoms in the tests).
 
-use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, FaerSvd};
-use ndarray::{Array2, ArrayView2};
+use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
+use ndarray::Array2;
 
 use super::Side;
-
-/// Stable evaluation of `μ/(μ + edge·log n_eff)` for validated non-negative
-/// inputs. Scaling by `max(μ, edge)` avoids overflow in both the tempered edge
-/// product and the denominator. At an exactly zero edge, zero energy contributes
-/// zero while every positive-energy direction contributes one.
-fn wbic_tempered_rank_fraction(mu: f64, edge: f64, n_eff: f64) -> f64 {
-    if mu == 0.0 {
-        return 0.0;
-    }
-    if edge == 0.0 {
-        return 1.0;
-    }
-    let log_n_eff = n_eff.max(std::f64::consts::E).ln();
-    let scale = mu.max(edge);
-    let scaled_mu = mu / scale;
-    scaled_mu / (scaled_mu + (edge / scale) * log_n_eff)
-}
 
 /// The reconstruction spectrum of ONE atom — the shared substrate both charges
 /// price. `mu` are the reconstruction-Gram eigenvalues `sv(diag(√λ)·Uᵀ·D)²/n_eff`
@@ -132,52 +115,11 @@ pub struct ReconSpectrum {
     mu: Vec<f64>,
     /// Marchenko–Pastur noise edge the hard rank count thresholds on.
     edge: f64,
-    /// `tr(G(G+λS)⁻¹)` — the graded effective basis-function count.
-    basis_edf: f64,
-    /// Effective sample size `Σ_row a²`.
-    n_eff: f64,
 }
 
 impl ReconSpectrum {
     fn rank_classification(&self) -> super::construction::ReconstructionRankClassification {
         super::construction::classify_reconstruction_rank(&self.mu, self.edge)
-    }
-
-    /// Validated per-observation reconstruction-Gram eigenvalues.
-    pub fn reconstruction_energies(&self) -> &[f64] {
-        &self.mu
-    }
-
-    /// Validated Marchenko–Pastur reconstruction-rank edge.
-    pub fn mp_reconstruction_rank_edge(&self) -> f64 {
-        self.edge
-    }
-
-    /// Graded effective basis-function count `tr(G(G+λS)⁻¹)`.
-    pub fn basis_edf(&self) -> f64 {
-        self.basis_edf
-    }
-
-    /// Audit-only basis-EDF specialization used by the checkpoint dynamics,
-    /// whose identity interpolation design contributes one graded unit per
-    /// reconstruction direction rather than the identity Gram's trace.
-    pub(super) fn with_audit_basis_edf(mut self, basis_edf: f64) -> Result<Self, String> {
-        if !basis_edf.is_finite() || basis_edf < 0.0 {
-            return Err(format!(
-                "audit basis EDF must be finite and non-negative; got {basis_edf}"
-            ));
-        }
-        self.basis_edf = basis_edf;
-        Ok(self)
-    }
-
-    /// Hard Marchenko–Pastur reconstruction-rank count `Σ_k 1[μ_k > e]`.
-    ///
-    /// This is a diagnostic reconstruction rank, not the production chargeable rank:
-    /// an alive decoder can have reconstruction rank zero and still be charged rank
-    /// one by [`Self::production_chargeable_rank`].
-    pub fn mp_reconstruction_rank(&self) -> usize {
-        self.rank_classification().mp_reconstruction_rank
     }
 
     /// #2258 production CHARGEABLE rank — the hard MP reconstruction count,
@@ -195,78 +137,6 @@ impl ReconSpectrum {
         self.rank_classification().production_chargeable_rank
     }
 
-    /// WBIC tempered soft count `Σ_k μ_k/(μ_k + e·log n_eff)` — the sigmoid that
-    /// replaces the hard step (derivation in the module header: the likelihood is
-    /// tempered by `β = 1/log n_eff`, the prior is NOT, so the edge carries the
-    /// `log n_eff` temperature). Always `≤` the number of directions, each term
-    /// `∈ [0, 1]` (the value 1 occurs only at zero edge with positive energy); a
-    /// direction at the TEMPERED edge `μ = e·log n_eff` counts `½`.
-    /// `n_eff` is floored at Euler's number so the tempered edge is never softer
-    /// than the hard MP edge.
-    pub fn rank_soft(&self) -> f64 {
-        self.mu
-            .iter()
-            .map(|&m| wbic_tempered_rank_fraction(m, self.edge, self.n_eff))
-            .sum()
-    }
-
-    /// Theoretical hard-MP reconstruction-rank charge
-    /// `½·rank_mp·basis_edf·log N_eff`.
-    ///
-    /// This is deliberately not called the production charge: #2258 production
-    /// uses [`Self::production_charge`] and can promote an alive, sub-edge atom
-    /// from MP reconstruction rank zero to chargeable rank one.
-    ///
-    /// #2a — the log-sample-size is the atom's OCCUPANCY-aware effective sample size
-    /// `N_eff = Σ_row a²` (`self.n_eff`), NOT the global row count `n`: `N_eff` is the
-    /// Fisher information a gated atom actually accumulates, so it is the honest BIC
-    /// scale, and it matches the MP edge in `recon_spectrum` (which already uses
-    /// `n_eff`). This satisfies inert-row invariance — appending rows on which the
-    /// atom's gate is OFF adds 0 to `Σa²` and so must not change the charge — which
-    /// `log n` violates. Floored at `N_eff=1` to keep the log non-negative.
-    pub fn mp_reconstruction_rank_charge(&self) -> f64 {
-        0.5 * self.mp_reconstruction_rank() as f64 * self.basis_edf * self.n_eff.max(1.0).ln()
-    }
-
-    /// Actual production Laplace–BIC charge
-    /// `½·rank_chargeable·basis_edf·log N_eff`, including the #2258
-    /// minimum-rank promotion for an alive decoder below the MP edge.
-    pub fn production_charge(&self) -> f64 {
-        0.5 * self.production_chargeable_rank() as f64 * self.basis_edf * self.n_eff.max(1.0).ln()
-    }
-
-    /// WBIC / singular free-energy charge `½·rank_soft·basis_edf·log N_eff`. Same
-    /// occupancy-aware `log N_eff` scale as [`Self::production_charge`] (#2a).
-    pub fn wbic_charge(&self) -> f64 {
-        0.5 * self.rank_soft() * self.basis_edf * self.n_eff.max(1.0).ln()
-    }
-
-    /// Watanabe learning-coefficient estimate `λ̂ = ½·rank_soft·basis_edf` (`≤ d/2`,
-    /// the singular bound); the regular Laplace coefficient is
-    /// `½·rank_mp·basis_edf` for a resolved atom.
-    ///
-    /// Theorem K: this `λ̂` IS the running complexity `λ(n) = d(−log Z)/d(log n)`
-    /// (the coefficient of `ln N_eff` in the atom's evidence charge) evaluated in the
-    /// FINITE-n regime. The hard-MP diagnostic uses its `n→∞` limit
-    /// `½·rank_mp·basis_edf`, so the soft ledger reduces to the hard limit away
-    /// from the edge. Near the edge, the WBIC soft count and production's
-    /// categorical minimum-rank rule answer different questions and have no
-    /// universal ordering.
-    ///
-    /// SYMMETRY-IS-CHARGE: a truth with a continuous symmetry — a compact stabilizer
-    /// of dimension `s` acting on the atom (e.g. the O(2) rotation of a clean circle
-    /// chart, or a gauge/permutation orbit of the decoder) — freezes `s` reconstruction
-    /// directions AT `μ=0`. Those directions never cross the noise edge, so they drop
-    /// `rank_soft` (hence `λ̂`) by `s/2` relative to a would-be regular model of the
-    /// same nominal dimension: the running complexity is `λ = (d−s)/2` where `d` counts
-    /// unconstrained directions. The evidence LOST to that lower `λ·ln n` charge is
-    /// exactly the evidence GAINED as `+log Vol(orbit)` (the O(1) integral over the
-    /// symmetry orbit in the Laplace expansion) — a symmetric atom is cheaper to encode
-    /// by precisely its orbit volume. This is why a genuinely curved (symmetric) atom is
-    /// NOT penalized as a full-rank blob: its stabilizer is a discount, not a cost.
-    pub fn learning_coefficient(&self) -> f64 {
-        0.5 * self.rank_soft() * self.basis_edf
-    }
 }
 
 /// Build the reconstruction spectrum from an atom's weighted basis Gram
@@ -299,8 +169,6 @@ pub fn recon_spectrum(
         return Ok(ReconSpectrum {
             mu: Vec::new(),
             edge: 0.0,
-            basis_edf: 0.0,
-            n_eff,
         });
     }
     let (evals, u) = gram
@@ -337,17 +205,9 @@ pub fn recon_spectrum(
             }
         }
     }
-    let factor = mmat.cholesky(Side::Lower).map_err(|error| {
-        format!("recon_spectrum: G + lambda*S is not positive definite: {error}")
-    })?;
-    let x = factor.solve_mat(gram);
-    let raw_basis_edf = (0..m).map(|i| x[[i, i]]).sum::<f64>();
-    let basis_edf = super::construction::certified_basis_edf(raw_basis_edf, m, "recon_spectrum")?;
     Ok(ReconSpectrum {
         mu,
         edge,
-        basis_edf,
-        n_eff,
     })
 }
 
@@ -381,63 +241,6 @@ pub struct AuditRow {
     /// `production_minus_wbic / production_charge` (`NaN` if production charge
     /// is zero).
     pub production_delta_fraction: f64,
-}
-
-impl AuditRow {
-    /// Price a named atom from its reconstruction spectrum.
-    pub fn from_spectrum(name: impl Into<String>, spec: &ReconSpectrum, n: usize) -> Self {
-        let mp_reconstruction_rank_charge = spec.mp_reconstruction_rank_charge();
-        let production_charge = spec.production_charge();
-        let wbic_charge = spec.wbic_charge();
-        let production_minus_wbic = production_charge - wbic_charge;
-        let production_delta_fraction = if production_charge.abs() > 0.0 {
-            production_minus_wbic / production_charge
-        } else {
-            f64::NAN
-        };
-        Self {
-            name: name.into(),
-            n,
-            mp_reconstruction_rank: spec.mp_reconstruction_rank(),
-            production_chargeable_rank: spec.production_chargeable_rank(),
-            rank_soft: spec.rank_soft(),
-            basis_edf: spec.basis_edf(),
-            mp_reconstruction_rank_charge,
-            production_charge,
-            wbic_charge,
-            production_minus_wbic,
-            production_delta_fraction,
-        }
-    }
-}
-
-/// Render a disagreement table to a plain-text block (for the audit report / test
-/// stderr). No side effects; the caller decides where it goes.
-pub fn render_audit_table(rows: &[AuditRow]) -> String {
-    let mut out = String::new();
-    out.push_str(
-        "population              n   r_mp r_prod  r_soft basis_edf    C_mp  C_prod  C_wbic  prod-wbic    frac\n",
-    );
-    out.push_str(
-        "----------------------- --- ------ ------ ------- -------- ------- ------- ------- ---------- -------\n",
-    );
-    for r in rows {
-        out.push_str(&format!(
-            "{:<23} {:>3} {:>6} {:>6} {:>7.3} {:>8.3} {:>7.3} {:>7.3} {:>7.3} {:>10.3} {:>7.3}\n",
-            r.name,
-            r.n,
-            r.mp_reconstruction_rank,
-            r.production_chargeable_rank,
-            r.rank_soft,
-            r.basis_edf,
-            r.mp_reconstruction_rank_charge,
-            r.production_charge,
-            r.wbic_charge,
-            r.production_minus_wbic,
-            r.production_delta_fraction,
-        ));
-    }
-    out
 }
 
 /// Directly price a WBIC learning-coefficient contribution for ONE scalar
@@ -504,78 +307,6 @@ mod learning_coeff_helpers_tests {
         let e_delta = 0.5 * (g / r_floor) * (var + shift2);
         e_delta / ln_neff
     }
-}
-
-/// Compute the audit spectrum from an already-projected reconstruction problem:
-/// given a residual `data` (`n×p`), a per-row activation weight `w` (gate²), and
-/// an orthonormal basis of chart features `phi` (`n×m`), least-squares fit the
-/// decoder `D = (ΦᵀWΦ + εI)⁻¹ ΦᵀW·data`, then form the reconstruction spectrum.
-/// This is the self-contained synthetic-suite entry: it turns raw planted data +
-/// a chart basis into the same spectrum the production charge prices.
-pub fn spectrum_from_fit(
-    data: ArrayView2<'_, f64>,
-    w: &[f64],
-    phi: &Array2<f64>,
-    r_floor: f64,
-    lam_smooth: f64,
-    smooth_penalty: Option<&Array2<f64>>,
-) -> Result<ReconSpectrum, String> {
-    let (n, p) = data.dim();
-    let m = phi.ncols();
-    if phi.nrows() != n || w.len() != n {
-        return Err("spectrum_from_fit: shape mismatch".into());
-    }
-    if data.iter().any(|value| !value.is_finite()) {
-        return Err("spectrum_from_fit: data must be finite".into());
-    }
-    if phi.iter().any(|value| !value.is_finite()) {
-        return Err("spectrum_from_fit: basis must be finite".into());
-    }
-    if w.iter().any(|weight| !weight.is_finite() || *weight < 0.0) {
-        return Err("spectrum_from_fit: weights must be finite and non-negative".into());
-    }
-    // Weighted Gram G = ΦᵀWΦ and cross term ΦᵀW·data.
-    let mut gram = Array2::<f64>::zeros((m, m));
-    let mut cross = Array2::<f64>::zeros((m, p));
-    let mut n_eff = 0.0_f64;
-    for i in 0..n {
-        let wi = w[i];
-        n_eff += wi;
-        for a in 0..m {
-            let pa = phi[[i, a]] * wi;
-            for b in a..m {
-                gram[[a, b]] += pa * phi[[i, b]];
-            }
-            for j in 0..p {
-                cross[[a, j]] += pa * data[[i, j]];
-            }
-        }
-    }
-    for a in 0..m {
-        for b in a..m {
-            let v = gram[[a, b]];
-            gram[[a, b]] = v;
-            gram[[b, a]] = v;
-        }
-    }
-    // Ridge LS decoder solve (εI SPD guard) via Cholesky.
-    let mut reg = gram.clone();
-    for a in 0..m {
-        reg[[a, a]] += 1.0e-9;
-    }
-    let decoder = reg
-        .cholesky(Side::Lower)
-        .map_err(|e| format!("spectrum_from_fit: chol: {e}"))?
-        .solve_mat(&cross);
-    recon_spectrum(
-        &gram,
-        &decoder,
-        n_eff,
-        p as f64,
-        r_floor,
-        lam_smooth,
-        smooth_penalty,
-    )
 }
 
 #[cfg(test)]
@@ -733,8 +464,6 @@ mod tests {
         let spec = ReconSpectrum {
             mu: vec![scale],
             edge: scale,
-            basis_edf: 1.0,
-            n_eff: f64::MAX,
         };
         let expected = 1.0 / (1.0 + f64::MAX.ln());
         let actual = spec.rank_soft();
@@ -1064,8 +793,6 @@ mod tests {
             &ReconSpectrum {
                 mu: vec![0.0; 7],
                 edge: 0.01 * (1.0 + (p as f64 / n as f64).sqrt()).powi(2),
-                basis_edf: 7.0,
-                n_eff: n as f64,
             },
             n,
         ));
@@ -1247,8 +974,6 @@ mod tests {
         let spec = ReconSpectrum {
             mu: vec![10.0, 0.01],
             edge: 1.0,
-            basis_edf: 3.0,
-            n_eff: 50.0,
         };
         assert_eq!(spec.mp_reconstruction_rank(), 1);
         assert_eq!(spec.production_chargeable_rank(), 1);

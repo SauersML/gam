@@ -316,47 +316,6 @@ impl ArrowSchurSystem {
         Self::new_with_hbb(n, d, k, Array2::<f64>::zeros((k, k)))
     }
 
-    /// Allocate an arrow system with no dense shared `H_ββ` block and with
-    /// per-row dense `H_tβ` slabs allocated at `htbeta_cols` columns.
-    pub fn new_with_empty_hbb_and_htbeta_cols(
-        n: usize,
-        d: usize,
-        k: usize,
-        htbeta_cols: usize,
-    ) -> Self {
-        let rows = (0..n)
-            .map(|_| ArrowRowBlock::new_with_htbeta_cols(d, htbeta_cols))
-            .collect();
-        let row_dims: Arc<[usize]> = (0..n).map(|_| d).collect::<Vec<_>>().into();
-        let row_offsets: Arc<[usize]> = (0..=n).map(|i| i * d).collect::<Vec<_>>().into();
-        Self {
-            rows,
-            hbb: Array2::<f64>::zeros((0, 0)),
-            hbb_matvec: None,
-            htbeta_matvec: None,
-            htbeta_transpose_matvec: None,
-            htbeta_dense_supplement: false,
-            hbb_diag: None,
-            gb: Array1::<f64>::zeros(k),
-            d,
-            row_dims,
-            row_offsets,
-            k,
-            manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
-            row_hessian_fingerprint: 0,
-            analytic_row_hessian_fingerprint: 0,
-            block_offsets: Arc::from([] as [Range<usize>; 0]),
-            penalty_op: None,
-            device_sae_pcg: None,
-            cross_row_penalties: Vec::new(),
-            row_gauge_deflation: None,
-            beta_gauge_quotient: None,
-            htbeta_operator_fingerprint: None,
-            exact_a_classification: None,
-            exact_a_reduced_conditioning: None,
-        }
-    }
-
     /// Allocate an arrow system using a caller-owned dense shared-block buffer.
     /// The buffer must already have shape `(k, k)` and is zeroed in place before
     /// use so callers can recycle it across assemblies without changing
@@ -399,64 +358,6 @@ impl ArrowSchurSystem {
             analytic_row_hessian_fingerprint: 0,
             block_offsets: Arc::from([] as [Range<usize>; 0]),
             penalty_op: None,
-            device_sae_pcg: None,
-            cross_row_penalties: Vec::new(),
-            row_gauge_deflation: None,
-            beta_gauge_quotient: None,
-            htbeta_operator_fingerprint: None,
-            exact_a_classification: None,
-            exact_a_reduced_conditioning: None,
-        }
-    }
-
-    /// Allocate an arrow system whose shared `H_ββ` block is supplied only as
-    /// a matrix-free operator for large BA InexactPCG.
-    ///
-    /// Direct and Square-Root BA modes require dense `hbb` and must not be
-    /// used with this constructor. The row-local `H_tβ` slabs remain explicit;
-    /// a future MegBA backend can replace those slab operations behind
-    /// [`BatchedBlockSolver`].
-    pub fn new_matrix_free_shared<F>(
-        n: usize,
-        d: usize,
-        k: usize,
-        matvec: F,
-        diag: Array1<f64>,
-    ) -> Self
-    where
-        F: for<'a> Fn(ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
-    {
-        assert_eq!(diag.len(), k);
-        let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
-        let row_dims: Arc<[usize]> = (0..n).map(|_| d).collect::<Vec<_>>().into();
-        let row_offsets: Arc<[usize]> = (0..=n).map(|i| i * d).collect::<Vec<_>>().into();
-        let matvec_arc: SharedBetaMatvec = Arc::new(matvec);
-        // Mirror the closure into a BetaPenaltyOp so all hot paths (#296)
-        // route through the trait while preserving hbb_matvec + hbb_diag for
-        // code that inspects them directly.
-        let penalty_op: Option<Arc<dyn BetaPenaltyOp>> = Some(Arc::new(MatvecDiagPenaltyOp::new(
-            k,
-            Arc::clone(&matvec_arc),
-            diag.clone(),
-        )));
-        Self {
-            rows,
-            hbb: Array2::<f64>::zeros((0, 0)),
-            hbb_matvec: Some(matvec_arc),
-            htbeta_matvec: None,
-            htbeta_transpose_matvec: None,
-            htbeta_dense_supplement: false,
-            hbb_diag: Some(diag),
-            gb: Array1::<f64>::zeros(k),
-            d,
-            row_dims,
-            row_offsets,
-            k,
-            manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
-            row_hessian_fingerprint: 0,
-            analytic_row_hessian_fingerprint: 0,
-            block_offsets: Arc::from([] as [Range<usize>; 0]),
-            penalty_op,
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
@@ -514,7 +415,6 @@ impl ArrowSchurSystem {
             exact_a_reduced_conditioning: None,
         }
     }
-
 
     /// Build a fresh numerical system while reusing caller-owned assembly
     /// allocations when their shapes still match.
@@ -1022,126 +922,6 @@ impl ArrowSchurSystem {
         }
     }
 
-    /// Fold analytic-penalty contributions into the appropriate blocks.
-    ///
-    /// BA source mapping: these are extra prior/regularization normal-equation
-    /// terms before point elimination, the same place Ceres/g2o attach robust
-    /// priors or gauge-fixing constraints.
-    ///
-    /// **Composition path.** Each registered [`AnalyticPenaltyKind`] is
-    /// queried for `grad_target` (added to `g_t` or `g_β`) and then for
-    /// `hessian_diag` first. Diagonal penalties (ARD and the shipped
-    /// sparsity kernels) are injected directly. The row-block-only Psi-tier
-    /// penalties are `ARDPenalty`, `SparsityPenalty`,
-    /// `SoftmaxAssignmentSparsity`, `OrderedBetaBernoulli`,
-    /// `RowPrecisionPrior`, `ParametricRowPrecisionPrior`, and
-    /// `ScadMcpPenalty`. Their `d × d` per-row Hessian folds into
-    /// `rows[i].htt`, so the exact arrow Schur elimination (`N` independent
-    /// `d × d` row solves) represents them exactly. Dense Beta-tier penalties
-    /// still fall back to `hvp` probes against the canonical basis vectors for
-    /// `β`.
-    ///
-    /// **Cross-row Psi penalties.** Penalties whose Hessian couples *distinct*
-    /// latent rows — `TotalVariationPenalty`, `SheafConsistencyPenalty`,
-    /// block-orthogonality, … — produce off-row blocks `∂²P/∂t_i∂t_j`
-    /// (`i ≠ j`) that the arrow elimination cannot store, since it assumes each
-    /// `H_tt^(i)` is independent of every other row. These are handled without
-    /// any approximation: their **gradient** is folded into `g_t` exactly as
-    /// for every other Psi penalty (`grad_target → g_t`), and their full
-    /// **curvature** is captured into [`Self::cross_row_penalties`] as a
-    /// matrix-free operator. At solve time, `K = K0 + P_cross` where `K0` is
-    /// the block-diagonal arrow operator and `P_cross · Δt = Σ_p ρ_p ·
-    /// psd_majorizer_hvp_p(t, Δt)` is the cross-row penalty Hessian applied to
-    /// the full flat latent vector. The presence of any captured cross-row
-    /// penalty auto-routes [`Self::solve`] through the matrix-free full-system
-    /// PCG path (the exact arrow block-diagonal inverse `K0⁻¹` is the
-    /// preconditioner `M⁻¹`); a purely row-block-diagonal system keeps the
-    /// exact one-shot Schur path unchanged. No new flag is involved — the route
-    /// is selected from the captured penalty set alone (magic by default).
-    ///
-    /// `target_t` is the full flat latent-coordinate vector (row-major, `N·d` entries)
-    /// at the current iterate; `target_beta` is the current `β`. `rho`
-    /// is the global ρ vector restricted to each penalty's local slice
-    /// by [`AnalyticPenaltyRegistry::rho_layout`].
-    pub fn add_analytic_penalty_contributions(
-        &mut self,
-        registry: &AnalyticPenaltyRegistry,
-        target_t: ArrayView1<'_, f64>,
-        target_beta: ArrayView1<'_, f64>,
-        rho_global: ArrayView1<'_, f64>,
-    ) -> Result<(), ArrowSchurError> {
-        registry
-            .validate_rho(rho_global)
-            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-        let layout = registry.rho_layout();
-        let mut penalty_fingerprints = Vec::new();
-        self.cross_row_penalties.clear();
-        for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(layout.iter()) {
-            let rho_local = rho_global.slice(ndarray::s![rho_slice.clone()]);
-            match tier {
-                PenaltyTier::Psi => {
-                    if analytic_penalty_is_row_block_diagonal(penalty) {
-                        // Row-block-diagonal: fold gradient + per-row d×d
-                        // curvature into rows[i].htt, exactly representable by
-                        // the arrow Schur elimination.
-                        self.add_ext_coord_penalty(penalty, target_t, rho_local);
-                        if let Some(fingerprint) =
-                            analytic_penalty_row_hessian_fingerprint(penalty, target_t, rho_local)
-                        {
-                            penalty_fingerprints.push(fingerprint);
-                        }
-                    } else {
-                        // Cross-row: fold the gradient into g_t (exact, like
-                        // every Psi penalty), but DO NOT fold any curvature into
-                        // the row blocks — its off-row coupling cannot be stored
-                        // there. Capture the penalty so the solve applies its
-                        // full Hessian-vector product P_cross·Δt over the flat
-                        // latent vector. This auto-selects the matrix-free
-                        // full-system PCG path.
-                        self.add_ext_coord_penalty_gradient_only(penalty, target_t, rho_local);
-                        self.cross_row_penalties.push(CrossRowLatentPenalty {
-                            penalty: penalty.clone(),
-                            rho_local: rho_local.to_owned(),
-                            target_t: target_t.to_owned(),
-                        });
-                    }
-                }
-                PenaltyTier::Beta => {
-                    self.add_beta_penalty(penalty, target_beta, rho_local);
-                }
-                PenaltyTier::Rho => {
-                    // Rho-tier hyperpriors do not contribute to the inner
-                    // (t, β) Newton step; they enter only at the REML
-                    // outer level.
-                }
-            }
-        }
-        // Cross-row penalties contribute to the Newton Hessian operator, not
-        // the stored row blocks, so they must still invalidate the row-Hessian
-        // cache when their curvature changes. Probe each captured penalty's PSD
-        // majorizer against the current latent vector (a deterministic, generic
-        // probe) and fold the resulting signature in.
-        for cross in &self.cross_row_penalties {
-            penalty_fingerprints.push(cross_row_penalty_fingerprint(
-                &cross.penalty,
-                target_t,
-                cross.rho_local.view(),
-            ));
-        }
-        self.analytic_row_hessian_fingerprint = if penalty_fingerprints.is_empty() {
-            0
-        } else {
-            let mut hasher = Fingerprinter::new();
-            hasher.write_str("arrow-schur-row-hessian-registry-v1");
-            hasher.write_usize(penalty_fingerprints.len());
-            for fingerprint in penalty_fingerprints {
-                hasher.write_u64(fingerprint);
-            }
-            hasher.finish_u64()
-        };
-        Ok(())
-    }
-
     /// Convert row-local Euclidean latent blocks to Riemannian tangent blocks.
     ///
     /// This is the only arrow-Schur algebra change needed for manifold
@@ -1170,62 +950,6 @@ impl ArrowSchurSystem {
                 gt_e.view(),
                 htbeta_e.view(),
             );
-        }
-    }
-
-    pub(crate) fn add_ext_coord_penalty(
-        &mut self,
-        penalty: &AnalyticPenaltyKind,
-        target_t: ArrayView1<'_, f64>,
-        rho_local: ArrayView1<'_, f64>,
-    ) {
-        let d = self.d;
-        let n = self.rows.len();
-        apply_analytic_penalty(
-            penalty,
-            target_t,
-            rho_local,
-            n * d,
-            d,
-            self,
-            |sys, flat, value| sys.rows[flat / d].gt[flat % d] += value,
-            |sys, flat, value| sys.rows[flat / d].htt[[flat % d, flat % d]] += value,
-            |a, probe| {
-                for i in 0..n {
-                    probe[i * d + a] = 1.0;
-                }
-            },
-            |sys, a, hv| {
-                for i in 0..n {
-                    for b in 0..d {
-                        sys.rows[i].htt[[b, a]] += hv[i * d + b];
-                    }
-                }
-            },
-        );
-    }
-
-    /// Fold ONLY the latent gradient `grad_target → g_t` of an analytic
-    /// penalty, leaving the row-block Hessian untouched.
-    ///
-    /// Used for cross-row Psi penalties: their gradient enters `g_t` exactly
-    /// like every other Psi penalty, but their curvature must NOT be scattered
-    /// into the per-row `H_tt^(i)` blocks (the diagonal piece would be
-    /// double-counted and the off-row coupling cannot be stored there). The
-    /// full curvature is instead applied as a matrix-free `P_cross · Δt`
-    /// during the solve, via [`Self::cross_row_penalties`].
-    pub(crate) fn add_ext_coord_penalty_gradient_only(
-        &mut self,
-        penalty: &AnalyticPenaltyKind,
-        target_t: ArrayView1<'_, f64>,
-        rho_local: ArrayView1<'_, f64>,
-    ) {
-        let d = self.d;
-        let n = self.rows.len();
-        assert_eq!(target_t.len(), n * d);
-        let grad = penalty.grad_target(target_t, rho_local);
-        for flat in 0..n * d {
-            self.rows[flat / d].gt[flat % d] += grad[flat];
         }
     }
 
@@ -1263,51 +987,6 @@ impl ArrowSchurSystem {
         }
     }
 
-    pub(crate) fn add_beta_penalty(
-        &mut self,
-        penalty: &AnalyticPenaltyKind,
-        target_beta: ArrayView1<'_, f64>,
-        rho_local: ArrayView1<'_, f64>,
-    ) {
-        let k = self.k;
-        let hvp_columns = if self.hbb.dim() == (k, k) { k } else { 0 };
-        apply_analytic_penalty(
-            penalty,
-            target_beta,
-            rho_local,
-            k,
-            hvp_columns,
-            self,
-            |sys, j, value| sys.gb[j] += value,
-            |sys, j, value| {
-                if sys.hbb.dim() == (k, k) {
-                    sys.hbb[[j, j]] += value;
-                }
-                if let Some(hbb_diag) = sys.hbb_diag.as_mut() {
-                    hbb_diag[j] += value;
-                }
-            },
-            |j, probe| probe[j] = 1.0,
-            |sys, j, hv| {
-                for i in 0..k {
-                    sys.hbb[[i, j]] += hv[i];
-                }
-                // Keep `hbb_diag` consistent with the dense `hbb` Hessian when
-                // both are populated (the dense-allocated path + a later
-                // `set_shared_beta_operator` install). The HVP probe for
-                // column `j` returns the full Hessian column, whose `j`-th
-                // entry is the diagonal contribution of this penalty. Without
-                // this mirror, the Jacobi Schur preconditioner — which prefers
-                // `hbb_diag` over `hbb`'s diagonal — would silently use a
-                // stale diagonal for any Beta-tier analytic penalty that
-                // exposes only an HVP (no `hessian_diag`).
-                if let Some(hbb_diag) = sys.hbb_diag.as_mut() {
-                    hbb_diag[j] += hv[j];
-                }
-            },
-        );
-    }
-
     /// Schur-eliminate the per-row latent block and solve for `(Δt, Δβ, diag)`.
     ///
     /// This uses [`ArrowSolveOptions::automatic`]: BA dense RCS for
@@ -1336,29 +1015,6 @@ impl ArrowSchurSystem {
     ) -> Result<(Array1<f64>, Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError> {
         let options = ArrowSolveOptions::automatic(self.k);
         solve_arrow_newton_step_core(self, ridge_t, ridge_beta, &options)
-    }
-
-    /// Solve with the standard LM-style ridge escalation: if a per-row
-    /// `H_tt + ridge_t·I` Cholesky pivot is non-PD, or the reduced Schur
-    /// factor fails, geometrically grow both ridges and retry. This is the
-    /// same Ceres-style proximal correction the Newton driver in
-    /// `run_joint_fit_arrow_schur` performs around `solve`, lifted into the
-    /// system itself so every entry point (predict OOS reconstruction,
-    /// single-shot Newton refinement, …) is self-healing against the
-    /// pathological per-row blocks produced by PCA-seeded latent
-    /// coordinates on subset / new data — see #163 and #175.
-    ///
-    /// `ridge_t` / `ridge_beta` are the caller-nominal Tikhonov ridges; the
-    /// escalation only adds extra damping on top of them when the factor
-    /// fails. PCG / AdaptiveCorrection failures are left untouched because
-    /// they are not factorization-recoverable.
-    pub fn solve_with_lm_escalation(
-        &self,
-        ridge_t: f64,
-        ridge_beta: f64,
-    ) -> Result<(Array1<f64>, Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError> {
-        let options = ArrowSolveOptions::automatic(self.k);
-        solve_with_lm_escalation_inner(self, ridge_t, ridge_beta, &options)
     }
 
     /// Solve with an explicit BA Schur mode, returning `(Δt, Δβ, ArrowPcgDiagnostics)`.
@@ -1670,22 +1326,6 @@ impl StreamingArrowSchur {
         }
     }
 
-    /// Move out the accumulated reduced Schur block `s_acc` and reduced RHS
-    /// `rhs_acc`, leaving fresh zero buffers in their place.
-    ///
-    /// The reduced contribution is `s_acc = hbb − Σ_i H_βt^(i)(H_tt^(i))⁻¹H_tβ^(i)`
-    /// (the β-block `hbb` seeded by `reset_accumulator`, minus the per-row
-    /// reduction summed by `accumulate_chunk`) and
-    /// `rhs_acc = +Σ_i H_βt^(i)(H_tt^(i))⁻¹g_t^(i)`. Used by external online
-    /// drivers (e.g. the SAE streaming joint fit) that accumulate the reduced
-    /// system across re-materialized chunk systems.
-    #[must_use]
-    pub fn take_accumulators(&mut self) -> (Array2<f64>, Array1<f64>) {
-        let s = std::mem::replace(&mut self.s_acc, Array2::<f64>::zeros((self.k, self.k)));
-        let rhs = std::mem::replace(&mut self.rhs_acc, Array1::<f64>::zeros(self.k));
-        (s, rhs)
-    }
-
     /// Reset the dense shared accumulator to `H_ββ + ridge_beta I`.
     pub fn reset_accumulator(&mut self, ridge_beta: f64) -> Result<(), ArrowSchurError> {
         if self.hbb.dim() != (self.k, self.k) {
@@ -1873,17 +1513,6 @@ impl StreamingArrowSchur {
         Ok(log_det_schur)
     }
 
-    pub fn exact_arrow_log_det(
-        &mut self,
-        ridge_t: f64,
-        ridge_beta: f64,
-        options: &ArrowSolveOptions,
-    ) -> Result<f64, ArrowSchurError> {
-        let (log_det_tt, schur) =
-            self.reduced_schur_and_log_det_tt(ridge_t, ridge_beta, options)?;
-        Ok(log_det_tt + Self::reduced_schur_log_det(&schur, options)?)
-    }
-
     pub fn solve(
         &mut self,
         ridge_t: f64,
@@ -2057,60 +1686,6 @@ impl StreamingArrowSchur {
         }
         Ok::<(), _>(())
     }
-}
-
-pub(crate) fn apply_analytic_penalty<S, G, D, P, H>(
-    penalty: &AnalyticPenaltyKind,
-    target: ArrayView1<'_, f64>,
-    rho_local: ArrayView1<'_, f64>,
-    expected_target_len: usize,
-    hvp_columns: usize,
-    scatter_target: &mut S,
-    mut grad_scatter: G,
-    mut diag_scatter: D,
-    seed_hvp_probe: P,
-    mut hvp_column_scatter: H,
-) where
-    G: FnMut(&mut S, usize, f64),
-    D: FnMut(&mut S, usize, f64),
-    P: Fn(usize, &mut Array1<f64>),
-    H: for<'a> FnMut(&mut S, usize, ArrayView1<'a, f64>),
-{
-    assert_eq!(target.len(), expected_target_len);
-
-    let grad = penalty.grad_target(target, rho_local);
-    for index in 0..expected_target_len {
-        grad_scatter(scatter_target, index, grad[index]);
-    }
-
-    // The scattered curvature lands in the arrow-Schur `H_tt` / `H_ββ` blocks,
-    // which are Cholesky-factored (with LM ridge escalation) as the Newton /
-    // PIRLS curvature operator and must therefore stay PSD. Nonconvex
-    // sparsifiers (log sparsity, JumpReLU) have an *indefinite* exact Hessian
-    // that would destroy that positive-definiteness, so we scatter the PSD
-    // majorizer here — never the exact `hessian_diag` / `hvp`. For convex
-    // penalties the majorizer equals the exact Hessian (the trait default
-    // delegates), so this is exact for them. Exact-derivative consumers (the
-    // outer objective Hessian) use `hessian_diag` / `hvp` directly elsewhere.
-    if let Some(diag) = penalty.psd_majorizer_diag(target, rho_local) {
-        assert_eq!(diag.len(), expected_target_len);
-        for index in 0..expected_target_len {
-            diag_scatter(scatter_target, index, diag[index]);
-        }
-        return;
-    }
-
-    let mut probe = Array1::<f64>::zeros(expected_target_len);
-    for column in 0..hvp_columns {
-        probe.fill(0.0);
-        seed_hvp_probe(column, &mut probe);
-        let hv = penalty.psd_majorizer_hvp(target, rho_local, probe.view());
-        hvp_column_scatter(scatter_target, column, hv.view());
-    }
-}
-
-pub(crate) fn analytic_penalty_is_row_block_diagonal(penalty: &AnalyticPenaltyKind) -> bool {
-    penalty.is_row_block_diagonal()
 }
 
 /// Per-row + Schur Cholesky factor cache produced by
@@ -2816,21 +2391,6 @@ impl ArrowFactorCache {
         self.htbeta.is_available()
     }
 
-    /// Whether the Newton solve that produced this cache actually executed on
-    /// the device: the device-resident Direct dense solve or the device-resident
-    /// matrix-free SAE PCG (whose matvec runs in CUDA kernels). This does NOT
-    /// include the injected host-procedural reduced-Schur matvec, whose
-    /// arithmetic runs on the CPU even when a CUDA context was opened to build
-    /// per-row factors (#1209) — that path sets
-    /// `ArrowPcgDiagnostics::injected_host_procedural_matvec` instead. Read-only
-    /// routing provenance: lets a fit result record device-vs-CPU as ground
-    /// truth instead of inferring it from the runtime probe. Mirrors
-    /// `ArrowPcgDiagnostics::used_device_arrow`.
-    #[must_use]
-    pub fn used_device(&self) -> bool {
-        self.pcg_diagnostics.used_device_arrow
-    }
-
     pub fn undamped_factor(&self, row: usize) -> ArrayView2<'_, f64> {
         match &self.htt_factors_undamped {
             ArrowUndampedFactors::SameAsDamped => self.htt_factors.factor(row),
@@ -3329,57 +2889,6 @@ impl ArrowFactorCache {
         Ok(out)
     }
 
-    /// Deflation-aware selected inverse of the cached β-Schur complement — a
-    /// drop-in for [`Self::schur_inverse_apply`] that pseudo-inverts across the
-    /// numerically-null curvature directions instead of dividing by them.
-    ///
-    /// # Why this exists (the λ→0 EDF divergence)
-    ///
-    /// The REML EDF/log-det-trace term contracts `(H⁻¹)_ββ` against `λS`. At the
-    /// ρ lower face a decoder direction can be null in BOTH the data
-    /// (`J_ββ ≈ 0`) AND the penalty (`s ≈ 0`), making `S_β = J + λS` singular
-    /// along it. The plain [`Self::schur_inverse_apply`] then divides by a
-    /// ~zero pivot and returns `Inf`/`NaN` (the value stays finite — only this
-    /// `H⁻¹`-contraction blows up). This method instead forms the spectral
-    /// pseudo-inverse `M⁺` of the SAME operator `M = L Lᵀ` the plain path
-    /// inverts, dropping every eigen-direction at or below the solver's
-    /// canonical rank floor `SPECTRAL_DEFLATION_REL_FLOOR · max|λ|` (the exact
-    /// threshold `factor_spectral_deflated_criterion_row_with_geometry` and the per-row
-    /// gauge deflation already use — NOT a new epsilon and NOT a λ-smoothing
-    /// floor). A doubly-null direction (`j ≈ 0 ∧ s ≈ 0`) deflates to `0` (it is
-    /// unidentifiable, not a real DOF); a penalty-only direction survives. The
-    /// result is finite by construction.
-    ///
-    /// # Interior equivalence
-    ///
-    /// Away from the boundary every eigenvalue of `M` sits orders of magnitude
-    /// above the floor, so NO direction deflates and `M⁺ = M⁻¹` to round-off —
-    /// this returns the plain selected inverse with no silent bias. Only the
-    /// λ→0 face deflates. The exact-Newton path keeps calling the plain
-    /// [`Self::schur_inverse_apply`] and is byte-for-byte unchanged.
-    ///
-    /// # Errors
-    ///
-    /// Same dense-Schur / undamped-factor / `rhs.len() != K` contract as
-    /// [`Self::schur_inverse_apply`], plus a failed symmetric eigendecomposition
-    /// of the reconstructed `M`.
-    pub fn schur_inverse_apply_deflated(
-        &self,
-        rhs: ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, ArrowSchurError> {
-        if rhs.len() != self.k {
-            return Err(ArrowSchurError::SchurFactorFailed {
-                reason: format!(
-                    "schur_inverse_apply_deflated: rhs length {} != K {}",
-                    rhs.len(),
-                    self.k
-                ),
-            });
-        }
-        let deflated = self.deflated_schur_pseudo_inverse()?;
-        Ok(self.apply_deflated_pseudo_inverse(&deflated, rhs))
-    }
-
     /// Precompute the deflated spectral pseudo-inverse ONCE and return a
     /// reusable applier — the many-RHS form of
     /// [`Self::schur_inverse_apply_deflated`]. The EDF trace contracts
@@ -3400,49 +2909,6 @@ impl ArrowFactorCache {
     ) -> Result<impl Fn(ArrayView1<'_, f64>) -> Array1<f64> + '_, ArrowSchurError> {
         let deflated = self.deflated_schur_pseudo_inverse()?;
         Ok(move |rhs: ArrayView1<'_, f64>| self.apply_deflated_pseudo_inverse(&deflated, rhs))
-    }
-
-    /// Deflation-aware dense principal sub-block of `(H⁻¹)_ββ` — the drop-in for
-    /// [`Self::schur_inverse_block`] used by the per-atom EDF trace. Identical
-    /// contract, but each column is solved through the spectral pseudo-inverse
-    /// (see [`Self::schur_inverse_apply_deflated`]) so a boundary atom with a
-    /// doubly-null decoder direction yields a finite block instead of `NaN`.
-    ///
-    /// The eigendecomposition of `M = L Lᵀ` is computed ONCE and reused across
-    /// all `W = block.len()` columns.
-    pub fn schur_inverse_block_deflated(
-        &self,
-        block: std::ops::Range<usize>,
-    ) -> Result<Array2<f64>, ArrowSchurError> {
-        if block.end > self.k {
-            return Err(ArrowSchurError::SchurFactorFailed {
-                reason: format!(
-                    "schur_inverse_block_deflated: block end {} exceeds K {}",
-                    block.end, self.k
-                ),
-            });
-        }
-        let deflated = self.deflated_schur_pseudo_inverse()?;
-        let w = block.len();
-        let mut out = Array2::<f64>::zeros((w, w));
-        let mut e_j = Array1::<f64>::zeros(self.k);
-        for (jc, j) in block.clone().enumerate() {
-            e_j.fill(0.0);
-            e_j[j] = 1.0;
-            let col = self.apply_deflated_pseudo_inverse(&deflated, e_j.view());
-            for (ic, i) in block.clone().enumerate() {
-                out[[ic, jc]] = col[i];
-            }
-        }
-        // (H⁻¹)_ββ is symmetric; symmetrize to clear round-off asymmetry.
-        for ic in 0..w {
-            for jc in (ic + 1)..w {
-                let avg = 0.5 * (out[[ic, jc]] + out[[jc, ic]]);
-                out[[ic, jc]] = avg;
-                out[[jc, ic]] = avg;
-            }
-        }
-        Ok(out)
     }
 
     /// Reconstruct the SPD operator `M = L Lᵀ` this cache inverts (the plain

@@ -1,8 +1,4 @@
-use crate::faer_ndarray::{
-    CrossprodAccum, CrossprodStructure, FaerArrayView, array2_to_matmut,
-    effective_global_parallelism, fast_ab, fast_atb, fast_atv, fast_atv_into, fast_av,
-    fast_av_into, fast_xt_diag_x, stream_weighted_crossprod_into,
-};
+use crate::faer_ndarray::{CrossprodAccum, CrossprodStructure, FaerArrayView, array2_to_matmut, effective_global_parallelism, fast_ab, fast_atb, fast_atv, fast_atv_into, fast_av, fast_av_into, stream_weighted_crossprod_into};
 use crate::types::RidgePolicy;
 use faer::Accum;
 use faer::linalg::matmul::matmul;
@@ -20,6 +16,7 @@ use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
+use crate::faer_ndarray::fast_xt_diag_x;
 
 const MATRIX_FREE_PCG_MIN_P: usize = 2048;
 const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
@@ -2071,11 +2068,6 @@ impl ReparamOperator {
         }
     }
 
-    /// Access the underlying original design matrix.
-    pub fn x_original(&self) -> &DesignMatrix {
-        &self.x_original
-    }
-
     /// Access the Qs orthogonal transform.
     pub fn qs(&self) -> &Array2<f64> {
         &self.qs
@@ -2417,85 +2409,9 @@ impl LinearOperator for RandomEffectOperator {
         Ok(diag)
     }
 
-    /// Fused X'WXβ + Sβ + ridge·β.  O(n + q).
-    fn apply_weighted_normal(
-        &self,
-        weights: FiniteSignedWeightsView<'_>,
-        vector: &Array1<f64>,
-        penalty: Option<&Array2<f64>>,
-        ridge: f64,
-    ) -> Array1<f64> {
-        assert_eq!(
-            weights.len(),
-            self.n,
-            "RandomEffectOperator::apply_weighted_normal weight length mismatch"
-        );
-        assert_eq!(
-            vector.len(),
-            self.num_groups,
-            "RandomEffectOperator::apply_weighted_normal vector length mismatch"
-        );
-        // Step 1: accumulate per-group weighted β[g] contributions.
-        //   group_acc[g] = Σ_{i in group g} w[i]
-        //   result[g] = group_acc[g] * vector[g]
-        let weights = weights.view();
-        let mut group_wacc = Array1::<f64>::zeros(self.num_groups);
-        for i in 0..self.n {
-            if let Some(g) = self.group_ids[i] {
-                group_wacc[g] += weights[i];
-            }
-        }
-        let mut out = Array1::<f64>::zeros(self.num_groups);
-        for g in 0..self.num_groups {
-            out[g] = group_wacc[g] * vector[g];
-        }
-        if let Some(pen) = penalty {
-            out += &pen.dot(vector);
-        }
-        if ridge > 0.0 {
-            for g in 0..self.num_groups {
-                out[g] += ridge * vector[g];
-            }
-        }
-        out
-    }
-
-    fn uses_matrix_free_pcg(&self) -> bool {
-        true
-    }
 }
 
 impl DenseDesignOperator for RandomEffectOperator {
-    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
-        if weights.len() != self.n || y.len() != self.n {
-            return Err(format!(
-                "RandomEffectOperator::compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
-                weights.len(),
-                y.len(),
-                self.n
-            ));
-        }
-        certify_signed_weights("RandomEffectOperator::compute_xtwy", weights, self.n)?;
-        let mut out = Array1::<f64>::zeros(self.num_groups);
-        for i in 0..self.n {
-            if let Some(g) = self.group_ids[i] {
-                let wi = weights[i];
-                out[g] += wi * y[i];
-            }
-        }
-        Ok(out)
-    }
-
-    /// diag(X M X') for one-hot X: out\[i\] = M[group\[i\], group\[i\]].
-    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
-        use rayon::prelude::*;
-        let out: Vec<f64> = self
-            .group_ids
-            .par_iter()
-            .map(|g| g.map(|g| middle[[g, g]].max(0.0)).unwrap_or(0.0))
-            .collect();
-        Ok(Array1::from(out))
-    }
 
     fn row_chunk_into(
         &self,
@@ -4601,41 +4517,10 @@ impl LinearOperator for DenseRightProductView<'_> {
         Ok(gram)
     }
 
-    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
-        Ok(self.diag_xtw_x(weights)?.diag().to_owned())
-    }
 }
 
 impl DenseRightProductView<'_> {
-    pub fn compute_xtwy(
-        &self,
-        weights: &Array1<f64>,
-        y: &Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        if weights.len() != self.nrows() || y.len() != self.nrows() {
-            return Err(format!(
-                "compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
-                weights.len(),
-                y.len(),
-                self.nrows()
-            ));
-        }
-        certify_signed_weights("DenseRightProductView::compute_xtwy", weights, self.nrows())?;
-        let weighted_xty = dense_transpose_weighted_response(self.base, weights, y, None);
-        let mut out = weighted_xty;
-        if let Some(factor) = self.first {
-            out = fast_atv(factor, &out);
-        }
-        if let Some(factor) = self.second {
-            out = fast_atv(factor, &out);
-        }
-        Ok(out)
-    }
 
-    pub fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
-        let dense = self.materialize();
-        DesignMatrix::Dense(DenseDesignMatrix::from(dense)).quadratic_form_diag(middle)
-    }
 }
 
 impl LinearOperator for EmbeddedColumnBlock<'_> {
@@ -4680,51 +4565,39 @@ impl LinearOperator for EmbeddedColumnBlock<'_> {
         Ok(out)
     }
 
-    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
-        let mut out = Array1::<f64>::zeros(self.total_cols);
-        let local =
-            DesignMatrix::Dense(DenseDesignMatrix::from(self.local.clone())).diag_gram(weights)?;
-        out.slice_mut(ndarray::s![self.global_range.clone()])
-            .assign(&local);
-        Ok(out)
-    }
 }
 
 impl EmbeddedColumnBlock<'_> {
-    pub fn compute_xtwy(
-        &self,
-        weights: &Array1<f64>,
-        y: &Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        if weights.len() != self.nrows() || y.len() != self.nrows() {
-            return Err(format!(
-                "compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
-                weights.len(),
-                y.len(),
-                self.nrows()
-            ));
-        }
-        certify_signed_weights("EmbeddedColumnBlock::compute_xtwy", weights, self.nrows())?;
-        let local = dense_transpose_weighted_response(self.local, weights, y, None);
-        let mut out = Array1::<f64>::zeros(self.total_cols);
-        out.slice_mut(ndarray::s![self.global_range.clone()])
-            .assign(&local);
-        Ok(out)
-    }
 
-    pub fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
-        let middle_local = middle
-            .slice(ndarray::s![
-                self.global_range.clone(),
-                self.global_range.clone()
-            ])
-            .to_owned();
-        DesignMatrix::Dense(DenseDesignMatrix::from(self.local.clone()))
-            .quadratic_form_diag(&middle_local)
-    }
 }
 
 impl DesignMatrix {
+
+    /// Like [`Self::try_to_dense_by_chunks`] but refuses to allocate when the
+    /// dense footprint would exceed `max_bytes`. Returned `Err` is the same
+    /// shape as a densification-refused error from the resource policy, so
+    /// observability-only callers can convert it into a `warn!` and skip
+    /// without ever touching the allocator at huge `n`.
+    pub fn try_to_dense_by_chunks_budgeted(
+        &self,
+        context: &str,
+        max_bytes: usize,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.nrows();
+        let p = self.ncols();
+        let dense_bytes = checked_dense_nbytes(n, p, context)?;
+        if dense_bytes > max_bytes {
+            let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            let cap_gib = max_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            return Err(MatrixError::DensificationRefused {
+                reason: format!(
+                    "{context}: refusing to densify {n}x{p} (~{gib:.2} GiB, cap ~{cap_gib:.2} GiB)"
+                ),
+            }
+            .into());
+        }
+        self.try_to_dense_by_chunks(context)
+    }
     fn factorize_system_dense(
         &self,
         weights: &Array1<f64>,
@@ -4930,32 +4803,6 @@ impl DesignMatrix {
                 .map_err(|err| format!("{context}: failed to materialize row chunk: {err}"))?;
         }
         Ok(out)
-    }
-
-    /// Like [`Self::try_to_dense_by_chunks`] but refuses to allocate when the
-    /// dense footprint would exceed `max_bytes`. Returned `Err` is the same
-    /// shape as a densification-refused error from the resource policy, so
-    /// observability-only callers can convert it into a `warn!` and skip
-    /// without ever touching the allocator at huge `n`.
-    pub fn try_to_dense_by_chunks_budgeted(
-        &self,
-        context: &str,
-        max_bytes: usize,
-    ) -> Result<Array2<f64>, String> {
-        let n = self.nrows();
-        let p = self.ncols();
-        let dense_bytes = checked_dense_nbytes(n, p, context)?;
-        if dense_bytes > max_bytes {
-            let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-            let cap_gib = max_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-            return Err(MatrixError::DensificationRefused {
-                reason: format!(
-                    "{context}: refusing to densify {n}x{p} (~{gib:.2} GiB, cap ~{cap_gib:.2} GiB)"
-                ),
-            }
-            .into());
-        }
-        self.try_to_dense_by_chunks(context)
     }
 
     /// Dot a single design row against a coefficient vector without allocating
@@ -5607,17 +5454,6 @@ impl DesignMatrix {
         }
     }
 
-    pub const fn is_materialized_dense(&self) -> bool {
-        matches!(self, Self::Dense(DenseDesignMatrix::Materialized(_)))
-    }
-
-    pub const fn is_operator_backed(&self) -> bool {
-        match self {
-            Self::Dense(matrix) => matrix.is_operator_backed(),
-            Self::Sparse(_) => false,
-        }
-    }
-
     /// Whether this design is backed by a sparse (CSR/COO) representation
     /// rather than a dense or dense-operator backing. Used to gate the
     /// row-chunked `Xᵀ diag(w) X` BLAS-3 Gram path, which is structurally
@@ -5625,43 +5461,6 @@ impl DesignMatrix {
     /// keep the generic sparse-aware per-row pullback).
     pub const fn is_sparse(&self) -> bool {
         matches!(self, Self::Sparse(_))
-    }
-
-    /// Zero-copy borrow when `Dense`, materialized conversion when `Sparse`.
-    ///
-    /// This avoids the unconditional clone that `to_dense()` performs on dense
-    /// matrices.  Callers that only need a `&Array2<f64>` should use this and
-    /// then call `Cow::as_ref()` or `&*cow`.
-    pub fn as_dense_cow(&self) -> Cow<'_, Array2<f64>> {
-        match self {
-            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => Cow::Borrowed(matrix.as_ref()),
-            Self::Dense(DenseDesignMatrix::Lazy(op)) => match op.as_dense_ref() {
-                Some(dense) => Cow::Borrowed(dense),
-                // SAFETY: `as_dense_cow` is the zero-copy view accessor; its
-                // contract forbids operator-backed designs that cannot expose
-                // a pre-materialized dense view. A caller that reached this
-                // arm used the borrow API on an operator representation it
-                // should have streamed through row chunks instead.
-                // SAFETY: as_dense_cow's zero-copy contract forbids operator-backed designs without a materialized view.
-                None => std::panic::panic_any(format!(
-                    "DesignMatrix::as_dense_cow called on operator-backed design ({}x{}); use row chunks or matrix-vector products",
-                    op.nrows(),
-                    op.ncols()
-                )),
-            },
-            Self::Sparse(matrix) => Cow::Owned(
-                matrix
-                    .try_to_dense_arc("DesignMatrix::as_dense_cow")
-                    // SAFETY: callers of `as_dense_cow` have accepted dense
-                    // materialization; densification failure here means the
-                    // sparse matrix exceeds the byte-cap that this accessor
-                    // contractually forbids.
-                    // SAFETY: caller of as_dense_cow has accepted dense materialization budget.
-                    .unwrap_or_else(|msg| std::panic::panic_any(msg))
-                    .as_ref()
-                    .clone(),
-            ),
-        }
     }
 
     /// Borrow when already-materialized dense, otherwise materialize via
@@ -5755,19 +5554,6 @@ impl DesignMatrix {
     pub fn try_to_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
         match self {
             Self::Dense(matrix) => matrix.try_to_dense_arc(context),
-            Self::Sparse(matrix) => matrix.try_to_dense_arc(context),
-        }
-    }
-
-    /// Policy-aware densify: callers that own the consumer's dense budget can
-    /// override the conservative default cap used by [`Self::try_to_dense_arc`].
-    pub fn try_to_dense_arc_with_policy(
-        &self,
-        context: &str,
-        policy: &ResourcePolicy,
-    ) -> Result<Arc<Array2<f64>>, String> {
-        match self {
-            Self::Dense(matrix) => matrix.try_to_dense_arc_with_policy(context, policy),
             Self::Sparse(matrix) => matrix.try_to_dense_arc(context),
         }
     }
@@ -5969,43 +5755,6 @@ impl DesignMatrix {
             ridge_floor,
             ridge_policy,
         )
-    }
-
-    pub fn solve_system_matrix_free_pcg(
-        &self,
-        weights: &Array1<f64>,
-        rhs: &Array1<f64>,
-        penalty: Option<&Array2<f64>>,
-        ridge_floor: f64,
-    ) -> Result<Array1<f64>, String> {
-        <Self as LinearOperator>::solve_system_matrix_free_pcg_try(
-            self,
-            weights,
-            rhs,
-            penalty,
-            ridge_floor,
-        )
-    }
-
-    pub fn solve_system_matrix_free_pcg_with_info(
-        &self,
-        weights: &Array1<f64>,
-        rhs: &Array1<f64>,
-        penalty: Option<&Array2<f64>>,
-        ridge_floor: f64,
-    ) -> Result<(Array1<f64>, PcgSolveInfo), String> {
-        <Self as LinearOperator>::solve_system_matrix_free_pcg_with_info_try(
-            self,
-            weights,
-            rhs,
-            penalty,
-            ridge_floor,
-        )
-    }
-
-    pub fn should_use_matrix_free_pcg(&self) -> bool {
-        <Self as LinearOperator>::uses_matrix_free_pcg(self)
-            && self.ncols() >= MATRIX_FREE_PCG_MIN_P
     }
 
     pub fn factorize_system(

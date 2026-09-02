@@ -1,5 +1,4 @@
-use super::dual::{Dual, DualKinkBranchRecord};
-use super::{ArrowFactorCache, arrow_factor_max_pivot, arrow_factor_min_pivot};
+use super::dual::DualKinkBranchRecord;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MajorizerAnchorMode {
@@ -25,17 +24,6 @@ pub enum PivotBranch {
     NonFinite,
 }
 
-impl PivotBranch {
-    fn classify(value: Option<f64>) -> Self {
-        match value {
-            None => Self::Missing,
-            Some(v) if !v.is_finite() => Self::NonFinite,
-            Some(v) if v > 0.0 => Self::Positive,
-            Some(_) => Self::NonPositive,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EigenDerivativeRoute {
     IndividualEigenpairs,
@@ -51,28 +39,6 @@ pub struct EigenGapCertificate {
 
 pub fn eigen_gap_threshold(eigen_scale: f64, eigen_count: usize) -> f64 {
     f64::EPSILON * (eigen_count.max(1) as f64) * eigen_scale.abs().max(1.0)
-}
-
-pub fn eigen_gap_certificate(eigenvalues: &[f64]) -> EigenGapCertificate {
-    let mut finite = eigenvalues
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect::<Vec<_>>();
-    finite.sort_by(|left, right| left.total_cmp(right));
-    let scale = finite
-        .iter()
-        .copied()
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    let mut min_eigen_gap = f64::INFINITY;
-    for pair in finite.windows(2) {
-        min_eigen_gap = min_eigen_gap.min((pair[1] - pair[0]).abs());
-    }
-    EigenGapCertificate {
-        min_eigen_gap,
-        threshold: eigen_gap_threshold(scale, finite.len()),
-        scale,
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -97,163 +63,7 @@ pub struct BranchCertificate {
 }
 
 impl BranchCertificate {
-    pub fn from_arrow_cache(cache: &ArrowFactorCache, anchor_mode: MajorizerAnchorMode) -> Self {
-        let min_pivot = arrow_factor_min_pivot(cache);
-        let max_pivot = arrow_factor_max_pivot(cache);
-        let eigen_gap = Self::eigen_gap_from_arrow_cache(cache);
-        Self {
-            anchor_mode,
-            row_dims: cache.row_dims.to_vec(),
-            row_offsets: cache.row_offsets.to_vec(),
-            beta_dim: cache.k,
-            manifold_mode_fingerprint: cache.manifold_mode_fingerprint,
-            row_hessian_fingerprint: cache.row_hessian_fingerprint,
-            solver_mode: format!("{:?}", cache.solver_mode),
-            deflated_rank: cache.gauge_deflated_directions,
-            deflated_per_row: cache.deflated_row_directions.iter().map(Vec::len).collect(),
-            spectral_deflated_rows: cache
-                .deflation_row_spectra
-                .iter()
-                .map(Option::is_some)
-                .collect(),
-            min_row_pivot_branch: PivotBranch::classify(min_pivot.min_row_pivot),
-            min_schur_pivot_branch: PivotBranch::classify(min_pivot.min_schur_pivot),
-            min_pivot_branch: PivotBranch::classify(min_pivot.min_pivot),
-            max_pivot_branch: PivotBranch::classify(max_pivot),
-            min_eigen_gap: eigen_gap.min_eigen_gap,
-            eigen_gap_threshold: eigen_gap.threshold,
-            kink_branches: Vec::new(),
-        }
-    }
 
-    fn eigen_gap_from_arrow_cache(cache: &ArrowFactorCache) -> EigenGapCertificate {
-        let mut min_eigen_gap = f64::INFINITY;
-        let mut max_scale = 0.0_f64;
-        let mut max_count = 0_usize;
-        for spectrum in cache.deflation_row_spectra.iter().flatten() {
-            let raw = spectrum
-                .raw_evals
-                .as_slice()
-                .expect("row deflation spectrum eigenvalues are contiguous");
-            let gap = eigen_gap_certificate(raw);
-            min_eigen_gap = min_eigen_gap.min(gap.min_eigen_gap);
-            max_scale = max_scale.max(gap.scale);
-            max_count = max_count.max(raw.len());
-        }
-        EigenGapCertificate {
-            min_eigen_gap,
-            threshold: eigen_gap_threshold(max_scale, max_count),
-            scale: max_scale,
-        }
-    }
-
-    pub fn with_eigen_gap(mut self, gap: EigenGapCertificate) -> Self {
-        self.min_eigen_gap = gap.min_eigen_gap;
-        self.eigen_gap_threshold = gap.threshold;
-        self
-    }
-
-
-    /// Route derivatives through individual eigenpairs only when the spectral
-    /// separation is resolved above eigensolver round-off. At degeneracy this
-    /// module records an unresolved invariant-subspace block and refuses scalar
-    /// derivative reporting. It does not implement the confluent
-    /// Daleckii-Krein/Sylvester block derivative.
-    pub fn eigen_derivative_route(&self) -> EigenDerivativeRoute {
-        if self.min_eigen_gap.is_finite() && self.min_eigen_gap < self.eigen_gap_threshold {
-            EigenDerivativeRoute::InvariantSubspaceBlock
-        } else {
-            EigenDerivativeRoute::IndividualEigenpairs
-        }
-    }
-
-    pub fn assert_derivative_reportable(&self) -> Result<(), BranchCertificateMismatch> {
-        match self.eigen_derivative_route() {
-            EigenDerivativeRoute::IndividualEigenpairs => Ok(()),
-            EigenDerivativeRoute::InvariantSubspaceBlock => Err(BranchCertificateMismatch {
-                refusal: BranchCertificateRefusal::UnresolvedInvariantSubspaceBlock,
-                changed_fields: vec!["min_eigen_gap".to_string()],
-                baseline: self.clone(),
-                probe: self.clone(),
-            }),
-        }
-    }
-
-    pub fn assert_same_branch(&self, probe: &Self) -> Result<(), BranchCertificateMismatch> {
-        let mut changed_fields = Vec::new();
-        if self.anchor_mode != probe.anchor_mode {
-            changed_fields.push("majorizer_anchor".to_string());
-        }
-        if self.row_dims != probe.row_dims {
-            changed_fields.push("row_dims".to_string());
-        }
-        if self.row_offsets != probe.row_offsets {
-            changed_fields.push("row_offsets".to_string());
-        }
-        if self.beta_dim != probe.beta_dim {
-            changed_fields.push("beta_dim".to_string());
-        }
-        if self.manifold_mode_fingerprint != probe.manifold_mode_fingerprint {
-            changed_fields.push("manifold_mode_fingerprint".to_string());
-        }
-        if self.row_hessian_fingerprint != probe.row_hessian_fingerprint {
-            changed_fields.push("row_hessian_fingerprint".to_string());
-        }
-        if self.solver_mode != probe.solver_mode {
-            changed_fields.push("solver_mode".to_string());
-        }
-        if self.deflated_rank != probe.deflated_rank {
-            changed_fields.push("deflated_rank".to_string());
-        }
-        if self.deflated_per_row != probe.deflated_per_row {
-            changed_fields.push("deflated_per_row".to_string());
-        }
-        if self.spectral_deflated_rows != probe.spectral_deflated_rows {
-            changed_fields.push("spectral_deflated_rows".to_string());
-        }
-        if self.min_row_pivot_branch != probe.min_row_pivot_branch {
-            changed_fields.push("min_row_pivot_branch".to_string());
-        }
-        if self.min_schur_pivot_branch != probe.min_schur_pivot_branch {
-            changed_fields.push("min_schur_pivot_branch".to_string());
-        }
-        if self.min_pivot_branch != probe.min_pivot_branch {
-            changed_fields.push("min_pivot_branch".to_string());
-        }
-        if self.max_pivot_branch != probe.max_pivot_branch {
-            changed_fields.push("max_pivot_branch".to_string());
-        }
-        let baseline_eigen_route = self.eigen_derivative_route();
-        let probe_eigen_route = probe.eigen_derivative_route();
-        let unresolved_invariant_subspace = baseline_eigen_route
-            == EigenDerivativeRoute::InvariantSubspaceBlock
-            || probe_eigen_route == EigenDerivativeRoute::InvariantSubspaceBlock;
-        if unresolved_invariant_subspace
-            || baseline_eigen_route != probe_eigen_route
-            || self.min_eigen_gap != probe.min_eigen_gap
-            || self.eigen_gap_threshold != probe.eigen_gap_threshold
-        {
-            changed_fields.push("min_eigen_gap".to_string());
-        }
-        if self.kink_branches != probe.kink_branches {
-            changed_fields.push("kink_branches".to_string());
-        }
-
-        if changed_fields.is_empty() {
-            Ok(())
-        } else {
-            Err(BranchCertificateMismatch {
-                refusal: if unresolved_invariant_subspace {
-                    BranchCertificateRefusal::UnresolvedInvariantSubspaceBlock
-                } else {
-                    BranchCertificateRefusal::BranchChanged
-                },
-                changed_fields,
-                baseline: self.clone(),
-                probe: probe.clone(),
-            })
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,99 +114,6 @@ pub struct ExactTraceReport {
     pub channels: Vec<ExactTraceChannel>,
     pub total_value: f64,
     pub total_derivative: f64,
-}
-
-impl ExactTraceReport {
-    pub fn channel_derivative(&self, channel: DerivativeTraceChannel) -> Option<f64> {
-        self.channels
-            .iter()
-            .find(|entry| entry.channel == channel)
-            .map(|entry| entry.derivative)
-    }
-}
-
-pub fn guarded_exact_trace_report(
-    certificate: BranchCertificate,
-    channels: Vec<ExactTraceChannel>,
-) -> Result<ExactTraceReport, BranchCertificateMismatch> {
-    certificate.assert_derivative_reportable()?;
-    let mut total_value = 0.0_f64;
-    let mut total_derivative = 0.0_f64;
-    for channel in &channels {
-        certificate.assert_same_branch(&channel.certificate)?;
-        channel.certificate.assert_derivative_reportable()?;
-        total_value += channel.value;
-        total_derivative += channel.derivative;
-    }
-    Ok(ExactTraceReport {
-        certificate,
-        channels,
-        total_value,
-        total_derivative,
-    })
-}
-
-pub fn dual_spd_logdet(matrix: &[Vec<Dual>]) -> Result<Dual, String> {
-    let n = matrix.len();
-    if n == 0 {
-        return Ok(Dual::constant(0.0));
-    }
-    for (row, values) in matrix.iter().enumerate() {
-        if values.len() != n {
-            return Err(format!(
-                "dual_spd_logdet: row {row} has width {}, expected {n}",
-                values.len()
-            ));
-        }
-    }
-
-    let mut lower = vec![vec![Dual::constant(0.0); n]; n];
-    for row in 0..n {
-        for col in 0..=row {
-            let mut sum = matrix[row][col];
-            for inner in 0..col {
-                sum = sum - lower[row][inner] * lower[col][inner];
-            }
-            if row == col {
-                if !(sum.re.is_finite() && sum.re > 0.0) {
-                    return Err(format!(
-                        "dual_spd_logdet: non-positive branch pivot at row {row}: {}",
-                        sum.re
-                    ));
-                }
-                lower[row][col] = sum.sqrt();
-            } else {
-                lower[row][col] = sum / lower[col][col];
-            }
-        }
-    }
-
-    let mut logdet = Dual::constant(0.0);
-    for (idx, row) in lower.iter().enumerate() {
-        let diag = row[idx];
-        if !(diag.re.is_finite() && diag.re > 0.0) {
-            return Err(format!(
-                "dual_spd_logdet: non-positive Cholesky diagonal at row {idx}: {}",
-                diag.re
-            ));
-        }
-        logdet = logdet + diag.ln() * 2.0;
-    }
-    Ok(logdet)
-}
-
-pub fn exact_logdet_channel(
-    channel: DerivativeTraceChannel,
-    matrix: &[Vec<Dual>],
-    certificate: BranchCertificate,
-) -> Result<ExactTraceChannel, String> {
-    let dual = dual_spd_logdet(matrix)?;
-    Ok(ExactTraceChannel {
-        channel,
-        value: dual.re,
-        derivative: dual.eps,
-        certificate,
-    })
 }
 
 #[cfg(test)]

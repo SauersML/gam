@@ -4,27 +4,6 @@
 use crate::basis::BasisError;
 use ndarray::{Array1, Array2};
 
-pub(crate) fn cumulative_exp(values: &Array1<f64>, sign: f64) -> Array1<f64> {
-    let mut out = Array1::<f64>::zeros(values.len());
-    let mut run = 0.0;
-    for i in 0..values.len() {
-        run += values[i].exp();
-        out[i] = sign * run;
-    }
-    out
-}
-
-pub(crate) fn second_cumulative_exp(values: &Array1<f64>, sign: f64) -> Array1<f64> {
-    let first = cumulative_exp(values, sign);
-    let mut out = Array1::<f64>::zeros(values.len());
-    let mut run = 0.0;
-    for i in 0..values.len() {
-        run += first[i];
-        out[i] = run;
-    }
-    out
-}
-
 pub(crate) fn cumulative_sum_transform_matrix(dim: usize, order: usize, sign: f64) -> Array2<f64> {
     // The loop form `t = next^order` where `next` is the unit lower-triangular
     // matrix of ones (`next[i,j] = 1` iff `i >= j`) has the closed form

@@ -147,17 +147,6 @@ fn record_thread_eigh(sequential: bool, dim: u64, nanos: u64) {
     });
 }
 
-/// Read the census for the CALLING THREAD only.
-///
-/// Use this, not [`eigh_census`], whenever the question is "did THIS region
-/// decompose anything, and how" — a delta on the global census across a region
-/// counts every concurrent caller too. Use [`eigh_census`] for whole-run
-/// questions ("did this job ever reach `dim` in the thousands?"), where the
-/// cross-thread accumulation is the point.
-pub fn eigh_census_this_thread() -> EighCensus {
-    EIGH_THREAD.with(|cell| cell.get())
-}
-
 /// #2267/#2738 — the eigendecomposition census, readable from a test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EighCensus {
@@ -169,33 +158,6 @@ pub struct EighCensus {
     pub max_dim: u64,
     /// Cumulative wall time across all calls, in nanoseconds.
     pub nanos: u64,
-}
-
-/// Read the census. Process-global and monotonic, so a test takes a reading
-/// before and after the region it cares about and differences them.
-///
-/// This exists because `log::debug!` is INVISIBLE under `cargo test` — no logger
-/// is installed there, so a probe that only logs prints nothing and is
-/// indistinguishable from a code path that never executed. A counter can be
-/// asserted on with no logger, no stderr, and no environment variable (which the
-/// ban scanner forbids reading anyway).
-pub fn eigh_census() -> EighCensus {
-    EighCensus {
-        calls: EIGH_CALLS.load(Ordering::Relaxed),
-        sequential_calls: EIGH_SEQ_CALLS.load(Ordering::Relaxed),
-        max_dim: EIGH_MAX_DIM.load(Ordering::Relaxed),
-        nanos: EIGH_NANOS.load(Ordering::Relaxed),
-    }
-}
-
-/// One-line rendering of [`ParallelismSnapshot::capture`], for log sites.
-///
-/// A log line is not assertable: nothing in a test can read it, and under
-/// `cargo test` no logger is installed at all, so the line is byte-identical to
-/// a code path that never ran. The struct is therefore the primary artifact and
-/// this string is only its `Display`, so the two cannot drift apart.
-pub fn parallelism_snapshot() -> String {
-    ParallelismSnapshot::capture().to_string()
 }
 
 /// #2738 — the thread configuration actually in force, read INSIDE the running

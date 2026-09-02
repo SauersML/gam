@@ -59,9 +59,7 @@ use gam_spec::{
     SasLinkState, StandardLink,
 };
 
-use gam_terms::smooth::penalty_priors::{
-    realize_keyed_penalty_block_gamma_priors, realize_penalty_block_gamma_priors,
-};
+use gam_terms::smooth::penalty_priors::realize_keyed_penalty_block_gamma_priors;
 
 use gam_terms::smooth::shape_constraints::{
     linear_constraints_from_lower_bounds_global, merge_linear_constraints_global,
@@ -80,6 +78,7 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
+use gam_terms::smooth::penalty_priors::realize_penalty_block_gamma_priors;
 
 // Fit-result carriers relocated out of `gam_terms::smooth::term_specs` with the
 // drivers (they hold a `gam_solve` `UnifiedFitResult` and are consumed only by
@@ -136,12 +135,6 @@ pub struct SpatialLengthScaleOptimizationTiming {
     /// this must stay 0 — a nonzero value would mean the retirement did not take.
     pub polish_nfree_skip_row_touches: u64,
     pub optim_total_s: f64,
-}
-
-impl SpatialLengthScaleOptimizationTiming {
-    pub fn trial_total_s(self) -> f64 {
-        self.cost_total_s + self.eval_total_s + self.efs_total_s
-    }
 }
 
 #[derive(Clone)]

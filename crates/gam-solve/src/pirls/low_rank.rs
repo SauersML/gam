@@ -13,48 +13,6 @@ use super::*;
 //   path), then solve the small `r × r` capacitance system.
 // ---------------------------------------------------------------------------
 
-use gam_linalg::low_rank_weight::LowRankWeight;
-
-/// `Xᵀ W X` for a low-rank-corrected weight, where the diagonal part is
-/// assembled by the **existing** signed-Gram kernels and the rank-r
-/// correction is added in place via [`LowRankWeight::add_low_rank_xtwx_correction`].
-///
-/// This is the new sibling of `GamWorkingModel::compute_xtwx_blas`; it is
-/// a free function (not a method on `GamWorkingModel`) so it can be reused
-/// for backward passes through downstream models without holding a borrow
-/// on a working-model instance.
-///
-/// Rank-0 fast path: returns the legacy diagonal-W Gram unchanged.
-pub fn compute_xtwx_low_rank(
-    workspace: &mut PirlsWorkspace,
-    design: &DesignMatrix,
-    weight: &LowRankWeight<'_>,
-) -> Result<Array2<f64>, EstimationError> {
-    // Diagonal part: reuse the diagonal-W BLAS / sparse path verbatim.
-    let diag_owned = weight.diag.to_owned();
-    let mut xtwx = GamWorkingModel::compute_xtwx_blas(workspace, design, &diag_owned)?;
-    if weight.is_rank_zero() {
-        return Ok(xtwx);
-    }
-    weight
-        .add_low_rank_xtwx_correction(design, &mut xtwx)
-        .map_err(EstimationError::InvalidInput)?;
-    Ok(xtwx)
-}
-
-/// `Xᵀ W y` for a low-rank-corrected weight. Used in the right-hand side
-/// of the weighted-LS normal equation `(XᵀWX + S) β = XᵀWz`. Rank-0 fast
-/// path coincides with `design.compute_xtwy(&d, &y)`.
-pub fn compute_xtwy_low_rank(
-    design: &DesignMatrix,
-    weight: &LowRankWeight<'_>,
-    y: &Array1<f64>,
-) -> Result<Array1<f64>, EstimationError> {
-    weight
-        .xtw_y(design, y.view())
-        .map_err(EstimationError::InvalidInput)
-}
-
 /// Dense multi-output block Fisher assembly for latent / coupled GLM fits.
 ///
 /// Given `X` with shape `(N, K)` and per-row output Fisher blocks `W_i`
@@ -214,19 +172,6 @@ pub fn dense_block_xtwy(
         }
     }
     Ok(out)
-}
-
-/// Build the small `r × r` capacitance for the parameter-space Woodbury
-/// solve `(A + Û V̂ᵀ)⁻¹ b`, where `A = XᵀDX + S` has already been factored
-/// by the caller and `a_inv_uhat = A⁻¹ Û` came out of `r` back-solves
-/// against that factor. The returned matrix is `I_r + V̂ᵀ A⁻¹ Û`, the
-/// system the caller inverts (Cholesky for symmetric metrics, dense LU
-/// otherwise) to apply the low-rank correction to the Newton direction.
-pub fn woodbury_gram_capacitance(
-    a_inv_uhat: &Array2<f64>,
-    vhat: &Array2<f64>,
-) -> Result<Array2<f64>, EstimationError> {
-    LowRankWeight::gram_capacitance(a_inv_uhat, vhat).map_err(EstimationError::InvalidInput)
 }
 
 #[cfg(test)]

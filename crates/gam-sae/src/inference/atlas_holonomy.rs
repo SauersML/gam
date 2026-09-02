@@ -18,7 +18,7 @@
 //! PCA gauge cancels exactly, and adjacent edges do not double-count their
 //! shared patch.
 
-use crate::manifold::{AtlasOrientability, SphereChartTransition};
+use crate::manifold::AtlasOrientability;
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use gam_math::probability::normal_two_sided_probability;
 use ndarray::{Array1, Array2, ArrayView2, s};
@@ -132,49 +132,30 @@ pub struct GaussianPatchRowSplit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum GaussianRowSet {
     Explicit(Vec<usize>),
-    Contiguous { start: usize, len: usize },
 }
 
 impl GaussianRowSet {
     fn len(&self) -> usize {
         match self {
             Self::Explicit(rows) => rows.len(),
-            Self::Contiguous { len, .. } => *len,
         }
     }
 
     fn contains(&self, row: usize) -> bool {
         match self {
             Self::Explicit(rows) => rows.binary_search(&row).is_ok(),
-            Self::Contiguous { start, len } => row >= *start && row - *start < *len,
         }
     }
 
     fn intersects(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Explicit(left), right) => left.iter().any(|row| right.contains(*row)),
-            (left, Self::Explicit(right)) => right.iter().any(|row| left.contains(*row)),
-            (
-                Self::Contiguous {
-                    start: left_start,
-                    len: left_len,
-                },
-                Self::Contiguous {
-                    start: right_start,
-                    len: right_len,
-                },
-            ) => {
-                let left_end = left_start.saturating_add(*left_len);
-                let right_end = right_start.saturating_add(*right_len);
-                *left_start < right_end && *right_start < left_end
-            }
         }
     }
 
     fn materialize(&self) -> Vec<usize> {
         match self {
             Self::Explicit(rows) => rows.clone(),
-            Self::Contiguous { start, len } => (*start..start.saturating_add(*len)).collect(),
         }
     }
 }
@@ -207,35 +188,6 @@ impl GaussianPatchRowSplit {
             inference_rows: GaussianRowSet::Explicit(inference_rows),
         })
     }
-
-    /// Compact constructor for synthetic/analytic row populations.
-    #[must_use = "Gaussian patch row-split validation errors must be handled"]
-    pub fn from_disjoint_ranges(
-        pilot_start: usize,
-        pilot_len: usize,
-        inference_start: usize,
-        inference_len: usize,
-    ) -> Result<Self, String> {
-        if pilot_len == 0 || inference_len == 0 {
-            return Err("Gaussian PCA pilot and inference ranges must be non-empty".to_string());
-        }
-        let pilot_rows = GaussianRowSet::Contiguous {
-            start: pilot_start,
-            len: pilot_len,
-        };
-        let inference_rows = GaussianRowSet::Contiguous {
-            start: inference_start,
-            len: inference_len,
-        };
-        if pilot_rows.intersects(&inference_rows) {
-            return Err("Gaussian PCA pilot and inference ranges must be disjoint".to_string());
-        }
-        Ok(Self {
-            pilot_rows,
-            inference_rows,
-        })
-    }
-
 
 }
 
@@ -409,45 +361,6 @@ pub struct AtlasSignedEdge {
 }
 
 impl AtlasSignedEdge {
-    fn from_validated_analytic_sign(
-        a: usize,
-        b: usize,
-        overlap: usize,
-        sign: i8,
-    ) -> Result<Self, String> {
-        let identity = AtlasHolonomyEdgeId::new(a, b, overlap)?;
-        if !matches!(sign, -1 | 1) {
-            return Err(format!(
-                "an atlas transition sign must be +1 or -1, got {sign}"
-            ));
-        }
-        Ok(Self {
-            a: identity.a,
-            b: identity.b,
-            overlap: identity.overlap,
-            sign,
-        })
-    }
-
-    /// Extract an exact sign only from an analytically derived sphere seam.
-    /// Fitted polar factors are rejected even when their stored matrix is
-    /// perfectly orthogonal.
-    #[must_use = "analytic sphere transition provenance must be handled"]
-    pub fn from_analytic_sphere_transition(
-        transition: &SphereChartTransition,
-        overlap: usize,
-    ) -> Result<Self, String> {
-        let sign = transition.analytic_sign().ok_or_else(|| {
-            "a fitted sphere transition cannot enter an exact analytic holonomy certificate"
-                .to_string()
-        })?;
-        Self::from_validated_analytic_sign(
-            transition.from_chart(),
-            transition.to_chart(),
-            overlap,
-            sign,
-        )
-    }
 
     #[must_use]
     pub fn identity(self) -> AtlasHolonomyEdgeId {
@@ -595,6 +508,14 @@ pub enum GaussianPcaSpectrumProvenance {
 }
 
 impl GaussianPcaSpectrumProvenance {
+
+    fn certified_bounds(self) -> Option<GaussianPcaPopulationBounds> {
+        match self {
+            Self::CertifiedPopulation(bounds) => Some(bounds),
+            Self::PlugInEstimate { .. } => None,
+        }
+    }
+
     fn validate(self) -> Result<Self, String> {
         match self {
             Self::CertifiedPopulation(bounds) => {
@@ -627,13 +548,6 @@ impl GaussianPcaSpectrumProvenance {
         }
         Ok(self)
     }
-
-    fn certified_bounds(self) -> Option<GaussianPcaPopulationBounds> {
-        match self {
-            Self::CertifiedPopulation(bounds) => Some(bounds),
-            Self::PlugInEstimate { .. } => None,
-        }
-    }
 }
 
 /// How the inference-split patch mean was handled.  This determines the exact
@@ -646,17 +560,18 @@ pub enum GaussianPatchCentering {
 }
 
 impl GaussianPatchCentering {
-    fn covariance_degrees_of_freedom(self, inference_rows: usize) -> Option<usize> {
-        match self {
-            Self::KnownOrIndependentMean => Some(inference_rows),
-            Self::MeanEstimatedOnInferenceRows => inference_rows.checked_sub(1),
-        }
-    }
 
     fn rows_for_degrees_of_freedom(self, degrees_of_freedom: usize) -> Option<usize> {
         match self {
             Self::KnownOrIndependentMean => Some(degrees_of_freedom),
             Self::MeanEstimatedOnInferenceRows => degrees_of_freedom.checked_add(1),
+        }
+    }
+
+    fn covariance_degrees_of_freedom(self, inference_rows: usize) -> Option<usize> {
+        match self {
+            Self::KnownOrIndependentMean => Some(inference_rows),
+            Self::MeanEstimatedOnInferenceRows => inference_rows.checked_sub(1),
         }
     }
 }
@@ -687,98 +602,6 @@ pub struct GaussianPcaPatch {
 }
 
 impl GaussianPcaPatch {
-    #[must_use = "Gaussian PCA patch validation errors must be handled"]
-    pub fn new(
-        chart: usize,
-        row_split: GaussianPatchRowSplit,
-        pilot_projection: PilotProjectionProvenance,
-        centering: GaussianPatchCentering,
-        projection_frame: Array2<f64>,
-        tangent_coordinates: Array2<f64>,
-        noise_variance_estimate: f64,
-        signal_variance_estimate: f64,
-        spectrum_provenance: GaussianPcaSpectrumProvenance,
-    ) -> Result<Self, String> {
-        let (ambient, retained) = projection_frame.dim();
-        let spectrum_provenance = spectrum_provenance.validate()?;
-        let inference_rows = row_split.inference_rows.len();
-        let covariance_dof = centering
-            .covariance_degrees_of_freedom(inference_rows)
-            .filter(|&value| value > 0)
-            .ok_or_else(|| {
-                format!(
-                    "Gaussian PCA patch {chart} inference split has no covariance degrees of freedom"
-                )
-            })?;
-        if ambient == 0 || retained < INTRINSIC_DIMENSION || retained > ambient {
-            return Err(format!(
-                "Gaussian PCA patch {chart} frame shape ({ambient}, {retained}) must satisfy ambient >= retained >= {INTRINSIC_DIMENSION}"
-            ));
-        }
-        if tangent_coordinates.dim() != (retained, INTRINSIC_DIMENSION) {
-            return Err(format!(
-                "Gaussian PCA patch {chart} tangent coordinates have shape {:?}, expected ({retained}, {INTRINSIC_DIMENSION})",
-                tangent_coordinates.dim()
-            ));
-        }
-        if projection_frame.iter().any(|value| !value.is_finite())
-            || tangent_coordinates.iter().any(|value| !value.is_finite())
-        {
-            return Err(format!(
-                "Gaussian PCA patch {chart} projection and tangent frames must be finite"
-            ));
-        }
-        if !(noise_variance_estimate.is_finite() && noise_variance_estimate >= 0.0) {
-            return Err(format!(
-                "Gaussian PCA patch {chart} noise estimate must be finite and nonnegative, got {noise_variance_estimate}"
-            ));
-        }
-        if !(signal_variance_estimate.is_finite() && signal_variance_estimate > 0.0) {
-            return Err(format!(
-                "Gaussian PCA patch {chart} signal estimate must be finite and positive, got {signal_variance_estimate}"
-            ));
-        }
-        let gram = projection_frame.t().dot(&projection_frame);
-        let frame_scale: f64 = projection_frame.iter().map(|value| value * value).sum();
-        let backward_error = f64::EPSILON * ambient.max(retained) as f64 * frame_scale.max(1.0);
-        for i in 0..retained {
-            for j in 0..retained {
-                let target = if i == j { 1.0 } else { 0.0 };
-                if (gram[[i, j]] - target).abs() > backward_error {
-                    return Err(format!(
-                        "Gaussian PCA patch {chart} retained frame is not orthonormal at ({i}, {j}): residual={}, machine backward-error bound={backward_error}",
-                        gram[[i, j]] - target
-                    ));
-                }
-            }
-        }
-        let tangent_gram = tangent_coordinates.t().dot(&tangent_coordinates);
-        let tangent_scale: f64 = tangent_coordinates.iter().map(|value| value * value).sum();
-        let tangent_backward_error =
-            f64::EPSILON * retained.max(INTRINSIC_DIMENSION) as f64 * tangent_scale.max(1.0);
-        for i in 0..INTRINSIC_DIMENSION {
-            for j in 0..INTRINSIC_DIMENSION {
-                let target = if i == j { 1.0 } else { 0.0 };
-                if (tangent_gram[[i, j]] - target).abs() > tangent_backward_error {
-                    return Err(format!(
-                        "Gaussian PCA patch {chart} tangent coordinates are not orthonormal at ({i}, {j})"
-                    ));
-                }
-            }
-        }
-        Ok(Self {
-            chart,
-            row_split,
-            pilot_projection,
-            centering,
-            covariance_degrees_of_freedom: covariance_dof,
-            projection_frame,
-            tangent_coordinates,
-            noise_variance_estimate,
-            signal_variance_estimate,
-            spectrum_provenance,
-        })
-    }
 
     #[must_use]
     pub fn ambient_dimension(&self) -> usize {
@@ -918,49 +741,99 @@ impl GaussianPcaPatch {
             spectrum_provenance,
         )
     }
-}
 
-fn selected_covariance(
-    data: ArrayView2<'_, f64>,
-    rows: &[usize],
-    projection: Option<&Array2<f64>>,
-) -> Result<Array2<f64>, String> {
-    let dimension = projection.map_or(data.ncols(), Array2::ncols);
-    let mut mean = Array1::<f64>::zeros(dimension);
-    for &row in rows {
-        if let Some(frame) = projection {
-            mean += &frame.t().dot(&data.row(row));
-        } else {
-            mean += &data.row(row);
+    #[must_use = "Gaussian PCA patch validation errors must be handled"]
+    pub fn new(
+        chart: usize,
+        row_split: GaussianPatchRowSplit,
+        pilot_projection: PilotProjectionProvenance,
+        centering: GaussianPatchCentering,
+        projection_frame: Array2<f64>,
+        tangent_coordinates: Array2<f64>,
+        noise_variance_estimate: f64,
+        signal_variance_estimate: f64,
+        spectrum_provenance: GaussianPcaSpectrumProvenance,
+    ) -> Result<Self, String> {
+        let (ambient, retained) = projection_frame.dim();
+        let spectrum_provenance = spectrum_provenance.validate()?;
+        let inference_rows = row_split.inference_rows.len();
+        let covariance_dof = centering
+            .covariance_degrees_of_freedom(inference_rows)
+            .filter(|&value| value > 0)
+            .ok_or_else(|| {
+                format!(
+                    "Gaussian PCA patch {chart} inference split has no covariance degrees of freedom"
+                )
+            })?;
+        if ambient == 0 || retained < INTRINSIC_DIMENSION || retained > ambient {
+            return Err(format!(
+                "Gaussian PCA patch {chart} frame shape ({ambient}, {retained}) must satisfy ambient >= retained >= {INTRINSIC_DIMENSION}"
+            ));
         }
-    }
-    mean /= rows.len() as f64;
-    let mut covariance = Array2::<f64>::zeros((dimension, dimension));
-    for &row in rows {
-        let centered = if let Some(frame) = projection {
-            frame.t().dot(&data.row(row)) - &mean
-        } else {
-            data.row(row).to_owned() - &mean
-        };
-        for left in 0..dimension {
-            for right in 0..=left {
-                covariance[[left, right]] += centered[left] * centered[right];
+        if tangent_coordinates.dim() != (retained, INTRINSIC_DIMENSION) {
+            return Err(format!(
+                "Gaussian PCA patch {chart} tangent coordinates have shape {:?}, expected ({retained}, {INTRINSIC_DIMENSION})",
+                tangent_coordinates.dim()
+            ));
+        }
+        if projection_frame.iter().any(|value| !value.is_finite())
+            || tangent_coordinates.iter().any(|value| !value.is_finite())
+        {
+            return Err(format!(
+                "Gaussian PCA patch {chart} projection and tangent frames must be finite"
+            ));
+        }
+        if !(noise_variance_estimate.is_finite() && noise_variance_estimate >= 0.0) {
+            return Err(format!(
+                "Gaussian PCA patch {chart} noise estimate must be finite and nonnegative, got {noise_variance_estimate}"
+            ));
+        }
+        if !(signal_variance_estimate.is_finite() && signal_variance_estimate > 0.0) {
+            return Err(format!(
+                "Gaussian PCA patch {chart} signal estimate must be finite and positive, got {signal_variance_estimate}"
+            ));
+        }
+        let gram = projection_frame.t().dot(&projection_frame);
+        let frame_scale: f64 = projection_frame.iter().map(|value| value * value).sum();
+        let backward_error = f64::EPSILON * ambient.max(retained) as f64 * frame_scale.max(1.0);
+        for i in 0..retained {
+            for j in 0..retained {
+                let target = if i == j { 1.0 } else { 0.0 };
+                if (gram[[i, j]] - target).abs() > backward_error {
+                    return Err(format!(
+                        "Gaussian PCA patch {chart} retained frame is not orthonormal at ({i}, {j}): residual={}, machine backward-error bound={backward_error}",
+                        gram[[i, j]] - target
+                    ));
+                }
             }
         }
-    }
-    let degrees_of_freedom = rows
-        .len()
-        .checked_sub(1)
-        .ok_or_else(|| "sample covariance requires at least two rows".to_string())?
-        as f64;
-    for left in 0..dimension {
-        for right in 0..=left {
-            let value = covariance[[left, right]] / degrees_of_freedom;
-            covariance[[left, right]] = value;
-            covariance[[right, left]] = value;
+        let tangent_gram = tangent_coordinates.t().dot(&tangent_coordinates);
+        let tangent_scale: f64 = tangent_coordinates.iter().map(|value| value * value).sum();
+        let tangent_backward_error =
+            f64::EPSILON * retained.max(INTRINSIC_DIMENSION) as f64 * tangent_scale.max(1.0);
+        for i in 0..INTRINSIC_DIMENSION {
+            for j in 0..INTRINSIC_DIMENSION {
+                let target = if i == j { 1.0 } else { 0.0 };
+                if (tangent_gram[[i, j]] - target).abs() > tangent_backward_error {
+                    return Err(format!(
+                        "Gaussian PCA patch {chart} tangent coordinates are not orthonormal at ({i}, {j})"
+                    ));
+                }
+            }
         }
+        Ok(Self {
+            chart,
+            row_split,
+            pilot_projection,
+            centering,
+            covariance_degrees_of_freedom: covariance_dof,
+            projection_frame,
+            tangent_coordinates,
+            noise_variance_estimate,
+            signal_variance_estimate,
+            spectrum_provenance,
+        })
     }
-    Ok(covariance)
 }
 
 /// Scalar provenance retained for every patch used by a noisy certificate.
@@ -983,15 +856,6 @@ pub struct GaussianPcaPatchSummary {
     pub signal_variance_estimate: f64,
     pub pilot_projection: PilotProjectionProvenance,
     pub spectrum_provenance: GaussianPcaSpectrumProvenance,
-}
-
-impl GaussianPcaPatchSummary {
-    #[must_use]
-    pub fn projector_variance_scale(self) -> f64 {
-        let noise = self.noise_variance_estimate;
-        let signal = self.signal_variance_estimate;
-        noise * (signal + noise) / (signal * signal * self.covariance_degrees_of_freedom as f64)
-    }
 }
 
 /// Whether the joint horizontal-error covariance is an exact Gaussian law or
@@ -1085,37 +949,6 @@ impl GaussianPcaErrorModel {
             patches,
             GaussianPcaCovarianceAuthority::AsymptoticPlugIn,
             CrossPatchCovarianceProvenance::DisjointInferenceRows,
-            covariance,
-        )
-    }
-
-    /// Construct an authoritative Gaussian linearized-error law from an exact
-    /// caller-supplied joint covariance, including every shared-row cross block.
-    #[must_use = "Gaussian PCA error-model validation errors must be handled"]
-    pub fn certified_joint(
-        patches: &[GaussianPcaPatch],
-        cross_patch_provenance: CrossPatchCovarianceProvenance,
-        covariance: Array2<f64>,
-    ) -> Result<Self, String> {
-        Self::validate_joint(
-            patches,
-            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
-            cross_patch_provenance,
-            covariance,
-        )
-    }
-
-    /// Construct an explicitly supplied asymptotic plug-in joint covariance.
-    #[must_use = "Gaussian PCA error-model validation errors must be handled"]
-    pub fn plugin_joint(
-        patches: &[GaussianPcaPatch],
-        cross_patch_provenance: CrossPatchCovarianceProvenance,
-        covariance: Array2<f64>,
-    ) -> Result<Self, String> {
-        Self::validate_joint(
-            patches,
-            GaussianPcaCovarianceAuthority::AsymptoticPlugIn,
-            cross_patch_provenance,
             covariance,
         )
     }
@@ -1224,6 +1057,14 @@ pub enum PopulationCrossGramProvenance {
 }
 
 impl PopulationCrossGramProvenance {
+
+    fn certified_lower_bound(self) -> Option<f64> {
+        match self {
+            Self::EstimatedOnly => None,
+            Self::CertifiedSmallestSingularValue { lower_bound } => Some(lower_bound),
+        }
+    }
+
     fn validate(self) -> Result<Self, String> {
         if let Self::CertifiedSmallestSingularValue { lower_bound } = self
             && !(lower_bound.is_finite() && lower_bound > 0.0 && lower_bound <= 1.0)
@@ -1233,13 +1074,6 @@ impl PopulationCrossGramProvenance {
             ));
         }
         Ok(self)
-    }
-
-    fn certified_lower_bound(self) -> Option<f64> {
-        match self {
-            Self::EstimatedOnly => None,
-            Self::CertifiedSmallestSingularValue { lower_bound } => Some(lower_bound),
-        }
     }
 }
 
@@ -1561,70 +1395,7 @@ pub enum GaussBonnetCovarianceAuthority {
 }
 
 impl GaussBonnetInput {
-    #[must_use = "certified Gauss-Bonnet input validation errors must be handled"]
-    pub fn certified_independent_gaussian(
-        sources: Vec<GaussBonnetNoiseSource>,
-        contributions: Vec<GaussBonnetContribution>,
-    ) -> Result<Self, String> {
-        Self::validate(
-            GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources,
-            sources,
-            contributions,
-        )
-    }
 
-    #[must_use = "plug-in Gauss-Bonnet input validation errors must be handled"]
-    pub fn asymptotic_plugin(
-        sources: Vec<GaussBonnetNoiseSource>,
-        contributions: Vec<GaussBonnetContribution>,
-    ) -> Result<Self, String> {
-        Self::validate(
-            GaussBonnetCovarianceAuthority::AsymptoticPlugIn,
-            sources,
-            contributions,
-        )
-    }
-
-    fn validate(
-        covariance_authority: GaussBonnetCovarianceAuthority,
-        mut sources: Vec<GaussBonnetNoiseSource>,
-        contributions: Vec<GaussBonnetContribution>,
-    ) -> Result<Self, String> {
-        sources.sort_by_key(|source| source.source);
-        if sources
-            .windows(2)
-            .any(|pair| pair[0].source == pair[1].source)
-        {
-            return Err("Gauss-Bonnet covariance source identifiers must be unique".to_string());
-        }
-        let dimensions: BTreeMap<usize, usize> = sources
-            .iter()
-            .map(|source| (source.source, source.covariance.nrows()))
-            .collect();
-        for contribution in &contributions {
-            for gradient in &contribution.source_gradients {
-                let dimension = dimensions.get(&gradient.source).ok_or_else(|| {
-                    format!(
-                        "Gauss-Bonnet gradient names absent covariance source {}",
-                        gradient.source
-                    )
-                })?;
-                if gradient.gradient.len() != *dimension {
-                    return Err(format!(
-                        "Gauss-Bonnet gradient for source {} has length {} but covariance dimension is {}",
-                        gradient.source,
-                        gradient.gradient.len(),
-                        dimension
-                    ));
-                }
-            }
-        }
-        Ok(Self {
-            covariance_authority,
-            sources,
-            contributions,
-        })
-    }
 }
 
 /// Integer Euler characteristic certified by a Gauss--Bonnet rounding cell.
@@ -4744,4 +4515,47 @@ impl AtlasHolonomyCertificate {
             )?,
         ))
     }
+}
+
+fn selected_covariance(
+    data: ArrayView2<'_, f64>,
+    rows: &[usize],
+    projection: Option<&Array2<f64>>,
+) -> Result<Array2<f64>, String> {
+    let dimension = projection.map_or(data.ncols(), Array2::ncols);
+    let mut mean = Array1::<f64>::zeros(dimension);
+    for &row in rows {
+        if let Some(frame) = projection {
+            mean += &frame.t().dot(&data.row(row));
+        } else {
+            mean += &data.row(row);
+        }
+    }
+    mean /= rows.len() as f64;
+    let mut covariance = Array2::<f64>::zeros((dimension, dimension));
+    for &row in rows {
+        let centered = if let Some(frame) = projection {
+            frame.t().dot(&data.row(row)) - &mean
+        } else {
+            data.row(row).to_owned() - &mean
+        };
+        for left in 0..dimension {
+            for right in 0..=left {
+                covariance[[left, right]] += centered[left] * centered[right];
+            }
+        }
+    }
+    let degrees_of_freedom = rows
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "sample covariance requires at least two rows".to_string())?
+        as f64;
+    for left in 0..dimension {
+        for right in 0..=left {
+            let value = covariance[[left, right]] / degrees_of_freedom;
+            covariance[[left, right]] = value;
+            covariance[[right, left]] = value;
+        }
+    }
+    Ok(covariance)
 }

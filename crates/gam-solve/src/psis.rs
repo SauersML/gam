@@ -56,39 +56,6 @@ pub fn tail_count(n: usize) -> usize {
         .min(n - 1)
 }
 
-/// Expected REPORTED shape when the sampled tail truly has shape `true_k` and
-/// `tail_count` excesses are fitted.
-///
-/// The profile fit `k_raw` is asymptotically unbiased for `true_k`; the reported
-/// value is then shrunk toward [`SHAPE_PRIOR_MEAN`] by
-/// [`SHAPE_PRIOR_PSEUDO_OBSERVATIONS`], which is a systematic offset, not noise:
-/// it does not vanish by averaging and it pulls every heavy-tail verdict toward
-/// the light side.
-pub fn expected_reported_shape(true_k: f64, tail_count: usize) -> f64 {
-    let n = tail_count as f64;
-    let p = SHAPE_PRIOR_PSEUDO_OBSERVATIONS;
-    (n * true_k + p * SHAPE_PRIOR_MEAN) / (n + p)
-}
-
-/// Standard error of the REPORTED shape at tail sample `tail_count`.
-///
-/// The generalized-Pareto shape MLE has asymptotic variance `(1 + k)² / n`
-/// (Smith 1985; Hosking & Wallis 1987), and the reported value is the raw fit
-/// scaled by `n / (n + P)` (see [`expected_reported_shape`]), so
-/// `sd(k̂) = √n (1 + k) / (n + P)`.
-///
-/// This is the quantity that decides whether a `k̂` verdict against a fixed
-/// cutoff means anything: with `n` tail draws the estimator simply cannot
-/// separate a true shape from the cutoff unless they differ by several of
-/// these. Returns `f64::INFINITY` for an empty tail.
-pub fn shape_resolution(k: f64, tail_count: usize) -> f64 {
-    if tail_count == 0 {
-        return f64::INFINITY;
-    }
-    let n = tail_count as f64;
-    n.sqrt() * (1.0 + k) / (n + SHAPE_PRIOR_PSEUDO_OBSERVATIONS)
-}
-
 /// Pareto-smooth a non-negative weight vector and report the fitted GPD tail
 /// shape.  Non-tail observations are left bit-identical; only the largest tail
 /// observations are replaced by sorted GPD expected quantiles and then clipped

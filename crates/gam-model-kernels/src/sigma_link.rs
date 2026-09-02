@@ -144,12 +144,6 @@ pub fn exp_sigma_jet3_scalar(eta: f64) -> SigmaJet3 {
     }
 }
 
-#[inline]
-pub fn exp_sigma_derivs_up_to_third_scalar(eta: f64) -> (f64, f64, f64, f64) {
-    let jet = exp_sigma_jet3_scalar(eta);
-    (jet.sigma, jet.d1, jet.d2, jet.d3)
-}
-
 pub fn exp_sigma_derivs_up_to_third(
     eta: ArrayView1<'_, f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
@@ -193,42 +187,6 @@ pub(crate) fn exp_sigma_jet4_scalar(eta: f64) -> SigmaJet4 {
 pub fn exp_sigma_derivs_up_to_fourth_scalar(eta: f64) -> (f64, f64, f64, f64, f64) {
     let jet = exp_sigma_jet4_scalar(eta);
     (jet.sigma, jet.d1, jet.d2, jet.d3, jet.d4)
-}
-
-pub fn exp_sigma_derivs_up_to_fourth(
-    eta: ArrayView1<'_, f64>,
-) -> (
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-) {
-    let n = eta.len();
-    let mut sigma = Array1::<f64>::uninit(n);
-    let mut d1 = Array1::<f64>::uninit(n);
-    let mut d2 = Array1::<f64>::uninit(n);
-    let mut d3 = Array1::<f64>::uninit(n);
-    let mut d4 = Array1::<f64>::uninit(n);
-    for i in 0..n {
-        let jet = exp_sigma_jet4_scalar(eta[i]);
-        sigma[i].write(jet.sigma);
-        d1[i].write(jet.d1);
-        d2[i].write(jet.d2);
-        d3[i].write(jet.d3);
-        d4[i].write(jet.d4);
-    }
-    // SAFETY: every slot in each length-`n` output is written exactly once by
-    // the loop over `0..n` before `assume_init`.
-    unsafe {
-        (
-            sigma.assume_init(),
-            d1.assume_init(),
-            d2.assume_init(),
-            d3.assume_init(),
-            d4.assume_init(),
-        )
-    }
 }
 
 /// Lower bound on σ in *response-scaled* units for the location-scale GAMLSS
@@ -308,90 +266,6 @@ pub fn logb_sigma_from_eta_scalar(eta: f64) -> f64 {
 #[inline]
 pub fn logb_sigma_from_eta_with_floor_scalar(floor: f64, eta: f64) -> f64 {
     floor + safe_exp(eta)
-}
-
-#[inline]
-pub fn logb_sigma_eta_for_sigma_scalar(sigma: f64) -> f64 {
-    assert!(
-        sigma.is_finite(),
-        "logb sigma inverse link requires finite sigma: sigma={sigma}"
-    );
-    assert!(
-        sigma > LOGB_SIGMA_FLOOR,
-        "logb sigma inverse link: sigma must exceed LOGB_SIGMA_FLOOR (got sigma={sigma}, floor={LOGB_SIGMA_FLOOR})"
-    );
-    (sigma - LOGB_SIGMA_FLOOR).ln()
-}
-
-#[inline]
-pub fn logb_sigma_jet3_scalar(eta: f64) -> SigmaJet3 {
-    let jet = logb_sigma_jet4_scalar(eta);
-    SigmaJet3 {
-        sigma: jet.sigma,
-        d1: jet.d1,
-        d2: jet.d2,
-        d3: jet.d3,
-    }
-}
-
-#[inline]
-pub fn logb_sigma_derivs_up_to_third_scalar(eta: f64) -> (f64, f64, f64, f64) {
-    let jet = logb_sigma_jet3_scalar(eta);
-    (jet.sigma, jet.d1, jet.d2, jet.d3)
-}
-
-#[inline]
-pub(crate) fn logb_sigma_jet4_scalar(eta: f64) -> SigmaJet4 {
-    let s = safe_exp(eta);
-    SigmaJet4 {
-        sigma: LOGB_SIGMA_FLOOR + s,
-        d1: s,
-        d2: s,
-        d3: s,
-        d4: s,
-    }
-}
-
-#[inline]
-pub fn logb_sigma_derivs_up_to_fourth_scalar(eta: f64) -> (f64, f64, f64, f64, f64) {
-    let jet = logb_sigma_jet4_scalar(eta);
-    (jet.sigma, jet.d1, jet.d2, jet.d3, jet.d4)
-}
-
-pub fn logb_sigma_derivs_up_to_fourth(
-    eta: ArrayView1<'_, f64>,
-) -> (
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-    Array1<f64>,
-) {
-    let n = eta.len();
-    let mut sigma = Array1::<f64>::uninit(n);
-    let mut d1 = Array1::<f64>::uninit(n);
-    let mut d2 = Array1::<f64>::uninit(n);
-    let mut d3 = Array1::<f64>::uninit(n);
-    let mut d4 = Array1::<f64>::uninit(n);
-    for i in 0..n {
-        let jet = logb_sigma_jet4_scalar(eta[i]);
-        sigma[i].write(jet.sigma);
-        d1[i].write(jet.d1);
-        d2[i].write(jet.d2);
-        d3[i].write(jet.d3);
-        d4[i].write(jet.d4);
-    }
-    // SAFETY: every slot in each length-`n` output is written exactly once by
-    // the loop over `0..n` before `assume_init`.
-    unsafe {
-        (
-            sigma.assume_init(),
-            d1.assume_init(),
-            d2.assume_init(),
-            d3.assume_init(),
-            d4.assume_init(),
-        )
-    }
 }
 
 #[cfg(test)]

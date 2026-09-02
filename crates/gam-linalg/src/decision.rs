@@ -513,56 +513,6 @@ pub struct DecrementEnclosure {
     pub upper: f64,
 }
 
-/// Enclose the squared Newton decrement `λ_N² = gᵀH⁻¹g` from an inexact solve.
-///
-/// Given an approximate solve `z ≈ H⁻¹g` with residual `r = g − Hz` and a
-/// positive lower bound `ℓ ≤ λ_min(H)` on the Hessian's smallest eigenvalue,
-/// returns `[gᵀz + rᵀz, gᵀz + rᵀz + ‖r‖²/ℓ]`, which contains `λ_N²`. Returns
-/// `None` when `ℓ ≤ 0` (no positive-definite certificate available).
-///
-/// The arguments are `g_dot_z = gᵀz`, `r_dot_z = rᵀz`, `r_norm_sq = ‖r‖²`,
-/// and `lambda_min_lower = ℓ`.
-///
-/// # Derivation
-///
-/// Substitute `g = Hz + r` (the definition of the residual) into `λ_N²`:
-///
-/// ```text
-///   λ_N² = gᵀH⁻¹g = (Hz + r)ᵀ H⁻¹ (Hz + r)
-///        = zᵀHz + 2 rᵀz + rᵀH⁻¹r         [ (Hz)ᵀH⁻¹(Hz) = zᵀHz, symmetry ]
-///        = zᵀ(Hz + r) + rᵀz + rᵀH⁻¹r     [ regroup: zᵀHz + rᵀz = zᵀ(Hz)+rᵀz ]
-///        = zᵀg + rᵀz + rᵀH⁻¹r
-///        = gᵀz + rᵀz + rᵀH⁻¹r.
-/// ```
-///
-/// For `H ⪰ ℓI ≻ 0` we have `0 ⪯ H⁻¹ ⪯ (1/ℓ)I`, hence
-/// `0 ≤ rᵀH⁻¹r ≤ ‖r‖²/ℓ`. Adding the constant `gᵀz + rᵀz` to this two-sided
-/// bound on the only unknown term gives the enclosure. When `r = 0` (exact
-/// solve) the enclosure collapses to the exact `λ_N² = gᵀz`.
-///
-/// # Why `λ_N` is *the* stationarity currency
-///
-/// The decrement is affine-invariant: under a coordinate change `θ ↦ Tθ` the
-/// gradient and Hessian transform as `g ↦ T^{-T}g`, `H ↦ T^{-T}HT^{-1}`, so
-/// `gᵀH⁻¹g ↦ gᵀT⁻¹ (T H⁻¹ Tᵀ) T^{-T} g = gᵀH⁻¹g` is unchanged. Unlike `‖g‖`,
-/// which depends on the arbitrary parameterization, `λ_N²` measures proximity
-/// to the stationary point in the metric the problem itself supplies — so a
-/// stopping test posed in this currency is invariant to how the model is
-/// coordinatized.
-pub fn newton_decrement_enclosure(
-    g_dot_z: f64,
-    r_dot_z: f64,
-    r_norm_sq: f64,
-    lambda_min_lower: f64,
-) -> Option<DecrementEnclosure> {
-    if lambda_min_lower <= 0.0 {
-        return None;
-    }
-    let lower = g_dot_z + r_dot_z;
-    let upper = lower + r_norm_sq / lambda_min_lower;
-    Some(DecrementEnclosure { lower, upper })
-}
-
 /// A running sum that also carries the data needed to certify its own rounding
 /// floor: the accumulated value, the sum of magnitudes, and the term count.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -595,49 +545,6 @@ impl ShadowSum {
         self.count += other.count;
     }
 
-    /// Certified forward-error floor for **sequential** summation:
-    /// `γ_{n−1} · Σ|x_i|`.
-    ///
-    /// # Derivation
-    ///
-    /// Let `γ_k = k·u / (1 − k·u)` (Higham's constant, `u` the unit roundoff).
-    /// The standard forward-error bound for recursive summation of `n` terms is
-    /// `|fl(S) − S| ≤ γ_{n−1} · Σ_{i} |x_i|`: each of the `n − 1` additions
-    /// commits a relative error `≤ u`, the errors compound multiplicatively as
-    /// `∏(1 + δ_i)` with `|δ_i| ≤ u`, and `∏(1+δ_i) − 1` is bounded in modulus
-    /// by `γ_{n−1}` (Higham, *Accuracy and Stability of Numerical Algorithms*,
-    /// Lemma 3.1 and §4.2). The bound is returned in the operands' own units so
-    /// a candidate decrement can be compared directly against it.
-    ///
-    /// If `(n−1)·u ≥ 1` the bound `γ_{n−1}` is not defined (the geometric
-    /// factor diverges); we saturate to `+∞`, the honest statement that at this
-    /// term count and precision no nontrivial floor can be certified.
-    pub fn rounding_floor(&self, unit_roundoff: f64) -> f64 {
-        let depth = self.count.saturating_sub(1);
-        gamma(depth, unit_roundoff) * self.abs_sum
-    }
-
-    /// Certified forward-error floor for a reduction of a given `depth`:
-    /// `γ_depth · Σ|x_i|`.
-    ///
-    /// Sequential summation has depth `n − 1`; pairwise/tree reduction lowers
-    /// the number of additions on any accumulation path to `⌈log₂ n⌉`,
-    /// improving the constant from `γ_{n−1}` to `γ_{⌈log₂ n⌉}`. A caller that
-    /// reduces with a tree (see [`crate::pairwise_reduce`]) passes that
-    /// effective depth here to obtain the tighter, still-rigorous floor.
-    pub fn rounding_floor_with_depth(&self, unit_roundoff: f64, depth: usize) -> f64 {
-        gamma(depth, unit_roundoff) * self.abs_sum
-    }
-}
-
-/// Higham's `γ_k = k·u / (1 − k·u)`, saturating to `+∞` once `k·u ≥ 1`.
-fn gamma(k: usize, unit_roundoff: f64) -> f64 {
-    let ku = (k as f64) * unit_roundoff;
-    if ku >= 1.0 {
-        f64::INFINITY
-    } else {
-        ku / (1.0 - ku)
-    }
 }
 
 #[cfg(test)]

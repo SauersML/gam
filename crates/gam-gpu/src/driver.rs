@@ -32,17 +32,6 @@ pub type CuResult = i32;
 // was dead dual-context code. Keep ONE context model: the cudarc primary context.
 // Do not reintroduce `cuCtxCreate` for issuing work.
 
-#[inline]
-pub fn check_cuda(result: CuResult, name: &str) -> Result<(), GpuError> {
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(GpuError::DriverCallFailed {
-            reason: format!("{name} failed with CUDA driver error {result}"),
-        })
-    }
-}
-
 /// Bind to a CUDA driver that is ALREADY RESIDENT in this process, if any.
 ///
 /// `RTLD_NOLOAD` makes `dlopen` return a handle only when some other
@@ -158,16 +147,6 @@ pub fn preload_cuda_driver() -> Result<(), GpuError> {
             Ok(())
         })
         .clone()
-}
-
-/// Lossless CUDA-driver presence probe. `Ok(false)` means every candidate was
-/// genuinely absent; loader/ABI/transitive-dependency faults remain `Err`.
-pub fn cuda_driver_available() -> Result<bool, GpuError> {
-    match preload_cuda_driver() {
-        Ok(()) => Ok(true),
-        Err(GpuError::DriverLibraryUnavailable { .. }) => Ok(false),
-        Err(error) => Err(error),
-    }
 }
 
 #[cfg(test)]

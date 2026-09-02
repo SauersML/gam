@@ -86,7 +86,6 @@
 /// was a file-local convention; see module docs for why it must be shared.)
 pub const MADSEN_DAMPING_CAP: f64 = 1e12;
 
-
 /// Is a damped retry still alive at this damping level?
 #[inline]
 pub fn madsen_can_retry(damping: f64) -> bool {
@@ -204,15 +203,6 @@ impl IterationBound {
         madsen_retry_exhausted(damping, self.used, self.max)
     }
 
-    /// [`IterationBound::exhausted_at`] as a verdict, for consumers that
-    /// speak [`LoopVerdict`].
-    pub fn verdict_at(&self, damping: f64) -> LoopVerdict {
-        if self.exhausted_at(damping) {
-            LoopVerdict::Exhausted
-        } else {
-            LoopVerdict::Continue
-        }
-    }
 }
 
 /// Initial damping multiplier on the first rejection of an iteration.

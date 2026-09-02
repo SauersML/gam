@@ -364,106 +364,6 @@ mod tests {
     use crate::survival::marginal_slope::row_kernel::RigidRowInputs;
     use gam_math::nested_dual::JetField;
 
-    fn cuda_runtime_for_test(test_name: &str) -> Option<&'static gam_gpu::device_runtime::GpuRuntime> {
-        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
-            Ok(Some(runtime)) => Some(runtime),
-            Ok(None) => {
-                eprintln!("[{test_name}] no CUDA device — skipping");
-                None
-            }
-            Err(error) => panic!("[{test_name}] CUDA probe failed: {error}"),
-        }
-    }
-
-    /// #2422 device-free half, shared by this module's CUDA-gated tests. With
-    /// no runtime two production contracts still hold and are checkable:
-    /// the ADMISSION decision must decline even above `DEVICE_ROW_THRESHOLD`,
-    /// where only the missing device can hold it back; and the
-    /// already-admitted execution entry must REFUSE with the device-absence
-    /// reason rather than run something. A `return` before the first assertion
-    /// could see neither.
-    fn assert_survival_device_seam_declines() {
-        let selected = survival_rigid_row_vgh_device_selected(DEVICE_ROW_THRESHOLD + 1024)
-            .expect("the survival V/G/H admission decision must not fault on a device-free host");
-        assert!(
-            !selected,
-            "no CUDA runtime on this host, yet the production admission decision selected the \
-             device for {} rows",
-            DEVICE_ROW_THRESHOLD + 1024
-        );
-        let rows = fixture(4);
-        let refusal = match survival_rigid_row_vgh(&rows, 0.7) {
-            Ok(_) => panic!(
-                "no CUDA runtime on this host, yet the admitted-only survival V/G/H execution \
-                 entry returned channels — it fabricated a device answer"
-            ),
-            Err(reason) => reason,
-        };
-        assert!(
-            refusal.contains("requires a device"),
-            "the device-free refusal must name device absence, got: {refusal}"
-        );
-    }
-
-    #[inline]
-    fn rigid_cpu_row_inputs(
-        row: usize,
-        input: &SurvivalRowInputs,
-        probit_scale: f64,
-    ) -> RigidRowInputs {
-        RigidRowInputs {
-            row,
-            wi: input.wi,
-            di: input.di,
-            z_sum: input.z_sum,
-            covariance_ones: input.cov_ones,
-            probit_scale,
-            // The batch caller validates the monotonicity guard before dispatch.
-            qd1_lower: f64::NEG_INFINITY,
-        }
-    }
-
-    /// CPU execution of the canonical row program at its order-2 scalar.
-    #[must_use]
-    fn survival_rigid_row_vgh_cpu(
-        rows: &[SurvivalRowInputs],
-        probit_scale: f64,
-    ) -> SurvivalRowVghChannels {
-        use crate::survival::marginal_slope::row_kernel::rigid_row_order2;
-        use crate::survival::marginal_slope::slope_geometry::{
-            STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry,
-        };
-
-        let n = rows.len();
-        let mut value = vec![0.0_f64; n];
-        let mut grad = vec![0.0_f64; n * 4];
-        let mut hess = vec![0.0_f64; n * 16];
-        for (row, input) in rows.iter().enumerate() {
-            let in_row = rigid_cpu_row_inputs(row, input, probit_scale);
-            let p = input.primaries;
-            if let Ok((row_value, row_gradient, row_hessian)) = rigid_row_order2::<
-                STATIC_SLOPE_PRIMARIES,
-                StaticSlopeGeometry,
-            >(&p, &in_row)
-            {
-                value[row] = row_value;
-                grad[row * 4..row * 4 + 4].copy_from_slice(&row_gradient);
-                for a in 0..4 {
-                    hess[row * 16 + a * 4..row * 16 + a * 4 + 4].copy_from_slice(&row_hessian[a]);
-                }
-            }
-        }
-        SurvivalRowVghChannels { value, grad, hess }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn survival_rigid_row_vgh_device_only(
-        rows: &[SurvivalRowInputs],
-        probit_scale: f64,
-    ) -> Result<SurvivalRowVghChannels, String> {
-        device::survival_rigid_row_vgh_device(rows, probit_scale).map_err(|error| error.to_string())
-    }
-
     fn fixture(n: usize) -> Vec<SurvivalRowInputs> {
         (0..n)
             .map(|i| {
@@ -482,28 +382,6 @@ mod tests {
                 }
             })
             .collect()
-    }
-
-    fn edge_fixture() -> Vec<SurvivalRowInputs> {
-        let row = |primaries, wi, di, z_sum, cov_ones| SurvivalRowInputs {
-            primaries,
-            wi,
-            di,
-            z_sum,
-            cov_ones,
-        };
-        vec![
-            row([-0.4, 0.6, 0.9, 0.3], 1.0, 1.0, 0.2, 0.5),
-            row([-0.4, 0.6, 0.9, 0.3], 1.0, 0.0, 0.2, 0.5),
-            row([8.0, 9.0, 1.2, 2.5], 1.0, 0.0, -3.0, 1.0),
-            row([-8.0, -9.0, 1.2, -2.5], 1.0, 1.0, 3.0, 1.0),
-            row([40.0, 41.0, 0.7, 3.0], 1.0, 0.0, 0.0, 2.0),
-            row([-0.3, 0.5, 0.8, 1.5], 1.0, 1.0, 0.4, 1e-10),
-            row([-0.2, 0.4, 1.1, 4.0], 1.0, 1.0, 0.1, 50.0),
-            row([-0.5, 0.3, 0.6, 1e-9], 1.0, 0.0, 0.7, 0.9),
-            row([-0.5, 0.3, 0.6, 0.4], 0.0, 1.0, 0.7, 0.9),
-            row([-0.5, 0.3, 1e-3, 0.4], 1.0, 1.0, 0.2, 0.6),
-        ]
     }
 
     #[test]
@@ -542,22 +420,6 @@ mod tests {
     const PARITY_ABS_TOLERANCE: f64 = 1e-9;
     #[cfg(target_os = "linux")]
     const PARITY_REL_TOLERANCE: f64 = 1e-7;
-
-    #[cfg(target_os = "linux")]
-    fn assert_channel_parity(name: &str, cpu: &[f64], device: &[f64]) {
-        assert_eq!(cpu.len(), device.len(), "{name} channel length");
-        for (index, (&left, &right)) in cpu.iter().zip(device).enumerate() {
-            let same_nonfinite = left == right && left.is_infinite();
-            let scale = left.abs().max(right.abs());
-            let tolerance = PARITY_ABS_TOLERANCE + PARITY_REL_TOLERANCE * scale;
-            assert!(
-                same_nonfinite
-                    || (left.is_finite() && right.is_finite() && (left - right).abs() <= tolerance),
-                "survival VGH {name}[{index}] device drift: cpu={left:+.16e}, \
-                 device={right:+.16e}, tolerance={tolerance:.3e}",
-            );
-        }
-    }
 
     #[cfg(target_os = "linux")]
     #[test]

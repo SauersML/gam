@@ -3942,30 +3942,6 @@ impl SaeManifoldTerm {
         Ok((v, loss, converged_cache, evidence_artifacts))
     }
 
-    /// Value-only streaming criterion — the cache-returning
-    /// [`Self::penalized_quasi_laplace_criterion_streaming_exact_with_cache`] with the cache dropped.
-    pub fn penalized_quasi_laplace_criterion_streaming_exact(
-        &mut self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        registry: Option<&AnalyticPenaltyRegistry>,
-        inner_max_iter: usize,
-        learning_rate: f64,
-        ridge_ext_coord: f64,
-        ridge_beta: f64,
-    ) -> Result<(f64, SaeManifoldLoss), SaeCriterionError> {
-        self.penalized_quasi_laplace_criterion_streaming_exact_with_lane(
-            target,
-            rho,
-            registry,
-            inner_max_iter,
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-            None,
-        )
-    }
-
     /// [`Self::penalized_quasi_laplace_criterion_streaming_exact`] with the #2080 surrogate lane
     /// threaded to the streaming `log|S|` term (`None` = bit-identical SLQ).
     pub fn penalized_quasi_laplace_criterion_streaming_exact_with_lane(
@@ -3991,19 +3967,6 @@ impl SaeManifoldTerm {
                 lane,
             )?;
         Ok((cost, loss))
-    }
-
-    /// Value-only streaming reduced-Schur criterion log-det via the historical SLQ
-    /// lane — convenience over [`Self::streaming_exact_arrow_log_det_with_lane`]
-    /// with `lane = None` (bit-identical to the pre-#2080 SLQ path).
-    pub fn streaming_exact_arrow_log_det(
-        &mut self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        registry: Option<&AnalyticPenaltyRegistry>,
-        rank_inputs: Option<&mut StreamingRankInputs>,
-    ) -> Result<f64, String> {
-        self.streaming_exact_arrow_log_det_with_lane(target, rho, registry, rank_inputs, None)
     }
 
     /// #2509/#2515 Phase-2b — the arrow evidence operator carrying the EXACT
@@ -4300,28 +4263,6 @@ impl SaeManifoldTerm {
         // assembled operator instead of the constructor sentinel `0`.
         system.refresh_row_hessian_fingerprint();
         Ok((system, full_chunk))
-    }
-
-    /// Streaming reduced-Schur evidence `log|H| = Σ log|H_tt| + log|S|` with the
-    /// #2080 surrogate lane threaded to the `log|S|` term. `lane = None` runs the
-    /// bit-identical SLQ path; `lane = Some(state)` builds-or-reuses the frozen
-    /// derived-rank rational surrogate (matrix-free, desync-safe) instead.
-    pub fn streaming_exact_arrow_log_det_with_lane(
-        &mut self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        registry: Option<&AnalyticPenaltyRegistry>,
-        rank_inputs: Option<&mut StreamingRankInputs>,
-        lane: Option<&mut SurrogateLaneState>,
-    ) -> Result<f64, String> {
-        self.streaming_exact_arrow_log_det_with_lane_and_system(
-            target,
-            rho,
-            registry,
-            rank_inputs,
-            lane,
-        )
-        .map(|(log_det, _system)| log_det)
     }
 
     fn streaming_exact_arrow_log_det_with_lane_and_system(
@@ -5455,52 +5396,6 @@ impl SaeManifoldTerm {
         }
         acc
     }
-
-    /// Fold the row's Daleckii–Krein deflation differential into the single
-    /// t–t weight consumed by `SaeRowJetContraction::Trace` (#2333).
-    ///
-    /// For every symmetric derivative block `D`, the returned `E` satisfies
-    /// `sum(E⊙D) = tr(inv_vv·D) - deflation_block_correction(inv_vv,D)`. In
-    /// the spectral case this is `U ((Uᵀ inv_vv U) ⊙ F) Uᵀ`, using the
-    /// exact same `F` and gap convention as the correction. Gauge-only rows fold
-    /// the structural-null subtraction directly; undeflated or malformed
-    /// spectral rows preserve the raw selected inverse, matching the correction's
-    /// zero branch.
-    fn deflation_folded_trace_weight(
-        inv_vv: &Array2<f64>,
-        dirs: &[Array1<f64>],
-        spectrum: Option<&RowDeflationSpectrum>,
-    ) -> Array2<f64> {
-        let q = inv_vv.nrows();
-        let Some(spec) = spectrum else {
-            let mut e = inv_vv.clone();
-            for v in dirs {
-                for a in 0..q {
-                    let va = v.get(a).copied().unwrap_or(0.0);
-                    if va == 0.0 {
-                        continue;
-                    }
-                    for b in 0..q {
-                        e[[a, b]] -= va * v.get(b).copied().unwrap_or(0.0);
-                    }
-                }
-            }
-            return e;
-        };
-        let u = &spec.evecs;
-        if u.nrows() != q || u.ncols() != q {
-            return inv_vv.clone();
-        }
-        let mut folded = u.t().dot(inv_vv).dot(u);
-        let f = Self::row_deflation_frechet_coefficients(spec, q);
-        for a in 0..q {
-            for b in 0..q {
-                folded[[a, b]] *= f[[a, b]];
-            }
-        }
-        u.dot(&folded).dot(&u.t())
-    }
-
 
     /// The Daleckii–Krein coefficient matrix `F` of the per-row spectral
     /// deflation map `Φ`, in the row's RAW eigenbasis:
@@ -7370,129 +7265,54 @@ impl SaeManifoldTerm {
         })
     }
 
-    /// Public analytic outer-ρ gradient at a converged inner state, constructing
-    /// the deflated arrow solver from the supplied cache. Use this seam from
-    /// integration tests and external consumers that have a converged
-    /// `(loss, cache)` from [`Self::penalized_quasi_laplace_criterion_with_cache`] but no access to
-    /// the crate-private `DeflatedArrowSolver`.
-    pub fn analytic_outer_rho_gradient_at_converged(
-        &self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        loss: &SaeManifoldLoss,
-        cache: &ArrowFactorCache,
-    ) -> Result<SaeOuterRhoGradientComponents, String> {
-        self.assignment.validate_rho_domain(rho)?;
-        let solver = self.outer_gradient_arrow_solver(cache, &rho.lambda_smooth_vec()?)?;
-        self.analytic_outer_rho_gradient_components(target, rho, loss, cache, &solver)
-            .map_err(|e| e.to_string())
-    }
-
-    /// Compose the custom SAE quasi-Laplace criterion as a sum of atoms.
-    ///
-    /// This is the single seam that establishes value↔gradient coherence for
-    /// the SAE objective: it runs the inner solve once via
-    /// [`Self::penalized_quasi_laplace_criterion_with_cache`], reads the value decomposition
-    /// (`loss.total() + extra_penalty_energy`, the rank-adjusted Laplace
-    /// complexity, `occam`) and the
-    /// matching gradient channels (`SaeOuterRhoGradientComponents`) from the
-    /// SAME converged cache, and hands them to [`SaeCriterion::assemble`]. The
-    /// returned criterion's [`SaeCriterion::value`] and
-    /// [`SaeCriterion::gradient`] are then projections of one factorization —
-    /// the outer optimizer can no longer evaluate a value path and a gradient
-    /// path that disagree (the #752/#748/#901 desync class). The
-    /// implicit-stationarity envelope correction (#1006's Γ term) is its own
-    /// named atom, so the channel the desync class keeps dropping is visible
-    /// rather than a silent zero.
-    pub fn criterion_as_atoms(
-        &mut self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        registry: Option<&AnalyticPenaltyRegistry>,
-        inner_max_iter: usize,
-        learning_rate: f64,
-        ridge_ext_coord: f64,
-        ridge_beta: f64,
-    ) -> Result<SaeCriterion, SaeCriterionError> {
-        let (production_value, loss, cache) = self.penalized_quasi_laplace_criterion_with_cache(
-            target,
-            rho,
-            registry,
-            inner_max_iter,
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-        )?;
-        // #2509 — the log-determinant pair MUST be the one that priced
-        // `production_value`, because the 64-ulp identity check below compares the
-        // two. `penalized_quasi_laplace_criterion_with_cache` ranks the EXACT
-        // observed information `A = ∇²_θθ L = B + ΔC` (#2330 Phase-2,
-        // `exact_observed_information_log_dets`) on the dense direct-logdet route,
-        // and only falls back to the Arrow–Schur majorizer `B` when that route is
-        // NOT admitted and it delegates to the streaming implementation (which
-        // stamps its own `B` joint value onto the cache). Reading
-        // `arrow_log_det_from_cache` / `coordinate_block_log_det` unconditionally
-        // reads `B` off the cache's per-row Cholesky + Schur factor, so on the dense
-        // route the assembled value differed from the production value by exactly
-        // `½·[(log|A| − log|A_tt|) − (log|B| − log|B_tt|)]` and this seam REFUSED
-        // every fit with `ΔC ≠ 0`. Branch on the same admission predicate the
-        // criterion branches on so both readers price one operator.
-        let direct_logdet_route = self
-            .streaming_plan()?
-            .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())?
-            .direct_logdet_admitted();
-        let (log_det, log_det_tt) = if direct_logdet_route {
-            self.exact_observed_information_log_dets(rho, target, &cache)?
-        } else {
-            let joint = arrow_log_det_from_cache(&cache).ok_or_else(|| {
-                "criterion_as_atoms: arrow_log_det_from_cache returned None".to_string()
-            })?;
-            (joint, coordinate_block_log_det(&cache)?)
-        };
-        let residual = self.reconstruction_residual(target, rho)?;
-        let dispersion =
-            self.reconstruction_dispersion(&loss, &cache, rho, Some(residual.view()))?;
-        let d_eff = self.per_atom_realised_rank_dof(rho, dispersion)?;
-        let n_eff = self.per_atom_effective_sample_size();
-        let quasi_laplace_complexity =
-            rank_adjusted_quasi_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
-        let occam = self.reml_occam_term(rho)?;
-        let extra_penalty_energy = self
-            .reml_extra_penalty_value_total(registry)
-            .map_err(|err| format!("SaeManifoldTerm::criterion_as_atoms: {err}"))?;
-        let data_fit_priors_value = loss.total() + extra_penalty_energy;
-
-        let solver = self
-            .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec()?)
-            .map_err(|error| SaeCriterionError::Numerical(error.to_string()))?;
-        let components = self
-            .analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &solver)
-            .map_err(|error| SaeCriterionError::Numerical(error.to_string()))?;
-        let criterion = SaeCriterion::assemble(
-            data_fit_priors_value,
-            quasi_laplace_complexity,
-            occam,
-            components.explicit,
-            components.logdet_trace,
-            components.occam,
-            components.third_order_correction,
-        );
-        let assembled_value = criterion.value();
-        let identity_roundoff =
-            64.0 * f64::EPSILON * (1.0 + production_value.abs().max(assembled_value.abs()));
-        if (assembled_value - production_value).abs() > identity_roundoff {
-            return Err(SaeCriterionError::Numerical(format!(
-                "criterion_as_atoms: assembled value {assembled_value:.17e} does not equal \
-                 production value {production_value:.17e} from the same cache \
-                 (roundoff={identity_roundoff:.3e})"
-            )));
-        }
-        Ok(criterion)
-    }
-
     // [#780 line-count gate] reconstruction_dispersion + assemble_shape_uncertainty
     // + recompute_joint_shape_uncertainty + unavailable_shape_uncertainty
     // (the contiguous trailing methods of this impl block) were split into the
     // sibling construction_reconstruction.rs (declared in mod.rs); callers reach
     // them bare via use super::*.
+
+    /// Fold the row's Daleckii–Krein deflation differential into the single
+    /// t–t weight consumed by `SaeRowJetContraction::Trace` (#2333).
+    ///
+    /// For every symmetric derivative block `D`, the returned `E` satisfies
+    /// `sum(E⊙D) = tr(inv_vv·D) - deflation_block_correction(inv_vv,D)`. In
+    /// the spectral case this is `U ((Uᵀ inv_vv U) ⊙ F) Uᵀ`, using the
+    /// exact same `F` and gap convention as the correction. Gauge-only rows fold
+    /// the structural-null subtraction directly; undeflated or malformed
+    /// spectral rows preserve the raw selected inverse, matching the correction's
+    /// zero branch.
+    fn deflation_folded_trace_weight(
+        inv_vv: &Array2<f64>,
+        dirs: &[Array1<f64>],
+        spectrum: Option<&RowDeflationSpectrum>,
+    ) -> Array2<f64> {
+        let q = inv_vv.nrows();
+        let Some(spec) = spectrum else {
+            let mut e = inv_vv.clone();
+            for v in dirs {
+                for a in 0..q {
+                    let va = v.get(a).copied().unwrap_or(0.0);
+                    if va == 0.0 {
+                        continue;
+                    }
+                    for b in 0..q {
+                        e[[a, b]] -= va * v.get(b).copied().unwrap_or(0.0);
+                    }
+                }
+            }
+            return e;
+        };
+        let u = &spec.evecs;
+        if u.nrows() != q || u.ncols() != q {
+            return inv_vv.clone();
+        }
+        let mut folded = u.t().dot(inv_vv).dot(u);
+        let f = Self::row_deflation_frechet_coefficients(spec, q);
+        for a in 0..q {
+            for b in 0..q {
+                folded[[a, b]] *= f[[a, b]];
+            }
+        }
+        u.dot(&folded).dot(&u.t())
+    }
 }

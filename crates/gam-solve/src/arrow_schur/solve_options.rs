@@ -559,23 +559,6 @@ impl ArrowSolveOptions {
         }
     }
 
-    /// Force Square-Root BA Schur assembly for the direct reduced solve.
-    pub fn sqrt_ba() -> Self {
-        Self {
-            mode: ArrowSolverMode::SqrtBA,
-            gpu_policy: gam_gpu::GpuPolicy::Auto,
-            pcg: ArrowPcgOptions::default(),
-            trust_region: ArrowTrustRegionOptions::default(),
-            streaming_chunk_size: None,
-            riemannian_trust_region: false,
-            gpu_matvec: None,
-            evidence_policy: ArrowEvidencePolicy::Strict,
-            solve_precision: ArrowSolvePrecisionPolicy::F64Only,
-            newton_schur_tikhonov_rel_floor: None,
-            sae_resident_frame: None,
-        }
-    }
-
     /// Force inexact BA Schur PCG with Jacobi preconditioning.
     pub fn inexact_pcg() -> Self {
         Self {
@@ -591,11 +574,6 @@ impl ArrowSolveOptions {
             newton_schur_tikhonov_rel_floor: None,
             sae_resident_frame: None,
         }
-    }
-
-    pub fn with_streaming_chunk_size(mut self, chunk_size: Option<usize>) -> Self {
-        self.streaming_chunk_size = chunk_size.filter(|&chunk| chunk > 0);
-        self
     }
 
     /// Route every device probe made by this solve under one per-request
@@ -637,11 +615,6 @@ impl ArrowSolveOptions {
     /// directions. This never changes the evidence value or inverse.
     pub fn with_newton_schur_tikhonov(mut self, relative_floor: f64) -> Self {
         self.newton_schur_tikhonov_rel_floor = Some(relative_floor);
-        self
-    }
-
-    pub fn with_solve_precision_policy(mut self, policy: ArrowSolvePrecisionPolicy) -> Self {
-        self.solve_precision = policy;
         self
     }
 

@@ -700,9 +700,4 @@ impl ProjectedKktResidual {
         self.residual_tol
     }
 
-    /// Dimensionality of the free subspace: `total_p - active_set_size`
-    /// at the producing iterate. `None` from legacy construction sites.
-    pub fn free_rank(&self) -> Option<usize> {
-        self.free_rank
-    }
 }

@@ -48,10 +48,7 @@
 //! The API here is intentionally allocation-light and stateless so the seam can
 //! call it per row inside the design build without owning any outer state.
 
-use ndarray::{Array1, ArrayView1};
-
-use super::manifold::GeometryResult;
-use crate::manifolds::constant_curvature::{ConstantCurvature, log_map_kappa_jet};
+use ndarray::Array1;
 
 use super::closure_family::inv_std_normal;
 
@@ -148,11 +145,6 @@ pub enum KappaEstimateSupport {
 }
 
 impl KappaEstimateSupport {
-    /// `true` when the box constraint was active at `κ̂`, i.e. the reported
-    /// curvature is a property of the search box and not only of the data.
-    pub fn is_railed(self) -> bool {
-        !matches!(self, Self::Interior)
-    }
 
     /// Serialized provenance label, for the report surfaces.
     pub fn label(self) -> &'static str {
@@ -204,10 +196,6 @@ pub enum RangeEstimateSupport {
 }
 
 impl RangeEstimateSupport {
-    /// `true` when `ℓ̂` is an interior stationary point of the range criterion.
-    pub fn is_interior(self) -> bool {
-        matches!(self, Self::Interior)
-    }
 
     /// Serialized provenance label, for the report surfaces.
     pub fn label(self) -> &'static str {
@@ -488,26 +476,6 @@ pub struct DesignCoordKappaJet {
     pub d_kappa: Array1<f64>,
     /// `∂²coord/∂κ²`.
     pub d_kappa2: Array1<f64>,
-}
-
-/// Geodesic normal coordinate `log_{base}(point)` and its `∂/∂κ`, `∂²/∂κ²` on
-/// the constant-curvature chart — the per-row design quantity whose κ-movement
-/// the outer ψ-channel consumes (see the module-level `smooth.rs` seam note).
-///
-/// This is a thin, allocation-light adapter over [`log_map_kappa_jet`] so the
-/// seam has a single, intent-named entry point and does not re-derive which
-/// geometric quantity moves the design.
-pub fn design_coord_kappa_derivative(
-    manifold: &ConstantCurvature,
-    base: ArrayView1<'_, f64>,
-    point: ArrayView1<'_, f64>,
-) -> GeometryResult<DesignCoordKappaJet> {
-    let (coord, d_kappa, d_kappa2) = log_map_kappa_jet(manifold, base, point)?;
-    Ok(DesignCoordKappaJet {
-        coord,
-        d_kappa,
-        d_kappa2,
-    })
 }
 
 #[cfg(test)]

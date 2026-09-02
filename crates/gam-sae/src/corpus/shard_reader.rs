@@ -45,7 +45,7 @@
 use memmap2::Mmap;
 use ndarray::Array2;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Magic bytes identifying a `v1` activation shard.
@@ -359,27 +359,6 @@ impl MmapShardSource {
         })
     }
 
-    /// Open a source over every `*.shard` file in `dir`, ordered by file name
-    /// (the stable, OS-independent ordering that pins the deterministic global
-    /// row sequence).
-    pub fn open_dir(dir: &Path) -> Result<Self, ShardError> {
-        let mut paths: Vec<PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("shard") {
-                paths.push(path);
-            }
-        }
-        // Sort by file name bytes: deterministic and independent of the order
-        // the OS returns directory entries in.
-        paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-        if paths.is_empty() {
-            return Err(ShardError::Empty);
-        }
-        Self::open(&paths)
-    }
-
     /// True once every row of every shard has been yielded.
     #[inline]
     fn at_end(&self) -> bool {
@@ -462,30 +441,6 @@ impl CorpusRowSource for MmapShardSource {
         self.skip_drained_shards();
         Ok(Some(RowBatch { rows, row_ids }))
     }
-}
-
-/// Serialize a `(n_rows × p)` `f64` activation matrix to the `v1` shard byte
-/// layout, downcasting each value to `f32`.
-///
-/// This is the writer counterpart to [`MmapShardSource`] — used by ingestion
-/// tooling and by the round-trip tests below to prove the reader reproduces the
-/// exact rows it was given (up to the `f32` storage rounding the format
-/// promises). Rows are written in row-major order.
-pub fn encode_shard_bytes(rows: ndarray::ArrayView2<'_, f64>) -> Vec<u8> {
-    let n_rows = rows.nrows();
-    let p = rows.ncols();
-    let mut out = Vec::with_capacity(HEADER_LEN + n_rows * p * std::mem::size_of::<f32>());
-    out.extend_from_slice(&SHARD_MAGIC);
-    out.extend_from_slice(&(n_rows as u64).to_le_bytes());
-    out.extend_from_slice(&(p as u64).to_le_bytes());
-    out.extend_from_slice(&DTYPE_F32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    for row in rows.outer_iter() {
-        for &v in row.iter() {
-            out.extend_from_slice(&(v as f32).to_le_bytes());
-        }
-    }
-    out
 }
 
 #[cfg(test)]

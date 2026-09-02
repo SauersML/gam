@@ -43,8 +43,6 @@
 
 use std::collections::BTreeMap;
 
-use ndarray::Array1;
-
 /// Minimal bit-vector. Backing storage is `Vec<u64>` words.
 ///
 /// We expose only the operations the atom-selection layer needs: construction,
@@ -169,11 +167,6 @@ impl SparseAtomCode {
         self.active_mask.count_ones()
     }
 
-    /// Sum of active weights. For simplex-projected codes this should be ≈ 1.
-    pub fn active_weight_sum(&self) -> f64 {
-        self.active_mask.iter_ones().map(|k| self.weights[k]).sum()
-    }
-
     /// Set the weight for atom `k` and mark it active.
     pub fn assign(&mut self, k: usize, w: f64) {
         assert!(k < self.k_atoms());
@@ -181,22 +174,6 @@ impl SparseAtomCode {
         self.weights[k] = w;
     }
 
-    /// Deactivate atom `k` and zero its stored weight.
-    pub fn deactivate(&mut self, k: usize) {
-        assert!(k < self.k_atoms());
-        self.active_mask.set(k, false);
-        self.weights[k] = 0.0;
-    }
-
-    /// Materialize the *effective* weight vector (zeros at inactive indices)
-    /// as an owned `Array1`. Useful for matmul-shaped downstream code.
-    pub fn effective_weights(&self) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.k_atoms());
-        for k in self.active_mask.iter_ones() {
-            out[k] = self.weights[k];
-        }
-        out
-    }
 }
 
 /// Storage for the per-row codes of all `N` observations.
@@ -240,61 +217,6 @@ impl SparseAtomCodes {
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut SparseAtomCode> {
         self.codes.iter_mut()
-    }
-
-    /// Flatten weights into a single `(N, K)` array, with zeros where the
-    /// mask is unset. Allocates; intended for diagnostic / post-fit use.
-    pub fn weights_matrix(&self) -> ndarray::Array2<f64> {
-        let n = self.n_obs();
-        let k = self.k_atoms();
-        let mut out = ndarray::Array2::<f64>::zeros((n, k));
-        for n_idx in 0..n {
-            let code = &self.codes[n_idx];
-            for kk in code.active_mask.iter_ones() {
-                out[[n_idx, kk]] = code.weights[kk];
-            }
-        }
-        out
-    }
-
-    /// Co-activation statistics for one atom pair `(a, b)` — the #976
-    /// code-dependence trigger. Pure popcount ratios over the active masks:
-    /// `P(a|b) = #{rows: a∧b} / #{rows: b}` and symmetrically.
-    ///
-    /// Two derived readings drive the structure search:
-    ///
-    /// * [`CoactivationStats::dependence`] (symmetric, the FUSION trigger) —
-    ///   independent atoms with marginal activation rates `π_a, π_b` co-activate
-    ///   at rate `π_a·π_b`, so both conditionals stay near the marginals; a
-    ///   shattered curved family re-encoded as several near-duplicate atoms
-    ///   pushes *both* conditionals toward 1.
-    /// * [`CoactivationStats::absorption_asymmetry`] (the ABSORPTION-audit
-    ///   trigger) — an A⇒B hierarchy where sparsity folded B's content into A
-    ///   shows `P(parent|child) ≈ 1` without the converse, so a large asymmetry
-    ///   with one conditional near 1 flags the pair for the within-atom
-    ///   substructure audit (#907 race on the atom's own code distribution).
-    ///
-    /// These are *triggers*, not decisions: they rank move proposals
-    /// deterministically; acceptance is owned by the e-process gates in
-    /// [`gam_solve::structure_search`].
-    pub fn coactivation(&self, a: usize, b: usize) -> CoactivationStats {
-        assert!(
-            a < self.k_atoms && b < self.k_atoms,
-            "SparseAtomCodes::coactivation: atoms ({a}, {b}) out of range K={}",
-            self.k_atoms
-        );
-        let n_obs = self.n_obs();
-        let mut n_a = 0usize;
-        let mut n_b = 0usize;
-        let mut n_joint = 0usize;
-        for code in &self.codes {
-            let on_a = code.active_mask.get(a);
-            let on_b = code.active_mask.get(b);
-            n_a += usize::from(on_a);
-            n_b += usize::from(on_b);
-            n_joint += usize::from(on_a && on_b);
-        }
-        CoactivationStats::from_counts(n_obs, n_a, n_b, n_joint, self.weight_codependence(a, b))
     }
 
     /// All atom pairs that co-fire at least once, with their support and
@@ -364,64 +286,6 @@ impl SparseAtomCodes {
                 (a, b, stats)
             })
             .collect()
-    }
-
-    /// #976 — the AMPLITUDE half of the fusion criterion: the Pearson
-    /// correlation of the two atoms' activation WEIGHTS over the rows where both
-    /// are active. Support co-activation ([`CoactivationStats::dependence`]) only
-    /// says the two atoms fire together; it cannot distinguish a single curved
-    /// family SHATTERED across two near-duplicate atoms (where moving along the
-    /// family smoothly trades amplitude between the pair, so their weights are
-    /// strongly — typically negatively — correlated on the joint support) from
-    /// two GENUINELY INDEPENDENT atoms that merely happen to co-fire on the same
-    /// input class (weights uncorrelated). The magnitude `|ρ|` of this
-    /// correlation is the interaction-evidence the issue's fusion trigger pairs
-    /// with code dependence: high support-overlap AND high `|weight_correlation|`
-    /// is the shattering signature ("dependent codes + joint interaction
-    /// evidence"), whereas high overlap with `|ρ|≈0` is two independent features
-    /// that should NOT be fused.
-    ///
-    /// Returns `0.0` when fewer than two rows are jointly active or when either
-    /// atom's weight is constant on the joint support (an undefined correlation
-    /// is, for the trigger, "no amplitude dependence detected").
-    pub fn weight_codependence(&self, a: usize, b: usize) -> f64 {
-        assert!(
-            a < self.k_atoms && b < self.k_atoms,
-            "SparseAtomCodes::weight_codependence: atoms ({a}, {b}) out of range K={}",
-            self.k_atoms
-        );
-        let mut wa = Vec::new();
-        let mut wb = Vec::new();
-        for code in &self.codes {
-            if code.active_mask.get(a) && code.active_mask.get(b) {
-                wa.push(code.weights[a]);
-                wb.push(code.weights[b]);
-            }
-        }
-        let m = wa.len();
-        if m < 2 {
-            return 0.0;
-        }
-        let inv = 1.0 / m as f64;
-        let mean_a: f64 = wa.iter().sum::<f64>() * inv;
-        let mean_b: f64 = wb.iter().sum::<f64>() * inv;
-        let mut cov = 0.0_f64;
-        let mut var_a = 0.0_f64;
-        let mut var_b = 0.0_f64;
-        for i in 0..m {
-            let da = wa[i] - mean_a;
-            let db = wb[i] - mean_b;
-            cov += da * db;
-            var_a += da * da;
-            var_b += db * db;
-        }
-        if !(var_a > 0.0 && var_b > 0.0) {
-            return 0.0;
-        }
-        let rho = cov / (var_a.sqrt() * var_b.sqrt());
-        // Numerical clamp: accumulation can nudge a perfect ±1 a hair past the
-        // bound.
-        rho.clamp(-1.0, 1.0)
     }
 
     /// Universal per-token code lengths for the binary support process, in bits.
@@ -729,18 +593,6 @@ impl CoactivationStats {
         (self.p_a_given_b - self.p_b_given_a).abs()
     }
 
-    /// #976 — the combined FUSION evidence: `dependence · |weight_correlation|`.
-    /// A fusion proposal needs BOTH halves — the atoms must co-activate (support
-    /// dependence) AND their amplitudes must be dependent on the joint support
-    /// (the interaction evidence that a single curved family was shattered). Two
-    /// independent atoms that happen to co-fire score near 0 on the second factor
-    /// and so are NOT proposed for fusion even at high support overlap; a genuine
-    /// shattered pair scores high on both. This is the scalar the canonical-order
-    /// fusion ranking ("fusions by code dependence descending") should sort on,
-    /// and the threshold the e-process acceptance gate guards.
-    pub fn fusion_evidence(&self) -> f64 {
-        self.dependence() * self.weight_correlation.abs()
-    }
 }
 
 #[cfg(test)]

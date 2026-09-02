@@ -263,6 +263,7 @@ pub struct RowScaledJacobian {
 }
 
 impl BlockEffectiveJacobian for RowScaledJacobian {
+
     fn effective_jacobian_rows(
         &self,
         state: &FamilyLinearizationState<'_>,
@@ -297,9 +298,6 @@ impl BlockEffectiveJacobian for RowScaledJacobian {
         Ok(scaled)
     }
 
-    fn eta_row_scaling_for_skewness(&self) -> Option<Arc<[f64]>> {
-        Some(Arc::clone(&self.eta_scaling))
-    }
 }
 
 pub(crate) fn clamp_jacobian_rows(rows: Range<usize>, n: usize) -> Range<usize> {
@@ -927,10 +925,6 @@ pub enum CoefficientCoordinate {
 }
 
 impl CoefficientCoordinate {
-    /// Is this coordinate free to be reparameterised?
-    pub fn is_spanning(self) -> bool {
-        matches!(self, Self::Spanning)
-    }
 
     /// Does this coordinate carry model structure a reparameterisation would
     /// destroy?

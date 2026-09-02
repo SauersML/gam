@@ -7,8 +7,6 @@
 //! effect decision is added beside it. Realized intervention KL is retained as
 //! an empirical validation ledger, not as the derived Fisher effect weight.
 
-use crate::inference::intervention_shard::InterventionShard;
-
 /// Per-atom evidence in the existing reconstruction currency.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VarianceChargeEvidence {
@@ -125,57 +123,6 @@ impl StreamingFisherEffectAccumulator {
         Ok(())
     }
 
-    pub fn accumulate_firing_score_vector(
-        &mut self,
-        atom: usize,
-        ablation_delta_theta: &[f64],
-        score_vector: &[f64],
-    ) -> Result<f64, String> {
-        if ablation_delta_theta.len() != score_vector.len() {
-            return Err(format!(
-                "accumulate_firing_score_vector: ablation_delta_theta has length {} but score_vector has length {}",
-                ablation_delta_theta.len(),
-                score_vector.len()
-            ));
-        }
-        let mut score_dot_delta = 0.0_f64;
-        for j in 0..ablation_delta_theta.len() {
-            let delta = ablation_delta_theta[j];
-            let score = score_vector[j];
-            if !delta.is_finite() {
-                return Err(format!(
-                    "accumulate_firing_score_vector: ablation_delta_theta[{j}] is non-finite"
-                ));
-            }
-            if !score.is_finite() {
-                return Err(format!(
-                    "accumulate_firing_score_vector: score_vector[{j}] is non-finite"
-                ));
-            }
-            score_dot_delta += score * delta;
-        }
-        let fisher_quadratic_kl_nats = 0.5 * score_dot_delta * score_dot_delta;
-        self.accumulate_firing_local_kl(atom, fisher_quadratic_kl_nats)?;
-        Ok(fisher_quadratic_kl_nats)
-    }
-
-    pub fn record_realized_kl_validation(
-        &mut self,
-        atom: usize,
-        empirical_realized_kl_nats: f64,
-    ) -> Result<(), String> {
-        self.validate_atom(atom, "record_realized_kl_validation")?;
-        validate_nonnegative_finite(
-            "record_realized_kl_validation",
-            "empirical_realized_kl_nats",
-            empirical_realized_kl_nats,
-        )?;
-        self.realized_sums[atom] += empirical_realized_kl_nats;
-        self.realized_maxes[atom] = self.realized_maxes[atom].max(empirical_realized_kl_nats);
-        self.realized_counts[atom] += 1;
-        Ok(())
-    }
-
     pub fn finish(self) -> Vec<Option<FisherEffectEvidence>> {
         let mut out = Vec::with_capacity(self.atom_count);
         for atom in 0..self.atom_count {
@@ -232,39 +179,6 @@ pub struct AtomRetentionEvidence {
     pub retained: bool,
 }
 
-/// Compute the Fisher effect ledger from Rung-3 local-KL predictions.
-///
-/// Controls are excluded: they estimate measurement floor elsewhere and do not
-/// represent an ablation/interchange dose. The retained effect score is the
-/// streaming mean Fisher quadratic local-KL per executed non-control firing for
-/// the atom; realized KL is attached only as empirical validation.
-pub fn fisher_effect_from_interventions(
-    atom_count: usize,
-    shard: &InterventionShard,
-) -> Result<Vec<Option<FisherEffectEvidence>>, String> {
-    shard.validate()?;
-    let mut accumulator = StreamingFisherEffectAccumulator::new(atom_count);
-    for i in 0..shard.n_records() {
-        if shard.is_control[i] {
-            continue;
-        }
-        let atom = usize::try_from(shard.atom[i]).map_err(|err| {
-            format!(
-                "fisher_effect_from_interventions: record {i} atom id {} is invalid: {err}",
-                shard.atom[i]
-            )
-        })?;
-        if atom >= atom_count {
-            return Err(format!(
-                "fisher_effect_from_interventions: record {i} atom {atom} out of range for {atom_count} atoms"
-            ));
-        }
-        accumulator.accumulate_firing_local_kl(atom, shard.nu_hat_1[i])?;
-        accumulator.record_realized_kl_validation(atom, shard.nu_measured[i])?;
-    }
-    Ok(accumulator.finish())
-}
-
 /// Combine reconstruction and behavioral ledgers. Retention is an OR: an atom
 /// that pays either in variance/charge or in Fisher local-KL effect survives.
 pub fn effect_weighted_retention(
@@ -302,7 +216,6 @@ pub fn effect_weighted_retention(
     Ok(out)
 }
 
-
 /// Primary fit-quality report. Interchange accuracy is deliberately the headline
 /// because coordinates are useful only if interventions in those coordinates
 /// land in the intended downstream behavior; reconstruction EV is secondary.
@@ -324,16 +237,6 @@ impl EffectWeightedFitReport {
         })
     }
 
-    pub fn headline_line(self) -> String {
-        match self.headline {
-            FitQualityMetric::InterchangeAccuracy(v) => {
-                format!(
-                    "headline: interchange_accuracy={v:.6}; secondary: explained_variance={:.6}",
-                    self.explained_variance
-                )
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

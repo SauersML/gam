@@ -871,35 +871,6 @@ pub fn prediction_fingerprint(values: &[f64]) -> PredictionFingerprint {
     }
 }
 
-pub fn design_diagnostics(
-    design: &gam_linalg::matrix::DesignMatrix,
-) -> Result<DesignDiagnostics, String> {
-    use gam_linalg::faer_ndarray::FaerSvd;
-    let dense = design
-        .try_to_dense_by_chunks_budgeted("quality diagnostics design SVD", 256 * 1024 * 1024)?;
-    let (_u, s, _vt) = dense.svd(false, false).map_err(|e| e.to_string())?;
-    let sigma_max = s.iter().copied().fold(0.0, f64::max);
-    let tol = (design.nrows().max(design.ncols()) as f64) * f64::EPSILON * sigma_max.max(1.0);
-    let rank = s.iter().filter(|&&v| v > tol).count();
-    let sigma_min = s
-        .iter()
-        .copied()
-        .filter(|v| *v > tol)
-        .fold(0.0_f64, |a, v| if a == 0.0 { v } else { a.min(v) });
-    Ok(DesignDiagnostics {
-        nrows: design.nrows(),
-        ncols: design.ncols(),
-        rank,
-        condition: if sigma_min > 0.0 {
-            sigma_max / sigma_min
-        } else {
-            f64::INFINITY
-        },
-        sigma_min,
-        sigma_max,
-    })
-}
-
 pub fn penalty_diagnostics(
     penalties: &[gam_terms::smooth::BlockwisePenalty],
     lambdas: &[f64],
@@ -1239,4 +1210,33 @@ mod pad_to_tests {
         assert_eq!(train_wire[n_train], train[n_train - 1]);
         assert_eq!(train_wire[n - 1], train[n_train - 1]);
     }
+}
+
+pub fn design_diagnostics(
+    design: &gam_linalg::matrix::DesignMatrix,
+) -> Result<DesignDiagnostics, String> {
+    use gam_linalg::faer_ndarray::FaerSvd;
+    let dense = design
+        .try_to_dense_by_chunks_budgeted("quality diagnostics design SVD", 256 * 1024 * 1024)?;
+    let (_u, s, _vt) = dense.svd(false, false).map_err(|e| e.to_string())?;
+    let sigma_max = s.iter().copied().fold(0.0, f64::max);
+    let tol = (design.nrows().max(design.ncols()) as f64) * f64::EPSILON * sigma_max.max(1.0);
+    let rank = s.iter().filter(|&&v| v > tol).count();
+    let sigma_min = s
+        .iter()
+        .copied()
+        .filter(|v| *v > tol)
+        .fold(0.0_f64, |a, v| if a == 0.0 { v } else { a.min(v) });
+    Ok(DesignDiagnostics {
+        nrows: design.nrows(),
+        ncols: design.ncols(),
+        rank,
+        condition: if sigma_min > 0.0 {
+            sigma_max / sigma_min
+        } else {
+            f64::INFINITY
+        },
+        sigma_min,
+        sigma_max,
+    })
 }

@@ -26,26 +26,8 @@
 //! options dict, calls [`run_sparse_sae_audit`], and turns
 //! [`SparseSaeAuditReport`] into Python objects.
 
-use crate::null_sampler::{resample_sparse_architecture_null, AuditSparseRoute};
-
-fn residuals_from_sparse_sae(
-    data: ndarray::ArrayView2<'_, f32>,
-    decoder: ndarray::ArrayView2<'_, f32>,
-    route: &AuditSparseRoute,
-) -> Result<ndarray::Array2<f32>, String> {
-    if data.ncols() != decoder.ncols() || data.nrows() != route.nrows() {
-        return Err(format!(
-            "audit_sae data shape {:?} is incompatible with decoder {:?} and {} route rows",
-            data.dim(),
-            decoder.dim(),
-            route.nrows()
-        ));
-    }
-    let fitted = route.reconstruct(decoder)?;
-    let mut residuals = data.to_owned();
-    residuals -= &fitted;
-    Ok(residuals)
-}
+use crate::null_sampler::AuditSparseRoute;
+use crate::null_sampler::resample_sparse_architecture_null;
 
 #[derive(Clone, Copy, Default)]
 struct SparsePairAccum {
@@ -56,7 +38,6 @@ struct SparsePairAccum {
     sum_b2: f64,
     sum_ab: f64,
 }
-
 pub struct AbsorptionPairReport {
     pub a: usize,
     pub b: usize,
@@ -79,102 +60,6 @@ pub struct AbsorptionAuditReport {
     pub pairs: Vec<AbsorptionPairReport>,
 }
 
-fn absorption_audit(
-    route: &AuditSparseRoute,
-    activation_threshold: f32,
-    max_pairs: usize,
-) -> AbsorptionAuditReport {
-    let mut marginals = vec![0usize; route.n_units];
-    let mut accumulators = std::collections::BTreeMap::<(usize, usize), SparsePairAccum>::new();
-    for row in 0..route.nrows() {
-        let mut live = Vec::with_capacity(route.width());
-        for slot in 0..route.width() {
-            let weight = route.gate(row, slot);
-            if weight > activation_threshold as f64 {
-                let unit = route.indices[[row, slot]] as usize;
-                marginals[unit] += 1;
-                live.push((unit, weight));
-            }
-        }
-        live.sort_unstable_by_key(|(unit, _)| *unit);
-        for left in 0..live.len() {
-            for right in (left + 1)..live.len() {
-                let (a, wa) = live[left];
-                let (b, wb) = live[right];
-                let acc = accumulators.entry((a, b)).or_default();
-                acc.n_joint += 1;
-                acc.sum_a += wa;
-                acc.sum_b += wb;
-                acc.sum_a2 += wa * wa;
-                acc.sum_b2 += wb * wb;
-                acc.sum_ab += wa * wb;
-            }
-        }
-    }
-    let n_obs = route.nrows();
-    let mut pairs = accumulators
-        .into_iter()
-        .map(|((a, b), acc)| {
-            let n_a = marginals[a];
-            let n_b = marginals[b];
-            let conditional = |joint: usize, marginal: usize| {
-                if marginal == 0 {
-                    0.0
-                } else {
-                    joint as f64 / marginal as f64
-                }
-            };
-            let p_a_given_b = conditional(acc.n_joint, n_b);
-            let p_b_given_a = conditional(acc.n_joint, n_a);
-            let lift = if n_a == 0 || n_b == 0 || n_obs == 0 {
-                0.0
-            } else {
-                acc.n_joint as f64 * n_obs as f64 / (n_a as f64 * n_b as f64)
-            };
-            let weight_correlation = if acc.n_joint < 2 {
-                0.0
-            } else {
-                let n = acc.n_joint as f64;
-                let covariance = acc.sum_ab - acc.sum_a * acc.sum_b / n;
-                let variance_a = acc.sum_a2 - acc.sum_a * acc.sum_a / n;
-                let variance_b = acc.sum_b2 - acc.sum_b * acc.sum_b / n;
-                if variance_a > 0.0 && variance_b > 0.0 {
-                    (covariance / (variance_a.sqrt() * variance_b.sqrt())).clamp(-1.0, 1.0)
-                } else {
-                    0.0
-                }
-            };
-            let dependence = p_a_given_b.min(p_b_given_a);
-            AbsorptionPairReport {
-                a,
-                b,
-                n_obs,
-                n_a,
-                n_b,
-                n_joint: acc.n_joint,
-                p_a_given_b,
-                p_b_given_a,
-                lift,
-                weight_correlation,
-                dependence,
-                fusion_evidence: dependence * weight_correlation.abs(),
-                absorption_asymmetry: (p_a_given_b - p_b_given_a).abs(),
-            }
-        })
-        .collect::<Vec<_>>();
-    pairs.sort_by(|left, right| {
-        right
-            .absorption_asymmetry
-            .total_cmp(&left.absorption_asymmetry)
-    });
-    pairs.truncate(max_pairs);
-    AbsorptionAuditReport {
-        n_units: route.n_units,
-        activation_threshold,
-        pairs,
-    }
-}
-
 #[derive(Clone)]
 pub struct AuditTopologyRecord {
     pub atom: usize,
@@ -195,266 +80,122 @@ pub struct AuditAtlasReport {
     pub holonomy_unavailable_reason: Option<String>,
 }
 
-fn topology_records_from_codes(
-    coordinate_reports: &[crate::sparse_dict::BlockCoordinateReport],
-    block_size: usize,
-    activation_threshold: f32,
-) -> Vec<AuditTopologyRecord> {
-    let threshold = activation_threshold as f64;
-    if block_size == 1 {
-        // A scalar external SAE feature is a point/line chart, not a manifold:
-        // there is no circle/torus topology to audit. This mirrors the atlas
-        // nerve, which likewise declines the scalar `block_size == 1` shape, so a
-        // scalar dictionary reports zero topology atoms rather than one trivial
-        // point record per column.
-        return Vec::new();
-    }
-
-    let expected = crate::manifold::BettiSignature {
-        b0: 1,
-        b1: 1,
-        b2: None,
-    };
-    let mut records = Vec::with_capacity(coordinate_reports.len());
-    for report in coordinate_reports {
-        let live: Vec<_> = report
-            .firings
-            .iter()
-            .filter(|firing| firing.amplitude > threshold)
-            .collect();
-        if live.len() < 4 {
-            let measured = crate::manifold::BettiSignature {
-                b0: if live.is_empty() { 0 } else { 1 },
-                b1: 0,
-                b2: None,
-            };
-            records.push(AuditTopologyRecord {
-                atom: report.firings.first().map_or(0, |firing| firing.block),
-                support_size: live.len(),
-                landmark_count: live.len(),
-                covering_side: "below_covering_number".to_string(),
-                measured_betti: measured,
-                expected_betti: expected,
-                contested: measured != expected,
-                dominant_h1_persistence: 0.0,
-                dominant_h2_persistence: 0.0,
-                note: "under-resolved harmonic-circle block: fewer than four firing coordinates"
-                    .to_string(),
-            });
-            continue;
+pub fn atlas_refusal_code(
+    refusal: &crate::inference::atlas_holonomy::AtlasStatisticalRefusal,
+) -> &'static str {
+    use crate::inference::atlas_holonomy::AtlasStatisticalRefusal;
+    match refusal {
+        AtlasStatisticalRefusal::PilotProjectionUncertified { .. } => {
+            "pilot_projection_uncertified"
         }
-
-        let mut points = ndarray::Array2::<f64>::zeros((live.len(), 2));
-        for (row_idx, firing) in live.iter().enumerate() {
-            let phase = std::f64::consts::TAU * firing.t;
-            let (sin_phase, cos_phase) = phase.sin_cos();
-            points[[row_idx, 0]] = cos_phase;
-            points[[row_idx, 1]] = sin_phase;
+        AtlasStatisticalRefusal::PopulationSpectrumUncertified { .. } => {
+            "population_spectrum_uncertified"
         }
-        if let Some(verdict) = crate::manifold::topology_persistence_verdict(
-            points.view(),
-            &crate::manifold::SaeAtomBasisKind::Periodic,
-        ) {
-            records.push(AuditTopologyRecord {
-                atom: live[0].block,
-                support_size: verdict.support_size,
-                landmark_count: verdict.landmark_count,
-                covering_side: verdict.covering_side.as_str().to_string(),
-                measured_betti: verdict.measured_betti,
-                expected_betti: verdict.expected_betti,
-                contested: verdict.contested,
-                dominant_h1_persistence: verdict.dominant_h1_persistence,
-                dominant_h2_persistence: verdict.dominant_h2_persistence,
-                note: verdict.note,
-            });
+        AtlasStatisticalRefusal::GaussianLinearizationIsPlugin { .. } => {
+            "gaussian_linearization_is_plugin"
         }
-    }
-    records
-}
-
-/// Genuine chart-transfer certificate for one atlas-nerve gate between two
-/// charts, read from the frozen code matrix.
-///
-/// A gate stamped `valid = true` with zero transport/equivariance defect is a
-/// FABRICATED certificate: it admits every co-active chart pair as a nerve edge
-/// without running any transport test, so the reported topology is manufactured,
-/// not measured. The real certificate needs a square (≤2-D) chart-to-chart
-/// operator; only the harmonic circle lane (`block_size == 2`) exposes a 2-D
-/// per-row coordinate from which the empirical transfer operator `A` (least
-/// squares `X_a A ≈ X_b` over the rows that fire in BOTH charts) can be formed.
-/// `A` is certified against isometry (`‖AᵀA − I‖_F`) and SO(2) equivariance
-/// (`‖A·G − G·A‖_F`) by [`certify_square_transfer`], and validity is the
-/// library's own gate ([`AtlasTransferGate::from_square_transfer`]). Any other
-/// block width, fewer than two co-firing rows, a singular coordinate Gram, or a
-/// non-finite operator exposes no transfer gate at this boundary; the nerve
-/// records the observed overlap as rejected because no certificate exists.
-/// `block_a`/`block_b` index the dictionary blocks the two charts read;
-/// `chart_a`/`chart_b` are the nerve-vertex labels.
-fn chart_transfer_gate_sparse(
-    route: &AuditSparseRoute,
-    support_a: &crate::inference::atlas_nerve::AtlasChart,
-    support_b: &crate::inference::atlas_nerve::AtlasChart,
-    block_a: usize,
-    block_b: usize,
-    chart_a: usize,
-    chart_b: usize,
-) -> Result<Option<crate::inference::atlas_nerve::AtlasTransferGate>, String> {
-    use crate::inference::atlas_holonomy::AtlasHolonomyEdgeId;
-    use crate::inference::atlas_nerve::AtlasTransferGate;
-    let edge = AtlasHolonomyEdgeId::new(chart_a, chart_b, 0)?;
-    if route.block_size != 2 {
-        return Ok(None);
-    }
-    let mut xa: Vec<f64> = Vec::new();
-    let mut xb: Vec<f64> = Vec::new();
-    let mut position_a = 0usize;
-    let mut position_b = 0usize;
-    while position_a < support_a.support_rows().len() && position_b < support_b.support_rows().len()
-    {
-        let row_a = support_a.support_rows()[position_a];
-        let row_b = support_b.support_rows()[position_b];
-        if row_a < row_b {
-            position_a += 1;
-            continue;
+        AtlasStatisticalRefusal::DegenerateFirstOrderLimitUnresolved { .. } => {
+            "degenerate_first_order_limit_unresolved"
         }
-        if row_b < row_a {
-            position_b += 1;
-            continue;
+        AtlasStatisticalRefusal::PopulationCrossGramMarginUncertified { .. } => {
+            "population_cross_gram_margin_uncertified"
         }
-        let row = row_a;
-        let mut a = None;
-        let mut b = None;
-        for slot in 0..route.width() {
-            let unit = route.indices[[row, slot]] as usize;
-            let value = [
-                route.values[[row, slot, 0]] as f64,
-                route.values[[row, slot, 1]] as f64,
-            ];
-            if value[0] * value[0] + value[1] * value[1] == 0.0 {
-                continue;
-            }
-            if unit == block_a {
-                a = Some(value);
-            } else if unit == block_b {
-                b = Some(value);
-            }
+        AtlasStatisticalRefusal::SingularProjectedCrossGram { .. } => {
+            "singular_projected_cross_gram"
         }
-        if let (Some([a0, a1]), Some([b0, b1])) = (a, b) {
-            xa.extend([a0, a1]);
-            xb.extend([b0, b1]);
+        AtlasStatisticalRefusal::PatchTailCrossesEigengap { .. } => "patch_tail_crosses_eigengap",
+        AtlasStatisticalRefusal::OrientationFlipBoundExceedsLevel { .. } => {
+            "orientation_flip_bound_exceeds_level"
         }
-        position_a += 1;
-        position_b += 1;
-    }
-    let n_co = xa.len() / 2;
-    if n_co < 2 {
-        return Ok(None);
-    }
-    let x_a = ndarray::Array2::from_shape_vec((n_co, 2), xa)
-        .map_err(|error| format!("chart {chart_a} overlap coordinates are malformed: {error}"))?;
-    let x_b = ndarray::Array2::from_shape_vec((n_co, 2), xb)
-        .map_err(|error| format!("chart {chart_b} overlap coordinates are malformed: {error}"))?;
-    // Empirical chart-to-chart transfer operator `A = (X_aᵀX_a)⁻¹ X_aᵀX_b`
-    // solving `X_a A ≈ X_b` over the co-firing rows.
-    let Ok(operator) =
-        crate::chart_transfer::pulled_back_operator(x_a.view(), x_b.view())
-    else {
-        return Ok(None);
-    };
-    // Both charts are circles, so the shared infinitesimal-rotation generator is
-    // the SO(2) generator `[[0,−1],[1,0]]`.
-    let generator = ndarray::array![[0.0_f64, -1.0], [1.0, 0.0]];
-    match crate::chart_transfer::certify_square_transfer(
-        operator.view(),
-        generator.view(),
-        generator.view(),
-    ) {
-        Ok(cert) => Ok(Some(AtlasTransferGate::from_square_transfer(edge, cert, 2))),
-        Err(_) => Ok(None),
+        AtlasStatisticalRefusal::ImproperCycleHolonomy { .. } => "improper_cycle_holonomy",
+        AtlasStatisticalRefusal::PolarLinearizationUnresolved { .. } => {
+            "polar_linearization_unresolved"
+        }
+        AtlasStatisticalRefusal::CycleAngleBranchCutCrossed { .. } => {
+            "cycle_angle_branch_cut_crossed"
+        }
+        AtlasStatisticalRefusal::GaussBonnetRoundingMarginExhausted { .. } => {
+            "gauss_bonnet_rounding_margin_exhausted"
+        }
+        AtlasStatisticalRefusal::GaussBonnetErrorBoundExceedsLevel { .. } => {
+            "gauss_bonnet_error_bound_exceeds_level"
+        }
+        AtlasStatisticalRefusal::GaussBonnetGaussianLinearizationIsPlugin => {
+            "gauss_bonnet_gaussian_linearization_is_plugin"
+        }
+        AtlasStatisticalRefusal::GaussBonnetFirstOrderLimitDegenerate { .. } => {
+            "gauss_bonnet_first_order_limit_degenerate"
+        }
     }
 }
 
-/// Build the fitted Gaussian-PCA holonomy analysis on a deterministic global
-/// cross-fit. Even rows fit every live chart's pilot frame; odd rows are
-/// assigned to exactly one live chart for inference. Consequently no pilot row
-/// is reused for inference and patch inference sets are pairwise disjoint.
-/// Spectrum values remain typed plug-in estimates, so the core reports an
-/// analyzed refusal rather than manufacturing a finite-sample certificate.
-fn cross_fitted_holonomy_from_ambient(
-    charts: &[crate::inference::atlas_nerve::AtlasChart],
-    admitted_edges: &[crate::inference::atlas_holonomy::AtlasHolonomyEdgeId],
-    data: ndarray::ArrayView2<'_, f64>,
-    familywise_alpha: f64,
-) -> Result<crate::inference::atlas_holonomy::AtlasHolonomyCertificate, String> {
-    use crate::inference::atlas_holonomy::{
-        AtlasFamilywiseLevel, AtlasHolonomyCertificate, GaussianPatchRowSplit,
-        GaussianPcaErrorModel, GaussianPcaPatch, PopulationCrossGramProvenance,
-        ProjectedAtlasEdgeSpec,
-    };
-    if data.ncols() < 3 {
-        return Err(format!(
-            "cross-fitted atlas holonomy needs at least three ambient coordinates, got {}",
-            data.ncols()
-        ));
-    }
-    let mut live_by_row = vec![Vec::<usize>::new(); data.nrows()];
-    for (chart, patch) in charts.iter().enumerate() {
-        for &row in patch.support_rows() {
-            if row >= data.nrows() {
-                return Err(format!(
-                    "atlas chart {chart} support row {row} exceeds ambient data height {}",
-                    data.nrows()
-                ));
-            }
-            live_by_row[row].push(chart);
-        }
-    }
-    let mut pilot_rows = vec![Vec::<usize>::new(); charts.len()];
-    let mut inference_rows = vec![Vec::<usize>::new(); charts.len()];
-    for (row, live) in live_by_row.iter().enumerate() {
-        if row % 2 == 0 {
-            for &chart in live {
-                pilot_rows[chart].push(row);
-            }
-        } else if !live.is_empty() {
-            let owner = live[(row / 2) % live.len()];
-            inference_rows[owner].push(row);
-        }
-    }
-    let mut patches = Vec::with_capacity(charts.len());
-    for chart in 0..charts.len() {
-        let split = GaussianPatchRowSplit::new(
-            std::mem::take(&mut pilot_rows[chart]),
-            std::mem::take(&mut inference_rows[chart]),
-        )?;
-        patches.push(GaussianPcaPatch::fit_cross_fitted_plugin(
-            chart,
-            split,
-            data.view(),
-            data.ncols(),
-        )?);
-    }
-    let error_model = GaussianPcaErrorModel::independent(&patches)?;
-    let edge_specs = admitted_edges
-        .iter()
-        .copied()
-        .map(|edge| {
-            ProjectedAtlasEdgeSpec::new(
-                edge.a(),
-                edge.b(),
-                edge.overlap(),
-                PopulationCrossGramProvenance::EstimatedOnly,
-                0.0,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    AtlasHolonomyCertificate::gaussian_pca(
-        patches,
-        edge_specs,
-        error_model,
-        AtlasFamilywiseLevel::new(familywise_alpha)?,
-        None,
-    )
+/// Monte-Carlo operating points for the standing null battery / spike-in
+/// calibration `audit_sae` attaches to its topology and atlas-nerve claims.
+/// Surfaced on the FFI so callers can widen the null replicate count or move the
+/// spike-in operating point; the FFI defaults are the reporting operating
+/// points.
+#[derive(Clone, Copy, Debug)]
+pub struct StandingCalibrationConfig {
+    pub null_replicates: usize,
+    pub null_seed: u64,
+    pub spikein_trials: usize,
+    pub spikein_snr: f64,
+    pub spikein_false_positive_rate: f64,
+}
+
+/// Knobs the sparse-route audit runs under. Every field is a reporting operating
+/// point rather than a correctness switch: the caller may widen the null
+/// replicate count or move the spike-in point without changing what the audit
+/// certifies.
+#[derive(Clone, Debug)]
+pub struct SparseSaeAuditConfig {
+    pub block_size: usize,
+    pub delta: f64,
+    /// Optimality-ratio quantiles reported by the routability audit.
+    pub quantile_levels: Vec<f64>,
+    pub max_candidates: usize,
+    /// Dictionary blocks promoted to atlas charts; `None` selects every block.
+    pub coordinate_blocks: Option<Vec<usize>>,
+    pub activation_threshold: f32,
+    pub max_absorption_pairs: usize,
+    pub transport_theta_in: Option<Vec<f64>>,
+    pub transport_theta_out: Option<Vec<f64>>,
+    pub transport_layer_from: usize,
+    pub transport_layer_to: usize,
+    pub calibration: StandingCalibrationConfig,
+}
+
+/// The frozen artifacts one audit reads: the dictionary, the observed route, the
+/// activations it was read from, and the architecture-matched donor route the
+/// standing null resamples. Bundled so the entry keeps a one-argument signature
+/// and each array is named at the call site rather than positional among six
+/// same-shaped neighbours.
+pub struct SparseSaeAuditRequest {
+    pub decoder: ndarray::Array2<f32>,
+    pub route_indices: ndarray::Array2<u32>,
+    pub route_values: ndarray::Array3<f32>,
+    pub data: ndarray::Array2<f32>,
+    pub donor_indices: ndarray::Array2<u32>,
+    pub donor_values: ndarray::Array3<f32>,
+    pub config: SparseSaeAuditConfig,
+}
+
+/// Everything one sparse-route audit measures. The binding marshals these
+/// fields; it recomputes none of them.
+pub struct SparseSaeAuditReport {
+    pub block_size: usize,
+    pub n_units: usize,
+    pub route_rows: usize,
+    pub route_width: usize,
+    pub decoder_shape: (usize, usize),
+    pub routability: crate::routability::RoutabilityAudit,
+    pub dual: crate::dual_certificate::DualCertificateReport,
+    pub coordinate_reports: Vec<crate::sparse_dict::BlockCoordinateReport>,
+    pub topology_records: Vec<AuditTopologyRecord>,
+    pub atlas_nerve: Option<AuditAtlasReport>,
+    pub absorption: AbsorptionAuditReport,
+    pub transport: Option<crate::inference::transport_class::CircleTransportReport>,
+    pub calibration: Option<crate::null_battery::ClaimNullCalibration>,
 }
 
 pub fn atlas_nerve_from_sparse_route(
@@ -588,218 +329,6 @@ pub fn atlas_nerve_from_sparse_route(
         diagram,
         holonomy_unavailable_reason,
     }))
-}
-
-pub fn atlas_refusal_code(
-    refusal: &crate::inference::atlas_holonomy::AtlasStatisticalRefusal,
-) -> &'static str {
-    use crate::inference::atlas_holonomy::AtlasStatisticalRefusal;
-    match refusal {
-        AtlasStatisticalRefusal::PilotProjectionUncertified { .. } => {
-            "pilot_projection_uncertified"
-        }
-        AtlasStatisticalRefusal::PopulationSpectrumUncertified { .. } => {
-            "population_spectrum_uncertified"
-        }
-        AtlasStatisticalRefusal::GaussianLinearizationIsPlugin { .. } => {
-            "gaussian_linearization_is_plugin"
-        }
-        AtlasStatisticalRefusal::DegenerateFirstOrderLimitUnresolved { .. } => {
-            "degenerate_first_order_limit_unresolved"
-        }
-        AtlasStatisticalRefusal::PopulationCrossGramMarginUncertified { .. } => {
-            "population_cross_gram_margin_uncertified"
-        }
-        AtlasStatisticalRefusal::SingularProjectedCrossGram { .. } => {
-            "singular_projected_cross_gram"
-        }
-        AtlasStatisticalRefusal::PatchTailCrossesEigengap { .. } => "patch_tail_crosses_eigengap",
-        AtlasStatisticalRefusal::OrientationFlipBoundExceedsLevel { .. } => {
-            "orientation_flip_bound_exceeds_level"
-        }
-        AtlasStatisticalRefusal::ImproperCycleHolonomy { .. } => "improper_cycle_holonomy",
-        AtlasStatisticalRefusal::PolarLinearizationUnresolved { .. } => {
-            "polar_linearization_unresolved"
-        }
-        AtlasStatisticalRefusal::CycleAngleBranchCutCrossed { .. } => {
-            "cycle_angle_branch_cut_crossed"
-        }
-        AtlasStatisticalRefusal::GaussBonnetRoundingMarginExhausted { .. } => {
-            "gauss_bonnet_rounding_margin_exhausted"
-        }
-        AtlasStatisticalRefusal::GaussBonnetErrorBoundExceedsLevel { .. } => {
-            "gauss_bonnet_error_bound_exceeds_level"
-        }
-        AtlasStatisticalRefusal::GaussBonnetGaussianLinearizationIsPlugin => {
-            "gauss_bonnet_gaussian_linearization_is_plugin"
-        }
-        AtlasStatisticalRefusal::GaussBonnetFirstOrderLimitDegenerate { .. } => {
-            "gauss_bonnet_first_order_limit_degenerate"
-        }
-    }
-}
-
-/// Monte-Carlo operating points for the standing null battery / spike-in
-/// calibration `audit_sae` attaches to its topology and atlas-nerve claims.
-/// Surfaced on the FFI so callers can widen the null replicate count or move the
-/// spike-in operating point; the FFI defaults are the reporting operating
-/// points.
-#[derive(Clone, Copy, Debug)]
-pub struct StandingCalibrationConfig {
-    pub null_replicates: usize,
-    pub null_seed: u64,
-    pub spikein_trials: usize,
-    pub spikein_snr: f64,
-    pub spikein_false_positive_rate: f64,
-}
-
-/// Atlas-nerve topological-richness statistic over a fixed-width sparse route.
-/// The statistic never materializes the logical `N×K` code matrix.
-fn sparse_atlas_nerve_richness_statistic(
-    route: &AuditSparseRoute,
-    chart_blocks: &[usize],
-    activation_threshold: f64,
-) -> Result<f64, String> {
-    let report = atlas_nerve_from_sparse_route(
-        route,
-        activation_threshold as f32,
-        Some(chart_blocks),
-        None,
-        None,
-    )?
-    .ok_or_else(|| "atlas null statistic requires at least two block charts".to_string())?;
-    let richness = report
-        .diagram
-        .simplex_counts
-        .iter()
-        .skip(1)
-        .map(|&count| count as f64)
-        .sum::<f64>();
-    if !richness.is_finite() {
-        return Err("atlas nerve richness overflowed finite reporting range".to_string());
-    }
-    Ok(richness)
-}
-
-/// Build the standing sparse donor null + residual spike-in calibration. Both
-/// observed and donor routing remain `N×s×b`; implicit zeros are never expanded.
-fn standing_sparse_null_calibration(
-    route: &AuditSparseRoute,
-    donor: &AuditSparseRoute,
-    residuals_f64: ndarray::ArrayView2<'_, f64>,
-    chart_blocks: &[usize],
-    activation_threshold: f64,
-    cfg: &StandingCalibrationConfig,
-) -> Result<Option<crate::null_battery::ClaimNullCalibration>, String> {
-    use crate::null_battery as nb;
-    if chart_blocks.len() < 2
-        || donor.n_units != route.n_units
-        || donor.block_size != route.block_size
-        || residuals_f64.nrows() < 4
-        || residuals_f64.ncols() < 2
-        || cfg.null_replicates == 0
-        || cfg.spikein_trials == 0
-    {
-        return Ok(None);
-    }
-    use rand::SeedableRng;
-    let observed =
-        sparse_atlas_nerve_richness_statistic(route, chart_blocks, activation_threshold)?;
-    let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.null_seed);
-    let mut samples = Vec::with_capacity(cfg.null_replicates);
-    for _ in 0..cfg.null_replicates {
-        let surrogate = resample_sparse_architecture_null(route, donor, &mut rng)?;
-        samples.push(sparse_atlas_nerve_richness_statistic(
-            &surrogate,
-            chart_blocks,
-            activation_threshold,
-        )?);
-    }
-    let null_summary = nb::summarize_null_distribution(
-        nb::NullKind::ArchitectureMatchedRandomWeight,
-        observed,
-        samples,
-        nb::Tail::Larger,
-    )?;
-    let nulls = nb::NullBatteryReport {
-        observed,
-        summaries: vec![null_summary],
-    };
-    // Spike-in power: plant a synthetic circle into the real audit residuals and
-    // measure the default block-chart/topology detector's recovery rate at the
-    // requested false-positive operating point. Bootstrapping the empirical
-    // residual rows keeps the real post-fit covariance and tails in the loop.
-    let mut roc_config = nb::SpikeInRocConfig::circle(
-        vec![0.0, cfg.spikein_snr],
-        cfg.spikein_trials,
-        cfg.null_seed,
-    );
-    roc_config.noise_mode = nb::SpikeInNoiseMode::EmpiricalResidualBootstrap;
-    roc_config.fpr_levels = vec![cfg.spikein_false_positive_rate];
-    let roc = nb::default_spike_in_roc_curve(residuals_f64, &roc_config)?;
-    let report = nb::calibrated_roc_claim_report(
-        "audit_sae.topology_atlas_nerve",
-        cfg.spikein_snr,
-        cfg.spikein_false_positive_rate,
-        nulls,
-        roc,
-    )?;
-    Ok(Some(nb::ClaimNullCalibration::from_calibrated_roc(report)?))
-}
-
-/// Knobs the sparse-route audit runs under. Every field is a reporting operating
-/// point rather than a correctness switch: the caller may widen the null
-/// replicate count or move the spike-in point without changing what the audit
-/// certifies.
-#[derive(Clone, Debug)]
-pub struct SparseSaeAuditConfig {
-    pub block_size: usize,
-    pub delta: f64,
-    /// Optimality-ratio quantiles reported by the routability audit.
-    pub quantile_levels: Vec<f64>,
-    pub max_candidates: usize,
-    /// Dictionary blocks promoted to atlas charts; `None` selects every block.
-    pub coordinate_blocks: Option<Vec<usize>>,
-    pub activation_threshold: f32,
-    pub max_absorption_pairs: usize,
-    pub transport_theta_in: Option<Vec<f64>>,
-    pub transport_theta_out: Option<Vec<f64>>,
-    pub transport_layer_from: usize,
-    pub transport_layer_to: usize,
-    pub calibration: StandingCalibrationConfig,
-}
-
-/// The frozen artifacts one audit reads: the dictionary, the observed route, the
-/// activations it was read from, and the architecture-matched donor route the
-/// standing null resamples. Bundled so the entry keeps a one-argument signature
-/// and each array is named at the call site rather than positional among six
-/// same-shaped neighbours.
-pub struct SparseSaeAuditRequest {
-    pub decoder: ndarray::Array2<f32>,
-    pub route_indices: ndarray::Array2<u32>,
-    pub route_values: ndarray::Array3<f32>,
-    pub data: ndarray::Array2<f32>,
-    pub donor_indices: ndarray::Array2<u32>,
-    pub donor_values: ndarray::Array3<f32>,
-    pub config: SparseSaeAuditConfig,
-}
-
-/// Everything one sparse-route audit measures. The binding marshals these
-/// fields; it recomputes none of them.
-pub struct SparseSaeAuditReport {
-    pub block_size: usize,
-    pub n_units: usize,
-    pub route_rows: usize,
-    pub route_width: usize,
-    pub decoder_shape: (usize, usize),
-    pub routability: crate::routability::RoutabilityAudit,
-    pub dual: crate::dual_certificate::DualCertificateReport,
-    pub coordinate_reports: Vec<crate::sparse_dict::BlockCoordinateReport>,
-    pub topology_records: Vec<AuditTopologyRecord>,
-    pub atlas_nerve: Option<AuditAtlasReport>,
-    pub absorption: AbsorptionAuditReport,
-    pub transport: Option<crate::inference::transport_class::CircleTransportReport>,
-    pub calibration: Option<crate::null_battery::ClaimNullCalibration>,
 }
 
 /// Run the whole sparse-route SAE audit: routability floor, dual certificate,
@@ -1020,4 +549,475 @@ pub fn run_sparse_sae_audit(
         transport,
         calibration,
     })
+}
+
+fn absorption_audit(
+    route: &AuditSparseRoute,
+    activation_threshold: f32,
+    max_pairs: usize,
+) -> AbsorptionAuditReport {
+    let mut marginals = vec![0usize; route.n_units];
+    let mut accumulators = std::collections::BTreeMap::<(usize, usize), SparsePairAccum>::new();
+    for row in 0..route.nrows() {
+        let mut live = Vec::with_capacity(route.width());
+        for slot in 0..route.width() {
+            let weight = route.gate(row, slot);
+            if weight > activation_threshold as f64 {
+                let unit = route.indices[[row, slot]] as usize;
+                marginals[unit] += 1;
+                live.push((unit, weight));
+            }
+        }
+        live.sort_unstable_by_key(|(unit, _)| *unit);
+        for left in 0..live.len() {
+            for right in (left + 1)..live.len() {
+                let (a, wa) = live[left];
+                let (b, wb) = live[right];
+                let acc = accumulators.entry((a, b)).or_default();
+                acc.n_joint += 1;
+                acc.sum_a += wa;
+                acc.sum_b += wb;
+                acc.sum_a2 += wa * wa;
+                acc.sum_b2 += wb * wb;
+                acc.sum_ab += wa * wb;
+            }
+        }
+    }
+    let n_obs = route.nrows();
+    let mut pairs = accumulators
+        .into_iter()
+        .map(|((a, b), acc)| {
+            let n_a = marginals[a];
+            let n_b = marginals[b];
+            let conditional = |joint: usize, marginal: usize| {
+                if marginal == 0 {
+                    0.0
+                } else {
+                    joint as f64 / marginal as f64
+                }
+            };
+            let p_a_given_b = conditional(acc.n_joint, n_b);
+            let p_b_given_a = conditional(acc.n_joint, n_a);
+            let lift = if n_a == 0 || n_b == 0 || n_obs == 0 {
+                0.0
+            } else {
+                acc.n_joint as f64 * n_obs as f64 / (n_a as f64 * n_b as f64)
+            };
+            let weight_correlation = if acc.n_joint < 2 {
+                0.0
+            } else {
+                let n = acc.n_joint as f64;
+                let covariance = acc.sum_ab - acc.sum_a * acc.sum_b / n;
+                let variance_a = acc.sum_a2 - acc.sum_a * acc.sum_a / n;
+                let variance_b = acc.sum_b2 - acc.sum_b * acc.sum_b / n;
+                if variance_a > 0.0 && variance_b > 0.0 {
+                    (covariance / (variance_a.sqrt() * variance_b.sqrt())).clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                }
+            };
+            let dependence = p_a_given_b.min(p_b_given_a);
+            AbsorptionPairReport {
+                a,
+                b,
+                n_obs,
+                n_a,
+                n_b,
+                n_joint: acc.n_joint,
+                p_a_given_b,
+                p_b_given_a,
+                lift,
+                weight_correlation,
+                dependence,
+                fusion_evidence: dependence * weight_correlation.abs(),
+                absorption_asymmetry: (p_a_given_b - p_b_given_a).abs(),
+            }
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_by(|left, right| {
+        right
+            .absorption_asymmetry
+            .total_cmp(&left.absorption_asymmetry)
+    });
+    pairs.truncate(max_pairs);
+    AbsorptionAuditReport {
+        n_units: route.n_units,
+        activation_threshold,
+        pairs,
+    }
+}
+
+/// Genuine chart-transfer certificate for one atlas-nerve gate between two
+/// charts, read from the frozen code matrix.
+///
+/// A gate stamped `valid = true` with zero transport/equivariance defect is a
+/// FABRICATED certificate: it admits every co-active chart pair as a nerve edge
+/// without running any transport test, so the reported topology is manufactured,
+/// not measured. The real certificate needs a square (≤2-D) chart-to-chart
+/// operator; only the harmonic circle lane (`block_size == 2`) exposes a 2-D
+/// per-row coordinate from which the empirical transfer operator `A` (least
+/// squares `X_a A ≈ X_b` over the rows that fire in BOTH charts) can be formed.
+/// `A` is certified against isometry (`‖AᵀA − I‖_F`) and SO(2) equivariance
+/// (`‖A·G − G·A‖_F`) by [`certify_square_transfer`], and validity is the
+/// library's own gate ([`AtlasTransferGate::from_square_transfer`]). Any other
+/// block width, fewer than two co-firing rows, a singular coordinate Gram, or a
+/// non-finite operator exposes no transfer gate at this boundary; the nerve
+/// records the observed overlap as rejected because no certificate exists.
+/// `block_a`/`block_b` index the dictionary blocks the two charts read;
+/// `chart_a`/`chart_b` are the nerve-vertex labels.
+fn chart_transfer_gate_sparse(
+    route: &AuditSparseRoute,
+    support_a: &crate::inference::atlas_nerve::AtlasChart,
+    support_b: &crate::inference::atlas_nerve::AtlasChart,
+    block_a: usize,
+    block_b: usize,
+    chart_a: usize,
+    chart_b: usize,
+) -> Result<Option<crate::inference::atlas_nerve::AtlasTransferGate>, String> {
+    use crate::inference::atlas_holonomy::AtlasHolonomyEdgeId;
+    use crate::inference::atlas_nerve::AtlasTransferGate;
+    let edge = AtlasHolonomyEdgeId::new(chart_a, chart_b, 0)?;
+    if route.block_size != 2 {
+        return Ok(None);
+    }
+    let mut xa: Vec<f64> = Vec::new();
+    let mut xb: Vec<f64> = Vec::new();
+    let mut position_a = 0usize;
+    let mut position_b = 0usize;
+    while position_a < support_a.support_rows().len() && position_b < support_b.support_rows().len()
+    {
+        let row_a = support_a.support_rows()[position_a];
+        let row_b = support_b.support_rows()[position_b];
+        if row_a < row_b {
+            position_a += 1;
+            continue;
+        }
+        if row_b < row_a {
+            position_b += 1;
+            continue;
+        }
+        let row = row_a;
+        let mut a = None;
+        let mut b = None;
+        for slot in 0..route.width() {
+            let unit = route.indices[[row, slot]] as usize;
+            let value = [
+                route.values[[row, slot, 0]] as f64,
+                route.values[[row, slot, 1]] as f64,
+            ];
+            if value[0] * value[0] + value[1] * value[1] == 0.0 {
+                continue;
+            }
+            if unit == block_a {
+                a = Some(value);
+            } else if unit == block_b {
+                b = Some(value);
+            }
+        }
+        if let (Some([a0, a1]), Some([b0, b1])) = (a, b) {
+            xa.extend([a0, a1]);
+            xb.extend([b0, b1]);
+        }
+        position_a += 1;
+        position_b += 1;
+    }
+    let n_co = xa.len() / 2;
+    if n_co < 2 {
+        return Ok(None);
+    }
+    let x_a = ndarray::Array2::from_shape_vec((n_co, 2), xa)
+        .map_err(|error| format!("chart {chart_a} overlap coordinates are malformed: {error}"))?;
+    let x_b = ndarray::Array2::from_shape_vec((n_co, 2), xb)
+        .map_err(|error| format!("chart {chart_b} overlap coordinates are malformed: {error}"))?;
+    // Empirical chart-to-chart transfer operator `A = (X_aᵀX_a)⁻¹ X_aᵀX_b`
+    // solving `X_a A ≈ X_b` over the co-firing rows.
+    let Ok(operator) =
+        crate::chart_transfer::pulled_back_operator(x_a.view(), x_b.view())
+    else {
+        return Ok(None);
+    };
+    // Both charts are circles, so the shared infinitesimal-rotation generator is
+    // the SO(2) generator `[[0,−1],[1,0]]`.
+    let generator = ndarray::array![[0.0_f64, -1.0], [1.0, 0.0]];
+    match crate::chart_transfer::certify_square_transfer(
+        operator.view(),
+        generator.view(),
+        generator.view(),
+    ) {
+        Ok(cert) => Ok(Some(AtlasTransferGate::from_square_transfer(edge, cert, 2))),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Build the fitted Gaussian-PCA holonomy analysis on a deterministic global
+/// cross-fit. Even rows fit every live chart's pilot frame; odd rows are
+/// assigned to exactly one live chart for inference. Consequently no pilot row
+/// is reused for inference and patch inference sets are pairwise disjoint.
+/// Spectrum values remain typed plug-in estimates, so the core reports an
+/// analyzed refusal rather than manufacturing a finite-sample certificate.
+fn cross_fitted_holonomy_from_ambient(
+    charts: &[crate::inference::atlas_nerve::AtlasChart],
+    admitted_edges: &[crate::inference::atlas_holonomy::AtlasHolonomyEdgeId],
+    data: ndarray::ArrayView2<'_, f64>,
+    familywise_alpha: f64,
+) -> Result<crate::inference::atlas_holonomy::AtlasHolonomyCertificate, String> {
+    use crate::inference::atlas_holonomy::{
+        AtlasFamilywiseLevel, AtlasHolonomyCertificate, GaussianPatchRowSplit,
+        GaussianPcaErrorModel, GaussianPcaPatch, PopulationCrossGramProvenance,
+        ProjectedAtlasEdgeSpec,
+    };
+    if data.ncols() < 3 {
+        return Err(format!(
+            "cross-fitted atlas holonomy needs at least three ambient coordinates, got {}",
+            data.ncols()
+        ));
+    }
+    let mut live_by_row = vec![Vec::<usize>::new(); data.nrows()];
+    for (chart, patch) in charts.iter().enumerate() {
+        for &row in patch.support_rows() {
+            if row >= data.nrows() {
+                return Err(format!(
+                    "atlas chart {chart} support row {row} exceeds ambient data height {}",
+                    data.nrows()
+                ));
+            }
+            live_by_row[row].push(chart);
+        }
+    }
+    let mut pilot_rows = vec![Vec::<usize>::new(); charts.len()];
+    let mut inference_rows = vec![Vec::<usize>::new(); charts.len()];
+    for (row, live) in live_by_row.iter().enumerate() {
+        if row % 2 == 0 {
+            for &chart in live {
+                pilot_rows[chart].push(row);
+            }
+        } else if !live.is_empty() {
+            let owner = live[(row / 2) % live.len()];
+            inference_rows[owner].push(row);
+        }
+    }
+    let mut patches = Vec::with_capacity(charts.len());
+    for chart in 0..charts.len() {
+        let split = GaussianPatchRowSplit::new(
+            std::mem::take(&mut pilot_rows[chart]),
+            std::mem::take(&mut inference_rows[chart]),
+        )?;
+        patches.push(GaussianPcaPatch::fit_cross_fitted_plugin(
+            chart,
+            split,
+            data.view(),
+            data.ncols(),
+        )?);
+    }
+    let error_model = GaussianPcaErrorModel::independent(&patches)?;
+    let edge_specs = admitted_edges
+        .iter()
+        .copied()
+        .map(|edge| {
+            ProjectedAtlasEdgeSpec::new(
+                edge.a(),
+                edge.b(),
+                edge.overlap(),
+                PopulationCrossGramProvenance::EstimatedOnly,
+                0.0,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    AtlasHolonomyCertificate::gaussian_pca(
+        patches,
+        edge_specs,
+        error_model,
+        AtlasFamilywiseLevel::new(familywise_alpha)?,
+        None,
+    )
+}
+
+fn residuals_from_sparse_sae(
+    data: ndarray::ArrayView2<'_, f32>,
+    decoder: ndarray::ArrayView2<'_, f32>,
+    route: &AuditSparseRoute,
+) -> Result<ndarray::Array2<f32>, String> {
+    if data.ncols() != decoder.ncols() || data.nrows() != route.nrows() {
+        return Err(format!(
+            "audit_sae data shape {:?} is incompatible with decoder {:?} and {} route rows",
+            data.dim(),
+            decoder.dim(),
+            route.nrows()
+        ));
+    }
+    let fitted = route.reconstruct(decoder)?;
+    let mut residuals = data.to_owned();
+    residuals -= &fitted;
+    Ok(residuals)
+}
+
+/// Build the standing sparse donor null + residual spike-in calibration. Both
+/// observed and donor routing remain `N×s×b`; implicit zeros are never expanded.
+fn standing_sparse_null_calibration(
+    route: &AuditSparseRoute,
+    donor: &AuditSparseRoute,
+    residuals_f64: ndarray::ArrayView2<'_, f64>,
+    chart_blocks: &[usize],
+    activation_threshold: f64,
+    cfg: &StandingCalibrationConfig,
+) -> Result<Option<crate::null_battery::ClaimNullCalibration>, String> {
+    use crate::null_battery as nb;
+    if chart_blocks.len() < 2
+        || donor.n_units != route.n_units
+        || donor.block_size != route.block_size
+        || residuals_f64.nrows() < 4
+        || residuals_f64.ncols() < 2
+        || cfg.null_replicates == 0
+        || cfg.spikein_trials == 0
+    {
+        return Ok(None);
+    }
+    use rand::SeedableRng;
+    let observed =
+        sparse_atlas_nerve_richness_statistic(route, chart_blocks, activation_threshold)?;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.null_seed);
+    let mut samples = Vec::with_capacity(cfg.null_replicates);
+    for _ in 0..cfg.null_replicates {
+        let surrogate = resample_sparse_architecture_null(route, donor, &mut rng)?;
+        samples.push(sparse_atlas_nerve_richness_statistic(
+            &surrogate,
+            chart_blocks,
+            activation_threshold,
+        )?);
+    }
+    let null_summary = nb::summarize_null_distribution(
+        nb::NullKind::ArchitectureMatchedRandomWeight,
+        observed,
+        samples,
+        nb::Tail::Larger,
+    )?;
+    let nulls = nb::NullBatteryReport {
+        observed,
+        summaries: vec![null_summary],
+    };
+    // Spike-in power: plant a synthetic circle into the real audit residuals and
+    // measure the default block-chart/topology detector's recovery rate at the
+    // requested false-positive operating point. Bootstrapping the empirical
+    // residual rows keeps the real post-fit covariance and tails in the loop.
+    let mut roc_config = nb::SpikeInRocConfig::circle(
+        vec![0.0, cfg.spikein_snr],
+        cfg.spikein_trials,
+        cfg.null_seed,
+    );
+    roc_config.noise_mode = nb::SpikeInNoiseMode::EmpiricalResidualBootstrap;
+    roc_config.fpr_levels = vec![cfg.spikein_false_positive_rate];
+    let roc = nb::default_spike_in_roc_curve(residuals_f64, &roc_config)?;
+    let report = nb::calibrated_roc_claim_report(
+        "audit_sae.topology_atlas_nerve",
+        cfg.spikein_snr,
+        cfg.spikein_false_positive_rate,
+        nulls,
+        roc,
+    )?;
+    Ok(Some(nb::ClaimNullCalibration::from_calibrated_roc(report)?))
+}
+
+fn topology_records_from_codes(
+    coordinate_reports: &[crate::sparse_dict::BlockCoordinateReport],
+    block_size: usize,
+    activation_threshold: f32,
+) -> Vec<AuditTopologyRecord> {
+    let threshold = activation_threshold as f64;
+    if block_size == 1 {
+        // A scalar external SAE feature is a point/line chart, not a manifold:
+        // there is no circle/torus topology to audit. This mirrors the atlas
+        // nerve, which likewise declines the scalar `block_size == 1` shape, so a
+        // scalar dictionary reports zero topology atoms rather than one trivial
+        // point record per column.
+        return Vec::new();
+    }
+
+    let expected = crate::manifold::BettiSignature {
+        b0: 1,
+        b1: 1,
+        b2: None,
+    };
+    let mut records = Vec::with_capacity(coordinate_reports.len());
+    for report in coordinate_reports {
+        let live: Vec<_> = report
+            .firings
+            .iter()
+            .filter(|firing| firing.amplitude > threshold)
+            .collect();
+        if live.len() < 4 {
+            let measured = crate::manifold::BettiSignature {
+                b0: if live.is_empty() { 0 } else { 1 },
+                b1: 0,
+                b2: None,
+            };
+            records.push(AuditTopologyRecord {
+                atom: report.firings.first().map_or(0, |firing| firing.block),
+                support_size: live.len(),
+                landmark_count: live.len(),
+                covering_side: "below_covering_number".to_string(),
+                measured_betti: measured,
+                expected_betti: expected,
+                contested: measured != expected,
+                dominant_h1_persistence: 0.0,
+                dominant_h2_persistence: 0.0,
+                note: "under-resolved harmonic-circle block: fewer than four firing coordinates"
+                    .to_string(),
+            });
+            continue;
+        }
+
+        let mut points = ndarray::Array2::<f64>::zeros((live.len(), 2));
+        for (row_idx, firing) in live.iter().enumerate() {
+            let phase = std::f64::consts::TAU * firing.t;
+            let (sin_phase, cos_phase) = phase.sin_cos();
+            points[[row_idx, 0]] = cos_phase;
+            points[[row_idx, 1]] = sin_phase;
+        }
+        if let Some(verdict) = crate::manifold::topology_persistence_verdict(
+            points.view(),
+            &crate::manifold::SaeAtomBasisKind::Periodic,
+        ) {
+            records.push(AuditTopologyRecord {
+                atom: live[0].block,
+                support_size: verdict.support_size,
+                landmark_count: verdict.landmark_count,
+                covering_side: verdict.covering_side.as_str().to_string(),
+                measured_betti: verdict.measured_betti,
+                expected_betti: verdict.expected_betti,
+                contested: verdict.contested,
+                dominant_h1_persistence: verdict.dominant_h1_persistence,
+                dominant_h2_persistence: verdict.dominant_h2_persistence,
+                note: verdict.note,
+            });
+        }
+    }
+    records
+}
+
+/// Atlas-nerve topological-richness statistic over a fixed-width sparse route.
+/// The statistic never materializes the logical `N×K` code matrix.
+fn sparse_atlas_nerve_richness_statistic(
+    route: &AuditSparseRoute,
+    chart_blocks: &[usize],
+    activation_threshold: f64,
+) -> Result<f64, String> {
+    let report = atlas_nerve_from_sparse_route(
+        route,
+        activation_threshold as f32,
+        Some(chart_blocks),
+        None,
+        None,
+    )?
+    .ok_or_else(|| "atlas null statistic requires at least two block charts".to_string())?;
+    let richness = report
+        .diagram
+        .simplex_counts
+        .iter()
+        .skip(1)
+        .map(|&count| count as f64)
+        .sum::<f64>();
+    if !richness.is_finite() {
+        return Err("atlas nerve richness overflowed finite reporting range".to_string());
+    }
+    Ok(richness)
 }

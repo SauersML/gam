@@ -326,26 +326,6 @@ pub struct BlockSparseConvergence {
     pub certified: bool,
 }
 
-impl BlockSparseConvergence {
-    /// A certificate whose every residual is exactly zero against a positive
-    /// tolerance, with no accepted births or polar failures — a trivially
-    /// converged full-alternation fixed point. Used to mint [`BlockSparseFit`]
-    /// values from fixed, hand-authored block routings.
-    pub fn trivially_converged() -> Self {
-        Self {
-            ev_residual: 0.0,
-            gamma_residual: 0.0,
-            frame_residual: 0.0,
-            routing_residual: 0.0,
-            reconstruction_residual: 0.0,
-            accepted_births: 0,
-            polar_failures: 0,
-            tolerance: 1e-6,
-            certified: true,
-        }
-    }
-}
-
 impl BlockSparseFit {
     /// Dense reconstruction `N×P` from the sparse block routing:
     /// `x̂_i = Σ_{g∈S_i} z_{ig} D_g`. Allocates the data-size `N×P`, not `N×K`.
@@ -372,27 +352,6 @@ impl BlockSparseFit {
         out
     }
 
-    /// Read the MATRYOSHKA-PREFIX reconstruction loss at atom prefix `K`.
-    ///
-    /// `K` must be one of the logged prefix atom counts in
-    /// [`Self::matryoshka_prefix_losses`]. The readout is intentionally exact:
-    /// callers asking for an unlogged rung should choose the ladder up front
-    /// rather than silently interpolating or refitting.
-    pub fn read_loss_at_prefix(&self, k_atoms: usize) -> Result<f64, String> {
-        self.matryoshka_prefix_losses
-            .iter()
-            .find(|&&(k, _)| k == k_atoms)
-            .map(|&(_, loss)| loss)
-            .ok_or_else(|| {
-                format!(
-                    "BlockSparseFit has no MATRYOSHKA-PREFIX loss at K={k_atoms}; logged prefixes: {:?}",
-                    self.matryoshka_prefix_losses
-                        .iter()
-                        .map(|&(k, _)| k)
-                        .collect::<Vec<_>>()
-                )
-            })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -442,60 +401,6 @@ pub fn route_row_blocks(gates: &[f32], k: usize) -> Vec<(u32, f32)> {
         sel.offer(g as u32, gate);
     }
     sel.finish()
-}
-
-/// Reconstruction of one row from a chosen block set under the frames `decoder`
-/// and the tied scalar `γ`: `x̂ = γ Σ_{g∈sel} (x D_gᵀ) D_g`. Returns the dense
-/// `ℝᵖ` reconstruction. Only the gauge-invariant subspace projector `P_g` of each
-/// selected block enters, so `x̂` (and therefore the loss below) is invariant to
-/// each block's internal `O(b)` basis.
-pub fn reconstruct_row(
-    row: ArrayView1<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
-    selected: &[u32],
-    gamma: f32,
-    b: usize,
-) -> Array1<f32> {
-    let p = row.len();
-    let mut out = Array1::<f32>::zeros(p);
-    for &g in selected {
-        let g = g as usize;
-        // w_g = x D_gᵀ, then add γ · w_g D_g.
-        for r in 0..b {
-            let atom = decoder.row(g * b + r);
-            let mut wr = 0.0f32;
-            for (xr, ar) in row.iter().zip(atom.iter()) {
-                wr += *xr * *ar;
-            }
-            let coef = gamma * wr;
-            if coef == 0.0 {
-                continue;
-            }
-            for c in 0..p {
-                out[c] += coef * atom[c];
-            }
-        }
-    }
-    out
-}
-
-/// Squared reconstruction loss `‖x − x̂‖₂²` of one row under a block set — the
-/// gauge-invariant per-row objective the tests compare across basis rotations.
-pub fn row_loss(
-    row: ArrayView1<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
-    selected: &[u32],
-    gamma: f32,
-    b: usize,
-) -> f64 {
-    let recon = reconstruct_row(row, decoder, selected, gamma, b);
-    row.iter()
-        .zip(recon.iter())
-        .map(|(&x, &r)| {
-            let d = x as f64 - r as f64;
-            d * d
-        })
-        .sum()
 }
 
 // ---------------------------------------------------------------------------

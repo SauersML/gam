@@ -40,15 +40,12 @@
 use ndarray::{Array1, Array2, ArrayView1};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Salt mixed into the per-table hyperplane seed so the index tables and the
 /// default sketch never share a random stream even when handed the same base
 /// seed.
 const INDEX_HYPERPLANE_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// Salt for the default random-projection sketch's projection matrix.
-const SKETCH_PROJECTION_SALT: u64 = 0xC2B2_AE3D_27D4_EB4F;
 
 /// Numerical floor below which a direction / column is treated as zero.
 const DIRECTION_NORM_FLOOR: f64 = 1e-12;
@@ -63,65 +60,6 @@ pub const CANDIDATE_BUDGET_MIN: usize = 32;
 /// dictionary grows; beyond this the proposal step stops being the bottleneck
 /// reduction it exists to be.
 pub const CANDIDATE_BUDGET_MAX: usize = 128;
-
-/// Auto-derive the per-row candidate budget `C` from the dictionary size `K`
-/// (#985): `C = 8·⌈log₂ K⌉`, clamped to
-/// [[`CANDIDATE_BUDGET_MIN`], [`CANDIDATE_BUDGET_MAX`]]. Logarithmic growth
-/// keeps the per-row local block effectively constant-size while giving larger
-/// dictionaries a little more recall headroom; the clamp realizes the issue's
-/// `C ≈ 32–128` band. Magic-by-default: derived from `K` alone, no flag.
-///
-/// Concretely: `K = 64 → 48`, `K = 1024 → 80`, `K = 10⁵ → 128`.
-pub fn auto_candidate_budget(num_atoms: usize) -> usize {
-    let log2 = if num_atoms <= 1 {
-        1
-    } else {
-        (usize::BITS - (num_atoms - 1).leading_zeros()) as usize
-    };
-    (8 * log2).clamp(CANDIDATE_BUDGET_MIN, CANDIDATE_BUDGET_MAX)
-}
-
-/// Two-stage routing shortlist size (stage-1 candidate budget `C`) DERIVED from
-/// the **routability floor** (#985 / E1) — no magic constant.
-///
-/// The default large-`K` route is two-stage: an LSH shortlist of size `C` (stage
-/// 1, sublinear) is exactly rescored on the frame gate (stage 2). This function
-/// sizes that shortlist from the interference floor rather than a hand-tuned band.
-///
-/// The routability floor's **union-bound term** ([`crate::routability`]) is
-/// `u = √(2·ln(K/δ)/p)`: the deviation, in target-to-clutter units, at which the
-/// EXPECTED number of off-target atoms whose random-projection gate exceeds a
-/// routable target's gate equals `δ`, because `K·exp(−p·u²/2) = δ` under the same
-/// Gaussian–Lipschitz union bound that sets the floor. Isolating the `s` genuine
-/// top-`s` winners among `K` atoms down to that floor, at confidence `1 − δ`,
-/// costs a shortlist that additionally covers the confusable band, whose
-/// log-multiplicity is exactly `p·u² = 2·ln(K/δ)`:
-///
-/// ```text
-///     C  =  s  +  ⌈ p·u² ⌉  =  s + ⌈ 2·ln(K/δ) ⌉.
-/// ```
-///
-/// The term `p·u²` is read straight off [`crate::routability::routability_floor`]
-/// (union = `floor − √(1/p)`), so the shortlist and the interference floor move
-/// together. `C` is LOGARITHMIC (sublinear) in `K`, monotone non-decreasing in
-/// `K`, and widens as the confidence tightens (`δ → 0`); it is clamped to
-/// `[s+1, K]`. The recall license
-/// ([`SaeCandidateIndex::proposal_recall_report`]) then certifies empirically that
-/// at this `C` the two-stage route recovers the exact top-`s` for the routable
-/// rows — the "matches exhaustive top-s to a derived bound" acceptance.
-pub fn routability_shortlist_size(p: usize, num_atoms: usize, top_s: usize, delta: f64) -> usize {
-    let k = num_atoms.max(1);
-    // The closed-form floor for the linear atom lane (b_max = 1). Reading it back
-    // out ties the shortlist to the exact quantity the router's floor is built on.
-    let floor = crate::routability::routability_floor(p.max(1), k, 1, delta);
-    // Peel the subspace term √(b_max/p) = √(1/p) to recover the union term u.
-    let subspace = (1.0 / p.max(1) as f64).sqrt();
-    let union = (floor.floor - subspace).max(0.0);
-    // Confusable-band log-multiplicity p·u² = 2·ln(K/δ).
-    let band = (p.max(1) as f64) * union * union;
-    let c = top_s.saturating_add(band.ceil() as usize);
-    c.clamp(top_s.saturating_add(1), k)
-}
 
 // ---------------------------------------------------------------------------
 // Sketch interface
@@ -237,48 +175,6 @@ pub struct RandomProjectionFrameSketch {
 }
 
 impl RandomProjectionFrameSketch {
-    /// Build the sketch from decoder column blocks.
-    ///
-    /// `decoder_blocks[k]` is `B_k` with shape `(p, m_k)`: `p` rows in output
-    /// space, `m_k` decoder columns for atom `k`. (`SaeManifoldAtom` stores the
-    /// transpose `(m_k, p)`; orient it `p`-rows before passing in.) All blocks
-    /// must share the same `p`. `sketch_dim` is the target sketch length `s`;
-    /// `seed` makes the projection deterministic.
-    pub fn from_decoder_blocks(
-        decoder_blocks: &[Array2<f64>],
-        sketch_dim: usize,
-        seed: u64,
-    ) -> Result<Self, String> {
-        if decoder_blocks.is_empty() {
-            return Err("RandomProjectionFrameSketch: need at least one decoder block".into());
-        }
-        if sketch_dim == 0 {
-            return Err("RandomProjectionFrameSketch: sketch_dim must be positive".into());
-        }
-        let output_dim = decoder_blocks[0].nrows();
-        if output_dim == 0 {
-            return Err("RandomProjectionFrameSketch: output dimension must be positive".into());
-        }
-        for (k, block) in decoder_blocks.iter().enumerate() {
-            if block.nrows() != output_dim {
-                return Err(format!(
-                    "RandomProjectionFrameSketch: atom {k} has {} output rows, expected {output_dim}",
-                    block.nrows()
-                ));
-            }
-        }
-
-        let frames: Vec<Array2<f64>> = decoder_blocks.iter().map(orthonormal_frame).collect();
-
-        let projection = gaussian_projection(sketch_dim, output_dim, seed ^ SKETCH_PROJECTION_SALT);
-
-        Ok(Self {
-            frames,
-            projection,
-            output_dim,
-            sketch_dim,
-        })
-    }
 
     /// In-range component `U_k U_kᵀ d` of a direction (length `output_dim`).
     fn in_range_component(&self, atom_id: usize, direction: ArrayView1<f64>) -> Array1<f64> {
@@ -410,11 +306,8 @@ impl AtomFrameSketch for RandomProjectionFrameSketch {
 /// identical tables.
 pub struct SaeCandidateIndex {
     /// Hyperplane banks, one per table: each `(bits_per_table, sketch_dim)`.
-    hyperplanes: Vec<Array2<f64>>,
     /// Buckets per table: signature -> atom ids.
-    tables: Vec<HashMap<u64, Vec<usize>>>,
     /// Sketch dimension shared by every atom.
-    sketch_dim: usize,
     /// Number of atoms indexed.
     num_atoms: usize,
 }
@@ -522,9 +415,6 @@ impl SaeCandidateIndex {
         }
 
         Ok(Self {
-            hyperplanes,
-            tables,
-            sketch_dim,
             num_atoms,
         })
     }
@@ -534,323 +424,6 @@ impl SaeCandidateIndex {
         self.num_atoms
     }
 
-    /// Gather the raw candidate atom-id set for a query `direction`, *without*
-    /// ranking or budget truncation. This is the sublinear part: it sketches the
-    /// query once per table (using a frame-agnostic global query sketch — the
-    /// query direction projected by the index's own representative projection)
-    /// and unions the colliding buckets (plus Hamming-1 neighbours when
-    /// multi-probe is enabled).
-    ///
-    /// `query_sketch` is the sketch-space query vector (length `sketch_dim`),
-    /// produced by the caller from the row residual via the
-    /// [`AtomFrameSketch`]. We probe each table with this single vector.
-    pub fn gather_candidates(&self, query_sketch: ArrayView1<f64>, multiprobe: bool) -> Vec<usize> {
-        let mut seen: HashSet<usize> = HashSet::new();
-        for (table, bank) in self.tables.iter().zip(self.hyperplanes.iter()) {
-            let (sig, margins) = sign_signature_with_margins(bank, query_sketch);
-            if let Some(ids) = table.get(&sig) {
-                seen.extend(ids.iter().copied());
-            }
-            if multiprobe {
-                // Flip the lowest-margin bit (the one most likely to be on the
-                // wrong side of its hyperplane) to reach the nearest neighbour
-                // bucket — standard multi-probe LSH, biggest recall win.
-                let flip_bit = lowest_margin_bit(&margins);
-                let neighbour = canonical_signature(sig ^ (1u64 << flip_bit), bank.nrows());
-                if let Some(ids) = table.get(&neighbour) {
-                    seen.extend(ids.iter().copied());
-                }
-            }
-        }
-        let mut out: Vec<usize> = seen.into_iter().collect();
-        out.sort_unstable();
-        out
-    }
-
-    /// Propose the top `candidate_budget` atoms for a row whose residual is
-    /// `direction` (length `sketch.output_dim()`), ranked by exact frame
-    /// alignment.
-    ///
-    /// Pipeline: probe with [`AtomFrameSketch::query_sketch`] (`O(p·s)` for
-    /// shared-projection sketches, #994 — no atom is touched before the
-    /// gather), gather the sublinear candidate union, score each by
-    /// [`AtomFrameSketch::alignment`], and keep the highest-scoring
-    /// `candidate_budget`.
-    ///
-    /// Returns `(proposed_ids, dropped_for_budget)` where the second element
-    /// lists every gathered candidate that was truncated by the budget (never
-    /// silently discarded).
-    pub fn propose<S: AtomFrameSketch>(
-        &self,
-        sketch: &S,
-        direction: ArrayView1<f64>,
-        candidate_budget: usize,
-        config_multiprobe: bool,
-    ) -> Proposal {
-        let query_sketch = sketch.query_sketch(direction);
-        let gathered = if query_sketch.len() == self.sketch_dim {
-            self.gather_candidates(query_sketch.view(), config_multiprobe)
-        } else {
-            // A probe of the wrong dimension cannot be hashed against the
-            // tables; gather nothing rather than hash garbage. The recall
-            // report will then attribute every planted atom to `NotGathered`,
-            // which is the loud, attributable failure mode.
-            Vec::new()
-        };
-
-        // Exact-score every gathered candidate by frame alignment.
-        let mut scored: Vec<(usize, f64)> = gathered
-            .iter()
-            .map(|&id| (id, sketch.alignment(id, direction)))
-            .collect();
-        // Descending by alignment; ties broken by id for determinism.
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-
-        let keep = candidate_budget.min(scored.len());
-        let proposed: Vec<usize> = scored[..keep].iter().map(|&(id, _)| id).collect();
-        let dropped_for_budget: Vec<usize> = scored[keep..].iter().map(|&(id, _)| id).collect();
-
-        Proposal {
-            proposed,
-            dropped_for_budget,
-            gathered_count: gathered.len(),
-        }
-    }
-
-    /// Recall contract. For a set of rows, each with planted truly-active atom
-    /// ids and a residual direction, run [`SaeCandidateIndex::propose`] at the
-    /// given `candidate_budget` and record what fraction of planted atoms
-    /// appear in the proposed set. Every miss is logged — no silent truncation.
-    ///
-    /// `rows` is `(direction, planted_active_ids)` per row.
-    pub fn recall_report<S: AtomFrameSketch>(
-        &self,
-        sketch: &S,
-        rows: &[(Array1<f64>, Vec<usize>)],
-        candidate_budget: usize,
-        multiprobe: bool,
-    ) -> RecallReport {
-        let mut total_planted: usize = 0;
-        let mut total_recovered: usize = 0;
-        let mut misses: Vec<RecallMiss> = Vec::new();
-        let mut total_gathered: usize = 0;
-
-        for (row_idx, (direction, planted)) in rows.iter().enumerate() {
-            let proposal = self.propose(sketch, direction.view(), candidate_budget, multiprobe);
-            total_gathered += proposal.gathered_count;
-            let proposed_set: HashSet<usize> = proposal.proposed.iter().copied().collect();
-            // A candidate that was gathered but truncated by the budget counts
-            // as a miss *attributable to the budget*; one never gathered at all
-            // is a miss *attributable to the index*. We record both, flagged.
-            let dropped_set: HashSet<usize> = proposal.dropped_for_budget.iter().copied().collect();
-
-            for &atom in planted {
-                total_planted += 1;
-                if proposed_set.contains(&atom) {
-                    total_recovered += 1;
-                } else {
-                    let reason = if dropped_set.contains(&atom) {
-                        MissReason::TruncatedByBudget
-                    } else {
-                        MissReason::NotGathered
-                    };
-                    misses.push(RecallMiss {
-                        row: row_idx,
-                        atom,
-                        alignment: sketch.alignment(atom, direction.view()),
-                        reason,
-                    });
-                }
-            }
-        }
-
-        let recall = if total_planted == 0 {
-            1.0
-        } else {
-            total_recovered as f64 / total_planted as f64
-        };
-        let avg_gathered = if rows.is_empty() {
-            0.0
-        } else {
-            total_gathered as f64 / rows.len() as f64
-        };
-
-        RecallReport {
-            candidate_budget,
-            num_rows: rows.len(),
-            total_planted,
-            total_recovered,
-            recall,
-            avg_candidates_gathered: avg_gathered,
-            num_atoms: self.num_atoms,
-            misses,
-        }
-    }
-
-    /// The two-stage routing **LICENSE** (#985 / E1): the fraction of the EXACT
-    /// top-`s` atoms (the true rescore winners, [`brute_force_top_s`]) that the
-    /// sublinear two-stage proposal ([`SaeCandidateIndex::propose`] at
-    /// `candidate_budget = C`) recovers, per row and in aggregate, with EVERY miss
-    /// logged (never silent).
-    ///
-    /// This is the *license* the default two-stage router runs under. Unlike
-    /// [`SaeCandidateIndex::recall_report`] it needs NO planted ground truth: the
-    /// reference is the exact rescore itself, so it can be run over any sample of
-    /// real row directions to certify that dropping from the `O(K)` exact scan to
-    /// the `O(C)` proposal did not lose the atoms the exact router would have kept.
-    /// A run with `recall = 1.0` licenses the proposal for that regime; misses (and
-    /// their reason — [`MissReason::NotGathered`] = an LSH recall miss, widen tables
-    /// / probes; [`MissReason::TruncatedByBudget`] = widen the budget) name exactly
-    /// where and why to widen.
-    ///
-    /// `directions` is one query direction per row (length `sketch.output_dim()`).
-    /// `top_s` is the sparse routing width `s`. The returned
-    /// [`ProposalRecallReport`] also carries the mean gathered-candidate count as
-    /// the sublinearity witness (compare against `num_atoms`).
-    pub fn proposal_recall_report<S: AtomFrameSketch>(
-        &self,
-        sketch: &S,
-        directions: &[Array1<f64>],
-        top_s: usize,
-        candidate_budget: usize,
-        multiprobe: bool,
-    ) -> ProposalRecallReport {
-        let mut total_true: usize = 0;
-        let mut total_recovered: usize = 0;
-        let mut total_gathered: usize = 0;
-        let mut misses: Vec<RecallMiss> = Vec::new();
-
-        for (row_idx, direction) in directions.iter().enumerate() {
-            // The exact rescore top-s over the WHOLE dictionary — the reference.
-            let exact = brute_force_top_s(sketch, direction.view(), top_s);
-            // The sublinear two-stage proposal for the same row.
-            let proposal = self.propose(sketch, direction.view(), candidate_budget, multiprobe);
-            total_gathered += proposal.gathered_count;
-            let proposed_set: HashSet<usize> = proposal.proposed.iter().copied().collect();
-            let dropped_set: HashSet<usize> = proposal.dropped_for_budget.iter().copied().collect();
-
-            for &atom in &exact {
-                total_true += 1;
-                if proposed_set.contains(&atom) {
-                    total_recovered += 1;
-                } else {
-                    // A true-top-s atom the proposal dropped: gathered-but-budgeted
-                    // (widen C) vs never-gathered (an LSH miss). Both logged.
-                    let reason = if dropped_set.contains(&atom) {
-                        MissReason::TruncatedByBudget
-                    } else {
-                        MissReason::NotGathered
-                    };
-                    misses.push(RecallMiss {
-                        row: row_idx,
-                        atom,
-                        alignment: sketch.alignment(atom, direction.view()),
-                        reason,
-                    });
-                }
-            }
-        }
-
-        let recall = if total_true == 0 {
-            1.0
-        } else {
-            total_recovered as f64 / total_true as f64
-        };
-        let avg_gathered = if directions.is_empty() {
-            0.0
-        } else {
-            total_gathered as f64 / directions.len() as f64
-        };
-
-        ProposalRecallReport {
-            candidate_budget,
-            top_s,
-            num_rows: directions.len(),
-            total_true,
-            total_recovered,
-            recall,
-            avg_candidates_gathered: avg_gathered,
-            num_atoms: self.num_atoms,
-            misses,
-        }
-    }
-
-    /// EXACT routing (#1777 / roadmap "real exact-routing guarantee"): return the
-    /// **global argmax** of the routing score over the WHOLE dictionary — the atom
-    /// whose frame best aligns with `direction` — with a guarantee that no
-    /// ungathered atom is silently better.
-    ///
-    /// The sublinear [`Self::propose`] gather is only a HEURISTIC: a gathered atom
-    /// at alignment `0.6` does not rule out an *ungathered* atom at `1.0`, because
-    /// the gather's alignment is a lower bound on the selected atom, never an upper
-    /// bound on the atoms it skipped. So `propose` alone can silently miss the true
-    /// best atom. This method closes that hole and is the path the encode router
-    /// uses.
-    ///
-    /// Correctness mechanism (sound, not heuristic):
-    /// * **LSH fast path with a TRUE upper bound.** The routing score is the frame
-    ///   alignment `‖U_kᵀ d‖ / ‖d‖ ∈ [0, 1]`, so [`ROUTING_ALIGNMENT_UPPER_BOUND`]
-    ///   (`1.0`) is a hard ceiling for *every* atom — gathered or not. If the best
-    ///   gathered candidate already sits within [`ROUTING_CERT_EPS`] of that
-    ///   ceiling, no ungathered atom can beat it: the gathered best is a certified
-    ///   global score-maximizer and we return it WITHOUT a full scan
-    ///   ([`ExactRoute::lsh_certified`] = `true`).
-    /// * **Exact fallback otherwise.** When the gathered best is not certified by
-    ///   that bound (no tighter sound bound on ungathered atoms is available), run
-    ///   the full [`brute_force_best_atom`] scan and return its argmax. This is the
-    ///   ground truth — correctness over speed, exactly the roadmap contract.
-    ///
-    /// In both branches the returned atom has no atom of strictly greater routing
-    /// score anywhere in the dictionary (no silent miss). Returns `None` only for
-    /// an empty dictionary or an all-non-finite scan (a degenerate sketch).
-    pub fn route_exact<S: AtomFrameSketch>(
-        &self,
-        sketch: &S,
-        direction: ArrayView1<f64>,
-        candidate_budget: usize,
-        multiprobe: bool,
-    ) -> Option<ExactRoute> {
-        // Heuristic LSH gather first (sublinear) — the speed fast path.
-        let proposal = self.propose(sketch, direction, candidate_budget, multiprobe);
-        let lsh_best = proposal
-            .proposed
-            .first()
-            .copied()
-            .map(|id| (id, sketch.alignment(id, direction)));
-
-        if let Some((b, a_b)) = lsh_best {
-            if a_b.is_finite() && a_b >= ROUTING_ALIGNMENT_UPPER_BOUND - ROUTING_CERT_EPS {
-                // Universal-bound certificate: the routing score is capped at 1.0
-                // for EVERY atom, so a gathered atom already at the ceiling cannot
-                // be beaten by any ungathered one. Sound global optimality with no
-                // full scan.
-                return Some(ExactRoute {
-                    atom: b,
-                    alignment: a_b,
-                    lsh_certified: true,
-                    lsh_agreed: true,
-                    did_full_scan: false,
-                });
-            }
-        }
-
-        // Not certified by the bound ⇒ the gather might have missed a better
-        // ungathered atom. The only sound recourse without a tighter per-atom upper
-        // bound is the exact full scan: it IS the global argmax.
-        let (atom, alignment) = brute_force_best_atom(sketch, direction)?;
-        let lsh_agreed = lsh_best.is_some_and(|(b, _)| b == atom);
-        Some(ExactRoute {
-            atom,
-            alignment,
-            lsh_certified: false,
-            lsh_agreed,
-            did_full_scan: true,
-        })
-    }
 }
 
 /// Hard upper bound on the routing score (frame alignment) of ANY atom: the
@@ -864,62 +437,6 @@ pub const ROUTING_ALIGNMENT_UPPER_BOUND: f64 = 1.0;
 /// A gathered best within this of the ceiling is treated as a certified global
 /// maximizer (floating-point slack on the `‖·‖`/`‖·‖` ratio).
 pub const ROUTING_CERT_EPS: f64 = 1e-12;
-
-/// Brute-force EXACT global argmax of the routing score (frame alignment) over the
-/// WHOLE dictionary: scan every atom, return `(atom_id, alignment)` of the highest
-/// scorer. Ties break to the LOWEST id (a strict `>` replacement keeps the first
-/// maximizer), matching [`SaeCandidateIndex::propose`]'s id-ascending tie-break so
-/// the two agree atom-for-atom. Non-finite alignments are skipped. Returns `None`
-/// for an empty dictionary (or one whose every atom scored non-finite).
-///
-/// This is `O(K)` per call and is the ground truth [`SaeCandidateIndex::route_exact`]
-/// falls back to whenever the LSH gather is not certified optimal.
-pub fn brute_force_best_atom<S: AtomFrameSketch>(
-    sketch: &S,
-    direction: ArrayView1<f64>,
-) -> Option<(usize, f64)> {
-    let mut best: Option<(usize, f64)> = None;
-    for id in 0..sketch.num_atoms() {
-        let a = sketch.alignment(id, direction);
-        if !a.is_finite() {
-            continue;
-        }
-        match best {
-            Some((_, ba)) if a <= ba => {}
-            _ => best = Some((id, a)),
-        }
-    }
-    best
-}
-
-/// EXACT top-`s` reference: the `s` atoms of GREATEST frame alignment with
-/// `direction` over the WHOLE dictionary (brute force, `O(K·p)`). This is the
-/// ground truth the sublinear two-stage proposal's recall is licensed against —
-/// the "true top-s" of the E1 acceptance (#985): the atoms the exact rescore
-/// router would select for a row. Ties break to the LOWEST id, matching
-/// [`SaeCandidateIndex::propose`]'s id-ascending tie-break so the two rank
-/// identically wherever alignments coincide; non-finite alignments are skipped.
-/// Returns up to `s` atom ids in descending-alignment order (fewer only when the
-/// dictionary has fewer than `s` finite-scoring atoms).
-pub fn brute_force_top_s<S: AtomFrameSketch>(
-    sketch: &S,
-    direction: ArrayView1<f64>,
-    s: usize,
-) -> Vec<usize> {
-    let mut scored: Vec<(usize, f64)> = (0..sketch.num_atoms())
-        .filter_map(|id| {
-            let a = sketch.alignment(id, direction);
-            a.is_finite().then_some((id, a))
-        })
-        .collect();
-    // Descending by alignment; ties broken by id — identical policy to `propose`.
-    scored.sort_by(|x, y| {
-        y.1.partial_cmp(&x.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(x.0.cmp(&y.0))
-    });
-    scored.into_iter().take(s).map(|(id, _)| id).collect()
-}
 
 /// Result of [`SaeCandidateIndex::route_exact`]: the certified-or-exact global
 /// argmax of the routing score for one row, plus how it was obtained.
@@ -996,19 +513,6 @@ pub struct RecallReport {
     pub misses: Vec<RecallMiss>,
 }
 
-impl RecallReport {
-    /// Convenience: ratio of mean gathered candidates to dictionary size. A
-    /// value far below `1.0` is the evidence that proposal touched a sublinear
-    /// slice of the dictionary.
-    pub fn sublinearity_ratio(&self) -> f64 {
-        if self.num_atoms == 0 {
-            0.0
-        } else {
-            self.avg_candidates_gathered / self.num_atoms as f64
-        }
-    }
-}
-
 /// Result of [`SaeCandidateIndex::proposal_recall_report`] — the two-stage
 /// routing license: how much of the EXACT top-`s` rescore the sublinear proposal
 /// recovered, plus every miss.
@@ -1036,19 +540,6 @@ pub struct ProposalRecallReport {
     /// Every miss (true-top-s atom the proposal dropped), with row, atom,
     /// alignment, and reason. No silent drops — the license's honesty contract.
     pub misses: Vec<RecallMiss>,
-}
-
-impl ProposalRecallReport {
-    /// Ratio of mean gathered candidates to dictionary size. Far below `1.0` is the
-    /// evidence the proposal touched a sublinear slice of the dictionary — the
-    /// `O(C)` vs `O(K)` witness that pairs with `recall`.
-    pub fn sublinearity_ratio(&self) -> f64 {
-        if self.num_atoms == 0 {
-            0.0
-        } else {
-            self.avg_candidates_gathered / self.num_atoms as f64
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,37 +573,6 @@ fn gaussian_projection(rows: usize, cols: usize, seed: u64) -> Array2<f64> {
         }
     }
     m
-}
-
-/// Modified Gram–Schmidt orthonormalization of a decoder block's columns.
-/// Input `block` is `(p, m)`; output `U` is `(p, r)` with orthonormal columns
-/// spanning `range(block)`, `r ≤ m` (rank-deficient columns are dropped).
-fn orthonormal_frame(block: &Array2<f64>) -> Array2<f64> {
-    let p = block.nrows();
-    let m = block.ncols();
-    let mut cols: Vec<Array1<f64>> = Vec::with_capacity(m);
-    for j in 0..m {
-        let mut v = block.column(j).to_owned();
-        for q in &cols {
-            let proj: f64 = q.iter().zip(v.iter()).map(|(&a, &b)| a * b).sum();
-            for (vi, &qi) in v.iter_mut().zip(q.iter()) {
-                *vi -= proj * qi;
-            }
-        }
-        let nrm = vec_norm(v.view());
-        if nrm > DIRECTION_NORM_FLOOR {
-            for vi in v.iter_mut() {
-                *vi /= nrm;
-            }
-            cols.push(v);
-        }
-    }
-    let r = cols.len();
-    let mut u = Array2::<f64>::zeros((p, r));
-    for (j, col) in cols.into_iter().enumerate() {
-        u.column_mut(j).assign(&col);
-    }
-    u
 }
 
 /// `M · v` for `M` shape `(rows, cols)`, `v` length `cols`.
@@ -1173,37 +633,6 @@ fn sign_signature(bank: &Array2<f64>, s: ArrayView1<f64>) -> u64 {
         }
     }
     canonical_signature(sig, bank.nrows())
-}
-
-/// Signature plus per-bit signed margins (the dot products), used by multi-probe
-/// to find the least-confident bit to flip.
-fn sign_signature_with_margins(bank: &Array2<f64>, s: ArrayView1<f64>) -> (u64, Vec<f64>) {
-    let mut sig = 0u64;
-    let mut margins = Vec::with_capacity(bank.nrows());
-    for r in 0..bank.nrows() {
-        let row = bank.row(r);
-        let dot: f64 = row.iter().zip(s.iter()).map(|(&a, &b)| a * b).sum();
-        if dot >= 0.0 {
-            sig |= 1u64 << r;
-        }
-        margins.push(dot);
-    }
-    (canonical_signature(sig, bank.nrows()), margins)
-}
-
-/// Index of the bit whose hyperplane the query sits closest to (smallest `|dot|`)
-/// — the most likely to have landed in the wrong bucket.
-fn lowest_margin_bit(margins: &[f64]) -> usize {
-    let mut best = 0usize;
-    let mut best_abs = f64::INFINITY;
-    for (i, &m) in margins.iter().enumerate() {
-        let a = m.abs();
-        if a < best_abs {
-            best_abs = a;
-            best = i;
-        }
-    }
-    best
 }
 
 // ---------------------------------------------------------------------------

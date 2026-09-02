@@ -21,51 +21,6 @@
 //! execution path; the CPU reference is therefore the single implementation
 //! until a real batched kernel exists end to end.
 
-use crate::arrow_schur::ArrowSchurSystem;
-use crate::gpu_kernels::arrow_schur::{
-    ArrowSchurGpuFailure, ArrowSchurGpuSolution, solve_arrow_newton_step_dense_reference,
-};
-
-/// Refit a color class of mutually support-disjoint K=1 atoms concurrently.
-///
-/// `systems[a]` is atom `a`'s leave-one-out arrow/border system (assembled by the
-/// caller, who owns the residual/Σ state). Returns one result per atom,
-/// positionally aligned with `systems`: coloring guarantees independence, so the
-/// results compose without interaction and the caller writes each accepted
-/// `(δt, δβ)` straight back into its atom's chart/gate.
-///
-/// A per-atom capability decline (a matrix-free atom, or a device transient) is
-/// served transparently by the CPU reference — that element is still `Ok`. Only a
-/// genuine numerical PD failure yields a per-atom `Err`, which the caller escalates
-/// by re-calling with that atom's bumped ridge. This mirrors the recoverable-vs-
-/// fatal split the single-system device seams use, so a non-dense atom can never
-/// surface a fatal `RemlConvergenceError`.
-#[must_use]
-pub fn solve_batched_k1_border(
-    systems: &[ArrowSchurSystem],
-    ridge_t: f64,
-    ridge_beta: f64,
-) -> Vec<Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure>> {
-    systems
-        .iter()
-        .map(|sys| cpu_reference_k1(sys, ridge_t, ridge_beta))
-        .collect()
-}
-
-/// One atom's K=1 border solve on the CPU. This is the canonical bit-parity oracle
-/// the device batched kernel is validated against, and the fallback whenever the
-/// device declines the class or a single atom. A non-PD/rank-deficient system
-/// surfaces as [`ArrowSchurGpuFailure::SchurFactorFailed`], the same numerical
-/// variant the caller's LM escalation responds to with a ridge bump.
-fn cpu_reference_k1(
-    sys: &ArrowSchurSystem,
-    ridge_t: f64,
-    ridge_beta: f64,
-) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
-    solve_arrow_newton_step_dense_reference(sys, ridge_t, ridge_beta)
-        .map_err(|reason| ArrowSchurGpuFailure::SchurFactorFailed { reason })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

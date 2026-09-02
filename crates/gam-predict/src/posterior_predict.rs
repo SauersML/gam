@@ -34,10 +34,6 @@ pub struct PosteriorDrawMatrices {
 }
 
 impl PosteriorDrawMatrices {
-    #[inline]
-    pub fn n_draws(&self) -> usize {
-        self.eta.nrows()
-    }
 
     #[inline]
     pub fn n_rows(&self) -> usize {

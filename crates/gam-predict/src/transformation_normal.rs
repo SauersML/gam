@@ -135,6 +135,26 @@ fn ladder_quantile(ladder_row: ndarray::ArrayView1<'_, f64>, z: f64) -> f64 {
 }
 
 impl PredictionTransform for TransformationNormalPredictor {
+
+    fn response_family(&self) -> ResponseFamily {
+        // Only the *latent* `h(y)` is Gaussian. The generic family observation
+        // band must never be built from this (its σ lives in latent units);
+        // the predictor supplies its own response-scale band from the
+        // quantile ladder in `predict_posterior_mean`.
+        ResponseFamily::Gaussian
+    }
+
+    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
+        match pass {
+            // `response` is the identity here (the offset already carries the
+            // response-scale conditional mean), so there is no link to
+            // transform or delta-propagate through in either pass: an η
+            // interval already IS the response interval.
+            PredictPass::FullUncertainty | PredictPass::PosteriorMean => {
+                ResponseInterval::IdentityEta
+            }
+        }
+    }
     fn point_state(&self, input: &PredictInput) -> Result<LinearState, EstimationError> {
         // The offset carries the precomputed response-scale conditional mean
         // `E[Y|x]`. No covariance-propagated SE exists for this quantity (see
@@ -154,29 +174,10 @@ impl PredictionTransform for TransformationNormalPredictor {
         Ok(eta.clone())
     }
 
-    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
-        match pass {
-            // `response` is the identity here (the offset already carries the
-            // response-scale conditional mean), so there is no link to
-            // transform or delta-propagate through in either pass: an η
-            // interval already IS the response interval.
-            PredictPass::FullUncertainty | PredictPass::PosteriorMean => {
-                ResponseInterval::IdentityEta
-            }
-        }
-    }
-
     fn bounds(&self) -> ResponseBounds {
         ResponseBounds::UNBOUNDED
     }
 
-    fn response_family(&self) -> ResponseFamily {
-        // Only the *latent* `h(y)` is Gaussian. The generic family observation
-        // band must never be built from this (its σ lives in latent units);
-        // the predictor supplies its own response-scale band from the
-        // quantile ladder in `predict_posterior_mean`.
-        ResponseFamily::Gaussian
-    }
 }
 
 impl PredictableModel for TransformationNormalPredictor {
