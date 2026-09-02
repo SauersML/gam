@@ -2344,8 +2344,6 @@ mod tests {
         );
     }
 
-    use gam_problem::test_support::spec_from_dense_with_priority;
-
     /// Direct unit test of the compiler primitive: a block whose columns are
     /// fully spanned by a higher-priority anchor must shed all overlapping
     /// directions, and a non-overlapping configuration must keep full width.

@@ -865,22 +865,6 @@ fn spherical_wahba_kernel_matrix_cpu_validated(
     Ok(out)
 }
 
-#[cfg(test)]
-mod spherical_wahba_kernel_contract_2475_tests {
-    use super::*;
-
-    fn assert_sobolev_m1_refusal(entry_point: &str, result: Result<Array2<f64>, BasisError>) {
-        let error = result.expect_err("untruncated Sobolev m=1 has no Gram diagonal");
-        let message = error.to_string();
-        assert!(
-            message.contains("log-singular") && message.contains("SobolevTruncated"),
-            "{entry_point} must identify both the mathematical defect and the explicit-resolution \
-             remedy; got: {message}"
-        );
-    }
-
-}
-
 pub(crate) fn weighted_coefficient_sum_to_zero_transform(
     weights: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, BasisError> {

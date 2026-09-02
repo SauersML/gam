@@ -1093,41 +1093,6 @@ mod tests {
         }
     }
 
-    /// [`assert_build_geometry_close`] for a basis that is EQUIVARIANT with
-    /// weight one rather than invariant: one common `scale` must restore both
-    /// the design and every active penalty. Taking the same factor out of both
-    /// is what distinguishes a units change from a model change.
-    fn assert_build_geometry_scaled_close(
-        actual: &BasisBuildResult,
-        expected: &BasisBuildResult,
-        scale: f64,
-        tolerance: f64,
-    ) {
-        assert_matrix_close(
-            &actual.design.to_dense().mapv(|value| value / scale),
-            &expected.design.to_dense(),
-            tolerance,
-        );
-        assert_eq!(
-            actual.active_penalties.len(),
-            expected.active_penalties.len()
-        );
-        for (observed, target) in actual
-            .active_penalties
-            .iter()
-            .zip(expected.active_penalties.iter())
-        {
-            assert_eq!(observed.info.source, target.info.source);
-            assert_eq!(observed.info.effective_rank, target.info.effective_rank);
-            assert_eq!(observed.nullity, target.nullity);
-            assert_matrix_close(
-                &observed.matrix.mapv(|value| value / scale),
-                &target.matrix,
-                tolerance,
-            );
-        }
-    }
-
     fn assert_local_geometry_close(
         actual: &LocalSmoothTermBuild,
         expected: &LocalSmoothTermBuild,
@@ -1474,19 +1439,6 @@ mod tests {
                     assert_matrix_close(&observed.matrix, &target.matrix, 2e-10);
                 }
             }
-        }
-    }
-
-    fn spherical_spec(method: SphereMethod, radians: bool) -> SphericalSplineBasisSpec {
-        SphericalSplineBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-            penalty_order: 2,
-            double_penalty: false,
-            radians,
-            method,
-            max_degree: Some(3),
-            wahba_kernel: SphereWahbaKernel::Sobolev,
-            identifiability: SphericalSplineIdentifiability::CenterSumToZero,
         }
     }
 

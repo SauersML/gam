@@ -1433,46 +1433,6 @@ mod soft_abs_gershgorin_2339_tests {
     use gam_linalg::utils::splitmix64;
     use ndarray::Array2;
 
-    /// Deterministic logit rows spanning the regimes the majorizer sees: a
-    /// near-uniform row (where the entropy Hessian is indefinite and the
-    /// majorizer earns its keep), a sharply peaked row, and seeded pseudo-random
-    /// rows. `splitmix64` keeps this reproducible without a RNG dependency.
-    fn seeded_rows(k: usize, seed: u64) -> Vec<Vec<f64>> {
-        let mut state = seed;
-        let mut rows = vec![vec![0.02_f64; k], {
-            let mut peaked = vec![-4.5_f64; k];
-            peaked[0] = 3.0;
-            peaked[k / 2] = 2.25;
-            peaked
-        }];
-        for _ in 0..6 {
-            let row: Vec<f64> = (0..k)
-                .map(|_| {
-                    let bits = splitmix64(&mut state) >> 11;
-                    (bits as f64) / ((1_u64 << 53) as f64) * 8.0 - 4.0
-                })
-                .collect();
-            rows.push(row);
-        }
-        rows
-    }
-
-    /// Hard Gershgorin radius `Σ_j|H_kj|` accumulated in the SAME diagonal-first,
-    /// then `j ≠ k` ascending order the smooth radius uses. Same order matters:
-    /// `f64` addition is monotone in each addend, so term-wise domination
-    /// (`σ_ε ≥ |·|`) implies `D̃_kk ≥ D_kk` EXACTLY only when both sums are
-    /// accumulated identically. Comparing against a differently-ordered sum would
-    /// weaken a hard guarantee into an approximate one.
-    fn hard_radius(h: &Array2<f64>, kk: usize, k: usize) -> f64 {
-        let mut acc = h[[kk, kk]].abs();
-        for jj in 0..k {
-            if jj != kk {
-                acc += h[[kk, jj]].abs();
-            }
-        }
-        acc
-    }
-
     /// (1) The envelope is an UPPER bound on `|·|` — unconditionally, including
     /// where `f64` rounding of `sqrt(x² + ε²)` would otherwise land below `|x|` —
     /// and exceeds it by at most `ε`. The contrast arm shows the gate is not

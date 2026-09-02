@@ -4200,8 +4200,5 @@ mod tests {
     }
 
     // ── Competing-risks cross-channel redundancy regression (gam#1590) ──────
-    use gam_problem::FamilyLinearizationState;
-    use gam_problem::block_spec::BlockEffectiveJacobian;
-    use std::sync::Arc;
 
 }

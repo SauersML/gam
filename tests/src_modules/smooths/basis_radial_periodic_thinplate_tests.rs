@@ -92,20 +92,6 @@ fn shared_ladder_matern_jets_match_per_order_reference() {
     }
 }
 
-/// Test helper that aborts the run with an "expected Duchon metadata"
-/// message. Defined once so the test bodies do not have to spell out
-/// a `panic!(…)` macro literal (which the history audit flags as a
-/// panic-shaped substitution for a removed `unreachable!`).
-fn expected_duchon_metadata() -> ! {
-    panic!("expected Duchon metadata")
-}
-
-/// Variant of [`expected_duchon_metadata`] used by the
-/// centers-extraction match arms.
-fn expected_duchon_metadata_for_centers() -> ! {
-    panic!("expected Duchon metadata for centers extraction")
-}
-
 #[test]
 fn spherical_harmonic_penalty_keeps_laplace_beltrami_scale() {
     let data = array![[-30.0, -120.0], [0.0, 0.0], [35.0, 80.0], [70.0, 160.0]];
@@ -325,11 +311,6 @@ fn evaluate_splines_at_point(x: f64, degree: usize, knots: ArrayView1<f64>) -> A
 fn periodic_test_spec(num_basis: usize) -> PeriodicBSplineBasisSpec {
     PeriodicBSplineBasisSpec::new(3, num_basis, std::f64::consts::TAU, 0.0, 2)
 }
-
-/// Smoothing strength shared by the periodic-curve fit tests; tiny
-/// ridge so the closed-form normal equations stay invertible without
-/// biasing the fitted coefficients.
-const PERIODIC_TEST_SMOOTHING_LAMBDA: f64 = 1.0e-10;
 
 #[test]
 fn periodic_bspline_basis_partitions_unity_and_closes_seam() {
@@ -3292,67 +3273,6 @@ fn test_fourth_derivative_matches_finite_difference() {
     );
 }
 
-/// Independent reference for the order-`m` B-spline derivative coefficient
-/// vector, coded separately from the production recurrence engine.
-///
-/// Bottoms out at the plain (order-0) basis via the test-module
-/// [`evaluate_bspline`] helper, then applies the single de-Boor derivative
-/// step `B^{(r)}_{i,d} = d·(B^{(r-1)}_{i,d-1}/Δ_left − B^{(r-1)}_{i+1,d-1}/Δ_right)`
-/// `m` times, peeling one order and one degree per step. Distinct code from
-/// `evaluate_bspline_derivative_recurrence_into`, so equality is a real
-/// cross-check rather than a tautology.
-fn reference_bspline_derivative(m: usize, x: f64, knots: &Array1<f64>, degree: usize) -> Vec<f64> {
-    // Support guard matches the engine: derivatives are zero outside the
-    // closed support [t_degree, t_{num_basis}].
-    let num_basis_top = knots.len() - degree - 1;
-    if num_basis_top > 0 {
-        let left = knots[degree];
-        let right = knots[num_basis_top];
-        if x < left || x > right {
-            return vec![0.0; num_basis_top];
-        }
-    }
-
-    // Order-0 (plain) basis at the base degree `degree - m`.
-    let base_degree = degree - m;
-
-    // The engine's base case is the order-1 derivative on degree
-    // `base_degree + 1`, which evaluates the plain `base_degree` basis at
-    // `one_sided_derivative_eval_point(x, knots, base_degree + 1)`. Mirror
-    // that exactly so endpoint evaluation agrees bit-for-bit.
-    let x_base = one_sided_derivative_eval_point(x, knots.view(), base_degree + 1);
-    let base_count = knots.len() - base_degree - 1;
-    let mut current: Vec<f64> = (0..base_count)
-        .map(|i| evaluate_bspline(x_base, knots, i, base_degree))
-        .collect();
-
-    // Apply `m` derivative steps, raising the degree by one each time.
-    for step in 1..=m {
-        let d = base_degree + step;
-        let count = knots.len() - d - 1;
-        let mut next = vec![0.0; count];
-        let kf = d as f64;
-        for i in 0..count {
-            let denom_left = knots[i + d] - knots[i];
-            let denom_right = knots[i + d + 1] - knots[i + 1];
-            let left = if denom_left.abs() > 1e-12 {
-                kf * current[i] / denom_left
-            } else {
-                0.0
-            };
-            let right = if denom_right.abs() > 1e-12 {
-                kf * current[i + 1] / denom_right
-            } else {
-                0.0
-            };
-            next[i] = left - right;
-        }
-        current = next;
-    }
-
-    current
-}
-
 #[test]
 fn test_greville_abscissae_cubic() {
     // Uniform cubic spline on [0, 1] with 1 internal knot at 0.5
@@ -5881,95 +5801,6 @@ fn test_duchon_raw_gram_psi_derivative_fd_dim1() {
         &symmetrize(&fast_ata(&ops_minus.d2)),
         &fd_s2_raw,
     );
-}
-
-/// Freeze the FULL Duchon chart onto `spec` from a cold build at the current
-/// length scale — the exact production configuration replayed at every REML
-/// trial-κ by `spatial_optimization.rs` (frozen centers, identifiability
-/// transform, data-metric radial reparam `V`, all pulled from
-/// `BasisMetadata::Duchon`). The Duchon log-κ derivative is a FROZEN-CHART
-/// derivative (V is fixed at the cold build, not recomputed per trial), so a
-/// finite-difference check is only well-posed once every chart artifact is
-/// frozen — otherwise the ±ε rebuilds recompute a fresh `V(κ±ε)` and the FD
-/// differentiates through the moving chart, which no frozen-chart analytic can
-/// match. Returns the cold base build for direct penalty/design access.
-fn freeze_duchon_chart(
-    data: ndarray::ArrayView2<'_, f64>,
-    spec: &mut DuchonBasisSpec,
-) -> BasisBuildResult {
-    let base =
-        build_duchon_basis(data, spec).expect("cold base build for Duchon chart freeze");
-    if let BasisMetadata::Duchon {
-        centers,
-        identifiability_transform,
-        radial_reparam,
-        ..
-    } = &base.metadata
-    {
-        spec.center_strategy = CenterStrategy::UserProvided(centers.clone());
-        spec.radial_reparam = radial_reparam.clone();
-        spec.identifiability = match identifiability_transform {
-            Some(t) => SpatialIdentifiability::FrozenTransform {
-                transform: t.clone(),
-            },
-            None => SpatialIdentifiability::None,
-        };
-    } else {
-        panic!("freeze_duchon_chart requires Duchon metadata");
-    }
-    base
-}
-
-/// Assert a Duchon log-κ FD gate's ±ε rebuilds were assembled in the SAME
-/// frozen chart the analytic derivative was taken in.
-///
-/// `build_duchon_basis` ADOPTS a fresh data-metric radial reparam `V(ψ)` for any
-/// spec that carries none (#1355), while every ψ-derivative builder is a
-/// frozen-chart derivative. A gate whose rebuilds re-derive the chart therefore
-/// differences a DIFFERENT penalty from the one the analytic side describes, and
-/// reads that chart mismatch as an error in the derivative -- which is what
-/// three of these fixtures were reporting as a 10x-290x analytic failure
-/// (#2638). The premise is shared by every FD gate on this path, so it is
-/// asserted here rather than assumed: without it the gate is not measuring the
-/// derivative at all.
-fn assert_duchon_fd_chart_frozen(
-    spec: &DuchonBasisSpec,
-    rebuilt: &BasisBuildResult,
-    label: &str,
-) {
-    let BasisMetadata::Duchon { radial_reparam, .. } = &rebuilt.metadata else {
-        panic!("[{label}] expected Duchon metadata on the FD rebuild");
-    };
-    match (spec.radial_reparam.as_ref(), radial_reparam.as_ref()) {
-        (Some(frozen), Some(rebuilt_v)) => {
-            assert_eq!(
-                frozen.dim(),
-                rebuilt_v.dim(),
-                "[{label}] the FD rebuild changed the radial chart shape: frozen {:?} vs rebuilt {:?}",
-                frozen.dim(),
-                rebuilt_v.dim(),
-            );
-            let drift = (frozen - rebuilt_v)
-                .iter()
-                .map(|value| value.abs())
-                .fold(0.0_f64, f64::max);
-            assert!(
-                drift == 0.0,
-                "[{label}] the FD rebuild re-derived the data-metric radial chart \
-                 (max|V_frozen - V_rebuilt| = {drift:.6e}); the analytic derivative is a \
-                 FROZEN-chart derivative, so this difference quotient is of a different \
-                 penalty (#2638)"
-            );
-        }
-        (None, None) => {}
-        (frozen, rebuilt_v) => panic!(
-            "[{label}] radial chart presence disagrees between the analytic spec \
-             (frozen={}) and the FD rebuild (frozen={}); one side is in the raw Z chart \
-             and the other in Z·V (#2638)",
-            frozen.is_some(),
-            rebuilt_v.is_some(),
-        ),
-    }
 }
 
 #[test]

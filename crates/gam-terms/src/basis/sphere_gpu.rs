@@ -1436,48 +1436,6 @@ mod sphere_gpu_tests {
         );
     }
 
-    /// Apply the Householder reflector `H = I − β·v·vᵀ` to a raw kernel matrix
-    /// on the host and drop the first column — the fused expression the device
-    /// kernel implements in one pass.
-    fn householder_apply_host(b: &Array2<f64>, v: &[f64], beta: f64) -> Array2<f64> {
-        let (n, m) = b.dim();
-        let mut xs = Array2::<f64>::zeros((n, m - 1));
-        for i in 0..n {
-            let d_i: f64 = (0..m).map(|j| v[j] * b[(i, j)]).sum();
-            for j_out in 0..(m - 1) {
-                xs[(i, j_out)] = b[(i, j_out + 1)] - beta * d_i * v[j_out + 1];
-            }
-        }
-        xs
-    }
-
-    /// #2424: grade the fused host expression against explicit matrix algebra
-    /// `(B · (I − β·v·vᵀ))` with column 0 dropped. The fused form is the
-    /// ORACLE the device kernel is compared against, so it owes its own proof
-    /// — and that proof needs no device.
-    fn assert_householder_fused_matches_explicit_product(b: &Array2<f64>, v: &[f64], beta: f64) {
-        let (n, m) = b.dim();
-        let mut reflector = Array2::<f64>::eye(m);
-        for i in 0..m {
-            for j in 0..m {
-                reflector[(i, j)] -= beta * v[i] * v[j];
-            }
-        }
-        let full = b.dot(&reflector);
-        let fused = householder_apply_host(b, v, beta);
-        let mut max_abs = 0.0_f64;
-        for i in 0..n {
-            for j in 0..(m - 1) {
-                max_abs = max_abs.max((fused[(i, j)] - full[(i, j + 1)]).abs());
-            }
-        }
-        assert!(
-            max_abs < 1e-13,
-            "fused Householder host expression departs from B·(I − β·v·vᵀ): \
-             max |Δ| = {max_abs:.3e}"
-        );
-    }
-
     /// The end-to-end sphere build routes its kernel to the device exactly
     /// when the dispatch policy admits one, on both kinds of host.
     ///

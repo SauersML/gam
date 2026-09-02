@@ -81,36 +81,3 @@ pub enum MeasureJetExtrapolationSpectrum<'a> {
     Fused(f64),
 }
 
-#[cfg(test)]
-mod tests {
-    use ndarray::Array1;
-
-    /// Shared deterministic fixture: a 5-level dyadic band with a
-    /// non-constant fitted spectrum.
-    pub(crate) fn band() -> Vec<f64> {
-        vec![0.05, 0.1, 0.2, 0.4, 0.8]
-    }
-
-    pub(crate) fn lambdas() -> Vec<f64> {
-        vec![40.0, 11.0, 3.5, 1.25, 0.6]
-    }
-
-    pub(crate) fn support_means(eps: &[f64]) -> Vec<f64> {
-        vec![TOTAL; eps.len()]
-    }
-
-    pub(crate) const FLOOR: f64 = 0.05;
-    pub(crate) const TOTAL: f64 = 1.0;
-
-    pub(crate) fn total_ignorance(lams: &[f64]) -> f64 {
-        lams.iter().map(|l| 1.0 / l).sum()
-    }
-
-    /// The exact single-unit-mass support curve at distance `d`:
-    /// q_ℓ(d) = total · exp(−d²/(2ε_ℓ²)) — the physical family the support
-    /// diagnostic produces for a one-center web.
-    pub(crate) fn support_at_distance(d: f64, eps: &[f64]) -> Array1<f64> {
-        Array1::from_iter(eps.iter().map(|e| TOTAL * (-d * d / (2.0 * e * e)).exp()))
-    }
-
-}
