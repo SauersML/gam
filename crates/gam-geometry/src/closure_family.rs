@@ -314,7 +314,6 @@ pub(crate) fn inv_std_normal(p: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
 
     #[test]
     fn nonpositive_or_nonfinite_window_is_rejected() {

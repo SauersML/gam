@@ -140,36 +140,9 @@ mod tests_fixtures {
     use super::*;
 
     impl CgroupMemoryProbeFailure {
-        pub(crate) fn fixture(
-            kind: CgroupMemoryProbeFailureKind,
-            path: impl Into<Box<str>>,
-            detail: impl Into<Box<str>>,
-        ) -> Self {
-            Self {
-                kind,
-                path: path.into(),
-                detail: detail.into(),
-            }
-        }
     }
 
     impl CgroupMemoryAvailability {
-        pub(crate) fn fixture(
-            binding_path: impl Into<Box<str>>,
-            limit_bytes: u64,
-            current_bytes: u64,
-            inactive_file_bytes: u64,
-            inspected_levels: usize,
-        ) -> Self {
-            Self::from_consistent_counters(
-                binding_path,
-                limit_bytes,
-                current_bytes,
-                inactive_file_bytes,
-                inspected_levels,
-            )
-            .expect("cgroup test fixture counters must be internally consistent")
-        }
     }
 }
 

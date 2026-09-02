@@ -163,8 +163,6 @@ mod oracle_tests {
     //! `faa_top*` ever diverges from the universal rule these disagree.
     use super::*;
     use crate::jet_algebra::faa_di_bruno;
-    use crate::paired_timing::{SpeedGate, batched};
-    use std::hint::black_box;
 
     fn stream(seed: u64) -> impl FnMut() -> f64 {
         let mut s = seed;

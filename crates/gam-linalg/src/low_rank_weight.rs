@@ -134,7 +134,6 @@ impl<'a> LowRankWeight<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::matrix::DesignMatrix;
     use ndarray::array;
 

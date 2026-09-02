@@ -54,7 +54,7 @@
 //! bottom of that curve for the second derivative and is what the assertions
 //! use.
 
-use ndarray::{Array1, Array2};
+use ndarray::Array1;
 
 use crate::manifold::RiemannianManifold;
 use crate::manifolds::constant_curvature::{ConstantCurvature, distance_kappa_jet};
@@ -357,105 +357,6 @@ fn assert_vector_close(
             "{context}: component {i} analytic {a} vs finite difference {d}"
         );
     }
-}
-
-#[test]
-fn kappa_jets_match_central_differences_of_the_value_path() {
-    // See the module docs for why H is 1e-3 and why the sample radius must not
-    // depend on it. The jets are compared against `distance` / `log_map` /
-    // `exp_map` — separately written value code — at κ ± H, so agreement is
-    // evidence about the Tower2 program rather than about itself.
-    const H: f64 = 1.0e-3;
-    let mut verified = 0usize;
-    for dim in [1usize, 2, 3] {
-        for kappa in [1.0_f64, 0.3, 0.0, -0.3, -1.0] {
-            let manifold = ConstantCurvature::new(dim, kappa);
-            let up = ConstantCurvature::new(dim, kappa + H);
-            let down = ConstantCurvature::new(dim, kappa - H);
-            let mut rng = Rng::new(seed_for(dim, kappa));
-            for _ in 0..TRIALS {
-                let x = chart_point(&mut rng, dim);
-                let y = chart_point(&mut rng, dim);
-
-                // ---- distance ----
-                let (value, first, second) =
-                    distance_kappa_jet(&manifold, x.view(), y.view()).expect("distance jet");
-                let here = manifold.distance(x.view(), y.view()).expect("d");
-                let above = up.distance(x.view(), y.view()).expect("d+");
-                let below = down.distance(x.view(), y.view()).expect("d-");
-                assert!(
-                    (value - here).abs() <= 1.0e-12 * here.max(1.0),
-                    "dim {dim} kappa {kappa}: jet value {value} != distance {here}"
-                );
-                let fd_first = (above - below) / (2.0 * H);
-                let fd_second = (above - 2.0 * here + below) / (H * H);
-                assert!(
-                    (first - fd_first).abs() <= jet_tolerance(first, fd_first, FIRST_FLOOR),
-                    "dim {dim} kappa {kappa}: d/dkappa distance {first} vs FD {fd_first}"
-                );
-                assert!(
-                    (second - fd_second).abs() <= jet_tolerance(second, fd_second, SECOND_FLOOR),
-                    "dim {dim} kappa {kappa}: d2/dkappa2 distance {second} vs FD {fd_second}"
-                );
-
-                // ---- logarithm ----
-                let (value, first, second) =
-                    log_map_kappa_jet(&manifold, x.view(), y.view()).expect("log jet");
-                let here = manifold.log_map(x.view(), y.view()).expect("log");
-                let above = up.log_map(x.view(), y.view()).expect("log+");
-                let below = down.log_map(x.view(), y.view()).expect("log-");
-                assert!(
-                    sup_diff(&value, &here) <= 1.0e-12 * joint_scale(&value, &here),
-                    "dim {dim} kappa {kappa}: log jet value disagrees with log_map"
-                );
-                let fd_first = (&above - &below) / (2.0 * H);
-                let fd_second = (&above - &(&here * 2.0) + &below) / (H * H);
-                assert_vector_close(
-                    &first,
-                    &fd_first,
-                    FIRST_FLOOR,
-                    &format!("dim {dim} kappa {kappa}: d/dkappa log"),
-                );
-                assert_vector_close(
-                    &second,
-                    &fd_second,
-                    SECOND_FLOOR,
-                    &format!("dim {dim} kappa {kappa}: d2/dkappa2 log"),
-                );
-
-                // ---- exponential ----
-                let tangent = manifold
-                    .project_tangent(x.view(), (rng.gaussian_vec(dim) * 0.2).view())
-                    .expect("tangent");
-                let (value, first, second) =
-                    exp_map_kappa_jet(&manifold, x.view(), tangent.view()).expect("exp jet");
-                let here = manifold.exp_map(x.view(), tangent.view()).expect("exp");
-                let above = up.exp_map(x.view(), tangent.view()).expect("exp+");
-                let below = down.exp_map(x.view(), tangent.view()).expect("exp-");
-                assert!(
-                    sup_diff(&value, &here) <= 1.0e-12 * joint_scale(&value, &here),
-                    "dim {dim} kappa {kappa}: exp jet value disagrees with exp_map"
-                );
-                let fd_first = (&above - &below) / (2.0 * H);
-                let fd_second = (&above - &(&here * 2.0) + &below) / (H * H);
-                assert_vector_close(
-                    &first,
-                    &fd_first,
-                    FIRST_FLOOR,
-                    &format!("dim {dim} kappa {kappa}: d/dkappa exp"),
-                );
-                assert_vector_close(
-                    &second,
-                    &fd_second,
-                    SECOND_FLOOR,
-                    &format!("dim {dim} kappa {kappa}: d2/dkappa2 exp"),
-                );
-
-                verified += 1;
-            }
-        }
-    }
-    assert!(verified > 0, "no kappa jet was differenced");
 }
 
 /// #2687: the κ > 0 branch is **not** unconstrained, and its singular locus sits

@@ -51,7 +51,6 @@
 use ndarray::Array1;
 
 use super::closure_family::inv_std_normal;
-use crate::manifolds::constant_curvature::ConstantCurvature;
 
 /// χ²₁ survival function `P(χ²₁ > t)` for `t ≥ 0` — the p-value of an
 /// interior-point likelihood-ratio statistic on one degree of freedom.
@@ -482,7 +481,6 @@ pub struct DesignCoordKappaJet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
 
     // A synthetic profiled criterion with a known minimiser and curvature:
     //   V_p(κ) = v0 + 0.5 * a * (κ − κ⋆)²   (a > 0, minimiser at κ⋆).

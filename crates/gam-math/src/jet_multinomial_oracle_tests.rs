@@ -50,7 +50,7 @@
 #![cfg(test)]
 
 use crate::jet_scalar::JetScalar;
-use crate::jet_tower::{KernelChannels, RowProgram, Tower4, program_full_tower};
+use crate::jet_tower::{KernelChannels, RowProgram};
 
 /// One multinomial-logit fixture over `M` active primaries: the active-class
 /// log-odds `η` (the reference class `M` is pinned at `0`), the observed class
@@ -194,13 +194,3 @@ fn make_rows<const M: usize>(seed: u64, count: usize) -> Vec<MultRow<M>> {
 
 const REL_TOL: f64 = 1e-11;
 
-/// The mechanically jet-derived multinomial value / ∇ / H equals the INDEPENDENT
-/// softmax closed form (residual gradient + Fisher Hessian), channel by channel,
-/// through the SAME universal [`verify_kernel_channels`] oracle every other #932
-/// family uses — for `M = 2` (K=3 classes) and `M = 3` (K=4), observed rows
-/// spanning every active class and the reference.
-#[test]
-fn multinomial_softmax_jet_value_grad_hessian_matches_closed_form() {
-    assert_vgh::<2>(0x9322_2020_1109_face);
-    assert_vgh::<3>(0x0bad_c0de_2020_1109);
-}

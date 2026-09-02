@@ -53,7 +53,7 @@
 //! `dscore_ls = κ(2m·μ̇ + 2n·κ·η̇) + κ'(a−n)·η̇` contracts.
 
 use crate::jet_scalar::JetScalar;
-use crate::jet_tower::{KernelChannels, RowProgram, Tower4, program_full_tower};
+use crate::jet_tower::{KernelChannels, RowProgram};
 
 /// The production `log-b` σ-link floor `b` (`gam-model-kernels::sigma_link::LOGB_SIGMA_FLOOR`).
 /// Replicated as a local constant so this oracle stays a leaf test in `gam-math`

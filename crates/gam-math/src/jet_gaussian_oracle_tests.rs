@@ -66,7 +66,7 @@
 //! cross channel is caught by the oracle.
 
 use crate::jet_scalar::JetScalar;
-use crate::jet_tower::{KernelChannels, RowProgram, Tower4, program_full_tower};
+use crate::jet_tower::{KernelChannels, RowProgram};
 
 /// One Gaussian location-scale fixture: the response `y` and the current
 /// primaries `(η, s)` at which the row is linearized (`s = log σ`).

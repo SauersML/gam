@@ -49,7 +49,6 @@
 //! caller that wants the CPU oracle runs it separately for parity.
 
 use super::policy::GpuThroughputVerdict;
-use std::time::Duration;
 
 /// A representative LLM/SAE batched-solve work cell: `n` design rows, `p` wide
 /// decoder border. (`d`, the per-atom reduced-Schur block size, is fixed by the

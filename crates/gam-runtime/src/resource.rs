@@ -1462,15 +1462,6 @@ mod governor_budget_is_capacity_determined_2702_tests {
         )
     }
 
-    /// The derivation this fix replaced, kept here as the control: 3/4 of FREE
-    /// memory. A test that never evaluates it cannot show that the assertions
-    /// below had a way to fail.
-    fn pre_2702_free_denominated_budget(availability: &MemoryAvailability) -> usize {
-        let scaled = u128::from(availability.available_bytes()) * GOVERNOR_BUDGET_NUMERATOR
-            / GOVERNOR_BUDGET_DENOMINATOR;
-        usize::try_from(scaled).unwrap_or(usize::MAX)
-    }
-
     #[test]
     fn a_request_larger_than_the_job_is_still_refused_at_every_load() {
         // The ceiling must keep saying no, or the test above is satisfied by a

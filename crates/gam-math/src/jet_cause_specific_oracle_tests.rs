@@ -40,7 +40,7 @@
 //! those EXACT production per-row weight formulas at `rel_tol = 1e-11`.
 
 use crate::jet_scalar::JetScalar;
-use crate::jet_tower::{KernelChannels, RowProgram, Tower4, program_full_tower};
+use crate::jet_tower::{KernelChannels, RowProgram};
 
 /// One cause-specific Royston-Parmar fixture. `s` (the spline derivative) is kept
 /// strictly positive, the finite regime the production formulas require.

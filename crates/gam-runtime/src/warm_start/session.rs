@@ -231,27 +231,3 @@ impl Session {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::warm_start::key::Fingerprinter;
-    use crate::warm_start::store::StoreOptions;
-
-    fn temp_session(label: &str) -> (tempfile::TempDir, Session) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = WarmStartStore::open(
-            dir.path().to_path_buf(),
-            StoreOptions {
-                size_budget_bytes: 1024 * 1024,
-                ttl: Duration::from_secs(60),
-            },
-        )
-        .unwrap();
-        let mut fp = Fingerprinter::new();
-        fp.absorb_str(b"label", label);
-        let key = fp.finalize();
-        let s = Session::open(store, key);
-        (dir, s)
-    }
-
-}

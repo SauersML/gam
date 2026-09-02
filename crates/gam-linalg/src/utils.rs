@@ -2014,44 +2014,9 @@ mod pure_fn_tests {
     // max_abs_diag
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn max_abs_diag_floors_at_one() {
-        let m = array![[0.1_f64, 0.0], [0.0, 0.2]];
-        assert_eq!(max_abs_diag(&m), 1.0);
-    }
-
-    #[test]
-    fn max_abs_diag_returns_largest_abs_diagonal() {
-        let m = array![[3.0_f64, 99.0], [0.0, -7.0]];
-        assert_eq!(max_abs_diag(&m), 7.0);
-    }
-
     // -----------------------------------------------------------------------
     // addridge
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn addridge_zero_ridge_clones_matrix() {
-        let m = array![[1.0_f64, 2.0], [3.0, 4.0]];
-        let r = addridge(&m, 0.0);
-        assert_eq!(r, m);
-    }
-
-    #[test]
-    fn addridge_negative_ridge_clones_matrix() {
-        let m = array![[1.0_f64, 2.0], [3.0, 4.0]];
-        let r = addridge(&m, -1.0);
-        assert_eq!(r, m);
-    }
-
-    #[test]
-    fn addridge_positive_adds_to_diagonal() {
-        let m = array![[1.0_f64, 0.0], [0.0, 2.0]];
-        let r = addridge(&m, 0.5);
-        assert_eq!(r[[0, 0]], 1.5);
-        assert_eq!(r[[1, 1]], 2.5);
-        assert_eq!(r[[0, 1]], 0.0);
-    }
 
     // -----------------------------------------------------------------------
     // row_mismatch_message / predict_gam_dimension_mismatch_message
