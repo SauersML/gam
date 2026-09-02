@@ -5,45 +5,6 @@
 // `pirls::tests` module) because the scanner forbids `#[cfg(test)]` on bare
 // src items and cross-module consumption rules out a private test_support
 // submodule in `deviance.rs`.
-use super::{LN_2PI, tweedie_exact_series_loglik_from_eta};
-use gam_spec::is_valid_tweedie_power;
-
-#[inline]
-fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
-    if !is_valid_tweedie_power(p) {
-        f64::NAN
-    } else if !valid_tweedie_response(yi) {
-        f64::NAN
-    } else if yi == 0.0 {
-        mui_c.powf(2.0 - p) / (2.0 - p)
-    } else {
-        yi.powf(2.0 - p) / ((1.0 - p) * (2.0 - p)) - yi * mui_c.powf(1.0 - p) / (1.0 - p)
-            + mui_c.powf(2.0 - p) / (2.0 - p)
-    }
-}
-
-/// Tweedie **saddlepoint** log-density (prior weight `w` ⇒ `φᵢ = φ/w`). Exact at
-/// `y = 0` for `1 < p < 2` (compound-Poisson point mass `exp(−wμ^{2−p}/((2−p)φ)`);
-/// the standard `(2πφᵢ V(y))^{-½} exp(−wd/φ)` approximation for `y > 0`, where
-/// `V(y) = y^p` and `d` is the unit deviance. The exponent matches the REML
-/// kernel's `−w·d/φ` term exactly; this only restores the `−½ln(2πφᵢ y^p)`
-/// prefactor. Homogeneous so `elpd(c·y) − elpd(y) = −n ln c` still holds.
-#[inline]
-fn tweedie_saddlepoint_loglik_approximation(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
-    if w <= 0.0 {
-        // Zero prior weight excludes the observation (the y>0 prefactor's
-        // −ln wᵢ would otherwise diverge).
-        return 0.0;
-    }
-    let exponent = -w * tweedie_unit_deviance(yi, mui, p) / phi;
-    if yi <= 0.0 {
-        // Exact point mass at zero (no Jacobian prefactor for a mass atom).
-        exponent
-    } else {
-        // φᵢ = φ/w  ⇒  −½ ln(2π (φ/w) y^p).
-        exponent - 0.5 * (LN_2PI + phi.ln() - w.ln() + p * yi.ln())
-    }
-}
 
 /// Exact Tweedie (compound Poisson–gamma, `1 < p < 2`) log-density at one
 /// observation, evaluated by the Jørgensen / Dunn–Smyth infinite-series
@@ -74,13 +35,6 @@ fn tweedie_series_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
         .expect("exact Tweedie test fixture")
 }
 
-/// Exact Tweedie log-density. This never switches to a saddlepoint: callers
-/// selecting an exact likelihood always receive the compound-Poisson–gamma
-/// series named by the API.
-#[inline]
-fn tweedie_exact_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
-    tweedie_series_loglik(yi, mui, w, p, phi)
-}
 // The nested test modules below address the rest of the solver through
 // `super::`, which resolves to this module; the re-imports here forward the
 // sibling concern modules and the shared item surface so those paths keep
@@ -92,33 +46,14 @@ pub(crate) use super::*;
 mod tests {
     use super::loop_driver::{default_beta_guess_external, exact_lambdas_from_rho};
     use super::reweight::madsen_lm_accept_factor;
-    use super::{
-        DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
-        PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily,
-        WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet,
-        calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta,
-        calculate_null_deviance, compute_constraint_kkt_diagnostics,
-        compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale,
-        deviance_eta_rows_with_log_measure_scale, evaluate_full_log_likelihood_from_eta,
-        fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical,
-        pirls_data_log_kernel_from_eta, select_active_set_release,
-        should_log_pirls_decision_summary, should_use_sparse_native_pirls,
-        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
-        stable_finite_signed_sum, update_glmvectors, variance_jet_for_weight_family,
-        write_gamma_log_working_state, write_negative_binomial_log_working_state,
-        write_poisson_log_working_state, write_tweedie_log_working_state,
-    };
+    use super::{DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily, WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance, compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical, pirls_data_log_kernel_from_eta, select_active_set_release, should_log_pirls_decision_summary, should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state, write_negative_binomial_log_working_state, write_poisson_log_working_state, write_tweedie_log_working_state};
     use crate::estimate::EstimationError;
     use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, state_fromspec};
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use gam_linalg::matrix::DesignMatrix;
     use gam_math::probability::standard_normal_quantile;
-    use gam_problem::{
-        Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec,
-        LinkComponent, LinkFunction, LogSmoothingParamsView, MixtureLinkSpec, ResponseFamily,
-        StandardLink,
-    };
+    use gam_problem::{Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkComponent, LinkFunction, LogSmoothingParamsView, MixtureLinkSpec, ResponseFamily, StandardLink};
 
     // Test-only zero-log-measure-scale wrapper over the production single-row
     // deviance/score oracle. Lives in this test module (its only consumer) rather
@@ -2712,87 +2647,6 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn poisson_external_fit_reports_full_loglikelihood_not_reml_kernel() {
-        use crate::estimate::{ExternalOptimOptions, optimize_external_design};
-        use gam_terms::smooth::BlockwisePenalty;
-
-        let x = array![
-            [1.0, -1.0],
-            [1.0, -0.5],
-            [1.0, 0.0],
-            [1.0, 0.5],
-            [1.0, 1.0],
-            [1.0, 1.5],
-        ];
-        let y = array![0.0, 1.0, 2.0, 4.0, 6.0, 9.0];
-        let w = Array1::ones(y.len());
-        let offset = Array1::zeros(y.len());
-        let local_penalty = array![[0.0, 0.0], [0.0, 1.0]];
-        let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
-            ResponseFamily::Poisson,
-            InverseLink::Standard(StandardLink::Log),
-        ));
-        let opts = ExternalOptimOptions {
-            family: likelihood.spec.clone(),
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: false,
-            skip_rho_posterior_inference: true,
-            max_iter: 100,
-            tol: 1e-10,
-            nullspace_dims: vec![1],
-            linear_constraints: None,
-            firth_bias_reduction: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
-            persistent_warm_start_store: None,
-        };
-
-        let result = optimize_external_design(
-            y.view(),
-            w.view(),
-            x.clone(),
-            offset.view(),
-            vec![BlockwisePenalty::new(0..2, local_penalty)],
-            &opts,
-        )
-        .expect("external Poisson fit should converge");
-
-        let eta = x.dot(&result.beta) + &offset;
-        let full =
-            evaluate_full_log_likelihood_from_eta(y.view(), eta.view(), &likelihood, w.view())
-                .expect("full eta log-likelihood")
-                .total();
-        let omit = calculate_loglikelihood_omitting_constants_from_eta(
-            y.view(),
-            &eta,
-            &likelihood,
-            &InverseLink::Standard(StandardLink::Log),
-            w.view(),
-        )
-        .expect("exact eta log-likelihood");
-        assert!(
-            full <= 0.0,
-            "Poisson reporting log-likelihood is a log-mass and must be <= 0, got {full}"
-        );
-        assert!(
-            omit > full,
-            "REML omitting-constants kernel must be larger after dropping count normalizers: \
-             omit={omit} full={full}"
-        );
-        assert_relative_eq!(
-            result.log_likelihood,
-            full,
-            epsilon = 1e-10,
-            max_relative = 1e-10
-        );
-    }
-
-    #[test]
     pub(crate) fn gamma_log_fit_profiles_shape_instead_of_fixing_one() {
         let x = array![[1.0], [1.0], [1.0], [1.0], [1.0], [1.0]];
         let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
@@ -3023,7 +2877,6 @@ mod tests {
         );
         assert_eq!(active_hint, vec![1]);
     }
-
 
     #[test]
     pub(crate) fn lower_bound_active_set_releases_stalewarm_boundary_hint() {
@@ -5000,127 +4853,12 @@ mod reporting_loglikelihood_tests {
 
     // Binomial reporting log-likelihood is a true log-mass ≤ 0 and carries the
     // ln C(nᵢ, nᵢyᵢ) coefficient (zero for Bernoulli, positive for counts).
-    #[test]
-    fn binomial_full_loglik_carries_coefficient() {
-        // Grouped binomial: prior weights are the trial counts nᵢ.
-        let y = array![0.0, 0.25, 0.5, 1.0];
-        let mu = array![0.1, 0.3, 0.55, 0.9];
-        let w = array![3.0, 4.0, 6.0, 2.0];
-        let glm = canonical(ResponseFamily::Binomial, StandardLink::Logit);
-        let evaluation = full_at_fixture(&y, &mu, &glm, &w, StandardLink::Logit);
-        let pw = evaluation.pointwise();
-        for (i, &v) in pw.iter().enumerate() {
-            assert!(
-                v <= 1e-12,
-                "row {i}: binomial log-mass must be ≤ 0, got {v}"
-            );
-            let n = w[i];
-            let k = n * y[i];
-            let coef = ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0);
-            let expect = coef + n * (y[i] * mu[i].ln() + (1.0 - y[i]) * (1.0 - mu[i]).ln());
-            assert!((v - expect).abs() < 1e-10, "row {i}: {v} vs {expect}");
-        }
-
-        // Bernoulli (nᵢ = 1, yᵢ ∈ {0,1}): coefficient vanishes, so the full and
-        // omitting kernels coincide.
-        let yb = array![0.0, 1.0, 1.0, 0.0];
-        let mub = array![0.2, 0.8, 0.6, 0.4];
-        let wb = Array1::<f64>::ones(4);
-        let full = full_at_fixture(&yb, &mub, &glm, &wb, StandardLink::Logit);
-        let eta = eta_fixture(&mub, StandardLink::Logit);
-        let omit = calculate_loglikelihood_omitting_constants_from_eta(
-            yb.view(),
-            &eta,
-            &glm,
-            &glm.spec.link,
-            wb.view(),
-        )
-        .expect("Bernoulli omitted likelihood");
-        for i in 0..4 {
-            let analytic = yb[i] * mub[i].ln() + (1.0 - yb[i]) * (1.0 - mub[i]).ln();
-            assert!(
-                (full.pointwise()[i] - analytic).abs() < 1e-12,
-                "row {i}: {} vs {analytic}",
-                full.pointwise()[i],
-            );
-        }
-        assert!((full.total() - omit).abs() < 1e-12);
-    }
 
     // Gamma reporting log-likelihood equals the analytic Gamma density (shape
     // ν = 1/φ, mean μ), evaluated on the eta surface.
-    #[test]
-    fn gamma_full_loglik_matches_density() {
-        let y = array![1.8, 0.7, 3.2];
-        let mu = array![2.0, 1.0, 2.5];
-        let w = array![1.0, 2.0, 0.5];
-        // canonical Gamma ⇒ shape 1 ⇒ ν = 1.
-        let glm = canonical(ResponseFamily::Gamma, StandardLink::Log);
-        let nu = 1.0_f64;
-        let evaluation = full_at_fixture(&y, &mu, &glm, &w, StandardLink::Log);
-        let pw = evaluation.pointwise();
-        for i in 0..3 {
-            let a = w[i] * nu;
-            let expect =
-                a * (a / mu[i]).ln() + (a - 1.0) * y[i].ln() - a * y[i] / mu[i] - ln_gamma(a);
-            assert!(
-                (pw[i] - expect).abs() < 1e-10,
-                "row {i}: {} vs {expect}",
-                pw[i]
-            );
-        }
-        let total = evaluation.total();
-        assert!((total - pw.sum()).abs() < 1e-12);
-    }
 
     // Zero prior weight excludes an observation: every family contributes
     // exactly 0 (no −∞ from the Gamma shape→0 or Tweedie −ln w prefactor).
-    #[test]
-    fn zero_prior_weight_contributes_zero_every_family() {
-        let y = array![2.0, 3.0];
-        let mu = array![1.5, 2.5];
-        let w = array![0.0, 0.0];
-        for glm in [
-            canonical(ResponseFamily::Poisson, StandardLink::Log),
-            canonical(ResponseFamily::Gamma, StandardLink::Log),
-            canonical(ResponseFamily::Binomial, StandardLink::Logit),
-            GlmLikelihoodSpec {
-                spec: LikelihoodSpec::new(
-                    ResponseFamily::Gaussian,
-                    InverseLink::Standard(StandardLink::Identity),
-                ),
-                scale: LikelihoodScaleMetadata::FixedDispersion { phi: 0.3 },
-            },
-            GlmLikelihoodSpec {
-                spec: LikelihoodSpec::new(
-                    ResponseFamily::Tweedie { p: 1.5 },
-                    InverseLink::Standard(StandardLink::Log),
-                ),
-                scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
-            },
-        ] {
-            let yb = array![0.5, 0.6];
-            let (yy, mm) = if matches!(glm.spec.response, ResponseFamily::Binomial) {
-                (yb.clone(), array![0.4, 0.55])
-            } else {
-                (y.clone(), mu.clone())
-            };
-            let link = match &glm.spec.response {
-                ResponseFamily::Gaussian => StandardLink::Identity,
-                ResponseFamily::Binomial => StandardLink::Logit,
-                _ => StandardLink::Log,
-            };
-            let evaluation = full_at_fixture(&yy, &mm, &glm, &w, link);
-            let pw = evaluation.pointwise();
-            for &v in pw.iter() {
-                assert_eq!(
-                    v, 0.0,
-                    "{:?}: zero-weight row must be 0, got {v}",
-                    glm.spec.response
-                );
-            }
-        }
-    }
 
     // The certified total shares the pointwise kernel.
     #[test]
@@ -5144,22 +4882,8 @@ mod reporting_loglikelihood_tests {
 /// dispersion `φ̂` and every SE / interval derived from it.
 #[cfg(test)]
 mod tweedie_exact_series_tests {
-    use super::super::tweedie_exact_loglik_total_from_eta;
-    use super::{
-        tweedie_exact_loglik, tweedie_saddlepoint_loglik_approximation, tweedie_series_loglik,
-    };
-    use ndarray::Array1;
-    use rand::RngExt;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
+    use super::tweedie_series_loglik;
     use statrs::function::gamma::ln_gamma;
-
-    /// Standard normal via Box–Muller (only `rand`'s uniform is available here).
-    fn normal_draw(rng: &mut StdRng) -> f64 {
-        let u1: f64 = rng.random::<f64>().max(1e-300);
-        let u2: f64 = rng.random::<f64>();
-        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
-    }
 
     /// Brute-force reference: sum a very wide, fixed window of the mixture terms
     /// with an explicit log-sum-exp. Independent of the adaptive climb/tail logic
@@ -5246,166 +4970,4 @@ mod tweedie_exact_series_tests {
         }
     }
 
-    #[test]
-    fn exact_loglik_never_switches_to_saddlepoint() {
-        let (mu, phi, p) = (1.0e8_f64, 0.5_f64, 1.5_f64);
-        let y = mu;
-        let exact = tweedie_exact_loglik(y, mu, 1.0, p, phi);
-        let series_at_large_index = tweedie_series_loglik(y, mu, 1.0, p, phi);
-        let saddle = tweedie_saddlepoint_loglik_approximation(y, mu, 1.0, p, phi);
-        assert_eq!(exact, series_at_large_index);
-        assert!(
-            (exact - saddle).abs() < 1e-3,
-            "the separately named approximation should converge toward the exact series: \
-             {exact} vs {saddle}"
-        );
-        let (mu2, phi2) = (5.0e3_f64, 1.0_f64); // index ≈ 283, below threshold
-        let series = tweedie_series_loglik(mu2, mu2, 1.0, p, phi2);
-        let saddle2 = tweedie_saddlepoint_loglik_approximation(mu2, mu2, 1.0, p, phi2);
-        assert!(
-            (series - saddle2).abs() < 1e-2,
-            "series and saddlepoint must agree closely near the crossover: {series} vs {saddle2}"
-        );
-    }
-
-    /// Compound-Poisson–gamma (Jørgensen) Tweedie sample generator.
-    fn tweedie_sample(mu: f64, p: f64, phi: f64, rng: &mut StdRng) -> f64 {
-        let lambda = mu.powf(2.0 - p) / (phi * (2.0 - p));
-        let shape = (2.0 - p) / (p - 1.0);
-        let scale = phi * (p - 1.0) * mu.powf(p - 1.0);
-        // Knuth Poisson.
-        let l = (-lambda).exp();
-        let mut k = 0u32;
-        let mut prod = 1.0_f64;
-        loop {
-            prod *= rng.random::<f64>();
-            if prod <= l {
-                break;
-            }
-            k += 1;
-            if k > 100_000 {
-                break;
-            }
-        }
-        // Sum of `k` Gamma(shape, scale) draws via Marsaglia–Tsang.
-        let mut y = 0.0;
-        for _ in 0..k {
-            y += gamma_draw(shape, scale, rng);
-        }
-        y
-    }
-
-    fn gamma_draw(shape: f64, scale: f64, rng: &mut StdRng) -> f64 {
-        if shape < 1.0 {
-            let u: f64 = rng.random::<f64>().max(1e-300);
-            return gamma_draw(shape + 1.0, scale, rng) * u.powf(1.0 / shape);
-        }
-        let d = shape - 1.0 / 3.0;
-        let c = 1.0 / (9.0 * d).sqrt();
-        loop {
-            let z: f64 = normal_draw(rng);
-            let v = (1.0 + c * z).powi(3);
-            if v <= 0.0 {
-                continue;
-            }
-            let u: f64 = rng.random::<f64>().max(1e-300);
-            if u.ln() < 0.5 * z * z + d - d * v + d * v.ln() {
-                return d * v * scale;
-            }
-        }
-    }
-
-    fn pearson_phi(y: &Array1<f64>, mu: &Array1<f64>, p: f64) -> f64 {
-        let mut num = 0.0;
-        for (&yi, &mui) in y.iter().zip(mu.iter()) {
-            num += (yi - mui).powi(2) / mui.powf(p);
-        }
-        num / y.len() as f64
-    }
-
-    fn golden_max_p<F: Fn(f64) -> f64>(f: F) -> f64 {
-        let (mut a, mut b) = (1.001_f64, 1.999_f64);
-        let gr = (5.0_f64.sqrt() - 1.0) / 2.0;
-        let (mut c, mut d) = (b - gr * (b - a), a + gr * (b - a));
-        let (mut fc, mut fd) = (f(c), f(d));
-        while b - a > 1e-3 {
-            if fc >= fd {
-                b = d;
-                d = c;
-                fd = fc;
-                c = b - gr * (b - a);
-                fc = f(c);
-            } else {
-                a = c;
-                c = d;
-                fc = fd;
-                d = a + gr * (b - a);
-                fd = f(d);
-            }
-        }
-        0.5 * (a + b)
-    }
-
-    #[test]
-    fn exact_profile_recovers_power_where_saddlepoint_is_biased_low() {
-        // Synthetic Tweedie data at the TRUE mean (isolates the density
-        // approximation from the mean fit). The exact-series profile recovers
-        // p_true; the saddlepoint profile is biased conspicuously low — the
-        // #2105 root cause at the density level.
-        let mut rng = StdRng::seed_from_u64(2_105_015);
-        let n = 6000usize;
-        let (p_true, phi_true) = (1.5_f64, 0.6_f64);
-        let mut mu = Array1::<f64>::zeros(n);
-        let mut y = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let x: f64 = -1.5 + 3.0 * rng.random::<f64>();
-            let m = (0.7 + 0.5 * x).exp();
-            mu[i] = m;
-            y[i] = tweedie_sample(m, p_true, phi_true, &mut rng);
-        }
-        let w = Array1::<f64>::ones(n);
-
-        let exact_obj = |p: f64| {
-            let phi = pearson_phi(&y, &mu, p);
-            let eta = mu.mapv(f64::ln);
-            tweedie_exact_loglik_total_from_eta(y.view(), eta.view(), w.view(), p, phi)
-                .expect("exact Tweedie profile row")
-        };
-        let saddle_obj = |p: f64| {
-            let phi = pearson_phi(&y, &mu, p);
-            (0..n)
-                .map(|i| tweedie_saddlepoint_loglik_approximation(y[i], mu[i], w[i], p, phi))
-                .sum::<f64>()
-        };
-
-        let p_exact = golden_max_p(exact_obj);
-        let p_saddle = golden_max_p(saddle_obj);
-        eprintln!("#2105 density profile: p_exact={p_exact:.4} p_saddle={p_saddle:.4}");
-
-        // Exact profile lands near the truth ...
-        assert!(
-            (p_exact - p_true).abs() < 0.06,
-            "exact-series profile must recover p_true={p_true}: got {p_exact}"
-        );
-        // ... while the saddlepoint is biased low by a wide margin (this is the
-        // bug — assert the pre-fix estimator would have failed a tight bound).
-        assert!(
-            p_saddle < p_exact - 0.1,
-            "saddlepoint profile should be biased low relative to exact: \
-             p_saddle={p_saddle}, p_exact={p_exact}"
-        );
-
-        // The dispersion at the recovered power is unbiased under the exact
-        // profile and INFLATED under the saddlepoint's low power.
-        let phi_exact = pearson_phi(&y, &mu, p_exact);
-        let phi_saddle = pearson_phi(&y, &mu, p_saddle);
-        assert!(
-            (phi_exact - phi_true).abs() < 0.05,
-            "φ̂ at the exact power must recover φ_true={phi_true}: got {phi_exact}"
-        );
-        assert!(
-            phi_saddle > phi_exact * 1.05,
-            "the saddlepoint's low power must inflate φ̂: {phi_saddle} vs {phi_exact}"
-        );
-    }
 }

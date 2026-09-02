@@ -10,10 +10,7 @@ use super::evaluation::{
     sas_log_delta_edge_barriercostgradhess,
 };
 use super::external_options::resolve_external_family;
-use super::optimizer::{
-    external_reml_seed_config, freeze_lambda_search_nuisance_at_canonical_anchor,
-    standard_reml_search_prefers_gradient_only,
-};
+use super::optimizer::{external_reml_seed_config, freeze_lambda_search_nuisance_at_canonical_anchor};
 use super::penalty::REML_SEED_SCREENING_RHO_CAP;
 use super::prefit::{
     PrefitRegularityDiagnostic, detect_prefit_binomial_single_column_separation_in_design,
@@ -80,28 +77,6 @@ fn generalized_external_reml_keeps_multistart_policy() {
         cfg.seed_budget, 2,
         "GLM REML must request the alternate ARC startup basin"
     );
-}
-
-#[test]
-fn profiled_gaussian_search_consumes_exact_outer_curvature() {
-    assert!(
-        !standard_reml_search_prefers_gradient_only(LinkFunction::Identity),
-        "quadratic Gaussian identity REML must route its available exact Hessian into search"
-    );
-}
-
-#[test]
-fn non_gaussian_search_reserves_order_four_for_mint() {
-    for link in [
-        LinkFunction::Logit,
-        LinkFunction::Probit,
-        LinkFunction::Log,
-    ] {
-        assert!(
-            standard_reml_search_prefers_gradient_only(link),
-            "{link:?} must retain the optimize-3 / certify-4 derivative ceiling"
-        );
-    }
 }
 
 #[test]

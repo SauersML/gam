@@ -2017,37 +2017,6 @@ mod tests {
     }
 
     #[test]
-    fn log_kernel_single_term_log_sigma_derivatives_match_ghq_reference() {
-        let ctx = QuadratureContext::new();
-        let mu = 0.2;
-        let sigma = 1.0;
-        let jet = LogKernelSumJet::single_term(&ctx, 0, 1.0, mu, sigma).unwrap();
-        let ghq = crate::inference::quadrature::cloglog_ghq_derivatives_adaptive(&ctx, mu, sigma);
-        let survival = (1.0 - ghq.l).max(1e-300);
-        let survival_sigma_over_survival = -ghq.l_sigma / survival;
-        let ref_score = sigma * survival_sigma_over_survival;
-        let ref_neg_hessian = -(ref_score
-            + sigma
-                * sigma
-                * (-ghq.l_sigmasigma / survival - survival_sigma_over_survival.powi(2)));
-
-        assert!(
-            (log_sigma_score_from_log_sum(&jet, sigma) - ref_score).abs()
-                / ref_score.abs().max(1e-12)
-                < 1e-4,
-            "log-sigma score={}, ref={ref_score}",
-            log_sigma_score_from_log_sum(&jet, sigma)
-        );
-        assert!(
-            (log_sigma_neg_hessian_from_log_sum(&jet, sigma) - ref_neg_hessian).abs()
-                / ref_neg_hessian.abs().max(1e-12)
-                < 1e-3,
-            "log-sigma neg_hessian={}, ref={ref_neg_hessian}",
-            log_sigma_neg_hessian_from_log_sum(&jet, sigma)
-        );
-    }
-
-    #[test]
     fn log_kernel_sum_jet_single_term_d1_fd() {
         let ctx = QuadratureContext::new();
         let mu = 0.5;

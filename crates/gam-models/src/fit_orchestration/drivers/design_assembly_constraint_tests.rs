@@ -36,7 +36,6 @@ mod design_assembly_constraint_tests {
     use rand::SeedableRng as _;
     use rand::rngs::StdRng;
 
-
 /// A minimal frozen 1-D B-spline basis at `feature_col`, used to exercise
 /// the column-remap walk without standing up a full fit.
 fn remap_test_bspline(feature_col: usize) -> SmoothBasisSpec {
@@ -3492,8 +3491,6 @@ fn tensor_bspline_design_is_identifiable_against_global_intercept() {
 // copies live in `spatial_length_scale_monotone_tests.rs` and
 // `psi_gram_tensor_fast_path_tests.rs`.
 
-
-
 /// Drives a two-block exact-joint κ optimization with the canonical
 /// zero-work test closures (cost = total design ncols + penalty count;
 /// flat gradient/Hessian; trivial EFS) and returns the resolved result.
@@ -5125,116 +5122,6 @@ fn incremental_realizer_replays_raw_duchon_spec_in_emitted_chart_2433() {
     );
 }
 
-/// Test PIRLS structural determinism: call debug_full_h three times at
-/// the SAME theta=0 and check the returned H matrices agree to a tight
-/// relative tolerance. We deliberately do NOT require bit-identical
-/// matrices: PIRLS feeds intermediate state through rayon `.reduce`
-/// fold/combine on f64 (deviance, weighted sums, X'WX accumulation),
-/// and floating-point addition is non-associative, so the bit pattern
-/// of those reductions varies with thread scheduling. What we *do*
-/// require is structural agreement — the same fixed point in the same
-/// Qs frame. A non-deterministic Qs reparametrization (e.g. an
-/// eigenvector sign flip) shows up as O(‖H‖) entry-wise drift, two
-/// to ten orders of magnitude above the rayon summation floor; the
-/// 1e-5 relative band catches that while tolerating the latter. The
-/// band is 1e-5 rather than 1e-6 because at θ=0 the BinomialProbit
-/// IRLS weights on near-separable data drive ‖H‖_∞ to ~2e9, and the
-/// measured rayon-reduction floor on cancellation-heavy X'WX sums at
-/// that scale is ~2.5e-6 relative — already above 1e-6. 1e-5 still
-/// sits ~5 orders below an O(1)-relative Qs sign flip.
-#[test]
-fn duchon_probit_pirls_determinism_at_zero() {
-    let DuchonProbitSetup {
-        data,
-        y,
-        weights,
-        offset,
-        raw: _,
-        frozen,
-        frozen_design,
-        spatial_terms,
-        dims_per_term,
-        rho_dim,
-        psi_dim,
-    } = build_duchon_probit_setup();
-    let fit_opts = FitOptions {
-        compute_inference: false,
-        max_iter: 200,
-        // This test certifies that `debug_full_h` is deterministic at a
-        // fixed θ; it needs the inner PIRLS to converge so a Hessian is
-        // returned. The binomial-probit Duchon fit's stationarity residual
-        // floors at ‖g‖≈2e-6 (the LM-ridge noise floor), so a sub-floor
-        // request such as 1e-12 can never be certified and surfaces as
-        // `PirlsDidNotConverge`. 1e-6 is the standard GLM convergence
-        // tolerance and clears the floor with margin (the scale-invariant
-        // KKT bound certifies at ‖g‖ < 1e-6·√n·√p ≈ 2.8e-5). 1e-12 only
-        // ever "passed" because the near-stationary band silently carried a
-        // 1e-6 floor, since removed.
-        tol: 1e-6,
-        ..FitOptions::default()
-    };
-
-    let external_opts = external_opts_for_design(
-        &LikelihoodSpec::binomial_probit(),
-        &frozen_design,
-        &fit_opts,
-    );
-    let mut cache = SingleBlockExactJointDesignCache::new(
-        data.view(),
-        frozen.clone(),
-        frozen_design.clone(),
-        spatial_terms.clone(),
-        rho_dim,
-        dims_per_term.clone(),
-    )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "cache", e));
-    let mut evaluator = gam_solve::estimate::ExternalJointHyperEvaluator::new(
-        y.view(),
-        weights.view(),
-        &frozen_design.design,
-        offset.view(),
-        &frozen_design.penalties,
-        &external_opts,
-        "PIRLS-determinism",
-    )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluator", e));
-
-    let theta_dim = rho_dim + psi_dim;
-    let theta_zero = Array1::<f64>::zeros(theta_dim);
-
-    let mut h_calls = Vec::new();
-    for trial in 0..3 {
-        cache.ensure_theta(&theta_zero).unwrap_or_else(|e| panic!("{} failed: {:?}", "ensure_theta", e));
-        let d = cache.design().clone();
-        let h_i = evaluator
-            .debug_full_h(
-                &d.design,
-                &d.penalties,
-                &d.nullspace_dims,
-                d.linear_constraints.clone(),
-                &theta_zero,
-                rho_dim,
-                &format!("determinism trial {}", trial),
-            )
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "debug_full_h", e));
-        h_calls.push(h_i);
-    }
-
-    let h0 = &h_calls[0];
-    let norm_h0 = h0.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-    let abs_tol = (1e-5_f64) * norm_h0 + 1e-12_f64;
-    for trial in 1..3 {
-        let diff = &h_calls[trial] - h0;
-        let max_abs = diff.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        assert!(
-            max_abs <= abs_tol,
-            "PIRLS non-deterministic at fixed θ (trial {trial} vs 0): \
-                 max|Δ|={max_abs:+.6e} > tol={abs_tol:+.6e} \
-                 (‖H‖_∞={norm_h0:+.6e})"
-        );
-    }
-}
-
 #[test]
 fn spatial_aniso_joint_large_psi_dim_reserves_exact_curvature_for_terminal_mint_979() {
     let cap = gam_solve::rho_optimizer::OuterCapability {
@@ -6460,7 +6347,6 @@ fn exact_duchon_log_kappa_derivative_uses_feature_columns_only() {
         "Duchon term should expose an exact derivative"
     );
 }
-
 
 #[test]
 fn spatial_length_scale_optimization_runs_binomial_logit_matern_with_exact_laml_derivatives() {

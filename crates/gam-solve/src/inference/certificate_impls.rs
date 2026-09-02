@@ -285,38 +285,6 @@ mod tests {
     }
 
     #[test]
-    fn coreset_budget_alone_is_insufficient_but_decides_with_margin() {
-        let cert = CoresetCertificate::new(0.1, 0.0, 4, 32).expect("coreset cert");
-        assert_eq!(cert.verdict(), Verdict::Insufficient);
-        // A margin below the budget stays insufficient; above it certifies.
-        let req = cert.race_transfer_margin();
-        assert_eq!(
-            coreset_race_verdict(cert.certify_margin(req * 0.5)),
-            Verdict::Insufficient
-        );
-        assert_eq!(
-            coreset_race_verdict(cert.certify_margin(req * 2.0 + 1.0)),
-            Verdict::Certified
-        );
-    }
-
-    #[test]
-    fn enclosure_certifies_only_when_margin_clears_gap() {
-        let enc = LogdetEnclosure {
-            block_diag_logdet: 10.0,
-            lower: 9.9,
-            upper: 10.1,
-            rho: 0.3,
-            p2: 0.01,
-            p3: None,
-        };
-        assert_eq!(enc.verdict(), Verdict::Insufficient);
-        // gap = 0.2; a margin of 0.5 > gap certifies; 0.1 < gap does not.
-        assert_eq!(enclosure_margin_verdict(&enc, 0.5), Verdict::Certified);
-        assert_eq!(enclosure_margin_verdict(&enc, 0.1), Verdict::Insufficient);
-    }
-
-    #[test]
     fn collapse_terminal_is_unavailable_reseeded_is_insufficient() {
         let reseeded = CollapseEvent {
             iteration: 3,

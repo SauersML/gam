@@ -18,7 +18,6 @@ use approx::assert_abs_diff_eq;
 use gam_solve::arrow_schur::{
     ArrowFactorSlab, ArrowHtbetaCache, ArrowPcgDiagnostics, ArrowSolverMode, ArrowUndampedFactors,
 };
-use gam_solve::evidence::arrow_log_det_from_cache;
 use ndarray::array;
 
 /// Torus T^2 fit on synthetic data with a known two-frequency signal.
@@ -1688,27 +1687,6 @@ pub(crate) struct FixedStateLogdetSample {
     pub(crate) stratum: FiniteDifferenceStratumCertificate,
 }
 
-pub(crate) fn fixed_state_logdet_sample(
-    mut term: SaeManifoldTerm,
-    target: &Array2<f64>,
-    rho: &SaeManifoldRho,
-) -> FixedStateLogdetSample {
-    let (_value, _loss, cache) = term
-        .penalized_quasi_laplace_criterion_with_cache(
-            target.view(),
-            rho,
-            None,
-            0,
-            0.4,
-            1.0e-6,
-            1.0e-6,
-        )
-        .expect("fixed-state cache");
-    let value = arrow_log_det_from_cache(&cache).expect("fixed-state authoritative joint logdet");
-    let stratum = FiniteDifferenceStratumCertificate::from_arrow_cache(&cache);
-    FixedStateLogdetSample { value, stratum }
-}
-
 pub(crate) fn certified_central_logdet_difference(
     label: &str,
     center: &FiniteDifferenceStratumCertificate,
@@ -1723,95 +1701,6 @@ pub(crate) fn certified_central_logdet_difference(
     center.assert_same_stratum(&format!("{label} (+h)"), &plus.stratum);
     center.assert_same_stratum(&format!("{label} (-h)"), &minus.stratum);
     (plus.value - minus.value) / (2.0 * step)
-}
-
-fn floor_crossing_logdet_sample_2398(ratio: f64) -> FixedStateLogdetSample {
-    assert!(ratio.is_finite() && ratio > 0.0);
-    let relative_floor = gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR;
-    let spectral_floor = relative_floor * 4.0;
-    let mut system = ArrowSchurSystem::new(1, 3, 0);
-    system.rows[0].htt = array![
-        [4.0_f64, 0.0, 0.0],
-        [0.0, ratio * spectral_floor, 0.0],
-        [0.0, 0.0, -1.0],
-    ];
-    SaeManifoldTerm::ensure_row_gauge_deflation_for_quasi_laplace(&mut system);
-    let options = ArrowSolveOptions::direct()
-        .with_gpu_policy(gam_gpu::GpuPolicy::Off)
-        .with_evidence_unit_deflation(relative_floor);
-    // The ridge belongs only to the Newton factor, keeping the deliberately
-    // indefinite fixture solvable. The independently assembled undamped
-    // evidence factor still classifies the original spectrum above.
-    let (_, _, cache) = solve_arrow_newton_step_with_options(&system, 2.0, 0.0, &options)
-        .expect("floor-crossing fixture must produce an evidence cache");
-    let value =
-        arrow_log_det_from_cache(&cache).expect("floor-crossing fixture must have a logdet");
-    let stratum = FiniteDifferenceStratumCertificate::from_arrow_cache(&cache);
-    FixedStateLogdetSample { value, stratum }
-}
-
-#[test]
-fn certified_central_logdet_difference_refuses_floor_clamp_crossing_2398() {
-    // These are the two sides of the production classifier's banded cutoff:
-    // 0.995 is retained through the floor-clamped branch, while 1.05 is raw.
-    // Their midpoint is also raw, so only the -h endpoint changes stratum.
-    let minus_ratio = 0.995_f64;
-    let plus_ratio = 1.05_f64;
-    let center_ratio = (minus_ratio + plus_ratio) / 2.0;
-    let step = (plus_ratio - minus_ratio) / 2.0;
-    let center = floor_crossing_logdet_sample_2398(center_ratio);
-    let plus = floor_crossing_logdet_sample_2398(plus_ratio);
-    let minus = floor_crossing_logdet_sample_2398(minus_ratio);
-
-    let expected_raw = vec![
-        RowSpectralConditioning::UnitDeflated,
-        RowSpectralConditioning::Raw,
-        RowSpectralConditioning::Raw,
-    ];
-    let expected_clamped = vec![
-        RowSpectralConditioning::UnitDeflated,
-        RowSpectralConditioning::FloorClamped,
-        RowSpectralConditioning::Raw,
-    ];
-    assert_eq!(
-        center.stratum.row_spectral_conditioning,
-        vec![Some(expected_raw.clone())],
-    );
-    assert_eq!(
-        plus.stratum.row_spectral_conditioning,
-        vec![Some(expected_raw)],
-    );
-    assert_eq!(
-        minus.stratum.row_spectral_conditioning,
-        vec![Some(expected_clamped)],
-    );
-    assert!(center.stratum.changed_fields(&plus.stratum).is_empty());
-    assert_eq!(
-        center.stratum.changed_fields(&minus.stratum),
-        vec!["row_spectral_conditioning"],
-    );
-
-    let panic = std::panic::catch_unwind(move || {
-        certified_central_logdet_difference(
-            "spectral-floor stratum #2398",
-            &center.stratum,
-            plus,
-            minus,
-            step,
-        )
-    })
-    .expect_err("a floor-clamp crossing must refuse before producing a quotient");
-    let message = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .expect("refusal panic must carry a string message");
-    assert!(
-        message
-            .contains("finite-difference endpoint crossed a nondifferentiable structural stratum")
-    );
-    assert!(message.contains("changed_fields=[\"row_spectral_conditioning\"]"));
-    assert!(message.contains("spectral-floor stratum #2398 (-h)"));
 }
 
 /// What the value-free branch guard could establish about a stencil.

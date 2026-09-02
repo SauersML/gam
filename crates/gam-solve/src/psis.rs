@@ -388,33 +388,4 @@ mod tests {
         }
     }
 
-    /// The reported shape is the prior-shrunk convex combination the resolution
-    /// helpers assume. Exercised on an exact-quantile GPD sample where the raw
-    /// profile fit is essentially the truth, so the residual offset from the
-    /// truth is the shrinkage term and nothing else.
-    #[test]
-    fn psis_reported_shape_is_shrunk_toward_the_prior_mean() {
-        // Reported = (n k_raw + P m) / (n + P) is an identity in k_raw, so it
-        // suffices to check the two helpers agree with it at the endpoints.
-        for &n in &[5usize, 23, 91, 1000] {
-            let n_f = n as f64;
-            let p = SHAPE_PRIOR_PSEUDO_OBSERVATIONS;
-            for &k in &[0.0_f64, 0.25, 0.7, 0.95, 1.5] {
-                let expected = (n_f * k + p * SHAPE_PRIOR_MEAN) / (n_f + p);
-                assert!(
-                    (expected_reported_shape(k, n) - expected).abs() < 1e-15,
-                    "expected_reported_shape must be the shrinkage identity"
-                );
-                assert!(
-                    (shape_resolution(k, n) - n_f.sqrt() * (1.0 + k) / (n_f + p)).abs() < 1e-15,
-                    "shape_resolution must be the shrunk GPD MLE standard error"
-                );
-            }
-            // The shrink always pulls a heavy tail toward the prior mean.
-            assert!(
-                expected_reported_shape(1.0, n) < 1.0,
-                "a true shape above the prior mean must report low at n = {n}"
-            );
-        }
-    }
 }

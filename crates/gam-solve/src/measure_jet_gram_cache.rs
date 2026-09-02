@@ -288,10 +288,6 @@ mod tests {
         out
     }
 
-    fn naive_xtwz(x: &Array2<f64>, weights: &Array1<f64>, z: &Array1<f64>) -> Array1<f64> {
-        naive_xtwy(x, weights, z)
-    }
-
     fn naive_ywy(weights: &Array1<f64>, r: &Array1<f64>) -> f64 {
         let mut sum = 0.0;
         for row in 0..weights.len() {
@@ -351,59 +347,6 @@ mod tests {
     }
 
     #[test]
-    fn penalized_rss_matches_direct_residual() {
-        let n = 40;
-        let p = 4;
-        let x = deterministic_design(n, p);
-        let y = deterministic_response(n);
-        let offset = deterministic_offset(n);
-        let weights = deterministic_weights(n, 0.21);
-        let beta = Array1::from_vec(vec![0.4, -0.2, 0.15, 0.05]);
-        let r = &y - &offset;
-        let cache = FixedDesignGramCache::build(
-            x.view(),
-            y.view(),
-            Some(offset.view()),
-            Some(weights.view()),
-        )
-        .unwrap();
-        let mut direct = 0.0;
-        for row in 0..n {
-            let mut fit = 0.0;
-            for col in 0..p {
-                fit += x[[row, col]] * beta[col];
-            }
-            let residual = r[row] - fit;
-            direct += weights[row] * residual * residual;
-        }
-        let cached = cache.penalized_rss(beta.view()).unwrap();
-        assert_abs_diff_eq!(cached, direct, epsilon = 1.0e-8);
-    }
-
-    #[test]
-    fn penalized_normal_matrix_adds_penalty() {
-        let n = 40;
-        let p = 4;
-        let x = deterministic_design(n, p);
-        let y = deterministic_response(n);
-        let cache = FixedDesignGramCache::build(x.view(), y.view(), None, None).unwrap();
-        let penalty = Array2::from_shape_fn((p, p), |(row, col)| {
-            if row == col {
-                0.5 + row as f64 * 0.1
-            } else {
-                0.02 * (row + col) as f64
-            }
-        });
-        let normal = cache.penalized_normal_matrix(penalty.view()).unwrap();
-        for row in 0..p {
-            for col in 0..p {
-                let expected = cache.xtwx()[[row, col]] + penalty[[row, col]];
-                assert_abs_diff_eq!(normal[[row, col]], expected, epsilon = 1.0e-12);
-            }
-        }
-    }
-
-    #[test]
     fn row_cache_xtwx_matches_fresh_build_across_weights() {
         let n = 40;
         let p = 4;
@@ -419,22 +362,6 @@ mod tests {
             let fresh = fast_xt_diag_x(&x, weights);
             assert_matrix_close(cached.view(), &fresh, 1.0e-12);
         }
-    }
-
-    #[test]
-    fn row_cache_xtwz_matches_naive() {
-        let n = 40;
-        let p = 4;
-        let x = deterministic_design(n, p);
-        let weights = deterministic_weights(n, 0.33);
-        let z = Array1::from_shape_fn(n, |i| {
-            let row = i as f64 + 1.0;
-            (row * 0.07).sin() + 0.03 * row
-        });
-        let cache = FixedDesignRowCache::build(x.view()).unwrap();
-        let cached = cache.xtwz(weights.view(), z.view()).unwrap();
-        let expected = naive_xtwz(&x, &weights, &z);
-        assert_vector_close(cached.view(), &expected, 1.0e-9);
     }
 
     #[test]

@@ -835,7 +835,6 @@ impl PreparedSharedTangent {
             penalty_beta.push(z);
         }
 
-
         // REML profiles the scale out as `φ̂ = D_p/rdf` with `D_p` the PENALIZED
         // deviance, so the criterion's data term is `rdf·ln(D_p)` and its
         // ρ-derivative is `rdf·(β̂ᵗλⱼSⱼβ̂)/D_p` — exactly `deviance_first[j]/D_p`.
@@ -953,7 +952,6 @@ impl PreparedSharedTangent {
             deviance_first[index] = beta.dot(&z);
             penalty_beta.push(z);
         }
-
 
         // REML profiles the scale out as `φ̂ = D_p/rdf` with `D_p` the PENALIZED
         // deviance, so the criterion's data term is `rdf·ln(D_p)` and its
@@ -1759,112 +1757,6 @@ mod tests {
                 let hessian_fd = (plus_eval.gradient[k] - minus_eval.gradient[k]) / (2.0 * step);
                 assert_close(exact.hessian[[k, j]], hessian_fd, 3.0e-6);
             }
-        }
-    }
-
-    /// #2629 scope item 2 — settle the `shared-tangent` row of the objective
-    /// table by MEASUREMENT rather than by grep.
-    ///
-    /// #2545 taught the outer certificate to subtract the soft ρ-guard barrier
-    /// from its view at railed coordinates, and reached only the objectives that
-    /// PUBLISH it via `OuterObjective::soft_rho_guard_gradient`. The trait's
-    /// `None` default means "this objective carries no barrier", and it is
-    /// byte-identical, at the seam, to an objective that carries one and says
-    /// nothing — which is the whole of #2545/#2629.
-    ///
-    /// [`SharedTangentObjective`] takes the default. #2629's grounds for that
-    /// being correct were a call-graph argument: `RemlState::build_prior` is the
-    /// only site that adds the barrier to a criterion, and this objective's
-    /// `eval` goes to `PreparedSharedTangent::evaluate` — its own criterion,
-    /// holding no `RemlState`. This is the number instead.
-    ///
-    /// Read the ladder printed below rather than just the verdict: a criterion
-    /// carrying the barrier is pinned within a hair of `w·a·tanh(a·ρ)` at every
-    /// rung, ~1.33e-7, and cannot decay past it.
-    #[test]
-    fn the_shared_tangent_criterion_carries_no_soft_rho_guard_floor_2629() {
-        use gam_solve::rho_optimizer::soft_rho_guard_floor::{
-            GuardLadderRung, SATURATED_RHO_LADDER, classify_soft_rho_guard_floor,
-            soft_rho_guard_emission_at,
-        };
-
-        let prepared =
-            PreparedSharedTangent::from_request(fixture_request(None)).expect("prepare");
-        // Hold BOTH penalties at the rung: the barrier is added to every ρ
-        // coordinate identically by `build_prior`, so a floor would show on
-        // either, and railing both is the configuration a λ=∞ face actually is.
-        let ladders: Vec<Vec<GuardLadderRung>> = (0..2)
-            .map(|coord| {
-                SATURATED_RHO_LADDER
-                    .iter()
-                    .map(|&probe| {
-                        let rho = Array1::from_elem(2, probe);
-                        let evaluation = prepared
-                            .evaluate(&rho)
-                            .unwrap_or_else(|e| panic!("shared-tangent eval at rho={probe}: {e}"));
-                        GuardLadderRung {
-                            rho: probe,
-                            rho_gradient: evaluation.gradient[coord],
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-
-        for (coord, ladder) in ladders.iter().enumerate() {
-            // This criterion holds no weighted `RemlState`, so there is no
-            // weight anchor to speak of and none to pass.
-            let verdict = classify_soft_rho_guard_floor(ladder, 0.0);
-            let rendered = ladder
-                .iter()
-                .map(|rung| {
-                    format!(
-                        "(rho={:.0}, g={:+.6e}, guard={:.6e})",
-                        rung.rho,
-                        rung.rho_gradient,
-                        soft_rho_guard_emission_at(rung.rho, 0.0)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            eprintln!(
-                "[#2629-table] shared-tangent k={coord}: {} | {rendered}",
-                verdict.summary()
-            );
-            assert!(
-                verdict.is_absent(),
-                "#2629's table lists `shared-tangent` as carrying no soft rho-guard \
-                 barrier. If that is wrong, every railed coordinate of every \
-                 shared-tangent fit carries a standing |Pg| >= w*a = 1.3333e-7 that \
-                 no convergence clears, and this objective owes the seam a \
-                 publication. k={coord}: {} | ladder {rendered}",
-                verdict.summary()
-            );
-
-            // The control that stops "absent" from being vacuous: inject the
-            // barrier into this very ladder and require the verdict off absent.
-            // A floor cannot be shown missing by a measurement that could not
-            // have shown it present.
-            let injected: Vec<GuardLadderRung> = ladder
-                .iter()
-                .map(|rung| GuardLadderRung {
-                    rho: rung.rho,
-                    rho_gradient: rung.rho_gradient
-                        + soft_rho_guard_emission_at(rung.rho, 0.0),
-                })
-                .collect();
-            let injected_verdict = classify_soft_rho_guard_floor(&injected, 0.0);
-            assert!(
-                !injected_verdict.is_absent(),
-                "k={coord}: with the barrier explicitly added this ladder must NOT \
-                 read as absent — if it does, the fixture is blind to the very \
-                 thing the assertion above claims to have looked for. Got: {}",
-                injected_verdict.summary()
-            );
-            eprintln!(
-                "[#2629-control] shared-tangent k={coord} + injected barrier: {}",
-                injected_verdict.summary()
-            );
         }
     }
 

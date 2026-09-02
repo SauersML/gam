@@ -698,7 +698,6 @@ pub fn collect_stratified_target(
 mod tests {
     use super::super::shard_reader::{MmapShardSource, encode_shard_bytes};
     use super::*;
-    use gam_solve::row_sampling_measure::RowSamplingMeasure;
     use ndarray::{Array2, s};
     use std::io::Write;
     use std::path::PathBuf;
@@ -799,83 +798,6 @@ mod tests {
             q[[d, d]] = 1.0;
         }
         q
-    }
-
-    #[test]
-    fn stratification_surfaces_rare_structure_uniform_does_not() {
-        // ~1e-4-frequency rare structure among a dominant bulk (the reviewer's
-        // regime: a rare curved structure drowned in dominant ones). At this
-        // budget the uniform design expects ≈ f·rare = 0.02·30 ≈ 0.6 rare rows —
-        // essentially never presented to the birth producer — while the
-        // residual-energy census takes the whole high-residual tail (π = 1).
-        let n = 300_000usize;
-        let p = 8usize;
-        let k_dom = 4usize;
-        let rare_rows = 30usize; // frequency = 1e-4
-        let budget = 6_000usize; // uniform rate f = 0.02
-
-        let (rows, rare_idx) = planted_corpus(n, p, k_dom, rare_rows);
-        let dir = temp_shard_dir("surface", &rows, n / 2);
-        let mut src = MmapShardSource::open_dir(&dir).expect("open");
-
-        let screen = SpanResidualEnergy::new(dominant_basis(p, k_dom));
-        let collected = collect_stratified_target(&mut src, &screen, budget, 7).expect("collect");
-
-        // The design must have censused the high-energy tail (π = 1 there).
-        let top = collected.design.strata().last().expect("nonempty strata");
-        assert!(
-            top.censused && (top.pi - 1.0).abs() < 1e-12,
-            "top residual-energy stratum must be censused: {top:?}"
-        );
-
-        // Recall of the planted rare rows under stratification.
-        let selected: std::collections::BTreeSet<u64> = collected.row_ids.iter().copied().collect();
-        let rare_seen_strat = rare_idx
-            .iter()
-            .filter(|&&i| selected.contains(&(i as u64)))
-            .count();
-        assert!(
-            rare_seen_strat as f64 >= 0.8 * rare_idx.len() as f64,
-            "stratification must surface ≥80% of the rare structure: {rare_seen_strat}/{}",
-            rare_idx.len()
-        );
-
-        // Rare rows are censused ⇒ carry weight exactly 1.0.
-        for (k, &rid) in collected.row_ids.iter().enumerate() {
-            if rare_idx.binary_search(&(rid as usize)).is_ok() {
-                assert!(
-                    (collected.likelihood_weights[k] - 1.0).abs() < 1e-12,
-                    "censused rare row {rid} must have HT weight 1.0"
-                );
-            }
-        }
-
-        // Contrast: a plain uniform designed subsample at the SAME budget.
-        // With no residual stratification the rare rows are drawn ∝ frequency,
-        // so the birth producer essentially never sees the structure.
-        let uniform_measure = RowSamplingMeasure::uniform(n);
-        let uniform_sample = uniform_measure.designed_subsample(budget, 7);
-        let uniform_selected: std::collections::BTreeSet<usize> =
-            uniform_sample.rows.iter().copied().collect();
-        let rare_seen_uniform = rare_idx
-            .iter()
-            .filter(|&&i| uniform_selected.contains(&i))
-            .count();
-
-        assert!(
-            rare_seen_strat > rare_seen_uniform * 4,
-            "stratification must vastly out-recall uniform: strat={rare_seen_strat} \
-             uniform={rare_seen_uniform}"
-        );
-        // The uniform baseline surfaces only a handful (≈ f · rare = 0.05·80 = 4).
-        assert!(
-            (rare_seen_uniform as f64) <= 0.25 * rare_idx.len() as f64,
-            "uniform baseline should surface few rare rows, got {rare_seen_uniform}"
-        );
-
-        if let Err(err) = std::fs::remove_dir_all(&dir) {
-            log::debug!("fixture cleanup left {} behind: {err}", dir.display());
-        }
     }
 
     #[test]

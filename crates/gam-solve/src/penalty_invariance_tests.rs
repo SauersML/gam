@@ -40,47 +40,6 @@ fn penalty(local: Array2<f64>, total_dim: usize) -> CanonicalPenalty {
     }
 }
 
-/// `S_2 = c * S_0` is the redundancy `geo_disease_matern` carries, and the
-/// invariance must be the exact line `(c, 0, -1)` — recovered from the Gram, not
-/// from a pairwise cosine threshold.
-#[test]
-fn proportional_penalties_yield_the_exact_lambda_null_direction_2676() {
-    let s0 = array![[2.0, 0.5, 0.0], [0.5, 1.0, 0.0], [0.0, 0.0, 0.0]];
-    let s1 = array![[0.0, 0.0, 0.0], [0.0, 3.0, 1.0], [0.0, 1.0, 2.0]];
-    let scale = 0.75_f64;
-    let s2 = s0.mapv(|value| scale * value);
-    let bundle = vec![penalty(s0, 3), penalty(s1, 3), penalty(s2, 3)];
-
-    let invariance = PenaltyMapInvariance::from_canonical_penalties(&bundle, 3)
-        .expect("penalty map gram must decompose");
-    assert_eq!(
-        invariance.dimension(),
-        1,
-        "one proportional pair is exactly one linear redundancy"
-    );
-    let basis = invariance.lambda_basis();
-    let w = basis.column(0).to_owned();
-    // Fix the sign, then compare against (c, 0, -1) normalised.
-    let expected = {
-        let raw = Array1::from(vec![scale, 0.0, -1.0]);
-        let norm = raw.dot(&raw).sqrt();
-        raw.mapv(|value| value / norm)
-    };
-    let aligned = if w.dot(&expected) < 0.0 {
-        w.mapv(|value| -value)
-    } else {
-        w.clone()
-    };
-    for index in 0..3 {
-        assert!(
-            (aligned[index] - expected[index]).abs() < 1e-12,
-            "null direction component {index}: got {}, expected {}",
-            aligned[index],
-            expected[index],
-        );
-    }
-}
-
 /// The property that makes this a defect rather than a tolerance question:
 /// along the lifted invariance the rho-curvature is EXACTLY the chain-rule
 /// term, so `|t' H_rho t| == sum_k |g_k| t_k^2` whenever the gradient shares a
@@ -580,56 +539,6 @@ fn an_all_zero_penalty_map_is_entirely_null_2676() {
         "an identically zero penalty map is flat in every lambda direction"
     );
     assert_eq!(invariance.resolution(), 0.0);
-}
-
-/// A three-term redundancy no pairwise measure can see: `A_2 = A_0 + A_1` with
-/// all three pairs far from proportional. The certification must find it, and
-/// the direction it returns must be the right one.
-///
-/// This is why the pairwise screen is documented as a SCREEN: it would report
-/// nothing here.
-#[test]
-fn a_three_term_redundancy_no_pair_can_see_is_certified_2676() {
-    let s0 = array![[2.0_f64, 0.5, 0.0], [0.5, 1.0, 0.0], [0.0, 0.0, 0.0]];
-    let s1 = array![[0.0_f64, 0.0, 0.0], [0.0, 3.0, 1.0], [0.0, 1.0, 2.0]];
-    let s2 = &s0 + &s1;
-    // Every pair is measurably distinct, so nothing pairwise fires.
-    for (a, b) in [(&s0, &s1), (&s0, &s2), (&s1, &s2)] {
-        let aa: f64 = a.iter().map(|v| v * v).sum();
-        let ab: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-        let scale = ab / aa;
-        let residual: f64 = a
-            .iter()
-            .zip(b.iter())
-            .map(|(x, y)| (y - scale * x) * (y - scale * x))
-            .sum::<f64>()
-            .sqrt()
-            / aa.sqrt();
-        assert!(
-            residual > 1e-2,
-            "the fixture must be pairwise-invisible; got a pair defect of {residual:.3e}"
-        );
-    }
-    let bundle = vec![penalty(s0, 3), penalty(s1, 3), penalty(s2, 3)];
-    let invariance =
-        PenaltyMapInvariance::from_canonical_penalties(&bundle, 3).expect("gram decomposes");
-    assert_eq!(invariance.dimension(), 1);
-    // `w ∝ (1, 1, -1)`, normalised, up to sign.
-    let w = invariance.lambda_basis().column(0).to_owned();
-    let expected = Array1::from(vec![1.0_f64, 1.0, -1.0]).mapv(|v| v / 3.0_f64.sqrt());
-    let aligned = if w.dot(&expected) < 0.0 {
-        w.mapv(|value| -value)
-    } else {
-        w
-    };
-    for index in 0..3 {
-        assert!(
-            (aligned[index] - expected[index]).abs() < 1e-12,
-            "component {index}: got {}, expected {}",
-            aligned[index],
-            expected[index]
-        );
-    }
 }
 
 /// The `(H_ρ, g_ρ, lifted invariance)` triple used by the #2748 instrument

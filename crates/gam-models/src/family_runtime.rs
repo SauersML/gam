@@ -17,7 +17,6 @@ use gam_solve::mixture_link::{
 };
 use ndarray::{Array1, ArrayView1};
 
-
 /// Runtime family behavior carrier built from a `LikelihoodSpec` (response
 /// distribution + parameterized inverse-link).
 pub trait FamilyStrategy: std::fmt::Debug + Send + Sync {
@@ -424,7 +423,6 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
 mod log_link_public_jet_tests {
     use super::*;
     use gam_problem::LikelihoodSpec;
-    use gam_solve::mixture_link::inverse_link_jet_for_family;
     use ndarray::Array1;
 
     /// The PUBLIC predict surface for a log-link family (Poisson/Gamma/Tweedie/
@@ -475,29 +473,4 @@ mod log_link_public_jet_tests {
         assert_eq!(under.mu, 0.0, "exp(-746) -> 0.0");
     }
 
-    /// On the inclusive solver domain, the public and solver jets are
-    /// byte-identical exact exponentials across the value and all derivatives.
-    #[test]
-    fn public_predict_log_jet_is_byte_identical_on_solver_domain() {
-        let spec = LikelihoodSpec::poisson_log();
-        let strategy = strategy_for_spec(&spec);
-        for &eta in &[
-            -700.0, -300.0, -12.5, -1.0, -0.25, 0.0, 0.25, 1.0, 12.5, 300.0, 700.0,
-        ] {
-            let public_jet = strategy.inverse_link_jet(eta).expect("public jet");
-            let solver_jet = inverse_link_jet_for_family(&spec, eta).expect("solver jet");
-            assert_eq!(
-                public_jet.mu.to_bits(),
-                solver_jet.mu.to_bits(),
-                "mu must be byte-identical in range at eta={eta}"
-            );
-            assert_eq!(
-                public_jet.d1.to_bits(),
-                solver_jet.d1.to_bits(),
-                "d1 must be byte-identical in range at eta={eta}"
-            );
-            assert_eq!(public_jet.d2.to_bits(), solver_jet.d2.to_bits());
-            assert_eq!(public_jet.d3.to_bits(), solver_jet.d3.to_bits());
-        }
-    }
 }

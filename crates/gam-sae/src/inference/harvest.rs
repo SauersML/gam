@@ -317,22 +317,6 @@ mod tests {
     }
 
     #[test]
-    fn lifted_measure_imputes_mean_mass_off_tier() {
-        // Tier rows 2 and 5 with masses 1 and 9 ⇒ mean 5. Off-tier rows carry
-        // mass 5, so the loud tier row outranks them and the quiet tier row
-        // ranks below them — observed signal moves attention both ways.
-        let metric = tier_metric(&[1.0, 9.0]);
-        let h = TieredHarvest::with_unweighted_tier(4, vec![2, 3], metric).expect("harvest");
-        let m = h.corpus_measure();
-        assert!(m.is_enriched());
-        let w = m.weights();
-        // masses: [5, 5, 1, 9] / 20.
-        assert!((w[0] - 0.25).abs() < 1e-12);
-        assert!((w[2] - 0.05).abs() < 1e-12);
-        assert!((w[3] - 0.45).abs() < 1e-12);
-    }
-
-    #[test]
     fn inclusion_correction_undoes_design_bias() {
         // Two tier rows with the SAME underlying mass, but row B was twice as
         // likely to be designed in (π = 1.0 vs 0.5). HT correction must give

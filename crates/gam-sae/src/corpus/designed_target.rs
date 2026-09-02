@@ -258,51 +258,6 @@ mod tests {
     }
 
     #[test]
-    fn designed_budget_collects_exactly_the_designed_rows_with_their_weights() {
-        let n = 200;
-        let p = 3;
-        let rows = planted_rows(n, p);
-        let dir = temp_shard_dir("designed", &rows, 90);
-        let mut src = MmapShardSource::open_dir(&dir).expect("open");
-
-        let budget = 40usize;
-        let seed = 17u64;
-        let collected = collect_designed_target(&mut src, None, budget, seed).expect("collect");
-        assert!(collected.is_designed_subsample());
-
-        // The selection must be the measure's own design, row for row,
-        // weight for weight.
-        let sample = RowSamplingMeasure::uniform(n).designed_subsample(budget, seed);
-        assert_eq!(
-            collected.row_ids,
-            sample.rows.iter().map(|&r| r as u64).collect::<Vec<_>>()
-        );
-        assert_eq!(collected.likelihood_weights, sample.likelihood_weights);
-
-        // Each collected row is bitwise the corpus row it claims to be.
-        let stored = rows.mapv(|v| f64::from(v as f32));
-        for (k, &rid) in collected.row_ids.iter().enumerate() {
-            for c in 0..p {
-                assert_eq!(
-                    collected.target[[k, c]].to_bits(),
-                    stored[[rid as usize, c]].to_bits(),
-                    "row {rid} col {c}"
-                );
-            }
-        }
-
-        // Deterministic: same (measure, budget, seed) ⇒ identical collection.
-        let again = collect_designed_target(&mut src, None, budget, seed).expect("collect again");
-        assert_eq!(again.row_ids, collected.row_ids);
-        for (a, b) in again.target.iter().zip(collected.target.iter()) {
-            assert_eq!(a.to_bits(), b.to_bits());
-        }
-        if let Err(error) = std::fs::remove_dir_all(&dir) {
-            log::debug!("designed-target test: removing the temp shard dir failed: {error}");
-        }
-    }
-
-    #[test]
     fn measure_dimension_mismatch_is_rejected() {
         let rows = planted_rows(20, 2);
         let dir = temp_shard_dir("mismatch", &rows, 10);

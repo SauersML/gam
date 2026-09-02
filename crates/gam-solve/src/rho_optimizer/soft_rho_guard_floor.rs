@@ -38,8 +38,6 @@
 //! [`OuterObjective::soft_rho_guard_gradient`]: super::OuterObjective::soft_rho_guard_gradient
 //! [`SoftRhoGuardPriorAtom`]: crate::estimate::reml::atoms::SoftRhoGuardPriorAtom
 
-
-
 /// The saturated-ρ ladder #2450 established and #2545/#2629 measure on.
 ///
 /// `ρ ≥ 21` is where the REML part's own ρ-derivative was measured below
