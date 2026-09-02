@@ -489,14 +489,6 @@ impl JointPenaltyBundle {
         }
     }
 
-    /// Per-penalty ρ-gradient contribution to the outer objective term:
-    ///   `∂/∂ρ_j [½ exp(ρ_j) βᵀ S_j β] = exp(ρ_j) · ½ βᵀ S_j β`.
-    pub fn rho_objective_gradient(&self, beta: ArrayView1<'_, f64>, out: &mut [f64]) {
-        assert_eq!(out.len(), self.specs.len());
-        for (i, (spec, &lam)) in self.specs.iter().zip(self.lambdas.iter()).enumerate() {
-            out[i] = 0.5 * lam * spec.quadratic_form(beta);
-        }
-    }
 }
 
 #[cfg(test)]

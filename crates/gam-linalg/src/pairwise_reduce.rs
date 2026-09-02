@@ -273,33 +273,6 @@ where
     }
 }
 
-/// Convenience: reduce an iterator of fixed-size chunks through a streaming
-/// pairwise tree, returning the bit-identical whole-slice result.
-///
-/// `chunks` may be sliced arbitrarily — the result depends only on the ordered
-/// concatenation of all elements, per the determinism contract.
-pub fn pairwise_reduce_chunked<'a, T, F, I>(chunks: I, combine: F, identity: T) -> T
-where
-    T: Copy + 'a,
-    F: Fn(T, T) -> T,
-    I: IntoIterator<Item = &'a [T]>,
-{
-    let mut acc = StreamingPairwise::new(combine, identity);
-    for chunk in chunks {
-        acc.extend_from_slice(chunk);
-    }
-    acc.finish()
-}
-
-/// Streaming `f64` pairwise sum over an iterator of chunks. Bit-identical to
-/// [`pairwise_sum`] over the concatenation of all chunks.
-pub fn pairwise_sum_chunked<'a, I>(chunks: I) -> f64
-where
-    I: IntoIterator<Item = &'a [f64]>,
-{
-    pairwise_reduce_chunked(chunks, |a, b| a + b, 0.0)
-}
-
 /// Parallel, bit-reproducible pairwise map-reduce over the index range
 /// `0..n`.
 ///

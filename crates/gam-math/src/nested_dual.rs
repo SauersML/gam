@@ -278,67 +278,6 @@ impl<S: JetFieldConst> JetFieldConst for Dual2<S> {
 pub type Dual22 = Dual2<Dual2<f64>>;
 
 impl Dual22 {
-    /// Seed a primary that varies only along the OUTER direction `a`
-    /// (`∂/∂a = 1`, `∂/∂b = 0`) — the `Tower4::variable(x, 0)` analogue.
-    #[inline]
-    pub fn seed_outer(x: f64) -> Self {
-        Dual2::variable(Dual2::<f64>::constant(x))
-    }
-    /// Seed a primary that varies only along the INNER direction `b`
-    /// (`∂/∂a = 0`, `∂/∂b = 1`) — the `Tower4::variable(x, 1)` analogue.
-    #[inline]
-    pub fn seed_inner(x: f64) -> Self {
-        Dual2::constant(Dual2::<f64>::variable(x))
-    }
-
-    /// Seed a primary at value `base` that moves as `base + s·d1 + t·d2` under the
-    /// two independent scalar directions `s` (outer `a`) and `t` (inner `b`):
-    /// `∂/∂a = d1`, `∂/∂b = d2`, all second-and-higher self-derivatives zero
-    /// (the primary is affine in `s, t`). This is what a directional
-    /// bidirectional contraction along arbitrary weight vectors `d1, d2` needs —
-    /// seed every primary `i` with `seed_directional(base_i, d1_i, d2_i)`, run
-    /// the program, and read `channels()[8]` (`∂²_a ∂²_b`) for
-    /// `Σ_{a,b,c,d} ℓ_{abcd}·d1_a d1_b d2_c d2_d`.
-    #[inline]
-    pub fn seed_directional(base: f64, d1: f64, d2: f64) -> Self {
-        Dual2 {
-            // value carries the inner (`t`) direction on its `g` channel.
-            v: Dual2::<f64> {
-                v: base,
-                g: d2,
-                h: 0.0,
-            },
-            // outer (`s`) first derivative is `d1`, itself constant in `t`.
-            g: Dual2::<f64>::constant(d1),
-            h: Dual2::<f64>::constant(0.0),
-        }
-    }
-
-    /// Build a nested dual directly from its nine `(s-order, t-order)` channels,
-    /// ordered as [`Self::channels`]: `[v, ∂a, ∂b, ∂aa, ∂ab, ∂bb, ∂aab, ∂abb,
-    /// ∂aabb]`. The inverse of [`Self::channels`]. Used to assemble the result of
-    /// a channel-space operation (e.g. a moment-recurrence residual term) back
-    /// into a `Dual22`.
-    #[inline]
-    pub fn from_channels(c: [f64; 9]) -> Self {
-        Dual2 {
-            v: Dual2::<f64> {
-                v: c[0],
-                g: c[2],
-                h: c[5],
-            },
-            g: Dual2::<f64> {
-                v: c[1],
-                g: c[4],
-                h: c[7],
-            },
-            h: Dual2::<f64> {
-                v: c[3],
-                g: c[6],
-                h: c[8],
-            },
-        }
-    }
 
     /// The nine channels this nested dual represents, keyed to the two-primary
     /// [`crate::jet_tower::Tower4`] indices `0` (outer `a`) and `1` (inner `b`):

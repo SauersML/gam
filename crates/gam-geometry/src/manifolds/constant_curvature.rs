@@ -154,47 +154,6 @@ pub fn cs_stacks(u: f64) -> ([f64; 5], [f64; 5]) {
     }
 }
 
-/// Derivative stack `[T, T′, T″, T‴, T⁗]` (in `w`) of
-/// `T(w) = atan(√w)/√w | artanh(√−w)/√−w`. Defined for `w > −1`
-/// (automatic in-chart: `w = κ‖·‖²` with `κ‖x‖² > −1` inside the ball).
-pub fn t_stacks(w: f64) -> [f64; 5] {
-    if w.abs() <= T_SERIES_W_MAX {
-        let mut t = [0.0; 5];
-        for (j, slot) in t.iter_mut().enumerate() {
-            // a_m = (−1)^m m!/(m−j)! w^{m−j} / (2m+1).
-            let mut term = 1.0;
-            for f in 1..=j {
-                let fj = f as f64;
-                term *= -fj * (2.0 * fj - 1.0) / (2.0 * fj + 1.0);
-            }
-            let mut acc = term;
-            for m in j..(j + T_SERIES_TERMS) {
-                let mf = m as f64;
-                let jf = j as f64;
-                term *= -w * (mf + 1.0) * (2.0 * mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 3.0));
-                acc += term;
-            }
-            *slot = acc;
-        }
-        t
-    } else {
-        let t0 = if w > 0.0 {
-            let r = w.sqrt();
-            r.atan() / r
-        } else {
-            let r = (-w).sqrt();
-            r.atanh() / r
-        };
-        let mut t = [t0, 0.0, 0.0, 0.0, 0.0];
-        let mut r_j = 1.0 / (1.0 + w); // R⁽ʲ⁾ = (−1)^j j! / (1+w)^{j+1}
-        for j in 0..4 {
-            t[j + 1] = (r_j - (2.0 * j as f64 + 1.0) * t[j]) / (2.0 * w);
-            r_j *= -((j + 1) as f64) / (1.0 + w);
-        }
-        t
-    }
-}
-
 /// Order-≤2 slice `[T, T′, T″]` of [`t_stacks`] — the *exact* prefix the
 /// second-order κ-jets consume.
 ///
@@ -362,48 +321,6 @@ pub(crate) fn t0(w: f64) -> f64 {
     }
 }
 
-/// SIMD batch of the [`t0`] **series branch** — four `w = κ‖w‖²` arguments in
-/// the lanes of a [`wide::f64x4`], returning `T(w)` in the matching lanes.
-///
-/// Lane `i` is **bit-for-bit** identical to the scalar series of [`t0`] on
-/// `w[i]` whenever `|w[i]| ≤ T_SERIES_W_MAX` (the only lanes [`distance_batch`]
-/// keeps; lanes in the closed-form branch are recomputed scalar by the caller).
-/// Bit-identity is structural: every operation is a plain lane-wise IEEE
-/// `+`/`-`/`*`/`/` (never a fused `mul_add`), built in the SAME left-to-right
-/// order and with the SAME splatted scalar coefficients as the scalar term
-/// recurrence, so lane `i` evaluates exactly the scalar arithmetic on `w[i]`.
-/// The loop runs until **every** lane's next partial sum stops moving
-/// (`next == acc` in all four lanes) and is capped at [`T_SERIES_TERMS`]; a lane
-/// that converged earlier than its neighbours only accumulates the tail of terms
-/// that are too small to move its sum — a provable no-op on `|w| ≤
-/// T_SERIES_W_MAX` (the term magnitude is strictly decreasing there), exactly as
-/// the scalar `if next == acc { break }` early-stop, so the extra lane-passes
-/// change no bit.
-fn t0x4(w: wide::f64x4) -> wide::f64x4 {
-    use wide::f64x4;
-    let neg_w = -w;
-    let mut term = f64x4::splat(1.0);
-    let mut acc = f64x4::splat(1.0);
-    for m in 0..T_SERIES_TERMS {
-        let mf = m as f64;
-        // factor = -w · (m+1)·(2m+1) / ((m+1)·(2m+3)) — same op order/operands
-        // as the scalar `term *= ...` recurrence, lane-wise.
-        let factor = neg_w * f64x4::splat(mf + 1.0) * f64x4::splat(2.0 * mf + 1.0)
-            / f64x4::splat((mf + 1.0) * (2.0 * mf + 3.0));
-        term *= factor;
-        let next = acc + term;
-        // Collective bit-identical early stop: break only once all four lanes
-        // have stopped moving (NaN lanes from the closed branch never compare
-        // equal, so they simply run the loop to the T_SERIES_TERMS cap and are
-        // discarded by the caller).
-        if next.to_array() == acc.to_array() {
-            break;
-        }
-        acc = next;
-    }
-    acc
-}
-
 /// Value-only `(C(u), S(u))` — bit-for-bit `(cs_stacks(u).0[0], cs_stacks(u).1[0])`.
 ///
 /// The exp map's generalized tangent `tn_κ = t·S/C` needs both values; the radial
@@ -443,7 +360,6 @@ pub(crate) fn cs_val(u: f64) -> (f64, f64) {
         (r.cosh(), r.sinh() / r)
     }
 }
-
 
 /// Per-point weight coefficients of the constant-curvature Dirichlet Gram and
 /// their `κ`-derivatives.
@@ -738,52 +654,6 @@ impl ConstantCurvature {
         Ok(2.0 / self.chart_gauge(x)?)
     }
 
-    /// Radial Jacobian determinant `J_κ(r) = det(d exp_μ)|_{‖v‖=r}` of the
-    /// exponential map in geodesic normal coordinates — the volume element that
-    /// converts the flat tangent measure `dr` into the Riemannian volume
-    /// `dvol_κ` at geodesic radius `r` from any base point (homogeneous, so it
-    /// depends only on `r`, never on the base).
-    ///
-    /// In a space form of curvature κ the Jacobi-field solution gives
-    /// `J_κ(r) = (sn_κ(r) / r)^{d−1}` with the curvature-normalized sine
-    /// `sn_κ(r) = sin(√κ r)/√κ` (κ>0), `r` (κ=0), `sinh(√−κ r)/√−κ` (κ<0).
-    /// Writing `S(u) = sn(t)/t` with `u = κ r²` (the entire function already in
-    /// the chart's [`cs_stacks`]), this is exactly `S(κ r²)^{d−1}` — analytic
-    /// through κ = 0 with no special case. `J_κ(0) = 1`.
-    ///
-    /// On a 1-D space form (`d = 1`) the exponent is 0, so `J_κ ≡ 1`: the exp
-    /// map is a radial isometry and the volume Jacobian carries no curvature
-    /// information (consistent with #944's reduced-information d = 1 power
-    /// analysis — there κ is identified by the conformal-factor term alone).
-    ///
-    /// Past the κ>0 conjugate radius (`√κ·r > π`, the antipodal shell) `S(u)`
-    /// turns negative. The geodesic ball is no longer embedded there, so the
-    /// well-defined non-negative volume element is `max(S(u), 0)^{d−1}` — the
-    /// clamp is on `S` itself, not on the (possibly even) power, so it stays a
-    /// genuine `→ 0⁺` collapse at the shell for every `d` (an even `d−1` would
-    /// otherwise resurrect a spurious positive volume past the cut). The
-    /// `response_kappa_bounds` cap keeps the search strictly before this shell;
-    /// the clamp only hardens stray CI/LR probes.
-    ///
-    /// This is the κ-dependent volume term whose log enters the #1104 honest
-    /// change-of-variables criterion and breaks the radius/scale degeneracy of
-    /// a dispersion-only curvature criterion.
-    pub fn jacobian_radial(&self, r: f64) -> f64 {
-        // The transverse exponent d − 1. At d ≤ 1 the exp map is a radial
-        // isometry (`d = 1`) or degenerate (`d = 0`): there are no transverse
-        // Jacobi directions, so J ≡ 1 with no exponentiation. Guarding `d ≤ 1`
-        // (not just `d == 1`) keeps a stray `d = 0` probe from forming `powi(−1)`.
-        if self.dim <= 1 {
-            return 1.0;
-        }
-        let exponent = (self.dim - 1) as i32;
-        let u = self.kappa * r * r;
-        let s = cs_val(u).1; // S(u) = sn_κ(r)/r ≥ 0 inside the chart
-        // Clamp S (not the power) at the κ>0 conjugate shell so the volume
-        // element collapses to 0⁺ there regardless of the parity of d−1.
-        s.max(0.0).powi(exponent)
-    }
-
     /// Möbius addition `x ⊕_κ y` — the chart realization of geodesic
     /// translation. Rational in κ (hence trivially κ-differentiable):
     ///
@@ -828,78 +698,6 @@ impl ConstantCurvature {
         let w = self.mobius_add(neg_x.view(), y)?;
         let nw2 = w.dot(&w);
         Ok(2.0 * nw2.sqrt() * t0(self.kappa * nw2))
-    }
-
-    /// Batched geodesic distance from a single fixed base point `x` to each row
-    /// of `rows` (an `n × dim` matrix of target points), writing
-    /// `out[i] = self.distance(x, rows.row(i))` for every `i`.
-    ///
-    /// This is the throughput entry point the per-row response-geometry hot loop
-    /// calls: the base `x` is constant across the batch (the κ-independent flat
-    /// centroid), so its chart validation is hoisted out of the per-row work and
-    /// the κ-stereographic `T`-series (the dominant cost) is evaluated four rows
-    /// at a time in [`wide::f64x4`] lanes via `t0x4`. Every `out[i]` is
-    /// **bit-for-bit** identical to the scalar `distance(x, rows.row(i))`: the
-    /// per-row Möbius/dot arithmetic is the same scalar `ndarray` code, and the
-    /// vectorised series reproduces the scalar `t0` value per lane exactly.
-    /// Lanes in the closed-form (`|κ‖w‖²| > T_SERIES_W_MAX`) branch and the
-    /// non-multiple-of-four tail fall back to the scalar path.
-    pub fn distance_batch(
-        &self,
-        x: ArrayView1<'_, f64>,
-        rows: ArrayView2<'_, f64>,
-        out: &mut [f64],
-    ) -> GeometryResult<()> {
-        let n = rows.nrows();
-        assert_eq!(
-            out.len(),
-            n,
-            "distance_batch output length must equal the number of rows"
-        );
-        // Validate the fixed base `x` once (it is constant across the batch).
-        self.check_len("constant-curvature distance x", x.len())?;
-        self.chart_gauge(x)?;
-        let neg_x = x.mapv(|v| -v);
-
-        let mut i = 0usize;
-        while i + 4 <= n {
-            // Per-row scalar Möbius/dot — bit-identical to `distance`'s prefix.
-            let mut nw2 = [0.0_f64; 4];
-            for (l, slot) in nw2.iter_mut().enumerate() {
-                let row = rows.row(i + l);
-                self.check_len("constant-curvature distance y", row.len())?;
-                self.chart_gauge(row)?;
-                let w = self.mobius_add(neg_x.view(), row)?;
-                *slot = w.dot(&w);
-            }
-            // Series argument `κ·‖w‖²` per lane — bit-identical to the scalar
-            // `t0(self.kappa * nw2)` argument.
-            let args = [
-                self.kappa * nw2[0],
-                self.kappa * nw2[1],
-                self.kappa * nw2[2],
-                self.kappa * nw2[3],
-            ];
-            let t_series = t0x4(wide::f64x4::from(args)).to_array();
-            for l in 0..4 {
-                // Series-branch lanes use the (bit-identical) vectorised value;
-                // closed-branch lanes take the scalar closed form so every lane
-                // equals `t0(args[l])` exactly.
-                let t_l = if args[l].abs() <= T_SERIES_W_MAX {
-                    t_series[l]
-                } else {
-                    t0(args[l])
-                };
-                out[i + l] = 2.0 * nw2[l].sqrt() * t_l;
-            }
-            i += 4;
-        }
-        // Non-multiple-of-four tail: scalar distance, bit-identical by definition.
-        while i < n {
-            out[i] = self.distance(x, rows.row(i))?;
-            i += 1;
-        }
-        Ok(())
     }
 
     /// `tn_κ(t) = sn(t)/cs(t) = t·S(κt²)/C(κt²)` — the generalized tangent.
@@ -1259,114 +1057,6 @@ pub fn distance_kappa_jet(
     let t = arg.compose_unary(t_stacks3(arg.v));
     let d = nw2.sqrt() * t * 2.0;
     Ok((d.v, d.g[0], d.h[0][0]))
-}
-
-/// `(log, ∂log/∂κ, ∂²log/∂κ²)` of the log map, componentwise — the
-/// κ-movement of geodesic (normal) coordinates, which is what κ-dependent
-/// bases consume. Sqrt-free, smooth through `w = 0` and `κ = 0`.
-pub fn log_map_kappa_jet(
-    manifold: &ConstantCurvature,
-    p_from: ArrayView1<'_, f64>,
-    p_to: ArrayView1<'_, f64>,
-) -> GeometryResult<(Array1<f64>, Array1<f64>, Array1<f64>)> {
-    manifold.check_len("constant-curvature log-jet from", p_from.len())?;
-    manifold.check_len("constant-curvature log-jet to", p_to.len())?;
-    manifold.chart_gauge(p_from)?;
-    manifold.chart_gauge(p_to)?;
-    let kappa = KJet::variable(manifold.kappa, 0);
-    let w = kjet_mobius_w(kappa, p_from, p_to)?;
-    let mut nw2 = KJet::constant(0.0);
-    for wi in &w {
-        nw2 = nw2 + *wi * *wi;
-    }
-    let arg = kappa * nw2;
-    let t = arg.compose_unary(t_stacks3(arg.v));
-    let gauge = kappa * p_from.dot(&p_from) + 1.0;
-    let coeff = gauge * t;
-    let d = p_from.len();
-    let mut value = Array1::zeros(d);
-    let mut dk = Array1::zeros(d);
-    let mut dkk = Array1::zeros(d);
-    for i in 0..d {
-        let li = coeff * w[i];
-        value[i] = li.v;
-        dk[i] = li.g[0];
-        dkk[i] = li.h[0][0];
-    }
-    Ok((value, dk, dkk))
-}
-
-/// `(exp, ∂exp/∂κ, ∂²exp/∂κ²)` of the geodesic exp map, componentwise — the
-/// κ-movement of the exponential chart, completing the κ-jet trio. Same
-/// program as [`ConstantCurvature::exp_map`] (`x ⊕_κ [tn_κ(λ_x‖v‖/2)·v̂]`)
-/// evaluated over `Tower2<1>` with κ seeded: the gauge `1+κ‖x‖²`, the
-/// generalized tangent `tn_κ(t) = t·S(κt²)/C(κt²)`, and the Möbius addition
-/// all become towers, with `C`/`S` entering through their certified stacks via
-/// `compose_unary`. Value and κ-derivatives are one expression, so they cannot
-/// desync. The conjugate-point guard (`C(κt²)=0`) and the antipodal-denominator
-/// guard are checked on the value channel.
-pub fn exp_map_kappa_jet(
-    manifold: &ConstantCurvature,
-    point: ArrayView1<'_, f64>,
-    tangent_vec: ArrayView1<'_, f64>,
-) -> GeometryResult<(Array1<f64>, Array1<f64>, Array1<f64>)> {
-    manifold.check_len("constant-curvature exp-jet point", point.len())?;
-    manifold.check_len("constant-curvature exp-jet tangent", tangent_vec.len())?;
-    manifold.chart_gauge(point)?;
-    let d = point.len();
-    let n = tangent_vec.dot(&tangent_vec).sqrt();
-    if n <= GEOMETRY_EPS {
-        // Zero tangent ⇒ exp_x(0) = x for every κ along the path.
-        return Ok((point.to_owned(), Array1::zeros(d), Array1::zeros(d)));
-    }
-    let kappa = KJet::variable(manifold.kappa, 0);
-    let xx = point.dot(&point);
-    // gauge = 1 + κ‖x‖²  (tower);  t = ‖v‖ / gauge = λ_x‖v‖/2.
-    let gauge = kappa * xx + 1.0;
-    let t = kjet_recip(gauge) * n;
-    // tn_κ(t) = t·S(κt²)/C(κt²), the primitives composed at the tower arg κt².
-    let arg = kappa * (t * t);
-    let (cstk, sstk) = cs_stacks3(arg.v);
-    let c = arg.compose_unary(cstk);
-    if c.v.abs() <= GEOMETRY_EPS {
-        return Err(GeometryError::Singular(
-            "constant-curvature exp-jet at a conjugate point (cos(√κ t) = 0)",
-        ));
-    }
-    let s = arg.compose_unary(sstk);
-    let tn = t * s * kjet_recip(c);
-    // step = (tn / ‖v‖) · v   (tower vector; v is a chart constant).
-    let scale = tn * (1.0 / n);
-    let step: Vec<KJet> = (0..d).map(|i| scale * tangent_vec[i]).collect();
-    // out = x ⊕_κ step, mirroring `mobius_add` with x constant and step a tower.
-    let mut xs = KJet::constant(0.0); // ⟨x, step⟩
-    let mut ss = KJet::constant(0.0); // ‖step‖²
-    for i in 0..d {
-        xs = xs + step[i] * point[i];
-        ss = ss + step[i] * step[i];
-    }
-    let two_k_xs = (kappa * 2.0) * xs; // 2κ⟨x,step⟩
-    // denom = 1 − 2κ⟨x,step⟩ + κ²‖x‖²‖step‖²  (no Sub on the tower; Neg+Add).
-    let denom = two_k_xs.scale(-1.0) + (kappa * kappa) * (ss * xx) + 1.0;
-    if denom.v.abs() <= MOBIUS_DENOM_EPS {
-        return Err(GeometryError::Singular(
-            "Möbius addition at the κ>0 antipodal point",
-        ));
-    }
-    // a = 1 − 2κ⟨x,step⟩ − κ‖step‖²;  b = 1 + κ‖x‖² = gauge.
-    let a = two_k_xs.scale(-1.0) + (kappa * ss).scale(-1.0) + 1.0;
-    let b = gauge;
-    let inv = kjet_recip(denom);
-    let mut value = Array1::zeros(d);
-    let mut dk = Array1::zeros(d);
-    let mut dkk = Array1::zeros(d);
-    for i in 0..d {
-        let oi = (a * point[i] + b * step[i]) * inv;
-        value[i] = oi.v;
-        dk[i] = oi.g[0];
-        dkk[i] = oi.h[0][0];
-    }
-    Ok((value, dk, dkk))
 }
 
 #[cfg(test)]
@@ -1955,7 +1645,6 @@ mod tests {
             }
         }
     }
-
 
     /// The analytic `∂S/∂κ` must match a central difference of the Gram itself.
     /// SPEC bans finite differences outside tests precisely so that the analytic

@@ -6,10 +6,6 @@
 
 use ndarray::{Array2, ArrayView2};
 
-pub fn solver_backend_status() -> Result<super::CudaBackendStatus, super::GpuError> {
-    super::cuda_backend_status()
-}
-
 /// Outcome reported by [`iterative_refinement_cholesky_solve`].
 #[derive(Clone, Debug)]
 pub struct RefinementOutcome {
@@ -990,18 +986,6 @@ pub fn iterative_refinement_cholesky_solve(
     }
 }
 
-pub fn cholesky_solve_gpu(
-    hessian: ArrayView2<'_, f64>,
-    rhs: ArrayView2<'_, f64>,
-) -> Result<(Array2<f64>, f64), String> {
-    // Route through iterative refinement. The function falls back to fp64
-    // internally, so callers always get a valid result; the refinement
-    // outcome metadata is intentionally not surfaced by this thin wrapper.
-    // This wrapper returns the logdet, so it must request it (`need_logdet`).
-    let result = iterative_refinement_cholesky_solve(hessian, rhs, /*need_logdet=*/ true)?;
-    Ok((result.0, result.1))
-}
-
 /// Solution-only mixed-precision solve: like [`cholesky_solve_gpu`] but skips
 /// the redundant fp64 POTRF when the fp32 + refinement path succeeds, since the
 /// caller does not consume the log-determinant. This is the path that delivers
@@ -1014,28 +998,6 @@ pub fn cholesky_solve_only_gpu(
 ) -> Result<Array2<f64>, String> {
     let result = iterative_refinement_cholesky_solve(hessian, rhs, /*need_logdet=*/ false)?;
     Ok(result.0)
-}
-
-pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let (rows, cols) = hessian.dim();
-        return Err(format!(
-            "CUDA support not compiled for Cholesky factorization; hessian={rows}x{cols}"
-        ));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        super::device_runtime::GpuRuntime::require().map_err(|error| {
-            let (rows, cols) = hessian.dim();
-            format!(
-                "CUDA runtime unavailable for Cholesky factorization; \
-                 hessian={rows}x{cols}: {error}"
-            )
-        })?;
-        cuda::cholesky_lower(hessian)
-    }
 }
 
 #[cfg(target_os = "linux")]

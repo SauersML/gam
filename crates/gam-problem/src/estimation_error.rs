@@ -385,14 +385,6 @@ impl OuterObjectiveErrorSource {
         }
     }
 
-    /// The optimizer-facing error, when this boundary was crossed through opt.
-    #[must_use]
-    pub fn objective_error(&self) -> Option<&opt::ObjectiveEvalError> {
-        match self {
-            Self::Estimation(_) => None,
-            Self::Objective(source) => Some(source),
-        }
-    }
 }
 
 /// A comprehensive error type for the model estimation process.

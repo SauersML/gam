@@ -64,30 +64,6 @@ impl RowSubsampleMask {
         }
     }
 
-    /// Materialize the row indices and per-row weights this measure
-    /// implies. `full_data(n)` returns `(0..n collected, [1.0; n])`,
-    /// preserving the full-data semantics of any caller that walked
-    /// `0..self.n` unconditionally with weight 1.0.
-    pub fn indices_and_weights(&self, n: usize) -> (Vec<usize>, Vec<f64>) {
-        match self.mask.as_ref() {
-            Some(m) => {
-                assert_eq!(
-                    m.n_full, n,
-                    "RowSubsampleMask n_full ({}) must match caller n ({})",
-                    m.n_full, n
-                );
-                let indices: Vec<usize> = m.mask.as_ref().clone();
-                let mut weights = vec![1.0_f64; n];
-                for r in m.rows.iter() {
-                    if r.index < n {
-                        weights[r.index] = r.weight;
-                    }
-                }
-                (indices, weights)
-            }
-            None => ((0..n).collect(), vec![1.0_f64; n]),
-        }
-    }
 }
 
 /// Thin wrapper over the canonical SplitMix64 hash in

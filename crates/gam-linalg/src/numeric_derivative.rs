@@ -136,37 +136,6 @@ impl FdDerivative {
         self.uncertainty.is_finite() && self.uncertainty <= self.self_band(rel_tol, abs_floor)
     }
 
-    /// The largest `|analytic − value|` this measurement is compatible with at
-    /// the requested tolerance: the band widened by the oracle's own
-    /// uncertainty.
-    pub fn agreement_bound(&self, analytic: f64, rel_tol: f64, abs_floor: f64) -> f64 {
-        self.band(analytic, rel_tol, abs_floor) + self.uncertainty
-    }
-
-    /// The single place that decides whether an analytic derivative component
-    /// agrees with this measurement. Callers should route every comparison
-    /// through it rather than re-deriving the three-way rule, which is easy to
-    /// state as two-way and thereby convert every unmeasurable component into a
-    /// false violation.
-    pub fn judge(&self, analytic: f64, rel_tol: f64, abs_floor: f64) -> FdVerdict {
-        if !self.value.is_finite() || !self.resolved(rel_tol, abs_floor) {
-            return FdVerdict::Unresolved;
-        }
-        if (analytic - self.value).abs() > self.agreement_bound(analytic, rel_tol, abs_floor) {
-            FdVerdict::Disagree
-        } else {
-            FdVerdict::Agree
-        }
-    }
-
-    /// The ladder rendered for a diagnostic line: `h=… D=…` coarsest first.
-    pub fn ladder_report(&self) -> String {
-        self.ladder
-            .iter()
-            .map(|(h, d)| format!("h={h:.2e} D={d:+.10e}"))
-            .collect::<Vec<_>>()
-            .join("  ")
-    }
 }
 
 /// Self-certifying numerical derivative of `f` at `t = 0` (Ridders' method).

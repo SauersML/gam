@@ -57,13 +57,6 @@ pub const fn packed_upper_len(n: usize) -> usize {
     n * (n + 1) / 2
 }
 
-/// Index of entry `(i, j)`, `i <= j`, in a row-major packed upper triangle.
-#[inline]
-#[must_use]
-pub const fn packed_upper_index(n: usize, i: usize, j: usize) -> usize {
-    packed_upper_row_offset(n, i) + (j - i)
-}
-
 /// Iterations the implicit-shift QL sweep may spend on ONE eigenvalue before
 /// the routine reports non-convergence rather than returning an unconverged
 /// diagonal.

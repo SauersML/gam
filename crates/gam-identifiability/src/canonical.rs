@@ -355,64 +355,6 @@ pub struct CanonicalSpecs {
     pub used_channel_aware_audit: bool,
 }
 
-/// Run the pre-fit cross-block identifiability audit. Fail-closed
-/// safety gate (see module docs).
-///
-/// Behaviour:
-///   - If the audit cleanly passes (`!fatal`), each `T_i` is the
-///     identity and the reduced specs are clones of the raw specs.
-///     The lift/sandwich machinery downstream becomes a no-op.
-///   - If the audit is `fatal=true` for **any** cause (joint rank
-///     deficiency with attributed drops, joint rank deficiency
-///     without attribution, or a hard-overlap alias pair), we refuse
-///     the fit with `CustomFamilyError::IdentifiabilityFailure`. The
-///     audit summary names the offending blocks and a reparameterisation
-///     hint, giving the caller a millisecond-scale diagnostic instead
-///     of a downstream `syr_row_into shape mismatch` panic when the
-///     family captures raw-width designs.
-///
-/// # Multi-channel routing
-///
-/// When any spec's `jacobian_callback` reports `n_outputs > 1` (i.e.
-/// the block contributes to multiple stacked output channels — as in
-/// survival marginal-slope where marginal and slope blocks target
-/// orthogonal channels of the per-row Jacobian), this function routes
-/// through [`audit_identifiability_channel_aware`] instead of the flat
-/// [`audit_identifiability`].
-///
-/// The routing decision is principled: for each spec, call
-/// `effective_jacobian_at(beta=0)` and check whether the returned
-/// matrix has `nrows > n` (i.e. `nrows == n * k` for some `k > 1`).
-/// If any block satisfies this, all blocks are treated as multi-channel
-/// and `BlockJacobianAsRowOp` adapters are built from each spec's
-/// callback to feed the channel-aware audit.
-///
-/// For specs without a `jacobian_callback`, the flat design with a
-/// single-channel identity operator is used.
-///
-/// # Invariant assertion
-///
-/// After building the transform `T`, the post-T joint Jacobian
-/// `J_can = J · T_full` is materialised and RRQR-checked.  If
-/// `rank(J_can) != rank(J)`, the transform `T` is defective (a bug in
-/// its construction) and the function returns
-/// `CustomFamilyError::DimensionMismatch` with a diagnostic naming
-/// `rank(J)`, `rank(J_can)`, and all per-block `T_i` shapes.
-pub fn canonicalize_for_identifiability(
-    specs: &[ParameterBlockSpec],
-    coordinates: &[CoefficientCoordinate],
-) -> Result<CanonicalSpecs, CustomFamilyError> {
-    // Robustness is unconditional: always attempt the exact W-metric
-    // orthogonalisation pass before the fail-closed audit. `try_orthogonalize_
-    // blocks` is self-gating (it returns `None` — and the audit runs unchanged —
-    // unless there are ≥2 plain single-channel dense blocks with an actual
-    // structural overlap to remove, deferring on any family-owned-geometry block,
-    // any multi-channel `stacked_design` block, and on clean designs), so this is
-    // byte-identical wherever there is nothing
-    // to orthogonalise.
-    canonicalize_for_identifiability_inner(specs, coordinates, true, None)
-}
-
 /// Like [`canonicalize_for_identifiability`], but linearizes every family-owned
 /// (`jacobian_callback`) block's effective Jacobian at the supplied pilot
 /// operating point (`operating_scalars`, the family's `family_scalars` at the
