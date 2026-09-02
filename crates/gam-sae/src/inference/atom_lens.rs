@@ -87,39 +87,8 @@ pub struct AtomLensEntry {
 }
 
 impl AtomLensEntry {
-    /// Whether this atom reads as **represented but not currently used** —
-    /// strong activation presence, weak behavioral coupling. Pure classification
-    /// of the already-computed scores; it suppresses nothing.
-    ///
-    /// Returns `false` when coupling is unavailable (no behavioral axis exists to
-    /// declare a discrepancy against).
-    pub fn is_represented_not_used(&self) -> bool {
-        match self.discrepancy {
-            Some(d) => d >= REPRESENTED_NOT_USED_THRESHOLD,
-            None => false,
-        }
-    }
 
-    /// Whether this atom reads as **used** — its behavioral coupling is at least
-    /// as strong as its representational presence (non-positive discrepancy).
-    /// Returns `false` when coupling is unavailable.
-    pub fn is_used(&self) -> bool {
-        match self.discrepancy {
-            Some(d) => d <= USED_THRESHOLD,
-            None => false,
-        }
-    }
 }
-
-/// Discrepancy at or above this flags "represented but not currently used".
-/// Presence and coupling are each normalized to `[0, 1]`, so the discrepancy
-/// lives in `[-1, 1]`; a value this large means presence outruns coupling by a
-/// wide, normalized margin.
-const REPRESENTED_NOT_USED_THRESHOLD: f64 = 0.5;
-
-/// Discrepancy at or below this flags "used" (coupling matches or exceeds
-/// presence).
-const USED_THRESHOLD: f64 = 0.0;
 
 /// The full two-score lens over every atom of a fitted SAE-manifold term.
 #[derive(Clone, Debug, PartialEq)]

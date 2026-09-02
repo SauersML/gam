@@ -170,37 +170,10 @@ impl RhoCascadeSchedule {
         &self.steps
     }
 
-    /// Plan for a specific outer step (clamped to the last step if `step`
-    /// runs past the schedule — extra ρ iterations are honest full passes).
-    pub fn step_plan(&self, step: usize) -> RhoStepPlan {
-        if let Some(plan) = self.steps.get(step) {
-            *plan
-        } else {
-            // Past the planned horizon: full pass at the final step index.
-            RhoStepPlan {
-                step,
-                fraction: 1.0,
-                importance_weight: 1.0,
-                is_full_pass: true,
-            }
-        }
-    }
-
     pub fn total_rows(&self) -> u64 {
         self.total_rows
     }
 
-    /// Expected number of rows visited at a given step (for accumulator sizing
-    /// / progress reporting). Deterministic for full passes; expectation for
-    /// subsample steps.
-    pub fn expected_rows(&self, step: usize) -> u64 {
-        let plan = self.step_plan(step);
-        if plan.is_full_pass {
-            self.total_rows
-        } else {
-            (plan.fraction * self.total_rows as f64).round() as u64
-        }
-    }
 }
 
 /// Below this many rows, subsampling is not worth the bias risk: a step's

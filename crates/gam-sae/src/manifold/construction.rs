@@ -62,31 +62,6 @@ pub struct StreamingRankInputs {
     pub(crate) n_eff: Vec<f64>,
 }
 
-/// #16/#2023 — the SINGLE per-atom rank-charge DOF core: `d_eff = rank_eff · basis_edf`
-/// for ONE atom from its weighted basis Gram `gram = Φᵀdiag(a²)Φ` (m×m), `decoder`
-/// (m×p), effective sample size `n_eff = Σ_row a²`, output dim `p_out`, noise floor
-/// `r_floor` (dispersion R, assumed already guarded > 0), and smoothness `(lam_smooth,
-/// smooth_penalty)`.
-///   * `rank_reconstructed` = Marchenko–Pastur HARD reconstruction count on the per-atom
-///     reconstruction Gram
-///     `(1/n_eff)·BᵀB`, `B = diag(a)·Φ·D`: eigenvalues = svd(diag(√λ)·Uᵀ·D)²/n_eff with
-///     `(λ,U)=eigh(gram)`; count those above `R·(1+√(p/n_eff))²` (a real rank-2 circle
-///     → 2). `rank_eff` is the production chargeable rank: it equals
-///     `rank_reconstructed` unless the #2258 alive-below-edge rule promotes 0 to 1;
-///     only an exact zero spectrum remains 0 in this classifier. [#1893/#11]
-///   * `basis_edf = tr(gram·(gram+λS)⁻¹)`.
-/// This is the source of truth the term-level `rank_dof_from_grams` (dense + #9
-/// streaming) loops, AND that the #2023 migration gate prices linear/curved candidates
-/// through — so PROMOTE (birth) and DEMOTE (hybrid split) adjudicate in ONE currency.
-/// #2258 reconstruction-rank-vs-degeneracy split: a positive reconstruction
-/// eigenvalue below the MP edge is unresolved, not vanished, and is promoted to
-/// the minimum chargeable rank 1. Numerical disappearance is certified
-/// separately, before rank charging, by
-/// `SaeManifoldTerm::vanished_atoms_from_signal_upper_bound`. That certificate
-/// compares a rigorous upper bound on the atom's gated reconstruction energy
-/// with the explicit backward-error envelope of the residual-energy reduction;
-/// there is no corpus-independent `c·R` cutoff hidden in the rank classifier.
-
 /// Non-empty, canonical set of atom slots whose realised gated decoder signal
 /// is numerically unobservable at a converged fixed-`rho` inner state.
 ///
@@ -262,12 +237,6 @@ impl SaeCriterionError {
         }
     }
 
-    pub fn numerical_message(&self) -> Option<&str> {
-        match self {
-            Self::Numerical(message) => Some(message),
-            Self::VanishedAtoms(_) | Self::IndefiniteObservedInformation { .. } => None,
-        }
-    }
 }
 
 impl SaeCriterionError {
@@ -723,28 +692,6 @@ pub(crate) fn realised_rank_charge_dof(
     Ok(rank.production_chargeable_rank as f64 * basis_edf)
 }
 
-/// Coordinate-block log-determinant `log|H_tt|` carried by an exact dense
-/// arrow cache. The undamped row factors are the value operator used by the
-/// rank-adjusted Laplace criterion, so a non-positive or non-finite diagonal is
-/// an invalid factorization, not a term to skip.
-pub(crate) fn coordinate_block_log_det(cache: &ArrowFactorCache) -> Result<f64, String> {
-    let mut log_det_tt = 0.0_f64;
-    for row in 0..cache.undamped_factor_count() {
-        let factor = cache.undamped_factor(row);
-        for diagonal in 0..factor.nrows() {
-            let value = factor[[diagonal, diagonal]];
-            if !(value.is_finite() && value > 0.0) {
-                return Err(format!(
-                    "coordinate_block_log_det: row {row} diagonal {diagonal} is {value}; \
-                     the undamped coordinate factor is invalid"
-                ));
-            }
-            log_det_tt += 2.0 * value.ln();
-        }
-    }
-    Ok(log_det_tt)
-}
-
 /// The one production Laplace-complexity scalar:
 ///
 /// `0.5 * log|H| - 0.5 * log|H_tt| +
@@ -1149,113 +1096,6 @@ impl SaeManifoldTerm {
         Ok((primary, rho))
     }
 
-    /// Gather a `Vec` into a new order without cloning: `out[new] = items[order[new]]`.
-    /// `order` MUST be a permutation of `0..items.len()` (each source index visited
-    /// exactly once); the caller [`Self::reorder_atoms`] validates that first.
-    fn gather_by_order<T>(items: Vec<T>, order: &[usize]) -> Vec<T> {
-        let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
-        order
-            .iter()
-            .map(|&src| {
-                slots[src]
-                    .take()
-                    .expect("reorder_atoms: order must visit each source index exactly once")
-            })
-            .collect()
-    }
-
-    /// #2023 — permute this term's atoms (and the paired `rho`) into a new order:
-    /// the atom currently at `order[i]` moves to final position `i`
-    /// (`new[i] = old[order[i]]`, a gather). Used by the two-tier fit-order to
-    /// restore the CALLER's atom order after [`Self::merge_tiers`] concatenates the
-    /// linear (primary) and curved (secondary) tiers — merge yields
-    /// linear++curved order, and this scatters each atom back to its original
-    /// input index so the entire downstream (joint polish, into_fitted,
-    /// shape-uncertainty, structured passes, and every by-original-index
-    /// serialization read) sees the caller's order with zero further changes.
-    ///
-    /// Permutes, in lockstep: atoms; assignment logit COLUMNS; per-atom coords and
-    /// ungated flags; and the paired `rho`'s `log_lambda_smooth` / `log_ard`. The
-    /// global sparsity ρ and the assignment mode are order-independent and left
-    /// untouched. Atom NAMES travel with their atom (the caller renames tiers to
-    /// their input indices before merging, so after this the names read
-    /// `atom_0..atom_{K-1}` in caller order — identical to a single-tier build).
-    /// K-dependent transient state that encodes the OLD column order (row layout,
-    /// frame flag, border workspace, frozen routing) is reset — rebuilt at the
-    /// next assembly (the joint polish).
-    ///
-    /// `order` must be a permutation of `0..K` and `rho` must carry `K` per-atom
-    /// entries, or this errs without mutating anything observable downstream.
-    pub fn reorder_atoms(
-        &mut self,
-        order: &[usize],
-        rho: &mut SaeManifoldRho,
-    ) -> Result<(), String> {
-        let k = self.k_atoms();
-        if order.len() != k {
-            return Err(format!(
-                "SaeManifoldTerm::reorder_atoms: order length {} must equal K={k}",
-                order.len()
-            ));
-        }
-        // Validate `order` is a permutation of 0..K (every index present once).
-        let mut seen = vec![false; k];
-        for &src in order {
-            let slot = seen.get_mut(src).ok_or_else(|| {
-                format!("SaeManifoldTerm::reorder_atoms: order index {src} out of range 0..{k}")
-            })?;
-            if *slot {
-                return Err(format!(
-                    "SaeManifoldTerm::reorder_atoms: order index {src} repeated (not a permutation)"
-                ));
-            }
-            *slot = true;
-        }
-        if rho.log_lambda_smooth.len() != k || rho.log_ard.len() != k {
-            return Err(format!(
-                "SaeManifoldTerm::reorder_atoms: rho per-atom lengths (smooth {}, ard {}) \
-                 must equal K={k}",
-                rho.log_lambda_smooth.len(),
-                rho.log_ard.len()
-            ));
-        }
-        // Assignment logit COLUMNS: new column i is old column order[i].
-        let n = self.n_obs();
-        let mut new_logits = Array2::<f64>::zeros((n, k));
-        for (new_j, &old_j) in order.iter().enumerate() {
-            new_logits
-                .column_mut(new_j)
-                .assign(&self.assignment.logits.column(old_j));
-        }
-        self.assignment.logits = new_logits;
-        // Per-atom Vecs (atoms / coords / ungated) and the paired rho blocks.
-        let atoms = std::mem::take(&mut self.atoms);
-        self.atoms = Self::gather_by_order(atoms, order);
-        // Atlas endpoints are atom indices.  `order[new] = old`, so invert the
-        // gather permutation to obtain old -> new and remap every seam.
-        let mut old_to_new = vec![None; k];
-        for (new, &old) in order.iter().enumerate() {
-            old_to_new[old] = Some(new);
-        }
-        for atlas in &mut self.chart_atlases {
-            atlas.remap(&old_to_new)?;
-        }
-        let coords = std::mem::take(&mut self.assignment.coords);
-        self.assignment.coords = Self::gather_by_order(coords, order);
-        let ungated = std::mem::take(&mut self.assignment.ungated);
-        self.assignment.ungated = Self::gather_by_order(ungated, order);
-        let smooth = std::mem::take(&mut rho.log_lambda_smooth);
-        rho.log_lambda_smooth = Self::gather_by_order(smooth, order);
-        let ard = std::mem::take(&mut rho.log_ard);
-        rho.log_ard = Self::gather_by_order(ard, order);
-        // Reset K-ordered transient state that encoded the OLD column order.
-        self.assignment.frozen_logits = None;
-        self.last_row_layout = None;
-        self.last_frames_active = false;
-        self.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
-        Ok(())
-    }
-
     /// Install the fitted reconstruction dispersion used by
     /// [`dictionary_incoherence_report`]. This is a pure diagnostic scalar and
     /// does not feed any loss, criterion, penalty, or optimizer state.
@@ -1605,62 +1445,6 @@ impl SaeManifoldTerm {
         self.row_loss_weights = None;
     }
 
-    /// Huber-style OUTLIER-ROBUST per-row weights from the target activation
-    /// norms — the missing default *policy* for the existing
-    /// [`set_row_loss_weights`](Self::set_row_loss_weights) mechanism.
-    ///
-    /// The SAE fits unweighted least squares, which weights each token by its
-    /// squared residual ∝ `‖z_i‖²`. On real LLM residual streams the per-token
-    /// norm distribution is heavy-tailed (e.g. an OLMo mixed-layer slice has
-    /// `p99/median ≈ 4.7`), so a small **coherent** cluster of high-norm tokens —
-    /// typically special / attention-sink tokens, not semantic content —
-    /// dominates the objective (measured: the top 5% of tokens carry ~31% of the
-    /// total `‖z‖²` budget) and pulls dictionary atoms toward their direction.
-    /// Mean-centering does NOT address this (it is per-feature, not per-token).
-    ///
-    /// This returns Huber weights `w_i = min(1, δ·m / ‖z_i‖)` where `m` is the
-    /// MEDIAN token norm: tokens at or below `δ·m` keep full weight, higher-norm
-    /// tokens are downweighted so their objective share grows only LINEARLY (not
-    /// quadratically) with norm. `δ` is the robustness knob (`δ=1` thresholds at
-    /// the median; larger `δ` only touches the extreme tail). The result is
-    /// mean-normalized (overall objective scale preserved). OPT-IN: the caller
-    /// installs it via `set_row_loss_weights` — the default fit is unchanged.
-    pub fn robust_norm_row_weights(
-        target: ArrayView2<'_, f64>,
-        delta: f64,
-    ) -> Result<Vec<f64>, String> {
-        if !(delta.is_finite() && delta > 0.0) {
-            return Err(format!(
-                "robust_norm_row_weights: delta must be finite and positive; got {delta}"
-            ));
-        }
-        let n = target.nrows();
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-        let norms: Vec<f64> = (0..n)
-            .map(|i| {
-                let r = target.row(i);
-                r.dot(&r).sqrt()
-            })
-            .collect();
-        let mut sorted = norms.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        // Median token norm (lower-median for even n; floored off zero so an
-        // all-zero/degenerate slice yields uniform weights instead of NaN).
-        let median = sorted[n / 2].max(f64::MIN_POSITIVE);
-        let thresh = delta * median;
-        let raw: Vec<f64> = norms
-            .iter()
-            .map(|&nm| if nm <= thresh { 1.0 } else { thresh / nm })
-            .collect();
-        let mean = raw.iter().sum::<f64>() / n as f64;
-        if !(mean.is_finite() && mean > 0.0) {
-            return Err("robust_norm_row_weights: degenerate weight normalizer".to_string());
-        }
-        Ok(raw.into_iter().map(|w| w / mean).collect())
-    }
-
     /// Install the single per-row [`RowMetric`](gam_problem::RowMetric)
     /// that both the reconstruction likelihood and the isometry gauge read.
     /// Installing per-row output-Fisher factors here flips the provenance to
@@ -1773,73 +1557,6 @@ impl SaeManifoldTerm {
                 }
             }
         }
-    }
-
-    /// #2023 C4 — fit the Tier-0 shared mean as the column mean of the fit target
-    /// `Z` (`N×P`), install it on the term, and return the DE-MEANED target
-    /// `Z − μ` the atoms should be fit against. This is the single seam a driver
-    /// calls before the joint fit so the global DC is carried by Tier-0 and the
-    /// atoms chase only structure. The mean is the TRAIN-split mean: hold it fixed
-    /// and reuse it for out-of-sample de-meaning and the EV baseline so held-out
-    /// EV is measured against the same Tier-0 constant (no full-data leak).
-    ///
-    /// DOUBLE-SUBTRACTION HAZARD: exactly ONE stage may own the mean. If an
-    /// upstream data-prep step already centers the target (e.g. the COMPOSE L17
-    /// driver's `tier0.json` mean/scale), the term must NOT also de-mean — leave
-    /// `tier0_mean` at `None` (the default), which is CORRECT for already-centered
-    /// data. Only call this on RAW (un-centered) targets, where the term takes
-    /// ownership of the mean.
-    pub fn fit_tier0_mean(&mut self, z: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-        let p = self.output_dim();
-        if z.ncols() != p {
-            return Err(format!(
-                "SaeManifoldTerm::fit_tier0_mean: target has P={} but output_dim is {p}",
-                z.ncols()
-            ));
-        }
-        if z.nrows() == 0 {
-            return Err("SaeManifoldTerm::fit_tier0_mean: empty target".to_string());
-        }
-        let mean = z.mean_axis(ndarray::Axis(0)).ok_or_else(|| {
-            "SaeManifoldTerm::fit_tier0_mean: mean_axis returned None".to_string()
-        })?;
-        let demeaned = &z - &mean.view().insert_axis(ndarray::Axis(0));
-        self.set_tier0_mean(mean)?;
-        Ok(demeaned)
-    }
-
-    /// #5/(B) — per-atom realised-rank effective DOF for the rank-charge criterion:
-    /// `d_eff_k = rank_eff_k · basis_edf_k`, where
-    ///   * `rank_eff_k` = the Marchenko–Pastur HARD count of the atom's realised
-    ///     output rank: the number of per-atom reconstruction-Gram eigenvalues
-    ///     (`(1/N_eff)·BᵀB`, `B = diag(a_k)·Φ_k·D_k`, `N_eff = Σ_row a_k²`) above
-    ///     the DERIVED bulk edge `R·(1+√(p/N_eff))²` (`R = dispersion_r`, the
-    ///     residual variance). Exactly 2 for a rank-2 circle; 0 for a decoder
-    ///     collapsing to `‖B‖→0` (every eigenvalue → 0 ≪ edge) → charge 0 →
-    ///     neutral (the co-collapse fix). The edge is parameter-free (NOT a
-    ///     self-relative `ε·max_sv`): pure output noise cannot exceed it, so an
-    ///     eigenvalue above it is identified signal. [#1893]
-    ///   * `basis_edf_k = tr(G_k · (G_k + λ_k S_k)⁻¹)` on the atom's `m×m`
-    ///     decoder data Gram (its identified basis dimension, ~m minus the
-    ///     smoothness/DC shrinkage).
-    /// The charge `½·d_eff_k·log n` is the honest BIC on the atom's realised
-    /// decoder parameters. It is ROTATION-INVARIANT (rank + basis EDF are), so it
-    /// does NOT distinguish a clean circle from a blend (both rank-2) — the
-    /// producer owns cleanliness.
-    pub(crate) fn per_atom_realised_rank_dof(
-        &self,
-        rho: &SaeManifoldRho,
-        dispersion_r: f64,
-    ) -> Result<Vec<f64>, String> {
-        // Dense path: materialise the per-atom Grams G_k = Φ_kᵀdiag(a_k²)Φ_k and the
-        // effective sample sizes N_eff,k = Σ_row a_k² from `self`, then delegate the
-        // rank/EDF pricing to the shared `rank_dof_from_grams`. The #9 streaming path
-        // ACCUMULATES the same `grams`/`n_eff` chunk-by-chunk (basis_values is not
-        // persisted there) and calls the SAME core — so the criterion is identical.
-        let mut grams = self.empty_decoder_gram_accumulator();
-        self.accumulate_decoder_gram(&mut grams)?;
-        let n_eff = self.per_atom_effective_sample_size();
-        self.rank_dof_from_grams(&grams, &n_eff, rho, dispersion_r)
     }
 
     /// Per-atom effective sample size `N_eff,k = Σ_i w_{ik}²` read through the
@@ -2210,24 +1927,6 @@ impl SaeManifoldTerm {
     /// Rung-2 — the behavioral data block, if this is a two-block term.
     pub fn behavior_block(&self) -> Option<&crate::manifold::BehaviorBlock> {
         self.behavior.as_ref()
-    }
-
-    /// Rung-2 — the activation output width `p_x` (the split point in the
-    /// augmented output). Equals the full `output_dim()` for an ordinary
-    /// single-block term (no behavior block installed).
-    pub fn activation_output_dim(&self) -> usize {
-        match &self.behavior {
-            Some(block) => block.activation_dim,
-            None => self.output_dim(),
-        }
-    }
-
-    /// Rung-2 — the half-open behavior output column range `[p_x, p_x + p_y)`, or
-    /// `None` for a single-block term.
-    pub fn behavior_output_range(&self) -> Option<std::ops::Range<usize>> {
-        self.behavior
-            .as_ref()
-            .map(|block| block.activation_dim..block.augmented_dim())
     }
 
     /// The installed per-row metric, if any. `None` ⇒ Euclidean / isotropic.
@@ -3573,78 +3272,6 @@ impl SaeManifoldTerm {
         out
     }
 
-    /// Assemble the factored border coordinate vector `C = [vec(C_1); …; vec(C_K)]`
-    /// in row-major `C_k[m, j] → C[off_k + m·r_k + j]` layout (issue #972).
-    ///
-    /// This is the reduced state the arrow-Schur border carries when frames are
-    /// active: its length is [`Self::factored_border_dim`] (`Σ M_k·r_k`), the
-    /// border-size invariant verified by [`grassmann_assert_border_dim_invariant`].
-    /// Atoms
-    /// without an active frame contribute their full `vec(B_k)` (their `r_k == p`
-    /// coordinates are the decoder itself), so on the all-full-`B` path this
-    /// reproduces [`Self::flatten_beta`].
-    pub fn flatten_factored_border(&self) -> Result<Array1<f64>, String> {
-        let offsets = self.factored_border_offsets();
-        let mut out = Array1::<f64>::zeros(self.factored_border_dim());
-        for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let off = offsets[atom_idx];
-            let r = atom.border_frame_rank();
-            let m = atom.basis_size();
-            let coords = match atom.factored_coordinates()? {
-                Some(c) => c,
-                // Full-`B` path: the decoder itself is the coordinate matrix.
-                None => atom.decoder_coefficients().clone(),
-            };
-            for basis_col in 0..m {
-                for j in 0..r {
-                    out[off + basis_col * r + j] = coords[[basis_col, j]];
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Scatter a factored border coordinate vector `C` (length
-    /// [`Self::factored_border_dim`]) back into the per-atom decoders, refreshing
-    /// each `decoder_coefficients = C_k · U_kᵀ` so the full-`B` consumers stay
-    /// consistent after a factored border solve (issue #972). The inverse of
-    /// [`Self::flatten_factored_border`].
-    pub fn scatter_factored_border(&mut self, border: ArrayView1<'_, f64>) -> Result<(), String> {
-        let expected = self.factored_border_dim();
-        if border.len() != expected {
-            return Err(format!(
-                "SaeManifoldTerm::scatter_factored_border: border length {} must equal \
-                 factored border dim {expected}",
-                border.len()
-            ));
-        }
-        let offsets = self.factored_border_offsets();
-        for atom_idx in 0..self.atoms.len() {
-            let off = offsets[atom_idx];
-            let (r, m, has_frame) = {
-                let atom = &self.atoms[atom_idx];
-                (
-                    atom.border_frame_rank(),
-                    atom.basis_size(),
-                    atom.decoder_frame.is_some(),
-                )
-            };
-            let mut coords = Array2::<f64>::zeros((m, r));
-            for basis_col in 0..m {
-                for j in 0..r {
-                    coords[[basis_col, j]] = border[off + basis_col * r + j];
-                }
-            }
-            if has_frame {
-                self.atoms[atom_idx].set_factored_coordinates(coords.view())?;
-            } else {
-                // Full-`B` path: the coordinates ARE the decoder.
-                self.atoms[atom_idx].set_decoder_coefficients(coords)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Auto-derive and install low-rank Grassmann decoder frames across all
     /// atoms (issue #972) — magic-by-default, no flag. Each atom independently
     /// activates its frame iff the factorization materially shrinks its border
@@ -4375,67 +4002,6 @@ impl SaeManifoldTerm {
         }
     }
 
-    /// #1026/#2394 — the collapse VERDICT reachable from the fit-free public
-    /// reconstruction path: the slot indices whose `d = 1` realized contribution
-    /// collapses to its straight (`Θ → 0`) sub-model under
-    /// `reconstruct_from_assignments(assignments, /*collapse=*/ true)`, in
-    /// ascending order.
-    ///
-    /// This is the observable form of the linear-dominance guarantee. The
-    /// reconstruction merely SUBSTITUTES a collapsed slot's straight image for its
-    /// curved decode; when the curved decode already lies on that straight image
-    /// at the assigned coordinates (exactly-linear data — a circle sampled only at
-    /// the two points its tangent line also passes through), the substitution is
-    /// value-preserving to round-off, so the *reconstruction* is bit-for-bit
-    /// unchanged and the verdict is INVISIBLE through a value comparison. Consumers
-    /// that need to know a slot collapsed (the #1026 "attach the linear verdict"
-    /// contract) must read it here, NOT by differencing collapsed vs. uncollapsed
-    /// reconstructions — that difference is exactly zero on the collapse-safe case
-    /// the guarantee is about.
-    ///
-    /// Honours a completed fit's `hybrid_split_report` and any attached
-    /// `oos_linear_images` (their `atom_idx` set is returned) before falling back
-    /// to the fit-free adjudication from `assignments`; the union is deduplicated
-    /// so the same slot is never reported twice. Errors only on an
-    /// assignment-shape mismatch, mirroring the reconstruction's own guard.
-    pub fn hybrid_collapse_verdict_from_assignments(
-        &self,
-        assignments: ArrayView2<'_, f64>,
-    ) -> Result<Vec<usize>, String> {
-        let n = self.n_obs();
-        let k_atoms = self.k_atoms();
-        if assignments.dim() != (n, k_atoms) {
-            return Err(format!(
-                "SaeManifoldTerm::hybrid_collapse_verdict_from_assignments: assignments {:?} != ({n}, {k_atoms})",
-                assignments.dim()
-            ));
-        }
-        // Same union the reconstruction forms: the fitted / OOS collapse policy
-        // (`hybrid_linear_image_map`) plus the fit-free images that layer under it
-        // (empty when a fitted / OOS policy already owns the decision).
-        let mut collapsed: std::collections::BTreeSet<usize> =
-            self.hybrid_linear_image_map().keys().copied().collect();
-        for image in self.collapse_fit_free_images(assignments) {
-            collapsed.insert(image.atom_idx);
-        }
-        Ok(collapsed.into_iter().collect())
-    }
-
-    /// Assemble a hybrid-collapsed reconstruction from explicit assignment
-    /// masses and the response being reconstructed. Ordinary straight images use
-    /// the atom's realized coordinate. A collapse-rescued image derives every
-    /// coordinate from that row's leave-this-atom-out residual projected onto its
-    /// persisted direction `v`; no train-row coordinate cache exists.
-    pub fn reconstruct_from_assignments_target_aware(
-        &self,
-        target: ArrayView2<'_, f64>,
-        assignments: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        let (fitted, _, _) =
-            self.reconstruct_from_assignments_target_aware_impl(target, assignments, false)?;
-        Ok(fitted)
-    }
-
     /// Target-aware reconstruction together with each effective, unweighted
     /// atom image and coordinate block. OOS reporting uses this entry so a
     /// hybrid-linear verdict changes both the summed reconstruction and the
@@ -4988,62 +4554,6 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
-    /// #1026 — the LOAD-BEARING collapsed reconstruction: the assembled
-    /// dictionary output `Σ_k a[i,k]·g_k(coord[i,k])` in which every slot whose
-    /// hybrid-split verdict selected LINEAR has its curved decoded image replaced
-    /// by its fitted straight sub-model `b₀ + (t − t̄)·b₁`. This is what makes the
-    /// verdict *change the reconstruction* instead of merely logging a choice:
-    /// the linear-collapsed atom no longer pays its `M·p` curved coefficients, it
-    /// carries a `2·p` straight image whose decoded curve has zero turning.
-    ///
-    /// The straight images are the exact weighted-least-squares lines already
-    /// realized inside [`Self::compute_hybrid_split_report`] (no re-fit, no outer
-    /// continuation, sidestepping #1051). Returns the curved reconstruction
-    /// unchanged when no verdict selected linear, or when the report has not been
-    /// computed yet (`hybrid_split_report == None`). A collapse-rescued image is
-    /// refused because this method has no target from which to derive its
-    /// coordinate; use [`Self::try_fitted_target_aware`] instead.
-    pub fn hybrid_collapsed_reconstruction(
-        &self,
-        rho: &SaeManifoldRho,
-    ) -> Result<Array2<f64>, String> {
-        // #1026 — the hybrid collapse is realised by the SINGLE reconstruction
-        // path ([`Self::try_fitted_with_rho`]) with the collapse flag set: a
-        // verdict-linear `d = 1` slot decodes its straight sub-model image
-        // instead of its curved curve. This replaces the dedicated re-collapse
-        // loop this method used to carry (a parallel layer). The production
-        // `try_fitted` shares the identical routine at `rho = None`; this entry
-        // point keeps the rho-keyed, target-less collapse for callers whose
-        // report contains only ordinary straight images.
-        self.try_fitted_with_rho(Some(rho), true)
-    }
-
-    /// #1026 — the reconstruction explained variance of the hybrid-collapsed
-    /// dictionary (every verdict-linear slot decoded by its straight sub-model)
-    /// against `target`. The companion of [`Self::per_atom_loao_explained_variance`]
-    /// for the dominance claim: because each linear-collapsed slot is the curved
-    /// family's `Θ → 0` sub-model and is only kept when its evidence beats the
-    /// curved candidate's parameter price, the collapsed dictionary match-or-beats
-    /// the all-curved one on EV-per-parameter — the strict-generalization floor
-    /// the #1026 hybrid argument rests on. `None` when EV is undefined (degenerate
-    /// target variance).
-    pub fn hybrid_collapsed_explained_variance(
-        &self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-    ) -> Result<Option<f64>, String> {
-        let n = self.n_obs();
-        let p = self.output_dim();
-        if target.dim() != (n, p) {
-            return Err(format!(
-                "SaeManifoldTerm::hybrid_collapsed_explained_variance: target {:?} != ({n}, {p})",
-                target.dim()
-            ));
-        }
-        let collapsed = self.try_fitted_target_aware(target, Some(rho))?;
-        Ok(reconstruction_explained_variance(target, collapsed.view()))
-    }
-
     /// #1026 ladder item 2/3 — the AMORTIZED ENCODER, wired from the fitted
     /// dictionary. Builds the offline certified `EncodeAtlas` over this term's
     /// frozen atoms and encodes a target corpus `targets` (`n × p`) through the
@@ -5248,18 +4758,6 @@ impl SaeManifoldTerm {
         Ok(amplitudes)
     }
 
-    /// #1026 — encode the dictionary's own fit-time target with the amortized
-    /// encoder, deriving the per-row amplitudes from the fitted assignment so the
-    /// caller supplies neither bounds nor amplitudes (magic by default). The
-    /// end-to-end "fit → distilled encoder → certificate-gated encode" path.
-    pub fn amortized_encode_fitted(
-        &self,
-        targets: ArrayView2<'_, f64>,
-    ) -> Result<crate::encode::JointEncodeResult, String> {
-        let amplitudes = self.fitted_assignment_amplitudes()?;
-        self.amortized_encode_target(targets, amplitudes.view())
-    }
-
     /// #1154 — amortized-encoder consistency of the CURRENT dictionary against
     /// its own fit-time target. This is the co-training signal of the joint
     /// amortized-encoder + penalized quasi-Laplace loop (Design A): the amortized (one-mat-vec)
@@ -5347,88 +4845,6 @@ impl SaeManifoldTerm {
             n_unconverged: encodes.unconverged_count,
             n_encodes: n,
         })
-    }
-
-    /// #1154 — the co-trained penalized quasi-Laplace criterion: the exact penalized quasi-Laplace criterion at `rho`
-    /// PLUS the amortized-encoder consistency penalty, so the outer optimizer
-    /// co-adapts the dictionary + smoothing parameters λ toward a dictionary the
-    /// fast initializer and joint refinement can faithfully invert.
-    ///
-    /// This is Design A of #1154. The inner solve still converges the `(t, β)`
-    /// system to stationarity at the engine's current ρ (so the implicit-function
-    /// penalized quasi-Laplace λ-gradient `dβ̂/dλ = −(H+S_λ)⁻¹(dS_λ/dλ)β̂` stays exact — the encoder
-    /// only warm-starts/co-adapts, it never replaces the stationary point). The
-    /// added term
-    ///
-    /// ```text
-    ///   J_cotrain(ρ) = penalized_quasi_laplace(ρ) + w · ‖x̂_amortized − x̂_exact‖²/(n·p)
-    ///                            +  w_conv · unconverged_fraction
-    /// ```
-    ///
-    /// folds the post-fit amortized-encode quality into the ranked objective. The
-    /// weights are auto-scaled to the penalized quasi-Laplace criterion magnitude (magic by default:
-    /// no caller knob) so the consistency term is a meaningful but non-dominant
-    /// fraction of the objective regardless of problem scale.
-    pub fn penalized_quasi_laplace_criterion_cotrained(
-        &mut self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        registry: Option<&AnalyticPenaltyRegistry>,
-        inner_max_iter: usize,
-        learning_rate: f64,
-        ridge_ext_coord: f64,
-        ridge_beta: f64,
-    ) -> Result<(f64, SaeManifoldLoss, AmortizedEncoderConsistency), String> {
-        // #1154: always attempt the amortized warm-start first inside
-        // `penalized_quasi_laplace_criterion_cotrained` (the encode/warm path for the cotrained
-        // objective). Good warm-starts from the running dictionary land the
-        // inner solve closer to the stationary point used for the fold.
-        // Advisory only (0 or err falls back to cold); telemetry recorded by
-        // outer objective callers when present.
-        self.warm_start_latents_from_amortized_encoder(target, rho)
-            .unwrap_or(0);
-        let (penalized_quasi_laplace, loss) = self
-            .penalized_quasi_laplace_criterion_with_refine_policy(
-                target,
-                rho,
-                registry,
-                inner_max_iter,
-                learning_rate,
-                ridge_ext_coord,
-                ridge_beta,
-                true,
-            )
-            .map_err(|error| error.to_string())?;
-        let consistency = self.amortized_encoder_consistency(target, rho)?;
-        // Auto-scale the co-training weights to the penalized quasi-Laplace magnitude so the
-        // consistency penalty is a bounded, scale-free fraction of the objective
-        // (magic by default: no caller knob). `criterion_scale` floors at 1 so a
-        // near-zero criterion still admits a meaningful consistency contribution.
-        let cotrained = Self::fold_cotrain_consistency(penalized_quasi_laplace, &consistency);
-        Ok((cotrained, loss, consistency))
-    }
-
-    /// #1154 — the single source of the co-training fold arithmetic: add the
-    /// auto-scaled amortized-encoder consistency penalty to an already-computed
-    /// penalized quasi-Laplace criterion at the converged dictionary. Both the public
-    /// [`Self::penalized_quasi_laplace_criterion_cotrained`] entry point and the outer-loop value /
-    /// gradient lanes (`SaeManifoldOuterObjective::fold_cotrain_consistency`)
-    /// route through THIS function, so the folded objective cannot drift between
-    /// the criterion and the cascade-ranked cost (the objective↔gradient desync
-    /// bug class). The weights are auto-scaled to the penalized quasi-Laplace magnitude
-    /// (`max(|penalized_quasi_laplace|,
-    /// 1)`) so the penalty is a bounded, scale-free fraction of the objective
-    /// regardless of problem scale; the fold carries no analytic gradient (under
-    /// Design A the penalized quasi-Laplace λ-gradient stays the exact implicit-function path).
-    #[must_use]
-    pub fn fold_cotrain_consistency(
-        penalized_quasi_laplace_cost: f64,
-        consistency: &AmortizedEncoderConsistency,
-    ) -> f64 {
-        let criterion_scale = penalized_quasi_laplace_cost.abs().max(1.0);
-        penalized_quasi_laplace_cost
-            + COTRAIN_RECON_WEIGHT * criterion_scale * consistency.recon_consistency
-            + COTRAIN_CONVERGENCE_WEIGHT * criterion_scale * consistency.unconverged_fraction
     }
 
     /// #1154 item 2 — warm-start the inner latent coordinates from the amortized
@@ -5780,64 +5196,6 @@ impl SaeManifoldTerm {
         })
     }
 
-    /// Reconstruction data-fit `0.5·Σ_i w_i·‖whiten(Z_i − R_i)‖²` for an EXPLICIT
-    /// reconstruction matrix `R` (e.g. the hard top-k–projected `fitted`), using
-    /// the SAME per-row metric and design-honesty weights as [`Self::loss_scaled`]
-    /// (the soft-assignment data-fit). The only difference is the residual source:
-    /// `loss_scaled` decodes the soft assignments on the fly, this consumes a
-    /// reconstruction the caller already assembled (so the projected loss and the
-    /// returned projected `fitted` describe one and the same model). The penalty
-    /// terms (`assignment_sparsity`/`smoothness`/`ard`) are decoder/ρ properties
-    /// the top-k gate does not change, so the caller keeps them from the soft
-    /// `loss_scaled` and only swaps this data-fit in — see #1232.
-    pub fn data_fit_for_reconstruction(
-        &self,
-        target: ArrayView2<'_, f64>,
-        reconstruction: ArrayView2<'_, f64>,
-    ) -> Result<f64, String> {
-        let n = self.n_obs();
-        let p = self.output_dim();
-        if target.dim() != (n, p) {
-            return Err(format!(
-                "SaeManifoldTerm::data_fit_for_reconstruction: Z must be ({n}, {p}); got {:?}",
-                target.dim()
-            ));
-        }
-        if reconstruction.dim() != (n, p) {
-            return Err(format!(
-                "SaeManifoldTerm::data_fit_for_reconstruction: reconstruction must be ({n}, {p}); got {:?}",
-                reconstruction.dim()
-            ));
-        }
-        let whitens = self
-            .row_metric
-            .as_ref()
-            .is_some_and(|metric| metric.whitens_likelihood());
-        let row_loss_w = self.row_loss_weights.as_deref();
-        let mut resid = vec![0.0_f64; p];
-        let mut total = 0.0_f64;
-        for row in 0..n {
-            for out_col in 0..p {
-                resid[out_col] = target[[row, out_col]] - reconstruction[[row, out_col]];
-            }
-            let w_row = row_loss_w.map_or(1.0, |w| w[row]);
-            match self.row_metric.as_ref() {
-                Some(metric) if whitens => {
-                    let r = ArrayView1::from(&resid[..p]);
-                    for w in metric.whiten_residual_row(row, r) {
-                        total += 0.5 * w_row * w * w;
-                    }
-                }
-                _ => {
-                    for &r in resid[..p].iter() {
-                        total += 0.5 * w_row * r * r;
-                    }
-                }
-            }
-        }
-        Ok(total)
-    }
-
     pub fn analytic_penalty_value_total(
         &self,
         registry: &AnalyticPenaltyRegistry,
@@ -5933,132 +5291,6 @@ impl SaeManifoldTerm {
                     }
                 }
                 PenaltyTier::Rho => {}
-            }
-        }
-        Ok(value)
-    }
-
-    /// Energy of the decoder-block analytic penalties that have no native
-    /// `SaeManifoldLoss` counterpart, evaluated at the current decoder `β` and
-    /// the converged SAE state. These act on the per-atom decoder coefficient
-    /// matrices: cross-atom decoder incoherence (#671), mechanism
-    /// (feature-group) sparsity, and nuclear-norm embedding rank (#672). Each
-    /// is injected with its live per-atom shape / co-activation before its
-    /// value is taken, mirroring the assemble path.
-    ///
-    /// This is deliberately narrower than [`Self::analytic_penalty_value_total`]:
-    /// it excludes the Psi-tier coordinate / assignment penalties (ARD,
-    /// Isometry, ScadMcp, BlockOrthogonality, ordered Beta--Bernoulli/softmax assignment sparsity).
-    /// The SAE already carries its own ARD (`loss.ard`) and assignment sparsity
-    /// (`loss.assignment_sparsity`) energy, so adding the registry ARD /
-    /// assignment value on top would double-count, and the gauge-only
-    /// coordinate penalties are not part of the penalized deviance the
-    /// penalized quasi-Laplace criterion scores. The decoder-block penalties, by contrast,
-    /// are real penalized-energy terms with no `loss.*` representative: the
-    /// inner solve minimizes them (they enter `gb`/`hbb`) but they were absent
-    /// from the criterion scalar `v`. This restores that consistency so the
-    /// ρ-sweep ranks the same objective the inner solve descends — the #671
-    /// incoherence lever in particular now shapes model selection, not just the
-    /// Newton step.
-    ///
-    /// NOTE: the coordinate-block penalties with no native `loss.*` twin
-    /// (`ScadMcp`, `BlockOrthogonality`) carry the same residual inconsistency
-    /// (scored in the line search via `penalized_objective_total`, absent from
-    /// the penalized quasi-Laplace scalar). They are left out here because they share a registry
-    /// dispatch with the always-on `Isometry` gauge, whose inclusion in the
-    /// topology-comparison criterion is a separate design question (#673:
-    /// topology evidence is gauge-conditional). Folding the coord-tier energy in
-    /// is tracked apart from this #671 decoder fix.
-    pub fn analytic_decoder_penalty_value_total(
-        &self,
-        registry: &AnalyticPenaltyRegistry,
-    ) -> Result<f64, ArrowSchurError> {
-        // Resolve each penalty's rho slice exactly as `analytic_penalty_value_total`
-        // does (registry-local rho at zeros), so a learnable decoder-penalty weight
-        // is honoured rather than indexing into an empty view.
-        let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
-        registry
-            .validate_rho(rho_global.view())
-            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-        let layout = registry.rho_layout();
-        let beta = self.flatten_beta();
-        let mut value = 0.0_f64;
-        for (penalty, (rho_slice, _tier, _name)) in registry.penalties.iter().zip(layout.iter()) {
-            let rho_local = rho_global.slice(s![rho_slice.clone()]);
-            match penalty {
-                AnalyticPenaltyKind::DecoderIncoherence(base) => {
-                    if let Some(per_fit) = self.live_decoder_incoherence_penalty(base) {
-                        value += per_fit.value(beta.view(), rho_local);
-                    }
-                }
-                AnalyticPenaltyKind::MechanismSparsity(base) => {
-                    for (per_atom, start, end) in self.live_mechanism_sparsity_penalties(base) {
-                        if start < end {
-                            value += per_atom.value(beta.view(), rho_local);
-                        }
-                    }
-                }
-                AnalyticPenaltyKind::NuclearNorm(base) => {
-                    for (per_atom, start, end) in self.live_nuclear_norm_penalties(base) {
-                        value += per_atom.value(beta.slice(s![start..end]), rho_local);
-                    }
-                }
-                // Every other registered kind is excluded by the contract
-                // documented above: it either double-counts a native `loss.*`
-                // twin or is a coordinate-tier / gauge-only term that is not
-                // part of the penalized deviance this scalar scores. Spelled
-                // out rather than wildcarded so a newly registered penalty kind
-                // has to state which side of that line it falls on.
-                AnalyticPenaltyKind::Isometry(_)
-                | AnalyticPenaltyKind::Sparsity(_)
-                | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
-                | AnalyticPenaltyKind::OrderedBetaBernoulli(_)
-                | AnalyticPenaltyKind::Ard(_)
-                | AnalyticPenaltyKind::TopKActivation(_)
-                | AnalyticPenaltyKind::SmoothThreshold(_)
-                | AnalyticPenaltyKind::TotalVariation(_)
-                | AnalyticPenaltyKind::HarmonicRoughness(_)
-                | AnalyticPenaltyKind::BlockSparsity(_)
-                | AnalyticPenaltyKind::Monotonicity(_)
-                | AnalyticPenaltyKind::NestedPrefix(_)
-                | AnalyticPenaltyKind::RowPrecisionPrior(_)
-                | AnalyticPenaltyKind::IvaeRidgeMeanGauge(_)
-                | AnalyticPenaltyKind::ParametricRowPrecisionPrior(_)
-                | AnalyticPenaltyKind::ScadMcp(_)
-                | AnalyticPenaltyKind::BlockOrthogonality(_)
-                | AnalyticPenaltyKind::Orthogonality(_)
-                | AnalyticPenaltyKind::SheafConsistency(_) => {}
-            }
-        }
-        Ok(value)
-    }
-
-    /// Energy of the COORDINATE-tier isometry penalty(ies) at the converged
-    /// SAE state. This is the per-atom `½μ Σ_n ‖J_n^T W_n J_n / gbar − g_ref‖²`
-    /// summed over atoms, evaluated through `corrected_isometry_penalty` so the
-    /// live decoder/coordinate caches drive the value exactly as the assemble
-    /// path does. It has no `SaeManifoldLoss` twin (the loss carries only
-    /// data-fit / assignment / smoothness / ARD), so the penalized quasi-Laplace criterion
-    /// must add it explicitly to score the same penalized objective the inner
-    /// solve descends.
-    pub fn isometry_penalty_value_total(
-        &self,
-        registry: &AnalyticPenaltyRegistry,
-    ) -> Result<f64, ArrowSchurError> {
-        let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
-        registry
-            .validate_rho(rho_global.view())
-            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-        let layout = registry.rho_layout();
-        let mut value = 0.0_f64;
-        for (penalty, (rho_slice, _tier, _name)) in registry.penalties.iter().zip(layout.iter()) {
-            if let AnalyticPenaltyKind::Isometry(iso) = penalty {
-                let rho_local = rho_global.slice(s![rho_slice.clone()]);
-                for atom_idx in 0..self.k_atoms() {
-                    let coord = &self.assignment.coords[atom_idx];
-                    let corrected_kind = self.corrected_isometry_penalty(iso, atom_idx, coord)?;
-                    value += corrected_kind.value(coord.as_flat().view(), rho_local);
-                }
             }
         }
         Ok(value)

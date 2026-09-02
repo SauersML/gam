@@ -3,41 +3,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::manifold::SaeManifoldTerm;
 use gam_linalg::faer_ndarray::{FaerSvd, fast_ab, fast_abt, fast_atb};
 
-/// Canonical orthonormal row frame spanning a requested ambient-output
-/// subspace (#2260).
-///
-/// `raw` is `(r, p)`. Its rows may be scaled or non-orthogonal, but must have
-/// numerical row rank `r`. The returned `(r, p)` rows are orthonormal and use
-/// [`GrassmannFrame`]'s deterministic sign gauge. Rank is certified against the
-/// standard SVD backward-error scale `eps * max(r, p) * sigma_max`; a deficient
-/// request is rejected rather than completed with arbitrary orthogonal vectors.
-pub fn canonical_output_subspace_rows(raw: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    let (r, p) = raw.dim();
-    if r == 0 || p == 0 {
-        return Err("canonical_output_subspace_rows: frame must be non-empty".to_string());
-    }
-    if r > p {
-        return Err(format!(
-            "canonical_output_subspace_rows: rank r={r} cannot exceed output dimension p={p}"
-        ));
-    }
-    if raw.iter().any(|value| !value.is_finite()) {
-        return Err("canonical_output_subspace_rows: frame must be finite".to_string());
-    }
-
-    let frame = GrassmannFrame::polar_update(raw.t())?;
-    let singular_values = frame.gauge_singular_values();
-    let rank_resolution = f64::EPSILON * r.max(p) as f64 * singular_values[0];
-    if singular_values[r - 1] <= rank_resolution {
-        return Err(format!(
-            "canonical_output_subspace_rows: requested {r}-row frame is rank deficient \
-             (sigma_min={}, numerical resolution={rank_resolution})",
-            singular_values[r - 1]
-        ));
-    }
-    Ok(frame.frame().t().to_owned())
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct FrameProjection {
     pub(crate) p: usize,
@@ -1075,59 +1040,5 @@ impl GrassmannCrossMoment {
         self.moment.view()
     }
 
-    /// Re-polar the frame from the accumulated cross-moment (the streaming
-    /// closed-form step): `U_new = polar(Mcm)`.
-    pub fn polar_frame(&self) -> Result<GrassmannFrame, String> {
-        GrassmannFrame::polar_update(self.moment.view())
-    }
 }
 
-/// Verification helper (issue #972): recover the planted low-rank column span of
-/// an atom by polaring the decoder-target cross-moment and report the largest
-/// principal angle (radians) between the recovered frame and a planted
-/// orthonormal frame `planted` (`p × r`).
-///
-/// `targets` (`N × p`) are the ambient decoder targets and `coords` (`N × r`)
-/// the latent coordinates that generated them (`targets ≈ coords · plantedᵀ`).
-/// The closed-form polar of `Σ targetsᵀ coords` recovers `range(planted)`; a
-/// successful low-rank fit drives the returned angle to `0`. Used by the
-/// `planted_low_rank_frame_recovered_by_polar` test, and available to callers
-/// that want a runtime span-recovery diagnostic.
-pub fn grassmann_recover_planted_span_angle(
-    targets: ArrayView2<'_, f64>,
-    coords: ArrayView2<'_, f64>,
-    planted: ArrayView2<'_, f64>,
-) -> Result<f64, String> {
-    let p = targets.ncols();
-    let r = coords.ncols();
-    if planted.dim() != (p, r) {
-        return Err(format!(
-            "grassmann_recover_planted_span_angle: planted frame must be ({p}, {r}); got {:?}",
-            planted.dim()
-        ));
-    }
-    let mut cross = GrassmannCrossMoment::new(p, r);
-    cross.accumulate(targets, coords)?;
-    let frame = cross.polar_frame()?;
-    frame.max_principal_angle(planted)
-}
-
-/// Verification helper (issue #972): the factored arrow-Schur border dimension
-/// equals `Σ_k M_k · r_k` exactly. Returns `Ok(())` iff the invariant holds for
-/// `term`, else an explanatory error. Compiled-in so the border-size contract is
-/// checkable at runtime, not only in tests.
-pub fn grassmann_assert_border_dim_invariant(term: &SaeManifoldTerm) -> Result<(), String> {
-    let expected: usize = term
-        .atoms
-        .iter()
-        .map(|a| a.basis_size() * a.border_frame_rank())
-        .sum();
-    let got = term.factored_border_dim();
-    if got != expected {
-        return Err(format!(
-            "grassmann border-dim invariant violated: factored_border_dim() = {got}, \
-             expected Σ M_k·r_k = {expected}"
-        ));
-    }
-    Ok(())
-}

@@ -159,31 +159,6 @@ impl AtomTransportReport {
     }
 }
 
-/// Measure the empirical anchor→first-block transport of one circle atom and
-/// test the phase-shift law. See the module header for the full definition.
-///
-/// `term` must hold the fitted atom (with an installed periodic basis evaluator);
-/// `layout` supplies the anchor width, the block column ranges, and the per-block
-/// `√λ_ℓ` unscaling (pass the layout the fit installed, or one built with
-/// [`CrosscoderLayout::from_blocks`]). `grid_resolution` is the number of source
-/// samples reported over `[0, 1)`; it controls diagnostic sampling, not the
-/// continuous target-coordinate solve. Requires `layout.num_blocks() ≥ 1`.
-pub fn measure_atom_transport(
-    term: &SaeManifoldTerm,
-    layout: &CrosscoderLayout,
-    atom: usize,
-    grid_resolution: usize,
-) -> Result<AtomTransportReport, String> {
-    measure_atom_transport_between(
-        term,
-        layout,
-        atom,
-        CrosscoderLayer::Anchor,
-        CrosscoderLayer::Block(0),
-        grid_resolution,
-    )
-}
-
 /// Measure the empirical transport of one circle atom between two explicit
 /// crosscoder layers (source image projected onto the target image). The
 /// two-layer entry point [`measure_atom_transport`] is the anchor→`Block(0)` case.
