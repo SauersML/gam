@@ -38,7 +38,7 @@
 //! silent skip (see `src/test_support/reference.rs`).
 
 use gam::matrix::LinearOperator;
-use gam::mixture_link::{inverse_link_jet_for_family, state_from_beta_logisticspec};
+use gam::mixture_link::state_from_beta_logisticspec;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, max_abs_diff, pearson, relative_l2, rmse, run_r};
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, SasLinkSpec};

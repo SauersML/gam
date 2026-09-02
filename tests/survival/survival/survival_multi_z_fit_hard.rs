@@ -30,10 +30,7 @@
 use gam::families::bms::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
 };
-use gam::families::survival::marginal_slope::{
-    RigidVectorValueWorkspace, survival_marginal_slope_vector_eta,
-    survival_marginal_slope_vector_neglog, survival_marginal_slope_vector_scale,
-};
+use gam::families::survival::marginal_slope::{RigidVectorValueWorkspace, survival_marginal_slope_vector_neglog};
 use gam::probability::{normal_cdf, normal_pdf};
 use ndarray::{Array1, Array2};
 

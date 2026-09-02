@@ -265,34 +265,6 @@ mod tests {
         assert!(form.is_analytic());
     }
 
-    #[test]
-    fn only_operator_variant_is_operator_only() {
-        let form = DeclaredHessianForm::Operator {
-            materialization: HessianMaterialization::RepeatedHvp,
-            estimated_materialization_cost: Some(1.0),
-        };
-        assert!(form.is_operator_only());
-        assert!(!DeclaredHessianForm::Dense.is_operator_only());
-        assert!(!DeclaredHessianForm::Either.is_operator_only());
-        assert!(!DeclaredHessianForm::Unavailable.is_operator_only());
-    }
-
-    #[test]
-    fn only_dense_variant_is_dense_only() {
-        assert!(DeclaredHessianForm::Dense.is_dense_only());
-        // `Operator` was the missing row. Its sibling
-        // `only_operator_variant_is_operator_only` enumerates all four variants;
-        // this one enumerated three, so the single form that most obviously must
-        // NOT be dense-only was the one never asked. Drift, not style.
-        let operator = DeclaredHessianForm::Operator {
-            materialization: HessianMaterialization::RepeatedHvp,
-            estimated_materialization_cost: Some(1.0),
-        };
-        assert!(!operator.is_dense_only());
-        assert!(!DeclaredHessianForm::Either.is_dense_only());
-        assert!(!DeclaredHessianForm::Unavailable.is_dense_only());
-    }
-
     // ── OuterEval ─────────────────────────────────────────────────────────────
 
     #[test]

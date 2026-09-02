@@ -15,10 +15,7 @@
 //! (`pub(crate)` only). See the module-level NOTE blocks on the Hessian
 //! and IFT tests for the workaround and the limitation.
 
-use gam::estimate::{
-    ExternalOptimOptions, evaluate_external_ift_residual_at_perturbed_rho,
-    evaluate_externalcost_andridge, evaluate_externalgradient,
-};
+use gam::estimate::{ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient};
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};

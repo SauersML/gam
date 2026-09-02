@@ -4,7 +4,7 @@
 //! single typed circle atom on a shape outside the typed zoo.
 
 use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator, SaeBasisSecondJet};
-use crate::manifold::{GraphEdge, LearnedGraphAtom, graph_edge_rank_charge};
+use crate::manifold::{GraphEdge, LearnedGraphAtom};
 use crate::saebench_metrics::{
     ChartInterpNullCalibration, ChartInterpNullProtocol, ChartInterpObservation,
     ChartInterpReadout, chart_interp_score,

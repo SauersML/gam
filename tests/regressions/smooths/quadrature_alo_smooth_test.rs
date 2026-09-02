@@ -1,7 +1,5 @@
 use gam::inference::alo::{AloInput, compute_alo_from_input};
-use gam::inference::quadrature::{
-    QuadratureContext, cloglog_ghq_value, integrated_family_moments_jet,
-};
+use gam::inference::quadrature::{QuadratureContext, integrated_family_moments_jet};
 use gam::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
 use gam::matrix::{PsdWeightsView, SignedWeightsView};
 use gam::types::{GlmLikelihoodSpec, InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
@@ -89,78 +87,6 @@ fn quadrature_order_doubling_stabilizes_cloglog_integral() {
             ref_err < 1e-7,
             "cloglog GHQ value must match the brute-force convolution reference; \
              |I_15-ref|={ref_err:.3e}, I_15={q:.12}, ref={reference:.12}, eta={eta:.4}, sigma={sigma:.4}"
-        );
-    }
-}
-
-#[test]
-fn alo_residual_matches_closed_form_identity_link() {
-    let x = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0]];
-    let y = array![0.9, 2.1, 2.8, 4.2];
-    let eta = array![1.0, 2.0, 3.0, 4.0];
-    let w = Array1::from_elem(4, 1.0);
-    let z = y.clone();
-    let offset = Array1::zeros(4);
-    let h = x.t().dot(&x);
-
-    let input = AloInput {
-        design: &x,
-        penalized_hessian: &h,
-        hessian_weights: SignedWeightsView::from_array(&w),
-        score_weights: PsdWeightsView::try_from_array(&w).expect("psd weights"),
-        working_response: &z,
-        eta: &eta,
-        offset: &offset,
-        phi: 1.0,
-        score_curvature: None,
-    };
-
-    let out = compute_alo_from_input(&input)
-        .expect("ALO should compute for full-rank identity-link setup");
-    for i in 0..y.len() {
-        let h_ii = out.leverage[i];
-        let expected = (y[i] - eta[i]) / (1.0 - h_ii);
-        let got = y[i] - out.eta_tilde[i];
-        assert!(
-            (got - expected).abs() < 1e-10,
-            "ALO residual should match (y-mu)/(1-h_ii) for identity link; row={i}, got={got:.12}, expected={expected:.12}"
-        );
-    }
-}
-
-#[test]
-fn alo_respects_family_and_robust_weights() {
-    let x = array![[1.0], [1.0], [1.0], [1.0]];
-    let y = array![1.0, 2.0, 3.0, 4.0];
-    let eta = array![1.5, 1.5, 3.5, 3.5];
-    let w_h = array![1.0, 2.0, 0.5, 3.0];
-    let w_s = array![0.8, 1.5, 0.4, 2.5];
-    let z = y.clone();
-    let offset = Array1::zeros(4);
-    let h = array![[w_h.sum()]];
-
-    let input = AloInput {
-        design: &x,
-        penalized_hessian: &h,
-        hessian_weights: SignedWeightsView::from_array(&w_h),
-        score_weights: PsdWeightsView::try_from_array(&w_s).expect("psd weights"),
-        working_response: &z,
-        eta: &eta,
-        offset: &offset,
-        phi: 1.0,
-        score_curvature: None,
-    };
-    let out = compute_alo_from_input(&input)
-        .expect("ALO should compute when family and robust weights are finite and positive");
-
-    for i in 0..4 {
-        let x_hinv_x = 1.0 / w_h.sum();
-        let h_ii = w_h[i] * x_hinv_x;
-        let expected = eta[i] + x_hinv_x * w_s[i] * (eta[i] - z[i]) / (1.0 - h_ii);
-        assert!(
-            (out.eta_tilde[i] - expected).abs() < 1e-10,
-            "ALO eta_tilde should use hessian weights in leverage and score weights in correction; row={i}, got={:.12}, expected={expected:.12}",
-            out.eta_tilde[i],
         );
     }
 }

@@ -34,11 +34,7 @@
 //! full kernel materialization this fix removes is on the operators-OFF path
 //! (e.g. `duchon(..., operators=off)` and scale-block Duchon smooths per #1561).
 
-use gam_terms::basis::{
-    BasisMetadata, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
-    DuchonOperatorPenaltySpec, OneDimensionalBoundary, SpatialIdentifiability, build_duchon_basis,
-    duchon_design_build_count,
-};
+use gam_terms::basis::{BasisMetadata, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, OneDimensionalBoundary, SpatialIdentifiability, build_duchon_basis};
 use ndarray::Array2;
 use std::sync::Mutex;
 

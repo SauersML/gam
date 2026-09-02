@@ -1,10 +1,7 @@
 use faer::{Mat, Side};
 use gam::linalg::faer_ndarray::factorize_symmetricwith_fallback;
 use gam::linalg::low_rank_weight::LowRankWeight;
-use gam::linalg::matrix::{
-    ConditionedDesign, DenseDesignMatrix, DesignMatrix, FiniteSignedWeightsView, LinearOperator,
-    PsdWeightsView, xt_diag_x_psd, xt_diag_x_signed, xt_diag_x_symmetric,
-};
+use gam::linalg::matrix::{ConditionedDesign, DenseDesignMatrix, DesignMatrix, FiniteSignedWeightsView, LinearOperator, PsdWeightsView, xt_diag_x_signed, xt_diag_x_symmetric};
 use ndarray::{Array2, array};
 
 #[test]

@@ -1,12 +1,7 @@
 use gam::ResourcePolicy;
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::terms::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, OneDimensionalBoundary,
-    PeriodicBSplineBasisSpec, build_bspline_basis_1d, build_periodic_bspline_basis_1d,
-    cyclic_bspline_derivative_penalty_matrix, fit_periodic_bspline_curve,
-    periodic_bspline_first_derivative_nd,
-};
+use gam::terms::basis::{BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, OneDimensionalBoundary, PeriodicBSplineBasisSpec, build_bspline_basis_1d, build_periodic_bspline_basis_1d, cyclic_bspline_derivative_penalty_matrix, periodic_bspline_first_derivative_nd};
 use gam::terms::smooth::{
     SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec, build_term_collection_design,
 };

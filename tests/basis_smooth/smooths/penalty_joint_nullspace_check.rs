@@ -37,7 +37,6 @@
 
 use gam::families::custom_family::{ParameterBlockSpec, PenaltyMatrix};
 use gam::identifiability::audit::{MapUniquenessError, check_map_uniqueness};
-use gam::identifiability::canonical::canonicalize_for_identifiability;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::{Array1, Array2};
 

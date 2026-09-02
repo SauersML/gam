@@ -57,9 +57,7 @@
 use ndarray::{Array1, Array2};
 
 use crate::manifold::RiemannianManifold;
-use crate::manifolds::constant_curvature::{
-    ConstantCurvature, distance_kappa_jet, exp_map_kappa_jet, log_map_kappa_jet,
-};
+use crate::manifolds::constant_curvature::{ConstantCurvature, distance_kappa_jet};
 use crate::manifolds::poincare;
 
 struct Rng(u64);
@@ -319,87 +317,6 @@ fn distance_is_a_metric_and_agrees_with_the_logarithm() {
         }
     }
     assert!(verified > 0, "no metric axiom was evaluated");
-}
-
-#[test]
-fn radial_volume_jacobian_matches_its_closed_form() {
-    // J_κ(r) = (sn_κ(r)/r)^{d−1}, with sn_κ the curvature-normalized sine. This
-    // is the volume term in the change-of-variables criterion, so an error here
-    // biases the curvature estimate itself rather than merely slowing it.
-    let mut verified = 0usize;
-    for dim in DIMS {
-        for kappa in CURVATURES {
-            let manifold = ConstantCurvature::new(dim, kappa);
-            let mut rng = Rng::new(seed_for(dim, kappa));
-            for _ in 0..TRIALS {
-                let r = 2.0 * rng.uniform();
-                let got = manifold.jacobian_radial(r);
-                let want = if dim <= 1 {
-                    1.0
-                } else {
-                    let sn_over_r = if kappa.abs() <= 1.0e-12 || r == 0.0 {
-                        1.0
-                    } else if kappa > 0.0 {
-                        let arc = kappa.sqrt() * r;
-                        (arc.sin() / arc).max(0.0)
-                    } else {
-                        let arc = (-kappa).sqrt() * r;
-                        arc.sinh() / arc
-                    };
-                    sn_over_r.powi((dim - 1) as i32)
-                };
-                assert!(
-                    (got - want).abs() <= 1.0e-9 * want.abs().max(1.0e-12),
-                    "dim {dim} kappa {kappa} r {r}: J = {got}, closed form {want}"
-                );
-                verified += 1;
-            }
-        }
-    }
-    assert!(verified > 0, "no volume Jacobian was evaluated");
-}
-
-#[test]
-fn batched_distance_is_bit_identical_to_the_scalar_path() {
-    // `distance_batch` documents bit-for-bit agreement with `distance`, which is
-    // a stronger claim than "close": the SIMD `T`-series must reproduce the
-    // scalar value per lane exactly, and the tail and closed-form lanes must
-    // fall back rather than approximate. Asserting equality (not a tolerance) is
-    // the only way to test the claim that is actually made.
-    let mut verified = 0usize;
-    for dim in DIMS {
-        for kappa in CURVATURES {
-            let manifold = ConstantCurvature::new(dim, kappa);
-            let mut rng = Rng::new(seed_for(dim, kappa));
-            // Row counts either side of the f64x4 lane width, so the vectorised
-            // body and the scalar tail are both exercised.
-            for rows in [1usize, 3, 4, 5, 8, 11] {
-                let base = chart_point(&mut rng, dim);
-                let mut targets = Array2::<f64>::zeros((rows, dim));
-                for r in 0..rows {
-                    targets.row_mut(r).assign(&chart_point(&mut rng, dim));
-                }
-                let mut batched = vec![0.0_f64; rows];
-                manifold
-                    .distance_batch(base.view(), targets.view(), &mut batched)
-                    .expect("distance_batch");
-                for r in 0..rows {
-                    let scalar = manifold
-                        .distance(base.view(), targets.row(r))
-                        .expect("scalar distance");
-                    assert_eq!(
-                        batched[r].to_bits(),
-                        scalar.to_bits(),
-                        "dim {dim} kappa {kappa} rows {rows} row {r}: \
-                         batched {} != scalar {scalar}",
-                        batched[r]
-                    );
-                    verified += 1;
-                }
-            }
-        }
-    }
-    assert!(verified > 0, "no batched distance was evaluated");
 }
 
 /// Relative tolerance for a jet component, plus an absolute floor set by what

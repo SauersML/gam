@@ -14,7 +14,7 @@
 //!   bracketed small-order winner instead of walking the ladder upward.
 
 use gam::solver::evidence::GaussianMixtureConfig;
-use gam::solver::topology_selector::{MIXTURE_K_LADDER, MixtureRungResult, fit_mixture_rung};
+use gam::solver::topology_selector::{MIXTURE_K_LADDER, MixtureRungResult};
 use ndarray::Array2;
 
 // ---------------------------------------------------------------------------

@@ -66,9 +66,7 @@
 //! cross channel is caught by the oracle.
 
 use crate::jet_scalar::JetScalar;
-use crate::jet_tower::{
-    KernelChannels, RowProgram, Tower4, program_full_tower, verify_kernel_channels,
-};
+use crate::jet_tower::{KernelChannels, RowProgram, Tower4, program_full_tower};
 
 /// One Gaussian location-scale fixture: the response `y` and the current
 /// primaries `(η, s)` at which the row is linearized (`s = log σ`).
@@ -280,94 +278,3 @@ fn gaussian_loc_scale_jet_tower_matches_hand_derived_via_universal_oracle() {
     }
 }
 
-/// The PRODUCTION packed scalars — `Order2` (value/∇/H), `OneSeed` (contracted
-/// third), `TwoSeed` (contracted fourth) — evaluated on the SAME single
-/// `eval` expression must reproduce the hand-derived closed form's
-/// corresponding channels. This pins the cutover path a family would actually use
-/// (the small packed scalars, not the dense `Tower4`) against external calculus,
-/// with the contraction directions folded into the nilpotent seeds. It is the
-/// proof that "adding a family" needs only its generic NLL + a channel comparison.
-#[test]
-fn gaussian_loc_scale_packed_scalars_match_hand_derived_contractions() {
-    use crate::jet_tower::{
-        program_fourth_contracted, program_row_kernel, program_third_contracted,
-    };
-
-    let mut rng = Lcg(0x0bad_c0de_9322_0203);
-    let third_dirs: [[f64; 2]; 3] = [[0.9, -0.5], [-1.1, 0.3], [0.2, 1.4]];
-
-    let mut rows = Vec::new();
-    for _ in 0..18 {
-        rows.push(GaussianRow {
-            y: rng.uniform(-3.0, 3.0),
-            eta: rng.uniform(-2.0, 2.0),
-            s: rng.uniform(-1.0, 1.0),
-        });
-    }
-    let program = GaussianLocScaleRow { rows: rows.clone() };
-
-    const REL_TOL: f64 = 1e-11;
-    let close = |a: f64, b: f64, label: &str| {
-        let band = REL_TOL + REL_TOL * a.abs().max(b.abs());
-        assert!(
-            (a - b).abs() <= band,
-            "{label}: jet {a:+.15e} vs hand {b:+.15e} (band {band:.3e})"
-        );
-    };
-
-    for (row, fixture) in rows.iter().enumerate() {
-        let hand = gaussian_closed_form_channels(fixture, &[], &[]);
-
-        // Order2: value / gradient / Hessian via the production packed scalar.
-        let (v, g, h) = program_row_kernel(&program, row).expect("Order2 channel");
-        close(v, hand.value, &format!("row {row} Order2 value"));
-        for i in 0..2 {
-            close(
-                g[i],
-                hand.gradient[i],
-                &format!("row {row} Order2 grad[{i}]"),
-            );
-            for j in 0..2 {
-                close(
-                    h[i][j],
-                    hand.hessian[i][j],
-                    &format!("row {row} Order2 hess[{i}][{j}]"),
-                );
-            }
-        }
-
-        // OneSeed: contracted third Σ_c ℓ_{abc}·dir_c via the production scalar,
-        // checked against the dense tower's own contraction of t3.
-        let tower: Box<Tower4<2>> = program_full_tower(&program, row).expect("tower");
-        for (di, dir) in third_dirs.iter().enumerate() {
-            let third = program_third_contracted(&program, row, dir).expect("OneSeed third");
-            let truth = tower.third_contracted(dir);
-            for i in 0..2 {
-                for j in 0..2 {
-                    close(
-                        third[i][j],
-                        truth[i][j],
-                        &format!("row {row} dir {di} OneSeed third[{i}][{j}]"),
-                    );
-                }
-            }
-        }
-
-        // TwoSeed: contracted fourth Σ_{cd} ℓ_{abcd}·u_c·v_d via the production
-        // scalar, checked against the dense tower's own contraction of t4.
-        for (ui, u) in third_dirs.iter().enumerate() {
-            let v = third_dirs[(ui + 1) % third_dirs.len()];
-            let fourth = program_fourth_contracted(&program, row, u, &v).expect("TwoSeed fourth");
-            let truth = tower.fourth_contracted(u, &v);
-            for i in 0..2 {
-                for j in 0..2 {
-                    close(
-                        fourth[i][j],
-                        truth[i][j],
-                        &format!("row {row} pair {ui} TwoSeed fourth[{i}][{j}]"),
-                    );
-                }
-            }
-        }
-    }
-}

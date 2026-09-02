@@ -16,11 +16,7 @@
 //! function `B_{i,k}(x)`, so we can FD it independently and compare to row `i`
 //! of the analytic derivative vector.
 
-use gam::terms::basis::{
-    SplineScratch, evaluate_bspline_basis_scalar, evaluate_bspline_derivative_scalar,
-    evaluate_bspline_fourth_derivative_scalar, evaluate_bsplinesecond_derivative_scalar,
-    evaluate_bsplinethird_derivative_scalar,
-};
+use gam::terms::basis::{SplineScratch, evaluate_bspline_basis_scalar, evaluate_bspline_derivative_scalar, evaluate_bspline_fourth_derivative_scalar, evaluate_bsplinethird_derivative_scalar};
 use ndarray::{Array1, ArrayView1};
 
 /// Value of basis column `i` at scalar `x`.

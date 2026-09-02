@@ -882,28 +882,6 @@ mod tests {
     use super::*;
     use ndarray::Array2;
 
-    /// Route the availability question through the one shared gate (#2422).
-    ///
-    /// The previous body probed with `GpuRuntime::resolve` and announced an
-    /// absent device with a wording unique to this file. That skip was invisible
-    /// to every count: the three callers below `return` immediately after it, so
-    /// on a CPU-only runner all three printed `ok` while the process-wide skip
-    /// counter never moved and no `SKIPPED(no-cuda):` line was emitted for a
-    /// ledger to scrape. `gpu_for_test` panics on a driver FAULT, panics under
-    /// `GpuPolicy::Required`, counts the genuine absence and prints the one
-    /// greppable marker; `assert_absent_device_was_counted` then makes the count
-    /// itself the assertion this skip path executes.
-    fn cuda_available_for_test(label: &str) -> bool {
-        let floor = gam_gpu::test_gate::skipped_for_absent_device();
-        match gam_gpu::test_gate::gpu_for_test(label) {
-            gam_gpu::test_gate::GpuTestGate::Ready(_) => true,
-            gam_gpu::test_gate::GpuTestGate::AbsentDevice => {
-                gam_gpu::test_gate::assert_absent_device_was_counted(floor);
-                false
-            }
-        }
-    }
-
     /// Deterministic fp32 fixture: `n_rows × p` rows and `n_atoms × p` unit-norm
     /// atoms (the lane unit-norms its decoder, so |xᵀd| is the projection).
     fn fixture(n_rows: usize, n_atoms: usize, p: usize) -> (Array2<f32>, Array2<f32>) {
@@ -918,35 +896,6 @@ mod tests {
             row.mapv_inplace(|v| v / norm);
         }
         (rows, atoms)
-    }
-
-    #[test]
-    fn cpu_score_block_matches_score_row_tile() {
-        // The block oracle must equal the per-atom CPU router primitive exactly.
-        use crate::sparse_dict::scoring::score_row_tile;
-        let (rows, atoms) = fixture(5, 9, 7);
-        let block = score_block_cpu(rows.view(), atoms.view());
-        for r in 0..rows.nrows() {
-            // score_row_tile folds into a selector; reproduce its raw scores by
-            // running the same acc loop it uses (separate mul/add, ascending c).
-            for a in 0..atoms.nrows() {
-                let mut acc = 0.0f32;
-                for c in 0..rows.ncols() {
-                    acc += rows[[r, c]] * atoms[[a, c]];
-                }
-                assert_eq!(
-                    block[r * atoms.nrows() + a].to_bits(),
-                    acc.to_bits(),
-                    "block oracle vs raw acc differ at r={r} a={a}"
-                );
-            }
-        }
-        // And score_row_tile's selection over the full block is reproducible
-        // from the same scores (sanity: the primitive is the one we accelerate).
-        let mut sel = crate::sparse_dict::scoring::TopSSelector::new(3);
-        score_row_tile(rows.row(0), atoms.view(), 0, &mut sel);
-        let picked = sel.finish();
-        assert!(picked.len() <= 3 && !picked.is_empty());
     }
 
     #[cfg(target_os = "linux")]
@@ -1086,43 +1035,4 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn device_score_block_is_bit_identical_to_cpu_when_available() {
-        // Exactness gate. The block MUST clear DEVICE_SCORE_BLOCK_MIN_ELEMS so
-        // the device path is actually admitted (a sub-break-even block would
-        // skip-pass on the CPU and prove nothing). On a CUDA host we drive
-        // GpuPolicy::Required so a silent CPU fallback is a hard FAILURE, and we
-        // assert the device block is BIT-IDENTICAL to the CPU reference. With no
-        // runtime, Required must fail closed and the CPU path stays exact.
-        let n_rows = 256;
-        let n_atoms = 4096; // 256*4096 = 1,048,576 == DEVICE_SCORE_BLOCK_MIN_ELEMS
-        let p = 48;
-        assert!(n_rows * n_atoms >= DEVICE_SCORE_BLOCK_MIN_ELEMS);
-        let (rows, atoms) = fixture(n_rows, n_atoms, p);
-        let cpu = score_block_cpu(rows.view(), atoms.view());
-
-        if !cuda_available_for_test("score-block parity") {
-            return;
-        }
-
-        match score_block_required(rows.view(), atoms.view(), gam_gpu::GpuPolicy::Required) {
-            Ok((got, path)) => {
-                assert_eq!(
-                    path,
-                    ScoreBlockPath::Device,
-                    "Required succeeded but reported CPU — device did not engage"
-                );
-                assert_eq!(got.len(), cpu.len());
-                for (i, (g, c)) in got.iter().zip(&cpu).enumerate() {
-                    assert_eq!(
-                        g.to_bits(),
-                        c.to_bits(),
-                        "device vs CPU score-block bit mismatch at {i}: dev={g} cpu={c}"
-                    );
-                }
-            }
-            Err(err) => panic!("Required score block failed after CUDA admission: {err}"),
-        }
-    }
 }

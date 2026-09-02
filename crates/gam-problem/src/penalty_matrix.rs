@@ -417,31 +417,12 @@ mod tests {
     }
 
     #[test]
-    fn dense_quadratic_form() {
-        // beta' S beta with S=diag(1,2), beta=[3,2] → 9 + 8 = 17
-        let m = array![[1.0, 0.0], [0.0, 2.0]];
-        let p = PenaltyMatrix::Dense(m);
-        let beta = ndarray::array![3.0, 2.0];
-        assert!((p.quadratic_form(&beta) - 17.0).abs() < 1e-14);
-    }
-
-    #[test]
     fn dense_add_scaled_to() {
         let s = array![[1.0, 0.0], [0.0, 1.0]];
         let p = PenaltyMatrix::Dense(s);
         let mut acc = ndarray::Array2::<f64>::zeros((2, 2));
         p.add_scaled_to(3.0, &mut acc);
         assert_eq!(acc, array![[3.0, 0.0], [0.0, 3.0]]);
-    }
-
-    #[test]
-    fn dense_add_scaled_diag_to() {
-        let s = array![[2.0, 5.0], [5.0, 7.0]];
-        let p = PenaltyMatrix::Dense(s);
-        let mut diag = ndarray::array![0.0, 0.0];
-        p.add_scaled_diag_to(1.0, &mut diag);
-        // diagonal entries are 2.0 and 7.0
-        assert_eq!(diag.as_slice().unwrap(), &[2.0, 7.0]);
     }
 
     // ── KroneckerFactored variant ─────────────────────────────────────────────

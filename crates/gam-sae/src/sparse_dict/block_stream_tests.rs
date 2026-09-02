@@ -5,10 +5,7 @@
 
 use super::BlockSparseStreamState;
 use super::test_support::BlockStreamTestAccess;
-use crate::sparse_dict::{
-    BlockSparseConfig, block_gates, block_projections_row, fit_block_sparse_dictionary,
-    reconstruct_row, route_row_blocks,
-};
+use crate::sparse_dict::{BlockSparseConfig, block_gates, block_projections_row, fit_block_sparse_dictionary, route_row_blocks};
 use ndarray::{Array2, ArrayView2};
 
 fn lcg(state: &mut u64) -> f32 {

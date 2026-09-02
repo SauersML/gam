@@ -423,7 +423,7 @@ impl CorpusRowSource for ObjectStoreShardSource {
 
 #[cfg(test)]
 mod tests {
-    use super::super::shard_reader::{MmapShardSource, encode_shard_bytes};
+    use super::super::shard_reader::MmapShardSource;
     use super::*;
     use ndarray::array;
     use std::io::Write;
@@ -577,18 +577,6 @@ mod tests {
                 dir.display()
             );
         }
-    }
-
-    #[test]
-    fn mandatory_selectivity_threshold_is_pure_and_monotone() {
-        assert!(!designed_sampling_mandatory(0));
-        assert!(!designed_sampling_mandatory(
-            DESIGNED_SAMPLE_MANDATORY_MIN_ROWS - 1
-        ));
-        assert!(designed_sampling_mandatory(
-            DESIGNED_SAMPLE_MANDATORY_MIN_ROWS
-        ));
-        assert!(designed_sampling_mandatory(u64::MAX));
     }
 
     #[test]

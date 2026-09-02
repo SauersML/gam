@@ -53,7 +53,7 @@ pub use block_scoring_gpu::{DEVICE_BLOCK_GATE_MIN_ELEMS, route_blocks_required};
 pub use block_stream::{BlockEpochStats, BlockShardStats, BlockSparseStreamArtifact, BlockSparseStreamState};
 pub use codes::SparseCode;
 pub use cofit::{CofitConfig, CofitReport, CofitRound};
-pub use coordinate::{BlockCoordinateReport, BlockMeasureCoordinateReport, FiringCoordinate, MeasureSpikeCoordinate, MeasureValuedCode, block_route_firing_coordinates, harmonic_measure_coordinates, harmonic_route_firing_coordinates, recover_measure_from_code};
+pub use coordinate::{BlockCoordinateReport, BlockMeasureCoordinateReport, FiringCoordinate, MeasureSpikeCoordinate, MeasureValuedCode, block_route_firing_coordinates, harmonic_measure_coordinates, harmonic_route_firing_coordinates, recover_measure_from_code, block_firing_coordinates};
 pub use scoring::{ScoreRoutePath, ScoreRouteResult, ScoreRouteStats, TileScorer, top_s_online};
 #[cfg(target_os = "linux")]
 pub use scoring_gpu::{DEVICE_SCORE_BLOCK_MIN_ELEMS, ScoreBlockPath};

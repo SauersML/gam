@@ -17,13 +17,8 @@
 //!
 //! The moment-emitting path below is the numerical parity oracle.
 
-use crate::gpu_kernels::cubic_cell::{
-    CubicCellDerivativeMomentHostView, MAX_SUPPORTED_DEGREE,
-};
-
 #[cfg(test)]
 mod tests {
-    use super::validate_host_view;
     use crate::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_derivative_moments_uncached};
     use crate::gpu_kernels::cubic_cell::branch::classify_cell_for_gpu;
     use crate::gpu_kernels::cubic_cell::{

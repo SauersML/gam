@@ -19,10 +19,7 @@
 //! are sound, so a failure in the armed arm is attributable to the term.
 
 use gam_models::MultinomialFamily;
-use gam_models::custom_family::{
-    BlockwiseFitOptions, CustomFamily, PenaltyMatrix,
-    evaluate_labeled_outer_criterion_for_diagnostics,
-};
+use gam_models::custom_family::{BlockwiseFitOptions, CustomFamily, PenaltyMatrix};
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_problem::EvalMode;
 use ndarray::{Array1, Array2};

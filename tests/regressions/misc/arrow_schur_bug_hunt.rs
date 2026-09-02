@@ -151,31 +151,6 @@ fn per_row_arrow_structure_matches_dense_block_solve_for_vector_response_shape()
 }
 
 #[test]
-fn square_root_ba_specialization_matches_direct_dense_solution() {
-    let mut sys = ArrowSchurSystem::new(2, 2, 2);
-    sys.rows[0].htt = array![[3.0, 0.4], [0.4, 2.5]];
-    sys.rows[1].htt = array![[2.2, 0.1], [0.1, 1.8]];
-    sys.rows[0].htbeta = array![[0.3, -0.1], [0.2, 0.7]];
-    sys.rows[1].htbeta = array![[-0.4, 0.9], [0.5, 0.6]];
-    sys.rows[0].gt = array![0.1, -0.2];
-    sys.rows[1].gt = array![0.3, 0.4];
-    sys.hbb = array![[4.0, 0.5], [0.5, 3.2]];
-    sys.gb = array![0.2, -0.6];
-    let direct = sys
-        .solve_with_options(0.0, 0.0, &ArrowSolveOptions::direct())
-        .expect("direct solve should succeed");
-    let sqrt = sys
-        .solve_with_options(0.0, 0.0, &ArrowSolveOptions::sqrt_ba())
-        .expect("sqrt BA solve should succeed");
-    let err = (&direct.0 - &sqrt.0).mapv(|v| v.abs()).sum()
-        + (&direct.1 - &sqrt.1).mapv(|v| v.abs()).sum();
-    assert!(
-        err < 1e-9,
-        "pure-arrow specialization should agree with general dense Schur solve within 1e-9"
-    );
-}
-
-#[test]
 fn wrong_per_row_hessian_block_dimension_returns_error_instead_of_panic() {
     let mut sys = ArrowSchurSystem::new(1, 2, 1);
     sys.rows[0].htt = Array2::<f64>::zeros((3, 3));

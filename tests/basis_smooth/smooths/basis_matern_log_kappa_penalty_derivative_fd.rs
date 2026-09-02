@@ -15,10 +15,7 @@
 //! any single dial — and in particular the stiffness block's mixed-curvature
 //! scalar `t` whose wrong chain rule caused the stall — is caught and localized.
 
-use gam::terms::basis::{
-    CenterStrategy, MaternBasisSpec, MaternNu, build_matern_basis,
-    build_matern_basis_log_kappa_derivatives, build_matern_basis_log_kappasecond_derivative,
-};
+use gam::terms::basis::{CenterStrategy, MaternBasisSpec, MaternNu, build_matern_basis, build_matern_basis_log_kappa_derivatives};
 use ndarray::Array2;
 
 fn dataset() -> Array2<f64> {

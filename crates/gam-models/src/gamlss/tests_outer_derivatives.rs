@@ -6,10 +6,7 @@
 //! back upward on the model layer merely to exercise generic outer machinery.
 
 use super::*;
-use crate::custom_family::{
-    CustomFamilyHyperLayout, OuterCriterionDiagnostics,
-    evaluate_rho_outer_criterion_for_diagnostics,
-};
+use crate::custom_family::{CustomFamilyHyperLayout, OuterCriterionDiagnostics};
 use gam_test_support::binomial_location_scale_base_fixture;
 use ndarray::{Array1, Array2, array};
 
@@ -64,78 +61,6 @@ pub(crate) struct BinomialLocationScaleWiggleOuterFixture {
     pub(crate) specs: Vec<ParameterBlockSpec>,
     pub(crate) rho: Array1<f64>,
     pub(crate) options: BlockwiseFitOptions,
-}
-
-pub(crate) fn binomial_location_scale_wiggle_outer_fixture(
-) -> BinomialLocationScaleWiggleOuterFixture {
-    let base = binomial_location_scale_base_fixture();
-    let q_seed = Array1::linspace(-1.4, 1.4, base.n);
-    let knots =
-        gam_terms::basis::initializewiggle_knots_from_seed(q_seed.view(), 3, 4).expect("knots");
-    let wiggle_block =
-        crate::wiggle::buildwiggle_block_input_from_knots(q_seed.view(), &knots, 3, 2, false)
-            .expect("wiggle block");
-    let wigglespec = ParameterBlockSpec {
-        name: "wiggle".to_string(),
-        design: wiggle_block.design.clone(),
-        offset: wiggle_block.offset.clone(),
-        penalties: wiggle_block
-            .penalties
-            .iter()
-            .map(|ps| match ps {
-                gam_solve::model_types::PenaltySpec::Block {
-                    local, col_range, ..
-                } => PenaltyMatrix::Blockwise {
-                    local: local.clone(),
-                    col_range: col_range.clone(),
-                    total_dim: wiggle_block.design.ncols(),
-                },
-                gam_solve::model_types::PenaltySpec::Dense(m)
-                | gam_solve::model_types::PenaltySpec::DenseWithMean { matrix: m, .. } => {
-                    PenaltyMatrix::Dense(m.clone())
-                }
-            })
-            .collect(),
-        nullspace_dims: wiggle_block.nullspace_dims.clone(),
-        // Derived from the block, never hand-counted: the assembled warp
-        // penalty set gained a gauge-closure coordinate in gam#2647, and a
-        // literal `array![0.1]` here turned that into
-        // "block 2 initial_log_lambdas length 1 does not match penalties 2"
-        // rather than into a test that exercises the new topology.
-        initial_log_lambdas: Array1::from_elem(wiggle_block.penalties.len(), 0.1),
-        initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
-        gauge_priority: 100,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    };
-    let family = BinomialLocationScaleWiggleFamily {
-        y: base.y,
-        weights: base.weights,
-        link_kind: gam_problem::InverseLink::Standard(gam_problem::StandardLink::Probit),
-        threshold_design: Some(base.threshold_design),
-        log_sigma_design: Some(base.log_sigma_design),
-        wiggle_knots: knots,
-        wiggle_degree: 3,
-        policy: gam_runtime::resource::ResourcePolicy::default_library(),
-    };
-    BinomialLocationScaleWiggleOuterFixture {
-        family,
-        rho: {
-            // threshold, log-sigma, then one coordinate per assembled warp
-            // penalty (see the note on `initial_log_lambdas` above).
-            let mut rho = vec![0.05, -0.15];
-            rho.extend(std::iter::repeat_n(0.1, wigglespec.penalties.len()));
-            Array1::from_vec(rho)
-        },
-        specs: vec![base.threshold_spec, base.log_sigma_spec, wigglespec],
-        options: BlockwiseFitOptions {
-            use_remlobjective: true,
-            ridge_floor: 1e-10,
-            outer_max_iter: 1,
-            ..BlockwiseFitOptions::default()
-        },
-    }
 }
 
 #[test]

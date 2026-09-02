@@ -2,6 +2,7 @@
 //! low-rank weight, and the Woodbury capacitance assembly.
 
 use super::*;
+use gam_linalg::low_rank_weight::LowRankWeight;
 
 // - The diagonal part flows through `xt_diag_x_signed` / `xt_diag_x_psd`
 //   exactly as before. When `LowRankWeight::is_rank_zero()` the path is
@@ -176,10 +177,7 @@ pub fn dense_block_xtwy(
 
 #[cfg(test)]
 mod low_rank_weight_pirls_tests {
-    use super::{
-        DesignMatrix, LowRankWeight, PirlsWorkspace, compute_xtwx_low_rank, compute_xtwy_low_rank,
-        dense_block_xtwx, woodbury_gram_capacitance,
-    };
+    use super::{DesignMatrix, PirlsWorkspace, dense_block_xtwx};
     use gam_linalg::matrix::{FiniteSignedWeightsView, LinearOperator};
     use ndarray::{Array2, Array3, array, s};
 

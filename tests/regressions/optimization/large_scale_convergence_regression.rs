@@ -23,7 +23,7 @@
 // either a status mismatch, an inner-iter blowup to ~100, or a wall-clock
 // timeout — any of which fails the test.
 
-use gam::estimate::{FitOptions, fit_gam};
+use gam::estimate::FitOptions;
 use gam::pirls::PirlsStatus;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};

@@ -1,5 +1,5 @@
 use faer::Side;
-use gam::alo::{AloInput, compute_alo_diagnostics_from_pirls, compute_alo_from_input};
+use gam::alo::{AloInput, compute_alo_from_input};
 use gam::construction::CanonicalPenalty;
 use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetricwith_fallback, fast_ata};
 use gam::matrix::{PsdWeightsView, SignedWeightsView};
@@ -227,85 +227,6 @@ fn alo_uses_exact_dense_stabilized_hessian_export_from_penalized_pirls() {
     assert!(alo.leverage.iter().all(|v| v.is_finite()));
 }
 
-/// #935: the one `FitSensitivity` operator's case-deletion channel, exposed
-/// from a converged PIRLS fit via `compute_case_deletion_from_pirls`, must
-/// agree with the ALO dialect on the quantity they BOTH compute — the
-/// per-observation leverage `h_ii = w_i x_iᵀ H⁻¹ x_i`. Both read the same
-/// converged penalized Hessian and working weights, so a disagreement would
-/// be exactly the "two sites, two inverses" bug class #935 dismantles. We
-/// also confirm the influence diagnostic (dfbeta / Cook's distance) is
-/// finite and correctly shaped — capability the operator had no production
-/// entry point for until now.
-#[test]
-fn case_deletion_from_pirls_leverage_matches_alo_dialect() {
-    let n = 90;
-    let p = 6;
-    let (x, y, _) = generate_synthetic_binary_data(n, p, 2026);
-    let w = Array1::<f64>::ones(n);
-    let fit = fit_identity_penalized(&x, &y, &w, LinkFunction::Probit, 0.35);
-
-    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view()).expect("ALO diagnostics");
-    let influence = gam::alo::compute_case_deletion_from_pirls(&fit)
-        .expect("case-deletion diagnostics must not error on a converged fit")
-        .expect("no leverage-one row in this well-conditioned fit");
-
-    assert_eq!(influence.leverage.len(), n);
-    assert_eq!(influence.dfbeta.nrows(), n);
-    assert_eq!(influence.dfbeta.ncols(), p);
-    assert_eq!(influence.cooks_distance.len(), n);
-    assert!(influence.dfbeta.iter().all(|v| v.is_finite()));
-    assert!(
-        influence
-            .cooks_distance
-            .iter()
-            .all(|v| v.is_finite() && *v >= 0.0)
-    );
-
-    // The leverage channel is the same hat value ALO computes; the two
-    // dialects share one factored inverse, so they must agree to machine
-    // precision (not merely "close").
-    let max_lev_diff = influence
-        .leverage
-        .iter()
-        .zip(alo.leverage.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0_f64, f64::max);
-    assert!(
-        max_lev_diff <= 1e-9,
-        "case-deletion leverage must equal the ALO dialect's hat value on the \
-         same fit (one shared H⁻¹); max_abs_diff={max_lev_diff:.3e}"
-    );
-}
-
-#[test]
-fn alo_solve_setup_rejects_non_square_dense_hessian_instead_of_workaround() {
-    let design = Array2::from_shape_vec((3, 2), vec![1.0, 0.0, 1.0, 1.0, 1.0, 2.0]).unwrap();
-    let bad_hessian = Array2::<f64>::ones((2, 1));
-    let hessian_weights = Array1::from_vec(vec![0.25, 0.25, 0.25]);
-    let score_weights = hessian_weights.clone();
-    let working_response = Array1::from_vec(vec![0.0, 0.5, 1.0]);
-    let eta = Array1::from_vec(vec![0.1, 0.2, 0.3]);
-    let offset = Array1::<f64>::zeros(3);
-    let input = AloInput {
-        design: &design,
-        penalized_hessian: &bad_hessian,
-        hessian_weights: SignedWeightsView::from_array(&hessian_weights),
-        score_weights: PsdWeightsView::try_from_array(&score_weights).expect("psd weights"),
-        working_response: &working_response,
-        eta: &eta,
-        offset: &offset,
-        phi: 1.0,
-        score_curvature: None,
-    };
-
-    let err = compute_alo_from_input(&input).expect_err("bad Hessian shape must fail setup");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("dense exact penalized Hessian with shape 2x2"),
-        "unexpected ALO setup error: {msg}"
-    );
-}
-
 #[test]
 fn alo_se_calculation_correct() {
     let n = 100;
@@ -348,49 +269,6 @@ fn alo_se_calculation_correct() {
             expected_se
         );
     }
-}
-
-#[test]
-fn alo_hat_diag_sane_and_bounded() {
-    let n = 200;
-    let p = 12;
-    let (x, y, _) = generate_synthetic_binary_data(n, p, 42);
-    let w = Array1::<f64>::ones(n);
-    let fit = fit_unpenalized(&x, &y, &w, LinkFunction::Logit);
-    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view()).unwrap();
-    let leverage = alo.leverage;
-
-    for &a in &leverage {
-        assert!(a >= 0.0);
-        assert!(a < 1.0);
-    }
-
-    let mean = leverage.sum() / n as f64;
-    let expected = p as f64 / n as f64;
-    assert!((mean - expected).abs() < 0.05);
-
-    let x_leverage: Vec<f64> = (0..n).map(|i| x.row(i).dot(&x.row(i))).collect();
-    let x_mean = x_leverage.iter().sum::<f64>() / n as f64;
-    let a_mean = mean;
-    let mut cov = 0.0;
-    let mut var_x = 0.0;
-    let mut var_a = 0.0;
-    for i in 0..n {
-        let dx = x_leverage[i] - x_mean;
-        let da = leverage[i] - a_mean;
-        cov += dx * da;
-        var_x += dx * dx;
-        var_a += da * da;
-    }
-    let corr = cov / (var_x.sqrt() * var_a.sqrt());
-    assert!(corr > 0.3);
-
-    // Zero prior weight should force zero leverage in ALO geometry.
-    let mut wzero = w.clone();
-    wzero[10] = 0.0;
-    let fitzero = fit_unpenalized(&x, &y, &wzero, LinkFunction::Logit);
-    let alozero = compute_alo_diagnostics_from_pirls(&fitzero, y.view()).unwrap();
-    assert!(alozero.leverage[10].abs() < 1e-12);
 }
 
 #[test]

@@ -701,7 +701,6 @@ mod host_budget_is_stationary_tests {
     //! the fit, not of the call site. Two invariants, one test each:
     //! it costs no probes, and it does not move.
     use super::*;
-    use gam_runtime::resource::memory_availability_probe_count;
 
     /// The number of budget lookups a single row-jet sweep of a modest fit
     /// performs (one per window over a few thousand rows, times the

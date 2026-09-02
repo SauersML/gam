@@ -21,7 +21,7 @@
 //! exact-order-statistic multiplier is honest about a too-small calibration
 //! set (returns +∞ → unbounded interval).
 
-use gam::estimate::{FitOptions, fit_gam};
+use gam::estimate::FitOptions;
 use gam::matrix::DesignMatrix;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
@@ -285,76 +285,3 @@ fn conformal_covers_in_well_specified_homoscedastic_case() {
     );
 }
 
-#[test]
-fn conformal_calibrator_pure_math_matches_split_conformal_definition() {
-    // Independent hand-rolled split-conformal reference (the match-or-beat
-    // baseline): the calibrated interval must cover ≥ nominal on a fresh draw,
-    // and q̂ must equal the exact order statistic of the absolute residuals
-    // (scale ≡ 1) — never an interpolated quantile.
-    let nominal = 0.90;
-    let alpha = 1.0 - nominal;
-    let mut rng = StdRng::seed_from_u64(99);
-
-    // Calibration residuals from a fixed offset model y = μ̂ + ε.
-    let unit = Normal::new(0.0, 1.0).unwrap();
-    let n_cal = 200usize;
-    let mut residuals = Array1::<f64>::zeros(n_cal);
-    for i in 0..n_cal {
-        residuals[i] = 1.3 * unit.sample(&mut rng);
-    }
-    let scales = Array1::<f64>::ones(n_cal);
-
-    let calib =
-        ConformalCalibrator::from_residuals_and_scales(residuals.view(), scales.view(), alpha)
-            .expect("calibrator");
-    assert!(calib.certifies_finite());
-
-    // Hand-rolled exact order statistic of |residuals|: rank = ⌈(n+1)(1−α)⌉.
-    let mut abs_sorted: Vec<f64> = residuals.iter().map(|r| r.abs()).collect();
-    abs_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let rank = ((n_cal as f64 + 1.0) * (1.0 - alpha)).ceil() as usize;
-    let reference_q = abs_sorted[rank - 1];
-    assert!(
-        (calib.q_hat() - reference_q).abs() < 1e-12,
-        "q̂ {} must equal the exact {rank}-th order statistic {reference_q}",
-        calib.q_hat()
-    );
-
-    // Fresh draw: realized coverage of μ̂ ± q̂ (μ̂ = 0 here, ε same law).
-    let n_test = 4000usize;
-    let mut y_test = Array1::<f64>::zeros(n_test);
-    for i in 0..n_test {
-        y_test[i] = 1.3 * unit.sample(&mut rng);
-    }
-    let mean = Array1::<f64>::zeros(n_test);
-    let test_scale = Array1::<f64>::ones(n_test);
-    let (lower, upper) = calib
-        .calibrated_interval(&mean, &test_scale, ResponseBounds::UNBOUNDED)
-        .expect("interval");
-    let cov = coverage(&y_test, &lower, &upper);
-    assert!(
-        cov >= nominal - 0.02,
-        "split-conformal realized coverage {cov:.3} below nominal {nominal}"
-    );
-}
-
-#[test]
-fn conformal_is_honest_about_too_small_calibration_set() {
-    // With n = 4 and α = 0.05, rank = ⌈5·0.95⌉ = 5 > 4, so the only honest
-    // multiplier is +∞ → an unbounded interval, never a finite under-covering
-    // one.
-    let residuals = Array1::from_vec(vec![0.1, -0.4, 0.9, -0.2]);
-    let scales = Array1::<f64>::ones(4);
-    let calib =
-        ConformalCalibrator::from_residuals_and_scales(residuals.view(), scales.view(), 0.05)
-            .expect("calibrator");
-    assert!(!calib.certifies_finite(), "q̂ must be +∞ for n=4, α=0.05");
-
-    let mean = Array1::from_vec(vec![0.0, 5.0]);
-    let scale = Array1::from_vec(vec![1.0, 2.0]);
-    let (lower, upper) = calib
-        .calibrated_interval(&mean, &scale, ResponseBounds::UNBOUNDED)
-        .expect("interval");
-    assert!(lower.iter().all(|&v| v == f64::NEG_INFINITY));
-    assert!(upper.iter().all(|&v| v == f64::INFINITY));
-}

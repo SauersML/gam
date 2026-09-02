@@ -28,7 +28,7 @@
 // test for the per-iter soft-acceptance and seed-screening fixes; the
 // gradient-only routing has its own unit tests in `outer_strategy.rs`.
 
-use gam::estimate::{FitOptions, fit_gam};
+use gam::estimate::FitOptions;
 use gam::pirls::PirlsStatus;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};

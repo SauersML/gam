@@ -41,10 +41,7 @@
 use gam::families::bms::{
     ConditionalScoreCovariance, ScoreCovarianceField, marginal_slope_covariance_from_scores,
 };
-use gam::families::survival::marginal_slope::{
-    RigidVectorValueWorkspace, survival_marginal_slope_vector_eta,
-    survival_marginal_slope_vector_neglog,
-};
+use gam::families::survival::marginal_slope::{RigidVectorValueWorkspace, survival_marginal_slope_vector_neglog};
 use gam::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 

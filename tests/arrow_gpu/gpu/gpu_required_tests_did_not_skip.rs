@@ -41,7 +41,7 @@
 //! count. That step does not exist yet and is the remaining work on #2422; this
 //! test is what can be enforced from inside the process.
 
-use gam::gpu::test_gate::{GpuTestGate, gpu_for_test, skipped_for_absent_device};
+use gam::gpu::test_gate::GpuTestGate;
 
 #[test]
 fn gpu_required_tests_did_not_skip() {

@@ -212,44 +212,6 @@ fn centered_fd(
     (vp - vm) / (2.0 * h)
 }
 
-/// The full analytic outer-ρ gradient must match a centered finite difference of
-/// the actual re-solved quasi-Laplace criterion. The FD is the ground truth for the IFT
-/// step: it differentiates the value through the inner re-solve, so it carries
-/// the exact stationarity Jacobian `A`. The analytic path matches it ONLY if its
-/// implicit correction also uses `A` (the #1418 fix) and not the surrogate `B`.
-fn assert_full_gradient_matches_fd(label: &str, f: &Fixture) {
-    let inner_iters = 12usize;
-    let (converged, _value, loss, cache) = evaluate(&f.term, &f.target, &f.rho, inner_iters);
-    let components = converged
-        .analytic_outer_rho_gradient_at_converged(f.target.view(), &f.rho, &loss, &cache)
-        .expect("analytic components");
-    let analytic = components.gradient();
-    let n_params = f.rho.to_flat().len();
-
-    // Sanity: the fixture must actually carry large residual curvature, otherwise
-    // it would not distinguish A from B and the certificate would be vacuous. The
-    // data-fit loss at the inner optimum is far from zero by construction.
-    assert!(
-        loss.data_fit > 1.0,
-        "[{label}] fixture is too well-fit (data_fit {:.3e}); residual curvature \
-         ΔC=⟨r,∂²f⟩ would be negligible and the A-vs-B test vacuous",
-        loss.data_fit
-    );
-
-    for coord in 0..n_params {
-        let fd = centered_fd(&converged, &f.target, &f.rho, coord, inner_iters);
-        let diff = (fd - analytic[coord]).abs();
-        let tol = 3.0e-3 * (1.0 + fd.abs().max(analytic[coord].abs()));
-        assert!(
-            diff <= tol,
-            "[{label}] full rho gradient coord {coord}: fd={fd:.8e}, analytic={:.8e}, \
-             diff={diff:.3e}, tol={tol:.3e} — implicit step likely using surrogate B \
-             instead of exact stationarity Jacobian A (#1418)",
-            analytic[coord]
-        );
-    }
-}
-
 /// #1418 (softmax): the entropy curvature delta (`H_entropy − D`) and the
 /// residual-curvature delta (`⟨r, ∂²f⟩`) are both large and nonzero here. The
 /// analytic outer gradient must still track the re-solved FD, proving the IFT

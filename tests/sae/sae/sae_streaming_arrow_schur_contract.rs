@@ -32,10 +32,8 @@
 
 use ndarray::{Array1, Array2, Array3, s};
 
-use gam::solver::arrow_schur::{
-    ArrowSchurSystem, ArrowSolveOptions, StreamingArrowSchur, solve_streaming_reduced_beta,
-};
-use gam::solver::gpu_kernels::arrow_schur::{ArrowSchurGpuFailure, solve_reduced_beta_pcg};
+use gam::solver::arrow_schur::{ArrowSchurSystem, ArrowSolveOptions, StreamingArrowSchur};
+use gam::solver::gpu_kernels::arrow_schur::ArrowSchurGpuFailure;
 use gam::terms::{
     sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
     sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
@@ -126,58 +124,6 @@ fn build_term(
         .collect();
     let rho = SaeManifoldRho::new(0.0, -4.0, log_ard);
     (term, target, rho)
-}
-
-/// Reduce an Arrow-Schur system into `(S, rhs)` by streaming the rows in
-/// `chunk_size`-row chunks, mirroring `SaeManifoldTerm::run_joint_fit_arrow_schur_streaming`'s
-/// per-chunk accumulation: seed `S` with `H_ββ` once (no per-chunk ridge),
-/// accumulate the per-row reduction across all chunks, then fold the global
-/// β-ridge in exactly once.
-fn reduce_in_chunks(
-    sys: &ArrowSchurSystem,
-    chunk_size: usize,
-    ridge_t: f64,
-    ridge_beta: f64,
-    options: &ArrowSolveOptions,
-) -> (Array2<f64>, Array1<f64>) {
-    let k = sys.k;
-    let n = sys.rows.len();
-    let mut s_acc = Array2::<f64>::zeros((k, k));
-    let mut rhs_acc = Array1::<f64>::zeros(k);
-    let mut start = 0usize;
-    while start < n {
-        let end = (start + chunk_size).min(n);
-        let mut streaming = StreamingArrowSchur::from_system(sys, (end - start).max(1));
-        streaming
-            .reset_accumulator(0.0)
-            .unwrap_or_else(|e| panic!("reset_accumulator failed: {e}"));
-        streaming
-            .accumulate_chunk(start, end, ridge_t, options.mode)
-            .unwrap_or_else(|e| panic!("accumulate_chunk failed: {e}"));
-        let (contrib_s, contrib_rhs) = streaming.take_accumulators();
-        // `contrib_s` is `H_ββ − Σ_{i∈chunk} reduction`; subtracting the
-        // shared `H_ββ` once per chunk and adding it back a single time below
-        // reconstructs `H_ββ − Σ_all reduction` exactly. We accumulate the
-        // per-chunk reductions by tracking the delta from the seeded `H_ββ`.
-        for i in 0..k {
-            rhs_acc[i] += contrib_rhs[i];
-            for j in 0..k {
-                s_acc[[i, j]] += contrib_s[[i, j]];
-            }
-        }
-        start = end;
-    }
-    // Each chunk re-seeded `S` with the full `H_ββ`; collapse the redundant
-    // seedings so a single `H_ββ` remains, then add the global β ridge once.
-    let n_chunks = n.div_ceil(chunk_size).max(1);
-    let hbb = sys.effective_penalty_op().to_dense();
-    for i in 0..k {
-        for j in 0..k {
-            s_acc[[i, j]] -= (n_chunks as f64 - 1.0) * hbb[[i, j]];
-        }
-        s_acc[[i, i]] += ridge_beta;
-    }
-    (s_acc, rhs_acc)
 }
 
 // ---------------------------------------------------------------------------
@@ -406,58 +352,3 @@ fn gpu_reduced_beta_solve_matches_cpu_when_available() {
 // end-to-end. A genuine chunking bug (e.g. a mis-scaled minibatch penalty, a
 // dropped per-chunk contribution, or per-chunk ridge double-counting) breaks
 // the invariance by O(1), far above float-reordering noise.
-#[test]
-fn streaming_full_fit_is_chunk_size_invariant() {
-    let (k, m, d, n, p) = (4usize, 4usize, 1usize, 36usize, 2usize);
-
-    // Deterministic per-row seed (logits, coords) + targets, generated once and
-    // sliced identically for every chunking. The driver re-seeds from this each
-    // pass, so it fully determines the fit independent of any resident state.
-    let mut rng = 0xA11CE_u64;
-    let full_logits = Array2::<f64>::from_shape_fn((n, k), |_| 0.4 * lcg_f64(&mut rng));
-    let full_coords: Vec<Array2<f64>> = (0..k)
-        .map(|_| Array2::<f64>::from_shape_fn((n, d), |_| 0.3 * lcg_f64(&mut rng)))
-        .collect();
-    let full_target = Array2::<f64>::from_shape_fn((n, p), |_| lcg_f64(&mut rng));
-
-    let fit_with_chunk = |chunk_size: usize| -> Array1<f64> {
-        // Rebuild an identical term (deterministic seed) for each fit, so only
-        // the chunking differs between runs.
-        let (mut term, _t, mut rho) =
-            build_term(k, m, d, n, p, AssignmentMode::softmax(1.0), k, 0x5EED_99);
-        let logits = full_logits.clone();
-        let coords = full_coords.clone();
-        let z_full = full_target.clone();
-        let seeder = move |start: usize, end: usize| {
-            let lg = logits.slice(s![start..end, ..]).to_owned();
-            let cd: Vec<Array2<f64>> = coords
-                .iter()
-                .map(|c| c.slice(s![start..end, ..]).to_owned())
-                .collect();
-            let z = z_full.slice(s![start..end, ..]).to_owned();
-            Ok::<_, String>((lg, cd, z))
-        };
-        term.run_joint_fit_arrow_schur_streaming(
-            n, chunk_size, &mut rho, None, 2, 1.0, 1e-4, 1e-4, seeder,
-        )
-        .unwrap_or_else(|e| panic!("streaming fit (chunk_size={chunk_size}) failed: {e}"));
-        term.flatten_beta()
-    };
-
-    let beta_one_chunk = fit_with_chunk(n);
-    assert!(
-        beta_one_chunk.iter().all(|v| v.is_finite()),
-        "single-chunk streaming fit produced non-finite decoder β"
-    );
-    for chunk_size in [7usize, 13, 25] {
-        let beta_chunked = fit_with_chunk(chunk_size);
-        let mut max_dev = 0.0_f64;
-        for (a, b) in beta_one_chunk.iter().zip(beta_chunked.iter()) {
-            max_dev = max_dev.max((a - b).abs());
-        }
-        assert!(
-            max_dev < 1e-6,
-            "streaming fit decoder β depends on chunk_size={chunk_size}: max|Δβ|={max_dev:.3e}"
-        );
-    }
-}

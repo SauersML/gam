@@ -588,41 +588,6 @@ mod tests {
     };
     use ndarray::array;
 
-    /// Regression guard for #1566: `no_densify_design` must live in `gam-linalg`
-    /// (the crate that owns the operator traits) and yield an operator-backed
-    /// design that services the lazy paths without ever materializing. If the
-    /// fixture is dropped or moved back out of this crate, this test stops
-    /// compiling in the very lib-test phase the issue was about.
-    #[test]
-    fn no_densify_design_is_operator_backed_and_stays_lazy() {
-        let design = no_densify_design(array![[1.0, 2.0], [3.0, 4.0]]);
-        assert!(design.as_dense_ref().is_none(), "must not be materialized");
-        assert!(!design.is_materialized_dense());
-        assert!(design.is_operator_backed());
-        assert_eq!(design.nrows(), 2);
-        assert_eq!(design.ncols(), 2);
-
-        // Operator-aware paths still work: y = X·β and lazy row chunks.
-        let beta = array![1.0, -1.0];
-        let got = design.dot(&beta);
-        assert!((got[0] - (-1.0)).abs() < 1e-12); // 1·1 + 2·(-1)
-        assert!((got[1] - (-1.0)).abs() < 1e-12); // 3·1 + 4·(-1)
-        let chunk = design
-            .try_row_chunk(0..2)
-            .expect("row chunk must stay lazy, not densify");
-        assert_eq!(chunk, array![[1.0, 2.0], [3.0, 4.0]]);
-    }
-
-    /// The whole point of the fixture: any code path that tries to collapse it to
-    /// a dense matrix trips a hard panic, turning a silent densification
-    /// regression into a test failure.
-    #[test]
-    #[should_panic(expected = "operator-backed design")]
-    fn no_densify_design_rejects_materialization() {
-        let design = no_densify_design(array![[1.0, 2.0], [3.0, 4.0]]);
-        design.as_dense_cow();
-    }
-
     #[test]
     fn paired_holdout_is_exact_reproducible_and_partitioned() {
         let first = paired_holdout_partition(221, 0.20, 17);

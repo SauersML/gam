@@ -106,26 +106,6 @@ fn forward_design(data: ArrayView2<'_, f64>, spec: &DuchonBasisSpec) -> Array2<f
         .to_dense()
 }
 
-fn analytic_first(data: ArrayView2<'_, f64>, spec: &DuchonBasisSpec) -> Array2<f64> {
-    let bundle = build_duchon_basis_log_kappa_derivatives(data, spec).expect("ψ-derivative bundle");
-    bundle
-        .implicit_operator
-        .as_ref()
-        .expect("hybrid Duchon design derivatives are operator-backed")
-        .materialize_first(0)
-        .expect("materialize ∂X/∂ψ")
-}
-
-fn analytic_second(data: ArrayView2<'_, f64>, spec: &DuchonBasisSpec) -> Array2<f64> {
-    let bundle = build_duchon_basis_log_kappa_derivatives(data, spec).expect("ψ-derivative bundle");
-    bundle
-        .implicit_operator
-        .as_ref()
-        .expect("hybrid Duchon design derivatives are operator-backed")
-        .materialize_second_diag(0)
-        .expect("materialize ∂²X/∂ψ²")
-}
-
 fn frobenius(m: &Array2<f64>) -> f64 {
     m.iter().map(|v| v * v).sum::<f64>().sqrt()
 }

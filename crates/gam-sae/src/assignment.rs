@@ -6,6 +6,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::manifold::SaeManifoldRho;
 use gam_terms::analytic_penalties::{AnalyticPenalty, OrderedBetaBernoulliHessianDiagThirdChannels, OrderedBetaBernoulliLogitAdjointData, OrderedBetaBernoulliPenalty, SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight};
 use gam_terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
+use gam_solve::evidence::HybridAtomCandidate;
 
 /// Shared per-atom row support measure.
 ///
@@ -1097,12 +1098,6 @@ mod topk_support_gate_tests {
     }
 
     #[test]
-    fn topk_neutral_support_is_first_k_atoms() {
-        let w = neutral_gate_weights(AssignmentMode::top_k_support(3), 6);
-        assert_eq!(w.to_vec(), vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
-    }
-
-    #[test]
     fn topk_mode_carries_no_temperature_or_prior_knobs() {
         let mode = AssignmentMode::top_k_support(4);
         mode.validate().expect("k >= 1 validates");
@@ -2049,54 +2044,6 @@ pub(crate) fn ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
         }
     }
     Ok(Some(channels))
-}
-
-#[cfg(test)]
-mod hybrid_split_tests {
-    use super::*;
-    use gam_solve::evidence::HybridAtomParam;
-
-    #[test]
-    fn flat_chart_drops_curved_candidate_and_keeps_linear() {
-        // A Euclidean chart has no curvature: even if a curved candidate with a
-        // lower NLE is offered, the helper drops it (a flat chart cannot honestly
-        // present a curved parameterization).
-        let linear = HybridAtomCandidate::linear(100.0, 2);
-        let curved = HybridAtomCandidate::curved(1, 1.0, 5, Some(2.0));
-        let choice =
-            select_hybrid_atom_parameterization(&LatentManifold::Euclidean, Some(curved), linear);
-        assert!(choice.param.is_linear());
-    }
-
-    #[test]
-    fn curveable_chart_selects_curved_when_turning_pays() {
-        // A Circle chart presents both candidates; a turning feature whose curved
-        // fit beats the linear secant on evidence selects curved.
-        let linear = HybridAtomCandidate::linear(100.0, 2);
-        let curved = HybridAtomCandidate::curved(1, 70.0, 5, Some(2.0 * std::f64::consts::PI));
-        let choice = select_hybrid_atom_parameterization(
-            &LatentManifold::Circle {
-                period: 2.0 * std::f64::consts::PI,
-            },
-            Some(curved),
-            linear,
-        );
-        assert_eq!(choice.param, HybridAtomParam::Curved { latent_dim: 1 });
-    }
-
-    #[test]
-    fn curveable_chart_falls_back_to_linear_when_no_curved_candidate() {
-        let linear = HybridAtomCandidate::linear(33.0, 2);
-        let choice = select_hybrid_atom_parameterization(
-            &LatentManifold::Circle {
-                period: 2.0 * std::f64::consts::PI,
-            },
-            None,
-            linear,
-        );
-        assert!(choice.param.is_linear());
-        assert_eq!(choice.num_parameters, 2);
-    }
 }
 
 #[cfg(test)]

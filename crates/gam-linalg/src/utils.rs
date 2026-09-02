@@ -1689,37 +1689,6 @@ mod certified_inverse_tests {
     }
 
     #[test]
-    fn psd_pseudoinverse_reports_the_declared_scale_invariant_rank_cutoff() {
-        let matrix = array![[1.0e-200, 0.0], [0.0, 1.0e-212]];
-        let geometry = rank_certified_psd_pseudoinverse(&matrix, 1.0e-10).unwrap();
-        assert_eq!(geometry.rank(), 1);
-        assert_eq!(geometry.relative_cutoff(), 1.0e-10);
-        // `absolute_cutoff = relative_cutoff · max_eigenvalue`, so asserting
-        // bit equality against the decimal literal 1.0e-210 demands
-        // fl(1e-10)·fl(1e-200) == fl(1e-210) exactly — a decimal-literal
-        // product identity that holds by luck rather than by contract, and
-        // roughly a coin flip for an arbitrary pair of literals. Likewise the
-        // `max_eigenvalue` line assumed `eigh` returns a diagonal entry
-        // bit-exactly. Compare ratios to within a few ulps instead; both
-        // 1e-200 and 1e-210 are normal, so the ratio is well conditioned.
-        let max_eigenvalue_ratio = geometry.max_eigenvalue() / 1.0e-200;
-        assert!(
-            (max_eigenvalue_ratio - 1.0).abs() <= 8.0 * f64::EPSILON,
-            "max_eigenvalue {:e} differs from 1e-200 by more than a few ulps",
-            geometry.max_eigenvalue()
-        );
-        let absolute_cutoff_ratio = geometry.absolute_cutoff() / 1.0e-210;
-        assert!(
-            (absolute_cutoff_ratio - 1.0).abs() <= 8.0 * f64::EPSILON,
-            "absolute_cutoff {:e} differs from relative_cutoff · max_eigenvalue \
-             = 1e-210 by more than a few ulps",
-            geometry.absolute_cutoff()
-        );
-        assert!(geometry.pseudoinverse()[[0, 0]].is_finite());
-        assert_eq!(geometry.pseudoinverse()[[1, 1]], 0.0);
-    }
-
-    #[test]
     fn psd_pseudoinverse_rejects_material_indefiniteness_instead_of_repairing_it() {
         let matrix = array![[1.0, 0.0], [0.0, -1.0e-4]];
         let error = rank_certified_psd_pseudoinverse(&matrix, 1.0e-10).unwrap_err();

@@ -1,9 +1,6 @@
 use faer::Side;
 use gam::faer_ndarray::FaerCholesky;
-use gam::inference::functionals::{
-    GaussianIdentityAverageDerivativeInput, average_derivative_gaussian_identity,
-    penalty_times_beta,
-};
+use gam::inference::functionals::GaussianIdentityAverageDerivativeInput;
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
     BasisMetadata, OneDimensionalBoundary, PenaltySource, build_bspline_basis_1d,

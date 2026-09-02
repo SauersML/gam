@@ -29,10 +29,7 @@
 
 use super::*;
 use crate::tests::{OneBlockGaussianFamily, test_design_hyper_layout};
-use gam_solve::rho_optimizer::soft_rho_guard_floor::{
-    ABSENCE_MAGNITUDE_FRACTION, GuardLadderRung, SATURATED_RHO_LADDER, SoftRhoGuardFloor,
-    classify_soft_rho_guard_floor, soft_rho_guard_emission_at,
-};
+use gam_solve::rho_optimizer::soft_rho_guard_floor::{ABSENCE_MAGNITUDE_FRACTION, GuardLadderRung, SATURATED_RHO_LADDER, SoftRhoGuardFloor};
 use ndarray::{Array1, Array2};
 
 /// A Gaussian one-block fixture with a real λ→∞ face: an unpenalized intercept

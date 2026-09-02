@@ -14,10 +14,7 @@
 //! The named invariants are solver-correctness properties, so a faithful test
 //! DISPROVES the historical "bug" by passing.
 
-use gam::estimate::{
-    ExternalOptimOptions, FitOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
-    fit_gam,
-};
+use gam::estimate::{ExternalOptimOptions, FitOptions, evaluate_externalcost_andridge, evaluate_externalgradient};
 use gam::smooth::BlockwisePenalty;
 use gam::solver::estimate::reml::reml_outer_engine::{
     DenseSpectralOperator, DispersionHandling, HessianFactorization, InnerSolutionBuilder,

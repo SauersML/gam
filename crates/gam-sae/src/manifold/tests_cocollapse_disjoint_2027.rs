@@ -73,59 +73,6 @@ fn two_circle_whitened_target(n: usize, p: usize, sigma: f64) -> Array2<f64> {
     z
 }
 
-/// Build a fresh K=2 periodic term seeded (production PCA seed) from the whitened
-/// two-circle target, decoders cold at zero.
-fn two_circle_k2_term(n: usize, p: usize, m: usize) -> (SaeManifoldTerm, Array2<f64>) {
-    let d = 1usize;
-    let k = 2usize;
-    let target = two_circle_whitened_target(n, p, 0.05);
-    let basis_kinds = vec![SaeAtomBasisKind::Periodic; k];
-    let dims = vec![d; k];
-    let seed = sae_pca_seed_initial_coords(target.view(), &basis_kinds, &dims)
-        .expect("the PCA seed covers every declared atom basis kind and dim");
-    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m)
-        .expect("a periodic harmonic evaluator exists for this odd basis count"));
-
-    let mut basis_values = Array3::<f64>::zeros((k, n, m));
-    let mut basis_jacobian = Array4::<f64>::zeros((k, n, m, d));
-    let decoder = Array3::<f64>::zeros((k, m, p));
-    let mut penalties = Array3::<f64>::zeros((k, m, m));
-    let mut coords_vec: Vec<Array2<f64>> = Vec::new();
-    for atom in 0..k {
-        let coords = seed.slice(s![atom, .., 0..d]).to_owned();
-        let (phi, jet) = evaluator.evaluate(coords.view())
-            .expect("the periodic evaluator accepts the seeded coordinate block");
-        basis_values.slice_mut(s![atom, .., ..]).assign(&phi);
-        basis_jacobian.slice_mut(s![atom, .., .., ..]).assign(&jet);
-        penalties
-            .slice_mut(s![atom, .., ..])
-            .assign(&Array2::<f64>::eye(m));
-        coords_vec.push(coords);
-    }
-    let logits = Array2::<f64>::zeros((n, k));
-    let mut evaluators: Vec<Option<Arc<dyn SaeBasisSecondJet>>> = Vec::new();
-    for _ in 0..k {
-        evaluators.push(Some(evaluator.clone()));
-    }
-    let term = term_from_padded_blocks_with_mode(
-        n,
-        p,
-        &basis_kinds,
-        basis_values.view(),
-        basis_jacobian.view(),
-        &vec![m; k],
-        &dims,
-        decoder.view(),
-        penalties.view(),
-        logits.view(),
-        &coords_vec,
-        AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
-        &evaluators,
-    )
-    .expect("the fixture assignment blocks match the declared mode");
-    (term, target)
-}
-
 /// The K=2 whitened two-circle fit must recover a materially positive
 /// reconstruction EV — the concrete bar this test asserts is `EV > 0.20`. Two disjoint
 /// circles together span a rank-4 subspace of the whitened cloud, so an honest K=2
@@ -377,72 +324,6 @@ pub(crate) fn structural_coherence_detector_fires_on_duplicate_not_orthogonal_20
     );
 }
 
-/// #2132 #2b — build a K=3 periodic term whose three atoms ALL decode into the
-/// SAME 2-D output plane (the first-harmonic sin/cos map onto output columns 0
-/// and 1 of a `p`-dim output), so the union output-frame rank `R = 2 < K = 3`
-/// and the dictionary is OVERCOMPLETE. `duplicate = true` makes atoms 0 and 1 a
-/// TRUE duplicate (identical decoder AND identical chart/phase) with atom 2 on a
-/// distinct phase; `duplicate = false` gives all three DISTINCT phases (identical
-/// decoder, different charts) — benign pigeonhole sharing.
-fn overcomplete_k3_planar_term(n: usize, p: usize, m: usize, duplicate: bool) -> SaeManifoldTerm {
-    let d = 1usize;
-    let k = 3usize;
-    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m)
-        .expect("a periodic harmonic evaluator exists for this odd basis count"));
-    let mut basis_values = Array3::<f64>::zeros((k, n, m));
-    let mut basis_jacobian = Array4::<f64>::zeros((k, n, m, d));
-    let mut decoder = Array3::<f64>::zeros((k, m, p));
-    let mut penalties = Array3::<f64>::zeros((k, m, m));
-    let mut coords_vec: Vec<Array2<f64>> = Vec::new();
-    for atom in 0..k {
-        // atoms 0,1 share phase 0 when duplicating (atom 2 shifted); otherwise all
-        // three phases are distinct.
-        let phase = if duplicate {
-            if atom == 2 { 1.0 / 3.0 } else { 0.0 }
-        } else {
-            atom as f64 / k as f64
-        };
-        let mut coords = Array2::<f64>::zeros((n, d));
-        for row in 0..n {
-            coords[[row, 0]] = ((row as f64) / (n as f64) + phase).rem_euclid(1.0);
-        }
-        let (phi, jet) = evaluator.evaluate(coords.view())
-            .expect("the periodic evaluator accepts the seeded coordinate block");
-        basis_values.slice_mut(s![atom, .., ..]).assign(&phi);
-        basis_jacobian.slice_mut(s![atom, .., .., ..]).assign(&jet);
-        penalties
-            .slice_mut(s![atom, .., ..])
-            .assign(&Array2::<f64>::eye(m));
-        // Every atom decodes the first harmonic into the (e0, e1) output plane
-        // (sin → col 0, cos → col 1), so all three output frames span the same
-        // 2-D subspace ⇒ union rank 2 < k = 3 (overcomplete).
-        decoder[[atom, 1, 0]] = 1.0;
-        decoder[[atom, 2, 1]] = 1.0;
-        coords_vec.push(coords);
-    }
-    let logits = Array2::<f64>::zeros((n, k));
-    let mut evaluators: Vec<Option<Arc<dyn SaeBasisSecondJet>>> = Vec::new();
-    for _ in 0..k {
-        evaluators.push(Some(evaluator.clone()));
-    }
-    term_from_padded_blocks_with_mode(
-        n,
-        p,
-        &vec![SaeAtomBasisKind::Periodic; k],
-        basis_values.view(),
-        basis_jacobian.view(),
-        &vec![m; k],
-        &vec![d; k],
-        decoder.view(),
-        penalties.view(),
-        logits.view(),
-        &coords_vec,
-        AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
-        &evaluators,
-    )
-    .expect("the fixture assignment blocks match the declared mode")
-}
-
 /// #2132 #2b — an OVERCOMPLETE (`K > R`) true duplicate must be detected. The old
 /// union-frame-rank gate returned NO collapsed pairs whenever `K > R`, which
 /// DISABLED the detector exactly in the overcomplete regime where duplicates are
@@ -509,59 +390,6 @@ fn two_amplitude_circle_target(n: usize, amp_b: f64) -> Array2<f64> {
         z[[row, 3]] = amp_b * tb.sin();
     }
     z
-}
-
-/// Build a fresh K=2 periodic term (production PCA seed, decoders cold at zero)
-/// from an arbitrary target — the general form of [`two_circle_k2_term`].
-fn k2_periodic_term_from_target(target: &Array2<f64>, m: usize) -> SaeManifoldTerm {
-    let n = target.nrows();
-    let p = target.ncols();
-    let d = 1usize;
-    let k = 2usize;
-    let basis_kinds = vec![SaeAtomBasisKind::Periodic; k];
-    let dims = vec![d; k];
-    let seed = sae_pca_seed_initial_coords(target.view(), &basis_kinds, &dims)
-        .expect("the PCA seed covers every declared atom basis kind and dim");
-    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m)
-        .expect("a periodic harmonic evaluator exists for this odd basis count"));
-
-    let mut basis_values = Array3::<f64>::zeros((k, n, m));
-    let mut basis_jacobian = Array4::<f64>::zeros((k, n, m, d));
-    let decoder = Array3::<f64>::zeros((k, m, p));
-    let mut penalties = Array3::<f64>::zeros((k, m, m));
-    let mut coords_vec: Vec<Array2<f64>> = Vec::new();
-    for atom in 0..k {
-        let coords = seed.slice(s![atom, .., 0..d]).to_owned();
-        let (phi, jet) = evaluator.evaluate(coords.view())
-            .expect("the periodic evaluator accepts the seeded coordinate block");
-        basis_values.slice_mut(s![atom, .., ..]).assign(&phi);
-        basis_jacobian.slice_mut(s![atom, .., .., ..]).assign(&jet);
-        penalties
-            .slice_mut(s![atom, .., ..])
-            .assign(&Array2::<f64>::eye(m));
-        coords_vec.push(coords);
-    }
-    let logits = Array2::<f64>::zeros((n, k));
-    let mut evaluators: Vec<Option<Arc<dyn SaeBasisSecondJet>>> = Vec::new();
-    for _ in 0..k {
-        evaluators.push(Some(evaluator.clone()));
-    }
-    term_from_padded_blocks_with_mode(
-        n,
-        p,
-        &basis_kinds,
-        basis_values.view(),
-        basis_jacobian.view(),
-        &vec![m; k],
-        &dims,
-        decoder.view(),
-        penalties.view(),
-        logits.view(),
-        &coords_vec,
-        AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
-        &evaluators,
-    )
-    .expect("the fixture assignment blocks match the declared mode")
 }
 
 /// #2132 births — the SEQUENTIAL-DEFLATION birth reseed must separate co-collapsed

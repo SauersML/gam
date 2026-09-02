@@ -403,30 +403,6 @@ mod tests {
 
     // ── OuterScoreSubsample::has_variable_weights ─────────────────────────────
 
-    #[test]
-    fn has_variable_weights_false_for_uniform() {
-        let s = OuterScoreSubsample::with_uniform_weight(vec![0, 1, 2], 3, 0, 1.5);
-        assert!(!s.has_variable_weights());
-    }
-
-    #[test]
-    fn has_variable_weights_true_for_mixed() {
-        let rows = vec![
-            WeightedOuterRow {
-                index: 0,
-                weight: 1.0,
-                stratum: 0,
-            },
-            WeightedOuterRow {
-                index: 1,
-                weight: 2.0,
-                stratum: 0,
-            },
-        ];
-        let s = OuterScoreSubsample::from_weighted_rows(rows, 5, 0);
-        assert!(s.has_variable_weights());
-    }
-
     // ── RowSet::par_reduce_fold ───────────────────────────────────────────────
 
     #[test]

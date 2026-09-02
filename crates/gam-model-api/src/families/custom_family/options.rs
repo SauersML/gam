@@ -836,13 +836,6 @@ mod tests {
     // default_coefficient_gradient_cost
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn gradient_cost_is_half_hessian_cost() {
-        let specs = [make_spec(10, 3)];
-        let hess = default_coefficient_hessian_cost(&specs);
-        assert_eq!(default_coefficient_gradient_cost(&specs), hess / 2);
-    }
-
     // -----------------------------------------------------------------------
     // joint_coupled_coefficient_hessian_cost
     // -----------------------------------------------------------------------

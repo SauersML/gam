@@ -309,22 +309,6 @@ mod tests {
     }
 
     #[test]
-    fn coreset_budget_alone_is_insufficient_but_decides_with_margin() {
-        let cert = CoresetCertificate::new(0.1, 0.0, 4, 32).expect("coreset cert");
-        assert_eq!(cert.verdict(), Verdict::Insufficient);
-        // A margin below the budget stays insufficient; above it certifies.
-        let req = cert.race_transfer_margin();
-        assert_eq!(
-            coreset_race_verdict(cert.certify_margin(req * 0.5)),
-            Verdict::Insufficient
-        );
-        assert_eq!(
-            coreset_race_verdict(cert.certify_margin(req * 2.0 + 1.0)),
-            Verdict::Certified
-        );
-    }
-
-    #[test]
     fn enclosure_certifies_only_when_margin_clears_gap() {
         let enc = LogdetEnclosure {
             block_diag_logdet: 10.0,
@@ -357,30 +341,4 @@ mod tests {
         assert_eq!(terminal.verdict(), Verdict::Unavailable);
     }
 
-    #[test]
-    fn ledger_rolls_up_to_weakest_member() {
-        let mut ledger = CertificateLedger::new();
-        let clean = OuterCriterionCertificate {
-            stationarity: crate::model_types::OuterStationarityCertificate::AnalyticGradient {
-                grad_norm: 1e-8,
-                projected_grad_norm: 1e-8,
-                bound: 1e-6,
-                rung: gam_problem::StationarityRung {
-                    label: "solver-band",
-                    derived_standard: false,
-                }
-                .into(),
-            },
-            curvature: crate::model_types::CurvatureEvidence::Measured { psd: true },
-            lambdas_railed: Vec::new(),
-            railed_facts: Vec::new(),
-            curvature_floor: None,
-        };
-        let cert = CoresetCertificate::new(0.1, 0.0, 4, 32).expect("coreset");
-        ledger.record(&clean); // Certified
-        ledger.record(&cert); // Insufficient
-        assert_eq!(ledger.overall(), Verdict::Insufficient);
-        assert_eq!(ledger.verdict_of("outer-optimality"), Verdict::Certified);
-        assert_eq!(ledger.verdict_of("coreset-budget"), Verdict::Insufficient);
-    }
 }

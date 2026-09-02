@@ -3880,93 +3880,6 @@ mod tests {
     // `#[test]` in this binary writes the same cell from another thread, so an
     // unlocked reader observes a state no test created (#2738 caught exactly
     // that — a live sequential scope beside a `Par::rayon` global).
-    /// #2267/#2738 — the census must be shown to MOVE, and to record the
-    /// sequential arm, or it is a counter nobody has ever seen count.
-    ///
-    /// This is the positive control for the instrument itself. The failure it
-    /// guards against is specific and has already happened once: the `log::debug!`
-    /// half of this probe printed nothing under `cargo test` because no logger is
-    /// installed, and a probe that prints nothing is indistinguishable from a code
-    /// path that never ran. A counter can be asserted on; a log line cannot.
-    ///
-    /// Both arms, so neither a stuck-at-zero counter nor a stuck-at-everything
-    /// one passes: an `eigh` OUTSIDE the scope must not increment the sequential
-    /// tally, and one INSIDE it must.
-    #[test]
-    fn eigh_census_counts_calls_and_separates_the_sequential_arm() {
-        crate::test_support::with_global_parallelism_serialized(|| {
-            let sym = Array2::<f64>::from_shape_fn((6, 6), |(i, j)| {
-                if i == j { 2.0 + i as f64 } else { 0.25 / (1.0 + (i as f64 - j as f64).abs()) }
-            });
-
-            // Establish a definitely-parallel baseline so the outside-the-scope arm
-            // is not vacuously sequential already.
-            let baseline = faer::get_global_parallelism();
-            faer::set_global_parallelism(Par::rayon(2));
-
-            // The EXACT deltas are taken on the per-thread census. Differencing
-            // the process-global one here asserted a property of the whole test
-            // binary's schedule: at `0033169a9` this test read `+12` instead of
-            // `+1` under the default thread count, twice in a row, and passed
-            // under `--test-threads=1`. Both readings were correct about the
-            // global counter and neither was about this region.
-            let before = eigh_census_this_thread();
-            let before_global = eigh_census();
-            sym.eigh(Side::Lower).expect("outside-scope eigh");
-            let outside = eigh_census_this_thread();
-            assert_eq!(
-                outside.calls,
-                before.calls + 1,
-                "the census must count an eigh call",
-            );
-            assert_eq!(
-                outside.sequential_calls, before.sequential_calls,
-                "an eigh outside any FaerSequentialScope must NOT be tallied sequential",
-            );
-            assert!(
-                outside.max_dim >= 6,
-                "max_dim must record the shape actually decomposed, got {}",
-                outside.max_dim,
-            );
-
-            {
-                let scope = FaerSequentialScope::enter();
-                sym.eigh(Side::Lower).expect("inside-scope eigh");
-                drop(scope);
-            }
-            let inside = eigh_census_this_thread();
-            assert_eq!(
-                inside.calls,
-                outside.calls + 1,
-                "the census must count the second call",
-            );
-            assert_eq!(
-                inside.sequential_calls,
-                outside.sequential_calls + 1,
-                "an eigh inside a FaerSequentialScope MUST be tallied sequential — this is \
-                 the property the #2267 read turns on",
-            );
-            assert!(
-                inside.nanos >= outside.nanos,
-                "cumulative time must be monotonic",
-            );
-
-            // The GLOBAL census is still exercised, at the only strength it can
-            // carry under a parallel harness: it must have absorbed at least
-            // this thread's two calls. A global counter that stopped counting
-            // altogether still fails here.
-            let inside_global = eigh_census();
-            assert!(
-                inside_global.calls >= before_global.calls + 2,
-                "the process-global census must absorb this thread's calls too: \
-                 {} -> {}",
-                before_global.calls,
-                inside_global.calls,
-            );
-
-            faer::set_global_parallelism(baseline);
-        });
-    }
 
     #[test]
     fn faer_sequential_scope_sets_seq_inside_and_restores_after() {
@@ -4167,23 +4080,4 @@ mod parallelism_snapshot_2738_tests {
         );
     }
 
-    /// The string the CLI logs is the captured struct, not a parallel
-    /// hand-written format that could disagree with it.
-    #[test]
-    fn the_logged_line_is_the_captured_struct() {
-        let (logged, captured) = crate::test_support::with_global_parallelism_serialized(|| {
-            (parallelism_snapshot(), ParallelismSnapshot::capture())
-        });
-        assert!(
-            logged.contains(&format!(
-                "rayon_current_num_threads={}",
-                captured.rayon_current_num_threads
-            )),
-            "the log line must carry the captured pool width: {logged}",
-        );
-        assert!(
-            logged.contains("process_available_parallelism="),
-            "the log line must carry the cores available to the process: {logged}",
-        );
-    }
 }

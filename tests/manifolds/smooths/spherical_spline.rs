@@ -1,7 +1,4 @@
-use gam::basis::{
-    ActivePenalty, BasisBuildResult, CenterStrategy, PenaltySource, SphericalSplineBasisSpec,
-    build_spherical_spline_basis, spherical_wahba_kernel_matrix,
-};
+use gam::basis::{ActivePenalty, BasisBuildResult, CenterStrategy, PenaltySource, SphericalSplineBasisSpec, build_spherical_spline_basis};
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula};
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};

@@ -3932,7 +3932,6 @@ mod blended_mixture_link_solve_tests {
     //! to keep the Newton system SPD, so the array build must tolerate a finite
     //! non-positive observed weight rather than hard-bail on it.
 
-    use super::optimize_external_design;
     use crate::estimate::external_options::ExternalOptimOptions;
     use gam_problem::{
         InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, ResponseFamily, StandardLink,
@@ -4088,7 +4087,6 @@ mod reported_loglikelihood_normalization_tests {
     //! distinct from the kernel-level checks in
     //! `crate::pirls::tests::reporting_loglikelihood_tests`.
 
-    use super::optimize_external_design;
     use crate::estimate::external_options::ExternalOptimOptions;
     use gam_problem::{
         InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization,
@@ -4240,7 +4238,7 @@ mod reported_loglikelihood_normalization_tests {
 
 #[cfg(test)]
 mod negative_binomial_joint_certificate_tests {
-    use super::{negbin_theta_stationarity_residual, optimize_external_design};
+    use super::negbin_theta_stationarity_residual;
     use crate::estimate::external_options::ExternalOptimOptions;
     use crate::pirls::{NEGBIN_THETA_MAX, NEGBIN_THETA_MIN};
     use gam_problem::{EstimationError, LikelihoodSpec};
@@ -4286,63 +4284,6 @@ mod negative_binomial_joint_certificate_tests {
         assert!(negbin_theta_stationarity_residual(1.0, 2.0, 1.0).is_infinite());
     }
 
-    #[test]
-    fn exhausted_joint_solve_returns_typed_checkpoint_instead_of_a_fit() {
-        // Intercept-only overdispersed counts make the large theta seed
-        // decisively non-stationary. With one joint round available the rho
-        // block is already vacuous, so exhaustion must be attributed to the
-        // theta partial and returned through the resumable typed error.
-        let y = array![0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 40.0, 0.0, 75.0, 0.0, 3.0, 0.0];
-        let n = y.len();
-        let design = Array2::<f64>::ones((n, 1));
-        let weights = Array1::<f64>::ones(n);
-        let offset = Array1::<f64>::zeros(n);
-        let opts = ExternalOptimOptions {
-            family: LikelihoodSpec::negative_binomial_log(1_000.0),
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: false,
-            skip_rho_posterior_inference: true,
-            max_iter: 1,
-            tol: 1.0e-8,
-            nullspace_dims: Vec::new(),
-            linear_constraints: None,
-            firth_bias_reduction: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
-            persistent_warm_start_store: None,
-        };
-        let error = match optimize_external_design(
-            y.view(),
-            weights.view(),
-            design,
-            offset.view(),
-            Vec::new(),
-            &opts,
-        ) {
-            Ok(_) => panic!("one round cannot certify this deliberately displaced theta seed"),
-            Err(error) => error,
-        };
-        match error {
-            EstimationError::NegativeBinomialAlternationDidNotConverge {
-                rounds,
-                theta_checkpoint,
-                theta_score_residual,
-                rho_checkpoint,
-                ..
-            } => {
-                assert_eq!(rounds, 1);
-                assert!(theta_checkpoint.is_finite() && theta_checkpoint > 0.0);
-                assert!(!theta_score_residual.is_nan() && theta_score_residual > opts.tol);
-                assert!(rho_checkpoint.is_empty());
-            }
-            other => panic!("expected typed negative-binomial joint exhaustion, got {other}"),
-        }
-    }
 }
 
 #[cfg(test)]

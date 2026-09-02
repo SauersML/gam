@@ -13,17 +13,13 @@
 //! unit-test churn in the shared lib-test binary. It uses the public API only.
 //! Off-device (CPU CI / non-Linux) the gates skip cleanly.
 
-
 use ndarray::{Array1, Array2};
 
 use gam_solve::arrow_schur::{
     ArrowSchurSystem, DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock,
     FactoredFrameGBlock,
 };
-use gam_solve::gpu_kernels::arrow_schur::{
-    ArrowSchurGpuFailure, build_framed_resident_evidence_matvec,
-    framed_reduced_schur_det_once_on_device, sae_framed_schur_matvec_cpu,
-};
+use gam_solve::gpu_kernels::arrow_schur::{ArrowSchurGpuFailure, build_framed_resident_evidence_matvec};
 
 // Device presence is detected via the one-shot probe itself: for a well-formed
 // framed fixture it returns `Err(Unavailable)` ONLY when CUDA is genuinely

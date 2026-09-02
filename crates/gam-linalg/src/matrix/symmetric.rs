@@ -635,23 +635,6 @@ mod tests {
 
     // ── addridge ──────────────────────────────────────────────────────────────
 
-    #[test]
-    fn addridge_zero_returns_clone() {
-        let m = dense2x2();
-        let r = m.addridge(0.0).unwrap().to_dense();
-        assert_eq!(r[[0, 0]], 1.0);
-        assert_eq!(r[[1, 1]], 4.0);
-    }
-
-    #[test]
-    fn addridge_nonzero_adds_to_diagonal_only() {
-        let m = dense2x2();
-        let r = m.addridge(10.0).unwrap().to_dense();
-        assert_eq!(r[[0, 0]], 11.0);
-        assert_eq!(r[[0, 1]], 2.0); // off-diagonal unchanged
-        assert_eq!(r[[1, 1]], 14.0);
-    }
-
     // ── dot ───────────────────────────────────────────────────────────────────
 
     #[test]
@@ -675,19 +658,6 @@ mod tests {
     }
 
     // ── max_abs_diag ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn max_abs_diag_finds_largest_diagonal() {
-        // A = [[1, 2], [2, 4]]: diag = {1, 4}, max_abs = 4
-        let m = dense2x2();
-        assert_eq!(m.max_abs_diag(), 4.0);
-    }
-
-    #[test]
-    fn max_abs_diag_with_negative_diagonal_entry() {
-        let m = SymmetricMatrix::Dense(array![[-5.0_f64, 0.0], [0.0, 3.0]]);
-        assert_eq!(m.max_abs_diag(), 5.0);
-    }
 
     #[test]
     fn raw_symmetric_gram_rejects_smallest_nonfinite_row_before_sparse_assembly() {

@@ -1,6 +1,4 @@
-use gam::generative::{
-    GenerativeSpec, NoiseModel, generativespec_from_predict, sampleobservation_replicates,
-};
+use gam::generative::{GenerativeSpec, NoiseModel, generativespec_from_predict};
 use gam::hmc::NutsResult;
 use gam::polya_gamma::PolyaGamma;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};

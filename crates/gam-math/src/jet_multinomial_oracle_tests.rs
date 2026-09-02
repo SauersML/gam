@@ -50,9 +50,7 @@
 #![cfg(test)]
 
 use crate::jet_scalar::JetScalar;
-use crate::jet_tower::{
-    KernelChannels, RowProgram, Tower4, program_full_tower, verify_kernel_channels,
-};
+use crate::jet_tower::{KernelChannels, RowProgram, Tower4, program_full_tower};
 
 /// One multinomial-logit fixture over `M` active primaries: the active-class
 /// log-odds `η` (the reference class `M` is pinned at `0`), the observed class

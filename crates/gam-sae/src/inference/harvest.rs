@@ -44,6 +44,7 @@
 //! from the tier — the same #973 honesty discipline, applied to the metric's
 //! estimation roles instead of the likelihood.
 
+use gam_problem::RowMetric;
 /// The Fisher-bearing tier: which corpus rows carry factors, and the metric
 /// over exactly those rows.
 struct FisherTier {
@@ -88,16 +89,6 @@ mod tests {
     use gam_solve::row_sampling_measure::MeasureProvenance;
     use ndarray::Array2;
     use std::sync::Arc;
-
-    fn tier_metric(masses: &[f64]) -> RowMetric {
-        // p = 1, rank = 1: factor u ⇒ tr(M) = u².
-        let n = masses.len();
-        let mut u = Array2::<f64>::zeros((n, 1));
-        for (i, &m) in masses.iter().enumerate() {
-            u[[i, 0]] = m.sqrt();
-        }
-        RowMetric::output_fisher(Arc::new(u), 1, 1).expect("tier metric")
-    }
 
     #[test]
     fn activations_only_degrades_everywhere() {

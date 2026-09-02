@@ -678,7 +678,6 @@ pub fn generative_spec_for_saved_model(
 mod tests {
     use super::*;
     use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
-    use gam_models::inference::generative::sampleobservation_replicates;
     use gam_models::inference::model::{
         FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     };

@@ -1,4 +1,4 @@
-use gam::families::survival::{CrudeRiskResult, calculate_crude_risk_quadrature};
+use gam::families::survival::CrudeRiskResult;
 use ndarray::array;
 
 fn run_constant_hazard_crude(

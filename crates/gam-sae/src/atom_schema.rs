@@ -122,7 +122,6 @@ pub fn topology_for_bases(bases: &[String]) -> Result<Option<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validated_n_harmonics;
 
     #[test]
     fn periodic_harmonic_metadata_is_strict() {

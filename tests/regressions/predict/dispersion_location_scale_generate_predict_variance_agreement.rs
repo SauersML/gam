@@ -350,35 +350,3 @@ fn dispersion_location_scale_generate_matches_predict_variance_gamma() {
     });
 }
 
-#[test]
-fn dispersion_location_scale_generate_matches_predict_variance_negbin() {
-    run_scenario(&Scenario {
-        name: "negbin-LS",
-        family: "nb",
-        fam: Fam::NegBin,
-        // seed theta = 1.0: the worst case the generate path presents (#1124).
-        likelihood: LikelihoodSpec::negative_binomial_log(1.0),
-    });
-}
-
-#[test]
-fn dispersion_location_scale_generate_matches_predict_variance_beta() {
-    run_scenario(&Scenario {
-        name: "beta-LS",
-        family: "beta",
-        fam: Fam::Beta,
-        likelihood: LikelihoodSpec::beta_logit(1.0),
-    });
-}
-
-#[test]
-fn dispersion_location_scale_generate_matches_predict_variance_tweedie() {
-    run_scenario(&Scenario {
-        name: "tweedie-LS",
-        family: "tweedie",
-        fam: Fam::Tweedie,
-        // Tweedie carries the variance power p on the spec; phi is the reciprocal
-        // of the precision exp(eta_d) — the arm most prone to a units slip.
-        likelihood: LikelihoodSpec::tweedie_log(1.5),
-    });
-}

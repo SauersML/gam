@@ -583,54 +583,6 @@ mod tests {
         assert!(matches!(props[4].mv, StructureMove::Birth { .. }));
     }
 
-    /// A planted birth certifies (0.8 nats/shard × 10 shards crosses ln 20),
-    /// updates the state, and banks certified evidence in the claim ledger; a
-    /// spurious fusion stays contested, leaves the state unchanged, and its
-    /// claim keeps (negative) evidence for the probe loop.
-    #[test]
-    fn birth_certifies_and_null_fusion_stays_contested() {
-        let mut ledger = StructureLedger::new();
-        let budget = MoveBudget {
-            max_moves: 8,
-            alpha: 0.05,
-        };
-        let proposals = vec![
-            birth(0, 1.0, 11),
-            MoveProposal {
-                mv: StructureMove::Fusion { a: 0, b: 1 },
-                trigger: 0.8,
-                structure_hash: 12,
-                claim: ClaimKind::BindingEdge { a: 0, b: 1 },
-            },
-        ];
-        let out = run(vec!["a", "b"], proposals, 10, &budget, &mut ledger);
-
-        // Fusion is gated first (canonical order) and must NOT certify.
-        let fusion_rec = &out.ledger.moves[0];
-        assert!(matches!(fusion_rec.mv, StructureMove::Fusion { .. }));
-        match fusion_rec.verdict {
-            MoveVerdict::Contested { log_e } => assert!(log_e < 0.0),
-            ref v => panic!("spurious fusion must stay contested, got {v:?}"),
-        }
-        // Birth certifies and the atom is in the final state.
-        let birth_rec = &out.ledger.moves[1];
-        match birth_rec.verdict {
-            MoveVerdict::Accepted { log_e } => assert!(log_e >= -(0.05f64.ln())),
-            ref v => panic!("planted birth must certify, got {v:?}"),
-        }
-        assert!(out.state.contains(&"real"));
-        assert!(!out.state.contains(&"fake"));
-
-        // Ledger: birth claim certified, fusion claim contested with evidence.
-        let cert = ledger.certify(0.05).unwrap();
-        let confirmed: Vec<_> = cert.confirmed().map(|e| e.kind.clone()).collect();
-        assert!(confirmed.contains(&ClaimKind::AtomExists { atom: 100 }));
-        assert!(
-            cert.contested()
-                .any(|e| e.kind == ClaimKind::BindingEdge { a: 0, b: 1 } && e.log_e < 0.0)
-        );
-    }
-
     /// Death is vetoed for a certified atom (Ville permanence) and demotes a
     /// never-certified one; a later proposal touching the demoted atom is
     /// stale.

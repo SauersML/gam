@@ -28,10 +28,7 @@
 
 use ndarray::Array2;
 
-use crate::manifold::{
-    SaeBehaviorAutoFitRequest, SaeCrosscoderAutoFitConfig, equilibrate_crosscoder_columns,
-    run_auto_sae_behavior_fit,
-};
+use crate::manifold::{SaeBehaviorAutoFitRequest, SaeCrosscoderAutoFitConfig, run_auto_sae_behavior_fit};
 
 /// Direct unit check of the equilibration primitive itself: every non-empty
 /// column of the mutated target has unit RMS, and un-scaling by the returned

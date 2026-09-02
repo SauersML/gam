@@ -26,7 +26,7 @@
 //!       trips if the outer work blows back up toward the ~150-eval bug regime.
 //! It does NOT depend on R / mgcv.
 
-use gam::estimate::{FitOptions, fit_gam};
+use gam::estimate::FitOptions;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};

@@ -19,11 +19,7 @@
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
-use crate::manifold::{
-    AssignmentMode, CrosscoderLayer, CrosscoderLayout, LatentManifold, OutputBlock,
-    PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,
-    SaeManifoldRho, SaeManifoldTerm, TwoBlockRemlControls, measure_atom_transport,
-};
+use crate::manifold::{AssignmentMode, CrosscoderLayer, CrosscoderLayout, LatentManifold, OutputBlock, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, TwoBlockRemlControls};
 
 const ON: f64 = 6.0;
 

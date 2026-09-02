@@ -3,10 +3,7 @@
 use super::*;
 use gam_data::load_dataset_projected;
 use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam_terms::basis::{
-    DuchonNullspaceOrder, center_strategy_is_auto, default_num_centers,
-    minimum_duchon_power_for_operator_penalties, starting_num_centers,
-};
+use gam_terms::basis::{DuchonNullspaceOrder, center_strategy_is_auto, default_num_centers, starting_num_centers};
 use gam_terms::inference::formula_dsl::{
     default_linkwiggle_formulaspec, parse_linkwiggle_formulaspec,
 };

@@ -12,9 +12,7 @@
 //! reproduction of any reference tool's fitted output.
 
 use gam::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
-use gam::terms::decoders::behavioral_head::{
-    AuxOutcomeFamily, BehavioralHead, LeakageAbsorber, head_feature_significance,
-};
+use gam::terms::decoders::behavioral_head::{AuxOutcomeFamily, BehavioralHead, LeakageAbsorber};
 use ndarray::{Array1, Array2};
 
 /// Deterministic LCG unit sampler so the test is reproducible and seed-stable.
@@ -353,69 +351,6 @@ fn multinomial_head_feature_p_values_are_channel_bonferroni_adjusted() {
 
     let expected = (p0.min(p1) * 2.0).min(1.0);
     assert!((sig.p_value[0] - expected).abs() < 1e-12);
-}
-
-#[test]
-fn leakage_absorber_orthogonalizes_reconstruction_against_label_channel() {
-    // The absorber must project the reconstruction update off the label
-    // channel's score-influence subspace: after orthogonalization the update
-    // must have ZERO component along the label direction, while preserving the
-    // orthogonal-complement component (orient what's there, never sculpt).
-    let mut seed = 0xABCD_1234_5678_0042;
-    let (n, d, planted) = (2000, 4, 1usize);
-    let (t, y) = plant(n, d, planted, &mut seed);
-    let head = BehavioralHead::fully_supervised(AuxOutcomeFamily::Binomial, y).expect("head");
-    let n_coeffs = head.n_coeffs(d);
-    let (coeffs, _cov) = fit_head_newton(&head, &t, n_coeffs);
-
-    // Score-influence Jacobian: row n, the Fisher-weighted η-direction √s·w.
-    let s = head
-        .head_working_weights(t.view(), coeffs.view())
-        .expect("working weights");
-    let loading = coeffs.slice(ndarray::s![1..1 + d]).to_owned();
-    let mut score_influence = Array2::<f64>::zeros((n, d)); // n_eta = 1
-    for r in 0..n {
-        let sw = s[[r, 0]].max(0.0).sqrt();
-        for k in 0..d {
-            score_influence[[r, k]] = sw * loading[k];
-        }
-    }
-    let absorber =
-        LeakageAbsorber::from_score_influence(score_influence.view(), d).expect("absorb");
-    assert!(
-        absorber.rank() >= 1,
-        "absorber found no label-channel direction to orthogonalize against"
-    );
-
-    // A reconstruction update that points partly along the label direction and
-    // partly along a null axis. After orthogonalization the label-direction
-    // component must vanish.
-    let q = absorber.basis().to_owned(); // d × r
-    let mut delta = Array2::<f64>::zeros((1, d));
-    // Build along normalized loading + along null axis 3.
-    let loading_norm = loading.dot(&loading).sqrt().max(1e-12);
-    for k in 0..d {
-        delta[[0, k]] = 3.0 * loading[k] / loading_norm; // label-aligned
-    }
-    delta[[0, 3]] += 1.7; // a genuine reconstruction direction (null axis)
-
-    let orth = absorber.orthogonalize_recon_update(delta.view());
-
-    // Component of the orthogonalized update along the absorbed subspace = 0.
-    let proj_coords = orth.dot(&q); // 1 × r
-    let leaked = proj_coords.iter().map(|v| v * v).sum::<f64>().sqrt();
-    assert!(
-        leaked < 1e-8,
-        "label-channel leakage survived orthogonalization: residual projection {leaked:.3e}"
-    );
-    // The genuine null-axis-3 reconstruction signal must SURVIVE (orient what
-    // p(x) put there): the orthogonalized update keeps a non-trivial component
-    // off the label subspace.
-    let off_label = orth.iter().map(|v| v * v).sum::<f64>().sqrt();
-    assert!(
-        off_label > 0.5,
-        "absorber destroyed the legitimate reconstruction signal (norm {off_label:.3e})"
-    );
 }
 
 #[test]

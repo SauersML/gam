@@ -32,7 +32,6 @@
 //! with `eprintln!` for context.
 
 use csv::StringRecord;
-use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::test_support::reference::{Column, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,

@@ -45,11 +45,7 @@
 //!    kernel across the series/closed-form κ = 0 seam. This is the per-distance
 //!    correctness underlying the `psi_kappa[..]` outer-gradient audit.
 
-use gam::basis::{
-    CenterStrategy, ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability,
-    build_constant_curvature_basis, constant_curvature_kernel_kappa_jets,
-    constant_curvature_kernel_matrix,
-};
+use gam::basis::{CenterStrategy, ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, build_constant_curvature_basis, constant_curvature_kernel_matrix};
 use gam::terms::basis::{BasisMetadata, PenaltySource};
 use ndarray::{Array2, array};
 

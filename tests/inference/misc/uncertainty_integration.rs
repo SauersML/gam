@@ -1,10 +1,7 @@
 use gam::estimate::FittedLinkState;
-use gam::estimate::{FitOptions, fit_gam};
+use gam::estimate::FitOptions;
 use gam::mixture_link::state_fromspec;
-use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
-    coefficient_uncertainty, predict_gam_posterior_mean, predict_gamwith_uncertainty,
-};
+use gam_predict::{InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions, predict_gamwith_uncertainty};
 
 use gam::smooth::BlockwisePenalty;
 use gam::types::{

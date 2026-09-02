@@ -50,23 +50,6 @@ fn gpu_available_or_fail() -> bool {
         .is_some()
 }
 
-/// Gate a device-only assertion, recording the skip when there is no device.
-///
-/// Returns `false` when the caller must stop. Unlike the bare
-/// `if !gpu_available_or_fail() { return; }` it replaces, the device-free path
-/// leaves a counted trace and asserts that the trace was recorded, so the test
-/// no longer reports `ok` having executed zero assertions (#2422).
-fn device_present_or_record_skip(label: &str) -> bool {
-    let floor = gam::gpu::test_gate::skipped_for_absent_device();
-    match gam::gpu::test_gate::gpu_for_test(label) {
-        gam::gpu::test_gate::GpuTestGate::Ready(_) => true,
-        gam::gpu::test_gate::GpuTestGate::AbsentDevice => {
-            gam::gpu::test_gate::assert_absent_device_was_counted(floor);
-            false
-        }
-    }
-}
-
 /// Build a production-shaped framed SAE arrow system: few rows, wide factored
 /// border (`k >= DEVICE_LOOP_MIN_P`), modest per-row depth `d` — the LLM/SAE
 /// shape the device-offload policy admits. Mirrors the in-crate framed device

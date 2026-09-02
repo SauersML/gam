@@ -21,14 +21,8 @@
 //! The assertions are against the PLANTED TRUTH (which generator produced the
 //! data), never against a reference tool's output.
 
-use gam::solver::evidence::{
-    GaussianMixtureConfig, StackingConfig, UnionStructure, union_per_point_log_density,
-};
-use gam::solver::topology_selector::{
-    AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider,
-    PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED,
-    adjudicate_predictive_race, fit_union_candidate, fit_union_rung, union_density_provider,
-};
+use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig, UnionStructure};
+use gam::solver::topology_selector::{AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider, PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_predictive_race};
 use ndarray::{Array2, ArrayView2};
 
 // ---------------------------------------------------------------------------

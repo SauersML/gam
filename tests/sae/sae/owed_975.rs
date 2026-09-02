@@ -45,9 +45,7 @@
 //! No `let _`, no `#[allow(...)]`, no env vars, no `#[cfg(feature=...)]`.
 
 use gam::inference::smooth_test::SmoothTestScale;
-use gam::terms::structure::anova_atom::{
-    BindingNotion, CarveInput, FissionDecision, carve, fission_decision, fit_pair_surface,
-};
+use gam::terms::structure::anova_atom::{BindingNotion, CarveInput, FissionDecision, carve, fission_decision};
 use ndarray::Array2;
 
 const N: usize = 1600;

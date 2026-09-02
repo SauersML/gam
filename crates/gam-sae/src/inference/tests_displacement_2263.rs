@@ -109,7 +109,6 @@
 #[cfg(test)]
 mod tests {
     use crate::encode::{AtlasConfig, EncodeAtlas};
-    use crate::inference::steering::set_coordinate;
     use crate::manifold::{
         SaeFisherRowMetricRequest, SaeFitAssignmentKind, SaeFitConfig, SaeFitSeedReport,
         SaeFitSeedRequest, SaeManifoldTerm, SaeMinimalSeedReport, SaeMinimalSeedRequest,

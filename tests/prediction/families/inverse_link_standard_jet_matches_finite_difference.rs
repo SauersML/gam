@@ -1,4 +1,3 @@
-use gam::mixture_link::inverse_link_jet_for_family;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 
 fn first_fd<F: Fn(f64) -> f64>(f: F, x: f64, h: f64) -> f64 {

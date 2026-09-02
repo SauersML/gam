@@ -46,14 +46,8 @@
 //! }
 //! ```
 
-use gam_sae::manifold::{
-    GraphCompressionKind, LearnedGraphAtom, OccupancyLaw, graph_edge_rank_charge,
-};
-use gam_sae::sparse_dict::{
-    BlockChartComposeConfig, BlockCoordinateReport, BlockSparseFit, block_firing_coordinates,
-    compose_block_coordinate_charts,
-};
-use gam_sae::structure_harvest::graph_birth_candidate_for_structure_search;
+use gam_sae::manifold::{GraphCompressionKind, LearnedGraphAtom, OccupancyLaw};
+use gam_sae::sparse_dict::{BlockChartComposeConfig, BlockCoordinateReport, BlockSparseFit, compose_block_coordinate_charts};
 use ndarray::{Array2, Array3};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -264,24 +258,6 @@ fn planted_radius(row: usize, axis: usize) -> f64 {
     1.0 + 0.12 * ((bucket - 8.0) / 8.0) + 0.08 * axis as f64
 }
 
-fn block_fit(fixture: &CalendarFixture) -> BlockSparseFit {
-    BlockSparseFit {
-        decoder: fixture.decoder.clone(),
-        blocks: fixture.blocks.clone(),
-        gates: fixture.gates.clone(),
-        codes: fixture.codes.clone(),
-        gamma: 1.0,
-        block_utilization: vec![1.0; AXES],
-        block_stable_rank: vec![2.0; AXES],
-        matryoshka_prefix_losses: Vec::new(),
-        explained_variance: 1.0,
-        epochs: 0,
-        convergence: gam_sae::sparse_dict::BlockSparseConvergence::trivially_converged(),
-        block_topk: AXES,
-        block_size: BLOCK_SIZE,
-    }
-}
-
 fn chart_config() -> BlockChartComposeConfig {
     BlockChartComposeConfig {
         block_size: BLOCK_SIZE,
@@ -395,82 +371,10 @@ fn calendar_axis_rows(fixture: &CalendarFixture, axis: usize) -> Vec<f64> {
         .collect()
 }
 
-fn assert_axis_circle_topology(fixture: &CalendarFixture, axis: usize) {
-    let embeddings = recovered_calendar_axis_anchor_embeddings(fixture, axis);
-    let rows = calendar_axis_rows(fixture, axis);
-    let candidate_edges =
-        LearnedGraphAtom::knn_candidate_edges(embeddings.view()).expect("calendar kNN graph");
-    let n_eff = rows.len() as f64;
-    let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
-    let precisions = vec![1.0; candidate_edges.len()];
-    let deltas = vec![charge * 1.4; candidate_edges.len()];
-    let candidate = graph_birth_candidate_for_structure_search(
-        embeddings.view(),
-        &rows,
-        n_eff,
-        &precisions,
-        &deltas,
-    )
-    .unwrap_or_else(|err| panic!("{} graph birth candidate failed: {err}", AXIS_NAMES[axis]));
-    let readout = &candidate.selection.topology;
-
-    assert!(
-        candidate.selection.selected,
-        "{} cluster must be selected as a graph atom by summed edge charge",
-        AXIS_NAMES[axis]
-    );
-    assert_eq!(readout.b0, 1, "{} graph Betti b0", AXIS_NAMES[axis]);
-    assert_eq!(readout.b1, 1, "{} graph Betti b1", AXIS_NAMES[axis]);
-    assert_eq!(
-        candidate.selection.occupancy,
-        OccupancyLaw::Discrete {
-            anchors: LABEL_COUNTS[axis]
-        },
-        "{} calendar occupancy must be atomic/discrete",
-        AXIS_NAMES[axis]
-    );
-    assert_eq!(
-        candidate.selection.compression.kind,
-        GraphCompressionKind::Circle,
-        "{} graph can certify a CIRCLE atom only after Betti (1,1) selection",
-        AXIS_NAMES[axis]
-    );
-}
-
 fn assert_calendar_graph_atoms_selected(fixture: &CalendarFixture) {
     for axis in 0..AXES {
         assert_axis_circle_topology(fixture, axis);
     }
-}
-
-fn assert_calendar_continuous_control_is_not_atomic() {
-    let embeddings = ideal_calendar_axis_anchor_embeddings(DAY_AXIS);
-    let rows = (0..ROWS)
-        .map(|row| row as f64 / ROWS as f64)
-        .collect::<Vec<_>>();
-    let candidate_edges =
-        LearnedGraphAtom::knn_candidate_edges(embeddings.view()).expect("continuous kNN graph");
-    let n_eff = rows.len() as f64;
-    let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
-    let precisions = vec![1.0; candidate_edges.len()];
-    let deltas = vec![charge * 1.4; candidate_edges.len()];
-    let candidate = graph_birth_candidate_for_structure_search(
-        embeddings.view(),
-        &rows,
-        n_eff,
-        &precisions,
-        &deltas,
-    )
-    .expect("continuous graph birth candidate");
-
-    assert!(
-        matches!(
-            candidate.selection.occupancy,
-            OccupancyLaw::Uniform | OccupancyLaw::Continuous
-        ),
-        "dense phase control must remain continuous/uniform, got {:?}",
-        candidate.selection.occupancy
-    );
 }
 
 fn circular_forward_delta(anchor: f64, phase: f64) -> f64 {

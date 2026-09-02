@@ -1,4 +1,4 @@
-use gam_math::paired_timing::{SpeedGate, paired_interleaved};
+use gam_math::paired_timing::SpeedGate;
 use gam_row_macros::row_program;
 
 const K: usize = 9;

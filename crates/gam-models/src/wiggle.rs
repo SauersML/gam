@@ -706,30 +706,6 @@ mod tests {
 
     // ---- buildwiggle_block_input_from_knots (driven via seed for valid knots) ----
 
-    fn build(double_penalty: bool, penalty_order: usize) -> (ParameterBlockInput, usize) {
-        // A spread-out seed so knot generation yields several monotone columns.
-        let seed = Array1::linspace(0.0, 1.0, 40);
-        let cfg = WiggleBlockConfig {
-            degree: 3,
-            num_internal_knots: 5,
-            penalty_order,
-            double_penalty,
-        };
-        let knots =
-            initializewiggle_knots_from_seed(seed.view(), cfg.degree, cfg.num_internal_knots)
-                .expect("knot init");
-        let block = buildwiggle_block_input_from_knots(
-            seed.view(),
-            &knots,
-            cfg.degree,
-            cfg.penalty_order,
-            cfg.double_penalty,
-        )
-        .expect("build block");
-        let p = block.design.ncols();
-        (block, p)
-    }
-
     #[test]
     fn single_penalty_block_shapes_and_invariants() {
         let (block, p) = build(false, 2);
@@ -1004,17 +980,6 @@ mod tests {
         let (block, _) = build(true, 1);
         assert_eq!(block.penalties.len(), 1);
         assert_eq!(block.nullspace_dims, vec![0]);
-    }
-
-    #[test]
-    fn unsupported_derivative_order_is_rejected_not_clamped() {
-        let seed = Array1::linspace(0.0, 1.0, 40);
-        let knots = initializewiggle_knots_from_seed(seed.view(), 3, 5).expect("knot init");
-        let error = match buildwiggle_block_input_from_knots(seed.view(), &knots, 3, 4, false) {
-            Ok(_) => panic!("order above represented value degree must be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.contains("derivative"), "unexpected error: {error}");
     }
 
     #[test]

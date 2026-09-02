@@ -71,11 +71,7 @@
 use gam::solver::evidence::{
     CircularGaussianFit2d, GaussianMixtureConfig, StackingConfig, fit_gaussian_mixture,
 };
-use gam::solver::topology_selector::{
-    AutoTopologyKind, EvidenceCertification, HeldOutDensityProvider, MIXTURE_K_LADDER,
-    PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED,
-    adjudicate_predictive_race, fit_mixture_rung, mixture_density_provider,
-};
+use gam::solver::topology_selector::{AutoTopologyKind, EvidenceCertification, HeldOutDensityProvider, MIXTURE_K_LADDER, PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_predictive_race};
 use gam::test_support::reference::{Column, run_python};
 use ndarray::{Array2, ArrayView2};
 

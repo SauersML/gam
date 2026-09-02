@@ -39,10 +39,7 @@ use rayon::prelude::*;
 
 use gam::inference::row_metric::RowMetric;
 use gam::terms::sae::chart_canonicalization::CanonicalChartTopology;
-use gam::terms::sae::identifiability::{
-    AtomTopology, AtomTransportLadderInput, AtomTransportLadderReport, FittedAtom,
-    FittedSaeManifold, atom_transport_ladder_reports,
-};
+use gam::terms::sae::identifiability::{AtomTopology, AtomTransportLadderInput, AtomTransportLadderReport, FittedAtom, FittedSaeManifold};
 
 /// A bare certificate-only fitted atom carrying just a name + Euclidean frame —
 /// the transport-ladder leg only reads `atom.name` and the index, so the rest is

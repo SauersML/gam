@@ -26,10 +26,7 @@
 //! numeric value of `λ̂` — and would cost the sign.
 
 use gam::families::bms::MarginalSlopeCovariance;
-use gam::families::survival::marginal_slope::{
-    RigidVectorValueWorkspace, survival_marginal_slope_vector_eta,
-    survival_marginal_slope_vector_neglog, survival_marginal_slope_vector_scale,
-};
+use gam::families::survival::marginal_slope::{RigidVectorValueWorkspace, survival_marginal_slope_vector_neglog};
 use ndarray::array;
 
 const PROBIT_SCALE: f64 = 0.83;

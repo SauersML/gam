@@ -23,9 +23,7 @@
 
 use gam::inference::row_metric::RowMetric;
 use gam::inference::structure_evidence::StructureLedger;
-use gam::terms::sae::identifiability::{
-    AtomInnerFit, AtomTopology, FittedAtom, FittedSaeManifold, dictionary_report,
-};
+use gam::terms::sae::identifiability::{AtomInnerFit, AtomTopology, FittedAtom, FittedSaeManifold};
 use ndarray::{Array1, Array2};
 
 /// Build a self-consistent `AtomInnerFit` for a 1-D inner smooth with basis
@@ -98,21 +96,6 @@ fn curved_inner_fit(beta_vec: [f64; 3], dispersion: f64) -> AtomInnerFit {
         peak_design_row,
         mode_design_row,
     }
-}
-
-fn patch_atom_with_fit(name: &str, fit: AtomInnerFit) -> FittedAtom {
-    let mut frame = Array2::<f64>::zeros((1, 2));
-    frame[[0, 0]] = 1.0;
-    FittedAtom {
-        name: name.to_string(),
-        topology: AtomTopology::EuclideanPatch { latent_dim: 2 },
-        frame,
-        ard_variances: None,
-        lowering_error: 0.0,
-        chart_canonicalized: false,
-        inner_fit: None,
-    }
-    .with_inner_fit(fit)
 }
 
 fn single_atom_model(atom: FittedAtom) -> FittedSaeManifold {

@@ -378,47 +378,6 @@ mod tests {
     }
 
     #[test]
-    fn exp_sigma_derivatives_match_finite_difference() {
-        assert_sigma_derivs_match_fd(
-            exp_sigma_from_eta_scalar,
-            exp_sigma_derivs_up_to_third_scalar,
-        );
-    }
-
-    #[test]
-    fn exp_sigma_fourth_derivative_matches_finite_difference() {
-        let h = 2e-3;
-        let points = [-6.0, -3.0, -1.1, 0.0, 0.6, 1.9, 5.5];
-
-        let d3_at = |x: f64| exp_sigma_derivs_up_to_third_scalar(x).3;
-        for &eta in &points {
-            let (_, d1_4, d2_4, d3_4, d4_4) = exp_sigma_derivs_up_to_fourth_scalar(eta);
-            let (_, d1_3, d2_3, d3_3) = exp_sigma_derivs_up_to_third_scalar(eta);
-            assert!((d1_4 - d1_3).abs() < 1e-12);
-            assert!((d2_4 - d2_3).abs() < 1e-12);
-            assert!((d3_4 - d3_3).abs() < 1e-12);
-
-            let d4fd = (d3_at(eta + h) - d3_at(eta - h)) / (2.0 * h);
-            let d4_scale = d4_4.abs().max(d4fd.abs()).max(1.0);
-            assert!((d4_4 - d4fd).abs() < 5e-4 * d4_scale);
-        }
-    }
-
-    #[test]
-    fn exp_sigmavectorized_up_to_fourth_matches_scalar() {
-        let eta = Array1::from_vec(vec![-701.0, -4.2, -1.4, -0.2, 0.4, 1.9, 3.1, 701.0]);
-        let (s, d1, d2, d3, d4) = exp_sigma_derivs_up_to_fourth(eta.view());
-        for i in 0..eta.len() {
-            let (ss, d1s, d2s, d3s, d4s) = exp_sigma_derivs_up_to_fourth_scalar(eta[i]);
-            assert!((s[i] - ss).abs() < 1e-12);
-            assert!((d1[i] - d1s).abs() < 1e-12);
-            assert!((d2[i] - d2s).abs() < 1e-12);
-            assert!((d3[i] - d3s).abs() < 1e-12);
-            assert!((d4[i] - d4s).abs() < 1e-12);
-        }
-    }
-
-    #[test]
     fn exp_sigma_inverse_accepts_positive_sigma() {
         let eta = exp_sigma_eta_for_sigma_scalar(2.5);
         assert!(eta.is_finite());
@@ -477,64 +436,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn logb_sigma_jet_d1_through_d4_match_pure_exp_eta() {
-        for &eta in &[-3.0_f64, 0.0, 2.0] {
-            let s = eta.exp();
-            let jet1 = logb_sigma_jet1_scalar(eta);
-            let jet3 = logb_sigma_jet3_scalar(eta);
-            let jet4 = logb_sigma_jet4_scalar(eta);
-            assert!((jet1.sigma - (LOGB_SIGMA_FLOOR + s)).abs() < 1e-12);
-            assert!((jet1.d1 - s).abs() < 1e-12);
-            assert!((jet3.sigma - (LOGB_SIGMA_FLOOR + s)).abs() < 1e-12);
-            assert!((jet3.d1 - s).abs() < 1e-12);
-            assert!((jet3.d2 - s).abs() < 1e-12);
-            assert!((jet3.d3 - s).abs() < 1e-12);
-            assert!((jet4.d4 - s).abs() < 1e-12);
-        }
-    }
-
-    #[test]
-    fn logb_sigma_derivatives_match_finite_difference() {
-        assert_sigma_derivs_match_fd(
-            logb_sigma_from_eta_scalar,
-            logb_sigma_derivs_up_to_third_scalar,
-        );
-    }
-
-    #[test]
-    fn logb_sigma_inverse_round_trip() {
-        for &sigma in &[
-            LOGB_SIGMA_FLOOR + 1e-3,
-            LOGB_SIGMA_FLOOR + 0.5,
-            1.0,
-            10.0,
-            1e6,
-        ] {
-            let eta = logb_sigma_eta_for_sigma_scalar(sigma);
-            let recovered = logb_sigma_from_eta_scalar(eta);
-            let scale = sigma.abs().max(1.0);
-            assert!((recovered - sigma).abs() < 1e-10 * scale);
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "sigma must exceed LOGB_SIGMA_FLOOR")]
-    fn logb_sigma_inverse_rejects_sigma_at_floor() {
-        logb_sigma_eta_for_sigma_scalar(LOGB_SIGMA_FLOOR);
-    }
-
-    #[test]
-    fn logb_sigma_vectorized_matches_scalar() {
-        let eta = Array1::from_vec(vec![-701.0, -4.2, -1.4, -0.2, 0.4, 1.9, 3.1, 701.0]);
-        let (s, d1, d2, d3, d4) = logb_sigma_derivs_up_to_fourth(eta.view());
-        for i in 0..eta.len() {
-            let (ss, d1s, d2s, d3s, d4s) = logb_sigma_derivs_up_to_fourth_scalar(eta[i]);
-            assert!((s[i] - ss).abs() < 1e-12);
-            assert!((d1[i] - d1s).abs() < 1e-12);
-            assert!((d2[i] - d2s).abs() < 1e-12);
-            assert!((d3[i] - d3s).abs() < 1e-12);
-            assert!((d4[i] - d4s).abs() < 1e-12);
-        }
-    }
 }

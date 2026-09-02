@@ -17,7 +17,7 @@
 //! makes A and B identical. The test asserts λ, EDF, dispersion φ̂, and the
 //! fitted coefficients all match to machine precision (#584).
 
-use gam::estimate::{FitOptions, fit_gam};
+use gam::estimate::FitOptions;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};

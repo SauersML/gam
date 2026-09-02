@@ -1,5 +1,5 @@
 use gam::estimate::FittedLinkState;
-use gam::estimate::{FitOptions, fit_gam};
+use gam::estimate::FitOptions;
 use gam::mixture_link::{
     mixture_inverse_link_jet, sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials,
     state_from_sasspec, state_fromspec,

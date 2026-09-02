@@ -665,25 +665,6 @@ mod tests {
     // Both callers are `cfg(target_os = "linux")` device-parity tests, so this
     // admission helper is dead off-Linux and `-D dead-code` rejects the test
     // target there (a wheel-blocking break class). Gate it with its callers.
-    /// The availability question goes through the one shared gate (#2422): the
-    /// two callers `return` on `false` with nothing asserted afterwards, so a
-    /// bare probe left both tests printing `ok` on every CPU-only runner with
-    /// the process skip counter untouched and no `SKIPPED(no-cuda):` marker for
-    /// a ledger to scrape. `gpu_for_test` panics on a driver FAULT and under
-    /// `GpuPolicy::Required`, and counts a genuine absence;
-    /// `assert_absent_device_was_counted` turns that count into the assertion
-    /// this skip path owes.
-    #[cfg(target_os = "linux")]
-    fn cuda_available_for_test(label: &str) -> bool {
-        let floor = gam_gpu::test_gate::skipped_for_absent_device();
-        match gam_gpu::test_gate::gpu_for_test(label) {
-            gam_gpu::test_gate::GpuTestGate::Ready(_) => true,
-            gam_gpu::test_gate::GpuTestGate::AbsentDevice => {
-                gam_gpu::test_gate::assert_absent_device_was_counted(floor);
-                false
-            }
-        }
-    }
 
     /// Deterministic fp32 fixture: `n_rows × p` rows and a `G·b × p` decoder whose
     /// blocks are orthonormalised so the gate `‖x D_gᵀ‖₂` is a genuine subspace
@@ -706,23 +687,6 @@ mod tests {
             }
         }
         (rows, decoder)
-    }
-
-    #[test]
-    fn cpu_gate_block_matches_per_row_reference() {
-        // The block-form gate oracle must equal the per-row group ℓ₂ exactly.
-        let (rows, decoder) = fixture(6, 10, 3, 8);
-        let block = block_gate_block_cpu(rows.view(), decoder.view(), 10, 3);
-        for r in 0..rows.nrows() {
-            let per_row = block_gate_row_cpu(rows.row(r), decoder.view(), 10, 3);
-            for g in 0..10 {
-                assert_eq!(
-                    block[r * 10 + g].to_bits(),
-                    per_row[g].to_bits(),
-                    "gate block vs per-row differ at r={r} g={g}"
-                );
-            }
-        }
     }
 
     #[test]

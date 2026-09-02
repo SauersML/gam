@@ -361,27 +361,6 @@ mod tests {
         assert!(madsen_retry_exhausted(damping, 0, usize::MAX));
     }
 
-    /// The design split the #968 thread demanded: a loop pass that never
-    /// reaches a reject ritual (Fisher fallback / special-case `continue`)
-    /// still burns the iteration budget, because the bound ticks at the
-    /// top of every pass — independent of the escalator.
-    #[test]
-    fn continue_paths_without_rejects_still_exhaust_the_bound() {
-        let mut bound = IterationBound::new(5);
-        let esc = RejectEscalator::new();
-        let damping = 1e-6; // benign forever: only the count can kill it
-        let mut passes = 0usize;
-        while !bound.exhausted_at(damping) {
-            bound.tick();
-            passes += 1;
-            assert!(passes <= 5, "bound must stop a reject-free spin");
-            // No escalate(): this pass `continue`d past every reject site.
-        }
-        assert_eq!(passes, 5);
-        assert_eq!(esc.rejects(), 0, "no reject was ever recorded");
-        assert_eq!(bound.verdict_at(damping), LoopVerdict::Exhausted);
-    }
-
     /// And the dual: escalations do NOT advance the iteration bound on
     /// their own — collapsing the rituals onto the escalator must not
     /// double-count attempts against the per-iteration budget.

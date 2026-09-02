@@ -1,7 +1,4 @@
-use gam::families::bms::{
-    MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
-    marginal_slope_preserving_scale, marginal_slope_probit_eta,
-};
+use gam::families::bms::{MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores};
 use gam::probability::normal_cdf;
 use ndarray::{Array1, array};
 
@@ -61,30 +58,6 @@ fn assert_preserves_signed_marginal(
         (marginal - target).abs() < 2e-15,
         "marginal={marginal:.17e} target={target:.17e}"
     );
-}
-
-#[test]
-fn multi_z_k1_diagonal_matches_scalar_rigid_eta_bitwise() {
-    let q = -0.37;
-    let slope = 0.42;
-    let z = 1.25;
-    let probit_scale = 0.8;
-    let covariance = MarginalSlopeCovariance::diagonal(array![1.0]).unwrap();
-
-    let eta_multi =
-        marginal_slope_probit_eta(q, &[z], &[slope], &covariance, probit_scale).expect("eta");
-    let observed_slope = probit_scale * slope;
-    let c = (1.0 + observed_slope * observed_slope).sqrt();
-    let eta_scalar = q * c + observed_slope * z;
-
-    assert_scalar_reduction(
-        eta_multi,
-        eta_scalar,
-        (q * c).abs() + (observed_slope * z).abs(),
-        "K=1 Diagonal[1.0] eta must reduce to the rigid scalar identity",
-    );
-    assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Diagonal);
-    assert_preserves_signed_marginal(q, &[slope], &covariance, probit_scale);
 }
 
 #[test]

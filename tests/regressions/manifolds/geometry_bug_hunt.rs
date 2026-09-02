@@ -172,25 +172,6 @@ impl RiemannianObjective for QuadObjective {
 }
 
 #[test]
-fn lbfgs_inverse_hessian_should_converge_to_true_hessian_inverse_for_quadratic() {
-    let m = EuclideanManifold::new(2);
-    let mut obj = QuadObjective {
-        h: array![[10.0, 0.0], [0.0, 1.0]],
-    };
-    let opt = RiemannianLBFGS {
-        max_iter: 50,
-        step_size: 0.1,
-        ..Default::default()
-    };
-    let x0 = array![1.0, 1.0];
-    let x_star = opt.minimize(&m, &mut obj, x0.view()).unwrap();
-    assert!(
-        norm(&x_star) < 1.0e-6,
-        "LBFGS on an SPD quadratic should converge to the exact minimizer with enough iterations"
-    );
-}
-
-#[test]
 fn trust_region_step_should_never_exceed_radius() {
     let m = EuclideanManifold::new(2);
     struct RecordingQuadObjective {

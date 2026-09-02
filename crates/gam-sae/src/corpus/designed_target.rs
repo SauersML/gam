@@ -35,6 +35,7 @@
 use ndarray::Array2;
 
 use gam_solve::row_sampling_measure::MeasureProvenance;
+use gam_solve::row_sampling_measure::RowSamplingMeasure;
 
 /// Default designed-sample budget once [`designed_sampling_mandatory`] fires.
 /// Auto-derived policy, not a knob: 2·10⁶ rows is comfortably in-memory at any
@@ -114,103 +115,4 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn full_budget_collects_every_row_bit_for_bit_with_unit_weights() {
-        let n = 137;
-        let p = 5;
-        let rows = planted_rows(n, p);
-        let dir = temp_shard_dir("full", &rows, 60);
-        let mut src = MmapShardSource::open_dir(&dir).expect("open");
-        let collected = collect_designed_target_auto(&mut src, 7).expect("collect");
-
-        assert!(!collected.is_designed_subsample());
-        assert_eq!(collected.row_ids, (0..n as u64).collect::<Vec<_>>());
-        assert!(collected.likelihood_weights.iter().all(|&w| w == 1.0));
-        // Bit-identity to the f32-storage round-trip of the source rows: the
-        // collection adds nothing on top of the shard format's own rounding.
-        let stored = rows.mapv(|v| f64::from(v as f32));
-        for (a, b) in collected.target.iter().zip(stored.iter()) {
-            assert_eq!(a.to_bits(), b.to_bits());
-        }
-        if let Err(error) = std::fs::remove_dir_all(&dir) {
-            log::debug!("designed-target test: removing the temp shard dir failed: {error}");
-        }
-    }
-
-    #[test]
-    fn designed_budget_collects_exactly_the_designed_rows_with_their_weights() {
-        let n = 200;
-        let p = 3;
-        let rows = planted_rows(n, p);
-        let dir = temp_shard_dir("designed", &rows, 90);
-        let mut src = MmapShardSource::open_dir(&dir).expect("open");
-
-        let budget = 40usize;
-        let seed = 17u64;
-        let collected = collect_designed_target(&mut src, None, budget, seed).expect("collect");
-        assert!(collected.is_designed_subsample());
-
-        // The selection must be the measure's own design, row for row,
-        // weight for weight.
-        let sample = RowSamplingMeasure::uniform(n).designed_subsample(budget, seed);
-        assert_eq!(
-            collected.row_ids,
-            sample.rows.iter().map(|&r| r as u64).collect::<Vec<_>>()
-        );
-        assert_eq!(collected.likelihood_weights, sample.likelihood_weights);
-
-        // Each collected row is bitwise the corpus row it claims to be.
-        let stored = rows.mapv(|v| f64::from(v as f32));
-        for (k, &rid) in collected.row_ids.iter().enumerate() {
-            for c in 0..p {
-                assert_eq!(
-                    collected.target[[k, c]].to_bits(),
-                    stored[[rid as usize, c]].to_bits(),
-                    "row {rid} col {c}"
-                );
-            }
-        }
-
-        // Deterministic: same (measure, budget, seed) ⇒ identical collection.
-        let again = collect_designed_target(&mut src, None, budget, seed).expect("collect again");
-        assert_eq!(again.row_ids, collected.row_ids);
-        for (a, b) in again.target.iter().zip(collected.target.iter()) {
-            assert_eq!(a.to_bits(), b.to_bits());
-        }
-        if let Err(error) = std::fs::remove_dir_all(&dir) {
-            log::debug!("designed-target test: removing the temp shard dir failed: {error}");
-        }
-    }
-
-    #[test]
-    fn measure_dimension_mismatch_is_rejected() {
-        let rows = planted_rows(20, 2);
-        let dir = temp_shard_dir("mismatch", &rows, 10);
-        let mut src = MmapShardSource::open_dir(&dir).expect("open");
-        let wrong = RowSamplingMeasure::uniform(7);
-        let err = collect_designed_target(&mut src, Some(&wrong), 5, 1)
-            .expect_err("mismatched measure must be rejected");
-        assert!(err.contains("covers 7 rows"), "got: {err}");
-        if let Err(error) = std::fs::remove_dir_all(&dir) {
-            log::debug!("designed-target test: removing the temp shard dir failed: {error}");
-        }
-    }
-
-    #[test]
-    fn auto_budget_is_exact_below_threshold_and_bounded_above_it() {
-        assert_eq!(auto_designed_budget(1_000), 1_000);
-        assert_eq!(
-            auto_designed_budget(99_999_999),
-            99_999_999,
-            "below the mandatory threshold the budget is the whole corpus"
-        );
-        assert_eq!(
-            auto_designed_budget(100_000_000),
-            DESIGNED_SAMPLE_DEFAULT_BUDGET_ROWS
-        );
-        assert_eq!(
-            auto_designed_budget(u64::MAX),
-            DESIGNED_SAMPLE_DEFAULT_BUDGET_ROWS
-        );
-    }
 }

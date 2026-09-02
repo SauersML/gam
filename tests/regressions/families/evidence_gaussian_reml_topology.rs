@@ -1,6 +1,4 @@
-use gam::solver::evidence::{
-    TopologyCandidate, TopologyKind, TopologyScoreScale, TopologySelectOptions, select_topology,
-};
+use gam::solver::evidence::{TopologyCandidate, TopologyKind, TopologyScoreScale, TopologySelectOptions};
 
 #[test]
 fn select_topology_keeps_input_order_for_identical_scores_and_same_complexity() {

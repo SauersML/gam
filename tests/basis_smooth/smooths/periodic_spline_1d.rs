@@ -1,4 +1,4 @@
-use gam::basis::{PeriodicBSplineBasisSpec, fit_periodic_bspline_curve};
+use gam::basis::PeriodicBSplineBasisSpec;
 use ndarray::{Array1, Array2, array};
 
 const TWO_PI: f64 = std::f64::consts::TAU;

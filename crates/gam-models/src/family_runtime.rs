@@ -17,7 +17,6 @@ use gam_solve::mixture_link::{
 };
 use ndarray::{Array1, ArrayView1};
 
-
 /// Runtime family behavior carrier built from a `LikelihoodSpec` (response
 /// distribution + parameterized inverse-link).
 pub trait FamilyStrategy: std::fmt::Debug + Send + Sync {

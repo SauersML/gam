@@ -21,10 +21,7 @@
 //!    calibrated frame path.
 
 use gam::inference::row_metric::RowMetric;
-use gam::terms::sae::identifiability::{
-    AtomParameterView, AtomTopology, FittedAtom, FittedSaeManifold, GENERATOR_FLAT_ENERGY_TOL,
-    GeneratorFamily, OrbitPenaltyOperator, isometry_orbit_penalty_operator, residual_gauge_exact,
-};
+use gam::terms::sae::identifiability::{AtomParameterView, AtomTopology, FittedAtom, FittedSaeManifold, GENERATOR_FLAT_ENERGY_TOL, GeneratorFamily, OrbitPenaltyOperator, isometry_orbit_penalty_operator};
 use ndarray::{Array1, Array2, Array3};
 
 const N: usize = 48;

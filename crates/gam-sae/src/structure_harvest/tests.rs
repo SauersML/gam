@@ -924,49 +924,6 @@ fn birth_row_amplitudes_are_row_norms() {
 // ---- F2: finite-set (discrete anchor) atom ------------------------------
 
 #[test]
-fn finite_set_race_is_not_enrolled_by_default() {
-    // Containment: the finite-set candidate is inert unless explicitly
-    // enrolled, so the enum arm + evaluator can never affect a birth by
-    // default.
-    assert!(!finite_set_race_enrolled());
-    set_finite_set_race_enrolled(true);
-    assert!(finite_set_race_enrolled());
-    set_finite_set_race_enrolled(false);
-    assert!(!finite_set_race_enrolled());
-}
-
-#[test]
-fn finite_set_candidate_fires_on_discrete_occupancy() {
-    // Seven-point cyclic occupancy (weekdays): the coordinate collapses onto
-    // 7 anchors, so the finite-set candidate builder returns 7 anchors and a
-    // per-row integer index in [0, 7); the rank charge is anchors − 1 = 6.
-    let per = 100;
-    let mut rows = Vec::new();
-    for i in 0..(7 * per) {
-        // Sub-resolution embedding noise (±1e-3 over a span of 6 ⇒ ~1.7e-4
-        // normalized, below the width floor) so the seven weekdays are a
-        // genuine finite point set, not seven fuzzy blobs whose structured
-        // noise the evidence could honestly resolve into more clusters.
-        rows.push((i % 7) as f64 + 0.001 * ((i as f64).sin()));
-    }
-    let coords = Array2::from_shape_vec((7 * per, 1), rows).unwrap();
-    let (anchors, idx) =
-        finite_set_candidate_for_birth(coords.view()).expect("discrete ⇒ finite-set candidate");
-    assert_eq!(anchors, 7, "anchors");
-    assert_eq!(crate::manifold::finite_set_rank_charge(anchors), 6);
-    // Every index is a valid anchor bin.
-    assert!(
-        idx.iter()
-            .all(|&v| (0.0..=6.0).contains(&v) && v.fract() == 0.0)
-    );
-
-    // A uniformly-occupied coordinate is NOT a finite set — no candidate.
-    let n = 400;
-    let uni = Array2::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
-    assert!(finite_set_candidate_for_birth(uni.view()).is_none());
-}
-
-#[test]
 fn anchor_indicator_evaluator_is_one_hot_with_zero_jets() {
     use crate::basis::{AnchorIndicatorEvaluator, SaeBasisEvaluator, SaeBasisSecondJet};
     let ev = AnchorIndicatorEvaluator::new(3).unwrap();

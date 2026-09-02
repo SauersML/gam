@@ -34,10 +34,7 @@
 
 use std::collections::BTreeMap;
 
-use gam::families::custom_family::{
-    CoefficientGroupSpec, ParameterBlockSpec, PenaltyMatrix, coefficient_label,
-    realize_coefficient_groups_for_custom_family,
-};
+use gam::families::custom_family::{CoefficientGroupSpec, ParameterBlockSpec, PenaltyMatrix};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam_problem::RhoPrior;
 use gam_spec::CoefficientGroupPrior;
@@ -100,25 +97,6 @@ struct GroupSeed {
     mean: f64,
     sd: f64,
     init_log_precision: f64,
-}
-
-fn group(seed: &GroupSeed) -> CoefficientGroupSpec {
-    let mut g = CoefficientGroupSpec::new(
-        seed.label,
-        seed.coords
-            .iter()
-            .map(|(b, c)| coefficient_label(*b, *c))
-            .collect(),
-    )
-    .with_prior(CoefficientGroupPrior::NormalLogPrecision {
-        mean: seed.mean,
-        sd: seed.sd,
-    });
-    if let Some(parent) = seed.parent {
-        g = g.with_parent(parent);
-    }
-    g.initial_log_precision = Some(seed.init_log_precision);
-    g
 }
 
 struct ComposedSpec {

@@ -1,9 +1,5 @@
-use gam::estimate::{FitOptions, fit_gam};
-use gam::gaussian_reml::{
-    GaussianRemlEigenCache, GaussianRemlMultiBatchProblem, GaussianRemlMultiResult,
-    gaussian_reml_closed_form, gaussian_reml_closed_form_with_nullspace_dim,
-    gaussian_reml_multi_closed_form, gaussian_reml_multi_closed_form_batch,
-};
+use gam::estimate::FitOptions;
+use gam::gaussian_reml::{GaussianRemlEigenCache, GaussianRemlMultiBatchProblem, GaussianRemlMultiResult, gaussian_reml_closed_form, gaussian_reml_closed_form_with_nullspace_dim, gaussian_reml_multi_closed_form};
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};

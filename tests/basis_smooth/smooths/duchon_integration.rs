@@ -3,7 +3,6 @@ use gam::basis::{
     OneDimensionalBoundary,
 };
 use gam::estimate::{AdaptiveRegularizationOptions, FitOptions};
-use gam::probability::try_inverse_link_array;
 use gam::smooth::{
     FittedTermCollectionWithSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
     TermCollectionSpec,

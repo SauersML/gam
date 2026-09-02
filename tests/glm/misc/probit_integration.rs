@@ -1,4 +1,4 @@
-use gam::estimate::{FitOptions, fit_gam};
+use gam::estimate::FitOptions;
 use gam::pirls::update_glmvectors_by_family;
 use gam::probability::normal_cdf;
 use gam::smooth::BlockwisePenalty;

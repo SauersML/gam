@@ -14,10 +14,7 @@
 //! derivative matrices contain no NaN and no Inf. The invariant is wording-
 //! independent: it is a fact about the numbers the code returns.
 
-use gam::basis::{
-    CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu, build_matern_basis,
-    build_matern_basis_log_kappa_derivative, create_thin_plate_spline_basis,
-};
+use gam::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu, build_matern_basis};
 use ndarray::{Array2, ArrayView2};
 
 /// Scan a dense matrix and return the first non-finite (NaN or Inf) entry's

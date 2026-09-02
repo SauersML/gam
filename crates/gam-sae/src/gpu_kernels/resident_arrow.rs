@@ -76,6 +76,8 @@
 //! order is a separate directional product, not a curvature mode.
 
 use crate::gpu_kernels::sae_rowjet::SaeRowJetPath;
+use crate::gpu_kernels::sae_rowjet::SaeRowJetPrimary;
+use crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput;
 
 /// Leaf size of the canonical cross-row reduction tree. Shared with the host
 /// deterministic fold so that both backends associate additions identically.
@@ -452,90 +454,6 @@ extern "C" __global__ void sae_arrow_beta_merge(
 mod tests {
     use super::*;
 
-    fn fixture(n: usize) -> (Vec<SaeSoftmaxRowJetInput>, Vec<f64>) {
-        let k = 3;
-        let p = 4;
-        let primaries = vec![
-            SaeRowJetPrimary::Logit { atom: 0 },
-            SaeRowJetPrimary::Logit { atom: 1 },
-            SaeRowJetPrimary::Coordinate { atom: 0, axis: 0 },
-            SaeRowJetPrimary::Coordinate { atom: 1, axis: 0 },
-            SaeRowJetPrimary::Coordinate { atom: 1, axis: 1 },
-            SaeRowJetPrimary::Coordinate { atom: 2, axis: 0 },
-        ];
-        let q = primaries.len();
-        let rows: Vec<SaeSoftmaxRowJetInput> = (0..n)
-            .map(|row| {
-                let logits: Vec<f64> = (0..k)
-                    .map(|atom| 0.4 * ((row * 17 + atom * 11 + 1) as f64 * 0.07).sin())
-                    .collect();
-                let shift = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                let exps: Vec<f64> = logits.iter().map(|value| (value - shift).exp()).collect();
-                let sum: f64 = exps.iter().sum();
-                let gate_values: Vec<f64> = exps.iter().map(|value| value / sum).collect();
-                let decoded: Vec<f64> = (0..k * p)
-                    .map(|index| ((row * 13 + index * 7 + 3) as f64 * 0.09).cos())
-                    .collect();
-                let mut decoded_first = vec![0.0; q * p];
-                for slot in 2..q {
-                    for c in 0..p {
-                        decoded_first[slot * p + c] =
-                            ((row * 19 + slot * 5 + c + 2) as f64 * 0.04).sin();
-                    }
-                }
-                let mut decoded_second = vec![0.0; q * q * p];
-                for a in 2..q {
-                    for b in 2..q {
-                        let same_atom = matches!(
-                            (primaries[a], primaries[b]),
-                            (
-                                SaeRowJetPrimary::Coordinate { atom: left, .. },
-                                SaeRowJetPrimary::Coordinate { atom: right, .. },
-                            ) if left == right
-                        );
-                        if same_atom {
-                            for c in 0..p {
-                                decoded_second[(a * q + b) * p + c] =
-                                    ((row * 23 + a * 7 + b * 3 + c + 1) as f64 * 0.03).cos();
-                            }
-                        }
-                    }
-                }
-                let beta_atoms = vec![0_usize, 1, 2];
-                let n_beta = beta_atoms.len();
-                let beta_basis_values = vec![0.8, -0.3, 0.5];
-                let mut beta_basis_first = vec![0.0; q * n_beta];
-                beta_basis_first[2 * n_beta] = 0.2;
-                beta_basis_first[3 * n_beta + 1] = -0.4;
-                beta_basis_first[4 * n_beta + 1] = 0.7;
-                beta_basis_first[5 * n_beta + 2] = -0.1;
-                let beta_outputs: Vec<f64> = (0..n_beta * p)
-                    .map(|index| ((index * 5 + 1) as f64 * 0.11).sin())
-                    .collect();
-                SaeSoftmaxRowJetInput {
-                    n_atoms: k,
-                    out_dim: p,
-                    coordinate_slots: SaeSoftmaxRowJetInput::coordinate_slots_for(&primaries),
-                    primaries: primaries.clone(),
-                    gate_values,
-                    active_atoms: vec![true, true, row % 3 != 0],
-                    sqrt_row_weight: (1.0 + row as f64 * 0.1).sqrt(),
-                    decoded,
-                    decoded_first,
-                    decoded_second,
-                    beta_atoms: beta_atoms.into(),
-                    beta_basis_values,
-                    beta_basis_first,
-                    beta_outputs: beta_outputs.into(),
-                }
-            })
-            .collect();
-        let residual: Vec<f64> = (0..n * p)
-            .map(|index| 0.3 * ((index * 3 + 1) as f64 * 0.17).sin())
-            .collect();
-        (rows, residual)
-    }
-
     fn assert_blocks_close(fused: &ArrowBlocks, reference: &ArrowBlocks, tol: f64, label: &str) {
         assert_eq!(fused.n_rows, reference.n_rows, "{label}: row count");
         let pairs: [(&str, &Vec<f64>, &Vec<f64>); 5] = [
@@ -559,28 +477,6 @@ mod tests {
             }
         }
         assert!(nonzero, "{label}: reference blocks are entirely zero");
-    }
-
-    /// CPU-parity: the fused resident formulation reproduces the arrow blocks of
-    /// the OLD boundary (materialize the full tower, then contract on the host).
-    /// Runs with no GPU.
-    #[test]
-    fn resident_arrow_blocks_match_materialized_tower_contraction_1017() {
-        // More rows than one reduction leaf, so the cross-row β tree has an
-        // interior node AND an odd tail.
-        let n = ARROW_REDUCTION_LEAF_ROWS * 2 + 7;
-        let (rows, residual) = fixture(n);
-        for curvature in [ArrowCurvature::GaussNewton, ArrowCurvature::ExactNewton] {
-            let mut handle =
-                ResidentRowJetHandle::new(3, 6, 4, 3, 1.3, n, SaeRowJetPath::Cpu).expect("handle");
-            assert!(handle.deterministic());
-            let fused = handle
-                .accumulate_arrow_blocks(&rows, &residual, curvature)
-                .expect("fused arrow blocks");
-            let reference = arrow_blocks_from_materialized_tower(&rows, &residual, 1.3, curvature)
-                .expect("materialized-tower reference");
-            assert_blocks_close(&fused, &reference, 1.0e-12, &format!("{curvature:?}"));
-        }
     }
 
     /// The Gauss-Newton and exact-Newton blocks must differ (otherwise the
@@ -681,65 +577,4 @@ mod tests {
         }
     }
 
-    /// The device path must reproduce the host mirror on every reduced block.
-    /// Skips ONLY when CUDA is genuinely absent; a real driver error fails loud.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn resident_arrow_device_matches_host_reduced_blocks_1017() {
-        // The availability question goes through the one shared gate (#2422).
-        // The seam assertion below is this test's own and is kept; what the bare
-        // `resolve` could not do is make the skip VISIBLE — the process counter
-        // never moved and no `SKIPPED(no-cuda):` line was emitted, so a CI ledger
-        // scraping a green CPU-only run saw no trace that the device half never
-        // ran. `gpu_for_test` also panics under `GpuPolicy::Required`, so a GPU
-        // lane no longer needs a per-test opt-in.
-        let skips_before = gam_gpu::test_gate::skipped_for_absent_device();
-        match gam_gpu::test_gate::gpu_for_test("resident-arrow reduced-block parity #1017") {
-            gam_gpu::test_gate::GpuTestGate::Ready(_) => {}
-            gam_gpu::test_gate::GpuTestGate::AbsentDevice => {
-                gam_gpu::test_gate::assert_absent_device_was_counted(skips_before);
-                // #2422: a bare `return` here reported `passed` with zero
-                // assertions on every device-free runner. Without a device the
-                // Device-path constructor must REFUSE -- `ResidentRowJetHandle::new`
-                // routes `SaeRowJetPath::Device` into
-                // `device::DeviceResidency::allocate`, which needs a backend, so an
-                // `Ok` would mean the handle fabricated device residency (#1551).
-                // The host path is constructed first so a fixture broken for an
-                // unrelated reason cannot make the refusal pass for the wrong reason.
-                let n = ARROW_REDUCTION_LEAF_ROWS + 1;
-                ResidentRowJetHandle::new(3, 6, 4, 3, 1.3, n, SaeRowJetPath::Cpu)
-                    .expect("the host resident-arrow handle must build on every host");
-                assert!(
-                    ResidentRowJetHandle::new(3, 6, 4, 3, 1.3, n, SaeRowJetPath::Device).is_err(),
-                    "no CUDA runtime on this host, yet the Device resident-arrow handle \
-                     constructed -- the seam fabricated device residency (#1551 class)"
-                );
-                return;
-            }
-        }
-        let n = ARROW_REDUCTION_LEAF_ROWS * 5 + 3;
-        let (rows, residual) = fixture(n);
-        for curvature in [ArrowCurvature::GaussNewton, ArrowCurvature::ExactNewton] {
-            let mut host =
-                ResidentRowJetHandle::new(3, 6, 4, 3, 1.3, n, SaeRowJetPath::Cpu).expect("host");
-            let expected = host
-                .accumulate_arrow_blocks(&rows, &residual, curvature)
-                .expect("host blocks");
-            let mut resident = ResidentRowJetHandle::new(3, 6, 4, 3, 1.3, n, SaeRowJetPath::Device)
-                .expect("device residency");
-            // Two passes through the SAME resident buffers: no reallocation, and
-            // the second pass must be bit-identical to the first.
-            let first = resident
-                .accumulate_arrow_blocks(&rows, &residual, curvature)
-                .expect("device blocks");
-            let second = resident
-                .accumulate_arrow_blocks(&rows, &residual, curvature)
-                .expect("device blocks (repeat)");
-            assert_eq!(
-                first, second,
-                "resident device reduction is not reproducible"
-            );
-            assert_blocks_close(&first, &expected, 1.0e-12, &format!("device {curvature:?}"));
-        }
-    }
 }

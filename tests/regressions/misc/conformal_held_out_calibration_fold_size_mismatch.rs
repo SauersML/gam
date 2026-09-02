@@ -25,7 +25,7 @@
 //!   2. the resulting conformal interval achieves at least nominal coverage on
 //!      a fresh draw from the same DGP (within small finite-sample slack).
 
-use gam::estimate::{FitOptions, fit_gam};
+use gam::estimate::FitOptions;
 use gam::matrix::DesignMatrix;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};

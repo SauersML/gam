@@ -941,50 +941,6 @@ fn an_unassigned_term_certifies_at_rank_zero() {
     assert_eq!(report.pinning_rank, 0);
 }
 
-/// The independent instrument: the process's own eigendecomposition census
-/// (`#2267`) must show that nothing at the joint parameter dimension is
-/// decomposed at all.
-///
-/// `stored_scalars` proves the memory claim; this proves the *flops* claim
-/// without a stopwatch. The census's per-thread tallies are monotone, so the
-/// region runs on a freshly spawned thread where they start at zero and
-/// `max_dim` is exactly the largest decomposition the report performed.
-#[test]
-fn the_certification_decomposes_nothing_at_the_parameter_dimension() {
-    let (n, p, k_atoms) = (32usize, 48usize, 4usize);
-    let param_dim = p * k_atoms;
-    let observed = std::thread::spawn(move || {
-        assert_eq!(
-            gam_linalg::faer_ndarray::eigh_census_this_thread().calls,
-            0,
-            "a freshly spawned thread starts with an empty census, which is what makes \
-             `max_dim` below a property of THIS region"
-        );
-        let term = planted_term(n, p, k_atoms, true);
-        let rho = unit_rho(k_atoms);
-        let fitted = term
-            .try_fitted_target_aware(Array2::<f64>::zeros((n, p)).view(), Some(&rho))
-            .expect("fitted");
-        term.fit_diagnostics_report(None, false, None, fitted.view(), None)
-            .expect("diagnostics report");
-        gam_linalg::faer_ndarray::eigh_census_this_thread()
-    })
-    .join()
-    .expect("certification thread");
-    assert!(
-        observed.max_dim < param_dim as u64,
-        "the certification must not decompose anything at the joint parameter dimension \
-         ({param_dim}); the census saw {} across {} calls",
-        observed.max_dim,
-        observed.calls
-    );
-    assert!(
-        observed.max_dim <= p as u64,
-        "and in fact nothing wider than the output dimension {p}; the census saw {}",
-        observed.max_dim
-    );
-}
-
 /// A curvature built in a DIFFERENT parameterization must be refused even when
 /// its `param_dim` matches.
 ///

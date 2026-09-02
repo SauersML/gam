@@ -32,7 +32,6 @@
 //! Bounds are not weakened to force a pass; a genuine ALO shortfall failing is
 //! the intended behavior.
 
-use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, QualityPair, pad_to, pearson, rmse, run_python, run_r};

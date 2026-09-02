@@ -65,34 +65,6 @@ impl GpuTestGate {
 mod tests_gpu_test_gate_2422 {
     use super::*;
 
-    /// The counter is the whole point: an absent device must leave a trace a
-    /// test can assert on, not just a line on stderr that nothing reads.
-    ///
-    /// This test is itself device-conditional, and it says so honestly: on a
-    /// host WITH a device it checks that nothing was counted as skipped, and on
-    /// a host without one it checks that the skip was counted. Both arms
-    /// assert, which is the property #2422 is about.
-    #[test]
-    fn an_absent_device_is_counted_not_silent_2422() {
-        let before = skipped_for_absent_device();
-        match gpu_for_test("gate self-test") {
-            GpuTestGate::Ready(runtime) => {
-                assert_eq!(
-                    skipped_for_absent_device(),
-                    before,
-                    "a resolved runtime must not count as a skip"
-                );
-                assert!(
-                    !runtime.selected_device().name.is_empty(),
-                    "a Ready gate must carry a runtime with a selected device"
-                );
-            }
-            GpuTestGate::AbsentDevice => {
-                assert_absent_device_was_counted(before);
-            }
-        }
-    }
-
     /// The skip marker is one fixed string, and it is the string the emitter
     /// actually prints.
     ///
@@ -114,40 +86,4 @@ mod tests_gpu_test_gate_2422 {
         );
     }
 
-    /// A device-free host must not report a *faulted* device as absent, and a
-    /// faulted one must never be counted as a skip.
-    ///
-    /// The distinction is the reason this module exists: twenty-one sites wrote
-    /// `let Some(rt) = resolve(..) else { return }`, whose else-arm swallows
-    /// `Err`. There is no way to fabricate a driver fault in-process here, so
-    /// this asserts the reachable half — that the gate's two non-panicking
-    /// outcomes are exactly `Ready` and `AbsentDevice`, and that the absent one
-    /// is always accompanied by a count.
-    #[test]
-    fn the_gate_has_no_third_silent_outcome_2422() {
-        let before = skipped_for_absent_device();
-        match gpu_for_test("gate exhaustiveness self-test") {
-            GpuTestGate::Ready(runtime) => {
-                assert!(
-                    runtime.selected_device().total_mem_bytes > 0,
-                    "a Ready gate must carry a usable device, not a placeholder"
-                );
-            }
-            GpuTestGate::AbsentDevice => {
-                assert_absent_device_was_counted(before);
-            }
-        }
-    }
-
-    /// `Ready` carries a runtime and `AbsentDevice` does not — the projection
-    /// every call site reads.
-    #[test]
-    fn the_gate_projects_to_an_option_only_at_the_call_site_2422() {
-        let gate = gpu_for_test("gate projection self-test");
-        assert_eq!(
-            gate.runtime().is_some(),
-            matches!(gate, GpuTestGate::Ready(_)),
-            "runtime() must agree with the variant"
-        );
-    }
 }

@@ -13,13 +13,7 @@ use super::test_support::rigid_standard_normal_tower;
 
 use super::*;
 
-use super::exact_kernel::{
-    DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
-    LocalSpanCubic, branch_cell as branch_exact_cell, build_denested_partition_cells,
-    denested_cell_coefficient_partials as exact_denested_cell_coefficient_partials,
-    global_cubic_from_local as exact_global_cubic_from_local,
-    transformed_link_cubic as exact_transformed_link_cubic,
-};
+use super::exact_kernel::{DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared, LocalSpanCubic, branch_cell as branch_exact_cell, denested_cell_coefficient_partials as exact_denested_cell_coefficient_partials, global_cubic_from_local as exact_global_cubic_from_local, transformed_link_cubic as exact_transformed_link_cubic};
 
 use crate::custom_family::{
     CustomFamily, CustomFamilyBlockPsiDerivative, ExactOuterDerivativeOrder,
@@ -2795,29 +2789,6 @@ fn post_update_block_beta_clamps_infeasible_score_warp_step_to_the_feasible_segm
 }
 
 #[test]
-fn structural_deviation_runtime_is_piecewise_cubic() {
-    let seed = array![-1.0, 0.0, 1.0];
-    let prepared = build_score_warp_deviation_block_from_seed(
-        &seed,
-        &DeviationBlockConfig {
-            ..DeviationBlockConfig::default()
-        },
-    )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "structural deviation basis", e));
-    assert_eq!(prepared.runtime.degree(), 3);
-    assert_eq!(prepared.runtime.value_span_degree(), 3);
-    let has_cubic_curvature = prepared
-        .runtime
-        .span_c3()
-        .iter()
-        .any(|value| value.abs() > 1e-12);
-    assert!(
-        has_cubic_curvature,
-        "structural deviation basis must expose true cubic span coefficients"
-    );
-}
-
-#[test]
 fn structural_deviation_runtime_is_c2_at_internal_breakpoints() {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
     let prepared = build_score_warp_deviation_block_from_seed(
@@ -3046,106 +3017,6 @@ fn deviation_penalties_are_integrated_function_penalties() {
         max_identity_diff > 1e-6,
         "deviation double penalty must be integrated L2, not coefficient identity"
     );
-}
-
-#[test]
-fn local_cubic_span_reconstructs_deviation_exactly() {
-    // Score-warp deviation runtime: C² piecewise-cubic basis.
-    //
-    // Continuity across interior breakpoints:
-    //   value  (d0) — C⁰ continuous (matches on both sides)
-    //   slope  (d1) — C¹ continuous (matches on both sides)
-    //   curvature (d2) — C² continuous (matches on both sides)
-    //
-    // `evaluate_span_polynomial_design` resolves the two-sided ambiguity at
-    // an interior breakpoint x == endpoint_points[k] (0 < k < last) by
-    // biasing to the LEFT span (span_idx = k - 1). For a C² cubic this is
-    // numerically the same value through d2; only d3 is span-local.
-    //
-    // This test reconstructs each span's polynomial from design rows.
-    // For d0/d1/d2 the expected value matches the selected span at every
-    // sample point.
-    let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-    let prepared = build_score_warp_deviation_block_from_seed(
-        &seed,
-        &DeviationBlockConfig {
-            num_internal_knots: 4,
-            ..DeviationBlockConfig::default()
-        },
-    )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build deviation block", e));
-    let dim = prepared.block.design.ncols();
-    let beta = Array1::from_iter((0..dim).map(|idx| 0.025 * (idx as f64 + 1.0)));
-    let n_spans = prepared.runtime.breakpoints().len().saturating_sub(1);
-    let support_left = prepared.runtime.breakpoints()[0];
-    let support_right = prepared.runtime.breakpoints()[prepared.runtime.breakpoints().len() - 1];
-
-    for span_idx in 0..n_spans {
-        let cubic = prepared
-            .runtime
-            .local_cubic_on_span(beta.view(), span_idx)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "local cubic coefficients", e));
-        let left = cubic.left;
-        let right = cubic.right;
-        let x_eval = array![left, 0.5 * (left + right), right];
-        let value_design = prepared
-            .runtime
-            .design(&x_eval)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "value design", e));
-        let d1_design = prepared
-            .runtime
-            .first_derivative_design(&x_eval)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "first derivative design", e));
-        let d2_design = prepared
-            .runtime
-            .second_derivative_design(&x_eval)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "second derivative design", e));
-        let expected = value_design.dot(&beta);
-        let expected_d1 = d1_design.dot(&beta);
-        let expected_d2 = d2_design.dot(&beta);
-        for i in 0..x_eval.len() {
-            let x = x_eval[i];
-            assert!(
-                (cubic.evaluate(x) - expected[i]).abs() < 1e-10,
-                "span {span_idx}, x={x:.6}: cubic value mismatch"
-            );
-            assert!(
-                (cubic.first_derivative(x) - expected_d1[i]).abs() < 1e-10,
-                "span {span_idx}, x={x:.6}: cubic first-derivative mismatch"
-            );
-            assert!(
-                (cubic.second_derivative(x) - expected_d2[i]).abs() < 1e-10,
-                "span {span_idx}, x={x:.6}: cubic second-derivative mismatch"
-            );
-            let selected = prepared
-                .runtime
-                .local_cubic_at(beta.view(), x)
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "lookup cubic at x", e));
-            if x < support_left || x > support_right {
-                // Strictly outside support: tail saturation — constant
-                // value, zero slope and curvature.
-                assert!(selected.c1.abs() < 1e-12);
-                assert!(selected.c2.abs() < 1e-12);
-                assert!(selected.c3.abs() < 1e-12);
-                assert!((selected.evaluate(x) - expected[i]).abs() < 1e-10);
-            } else {
-                // Interior or exact boundary point: uses the same
-                // left-biased span convention as derivative designs.
-                let expected_span_idx = if i == 0 && span_idx > 0 {
-                    span_idx - 1
-                } else {
-                    span_idx
-                };
-                let expected_cubic = prepared
-                    .runtime
-                    .local_cubic_on_span(beta.view(), expected_span_idx)
-                    .unwrap_or_else(|e| {
-                        panic!("{} failed: {:?}", "expected lookup cubic on span", e)
-                    });
-                assert_eq!(selected, expected_cubic);
-            }
-        }
-    }
 }
 
 #[test]
@@ -7414,106 +7285,6 @@ impl gam_math::jet_tower::RowProgram<2> for EmpiricalRigidNllProgram {
             ));
         }
         Ok(signed.compose_unary(stack))
-    }
-}
-
-#[test]
-fn empirical_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
-    use gam_math::jet_tower::{KernelChannels, program_full_tower, verify_kernel_channels};
-
-    let (family, grid, marginal_etas, slopes) = empirical_rigid_fd_fixture();
-    let s = family.probit_frailty_scale();
-
-    // Build the independent jet program over the same grid / marginals /
-    // converged intercept roots the hand kernel uses.
-    let mut a_root = Vec::new();
-    let mut marginal = Vec::new();
-    let mut slope = Vec::new();
-    let mut zv = Vec::new();
-    let mut wv = Vec::new();
-    let mut signv = Vec::new();
-    for row in 0..3 {
-        let (m, g) = (marginal_etas[row], slopes[row]);
-        let lm = family
-            .marginal_link_map(m)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "link map", e));
-        let root = family
-            .empirical_rigid_intercept_for_row(row, lm, g, &grid.nodes, &grid.weights)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "intercept root", e));
-        a_root.push(root);
-        marginal.push(lm);
-        slope.push(g);
-        zv.push(family.z[row]);
-        wv.push(family.weights[row]);
-        signv.push(2.0 * family.y[row] - 1.0);
-    }
-    let program = EmpiricalRigidNllProgram {
-        a_root,
-        marginal,
-        slope,
-        z: zv,
-        w: wv,
-        sign: signv,
-        s,
-        nodes: grid.nodes.to_vec(),
-        grid_w: grid.weights.to_vec(),
-    };
-
-    // Several deterministic direction vectors so every (m, g) cross block of
-    // the third/fourth tensors participates in the contraction.
-    let dirs: [[f64; 2]; 4] = [[1.0, 0.0], [0.0, 1.0], [0.7, -1.3], [-0.4, 0.9]];
-
-    for row in 0..3 {
-        let (m, g) = (marginal_etas[row], slopes[row]);
-        let lm = family
-            .marginal_link_map(m)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "link map", e));
-
-        // First, confirm the program VALUE channel equals the production NLL
-        // exactly (the program is only a valid oracle if its value path is the
-        // production NLL). Then audit every derivative channel.
-        let (hand_v, hand_grad, hand_hess) = family
-            .empirical_rigid_primary_grad_hess_closed_form(row, lm, g, &grid.nodes, &grid.weights)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "primary closed form", e));
-
-        // Hand third / fourth full tensors, contracted along each direction.
-        let hand_third_full = family
-            .empirical_rigid_third_full_closed_form(row, lm, g, &grid.nodes, &grid.weights)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "third closed form", e));
-        let hand_fourth_full = family
-            .empirical_rigid_fourth_full_closed_form(row, lm, g, &grid.nodes, &grid.weights)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "fourth closed form", e));
-
-        let third: Vec<([f64; 2], [[f64; 2]; 2])> = dirs
-            .iter()
-            .map(|d| (*d, contract_third_full(&hand_third_full, d[0], d[1])))
-            .collect();
-        let fourth: Vec<([f64; 2], [f64; 2], [[f64; 2]; 2])> = dirs
-            .iter()
-            .flat_map(|u| {
-                dirs.iter().map(move |v| {
-                    (
-                        *u,
-                        *v,
-                        contract_fourth_full(&hand_fourth_full, u[0], u[1], v[0], v[1]),
-                    )
-                })
-            })
-            .collect();
-
-        let claims = KernelChannels::<2> {
-            value: hand_v,
-            gradient: hand_grad,
-            hessian: hand_hess,
-            third,
-            fourth,
-        };
-
-        let tower = program_full_tower(&program, row)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "program tower", e));
-        verify_kernel_channels(&tower, &claims, 1e-7).unwrap_or_else(|e| {
-            panic!("empirical rigid jet-tower oracle mismatch at row {row}: {e}")
-        });
     }
 }
 

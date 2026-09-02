@@ -135,43 +135,6 @@ fn build_cold_k1_term(z: &Array2<f64>, seed_logit: f64) -> SaeManifoldTerm {
     SaeManifoldTerm::new(vec![atom], assignment).unwrap()
 }
 
-fn run_production_fit(z: &Array2<f64>, seed_logit: f64) -> (SaeManifoldTerm, SaeManifoldRho) {
-    let term = build_cold_k1_term(z, seed_logit);
-    let seed_dispersion = term
-        .seed_reconstruction_dispersion(z.view())
-        .expect("seed reconstruction dispersion");
-    let init_rho = SaeManifoldRho::new(
-        SPARSITY.ln(),
-        SMOOTHNESS.ln(),
-        vec![Array1::<f64>::zeros(0)],
-    )
-    .seed_scaled_by_dispersion(seed_dispersion)
-    .expect("dimensionless seed scaling");
-    let init_flat = init_rho.to_flat();
-    let n_params = init_flat.len();
-    let mut objective = SaeManifoldOuterObjective::new(
-        term,
-        z.clone(),
-        None,
-        init_rho,
-        INNER_MAX_ITER,
-        LEARNING_RATE,
-        RIDGE_EXT_COORD,
-        RIDGE_BETA,
-    );
-    let result = OuterProblem::new(n_params)
-        .with_initial_rho(init_flat)
-        .run(&mut objective, "K=1 circle radial bias")
-        .expect("production outer fit must converge");
-    objective
-        .certify_outer_result(&result)
-        .expect("radial-bias outer result must certify the installed state");
-    let fitted_result = objective.into_fitted().expect("outer fit was evaluated");
-    let term = fitted_result.term;
-    let rho = fitted_result.rho;
-    (term, rho)
-}
-
 struct ArmMetrics {
     mean_zeta: f64,
     radius_ratio: f64,

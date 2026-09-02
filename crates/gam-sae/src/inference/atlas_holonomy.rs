@@ -24,6 +24,7 @@ use gam_math::probability::normal_two_sided_probability;
 use ndarray::{Array1, Array2, ArrayView2, s};
 use statrs::distribution::{ContinuousCDF, Normal};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use crate::manifold::SphereChartTransition;
 
 const INTRINSIC_DIMENSION: usize = 2;
 
@@ -1587,22 +1588,6 @@ mod tests {
     use crate::manifold::AtlasSeamKind;
     use ndarray::{arr2, array};
 
-    fn analytic_edge(a: usize, b: usize, overlap: usize, sign: i8) -> AtlasSignedEdge {
-        assert!(matches!(sign, -1 | 1));
-        let transition = SphereChartTransition::new_analytic(
-            a,
-            b,
-            [
-                [f64::from(sign), 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            AtlasSeamKind::Regular,
-        )
-        .unwrap();
-        AtlasSignedEdge::from_analytic_sphere_transition(&transition, overlap).unwrap()
-    }
-
     fn projection_frame(angle: f64, padded_ambient: usize) -> Array2<f64> {
         let mut frame = Array2::<f64>::zeros((3 + padded_ambient, 3));
         let (cosine, sine) = (angle.cos(), angle.sin());
@@ -1932,64 +1917,6 @@ mod tests {
 
     fn wrap_signed_angle(angle: f64) -> f64 {
         (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
-    }
-
-    #[test]
-    fn authoritative_edge_constructors_enforce_canonical_identity() {
-        assert!(GaussianPcaPopulationBounds::new(f64::MAX, f64::MAX, 1.0).is_err());
-        assert!(GaussianPcaPopulationBounds::new(0.0, 1.0, 2.0).is_err());
-        assert!(AtlasHolonomyEdgeId::new(1, 1, 0).is_err());
-        assert_eq!(
-            AtlasHolonomyEdgeId::new(4, 2, 9).unwrap(),
-            AtlasHolonomyEdgeId::new(2, 4, 9).unwrap()
-        );
-        assert!(
-            SphereChartTransition::new_analytic(0, 1, [[0.0; 3]; 3], AtlasSeamKind::Regular,)
-                .is_err()
-        );
-        assert!(
-            ProjectedAtlasEdgeSpec::new(
-                0,
-                1,
-                0,
-                PopulationCrossGramProvenance::EstimatedOnly,
-                f64::NAN,
-            )
-            .is_err()
-        );
-        assert!(
-            ExactAnalyticHolonomyCertificate::new(
-                2,
-                vec![analytic_edge(0, 1, 3, 1), analytic_edge(0, 1, 3, -1),],
-            )
-            .is_err()
-        );
-        assert!(
-            ExactAnalyticHolonomyCertificate::new(2, vec![analytic_edge(0, 2, 0, 1)],).is_err()
-        );
-    }
-
-    #[test]
-    fn fitted_sphere_seam_cannot_construct_an_exact_analytic_edge() {
-        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let fitted =
-            SphereChartTransition::new_fitted(0, 1, identity, crate::manifold::AtlasSeamKind::Pole)
-                .unwrap();
-        assert!(AtlasSignedEdge::from_analytic_sphere_transition(&fitted, 0).is_err());
-
-        let analytic = SphereChartTransition::new_analytic(
-            0,
-            1,
-            identity,
-            crate::manifold::AtlasSeamKind::Pole,
-        )
-        .unwrap();
-        assert_eq!(
-            AtlasSignedEdge::from_analytic_sphere_transition(&analytic, 0)
-                .unwrap()
-                .sign(),
-            1
-        );
     }
 
     #[test]

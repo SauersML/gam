@@ -22,11 +22,7 @@
 //! extension ⇒ nonzero boundary-slope exterior derivative. These tests pin both,
 //! across the sparse, dense, and scalar paths.
 
-use gam::terms::basis::{
-    BasisOptions, Dense, KnotSource, Sparse, SplineScratch, create_basis,
-    evaluate_bspline_basis_scalar, evaluate_bspline_derivative_scalar,
-    evaluate_bsplinesecond_derivative_scalar,
-};
+use gam::terms::basis::{BasisOptions, Dense, KnotSource, Sparse, SplineScratch, create_basis, evaluate_bspline_basis_scalar, evaluate_bspline_derivative_scalar};
 use ndarray::{Array1, Array2};
 
 fn open_knots(a: f64, b: f64, m: usize) -> Array1<f64> {

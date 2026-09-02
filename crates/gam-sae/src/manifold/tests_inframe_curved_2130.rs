@@ -6,11 +6,7 @@
 use ndarray::{Array2, Array3};
 
 use super::atom::{SaeAtomBasisKind, SaeManifoldAtom};
-use super::inframe_curved::{
-    ChartOccupancyStatus, CurvedRegion, InFrameCurvedConfig, WeightFrameOccupancy,
-    activate_residual_frame, dense_ambient_radial_reference, fit_inframe_curved_regions,
-    fit_inframe_curved_weight_frame_catalog, inframe_curved_region_prediction, residual_span_frame,
-};
+use super::inframe_curved::{ChartOccupancyStatus, CurvedRegion, InFrameCurvedConfig, WeightFrameOccupancy, activate_residual_frame, fit_inframe_curved_weight_frame_catalog, residual_span_frame};
 use super::weight_frame_catalog::{
     WeightFrameCatalogConfig, WeightFrameMatrix, WeightFrameSource,
     frame_catalog_from_weight_matrices,

@@ -774,13 +774,7 @@ impl SmoothBasisSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis::{
-        BSplineBoundaryConditions, BasisWorkspace, ConstantCurvatureIdentifiability,
-        DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternIdentifiability, MaternNu,
-        MeasureJetIdentifiability, SphereWahbaKernel, SphericalSplineIdentifiability,
-        build_constant_curvature_basis, build_spherical_spline_basis,
-        constant_curvature_kernel_kappa_jets,
-    };
+    use crate::basis::{BSplineBoundaryConditions, BasisWorkspace, ConstantCurvatureIdentifiability, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternIdentifiability, MaternNu, MeasureJetIdentifiability, SphereWahbaKernel, SphericalSplineIdentifiability, build_constant_curvature_basis, build_spherical_spline_basis};
     use ndarray::{Array1, Array2, array};
     use std::collections::HashSet;
 

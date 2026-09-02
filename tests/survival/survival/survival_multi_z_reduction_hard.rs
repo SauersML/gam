@@ -3,14 +3,8 @@
 // designed to surface drift between specialised K=1 / Diagonal / LowRank routes
 // and the generic Full path. If any assertion fails, that is a real bug.
 
-use gam::families::bms::{
-    MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
-    marginal_slope_preserving_scale, marginal_slope_probit_eta,
-};
-use gam::families::survival::marginal_slope::{
-    RigidVectorValueWorkspace, survival_marginal_slope_vector_eta,
-    survival_marginal_slope_vector_neglog, survival_marginal_slope_vector_scale,
-};
+use gam::families::bms::{MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores};
+use gam::families::survival::marginal_slope::{RigidVectorValueWorkspace, survival_marginal_slope_vector_neglog};
 use gam::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 

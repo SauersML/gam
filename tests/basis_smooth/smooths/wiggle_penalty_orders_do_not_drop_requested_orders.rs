@@ -1,7 +1,4 @@
-use gam::families::wiggle::{
-    WiggleBlockConfig, buildwiggle_block_input_from_orders, buildwiggle_block_input_from_seed,
-    split_wiggle_penalty_orders,
-};
+use gam::families::wiggle::{WiggleBlockConfig, buildwiggle_block_input_from_orders, split_wiggle_penalty_orders};
 use ndarray::array;
 
 #[test]

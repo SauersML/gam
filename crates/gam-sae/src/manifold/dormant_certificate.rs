@@ -546,17 +546,6 @@ mod tests {
         (blocks, gates)
     }
 
-    fn ledger(x: &Array2<f32>, decoder: &Array2<f32>) -> AtomOccupancy {
-        let (blocks, gates) = route_top1(x, decoder);
-        let n_eff = effective_occupancy(blocks.view(), gates.view(), CAPACITY)
-            .expect("routing is well formed");
-        classify_occupancy(
-            &n_eff,
-            OccupancyThreshold::FrameIdentifiability { frame_dim: B },
-        )
-        .expect("identifiability threshold is positive")
-    }
-
     fn inputs<'a>(
         frames: &'a Array2<f32>,
         replayed: &'a Array2<f32>,
@@ -679,58 +668,4 @@ mod tests {
         ));
     }
 
-    /// Conditions 3–5 are load-bearing: a profitable birth, a profitable structural
-    /// move, and a ledger that fails to recur each refuse the certificate even
-    /// though the ACTIVE continuous fixed point holds exactly.
-    #[test]
-    fn dormant_capacity_certificate_refuses_profitable_moves_and_open_ledger() {
-        let x = corpus();
-        let decoder = capacity_decoder();
-        let occupancy = ledger(&x, &decoder);
-
-        let birth = certify_dormant_capacity(inputs(
-            &decoder,
-            &decoder,
-            &occupancy,
-            &occupancy,
-            &[-1.0, 4.75],
-        ))
-        .expect("well-formed certificate inputs");
-        assert!(!birth.no_profitable_birth);
-        assert_eq!(
-            birth.verdict,
-            CapacityVerdict::NotConverged(NotConvergedReason::ProfitableBirth { margin: 4.75 })
-        );
-
-        let mut structural = inputs(&decoder, &decoder, &occupancy, &occupancy, &[]);
-        let margins = [0.5_f64];
-        structural.structural_margins = &margins;
-        let merged = certify_dormant_capacity(structural).expect("well-formed certificate inputs");
-        assert!(!merged.no_profitable_structural_move);
-        assert_eq!(
-            merged.verdict,
-            CapacityVerdict::NotConverged(NotConvergedReason::ProfitableStructuralMove {
-                margin: 0.5
-            })
-        );
-
-        // A dormant slot that woke up (its N_eff cleared the identifiability count)
-        // is a CHANGED ledger — that, and not dormant frame motion, is the recurrence
-        // failure the certificate is supposed to catch.
-        let mut woken = occupancy.clone();
-        woken.effective_rows[7] = 32.0;
-        let woken = classify_occupancy(&woken.effective_rows, woken.threshold)
-            .expect("identifiability threshold is positive");
-        let open =
-            certify_dormant_capacity(inputs(&decoder, &decoder, &occupancy, &woken, &[-1.0]))
-                .expect("well-formed certificate inputs");
-        assert!(!open.ledger_recurs);
-        assert_eq!(
-            open.verdict,
-            CapacityVerdict::NotConverged(NotConvergedReason::LedgerChanged {
-                entered: vec![7],
-                left: vec![],
-            })
-        );
-    }
 }

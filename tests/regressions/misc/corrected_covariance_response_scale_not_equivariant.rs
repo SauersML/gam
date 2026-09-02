@@ -26,7 +26,7 @@
 //!   2. premise  — `Vb` diagonals scale by exactly `c²`,
 //!   3. property — `Vp` diagonals scale by the same `c²` (was `c⁴`).
 
-use gam::estimate::{FitOptions, fit_gam};
+use gam::estimate::FitOptions;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};

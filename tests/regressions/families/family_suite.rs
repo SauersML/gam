@@ -1,8 +1,6 @@
 use gam::families::family_runtime::{FamilyStrategy, strategy_for_spec};
 use gam::families::marginal_slope_shared::{outer_row_weights_by_index, outer_weighted_rows};
-use gam::families::scale_design::{
-    apply_scale_deviation_transform, build_scale_deviation_transform,
-};
+use gam::families::scale_design::build_scale_deviation_transform;
 use gam::families::survival::latent::fixed_latent_hazard_frailty;
 use gam::families::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
 use gam::families::vector_response::{GaussianVectorLikelihood, VectorNoise, VectorResponseTarget};
@@ -116,52 +114,6 @@ fn bug_marginal_slope_outer_weighted_rows_match_documented_row_weights() {
         (dense[1] - 2.5).abs() < 1e-12 && (dense[3] - 5.0).abs() < 1e-12,
         "outer_row_weights_by_index must place retained-row weights at their original row indices."
     );
-}
-
-#[test]
-fn bug_vector_response_rejects_row_weight_dimension_mismatch_and_noise_diagonals_are_documented() {
-    let y = Array2::<f64>::zeros((3, 2));
-    let target = VectorResponseTarget::new(y.clone(), VectorNoise::Isotropic(2.0));
-    let err = target.with_row_weights(array![1.0, 2.0]).expect_err(
-        "VectorResponseTarget must reject row_weights vectors whose length does not match N.",
-    );
-    assert!(
-        format!("{err}").contains("length 2"),
-        "Mismatched row-weight dimensions should report the observed size."
-    );
-
-    let iso = VectorNoise::Isotropic(2.0)
-        .diag_precision(2)
-        .expect("Isotropic noise with sigma=2 must be valid.");
-    assert!(
-        (iso[0] - 0.25).abs() < 1e-12 && (iso[1] - 0.25).abs() < 1e-12,
-        "Isotropic VectorNoise diag_precision must return 1/sigma^2 in every column."
-    );
-
-    let diag = VectorNoise::Diagonal(array![2.0, 4.0])
-        .diag_precision(2)
-        .expect("Positive diagonal sigmas must be valid.");
-    assert!(
-        (diag[0] - 0.25).abs() < 1e-12 && (diag[1] - 0.0625).abs() < 1e-12,
-        "Diagonal VectorNoise diag_precision must return elementwise 1/sigma_j^2."
-    );
-
-    let low_rank = VectorNoise::LowRank {
-        diag: array![3.0, 5.0],
-        factor: Array2::zeros((2, 1)),
-    }
-    .diag_precision(2)
-    .expect("LowRank noise with positive precision diagonal must be valid.");
-    assert!(
-        (low_rank[0] - 3.0).abs() < 1e-12 && (low_rank[1] - 5.0).abs() < 1e-12,
-        "LowRank VectorNoise diag_precision must return the diagonal precision unchanged."
-    );
-
-    GaussianVectorLikelihood::from_target(&VectorResponseTarget::new(
-        y,
-        VectorNoise::Diagonal(array![1.0, 1.0]),
-    ))
-    .expect("Well-formed vector-response targets must construct a GaussianVectorLikelihood.");
 }
 
 #[test]

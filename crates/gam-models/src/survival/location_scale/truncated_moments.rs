@@ -699,29 +699,6 @@ mod tests {
     };
     use ndarray::array;
 
-    /// Knots and degree for a link-wiggle block of the requested width, taken
-    /// from the production seed builder so the basis is the one predict uses.
-    fn wiggle_metadata(width: usize) -> (Array1<f64>, usize) {
-        let seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
-        for degree in [2usize, 3, 1] {
-            for num_internal_knots in 0..=8 {
-                let config = WiggleBlockConfig {
-                    degree,
-                    num_internal_knots,
-                    penalty_order: 2,
-                    double_penalty: false,
-                };
-                if let Ok((block, knots)) =
-                    crate::wiggle::buildwiggle_block_input_from_seed(seed.view(), &config)
-                    && block.design.ncols() == width
-                {
-                    return (knots, degree);
-                }
-            }
-        }
-        panic!("could not synthesize link-wiggle metadata for {width} coefficients");
-    }
-
     /// #2679: the response-moment integral must be taken against the
     /// CONE-TRUNCATED posterior, not against the normal that carries its first
     /// two moments.

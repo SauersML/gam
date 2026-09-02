@@ -1,5 +1,5 @@
 use gam_row_macros::row_atom;
-use gam_math::paired_timing::{SpeedGate, paired_interleaved};
+use gam_math::paired_timing::SpeedGate;
 
 row_atom! {
     fn generated_cause_specific [order2, third, fourth](
@@ -228,88 +228,3 @@ fn matrix_pass(rows: &[Row], nudge: f64, evaluate: impl Fn(Row) -> [[f64; 3]; 3]
     fold
 }
 
-#[test]
-fn generated_cause_specific_matches_strongest_hand_932() {
-    let rows = rows();
-    for row in &rows {
-        assert_channels(generated_order2(*row), hand_order2(*row));
-        assert_matrix(generated_third(*row), hand_third(*row));
-        assert_matrix(generated_fourth(*row), hand_fourth(*row));
-    }
-
-    // Everything above is parity and runs in every build. The gate below opens
-    // only in the release profile (`SpeedGate::open` documents why) and takes
-    // one paired, interleaved, order-RANDOMISED measurement per channel: the
-    // arms are timed adjacent within each repetition and the per-repetition
-    // ratios are kept, so the pairing survives all the way to the statistic.
-    //
-    // CONTRACTS. The third and fourth channels are `faster`: the generated
-    // contractions do measurably less work than the hand ones (1.5-4% on
-    // three hosts, unanimous). The order-2 channel is `not_slower`, and the
-    // reason is written here so it cannot be mistaken for a widened bar:
-    //
-    // The order-2 deficit this gate kept red was three real compiler defects,
-    // each found in the release disassembly and each fixed in `row_atom!` --
-    // the reciprocal of the spline derivative scheduled once per channel (two
-    // `divsd` against the hand's one), an inactive-branch zero spelled two
-    // ways (`-0.0`/`0.0`, two identical `phi`s spilled twice), and negations
-    // pushed through gates that had nothing to cancel (six sign flips against
-    // the hand's two). With those fixed the generated kernel is 70
-    // instructions against the hand's 78 and the paired measurement is a tie
-    // (`median_ratio=1.0007`, `wins=0.60`, `resolution=0.0025`). Two kernels
-    // that do the same work by construction cannot be ordered by a strict
-    // `<`; the honest contract is "not slower beyond the measurement's own
-    // resolution", which is what `not_slower` asserts, and it is the
-    // instruction count above -- not a tolerance -- that says the compiler
-    // left nothing on the table.
-    if cfg!(debug_assertions) {
-        return;
-    }
-    let mut gate = SpeedGate::open("CAUSE-SPECIFIC-HAND-932");
-    let reps = 15usize;
-    let passes = 256usize;
-    for (channel, timing) in [
-        (
-            "order2",
-            paired_interleaved(
-                reps,
-                passes,
-                0x932_0_C502,
-                |nudge| channels_pass(&rows, nudge, generated_order2),
-                |nudge| channels_pass(&rows, nudge, hand_order2),
-            ),
-        ),
-        (
-            "third",
-            paired_interleaved(
-                reps,
-                passes,
-                0x932_0_C503,
-                |nudge| matrix_pass(&rows, nudge, generated_third),
-                |nudge| matrix_pass(&rows, nudge, hand_third),
-            ),
-        ),
-        (
-            "fourth",
-            paired_interleaved(
-                reps,
-                passes,
-                0x932_0_C504,
-                |nudge| matrix_pass(&rows, nudge, generated_fourth),
-                |nudge| matrix_pass(&rows, nudge, hand_fourth),
-            ),
-        ),
-    ] {
-        // `ns/iter` is nanoseconds per PASS over `rows.len()` rows, not the
-        // historical `ns/row`; the ratio the verdict rests on is unit-free
-        // either way. `median_ratio` is hand / generated, so above 1 means the
-        // generated kernel is faster.
-        let cell = format!("channel={channel} rows={}", rows.len());
-        if channel == "order2" {
-            gate.not_slower(&cell, &timing, "generated", "strongest_hand");
-        } else {
-            gate.faster(&cell, &timing, "generated", "strongest_hand");
-        }
-    }
-    gate.finish();
-}

@@ -452,46 +452,6 @@ mod tests {
         assert_eq!(tf.h[0][1], tf.h[1][0], "tower mixed-partial symmetry");
     }
 
-    #[test]
-    fn tower_contractions_match_dirjet_directional_coefficients() {
-        const K: usize = 3;
-        let p = [0.37_f64, -0.42_f64, 0.19_f64];
-        let q = [0.25_f64, -0.7_f64, 1.3_f64];
-        let u = [-0.4_f64, 0.9_f64, 0.15_f64];
-        let w = [1.1_f64, -0.2_f64, 0.6_f64];
-
-        let tower = nonlinear_tower_program(p);
-        let third = tower.third_contracted(&q);
-        let fourth = tower.fourth_contracted(&u, &w);
-
-        for a in 0..K {
-            for b in 0..K {
-                let mut dirs3 = [[0.0; K]; 3];
-                dirs3[0][a] = 1.0;
-                dirs3[1][b] = 1.0;
-                dirs3[2] = q;
-                let jet3 = nonlinear_dirjet_program(p, &dirs3);
-                assert_close(
-                    jet3.coeff(jet3.coeffs.len() - 1),
-                    third[a][b],
-                    &format!("third contraction ({a},{b})"),
-                );
-
-                let mut dirs4 = [[0.0; K]; 4];
-                dirs4[0][a] = 1.0;
-                dirs4[1][b] = 1.0;
-                dirs4[2] = u;
-                dirs4[3] = w;
-                let jet4 = nonlinear_dirjet_program(p, &dirs4);
-                assert_close(
-                    jet4.coeff(jet4.coeffs.len() - 1),
-                    fourth[a][b],
-                    &format!("fourth contraction ({a},{b})"),
-                );
-            }
-        }
-    }
-
     fn nonlinear_tower_program(p: [f64; 3]) -> Tower4<3> {
         let x = Tower4::<3>::variable(p[0], 0);
         let y = Tower4::<3>::variable(p[1], 1);

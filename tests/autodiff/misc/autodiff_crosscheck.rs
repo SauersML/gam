@@ -3,9 +3,7 @@ use ad_trait::differentiable_function::{DifferentiableFunctionTrait, ForwardAD};
 use ad_trait::forward_ad::adfn::adfn;
 use ad_trait::function_engine::FunctionEngine;
 use autodiff::{F1, Float, diff};
-use gam::families::sigma_link::{
-    exp_sigma_derivs_up_to_fourth_scalar, exp_sigma_derivs_up_to_third_scalar,
-};
+use gam::families::sigma_link::exp_sigma_derivs_up_to_fourth_scalar;
 use num_dual::{DualNum, first_derivative, second_derivative, third_derivative};
 use std::marker::PhantomData;
 

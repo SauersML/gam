@@ -1,6 +1,4 @@
-use gam::estimate::{
-    FitOptions, PenaltySpec, fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas,
-};
+use gam::estimate::{FitOptions, PenaltySpec, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas};
 use gam::terms::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::array;

@@ -24,10 +24,7 @@
 use std::time::Instant;
 
 use gam::inference::smooth_test::SmoothTestScale;
-use gam::terms::structure::anova_atom::{
-    BindingNotion, CarveInput, FISSION_MAX_INTERACTION_FRACTION, PairSurfaceBackend, basis_means,
-    carve, fit_pair_surface,
-};
+use gam::terms::structure::anova_atom::{BindingNotion, CarveInput, FISSION_MAX_INTERACTION_FRACTION, PairSurfaceBackend, basis_means, carve};
 use ndarray::Array2;
 
 // ───────────────────────── in-test dense linear algebra ─────────────────────

@@ -35,11 +35,7 @@
 //!         the cross-strand value offset — ≤ 1e-2× the checkerboard energy —
 //!         because the offset is ambient-affine on the support.
 
-use gam::basis::{
-    BasisMetadata, CenterStrategy, MeasureJetBand, MeasureJetBasisSpec,
-    MeasureJetExtrapolationSpectrum, build_measure_jet_basis, measure_jet_band,
-    measure_jet_energy_form, measure_jet_extrapolation_variance, measure_jet_support_curve,
-};
+use gam::basis::{BasisMetadata, CenterStrategy, MeasureJetBand, MeasureJetBasisSpec, MeasureJetExtrapolationSpectrum, build_measure_jet_basis, measure_jet_band, measure_jet_energy_form, measure_jet_support_curve};
 use ndarray::{Array1, Array2};
 
 /// `MeasureJetBasisSpec` default dials, made explicit for the energy-form

@@ -585,10 +585,7 @@ pub(crate) fn build_manifold_sae_payload(
 #[cfg(test)]
 mod manifold_sae_coercion_tests {
     use super::*;
-    use gam::terms::sae::atom_schema::{
-        basis_kind_for_topology, basis_to_topology, canonical_topology,
-        coordinate_periods_for_basis, topologies_for_bases, topology_for_bases,
-    };
+    use gam::terms::sae::atom_schema::{basis_kind_for_topology, basis_to_topology, canonical_topology, topologies_for_bases, topology_for_bases};
     use ndarray::array;
 
     #[test]

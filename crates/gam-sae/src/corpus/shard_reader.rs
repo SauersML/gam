@@ -449,20 +449,6 @@ mod tests {
     use ndarray::array;
     use std::io::Write;
 
-    fn write_temp_shard(name: &str, rows: ndarray::ArrayView2<'_, f64>) -> PathBuf {
-        let bytes = encode_shard_bytes(rows);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "gam-sae-corpus-test-{}-{}.shard",
-            std::process::id(),
-            name
-        ));
-        let mut f = File::create(&path).expect("create temp shard");
-        f.write_all(&bytes).expect("write shard");
-        f.sync_all().expect("sync shard");
-        path
-    }
-
     #[test]
     fn single_shard_round_trips_rows_and_ids() {
         let data = array![[1.0_f64, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]];

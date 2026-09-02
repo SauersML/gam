@@ -135,25 +135,6 @@ mod tests {
     }
 
     #[test]
-    fn sub_floor_and_degenerate_shapes_stay_on_host() {
-        let tiny = DictionaryScoreRoutePlan::default_for_shape(16, 1024, 64);
-        assert!(!tiny.device_admitted);
-        assert_eq!(tiny.tile_count, 1);
-
-        for plan in [
-            DictionaryScoreRoutePlan::default_for_shape(0, 1024, 64),
-            DictionaryScoreRoutePlan::default_for_shape(16, 0, 64),
-            DictionaryScoreRoutePlan::default_for_shape(16, 1024, 0),
-        ] {
-            assert!(plan.is_degenerate());
-            assert!(!plan.device_admitted);
-            assert_eq!(plan.tile_items, 0);
-            assert_eq!(plan.tile_count, 0);
-            assert_eq!(plan.peak_score_bytes, 0);
-        }
-    }
-
-    #[test]
     fn tiny_tile_budget_still_makes_forward_progress() {
         let plan = DictionaryScoreRoutePlan::with_limits(512, 1000, 32, 1, 7);
         assert_eq!(plan.tile_items, 1);

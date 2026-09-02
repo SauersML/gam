@@ -135,44 +135,6 @@ fn finite_difference_row(
     (forward - backward) / (2.0 * step)
 }
 
-/// Build the operator exactly the way the latent-coordinate driver does
-/// (`spatial_optimization.rs`, the `SmoothBasisSpec::Matern` arm): metadata
-/// `centers` and metadata `length_scale`, paired with the raw latent values.
-fn operator_under_test(
-    data: &Array2<f64>,
-    metadata: &BasisMetadata,
-) -> LatentCoordDesignDerivative {
-    let BasisMetadata::Matern {
-        centers,
-        length_scale,
-        nu,
-        include_intercept,
-        identifiability_transform,
-        input_scale,
-        ..
-    } = metadata
-    else {
-        panic!("fixture must produce Matérn metadata");
-    };
-    let flat = Array1::from_iter(data.iter().copied());
-    let latent = std::sync::Arc::new(LatentCoordValues::from_flat(
-        flat,
-        data.nrows(),
-        2,
-        LatentIdMode::None,
-    ));
-    LatentCoordDesignDerivative::new_matern(
-        latent,
-        std::sync::Arc::new(centers.clone()),
-        *input_scale,
-        *length_scale,
-        *nu,
-        *include_intercept,
-        identifiability_transform.clone(),
-    )
-    .expect("latent Matérn design derivative")
-}
-
 /// Worst relative disagreement between the analytic Jacobian and the central
 /// difference, over a spread of (row, axis) pairs.
 fn worst_relative_error(target_sigma: f64) -> (f64, f64) {

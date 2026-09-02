@@ -12,11 +12,7 @@
 //! splitmix64 stream seeded by an integer — there is no clock randomness.
 
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
-use gam::solver::topology_selector::{
-    AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider, MIXTURE_K_LADDER,
-    PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED,
-    adjudicate_predictive_race, fit_mixture_rung,
-};
+use gam::solver::topology_selector::{AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider, MIXTURE_K_LADDER, PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_predictive_race};
 use ndarray::{Array2, ArrayView2};
 
 // ---------------------------------------------------------------------------
@@ -152,72 +148,6 @@ struct RaceOutcome {
     circle_evidence: f64,
     mixture_evidence: f64,
     mixture_k: usize,
-}
-
-fn run_race(data: &Array2<f64>) -> RaceOutcome {
-    let cfg = GaussianMixtureConfig::default();
-    // In-class mixture rung: sweep the fixed ladder and pick the BIC winner.
-    let rung = fit_mixture_rung(data.view(), MIXTURE_K_LADDER, cfg)
-        .expect("mixture rung must fit at least one order");
-    let mix_winner = rung.winner();
-    let mixture_k = mix_winner.k;
-    let mixture_evidence = mix_winner.bic;
-
-    // Smooth-circle BIC: a 2-parameter ring model (r_bar, sigma_r) plus
-    // uniform angle. This is corroboration only (the headline is stacking).
-    let circle_evidence = ring_negative_log_evidence(data.view());
-
-    let circle_provider = ring_density_provider(data.view());
-    let mixture_provider =
-        gam::solver::topology_selector::mixture_density_provider(data.view(), mixture_k, cfg);
-
-    let candidates = vec![
-        PredictiveRaceCandidate {
-            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
-            negative_log_evidence: circle_evidence,
-            certification: EvidenceCertification::Exact,
-            density_provider: circle_provider,
-        },
-        PredictiveRaceCandidate {
-            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k: mixture_k }),
-            negative_log_evidence: mixture_evidence,
-            certification: EvidenceCertification::Exact,
-            density_provider: mixture_provider,
-        },
-    ];
-
-    let verdict = adjudicate_predictive_race(
-        data.nrows(),
-        candidates,
-        STACKING_CV_FOLDS,
-        STACKING_CV_SEED,
-        StackingConfig::default(),
-    )
-    .expect("cross-class adjudication must succeed");
-
-    assert!(
-        verdict.is_cross_class,
-        "race mixing Circle + Mixture must be detected as cross-class"
-    );
-    assert_eq!(
-        verdict.headline,
-        Headline::Stacking,
-        "cross-class headline must switch to stacking"
-    );
-    let stacking = verdict
-        .stacking
-        .as_ref()
-        .expect("cross-class verdict must carry stacking weights");
-
-    RaceOutcome {
-        winner_name: verdict.candidate_names[verdict.winner_index].clone(),
-        headline: verdict.headline,
-        circle_weight: stacking.weights[0],
-        mixture_weight: stacking.weights[1],
-        circle_evidence,
-        mixture_evidence,
-        mixture_k,
-    }
 }
 
 /// Closed-form ring negative-log-evidence on the rank-aware Laplace (BIC-form)

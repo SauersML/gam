@@ -24,11 +24,7 @@
 //! (matched SNR 12), swept over many more seeds.
 
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
-use gam::solver::topology_selector::{
-    AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider, MIXTURE_K_LADDER,
-    PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED,
-    adjudicate_predictive_race, fit_mixture_rung, mixture_density_provider,
-};
+use gam::solver::topology_selector::{AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider, MIXTURE_K_LADDER, PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_predictive_race};
 use ndarray::{Array2, ArrayView2};
 
 // ---------------------------------------------------------------------------

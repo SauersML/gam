@@ -15,7 +15,7 @@
 //! 40-min cmd timeout). With path #2/#3 + standard-GAM gate this is
 //! expected to drop dramatically vs the pre-fix scaling.
 
-use gam::estimate::{FitOptions, fit_gam};
+use gam::estimate::FitOptions;
 use gam::pirls::PirlsStatus;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};

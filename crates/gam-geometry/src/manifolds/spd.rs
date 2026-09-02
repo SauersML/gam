@@ -641,7 +641,7 @@ mod exp_map_vjp_tests {
 
 #[cfg(test)]
 mod frechet_mean_tests {
-    use super::{SpdManifold, affine_sq_norm, spd_frechet_mean};
+    use super::SpdManifold;
     use crate::manifold::{GeometryError, RiemannianManifold, spectral_map_spd};
     use ndarray::{Array1, Array2};
 

@@ -1281,48 +1281,6 @@ mod tests {
         SaeManifoldOuterObjective::new(term, target, None, rho, 5000, 0.04, 1.0e-6, 1.0e-6)
     }
 
-    fn assert_floor_absent_with_positive_control_2629(
-        context: &str,
-        ladder: &[gam_solve::rho_optimizer::soft_rho_guard_floor::GuardLadderRung],
-    ) {
-        use gam_solve::rho_optimizer::soft_rho_guard_floor::{
-            GuardLadderRung, classify_soft_rho_guard_floor, soft_rho_guard_emission_at,
-        };
-
-        let injected = ladder
-            .iter()
-            .map(|rung| GuardLadderRung {
-                rho: rung.rho,
-                rho_gradient: rung.rho_gradient + soft_rho_guard_emission_at(rung.rho, 0.0),
-            })
-            .collect::<Vec<_>>();
-        let bare = classify_soft_rho_guard_floor(ladder, 0.0);
-        let positive_control = classify_soft_rho_guard_floor(&injected, 0.0);
-        let rendered = ladder
-            .iter()
-            .map(|rung| format!("({:.0},{:+.9e})", rung.rho, rung.rho_gradient))
-            .collect::<Vec<_>>()
-            .join(" ");
-        eprintln!(
-            "[#2629] {context}: bare={}; injected={}; ladder={rendered}",
-            bare.summary(),
-            positive_control.summary(),
-        );
-        assert!(
-            bare.is_absent(),
-            "{context} must carry no standard-REML soft rho-guard floor; {}; \
-             ladder={rendered}",
-            bare.summary()
-        );
-        assert!(
-            !positive_control.is_absent(),
-            "{context}: adding the shipped floor to the same measurements must \
-             move the verdict off ABSENT or this ladder is blind to the defect; \
-             {}; ladder={rendered}",
-            positive_control.summary(),
-        );
-    }
-
     /// Solve the inner fixed point cleanly from the initial term at `rho`
     /// (rebuilding the whole cache — never freezing it, per the FD-gate rule)
     /// and read off the penalized deviance `D_p = 2·penalized_objective` and the

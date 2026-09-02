@@ -1,7 +1,4 @@
-use gam::terms::basis::{
-    CenterStrategy, MaternBasisSpec, MaternNu, build_matern_basis,
-    build_matern_basis_log_kappa_derivative,
-};
+use gam::terms::basis::{CenterStrategy, MaternBasisSpec, MaternNu, build_matern_basis};
 use ndarray::Array2;
 
 #[test]

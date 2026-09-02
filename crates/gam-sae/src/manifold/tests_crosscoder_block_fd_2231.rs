@@ -12,11 +12,7 @@
 //! appended block sub-vector survives `to_flat`/`from_flat` and that an empty
 //! block vector is byte-identical to the plain-SAE layout.
 
-use super::{
-    ArdSharing, SaeManifoldRho, profiled_penalized_quasi_laplace_block_efs_log_lambda_steps,
-    profiled_penalized_quasi_laplace_block_log_lambda_gradient,
-    profiled_penalized_quasi_laplace_criterion,
-};
+use super::{ArdSharing, SaeManifoldRho, profiled_penalized_quasi_laplace_block_efs_log_lambda_steps, profiled_penalized_quasi_laplace_criterion};
 use ndarray::{Array1, arr1};
 
 /// Central-difference FD of [`profiled_penalized_quasi_laplace_criterion`] with respect to each

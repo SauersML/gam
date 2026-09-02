@@ -7,14 +7,7 @@
 //! symmetry, rotation invariance of intrinsic S² smooths) all still hold
 //! at large scale.
 
-use gam::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, OneDimensionalBoundary, PenaltySource,
-    PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d,
-    build_periodic_bspline_basis_1d, build_spherical_spline_basis,
-    cyclic_bspline_derivative_penalty_matrix, fit_periodic_bspline_curve,
-    periodic_bspline_first_derivative_nd, spherical_wahba_kernel_matrix,
-};
+use gam::basis::{BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, OneDimensionalBoundary, PenaltySource, PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d, build_periodic_bspline_basis_1d, build_spherical_spline_basis, cyclic_bspline_derivative_penalty_matrix, periodic_bspline_first_derivative_nd};
 use ndarray::{Array1, Array2, Axis};
 use std::time::Instant;
 

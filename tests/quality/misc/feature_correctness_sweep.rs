@@ -5,15 +5,7 @@
 //! These tests live in release mode and are individually short, so a single
 //! cargo test --test feature_correctness_sweep runs the whole sweep quickly.
 
-use gam::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy, OneDimensionalBoundary,
-    PenaltySource, PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec,
-    build_bspline_basis_1d, build_periodic_bspline_basis_1d, build_spherical_spline_basis,
-    cyclic_bspline_derivative_penalty_matrix, evaluate_bspline_derivative_scalar,
-    periodic_bspline_first_derivative_nd, SphereWahbaKernel, spherical_wahba_kernel_matrix,
-    spherical_wahba_kernel_matrix_with_kind,
-};
+use gam::basis::{BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy, OneDimensionalBoundary, PenaltySource, PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d, build_periodic_bspline_basis_1d, build_spherical_spline_basis, cyclic_bspline_derivative_penalty_matrix, evaluate_bspline_derivative_scalar, periodic_bspline_first_derivative_nd, SphereWahbaKernel, spherical_wahba_kernel_matrix_with_kind};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use std::f64::consts::{PI, TAU};
 

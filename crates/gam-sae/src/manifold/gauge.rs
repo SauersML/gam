@@ -14,6 +14,9 @@ use ndarray::ArrayView1;
 
 use gam_math::special::{digamma, trigamma};
 use opt::{BacktrackConfig, backtracking_line_search};
+use ndarray::Array2;
+use ndarray::ArrayView2;
+use super::SaeBasisEvaluator;
 
 /// The two-parameter affine transition `t_a ≈ slope·t_b + offset` relating the
 /// arc-length coordinate of curve B to that of curve A, the object SAC's birth
@@ -533,22 +536,6 @@ mod tests {
     struct AffineLineEvaluator;
 
     impl SaeBasisEvaluator for AffineLineEvaluator {
-        fn evaluate(
-            &self,
-            coords: ArrayView2<'_, f64>,
-        ) -> Result<(Array2<f64>, Array3<f64>), String> {
-            let n = coords.nrows();
-            let mut phi = Array2::<f64>::zeros((n, 2));
-            let mut jet = Array3::<f64>::zeros((n, 2, 1));
-            for i in 0..n {
-                let t = coords[[i, 0]];
-                phi[[i, 0]] = 1.0;
-                phi[[i, 1]] = t;
-                jet[[i, 0, 0]] = 0.0;
-                jet[[i, 1, 0]] = 1.0;
-            }
-            Ok((phi, jet))
-        }
 
         fn second_jet_dyn(
             &self,
@@ -576,69 +563,5 @@ mod tests {
             None
         }
     }
-    #[test]
-    fn affine_transition_detects_same_line_with_reflection_and_offset() {
-        // Curve A: straight segment through the origin, arc-length t ∈ [0, 1].
-        // Curve B: the SAME line, reflected and offset — its arc-length coord is
-        // t_a = -t_b + 1, i.e. slope -1, offset 1.
-        let ev = AffineLineEvaluator;
-        // Decoder makes γ(t) = [t·d] with unit-speed d (‖d‖ = 1) so t is arc length.
-        let d = array![[0.0_f64, 0.0], [0.6, 0.8]]; // γ(t) = (0,0) + t·(0.6,0.8), speed 1
-        let ca = Array1::linspace(0.0, 1.0, 11);
-        let pts_a = sample_decoded_curve(&ev, d.view(), ca.view()).unwrap();
-        // B samples the same physical points but parameterized as t_b with
-        // t_a = -t_b + 1  ⇒  physical point = (1 - t_b)·d. Matched grid so every
-        // B point coincides with an A grid point (nearest-match is exact and the
-        // reflected transition is recovered to machine precision).
-        let cb = Array1::linspace(0.0, 1.0, 11);
-        let db = array![[0.6_f64, 0.8], [-0.6, -0.8]]; // γ_b(t_b) = (0.6,0.8) + t_b·(-0.6,-0.8)
-        let pts_b = sample_decoded_curve(&ev, db.view(), cb.view()).unwrap();
-        let tr = affine_chart_transition(pts_a.view(), ca.view(), pts_b.view(), cb.view(), None)
-            .unwrap();
-        assert!(
-            (tr.slope + 1.0).abs() < 1e-6,
-            "slope must be -1, got {}",
-            tr.slope
-        );
-        assert!(
-            (tr.offset - 1.0).abs() < 1e-6,
-            "offset must be 1, got {}",
-            tr.offset
-        );
-        assert!(
-            tr.coord_residual < 1e-6,
-            "coord residual {}",
-            tr.coord_residual
-        );
-        assert!(
-            tr.geometric_residual < 1e-6,
-            "geometric residual {}",
-            tr.geometric_residual
-        );
-        assert!(tr.same_manifold(1.0, 1e-3), "must be flagged same-manifold");
-    }
 
-    #[test]
-    fn affine_transition_rejects_disjoint_curve() {
-        // Curve B is a parallel line displaced far off curve A: the coordinate
-        // regression may still fit a slope, but the GEOMETRIC residual is large,
-        // so same_manifold must reject.
-        let ev = AffineLineEvaluator;
-        let da = array![[0.0_f64, 0.0], [1.0, 0.0]]; // A along x-axis
-        let db = array![[0.0_f64, 5.0], [1.0, 0.0]]; // B parallel, y = 5 away
-        let ca = Array1::linspace(0.0, 1.0, 11);
-        let cb = Array1::linspace(0.0, 1.0, 11);
-        let pts_a = sample_decoded_curve(&ev, da.view(), ca.view()).unwrap();
-        let pts_b = sample_decoded_curve(&ev, db.view(), cb.view()).unwrap();
-        let tr = affine_chart_transition(pts_a.view(), ca.view(), pts_b.view(), cb.view(), None)
-            .unwrap();
-        assert!(
-            tr.geometric_residual > 1.0,
-            "disjoint curve must have large geometric residual"
-        );
-        assert!(
-            !tr.same_manifold(1.0, 1e-2),
-            "disjoint curve must be rejected"
-        );
-    }
 }

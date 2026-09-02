@@ -24,10 +24,7 @@
 //!      no-fill sparse factor that keeps the band — beats block-Jacobi, the
 //!      iteration-count reduction #299 measures.
 
-use gam::solver::arrow_schur::{
-    ArrowPcgOptions, ArrowSchurSystem, ArrowTrustRegionOptions, PrecondLadderRow,
-    SchurPreconditionerKind, arrow_precond_ladder_iteration_study,
-};
+use gam::solver::arrow_schur::{ArrowPcgOptions, ArrowSchurSystem, ArrowTrustRegionOptions, PrecondLadderRow, SchurPreconditionerKind};
 use ndarray::Array1;
 use std::ops::Range;
 

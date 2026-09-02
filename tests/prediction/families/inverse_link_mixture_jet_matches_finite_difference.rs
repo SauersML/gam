@@ -1,4 +1,4 @@
-use gam::mixture_link::{inverse_link_jet_for_family, state_fromspec};
+use gam::mixture_link::state_fromspec;
 use gam::types::{InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, ResponseFamily};
 use ndarray::array;
 

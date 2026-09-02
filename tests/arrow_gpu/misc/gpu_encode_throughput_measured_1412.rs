@@ -24,10 +24,7 @@
 //! meet the target) — it does NOT fabricate a GPU number.
 
 use gam::gpu::device_runtime::GpuRuntime;
-use gam::gpu::encode_throughput::{
-    CANONICAL_ENCODE_SHAPES, EncodeShape, cpu_oracle_normal_equations_solve,
-    measure_resident_solve_throughput,
-};
+use gam::gpu::encode_throughput::{CANONICAL_ENCODE_SHAPES, EncodeShape};
 use gam::gpu::linalg_dispatch::ResidentDesignGram;
 use ndarray::{Array1, Array2};
 

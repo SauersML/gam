@@ -556,17 +556,6 @@ mod tests {
         (values.to_vec(), projected)
     }
 
-    fn pack_upper(dense: &Array2<f64>) -> Vec<f64> {
-        let n = dense.nrows();
-        let mut packed = vec![0.0_f64; packed_upper_len(n)];
-        for i in 0..n {
-            for j in i..n {
-                packed[packed_upper_index(n, i, j)] = dense[(i, j)];
-            }
-        }
-        packed
-    }
-
     /// Compare two `(Θ, Vᵀw)` readings as the SPECTRAL MEASURE they represent,
     /// which is the only thing either of them determines.
     ///

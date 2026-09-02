@@ -128,25 +128,6 @@ fn build_cold_term(s_true: &[f64], z: &Array2<f64>) -> SaeManifoldTerm {
     SaeManifoldTerm::new(vec![atom], assignment).unwrap()
 }
 
-fn dimensionless_entry_rho(term: &SaeManifoldTerm, z: &Array2<f64>) -> SaeManifoldRho {
-    let seed_dispersion = term
-        .seed_reconstruction_dispersion(z.view())
-        .expect("seed reconstruction dispersion");
-    assert!(seed_dispersion.is_finite() && seed_dispersion > 0.0);
-    // Native ARD ON with one precision per latent axis — exactly what the
-    // production `sae_manifold_fit` seeds (`native_ard_enabled = true` ⇒
-    // `log_ard = zeros(d)`). The coordinate Gaussian prior this installs
-    // regularises the otherwise-unbounded euclidean latent `t`, which is what
-    // keeps the joint (coord × decoder) inner solve well-conditioned.
-    SaeManifoldRho::new(
-        SPARSITY.ln(),
-        SMOOTHNESS.ln(),
-        vec![Array1::<f64>::zeros(1)],
-    )
-    .seed_scaled_by_dispersion(seed_dispersion)
-    .expect("dimensionless seed scaling")
-}
-
 /// Reconstruction R² over all rows (1 ⇒ perfect recovery of the line).
 fn reconstruction_r2(fitted: &Array2<f64>, z: &Array2<f64>) -> f64 {
     let mut zbar = 0.0;

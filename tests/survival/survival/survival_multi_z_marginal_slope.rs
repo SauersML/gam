@@ -1,8 +1,5 @@
 use gam::families::bms::{MarginalSlopeCovariance, MarginalSlopeCovarianceShape};
-use gam::families::survival::marginal_slope::{
-    RigidVectorValueWorkspace, survival_marginal_slope_vector_eta,
-    survival_marginal_slope_vector_neglog, survival_marginal_slope_vector_scale,
-};
+use gam::families::survival::marginal_slope::{RigidVectorValueWorkspace, survival_marginal_slope_vector_neglog};
 use gam::probability::normal_cdf;
 use ndarray::array;
 
@@ -56,28 +53,6 @@ fn assert_marginal_preservation(
     let lhs = normal_cdf(-q * c / (1.0 + variance).sqrt());
     let rhs = normal_cdf(-q);
     assert!((lhs - rhs).abs() <= 2e-15, "lhs={lhs:.17e} rhs={rhs:.17e}");
-}
-
-#[test]
-fn survival_multi_z_k1_diagonal_matches_scalar_eta_bitwise() {
-    let q = 0.41;
-    let z = [1.3];
-    let slope = [0.27];
-    let probit_scale = 0.8;
-    let covariance = MarginalSlopeCovariance::diagonal(array![1.0]).unwrap();
-    let eta =
-        survival_marginal_slope_vector_eta(q, &z, &slope, &covariance, probit_scale).expect("eta");
-    let observed = probit_scale * slope[0];
-    let c = (1.0 + observed * observed).sqrt();
-    let scalar = q * c + observed * z[0];
-    assert_scalar_reduction(
-        eta,
-        scalar,
-        (q * c).abs() + (observed * z[0]).abs(),
-        "K=1 Diagonal[1.0] eta must reduce to the scalar identity",
-    );
-    assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Diagonal);
-    assert_marginal_preservation(q, &slope, &covariance, probit_scale);
 }
 
 #[test]

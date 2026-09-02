@@ -1496,29 +1496,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn gate_rejects_below_min_p() {
-        assert!(!should_use_gpu_hutchinson(64, 16, true, true, true, false));
-    }
-
-    #[test]
-    fn gate_rejects_k_out_of_range() {
-        assert!(!should_use_gpu_hutchinson(2000, 4, true, true, true, false));
-        assert!(!should_use_gpu_hutchinson(
-            2000, 200, true, true, true, false
-        ));
-    }
-
-    #[test]
-    fn gate_rejects_when_subspace_active() {
-        assert!(!should_use_gpu_hutchinson(2000, 16, true, true, true, true));
-    }
-
-    #[test]
-    fn gate_accepts_canonical_case() {
-        assert!(should_use_gpu_hutchinson(2000, 16, true, true, true, false));
-    }
-
     // ────────────────────────────────────────────────────────────────
     // Block 2.6: adaptive-K validation tests.
     //

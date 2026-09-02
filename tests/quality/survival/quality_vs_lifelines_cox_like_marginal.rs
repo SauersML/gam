@@ -75,7 +75,6 @@
 
 use gam::families::bms::marginal_slope_covariance_from_scores;
 use gam::families::marginal_slope_shared::probit_frailty_scale;
-use gam::families::survival::marginal_slope::survival_marginal_slope_vector_eta;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, run_python};

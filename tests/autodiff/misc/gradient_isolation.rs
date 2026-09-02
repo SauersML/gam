@@ -1,7 +1,4 @@
-use gam::estimate::{
-    ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
-    optimize_external_design,
-};
+use gam::estimate::{ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient};
 use gam::mixture_link::state_from_sasspec;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, SasLinkSpec, StandardLink};

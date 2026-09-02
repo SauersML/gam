@@ -1,4 +1,4 @@
-use gam::mixture_link::{inverse_link_jet_for_family, state_from_sasspec};
+use gam::mixture_link::state_from_sasspec;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, SasLinkSpec};
 
 #[test]

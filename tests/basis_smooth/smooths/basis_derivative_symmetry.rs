@@ -1,7 +1,4 @@
-use gam::terms::basis::{
-    BasisMetadata, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, SpatialIdentifiability,
-    build_duchon_basis, build_duchon_basis_log_kappa_derivative,
-};
+use gam::terms::basis::{BasisMetadata, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, SpatialIdentifiability, build_duchon_basis};
 use ndarray::Array2;
 
 #[test]

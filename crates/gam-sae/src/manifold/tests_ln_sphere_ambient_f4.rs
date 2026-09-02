@@ -25,10 +25,7 @@
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
-use crate::manifold::{
-    AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, ln_sphere_project,
-};
+use crate::manifold::{AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
 
 const ON: f64 = 6.0;
 

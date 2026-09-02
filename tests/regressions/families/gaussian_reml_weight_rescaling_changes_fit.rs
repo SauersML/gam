@@ -43,7 +43,7 @@
 //! coefficients are invariant. It fails today and will pass once the Gaussian
 //! REML smoothing selection is made weight-scale invariant.
 
-use gam::estimate::{FitOptions, fit_gam};
+use gam::estimate::FitOptions;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};

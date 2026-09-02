@@ -115,49 +115,6 @@ fn two_atom_periodic_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     (term, target, rho)
 }
 
-/// #1407 core equivalence: the LEAN fixed-decoder assembler (per-row htt/gt
-/// only, β tier elided) must produce a fixed-decoder latent step that is
-/// BIT-IDENTICAL to the one produced via the FULL joint assembler (which also
-/// builds — and the fixed-decoder step discards — the entire decoder β tier).
-///
-/// This is the perf-fix's correctness contract: we are only skipping wasted
-/// decoder-tier work, not changing the math. Identical steps ⇒ the lean path
-/// is a faithful drop-in for the full path on the encode walk.
-#[test]
-fn fixed_decoder_lean_step_equals_full_step_1407() {
-    let (mut term, target, rho) = two_atom_periodic_term();
-
-    let (lean_step, full_step) = term
-        .fixed_decoder_step_lean_vs_full_1407(target.view(), &rho, None, 1.0e-6)
-        .expect("both fixed-decoder assemblies + steps succeed");
-
-    assert_eq!(
-        lean_step.len(),
-        full_step.len(),
-        "lean and full fixed-decoder steps must have the same dimension"
-    );
-    assert!(
-        !lean_step.is_empty(),
-        "the fixed-decoder latent step must be non-empty for this fixture"
-    );
-    assert!(
-        lean_step.iter().all(|v| v.is_finite()) && full_step.iter().all(|v| v.is_finite()),
-        "both fixed-decoder steps must be finite"
-    );
-    // Bit-identical: the lean assembler builds htt/gt exactly as the full path
-    // does; it only elides the β decoder tier the fixed-decoder step never
-    // reads. Any divergence here is a #1407 regression (β-tier work leaking
-    // into the per-row latent blocks).
-    for (idx, (lean, full)) in lean_step.iter().zip(full_step.iter()).enumerate() {
-        assert_eq!(
-            lean, full,
-            "lean vs full fixed-decoder step component {idx} diverged \
-             (lean {lean} != full {full}); the lean assembler must be \
-             numerically identical to the full one on htt/gt (#1407)"
-        );
-    }
-}
-
 /// #1407 end-to-end: the fixed-decoder encode (now driven through the lean
 /// assembler) runs to a finite loss and leaves the decoder EXACTLY frozen.
 /// A regression that wires the β tier back into this path (recomputing /

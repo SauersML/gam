@@ -6,10 +6,7 @@
 //! `normal_cdf`) so the test file is self-contained.
 
 use gam::families::bms::MarginalSlopeCovariance;
-use gam::families::survival::marginal_slope::{
-    RigidVectorValueWorkspace, survival_marginal_slope_vector_neglog,
-    survival_marginal_slope_vector_scale,
-};
+use gam::families::survival::marginal_slope::{RigidVectorValueWorkspace, survival_marginal_slope_vector_neglog};
 use gam::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 

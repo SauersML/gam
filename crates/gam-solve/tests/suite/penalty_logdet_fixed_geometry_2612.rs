@@ -1,6 +1,4 @@
-use gam_solve::estimate::reml::reml_outer_engine::{
-    compute_block_penalty_logdet_derivs, compute_block_penalty_logdet_derivs_with_prior_factors,
-};
+use gam_solve::estimate::reml::reml_outer_engine::compute_block_penalty_logdet_derivs_with_prior_factors;
 use gam_solve::pirls::dense_block_xtwx;
 use ndarray::{Array2, Array3, arr1, arr2, s};
 

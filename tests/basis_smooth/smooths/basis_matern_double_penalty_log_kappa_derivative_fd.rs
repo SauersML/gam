@@ -21,10 +21,7 @@
 //! structural shrinkage block is reliably active and the previously omitted
 //! derivative is genuinely exercised.
 
-use gam::terms::basis::{
-    CenterStrategy, MaternBasisSpec, MaternNu, build_matern_basis,
-    build_matern_basis_log_kappa_derivatives, build_matern_basis_log_kappasecond_derivative,
-};
+use gam::terms::basis::{CenterStrategy, MaternBasisSpec, MaternNu, build_matern_basis, build_matern_basis_log_kappa_derivatives};
 use ndarray::Array2;
 
 /// Evaluation data: a 6×6 grid (36 rows). `n = 36 >= k = 28` so the Matérn

@@ -37,7 +37,7 @@
 //! small fraction of the signal range. MATCH-OR-BEAT: its recovery RMSE is no
 //! worse than mgcv's by more than 10%.
 
-use gam::terms::structure::anova_atom::{PairSurfaceBackend, fit_pair_surface};
+use gam::terms::structure::anova_atom::PairSurfaceBackend;
 use gam::test_support::reference::{Column, QualityPair, rmse, run_r};
 use ndarray::Array2;
 

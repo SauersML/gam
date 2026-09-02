@@ -17,11 +17,7 @@
 //! plus the κ-differentiability contract: the kernel κ-jets agree with
 //! central finite differences across the series/closed-form boundary.
 
-use gam::basis::{
-    CenterStrategy, ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability,
-    build_constant_curvature_basis, constant_curvature_kernel_kappa_jets,
-    constant_curvature_kernel_matrix,
-};
+use gam::basis::{CenterStrategy, ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, build_constant_curvature_basis, constant_curvature_kernel_matrix};
 use gam::inference::formula_dsl::parse_formula;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;

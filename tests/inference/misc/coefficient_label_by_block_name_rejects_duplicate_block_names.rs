@@ -1,7 +1,4 @@
-use gam::families::custom_family::{
-    CoefficientGroupSpec, ParameterBlockSpec, coefficient_label,
-    realize_coefficient_groups_for_custom_family,
-};
+use gam::families::custom_family::{CoefficientGroupSpec, ParameterBlockSpec};
 use gam::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::types::RhoPrior;
 use ndarray::{Array1, Array2};

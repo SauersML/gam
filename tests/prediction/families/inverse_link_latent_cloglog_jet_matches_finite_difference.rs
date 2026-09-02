@@ -1,4 +1,3 @@
-use gam::mixture_link::inverse_link_jet_for_family;
 use gam::types::{InverseLink, LatentCLogLogState, LikelihoodSpec, ResponseFamily};
 
 fn fd1<F: Fn(f64) -> f64>(f: F, x: f64) -> f64 {

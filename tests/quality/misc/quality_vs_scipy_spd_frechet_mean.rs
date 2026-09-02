@@ -31,7 +31,6 @@
 //! measured with gam's metric). It is no longer the pass gate; the axioms are.
 //! `rel_l2` between the two centers is printed for context but never asserted.
 
-use gam::geometry::spd::spd_frechet_mean;
 use gam::test_support::reference::{Column, relative_l2, run_python};
 use gam::{RiemannianManifold, SpdManifold, load_csvwith_inferred_schema};
 use ndarray::{Array1, Array2, ArrayView1};

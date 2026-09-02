@@ -1,9 +1,4 @@
-use gam::families::cubic_cell_kernel::{
-    CellMomentScratch, DenestedCubicCell, LocalSpanCubic, affine_anchor_moment_vector,
-    build_denested_partition_cells, evaluate_cell_moments, evaluate_cell_moments_with_scratch,
-    global_cubic_from_local, reduce_quartic_moments, reduce_sextic_moments,
-    reset_tail_cell_moment_cache, set_tail_cell_moment_cache_enabled, tail_cell_moment_cache_stats,
-};
+use gam::families::cubic_cell_kernel::{DenestedCubicCell, LocalSpanCubic, affine_anchor_moment_vector, evaluate_cell_moments, global_cubic_from_local, reset_tail_cell_moment_cache, set_tail_cell_moment_cache_enabled, tail_cell_moment_cache_stats};
 use std::sync::{Arc, Barrier};
 
 fn gauss_legendre_integral(cell: DenestedCubicCell, degree: usize) -> f64 {

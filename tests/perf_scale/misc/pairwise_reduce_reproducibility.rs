@@ -3,10 +3,7 @@
 //!
 //! All inputs are fixed and deterministic — no clock, no randomness.
 
-use gam::linalg::pairwise_reduce::{
-    BASE_CHUNK, StreamingPairwise, pairwise_reduce, pairwise_reduce_chunked, pairwise_sum,
-    pairwise_sum_chunked,
-};
+use gam::linalg::pairwise_reduce::{BASE_CHUNK, StreamingPairwise, pairwise_reduce, pairwise_sum};
 
 /// A deterministic, fixed sequence with a wide dynamic range: one large value
 /// followed by many tiny values. Naively summed left to right (large first),

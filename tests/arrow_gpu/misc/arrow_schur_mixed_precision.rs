@@ -3,11 +3,6 @@ use gam::solver::arrow_schur::{
 };
 use ndarray::{Array1, Array2, array};
 
-fn certified_options() -> ArrowSolveOptions {
-    ArrowSolveOptions::direct()
-        .with_solve_precision_policy(ArrowSolvePrecisionPolicy::certified_mixed())
-}
-
 fn assert_close(lhs: &Array1<f64>, rhs: &Array1<f64>, tol: f64) {
     assert_eq!(lhs.len(), rhs.len());
     for i in 0..lhs.len() {

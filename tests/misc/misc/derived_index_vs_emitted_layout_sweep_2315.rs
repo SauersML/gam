@@ -27,10 +27,7 @@
 
 use std::collections::BTreeMap;
 
-use gam::families::custom_family::{
-    CoefficientGroupSpec, ParameterBlockSpec, PenaltyMatrix, coefficient_label,
-    realize_coefficient_groups_for_custom_family,
-};
+use gam::families::custom_family::{CoefficientGroupSpec, ParameterBlockSpec, PenaltyMatrix};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::terms::basis::{
     ConstructiveQuadratic, PenaltyCandidate, PenaltyDropReason, PenaltySource,
@@ -88,19 +85,6 @@ fn with_initial_log_lambdas(mut spec: ParameterBlockSpec, values: &[f64]) -> Par
     assert_eq!(spec.penalties.len(), values.len());
     spec.initial_log_lambdas = Array1::from_vec(values.to_vec());
     spec
-}
-
-fn flat_group(label: &str, coords: Vec<(&str, usize)>, mean: f64) -> CoefficientGroupSpec {
-    let mut g = CoefficientGroupSpec::new(
-        label,
-        coords
-            .into_iter()
-            .map(|(b, c)| coefficient_label(b, c))
-            .collect(),
-    )
-    .with_prior(CoefficientGroupPrior::NormalLogPrecision { mean, sd: 2.0 });
-    g.initial_log_precision = Some(mean / 10.0);
-    g
 }
 
 struct LayoutCase {

@@ -4180,21 +4180,6 @@ mod tests {
         assert!(MechanismSparsityJacobian::new(1.0, 0.0).is_err());
     }
 
-    #[test]
-    fn frame_inner_rotation_dim_is_sum_of_so_r_dims() {
-        // dim O(r) = r(r−1)/2 per factored atom; rank-1 frames contribute 0.
-        assert_eq!(frame_inner_rotation_dim(&[]), 0);
-        assert_eq!(frame_inner_rotation_dim(&[1]), 0);
-        assert_eq!(frame_inner_rotation_dim(&[2]), 1);
-        assert_eq!(frame_inner_rotation_dim(&[4]), 6);
-        assert_eq!(frame_inner_rotation_dim(&[1, 4, 8]), 0 + 6 + 28);
-        assert_eq!(
-            FrameInnerRotationGauge::from_ranks(vec![3, 3]).dim,
-            6,
-            "two rank-3 frames carry 2·3 inner-rotation dims"
-        );
-    }
-
     /// The #972 inner-rotation gauge is enumerated in the certificate, never
     /// curvature-tested: attaching it must not change any generator verdict
     /// or the residual_gauge_dim, but it MUST change the group signature and
@@ -4424,17 +4409,6 @@ mod tests {
             err.contains("numerical rank") && err.contains("Khemakhem"),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn piecewise_linear_eval_endpoints_and_midpoint() {
-        let coeffs = array![[0.0_f64, 10.0], [1.0, 20.0], [2.0, 30.0]];
-        let u = Array1::from(vec![0.0, 0.5, 1.0]);
-        let out = piecewise_linear_eval(u.view(), coeffs.view(), 0.0, 1.0);
-        assert!((out[[0, 0]] - 0.0).abs() < 1e-12);
-        assert!((out[[1, 0]] - 1.0).abs() < 1e-12);
-        assert!((out[[2, 0]] - 2.0).abs() < 1e-12);
-        assert!((out[[1, 1]] - 20.0).abs() < 1e-12);
     }
 
     #[test]

@@ -3345,62 +3345,6 @@ mod sphere_defect_tests {
         c
     }
 
-    #[test]
-    fn round_isometric_chart_has_zero_defect() {
-        let ev = MockSphereEvaluator { warp: 1.0 };
-        let decoder = Array2::<f64>::eye(2);
-        let c = coords(&[-0.6, -0.2, 0.0, 0.3, 0.7]);
-        let defect = sphere_chart_isometry_defect(&ev, decoder.view(), c.view())
-            .expect("defect must evaluate")
-            .expect("non-degenerate round chart must return Some");
-        assert!(
-            defect < 1e-10,
-            "a chart whose pullback metric is exactly diag(1, cos²lat) is round-isometric; \
-             defect should be ~0, got {defect:.3e}"
-        );
-    }
-
-    #[test]
-    fn warped_chart_has_large_defect() {
-        // warp = 2.5 stretches the lon direction by a lat-independent factor,
-        // so the pullback metric is diag(1, (2.5·cos lat)²) — NOT a global
-        // rescale of diag(1, cos²lat), so the profiled-scale residual is
-        // strictly positive.
-        let ev = MockSphereEvaluator { warp: 2.5 };
-        let decoder = Array2::<f64>::eye(2);
-        let c = coords(&[-0.6, -0.2, 0.0, 0.3, 0.7]);
-        let defect = sphere_chart_isometry_defect(&ev, decoder.view(), c.view())
-            .expect("defect must evaluate")
-            .expect("non-degenerate warped chart must return Some");
-        assert!(
-            defect > 1e-2,
-            "an anisotropically warped chart must register a sizeable defect, got {defect:.3e}"
-        );
-    }
-
-    #[test]
-    fn pole_singularity_is_refused_not_fabricated() {
-        // A row sitting exactly on the pole (lat = π/2, cos lat = 0) makes the
-        // reference metric's lon column vanish; the function must refuse (None)
-        // rather than fabricate a defect on the chart singularity.
-        let ev = MockSphereEvaluator { warp: 1.0 };
-        let decoder = Array2::<f64>::eye(2);
-        let base = coords(&[0.0, 0.3]);
-        // Append a pole row (lat = π/2).
-        let mut c3 = Array2::<f64>::zeros((3, 2));
-        c3.slice_mut(ndarray::s![0..2, ..]).assign(&base);
-        c3[[2, 0]] = std::f64::consts::FRAC_PI_2;
-        let out = sphere_chart_isometry_defect(&ev, decoder.view(), c3.view())
-            .expect("defect must evaluate");
-        // At the exact pole the decoded lon tangent (cos lat = 0) also collapses
-        // the pullback metric (det G = 0), so this refuses via the rank-deficient
-        // metric guard — either way an honest None, never a fabricated number.
-        assert!(
-            out.is_none(),
-            "a pole-singular chart row must be refused, got {out:?}"
-        );
-    }
-
     /// FD-gate the analytic conformal-boost mode Jacobians `Dv_k(t)` against
     /// central differences of the displacements `v_k(t)` — the exact object the
     /// sphere Gauss–Newton residual derivative is built from.

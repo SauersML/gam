@@ -638,7 +638,7 @@ mod sigma_parameter_jet_release_tests {
     use gam_math::jet_scalar::JetScalar;
     use gam_math::jet_tower::{Tower3, Tower4};
     use gam_math::nested_dual::Dual2;
-    use gam_math::paired_timing::{SpeedGate, paired_interleaved};
+    use gam_math::paired_timing::SpeedGate;
 
     // One synthetic interior row: finite signed margins and a strictly-positive
     // raw time derivative so the monotonicity guard admits. `probit_scale = 1.0`

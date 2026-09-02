@@ -32,7 +32,6 @@ use std::sync::Arc;
 use gam::families::custom_family::CoefficientCoordinate;
 use gam::families::custom_family::{AdditiveBlockJacobian, ParameterBlockSpec};
 use gam::identifiability::audit::audit_identifiability;
-use gam::identifiability::canonical::canonicalize_for_identifiability;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::{Array1, Array2};
 

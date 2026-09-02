@@ -3751,74 +3751,6 @@ mod empirical_rigid_jet_oracle_tests {
     // (`empirical_flex_jet_oracle_tests`) and the BMS rigid std-normal
     // `tower.t4` cutover, extended to the last hand-derived BMS tower.
 
-    /// Exact `Tower4<2>` row NLL over the primaries θ = (m = marginal η, g =
-    /// slope), with the calibrated intercept `a(m, g)` solved as an exact
-    /// implicit tower via [`gam_math::jet_tower::implicit_solve`]. Reads
-    /// value / gradient / Hessian / third / fourth straight off the tower.
-    ///
-    /// `m` enters the constraint ONLY through the marginal target `μ(m)` (its
-    /// derivatives `mu1..mu4` come from the production link map), exactly as in
-    /// production: the observed index `a + s·g·z` carries no explicit `m`, so
-    /// every m-channel of the tower rides through `a(m, g)`.
-    fn rigid_empirical_tower_witness(
-        family: &BernoulliMarginalSlopeFamily,
-        row: usize,
-        marginal: BernoulliMarginalLinkMap,
-        slope: f64,
-        nodes: &[f64],
-        measure_weights: &[f64],
-    ) -> gam_math::jet_tower::Tower4<2> {
-        // `unary_derivatives_{normal_cdf,neglog_phi}` are in scope via the
-        // file-level `use super::gradient_paths::*` (the same glob the flex
-        // tower witness relies on).
-        use gam_math::jet_tower::{Tower4, implicit_solve};
-
-        let s = family.probit_frailty_scale();
-        // Scalar intercept anchor (order-0 root) from the independent bracketed
-        // solve already defined in this module — shares no code with the
-        // production IFT chain.
-        let a0 = witness_intercept(marginal.mu, slope, s, nodes, measure_weights);
-
-        // Calibration constraint F(a, m, g) over slots (0 = a, 1 = m, 2 = g):
-        //   F = −μ(m) + Σ_k π_k · Φ(a + s·g·node_k).
-        let a_var = Tower4::<3>::variable(a0, 0);
-        // m-axis anchor is the marginal linear predictor η this map expands
-        // about (`marginal.eta`); `mu1..mu4` are derivatives of μ w.r.t. that η.
-        let m_var = Tower4::<3>::variable(marginal.eta, 1);
-        let g_var = Tower4::<3>::variable(slope, 2);
-        // μ(m) as a unary composition of the marginal η slot — derivatives are
-        // exactly the production link map (correct for ANY marginal link).
-        let mu_tower = m_var.compose_unary([
-            marginal.mu,
-            marginal.mu1,
-            marginal.mu2,
-            marginal.mu3,
-            marginal.mu4,
-        ]);
-        let mut f_constraint = Tower4::<3>::constant(0.0) - mu_tower;
-        for (&node, &weight) in nodes.iter().zip(measure_weights.iter()) {
-            // η_k = a + (s·g)·node_k.
-            let eta_k = a_var + g_var.scale(s * node);
-            let cdf = eta_k.compose_unary(unary_derivatives_normal_cdf(eta_k.v));
-            f_constraint = f_constraint + cdf.scale(weight);
-        }
-        // Eliminate a → exact intercept tower a(m, g) as a Tower4<2>.
-        let a_tower: Tower4<2> = implicit_solve::<3, 2>(&f_constraint, a0)
-            .expect("rigid empirical implicit intercept tower");
-
-        // Row NLL over θ = (m, g): observed index η = a(m, g) + s·g·z, signed by
-        // (2y − 1), through the SAME signed-probit −logΦ scalar kernel
-        // production uses (`unary_derivatives_neglog_phi` = the production
-        // `signed_probit_neglog_unary_stack`). g (slot 1) enters the index both
-        // directly (s·g·z) and through a; m (slot 0) only through a.
-        let z = family.z[row];
-        let g_t = Tower4::<2>::variable(slope, 1);
-        let eta = a_tower + g_t.scale(s * z);
-        let sign = 2.0 * family.y[row] - 1.0;
-        let signed = eta.scale(sign);
-        signed.compose_unary(unary_derivatives_neglog_phi(signed.v, family.weights[row]))
-    }
-
     /// The production hand-written closed-form tower
     /// (`primary_grad_hess` + `third_full` + `fourth_full`) must equal the
     /// mechanically-derived `implicit_solve` tower to the f64 floor (~1e-9) —
@@ -4369,41 +4301,6 @@ mod empirical_flex_jet_oracle_tests {
     // The primaries are θ = (q, b, β₀) in tower slots (0, 1, 2); the remaining
     // deviation coordinates are held at their fixed values as tower constants.
 
-    /// Per-node, per-basis unary stack `[Φⱼ, Φⱼ′, Φⱼ″, Φⱼ‴, 0]` of the active
-    /// deviation basis, evaluated at the SCALAR base argument the tower expands
-    /// about. For the link-deviation block the argument is `u₀ = a₀ + b₀·node`
-    /// (the basis is composed with the tower `u`); for the score-warp block the
-    /// basis sits at the fixed `node` and contributes a *constant* warp (its
-    /// only θ-dependence is the linear `βⱼ` it multiplies), so the stack is the
-    /// plain value with zero derivatives. The fourth basis derivative of a cubic
-    /// I-spline is identically zero, so the stack tops out at the third.
-    fn witness_basis_stacks_at(fx: &FlexFixture, arg: f64) -> Vec<[f64; 5]> {
-        let pt = Array1::from_vec(vec![arg]);
-        let d0 = fx.runtime.design(&pt).expect("witness basis value");
-        let basis_dim = d0.ncols();
-        if fx.is_score_warp {
-            // Score-warp basis enters at the fixed node: a constant per column.
-            return (0..basis_dim)
-                .map(|j| [d0[[0, j]], 0.0, 0.0, 0.0, 0.0])
-                .collect();
-        }
-        let d1 = fx
-            .runtime
-            .first_derivative_design(&pt)
-            .expect("witness basis 1st");
-        let d2 = fx
-            .runtime
-            .second_derivative_design(&pt)
-            .expect("witness basis 2nd");
-        let d3 = fx
-            .runtime
-            .third_derivative_design(&pt)
-            .expect("witness basis 3rd");
-        (0..basis_dim)
-            .map(|j| [d0[[0, j]], d1[[0, j]], d2[[0, j]], d3[[0, j]], 0.0])
-            .collect()
-    }
-
     /// The observed-index tower `η(a; node) = scale·(a + b·node + warp)` over
     /// the `K` primaries, with the deviation basis entering exactly as the model
     /// (score-warp: `b·Σβⱼ·Φⱼ(node)`; link-dev: `Σβⱼ·Φⱼ(u)`, `u = a + b·node`).
@@ -4446,92 +4343,6 @@ mod empirical_flex_jet_oracle_tests {
             let inside = u + warp;
             inside.scale(scale)
         }
-    }
-
-    /// Exact `Tower4<3>` row NLL over θ = (q, b, β₀), with the calibrated
-    /// intercept solved as an exact implicit tower. Read value/grad/Hessian/
-    /// third/fourth straight off the returned tower.
-    fn flex_tower_witness(fx: &FlexFixture, p0: &[f64]) -> gam_math::jet_tower::Tower4<3> {
-        use gam_math::jet_tower::{Tower4, implicit_solve};
-        let q0 = p0[fx.primary.q];
-        let b0 = p0[fx.primary.slope];
-        let dev_range = if fx.is_score_warp {
-            fx.primary.h.clone().unwrap()
-        } else {
-            fx.primary.w.clone().unwrap()
-        };
-        let beta: Vec<f64> = dev_range.clone().map(|i| p0[i]).collect();
-        let beta0_0 = beta[0];
-        let scale = fx.family.probit_frailty_scale();
-        let marginal = bernoulli_marginal_link_map(
-            &InverseLink::Standard(gam_problem::StandardLink::Probit),
-            q0,
-        )
-        .expect("witness link map");
-        let mu_stack = [
-            marginal.mu,
-            marginal.mu1,
-            marginal.mu2,
-            marginal.mu3,
-            marginal.mu4,
-        ];
-
-        // Scalar intercept root (the tower's order-0 anchor) from the existing
-        // independent bracketed solve.
-        let a0 = witness_intercept(fx, marginal.mu, b0, &Array1::from(beta.clone()), scale);
-
-        let nodes: Vec<f64> = fx.grid.pairs().map(|(n, _)| n).collect();
-        let node_weights: Vec<f64> = fx.grid.pairs().map(|(_, w)| w).collect();
-
-        // Calibration constraint over (a, q, b, β₀) as a Tower4<4>:
-        //   F(a, q, b, β₀) = −μ(q) + Σ_k π_k · Φ_cdf(η(a; node_k)).
-        // slot 0 = a (the dependent variable implicit_solve eliminates),
-        // slots 1,2,3 = q, b, β₀.
-        let a_var = Tower4::<4>::variable(a0, 0);
-        let q_var = Tower4::<4>::variable(q0, 1);
-        let b_var = Tower4::<4>::variable(b0, 2);
-        let beta0_var = Tower4::<4>::variable(beta0_0, 3);
-        let mu_tower = q_var.compose_unary(mu_stack);
-        let mut f_constraint = Tower4::<4>::constant(0.0) - mu_tower;
-        // The deviation basis is evaluated at the fixed node for the score-warp
-        // block (`Φ(node)`, a constant) and at the composed observed index
-        // `u₀ = a₀ + b₀·node` for the link-deviation block (`Φ(u)`).
-        let basis_arg = |node: f64| -> f64 {
-            if fx.is_score_warp {
-                node
-            } else {
-                a0 + b0 * node
-            }
-        };
-        for (node, &w) in nodes.iter().zip(node_weights.iter()) {
-            let eta = witness_eta_tower::<4>(
-                fx,
-                &a_var,
-                &b_var,
-                &beta0_var,
-                &beta,
-                *node,
-                basis_arg(*node),
-                scale,
-            );
-            let cdf = eta.compose_unary(unary_derivatives_normal_cdf(eta.v));
-            f_constraint = f_constraint + cdf.scale(w);
-        }
-        let a_tower: Tower4<3> =
-            implicit_solve::<4, 3>(&f_constraint, a0).expect("implicit intercept tower");
-
-        // Row NLL over θ = (q, b, β₀) as a Tower4<3>. q (slot 0) enters the
-        // observed-index map ONLY through the calibrated intercept a(q,b,β₀)
-        // (μ(q) sets the calibration target), so it appears here solely via the
-        // q-derivative channels already carried in `a_tower`; b and β₀ also
-        // enter directly through the index map below.
-        let b_t = Tower4::<3>::variable(b0, 1);
-        let beta0_t = Tower4::<3>::variable(beta0_0, 2);
-        let z = fx.family.z[0];
-        let eta =
-            witness_eta_tower::<3>(fx, &a_tower, &b_t, &beta0_t, &beta, z, basis_arg(z), scale);
-        let signed = eta.scale(2.0 * fx.family.y[0] - 1.0);
-        signed.compose_unary(unary_derivatives_neglog_phi(signed.v, fx.family.weights[0]))
     }
 
     /// Read the exact tower channel for the multiset of primary axes `axes`,

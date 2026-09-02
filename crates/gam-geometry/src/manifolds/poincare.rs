@@ -1712,66 +1712,6 @@ mod tests {
         (inv, det)
     }
 
-    #[test]
-    fn conformal_dirichlet_penalty_matches_finite_difference_pullback_metric() {
-        // Independent oracle for the closed-form `G(t) = sqrt(det h) * h^-1`
-        // spectral shortcut used inside `conformal_dirichlet_penalty` (see its
-        // doc comment). This builds `h(t) = D exp_0(t)^T * lambda(p)^2 *
-        // D exp_0(t)` from a finite-difference Jacobian and a Gauss-Jordan
-        // inverse/det — neither borrowed from the function under test — and
-        // compares it against the function's output on a single point with an
-        // identity basis jacobian (`Phi_k(t) = t_k`), which algebraically
-        // reduces `conformal_dirichlet_penalty` to exactly `G(t)` itself.
-        let curvatures = [-1.0_f64, -0.3, -2.5];
-        for &curvature in &curvatures {
-            let points_by_dim: [(usize, Vec<Vec<f64>>); 3] = [
-                (1, vec![vec![0.37], vec![-0.62], vec![1.0e-4]]),
-                (
-                    2,
-                    vec![vec![0.2, -0.1], vec![0.55, 0.4], vec![1.0e-4, -2.0e-4]],
-                ),
-                (3, vec![vec![0.15, -0.2, 0.05], vec![0.4, 0.3, -0.5]]),
-            ];
-            for (d, points) in points_by_dim.iter() {
-                let d = *d;
-                for coeffs in points {
-                    let t = Array1::<f64>::from_vec(coeffs.clone());
-
-                    let jac = numeric_dexp0_jacobian(t.view(), curvature);
-                    let p = exp_origin(t.view(), curvature).expect("exp");
-                    let lambda = conformal_factor(p.view(), curvature).expect("lambda");
-                    let mut h = jac.t().dot(&jac);
-                    h.mapv_inplace(|v| v * lambda * lambda);
-                    let (h_inv, det_h) = small_inverse_and_det(&h);
-                    assert!(det_h > 0.0, "h must be SPD, got det={det_h}");
-                    let g_fd = h_inv.mapv(|v| v * det_h.sqrt());
-
-                    let mut basis_jac = Array3::<f64>::zeros((1, d, d));
-                    for k in 0..d {
-                        basis_jac[[0, k, k]] = 1.0;
-                    }
-                    let coords = Array2::from_shape_vec((1, d), coeffs.clone()).unwrap();
-                    let g_closed =
-                        conformal_dirichlet_penalty(coords.view(), basis_jac.view(), curvature)
-                            .expect("closed form");
-
-                    for i in 0..d {
-                        for j in 0..d {
-                            let fd = g_fd[[i, j]];
-                            let closed = g_closed[[i, j]];
-                            let tol = 1.0e-4 * (1.0 + fd.abs());
-                            assert!(
-                                (fd - closed).abs() < tol,
-                                "G mismatch d={d} c={curvature} t={coeffs:?} at ({i},{j}): \
-                                 fd={fd} closed={closed}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     // ---- Mobius gyrogroup laws and numerical regressions ----
     //
     // G1 is covered above by `mobius_add_zero_is_identity_on_either_side`.

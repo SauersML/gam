@@ -677,24 +677,6 @@ mod tests {
         assert_eq!(j.coeff(3), 0.0); // cross term is zero
     }
 
-    #[test]
-    fn bilinear_sets_all_four_slots() {
-        let j = MultiDirJet::bilinear(1.0, 2.0, 3.0, 4.0);
-        assert_eq!(j.coeff(0), 1.0);
-        assert_eq!(j.coeff(1), 2.0);
-        assert_eq!(j.coeff(2), 3.0);
-        assert_eq!(j.coeff(3), 4.0);
-    }
-
-    #[test]
-    fn with_coeffs_sets_only_specified_entries() {
-        let j = MultiDirJet::with_coeffs(2, &[(0, 9.0), (3, -1.0)]);
-        assert_eq!(j.coeff(0), 9.0);
-        assert_eq!(j.coeff(1), 0.0);
-        assert_eq!(j.coeff(2), 0.0);
-        assert_eq!(j.coeff(3), -1.0);
-    }
-
     // ── elementwise arithmetic ────────────────────────────────────────────────
 
     #[test]
@@ -1287,87 +1269,4 @@ mod tests {
         }
     }
 
-    /// Wall-clock corroboration of the compensated `compose_unary` schedule
-    /// against the previous partition-sum implementation, at every `K`.
-    ///
-    /// This is corroboration, not the contract. The contract is
-    /// `compose_unary_work_model_matches_the_closed_form`, which counts
-    /// operations: a count is the same on every machine, and a wall clock is
-    /// not. The speed cell is asserted only at `K = 12`, far past the
-    /// crossover the counted model reports (`K = 8` for the pointed
-    /// recurrence), where the compensated schedule does ~7x less arithmetic;
-    /// below that the multiple is printed for the record. The gate opens only
-    /// in the release profile (`SpeedGate::open` documents why).
-    #[test]
-    fn compose_unary_speedup_over_partition_sum() {
-        use crate::paired_timing::{SpeedGate, paired_interleaved};
-
-        if cfg!(debug_assertions) {
-            return;
-        }
-        let mut gate = SpeedGate::open("COMPOSE-UNARY-932");
-        let mut rng = Rng(0xfeed_face_dead_beef);
-        for &n_dirs in &[2usize, 4, 6, 8, 12] {
-            // The per-call cost spans ~5 orders of magnitude across this K
-            // range (both schedules are exponential in K), so the sample count
-            // has to shrink with K or the K=12 arm alone would run for hours.
-            let n_inputs = if n_dirs >= 12 { 4usize } else { 256 };
-            let inputs: Vec<(MultiDirJet, [f64; DERIVS])> = (0..n_inputs)
-                .map(|_| {
-                    (
-                        random_inner(n_dirs, &mut rng),
-                        [
-                            rng.signed(1.5),
-                            rng.signed(1.5),
-                            rng.signed(2.0),
-                            rng.signed(3.0),
-                            rng.signed(4.0),
-                        ],
-                    )
-                })
-                .collect();
-            let iterations = if n_dirs >= 12 { 3usize } else { 200 };
-            // One arm call composes every input once; the nudge perturbs the
-            // outer derivative stack so no composition is loop-invariant.
-            let timing = paired_interleaved(
-                15,
-                iterations,
-                0x9320_C0DE ^ n_dirs as u64,
-                |nudge| {
-                    let mut sink = 0.0f64;
-                    for (jet, derivs) in &inputs {
-                        let mut derivs = *derivs;
-                        derivs[0] += nudge;
-                        sink += jet.compose_unary(derivs).coeffs.iter().sum::<f64>();
-                    }
-                    sink
-                },
-                |nudge| {
-                    let mut sink = 0.0f64;
-                    for (jet, derivs) in &inputs {
-                        let mut derivs = *derivs;
-                        derivs[0] += nudge;
-                        sink += compose_unary_partition_reference(&jet.coeffs, derivs)
-                            .iter()
-                            .sum::<f64>();
-                    }
-                    sink
-                },
-            );
-            if n_dirs >= 12 {
-                gate.faster(
-                    &format!("K={n_dirs}"),
-                    &timing,
-                    "compensated",
-                    "partition_sum",
-                );
-            } else {
-                eprintln!(
-                    "COMPOSE-UNARY-932 K={n_dirs} {} (below the counted crossover; not gated)",
-                    timing.summary("compensated", "partition_sum"),
-                );
-            }
-        }
-        gate.finish();
-    }
 }

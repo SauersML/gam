@@ -2,15 +2,7 @@
 //! hand-verified `Manifold-SAE experiments/mdl_ladder/mdl.py` reference numbers
 //! exactly, and the criterion-bits reconciliation invariant must hold.
 
-use super::{
-    BirthMdlPrescreen, Crossover, DescriptionLength, Featurizer, ScoreRow,
-    bar_birth_threshold_nats, bar_supports_birth, circle_chart_columns, circle_coding_gain_bits,
-    circle_shape_const_bits, crossover_firings, curved_coding_gain_bits,
-    evidence_per_log_persistence, kappa_coding_gain_detector, manifold_fit_description_length,
-    matched_dl, matched_dl_delta, predicted_birth_dl_bits, reverse_water_filling, scalar_rate_bits,
-    score, se_resolution_bits, selection_bits, uniform_unit_range_sd,
-    weighted_reverse_water_filling,
-};
+use super::{BirthMdlPrescreen, Crossover, DescriptionLength, Featurizer, ScoreRow, circle_coding_gain_bits, manifold_fit_description_length, matched_dl, matched_dl_delta, predicted_birth_dl_bits, reverse_water_filling, scalar_rate_bits, score, se_resolution_bits, selection_bits, weighted_reverse_water_filling};
 use crate::atom_codes::SparseAtomCodes;
 
 /// A small deterministic support: `n` tokens over `g` atoms, atom `k` firing on

@@ -1,9 +1,4 @@
-use gam::terms::basis::{
-    CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu, PeriodicBSplineBasisSpec,
-    bspline_tensor_first_derivative, build_matern_basis, build_matern_basis_log_kappa_derivative,
-    build_periodic_bspline_basis_1d, periodic_bspline_first_derivative_nd,
-    sphere_first_derivative_nd,
-};
+use gam::terms::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu, PeriodicBSplineBasisSpec, bspline_tensor_first_derivative, build_matern_basis, build_periodic_bspline_basis_1d, periodic_bspline_first_derivative_nd, sphere_first_derivative_nd};
 use ndarray::{Array1, array};
 
 #[test]
