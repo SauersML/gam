@@ -13,12 +13,17 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 
-use crate::jet_scalar::{RuntimeJetScalar, SymmetricQuadraticCoefficients, aggregate_shared_source_derivatives, canonical_shared_source_schedule};
+use crate::jet_scalar::{
+    Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients, aggregate_shared_source_derivatives,
+    canonical_shared_source_schedule,
+};
 
 #[derive(Clone, Copy, Debug)]
 struct GraphNode {
     value: f64,
     support: u16,
+    edge_start: u16,
+    edge_len: u16,
     primary_axis: u8,
 }
 
@@ -56,6 +61,8 @@ const MAX_PROJECTED_CURVATURE_VALUES: usize =
 const EMPTY_NODE: GraphNode = GraphNode {
     value: 0.0,
     support: 0,
+    edge_start: 0,
+    edge_len: 0,
     primary_axis: NO_PRIMARY_AXIS,
 };
 const EMPTY_CURVATURE_EVENT: CurvatureEvent = CurvatureEvent::RankOne {
@@ -119,6 +126,7 @@ struct GraphTape {
     projected_curvature_len: usize,
     nodes: [GraphNode; MAX_GRAPH_NODES],
     gradients: [f64; MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION],
+    adjoints: [f64; MAX_GRAPH_NODES],
     edge_parents: [u8; MAX_GRAPH_EDGES],
     edge_firsts: [f64; MAX_GRAPH_EDGES],
     events: [CurvatureEvent; MAX_GRAPH_NODES],
@@ -138,12 +146,65 @@ impl GraphTape {
             projected_curvature_len: 0,
             nodes: [EMPTY_NODE; MAX_GRAPH_NODES],
             gradients: [0.0; MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION],
+            adjoints: [0.0; MAX_GRAPH_NODES],
             edge_parents: [0; MAX_GRAPH_EDGES],
             edge_firsts: [0.0; MAX_GRAPH_EDGES],
             events: [EMPTY_CURVATURE_EVENT; MAX_GRAPH_NODES],
             diagonal_inputs: [0; MAX_GRAPH_EDGES],
             diagonal_seconds: [0.0; MAX_GRAPH_EDGES],
             projected_curvatures: [0.0; MAX_PROJECTED_CURVATURE_VALUES],
+        }
+    }
+}
+
+trait HessianSink<const K: usize> {
+    fn reset(&mut self);
+    fn add_upper(&mut self, row: usize, column: usize, value: f64);
+    fn reflect_upper(&mut self);
+}
+
+struct ArrayHessianSink<'a, const K: usize>(&'a mut [[f64; K]; K]);
+
+impl<const K: usize> HessianSink<K> for ArrayHessianSink<'_, K> {
+    #[inline(always)]
+    fn reset(&mut self) {
+        // `into_order2` is the sole constructor and supplies `Tower2::zero()`.
+    }
+
+    #[inline(always)]
+    fn add_upper(&mut self, row: usize, column: usize, value: f64) {
+        self.0[row][column] += value;
+    }
+
+    #[inline(always)]
+    fn reflect_upper(&mut self) {
+        for row in 0..K {
+            for column in row + 1..K {
+                self.0[column][row] = self.0[row][column];
+            }
+        }
+    }
+}
+
+struct RowMajorHessianSink<'a, const K: usize>(&'a mut [f64]);
+
+impl<const K: usize> HessianSink<K> for RowMajorHessianSink<'_, K> {
+    #[inline(always)]
+    fn reset(&mut self) {
+        self.0.fill(0.0);
+    }
+
+    #[inline(always)]
+    fn add_upper(&mut self, row: usize, column: usize, value: f64) {
+        self.0[row * K + column] += value;
+    }
+
+    #[inline(always)]
+    fn reflect_upper(&mut self) {
+        for row in 0..K {
+            for column in row + 1..K {
+                self.0[column * K + row] = self.0[row * K + column];
+            }
         }
     }
 }
@@ -226,6 +287,8 @@ impl Order2GraphWorkspace {
         tape.nodes[node] = GraphNode {
             value,
             support,
+            edge_start: edge_start as u16,
+            edge_len: edge_len as u16,
             primary_axis: NO_PRIMARY_AXIS,
         };
         tape.gradients[node * K..(node + 1) * K].copy_from_slice(&gradient);
@@ -273,6 +336,131 @@ impl Order2GraphWorkspace {
         tape.diagonal_len += 1;
     }
 
+    #[inline(always)]
+    fn lower_into<const K: usize, H: HessianSink<K>>(
+        &self,
+        output: usize,
+        gradient: &mut [f64],
+        hessian: &mut H,
+    ) -> f64 {
+        let tape = self.tape_mut();
+        assert_eq!(tape.dimension, K, "compiled graph dimension mismatch");
+        assert!(output < tape.node_len, "compiled graph output is absent");
+        assert_eq!(gradient.len(), K, "compiled graph gradient width mismatch");
+        tape.adjoints[..tape.node_len].fill(0.0);
+        tape.adjoints[output] = 1.0;
+
+        gradient.copy_from_slice(&tape.gradients[output * K..(output + 1) * K]);
+        hessian.reset();
+
+        for node_index in (0..=output).rev() {
+            let adjoint = tape.adjoints[node_index];
+            if adjoint == 0.0 {
+                continue;
+            }
+            let node = tape.nodes[node_index];
+            let edge_start = node.edge_start as usize;
+            for edge in edge_start..edge_start + node.edge_len as usize {
+                let parent = tape.edge_parents[edge] as usize;
+                tape.adjoints[parent] += adjoint * tape.edge_firsts[edge];
+            }
+        }
+
+        for event_index in (0..tape.event_len).rev() {
+            match tape.events[event_index] {
+                CurvatureEvent::RankOne {
+                    owner,
+                    input,
+                    second,
+                } => {
+                    let owner_adjoint = tape.adjoints[owner as usize];
+                    if owner_adjoint == 0.0 {
+                        continue;
+                    }
+                    let input = input as usize;
+                    let curvature_scale = owner_adjoint * second;
+                    for_each_supported_upper(tape.nodes[input].support, |primary, other| {
+                        hessian.add_upper(
+                            primary,
+                            other,
+                            curvature_scale
+                                * tape.gradients[input * K + primary]
+                                * tape.gradients[input * K + other],
+                        );
+                    });
+                }
+                CurvatureEvent::Cross { owner, left, right } => {
+                    let owner_adjoint = tape.adjoints[owner as usize];
+                    if owner_adjoint == 0.0 {
+                        continue;
+                    }
+                    let left = left as usize;
+                    let right = right as usize;
+                    for_each_supported_upper(
+                        tape.nodes[left].support | tape.nodes[right].support,
+                        |primary, other| {
+                            let left_primary = tape.gradients[left * K + primary];
+                            let right_primary = tape.gradients[right * K + primary];
+                            let curvature = left_primary * tape.gradients[right * K + other]
+                                + right_primary * tape.gradients[left * K + other];
+                            hessian.add_upper(primary, other, owner_adjoint * curvature);
+                        },
+                    );
+                }
+                CurvatureEvent::Diagonal {
+                    owner,
+                    term_start,
+                    len,
+                } => {
+                    let owner_adjoint = tape.adjoints[owner as usize];
+                    if owner_adjoint == 0.0 {
+                        continue;
+                    }
+                    let term_start = term_start as usize;
+                    for term in term_start..term_start + len as usize {
+                        let input = tape.diagonal_inputs[term] as usize;
+                        let curvature_scale = owner_adjoint * tape.diagonal_seconds[term];
+                        if curvature_scale == 0.0 {
+                            continue;
+                        }
+                        for_each_supported_upper(tape.nodes[input].support, |primary, other| {
+                            hessian.add_upper(
+                                primary,
+                                other,
+                                curvature_scale
+                                    * tape.gradients[input * K + primary]
+                                    * tape.gradients[input * K + other],
+                            );
+                        });
+                    }
+                }
+                CurvatureEvent::Projected {
+                    owner,
+                    curvature_start,
+                    support,
+                } => {
+                    let owner_adjoint = tape.adjoints[owner as usize];
+                    if owner_adjoint == 0.0 {
+                        continue;
+                    }
+                    let mut curvature_offset = 0;
+                    let curvature_start = curvature_start as usize;
+                    for_each_supported_upper_by_column(support, |primary, other| {
+                        hessian.add_upper(
+                            primary,
+                            other,
+                            owner_adjoint
+                                * tape.projected_curvatures[curvature_start + curvature_offset],
+                        );
+                        curvature_offset += 1;
+                    });
+                }
+            }
+        }
+
+        hessian.reflect_upper();
+        tape.nodes[output].value
+    }
 }
 
 #[inline(always)]
@@ -298,6 +486,20 @@ fn supported_upper_offset(support: u16, primary: usize, other: usize) -> usize {
     other_rank * (other_rank + 1) / 2 + primary_rank
 }
 
+#[inline(always)]
+fn for_each_supported_upper(mut rows: u16, mut visit: impl FnMut(usize, usize)) {
+    while rows != 0 {
+        let primary = rows.trailing_zeros() as usize;
+        rows &= rows - 1;
+        let mut columns = rows | (1_u16 << primary);
+        while columns != 0 {
+            let other = columns.trailing_zeros() as usize;
+            columns &= columns - 1;
+            visit(primary, other);
+        }
+    }
+}
+
 /// Const-primary scalar handle into an [`Order2GraphWorkspace`].
 ///
 /// The handle is two machine words. Clone/copy duplicates only the graph node
@@ -309,6 +511,32 @@ pub struct Order2Graph<'arena, const K: usize> {
 }
 
 impl<'arena, const K: usize> Order2Graph<'arena, K> {
+    /// Lower this scalar output to the ordinary packed order-2 channels.
+    #[must_use]
+    pub fn into_order2(self) -> Order2<K> {
+        let mut out = crate::jet_tower::Tower2::zero();
+        let mut hessian = ArrayHessianSink(&mut out.h);
+        out.v = self
+            .workspace
+            .lower_into(self.node, &mut out.g, &mut hessian);
+        Order2(out)
+    }
+
+    /// Lower into caller-owned gradient and row-major Hessian storage.
+    ///
+    /// Both slices are completely overwritten, including structurally-zero
+    /// channels. Reusing them therefore requires no caller-side clearing.
+    #[must_use]
+    pub fn lower_into(self, gradient: &mut [f64], hessian_row_major: &mut [f64]) -> f64 {
+        assert_eq!(gradient.len(), K, "compiled graph gradient width mismatch");
+        assert_eq!(
+            hessian_row_major.len(),
+            K * K,
+            "compiled graph Hessian width mismatch"
+        );
+        let mut hessian = RowMajorHessianSink::<K>(hessian_row_major);
+        self.workspace.lower_into(self.node, gradient, &mut hessian)
+    }
 
     #[inline(always)]
     fn assert_compatible(&self, other: &Self) {

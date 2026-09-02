@@ -547,16 +547,6 @@ impl ShadowSum {
 
 }
 
-/// Higham's `γ_k = k·u / (1 − k·u)`, saturating to `+∞` once `k·u ≥ 1`.
-fn gamma(k: usize, unit_roundoff: f64) -> f64 {
-    let ku = (k as f64) * unit_roundoff;
-    if ku >= 1.0 {
-        f64::INFINITY
-    } else {
-        ku / (1.0 - ku)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
