@@ -1412,15 +1412,6 @@ pub fn measure_jet_quadrature_nodes(
     Ok((nodes, masses))
 }
 
-/// Per-center masses of the empirical measure (the zeroth-moment half of
-/// [`measure_jet_quadrature_nodes`]; single assignment source).
-pub fn measure_jet_center_masses(
-    data: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-) -> Result<Array1<f64>, BasisError> {
-    measure_jet_quadrature_nodes(data, centers).map(|(_, masses)| masses)
-}
-
 /// THE single assembly source: walk every (scale, outer-net center) local
 /// residual block exactly once and scatter it into `n_forms` accumulators
 /// with caller-chosen scalar weights. The energy, its (s, α) jets, and the
@@ -1704,110 +1695,6 @@ pub(crate) fn project_symmetric_psd(
     }
     let psd = scaled.dot(&evecs.t());
     Ok((&psd + &psd.t()) * 0.5)
-}
-
-/// The energy together with its exact first and second jets in the live
-/// dials, plus zero slots for the retained `ψ_τ = ln τ` coordinate. With
-/// `g_s = −2 ln ε`, `g_α = −2 ln q`:
-///
-/// ```text
-///   ∂Q/∂s   = Σ g_s·w·R,        ∂²Q/∂s²   = Σ g_s²·w·R,
-///   ∂Q/∂α   = Σ g_α·w·R,        ∂²Q/∂α²   = Σ g_α²·w·R,
-///   ∂²Q/∂s∂α = Σ g_s·g_α·w·R,
-///   ∂Q/∂ψ_τ = ∂²Q/∂ψ_τ² = ∂²Q/∂s∂ψ_τ = ∂²Q/∂α∂ψ_τ = 0.
-/// ```
-///
-/// all scattered from the SAME local blocks as `Q` in one pass (no second
-/// assembly that could drift). FD-gated in this module's tests. Requires
-/// `tau0 > 0` only because the retained coordinate is `ln τ`.
-pub fn measure_jet_energy_form_with_jets(
-    centers: ArrayView2<'_, f64>,
-    masses: ArrayView1<'_, f64>,
-    band: &MeasureJetBand,
-    order_s: f64,
-    alpha: f64,
-    tau0: f64,
-) -> Result<MeasureJetEnergyJets, BasisError> {
-    if !(tau0.is_finite() && tau0 > 0.0) {
-        crate::bail_invalid_basis!(
-            "measure-jet jets need tau0 > 0 because the retained τ coordinate is ln τ; got {tau0}"
-        );
-    }
-    let mut forms = assemble_weighted_forms(
-        centers,
-        masses,
-        band,
-        order_s,
-        alpha,
-        tau0,
-        10,
-        3,
-        &|_, eps: f64, q: f64, base: f64, out: &mut [[f64; 3]]| {
-            let gs = -2.0 * eps.ln();
-            let intrinsic_dim = centers.ncols() as f64;
-            let ga = 2.0 * intrinsic_dim * eps.ln() - 2.0 * q.max(f64::MIN_POSITIVE).ln();
-            out[0] = [base, 0.0, 0.0];
-            out[1] = [gs * base, 0.0, 0.0];
-            out[2] = [gs * gs * base, 0.0, 0.0];
-            out[3] = [ga * base, 0.0, 0.0];
-            out[4] = [ga * ga * base, 0.0, 0.0];
-            out[5] = [gs * ga * base, 0.0, 0.0];
-            out[6] = [0.0, 0.0, 0.0];
-            out[7] = [0.0, 0.0, 0.0];
-            out[8] = [0.0, 0.0, 0.0];
-            out[9] = [0.0, 0.0, 0.0];
-        },
-    )?;
-    let d2q_dalpha_dlogtau = forms.pop().expect("ten assembled forms");
-    let d2q_ds_dlogtau = forms.pop().expect("ten assembled forms");
-    let d2q_dlogtau2 = forms.pop().expect("ten assembled forms");
-    let dq_dlogtau = forms.pop().expect("ten assembled forms");
-    let d2q_ds_dalpha = forms.pop().expect("ten assembled forms");
-    let d2q_dalpha2 = forms.pop().expect("ten assembled forms");
-    let dq_dalpha = forms.pop().expect("ten assembled forms");
-    let d2q_ds2 = forms.pop().expect("ten assembled forms");
-    let dq_ds = forms.pop().expect("ten assembled forms");
-    let q = forms.pop().expect("ten assembled forms");
-    Ok(MeasureJetEnergyJets {
-        q,
-        dq_ds,
-        d2q_ds2,
-        dq_dalpha,
-        d2q_dalpha2,
-        d2q_ds_dalpha,
-        dq_dlogtau,
-        d2q_dlogtau2,
-        d2q_ds_dlogtau,
-        d2q_dalpha_dlogtau,
-    })
-}
-
-/// Per-scale energy decomposition of center values `v`: element ℓ is
-/// `vᵀ Q_ℓ v`, the detail energy charged at scale `ε_ℓ`. Sums exactly to
-/// `vᵀQv` (same blocks, one-hot weights) and doubles as the scale spectrum
-/// diagnostic of the fitted intensity field — where along the band the
-/// signal lives, and the analytic carrier of `∂/∂s` reweightings.
-pub fn measure_jet_scale_spectrum(
-    centers: ArrayView2<'_, f64>,
-    masses: ArrayView1<'_, f64>,
-    band: &MeasureJetBand,
-    order_s: f64,
-    alpha: f64,
-    tau0: f64,
-    values: ArrayView1<'_, f64>,
-) -> Result<Vec<f64>, BasisError> {
-    if values.len() != centers.nrows() {
-        crate::bail_dim_basis!(
-            "measure-jet scale spectrum needs one value per center: {} values for {} centers",
-            values.len(),
-            centers.nrows()
-        );
-    }
-    let forms = measure_jet_energy_forms_per_scale(centers, masses, band, order_s, alpha, tau0)?;
-    Ok(forms
-        .iter()
-        .map(|q_l| values.dot(&q_l.dot(&values)))
-        .collect())
 }
 
 /// The per-scale energy forms `Q_ℓ` (each m × m, symmetric PSD), with

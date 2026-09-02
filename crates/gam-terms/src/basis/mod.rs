@@ -70,46 +70,15 @@ pub mod radial_profile;
 
 // ---- Flat re-exports: preserve the external `basis::X` path surface ----
 
-pub use constant_curvature_smooth::{
-    ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, ConstantCurvatureKernelPsiJets,
-    ConstantCurvaturePsiJets, build_constant_curvature_basis,
-    build_constant_curvature_basis_kappa_derivatives,
-    build_constant_curvature_basis_psi_derivatives, constant_curvature_center_chart_radius2,
-    constant_curvature_data_chart_radius2, constant_curvature_evaluated_scale_span,
-    constant_curvature_kernel_kappa_jets,
-    constant_curvature_kernel_matrix, constant_curvature_kernel_psi_jets,
-    constant_curvature_length_scale_bounds, constant_curvature_realized_centers,
-    realized_constant_curvature_length_scale,
-};
+pub use constant_curvature_smooth::{ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, ConstantCurvatureKernelPsiJets, ConstantCurvaturePsiJets, build_constant_curvature_basis, build_constant_curvature_basis_kappa_derivatives, build_constant_curvature_basis_psi_derivatives, constant_curvature_center_chart_radius2, constant_curvature_data_chart_radius2, constant_curvature_evaluated_scale_span, constant_curvature_kernel_matrix, constant_curvature_kernel_psi_jets, constant_curvature_length_scale_bounds, constant_curvature_realized_centers, realized_constant_curvature_length_scale};
 
-pub use measure_jet_moments::{
-    MeasureJetJetStats, MeasureJetMomentTable, accumulate_moment_table, jet_sufficient_stats,
-    merge_moment_tables, recenter_moment_table,
-};
+pub use measure_jet_moments::MeasureJetJetStats;
 
-pub use measure_jet_predict::{
-    MeasureJetExtrapolationSpectrum, measure_jet_ambient_gradient,
-    measure_jet_extrapolation_variance,
-};
+pub use measure_jet_predict::MeasureJetExtrapolationSpectrum;
 
-pub use measure_jet_smooth::{
-    MeasureJetBand, MeasureJetBasisSpec, MeasureJetEnergyJets, MeasureJetFrozenQuadrature,
-    MeasureJetIdentifiability, MeasureJetRangeBracket, build_measure_jet_basis,
-    build_measure_jet_basis_psi_derivatives, measure_jet_affine_head_block,
-    measure_jet_affine_head_lift, measure_jet_affine_head_transform, measure_jet_band,
-    measure_jet_center_masses, measure_jet_design_matrix, measure_jet_energy_form,
-    measure_jet_energy_form_with_jets, measure_jet_energy_forms_per_scale,
-    measure_jet_input_noise_scale, measure_jet_ln_range_window, measure_jet_multiscale_mode,
-    measure_jet_quadrature_nodes, measure_jet_range_bracket,
-    measure_jet_range_feasibility_ceiling, measure_jet_scale_spectrum,
-    measure_jet_support_curve,
-    realized_measure_jet_length_scale,
-};
+pub use measure_jet_smooth::{MeasureJetBand, MeasureJetBasisSpec, MeasureJetEnergyJets, MeasureJetFrozenQuadrature, MeasureJetIdentifiability, MeasureJetRangeBracket, build_measure_jet_basis, build_measure_jet_basis_psi_derivatives, measure_jet_affine_head_block, measure_jet_affine_head_lift, measure_jet_affine_head_transform, measure_jet_band, measure_jet_design_matrix, measure_jet_energy_form, measure_jet_energy_forms_per_scale, measure_jet_input_noise_scale, measure_jet_ln_range_window, measure_jet_multiscale_mode, measure_jet_quadrature_nodes, measure_jet_range_bracket, measure_jet_range_feasibility_ceiling, measure_jet_support_curve, realized_measure_jet_length_scale};
 
-pub use measure_jet_anisotropy::{
-    LIndex, MeasureJetAnisotropyJets, lower_triangular_indices, measure_jet_anisotropy_energy_form,
-    measure_jet_anisotropy_energy_form_with_jets,
-};
+pub use measure_jet_anisotropy::{LIndex, MeasureJetAnisotropyJets};
 
 pub use sphere_spec::{
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,

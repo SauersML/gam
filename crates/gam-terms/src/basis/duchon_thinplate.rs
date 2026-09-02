@@ -1763,135 +1763,6 @@ pub struct ResolvedDuchonChart {
     pub identifiability_transform: Option<Array2<f64>>,
 }
 
-/// Resolve every ψ-invariant chart decision a Duchon build makes, so a caller
-/// can hand the SAME chart to the forward and to its ψ-derivative.
-///
-/// # The contract this exists to make expressible
-///
-/// A Duchon basis is not determined by `spec` alone. Four decisions are taken
-/// against the data at build time and then baked into `BasisMetadata::Duchon`:
-///
-/// | decision | forward site |
-/// |---|---|
-/// | realized centers | `select_centers_by_strategy` |
-/// | effective null-space order (degraded when the centers cannot span the requested polynomial block) | `duchon_effective_nullspace_order` |
-/// | auto-seeded anisotropy contrasts | `auto_seed_aniso_contrasts` |
-/// | data-metric radial reparam `V` (#1355) | `duchon_resolve_radial_chart` |
-/// | identifiability transform `T`, derived from the **`V`-rotated** design | `spatial_identifiability_transform_from_design` |
-///
-/// Until #2638 the log-κ derivative context re-made only the first of these and
-/// took the raw spec value for the rest: it passed `spec.nullspace_order`
-/// (not the effective order), `spec.aniso_log_scales` (not the seeded
-/// contrasts), `None` for the reparam, and derived `T` from the **un**-rotated
-/// design. So `build_duchon_basis_log_kappa_derivatives(data, spec)` returned
-/// the ψ-jet of a basis `build_duchon_basis(data, spec)` does not build. The
-/// dominant term was the reparam: measured on a 1-D `power=1`, `Linear`
-/// fixture, the returned Primary jet was 32× the true jet and the OperatorMass
-/// jet 242× too small, each in the wrong coefficient frame.
-///
-/// Resolving once and passing the resolved spec everywhere makes that class of
-/// desync unrepresentable rather than merely fixed: a builder that reads
-/// `spec.radial_reparam` from a resolved spec cannot see `None` where the
-/// forward saw a `V`.
-///
-/// # Cost
-///
-/// One dense `n×k` kernel materialization (the design that feeds the `V`
-/// eigenproblem and the identifiability test). This is the same pass the
-/// derivative context already paid; the resolver reuses it for both.
-pub fn duchon_resolve_chart(
-    data: ArrayView2<'_, f64>,
-    spec: &DuchonBasisSpec,
-    workspace: &mut BasisWorkspace,
-) -> Result<ResolvedDuchonChart, BasisError> {
-    let original_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
-    assert_spatial_centers_below_large_scale_cap(data.ncols(), centers.view())?;
-    let effective_nullspace_order =
-        duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
-    let aniso = auto_seed_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
-
-    let mut resolved = spec.clone();
-    resolved.center_strategy = CenterStrategy::UserProvided(centers.clone());
-    resolved.nullspace_order = effective_nullspace_order;
-    resolved.aniso_log_scales = aniso.clone();
-
-    // The pre-identifiability design IN the resolved radial chart. On a replay
-    // spec the chart is handed in; on a cold spec it is solved for here by the
-    // same helper the forward uses, so the two frames agree by construction.
-    let basis = match spec.radial_reparam.as_ref() {
-        Some(v) => {
-            build_duchon_basis_designwithworkspace(
-                data,
-                centers.view(),
-                spec.length_scale,
-                spec.power,
-                effective_nullspace_order,
-                aniso.as_deref(),
-                Some(v),
-                None,
-                workspace,
-            )?
-            .basis
-        }
-        None => {
-            let kernel_transform = kernel_constraint_nullspace(
-                centers.view(),
-                effective_nullspace_order,
-                &mut workspace.cache,
-            )?;
-            if kernel_transform.ncols() == 0 {
-                build_duchon_basis_designwithworkspace(
-                    data,
-                    centers.view(),
-                    spec.length_scale,
-                    spec.power,
-                    effective_nullspace_order,
-                    aniso.as_deref(),
-                    None,
-                    None,
-                    workspace,
-                )?
-                .basis
-            } else {
-                let chart = duchon_resolve_radial_chart(
-                    data,
-                    centers.view(),
-                    spec,
-                    effective_nullspace_order,
-                    aniso.as_deref(),
-                    &kernel_transform,
-                    workspace,
-                )?;
-                resolved.radial_reparam = chart.reparam;
-                chart.basis
-            }
-        }
-    };
-
-    // `T` is a property of the REALIZED design, so it must be read off the
-    // rotated basis — the forward derives it after folding `V`, and a `T` built
-    // on the un-rotated columns constrains a different function space.
-    let identifiability_transform = spatial_identifiability_transform_from_design(
-        data,
-        basis.view(),
-        &spec.identifiability,
-        "Duchon",
-    )?;
-    resolved.identifiability = match identifiability_transform.as_ref() {
-        Some(transform) => SpatialIdentifiability::FrozenTransform {
-            transform: transform.clone(),
-        },
-        None => SpatialIdentifiability::None,
-    };
-
-    Ok(ResolvedDuchonChart {
-        spec: resolved,
-        centers,
-        identifiability_transform,
-    })
-}
-
 pub(crate) fn thin_plate_radial_reparam_from_centers(
     centers: ArrayView2<'_, f64>,
     length_scale: f64,
@@ -2547,65 +2418,6 @@ pub(crate) fn thin_plate_kernel_psi_triplet_from_distance(
     Ok((value, psi, psi_psi))
 }
 
-/// Creates a thin-plate regression spline basis from data and knot locations.
-///
-/// # Arguments
-/// * `data` - `n x d` matrix of evaluation points
-/// * `knots` - `k x d` matrix of knot locations
-///
-/// # Returns
-/// `ThinPlateSplineBasis` containing:
-/// - `basis`: `n x (k_c + M)` matrix (`[K_c | P]`) where `M` is the TPS
-///   polynomial null-space dimension for the selected ambient dimension
-/// - `penalty_bending`: constrained TPS curvature penalty
-/// - `penalty_ridge`: center-metric penalty for null-function shrinkage
-pub fn create_thin_plate_spline_basis(
-    data: ArrayView2<f64>,
-    knots: ArrayView2<f64>,
-) -> Result<ThinPlateSplineBasis, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    create_thin_plate_spline_basiswithworkspace(data, knots, &mut workspace)
-}
-
-pub fn create_thin_plate_spline_basiswithworkspace(
-    data: ArrayView2<f64>,
-    knots: ArrayView2<f64>,
-    workspace: &mut BasisWorkspace,
-) -> Result<ThinPlateSplineBasis, BasisError> {
-    create_thin_plate_spline_basis_scaledwithworkspace(data, knots, 1.0, None, workspace)
-}
-
-/// Evaluates a thin-plate basis at `data` in a radial chart supplied by the
-/// caller, rather than one chosen from `data` itself.
-///
-/// [`create_thin_plate_spline_basis`] selects its radial chart `V` from the rows
-/// it is handed: since #1347 the reparameterization is taken in the *realized
-/// data metric* `G_c = (K Z)ᵀ (K Z)`, so two different row sets over the same
-/// knots yield two different `V`, and the design columns `Φ Z V` are two
-/// different coordinate systems for the same model space. A coefficient vector
-/// fitted against one therefore does not describe the same function against the
-/// other — silently, since both designs have the same shape.
-///
-/// Scoring a fit on rows it was not fitted to must consequently replay the
-/// training chart: pass the [`ThinPlateSplineBasis::radial_reparam`] of the
-/// basis the coefficients were fitted against. The knots must be the same ones,
-/// as usual; the chart is checked against the side-constrained radial dimension
-/// and a mismatch is a typed error rather than a wrong answer.
-pub fn create_thin_plate_spline_basis_in_chart(
-    data: ArrayView2<f64>,
-    knots: ArrayView2<f64>,
-    radial_reparam: &Array2<f64>,
-) -> Result<ThinPlateSplineBasis, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    create_thin_plate_spline_basis_scaledwithworkspace(
-        data,
-        knots,
-        1.0,
-        Some(radial_reparam),
-        &mut workspace,
-    )
-}
-
 pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
     data: ArrayView2<f64>,
     knots: ArrayView2<f64>,
@@ -3218,25 +3030,6 @@ pub(crate) fn build_thin_plate_scalar_design_psi_derivatives(
     )
 }
 
-pub fn build_thin_plate_basis_log_kappa_derivative(
-    data: ArrayView2<'_, f64>,
-    spec: &ThinPlateBasisSpec,
-) -> Result<BasisPsiDerivativeResult, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    build_thin_plate_basis_log_kappa_derivativewithworkspace(data, spec, &mut workspace)
-}
-
-pub fn build_thin_plate_basis_log_kappa_derivativewithworkspace(
-    data: ArrayView2<'_, f64>,
-    spec: &ThinPlateBasisSpec,
-    workspace: &mut BasisWorkspace,
-) -> Result<BasisPsiDerivativeResult, BasisError> {
-    let mut bundle =
-        build_thin_plate_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
-    bundle.first.implicit_operator = bundle.implicit_operator;
-    Ok(bundle.first)
-}
-
 pub fn build_thin_plate_basis_log_kappa_derivatives(
     data: ArrayView2<'_, f64>,
     spec: &ThinPlateBasisSpec,
@@ -3315,44 +3108,6 @@ pub fn build_thin_plate_basis_log_kappa_derivativeswithworkspace(
         },
         implicit_operator: scalar.implicit_operator,
     })
-}
-
-pub fn build_thin_plate_basis_log_kappasecond_derivative(
-    data: ArrayView2<'_, f64>,
-    spec: &ThinPlateBasisSpec,
-) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    build_thin_plate_basis_log_kappasecond_derivativewithworkspace(data, spec, &mut workspace)
-}
-
-pub fn build_thin_plate_basis_log_kappasecond_derivativewithworkspace(
-    data: ArrayView2<'_, f64>,
-    spec: &ThinPlateBasisSpec,
-    workspace: &mut BasisWorkspace,
-) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    let mut bundle =
-        build_thin_plate_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
-    bundle.second.implicit_operator = bundle.implicit_operator;
-    Ok(bundle.second)
-}
-
-/// High-level TPS constructor: selects knots from data, then builds basis+penalty.
-pub fn create_thin_plate_spline_basis_with_knot_count(
-    data: ArrayView2<f64>,
-    num_knots: usize,
-) -> Result<(ThinPlateSplineBasis, Array2<f64>), BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    create_thin_plate_spline_basis_with_knot_count_andworkspace(data, num_knots, &mut workspace)
-}
-
-pub fn create_thin_plate_spline_basis_with_knot_count_andworkspace(
-    data: ArrayView2<f64>,
-    num_knots: usize,
-    workspace: &mut BasisWorkspace,
-) -> Result<(ThinPlateSplineBasis, Array2<f64>), BasisError> {
-    let knots = select_thin_plate_knots(data, num_knots)?;
-    let basis = create_thin_plate_spline_basiswithworkspace(data, knots.view(), workspace)?;
-    Ok((basis, knots))
 }
 
 /// Applies a sum-to-zero constraint to a basis matrix for model identifiability.
