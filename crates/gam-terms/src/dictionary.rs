@@ -744,24 +744,6 @@ fn centered_rank_one_components(
     })
 }
 
-/// Centered rank-1 PCA ceiling for the K=1 lane, exposed for callers that want the
-/// ceiling reconstruction/EV directly. Subtracts the column means, takes the
-/// leading eigenvector of the CENTERED second-moment matrix, fits the rank-1 code
-/// on the centered data with the same ridge shrink the uncentered lane uses, then
-/// adds the mean back so the reconstruction lives in the original space. Returns
-/// `(fitted, explained_variance)`; the EV is measured against the same centered
-/// denominator as the rest of the crate, so it is directly comparable to (and an
-/// upper bound on) the uncentered lane's EV. Prefer setting
-/// `LinearDictionaryConfig::center_rank_one = true` to route the K=1 lane through
-/// this computation as part of a full [`LinearDictionaryFit`].
-pub fn rank_one_centered_pca_ceiling(
-    x: ArrayView2<'_, f64>,
-    code_ridge: f64,
-) -> Result<(Array2<f64>, f64), String> {
-    let components = centered_rank_one_components(x, code_ridge)?;
-    Ok((components.fitted, components.explained_variance))
-}
-
 fn initialize_atoms(x: ArrayView2<'_, f64>, n_atoms: usize) -> Array2<f64> {
     let mut atoms = Array2::<f64>::zeros((n_atoms, x.ncols()));
     let first = max_norm_row(x);

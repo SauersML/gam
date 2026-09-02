@@ -69,14 +69,6 @@ impl BasisOptions {
         }
     }
 
-    /// Create options for evaluating M-spline basis values.
-    pub const fn m_spline() -> Self {
-        Self {
-            derivative_order: 0,
-            basis_family: BasisFamily::MSpline,
-        }
-    }
-
     /// Create options for evaluating I-spline basis values.
     pub const fn i_spline() -> Self {
         Self {
@@ -1274,11 +1266,6 @@ impl Default for DuchonOperatorPenaltySpec {
 }
 
 impl DuchonOperatorPenaltySpec {
-    pub fn has_active_operator_penalty(&self) -> bool {
-        matches!(self.mass, OperatorPenaltySpec::Active { .. })
-            || matches!(self.tension, OperatorPenaltySpec::Active { .. })
-            || matches!(self.stiffness, OperatorPenaltySpec::Active { .. })
-    }
 
     pub fn all_disabled() -> Self {
         Self {
@@ -1341,19 +1328,6 @@ impl DuchonOperatorPenaltySpec {
             stiffness: gate(2.0),
         }
     }
-}
-
-pub fn minimum_duchon_power_for_operator_penalties(
-    dim: usize,
-    nullspace_order: DuchonNullspaceOrder,
-    max_operator_derivative_order: usize,
-) -> usize {
-    let p = duchon_p_from_nullspace_order(nullspace_order);
-    let mut s = 0usize;
-    while 2 * (p + s) <= dim + max_operator_derivative_order {
-        s += 1;
-    }
-    s
 }
 
 /// Resolve a fully admissible Duchon `(nullspace_order, power)` pair.
@@ -2153,11 +2127,6 @@ impl ConstructiveQuadratic {
     /// Dense materialization `AᵀA` for consumers that require a matrix.
     pub fn dense(&self) -> &Array2<f64> {
         &self.matrix
-    }
-
-    /// Consume this quadratic and return its dense materialization.
-    pub fn into_dense(self) -> Array2<f64> {
-        self.matrix
     }
 
     /// Apply a coefficient gauge to the factor, preserving PSD by

@@ -627,11 +627,4 @@ impl AnalyticPenalty for MechanismSparsityPenalty {
         "mechanism_sparsity"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        if let Some(schedule) = self.weight_schedule.as_mut() {
-            let schedule = Arc::make_mut(schedule);
-            self.weight = schedule.current_weight(iter);
-            schedule.iter_count = iter + 1;
-        }
-    }
 }

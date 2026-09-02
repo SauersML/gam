@@ -51,10 +51,6 @@
 //!    orthogonalization AND the multiplicity correction are the reportable
 //!    ones.
 
-use crate::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
-use crate::inference::structure_evidence::{e_benjamini_hochberg, log_e_from_p_calibrator};
-use gam_linalg::faer_ndarray::FaerSvd;
-use gam_problem::RowSubsampleMask;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 /// Outcome family for the behavioral head.
@@ -166,26 +162,6 @@ impl BehavioralHead {
     pub fn fully_supervised(family: AuxOutcomeFamily, y: Array1<f64>) -> Result<Self, String> {
         let n = y.len();
         Self::new(family, y, Array1::from_elem(n, 1.0))
-    }
-
-    /// Build a head whose per-row weights come from a [`RowSubsampleMask`]: rows
-    /// outside the measure (unlabeled) get weight 0, rows inside get the
-    /// measure's weight. This is the semi-supervised seam — no new mechanism,
-    /// the same row-weighting the inner solver already enforces for ρ-coherence.
-    pub fn with_row_measure(
-        family: AuxOutcomeFamily,
-        y: Array1<f64>,
-        measure: &RowSubsampleMask,
-    ) -> Result<Self, String> {
-        let n = y.len();
-        let (indices, weights) = measure.indices_and_weights(n);
-        let mut w_row = Array1::<f64>::zeros(n);
-        for &idx in &indices {
-            if idx < n {
-                w_row[idx] = weights[idx];
-            }
-        }
-        Self::new(family, y, w_row)
     }
 
     pub fn family(&self) -> AuxOutcomeFamily {
@@ -337,54 +313,6 @@ impl BehavioralHead {
         Ok((nll, grad_coeffs, grad_t))
     }
 
-    /// Per-row, per-channel head working weights `s[n, c]` — the diagonal of the
-    /// Fisher information in η-space (`p(1−p)` logistic, `p_c(1−p_c)` softmax
-    /// diagonal). These weight the score-influence directions the leakage
-    /// absorber appends to the reconstruction design (the realized label-channel
-    /// leverage per row), times the row's head weight so unlabeled rows
-    /// contribute nothing to the absorber, exactly as they contribute nothing
-    /// to the head likelihood.
-    pub fn head_working_weights(
-        &self,
-        t: ArrayView2<'_, f64>,
-        coeffs: ArrayView1<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        let (n, d) = t.dim();
-        let n_eta = self.family.n_eta_channels();
-        if coeffs.len() != n_eta * (1 + d) {
-            return Err("BehavioralHead::head_working_weights: coeff length mismatch".to_string());
-        }
-        let eta = self.eta(t, coeffs);
-        let mut s = Array2::<f64>::zeros((n, n_eta));
-        match self.family {
-            AuxOutcomeFamily::Binomial => {
-                for row in 0..n {
-                    let p = 1.0 / (1.0 + (-eta[[row, 0]]).exp());
-                    s[[row, 0]] = self.w_row[row] * p * (1.0 - p);
-                }
-            }
-            AuxOutcomeFamily::Multinomial { .. } => {
-                for row in 0..n {
-                    let mut max_eta = 0.0_f64;
-                    for c in 0..n_eta {
-                        if eta[[row, c]] > max_eta {
-                            max_eta = eta[[row, c]];
-                        }
-                    }
-                    let mut denom = (0.0 - max_eta).exp();
-                    for c in 0..n_eta {
-                        denom += (eta[[row, c]] - max_eta).exp();
-                    }
-                    let lse = max_eta + denom.ln();
-                    for c in 0..n_eta {
-                        let p_c = (eta[[row, c]] - lse).exp();
-                        s[[row, c]] = self.w_row[row] * p_c * (1.0 - p_c);
-                    }
-                }
-            }
-        }
-        Ok(s)
-    }
 }
 
 /// The #461 Neyman-orthogonal leakage absorber for the behavioral head.
@@ -431,64 +359,6 @@ pub struct LeakageAbsorber {
 }
 
 impl LeakageAbsorber {
-    /// Build the absorber from the head's score-influence Jacobian.
-    ///
-    /// `score_influence` is `(n × (d · n_eta))`: for each row, the stacked
-    /// per-channel Fisher-weighted direction `√s_{n,c} · w_c` flattened over
-    /// channels. We take the *column* span (the directions in latent-code space
-    /// the label channel is sensitive to), reduced to an orthonormal basis via
-    /// thin SVD with a relative tolerance, so a rank-deficient or vacuous label
-    /// channel yields a low-rank (possibly empty) `Q` and the absorber is a
-    /// no-op — the honest behavior when the label pins little gauge.
-    pub fn from_score_influence(
-        score_influence: ArrayView2<'_, f64>,
-        latent_dim: usize,
-    ) -> Result<Self, String> {
-        let (n, cols) = score_influence.dim();
-        if latent_dim == 0 {
-            return Ok(Self {
-                q: Array2::<f64>::zeros((0, 0)),
-            });
-        }
-        if cols % latent_dim != 0 {
-            return Err(format!(
-                "LeakageAbsorber: score_influence has {cols} columns, not a multiple of \
-                 latent_dim {latent_dim}"
-            ));
-        }
-        let n_eta = cols / latent_dim;
-        // Accumulate the (d × d) latent-space Gram of the label-channel
-        // directions: G = Σ_n Σ_c v_{n,c} v_{n,c}ᵀ where v_{n,c} ∈ ℝ^d is the
-        // c-th channel's score-influence direction for row n.
-        let mut gram = Array2::<f64>::zeros((latent_dim, latent_dim));
-        for row in 0..n {
-            for c in 0..n_eta {
-                let base = c * latent_dim;
-                for i in 0..latent_dim {
-                    let vi = score_influence[[row, base + i]];
-                    for j in 0..latent_dim {
-                        gram[[i, j]] += vi * score_influence[[row, base + j]];
-                    }
-                }
-            }
-        }
-        // Eigenvectors of G via SVD (G symmetric PSD) give the principal
-        // label-channel directions; keep those above a relative tolerance.
-        let (u_opt, sv, _vt) = gram
-            .svd(true, false)
-            .map_err(|e| format!("LeakageAbsorber: SVD of label-channel Gram failed: {e}"))?;
-        let u = u_opt.ok_or_else(|| "LeakageAbsorber: SVD did not return U".to_string())?;
-        let max_sv = sv.iter().cloned().fold(0.0_f64, f64::max);
-        let tol = max_sv * (latent_dim as f64) * f64::EPSILON;
-        let rank = sv.iter().filter(|&&s| s > tol).count();
-        let mut q = Array2::<f64>::zeros((latent_dim, rank));
-        for col in 0..rank {
-            for r in 0..latent_dim {
-                q[[r, col]] = u[[r, col]];
-            }
-        }
-        Ok(Self { q })
-    }
 
     /// Rank of the absorbed label-channel subspace (`r`). Zero ⇒ the absorber
     /// is a no-op (the label channel pins no direction the dictionary must be
@@ -500,24 +370,6 @@ impl LeakageAbsorber {
     /// Orthonormal basis `Q` of the absorbed subspace (`d × r`).
     pub fn basis(&self) -> ArrayView2<'_, f64> {
         self.q.view()
-    }
-
-    /// Project a reconstruction-channel latent update `Δt` (`n × d`) onto the
-    /// orthogonal complement of the label-channel subspace, in-place semantics
-    /// returned as a fresh array. This is the operative orthogonalization: the
-    /// dictionary update keeps only the component the label channel does not
-    /// already explain.
-    pub fn orthogonalize_recon_update(&self, delta_t: ArrayView2<'_, f64>) -> Array2<f64> {
-        let (_, d) = delta_t.dim();
-        if self.q.ncols() == 0 || self.q.nrows() != d {
-            return delta_t.to_owned();
-        }
-        // Δt − (Δt Q) Qᵀ.
-        let proj_coords = delta_t.dot(&self.q); // (n × r)
-        let proj = proj_coords.dot(&self.q.t()); // (n × d)
-        let mut out = delta_t.to_owned();
-        out -= &proj;
-        out
     }
 
 }
@@ -538,131 +390,3 @@ pub struct HeadFeatureSignificance {
     pub alpha: f64,
 }
 
-/// Per-feature significance of the head's behavioral loadings, with FDR control.
-///
-/// For each latent axis (feature) `k`, the behavioral loading is the head
-/// coefficient `w_{c,k}` across η-channels. We test the null `w_{·,k} = 0`
-/// (the atom carries no behavioral signal) with [`wood_smooth_test`] on the
-/// coefficient block for that axis, using the head's posterior covariance.
-/// Raw p-values are first Bonferroni-combined across η-channels for each axis,
-/// then converted to calibrated e-values with
-/// [`log_e_from_p_calibrator`] and fed to [`e_benjamini_hochberg`] for an
-/// FDR-controlled rejection set that needs no independence assumption across
-/// atoms — exactly the case BH cannot legally handle when atoms share tokens.
-///
-/// `coeffs` is the fitted head coefficient vector (`n_eta · (1 + d)`),
-/// `covariance` its posterior covariance of the same size, `latent_dim` is `d`,
-/// `n_eta` the channel count, and `alpha` the target FDR.
-pub fn head_feature_significance(
-    coeffs: ArrayView1<'_, f64>,
-    covariance: &Array2<f64>,
-    latent_dim: usize,
-    n_eta: usize,
-    residual_df: f64,
-    alpha: f64,
-) -> Result<HeadFeatureSignificance, String> {
-    let block = 1 + latent_dim;
-    if coeffs.len() != n_eta * block {
-        return Err(format!(
-            "head_feature_significance: coeffs length {} != n_eta·(1+d) = {}",
-            coeffs.len(),
-            n_eta * block
-        ));
-    }
-    if covariance.nrows() != coeffs.len() || covariance.ncols() != coeffs.len() {
-        return Err(format!(
-            "head_feature_significance: covariance must be {0}×{0}, got {1}×{2}",
-            coeffs.len(),
-            covariance.nrows(),
-            covariance.ncols()
-        ));
-    }
-    let beta = coeffs.to_owned();
-    let mut statistic = Vec::with_capacity(latent_dim);
-    let mut p_value = Vec::with_capacity(latent_dim);
-    let mut log_e_values = Vec::with_capacity(latent_dim);
-    for axis in 0..latent_dim {
-        // Gather the coefficient indices for this axis across all channels:
-        // for channel c the loading is at `c·block + 1 + axis`. wood_smooth_test
-        // tests a contiguous range, so for the common Binomial (n_eta = 1) case
-        // the range is a single coefficient; for multinomial we test each
-        // channel's loading and combine the minimum p-value with Bonferroni.
-        let mut best_p = 1.0_f64;
-        let mut best_stat = 0.0_f64;
-        let mut tested_channels = 0_usize;
-        for c in 0..n_eta {
-            let idx = c * block + 1 + axis;
-            let input = SmoothTestInput {
-                beta: beta.view(),
-                covariance,
-                influence_matrix: None,
-                whitening_gram: None,
-                coeff_range: idx..idx + 1,
-                edf: 1.0,
-                nullspace_dim: 1,
-                residual_df: Some(residual_df),
-                scale: SmoothTestScale::Estimated,
-            };
-            if let Some(res) = wood_smooth_test(input) {
-                tested_channels += 1;
-                if res.p_value < best_p {
-                    best_p = res.p_value;
-                    best_stat = res.statistic;
-                }
-            }
-        }
-        let axis_p = if tested_channels > 0 {
-            (best_p * tested_channels as f64).min(1.0)
-        } else {
-            1.0
-        };
-        statistic.push(best_stat);
-        p_value.push(axis_p);
-        // Numerical tail routines can underflow a mathematically positive
-        // p-value to exactly zero; calibrate at the smallest positive f64 while
-        // still reporting the Bonferroni-adjusted p-value above.
-        let calibration_p = axis_p.max(f64::MIN_POSITIVE);
-        log_e_values.push(log_e_from_p_calibrator(calibration_p).map_err(|err| {
-            format!("head_feature_significance: invalid calibrated axis p-value: {err}")
-        })?);
-    }
-    let fdr_rejected = e_benjamini_hochberg(&log_e_values, alpha)
-        .map_err(|error| format!("head_feature_significance: {error}"))?;
-    Ok(HeadFeatureSignificance {
-        statistic,
-        p_value,
-        fdr_rejected,
-        alpha,
-    })
-}
-
-/// Reduce a per-row score-influence Jacobian `(n × d)` to a rank-truncated
-/// orthonormal basis of its latent-code column span. Convenience used by the
-/// absorber install site when the caller already has the `(n × d)` Jacobian
-/// for a single η-channel (the common Binomial case). Returns `Q ∈ ℝ^{d × r}`,
-/// `r` = numerical rank of the column span (rank-deficient inputs yield a
-/// low-rank `Q`, so a vacuous label channel orthogonalizes against nothing).
-pub fn orthonormal_span(jacobian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    let (n, d) = jacobian.dim();
-    if d == 0 || n == 0 {
-        return Ok(Array2::<f64>::zeros((d, 0)));
-    }
-    // The right singular vectors of `J` span its row space = the column span
-    // of `Jᵀ` in ℝ^d. Equivalently the eigenvectors of the d × d Gram `JᵀJ`;
-    // route through the SVD bridge for a stable, rank-truncated basis.
-    let gram = jacobian.t().dot(&jacobian);
-    let (u_opt, sv, _vt) = gram
-        .svd(true, false)
-        .map_err(|e| format!("orthonormal_span: SVD failed: {e}"))?;
-    let u = u_opt.ok_or_else(|| "orthonormal_span: SVD did not return U".to_string())?;
-    let max_sv = sv.iter().cloned().fold(0.0_f64, f64::max);
-    let tol = max_sv * (d as f64) * f64::EPSILON;
-    let rank = sv.iter().filter(|&&s| s > tol).count();
-    let mut q = Array2::<f64>::zeros((d, rank));
-    for col in 0..rank {
-        for r in 0..d {
-            q[[r, col]] = u[[r, col]];
-        }
-    }
-    Ok(q)
-}

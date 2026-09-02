@@ -719,30 +719,6 @@ pub fn isotropic_duchon_penalty(q: usize, d: usize, m: usize, s: f64, kappa: f64
     sum.sum()
 }
 
-/// Analytic anisotropic Duchon pair-block kernel.
-///
-/// The historical implementation evaluated the Schoenberg heat integral
-/// numerically. Production now uses the exact radial identity
-/// `g_q(z) = (-Δ_B)^q f(|z|)` with closed-form radial derivatives of the
-/// isotropic Riesz/Matérn hybrid kernel.
-pub fn anisotropic_duchon_penalty(
-    q: usize,
-    m: usize,
-    s: f64,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-) -> f64 {
-    assert_eq!(
-        eta.len(),
-        r.len(),
-        "anisotropic_duchon_penalty: eta and r dimension mismatch"
-    );
-    assert!(!r.is_empty(), "anisotropic_duchon_penalty: empty input");
-    assert!(q <= 2, "anisotropic_duchon_penalty: q must be in {{0,1,2}}");
-    anisotropic_duchon_penalty_radial(q, m, s, kappa, eta, r)
-}
-
 /// Bundled value + first/second derivatives of the anisotropic pair-block
 /// kernel `J · g_q(z; η, m, s, κ)` with `J = exp(Σ η_k)`.
 ///
@@ -2660,91 +2636,6 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
         d2_eta_kappa,
         d2_kappa,
     }
-}
-
-/// Bare-kernel first derivative ∂g_q/∂η_k. The production bundle carries
-/// derivatives of `J · g_q`; this unwraps the `J` contribution.
-pub fn psi_first_derivative(
-    q: usize,
-    m: usize,
-    s: usize,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-    k: usize,
-) -> f64 {
-    assert!(
-        k < eta.len(),
-        "psi_first_derivative: axis index out of range"
-    );
-    let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
-    let big_j = eta.iter().sum::<f64>().exp();
-    (bundle.d_eta[k] - bundle.value) / big_j
-}
-
-/// Bare-kernel second derivative ∂²g_q/∂η_k∂η_l.
-pub fn psi_second_derivative(
-    q: usize,
-    m: usize,
-    s: usize,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-    k: usize,
-    l: usize,
-) -> f64 {
-    assert!(
-        k < eta.len() && l < eta.len(),
-        "psi_second_derivative: axis index out of range"
-    );
-    let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
-    let big_j = eta.iter().sum::<f64>().exp();
-    (bundle.d2_eta[k][l] - bundle.d_eta[k] - bundle.d_eta[l] + bundle.value) / big_j
-}
-
-/// Bare-kernel first derivative ∂g_q/∂κ.
-pub fn kappa_first_derivative(
-    q: usize,
-    m: usize,
-    s: usize,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-) -> f64 {
-    let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
-    bundle.d_kappa / eta.iter().sum::<f64>().exp()
-}
-
-/// Bare-kernel second derivative ∂²g_q/∂κ².
-pub fn kappa_second_derivative(
-    q: usize,
-    m: usize,
-    s: usize,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-) -> f64 {
-    let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
-    bundle.d2_kappa / eta.iter().sum::<f64>().exp()
-}
-
-/// Bare-kernel mixed derivative ∂²g_q/∂η_k∂κ.
-pub fn psi_kappa_mixed_derivative(
-    q: usize,
-    m: usize,
-    s: usize,
-    kappa: f64,
-    eta: &[f64],
-    r: &[f64],
-    k: usize,
-) -> f64 {
-    assert!(
-        k < eta.len(),
-        "psi_kappa_mixed_derivative: axis index out of range"
-    );
-    let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, eta, r);
-    let big_j = eta.iter().sum::<f64>().exp();
-    (bundle.d2_eta_kappa[k] - bundle.d_kappa) / big_j
 }
 
 #[cfg(test)]

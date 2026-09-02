@@ -14,9 +14,7 @@ use crate::basis::{
     pairwise_distance_bounds_sampled, points_in_aniso_y_space, select_centers_by_strategy,
 };
 
-use crate::construction::{
-    kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
-};
+use crate::construction::{kronecker_marginal_eigensystems, kronecker_product};
 
 use penalty_priors::realize_coefficient_groups;
 

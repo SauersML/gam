@@ -5,7 +5,7 @@
 //! build. It streams row chunks over `(data, centers)` and supports the global
 //! log-kappa coordinate plus per-axis anisotropic log-scale coordinates.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use ndarray::{Array2, ArrayView2, s};
 use rayon::prelude::*;
 
 use crate::basis::duchon_kernel_math::centered_aniso_metric_weights;
@@ -176,29 +176,6 @@ impl StreamingMaternBasisGradientEvaluator {
             let end = (start + self.chunk_size).min(data.nrows());
             let chunk = self.row_chunk_gradient(data, start, end, target)?;
             out.slice_mut(s![start..end, ..]).assign(&chunk);
-        }
-        Ok(out)
-    }
-
-    pub fn forward_mul(
-        &self,
-        data: ArrayView2<'_, f64>,
-        target: MaternBasisGradientTarget,
-        coeffs: ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, BasisError> {
-        self.validate_data(data)?;
-        if coeffs.len() != self.n_centers() {
-            crate::bail_dim_basis!(
-                "Matérn gradient coeff length {} != centers {}",
-                coeffs.len(),
-                self.n_centers()
-            );
-        }
-        let mut out = Array1::<f64>::zeros(data.nrows());
-        for start in (0..data.nrows()).step_by(self.chunk_size) {
-            let end = (start + self.chunk_size).min(data.nrows());
-            let chunk = self.row_chunk_gradient(data, start, end, target)?;
-            out.slice_mut(s![start..end]).assign(&chunk.dot(&coeffs));
         }
         Ok(out)
     }

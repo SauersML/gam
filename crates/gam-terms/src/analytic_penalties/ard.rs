@@ -80,35 +80,6 @@ impl ARDPenalty {
 
     impl_with_weight_schedule!(weight);
 
-    /// Override the effective observation count used in the Occam log-det
-    /// term (default: `target.len() / latent_dim`). Pass the number of
-    /// latent rows that actually contribute to axis `j` (uniform across
-    /// axes for the current implementation).
-    #[must_use = "build error must be handled"]
-    pub fn with_n_eff(mut self, n_eff: f64) -> Result<Self, String> {
-        if !(n_eff.is_finite() && n_eff >= 0.0) {
-            return Err(format!(
-                "ARDPenalty::with_n_eff requires a finite non-negative value, got {n_eff}"
-            ));
-        }
-        self.n_eff = n_eff;
-        Ok(self)
-    }
-
-    /// Build scalar [`BlockwisePenalty`] entries for each latent-axis row.
-    /// Fixes the audit finding that the row-major `LatentCoordValues` layout
-    /// (`n * d + j`) cannot be represented as one contiguous per-axis range.
-    pub fn as_blockwise(&self, global_offset: usize) -> Vec<BlockwisePenalty> {
-        let n_obs = self.target.len() / self.latent_dim;
-        let mut out = Vec::with_capacity(n_obs * self.latent_dim);
-        for j in 0..self.latent_dim {
-            for n in 0..n_obs {
-                let idx = global_offset + self.target.range.start + n * self.latent_dim + j;
-                out.push(BlockwisePenalty::ridge(idx..idx + 1, 1.0).with_op(None));
-            }
-        }
-        out
-    }
 }
 
 impl AnalyticPenalty for ARDPenalty {
