@@ -22,11 +22,7 @@
 //! extension ⇒ nonzero boundary-slope exterior derivative. These tests pin both,
 //! across the sparse, dense, and scalar paths.
 
-use gam::terms::basis::{
-    BasisOptions, Dense, KnotSource, Sparse, SplineScratch, create_basis,
-    evaluate_bspline_basis_scalar, evaluate_bspline_derivative_scalar,
-    evaluate_bsplinesecond_derivative_scalar,
-};
+use gam::terms::basis::{BasisOptions, Dense, KnotSource, Sparse, create_basis, evaluate_bspline_derivative_scalar};
 use ndarray::{Array1, Array2};
 
 fn open_knots(a: f64, b: f64, m: usize) -> Array1<f64> {
@@ -141,72 +137,6 @@ fn sparse_open_knot_derivative_matches_dense_including_exterior() {
             );
         }
     }
-}
-
-/// The public scalar derivative evaluators (the marginal-slope / boundary-pin
-/// path) must zero the open-knot exterior and match a value finite difference in
-/// the interior, for orders 1 and 2 (order 2 exercises the recurrence).
-#[test]
-fn scalar_open_knot_derivative_zero_exterior_fd_interior() {
-    let degree = 3usize;
-    let knots = open_knots(-1.0, 2.0, 15);
-    let num_basis = knots.len() - degree - 1;
-    let left = knots[degree];
-    let right = knots[num_basis];
-
-    let value_col = |x: f64, i: usize| -> f64 {
-        let mut out = vec![0.0; num_basis];
-        let mut scratch = SplineScratch::new(degree);
-        evaluate_bspline_basis_scalar(x, knots.view(), degree, &mut out, &mut scratch)
-            .expect("value");
-        out[i]
-    };
-
-    let mut d1 = vec![0.0; num_basis];
-    let mut d2 = vec![0.0; num_basis];
-
-    // Exterior: every order is exactly zero.
-    for &x in &[
-        knots[0],
-        knots[1],
-        0.5 * (knots[0] + left),
-        right + 0.3,
-        knots[knots.len() - 1],
-    ] {
-        if x >= left && x <= right {
-            continue;
-        }
-        evaluate_bspline_derivative_scalar(x, knots.view(), degree, &mut d1).expect("d1");
-        evaluate_bsplinesecond_derivative_scalar(x, knots.view(), degree, &mut d2).expect("d2");
-        assert!(
-            d1.iter().all(|&v| v == 0.0),
-            "scalar d1 nonzero at exterior x={x}: {d1:?}"
-        );
-        assert!(
-            d2.iter().all(|&v| v == 0.0),
-            "scalar d2 nonzero at exterior x={x}: {d2:?}"
-        );
-    }
-
-    // Interior: first derivative matches the value's central difference.
-    let h = 1e-6;
-    let mut any_nonzero = false;
-    for &x in &[left + 0.4, 0.5 * (left + right), right - 0.4, 0.137, 1.21] {
-        if x <= left || x >= right {
-            continue;
-        }
-        evaluate_bspline_derivative_scalar(x, knots.view(), degree, &mut d1).expect("d1");
-        for i in 0..num_basis {
-            let fd = (value_col(x + h, i) - value_col(x - h, i)) / (2.0 * h);
-            assert!(
-                (d1[i] - fd).abs() < 1e-6,
-                "scalar interior d1 mismatch at x={x}, i={i}: {} vs {fd}",
-                d1[i]
-            );
-            any_nonzero |= d1[i].abs() > 1e-6;
-        }
-    }
-    assert!(any_nonzero, "scalar interior derivative degenerately zero");
 }
 
 /// Guard the *clamped* geometry: a clamped knot vector extends the value

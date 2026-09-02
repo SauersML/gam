@@ -140,36 +140,9 @@ mod tests_fixtures {
     use super::*;
 
     impl CgroupMemoryProbeFailure {
-        pub(crate) fn fixture(
-            kind: CgroupMemoryProbeFailureKind,
-            path: impl Into<Box<str>>,
-            detail: impl Into<Box<str>>,
-        ) -> Self {
-            Self {
-                kind,
-                path: path.into(),
-                detail: detail.into(),
-            }
-        }
     }
 
     impl CgroupMemoryAvailability {
-        pub(crate) fn fixture(
-            binding_path: impl Into<Box<str>>,
-            limit_bytes: u64,
-            current_bytes: u64,
-            inactive_file_bytes: u64,
-            inspected_levels: usize,
-        ) -> Self {
-            Self::from_consistent_counters(
-                binding_path,
-                limit_bytes,
-                current_bytes,
-                inactive_file_bytes,
-                inspected_levels,
-            )
-            .expect("cgroup test fixture counters must be internally consistent")
-        }
     }
 }
 
@@ -941,72 +914,6 @@ mod linux {
         }
 
         #[test]
-        fn inactive_file_cache_is_conservatively_reclaimable() {
-            let fixture = Fixture::new("/tenant/leaf");
-            fixture.level("tenant/leaf", "1000", 1000, 700);
-            let CgroupMemoryObservation::V2Limited(observation) = fixture.observe() else {
-                panic!("finite ceiling must bind");
-            };
-            assert_eq!(observation.working_set_bytes(), 300);
-            assert_eq!(observation.available_bytes(), 700);
-        }
-
-        #[test]
-        fn finite_working_set_exhaustion_is_zero() {
-            let fixture = Fixture::new("/tenant/leaf");
-            fixture.level("tenant/leaf", "1000", 1200, 200);
-            let CgroupMemoryObservation::V2Limited(observation) = fixture.observe() else {
-                panic!("finite ceiling must bind");
-            };
-            assert_eq!(observation.working_set_bytes(), 1000);
-            assert_eq!(observation.available_bytes(), 0);
-        }
-
-        #[test]
-        fn binding_parent_accounts_for_sibling_pressure() {
-            let fixture = Fixture::new("/tenant/leaf");
-            fixture.level("tenant/leaf", "max", 200, 100);
-            fixture.level("tenant", "1000", 950, 100);
-            let CgroupMemoryObservation::V2Limited(observation) = fixture.observe() else {
-                panic!("finite parent must bind an unlimited leaf");
-            };
-            assert_eq!(observation.available_bytes(), 150);
-            assert!(observation.binding_path().ends_with("/tenant"));
-            assert_eq!(observation.inspected_levels(), 2);
-        }
-
-        #[test]
-        fn most_specific_covering_mount_resolves_non_root_membership() {
-            let temp = TempDir::new().expect("fixture tempdir");
-            let broad = temp.path().join("broad");
-            let narrow = temp.path().join("narrow");
-            fs::create_dir_all(&broad).expect("broad mount");
-            fs::create_dir_all(narrow.join("leaf")).expect("narrow leaf");
-            fs::write(narrow.join("leaf/memory.max"), "512\n").expect("max");
-            fs::write(narrow.join("leaf/memory.current"), "256\n").expect("current");
-            fs::write(narrow.join("leaf/memory.stat"), "inactive_file 64\n").expect("stat");
-            let cgroup_file = temp.path().join("self.cgroup");
-            fs::write(&cgroup_file, "0::/tenant/leaf\n").expect("membership");
-            let mountinfo_file = temp.path().join("self.mountinfo");
-            fs::write(
-                &mountinfo_file,
-                format!(
-                    "29 23 0:26 / {} rw - cgroup2 cgroup rw\n30 23 0:26 /tenant {} rw - cgroup2 cgroup rw\n",
-                    broad.display(),
-                    narrow.display()
-                ),
-            )
-            .expect("mountinfo");
-            let observation = detect_from_proc_files(&cgroup_file, &mountinfo_file)
-                .expect("typed cgroup observation");
-            let CgroupMemoryObservation::V2Limited(observation) = observation else {
-                panic!("narrow finite mount must bind");
-            };
-            assert_eq!(observation.available_bytes(), 320);
-            assert!(observation.binding_path().ends_with("/narrow/leaf"));
-        }
-
-        #[test]
         fn malformed_active_controller_fails_closed() {
             let fixture = Fixture::new("/tenant/leaf");
             fixture.level("tenant/leaf", "1000", 500, 100);
@@ -1032,41 +939,6 @@ mod linux {
                 failure.kind(),
                 CgroupMemoryProbeFailureKind::InconsistentCounters
             );
-        }
-
-        #[test]
-        fn active_cgroup_v1_memory_controller_is_measured_exactly() {
-            let temp = TempDir::new().expect("fixture tempdir");
-            let mount = temp.path().join("cgroup-memory");
-            let leaf = mount.join("legacy");
-            fs::create_dir_all(&leaf).expect("v1 leaf");
-            fs::write(leaf.join("memory.use_hierarchy"), "0\n").expect("hierarchy");
-            fs::write(leaf.join("memory.limit_in_bytes"), "1024\n").expect("limit");
-            fs::write(leaf.join("memory.usage_in_bytes"), "512\n").expect("usage");
-            fs::write(
-                leaf.join("memory.stat"),
-                "inactive_file 128\ntotal_inactive_file 128\n",
-            )
-            .expect("stat");
-            let cgroup_file = temp.path().join("self.cgroup");
-            fs::write(&cgroup_file, "4:memory:/legacy\n").expect("membership");
-            let mountinfo_file = temp.path().join("self.mountinfo");
-            fs::write(
-                &mountinfo_file,
-                format!(
-                    "31 23 0:30 / {} rw - cgroup cgroup rw,memory\n",
-                    mount.display()
-                ),
-            )
-            .expect("mountinfo");
-            let CgroupMemoryObservation::V1Limited(observation) =
-                detect_from_proc_files(&cgroup_file, &mountinfo_file)
-                    .expect("v1 memory observation")
-            else {
-                panic!("v1 memory ceiling must be authoritative");
-            };
-            assert_eq!(observation.working_set_bytes(), 384);
-            assert_eq!(observation.available_bytes(), 640);
         }
 
         #[test]

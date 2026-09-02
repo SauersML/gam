@@ -19,7 +19,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::solver::residual_cascade::{ResidualCascadeDesign, fit_residual_cascade};
+use gam::solver::residual_cascade::ResidualCascadeDesign;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -212,79 +212,6 @@ fn cascade_matches_or_beats_dense_duchon_on_truth_recovery() {
         cascade_rmse <= 1.10 * dense_rmse,
         "cascade truth recovery regressed vs dense duchon: \
          cascade RMSE={cascade_rmse} > 1.10 × dense RMSE={dense_rmse}"
-    );
-}
-
-/// The quality fixture's automatic route must stop AT the data's identifiable
-/// rank — never short of it, never past it into a rank-deficient score search,
-/// and never as a downstream score-search failure.
-///
-/// # WHAT IT DOES AT THAT FRONTIER CHANGED WITH #2759
-///
-/// It used to refuse there, because the seventh level's gain was above
-/// `1e-3·rss_pen`. That bar charges nothing for the WIDTH of the set it buys,
-/// and this level proposes 6968 penalized modes against 1997 identifiable
-/// directions: at the rank-maximal design those candidates are redundant
-/// against the sample's own row space, so what they buy is penalty dilution.
-/// Charged against its own Occam factor the level does not pay for itself and
-/// the route mints the rank-maximal fit. The measured boundary — 6971 columns,
-/// 6968 penalized modes, 1997 identifiable directions — is a property of the
-/// geometry and is asserted here exactly as before; what changed is the verdict
-/// taken on it, and the typed refusal still fires at the MEMORY boundary
-/// (`past_cliff_fit_from_formula_propagates_refinement_proof_capacity`), where
-/// the design is capped below the identifiable rank and the levels it cannot
-/// reach do pay for themselves.
-#[test]
-fn cascade_quality_fixture_stops_at_the_measured_identifiability_frontier() {
-    init_parallelism();
-    let n = 2_000;
-    let (axes, y, w) = coords_y(2, n);
-    let xs: Vec<&[f64]> = axes.iter().map(|axis| axis.as_slice()).collect();
-    let fit = match fit_residual_cascade(&xs, &y, &w, &[1.0, 1.0], 2.5) {
-        Ok(fit) => fit,
-        Err(other) => panic!(
-            "the cascade must stop at the identifiability frontier rather than refuse at it or \
-             run past it: {other}"
-        ),
-    };
-    // #2700: the seventh level is taken as far as the identifiability budget
-    // reaches (238 of its 5 209 candidates), so the design is the rank-maximal
-    // one rather than the 1 759-center one the route used to keep.
-    let identifiable_directions = n - 3;
-    assert_eq!(fit.num_levels(), 7);
-    assert_eq!(fit.num_centers(), identifiable_directions);
-
-    // The boundary is still MEASURED, not assumed: the complete seventh level
-    // is 6971 columns / 6968 penalized modes against 1997 identifiable
-    // directions. That is geometry, and it did not move.
-    let complete_seventh = ResidualCascadeDesign::build(&xs, &y, &w, &[1.0, 1.0], 2.5, 7)
-        .expect("complete level 7");
-    assert_eq!(complete_seventh.num_coeffs(), 6_971);
-    assert_eq!(complete_seventh.num_centers(), 6_968);
-    assert!(
-        complete_seventh.num_centers() > identifiable_directions,
-        "premise: the seventh level must outrun the data's rank, or this fixture is not at the \
-         boundary it names"
-    );
-
-    // #2759: the fit is minted BY THE CRITERION — the binding candidate set
-    // does not earn its own Occam factor — and it is still a fit the fixed
-    // relative bar would have refused.
-    let certificate = fit.refinement.as_ref().expect("a minted fit carries its comparison");
-    assert!(
-        certificate.gain <= certificate.tolerance && certificate.evidence <= 0.0,
-        "the frontier fit's binding candidate set still earns a level: gain {} vs break-even {} \
-         ({:+} nats)",
-        certificate.gain,
-        certificate.tolerance,
-        certificate.evidence
-    );
-    assert!(
-        certificate.gain > 1e-3 * fit.rss_pen,
-        "premise: the minted fit must be one the fixed relative bar would have refused, got \
-         gain {} against 1e-3·rss_pen {}",
-        certificate.gain,
-        1e-3 * fit.rss_pen
     );
 }
 

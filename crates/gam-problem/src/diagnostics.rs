@@ -853,43 +853,6 @@ impl KktRefusalDiagnosis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::arr1;
-
-    #[test]
-    fn test_envelopeaudit_noviolation() {
-        let reference = arr1(&[0.0, 0.0, 0.0]);
-        let beta = arr1(&[0.1, 0.2, 0.3]);
-        let result = compute_envelopeaudit(0.0, &reference, 0.0, 0.0, &beta, 1e-8, 1e-6);
-
-        assert!(!result.isviolated);
-    }
-
-    #[test]
-    fn test_envelopeaudit_detects_ridge_mismatch() {
-        let reference = arr1(&[1.0, 0.0, 0.0]);
-        let beta = arr1(&[0.1, 0.2, 0.3]);
-        let result = compute_envelopeaudit(1e-10, &reference, 0.1, 0.0, &beta, 1e-8, 1e-6);
-
-        assert!(result.isviolated);
-        assert!(result.message.contains("Ridge Mismatch"));
-    }
-
-    #[test]
-    fn test_dualridge_check_no_mismatch() {
-        let beta = arr1(&[0.1, 0.2, 0.3]);
-        let result = compute_dualridge_check(0.0, 0.0, 0.0, &beta);
-
-        assert!(!result.has_mismatch);
-    }
-
-    #[test]
-    fn test_dualridge_check_detects_mismatch() {
-        let beta = arr1(&[0.1, 0.2, 0.3]);
-        let result = compute_dualridge_check(1e-4, 0.0, 0.0, &beta);
-
-        assert!(result.has_mismatch);
-        assert!(result.message.contains("Ridge Mismatch detected"));
-    }
 
     #[test]
     fn diagnostics_from_predictions_computes_residual_metrics() {

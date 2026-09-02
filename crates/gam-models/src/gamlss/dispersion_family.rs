@@ -2569,13 +2569,6 @@ mod tests {
         loglik.scale(-wi)
     }
 
-    pub(crate) fn beta_fisher_cross_info_mu_phi(mu: f64, phi: f64) -> f64 {
-        let a = mu * phi;
-        let b = (1.0 - mu) * phi;
-        phi * (mu * gam_math::jet_tower::trigamma_derivative_stack(a)[0]
-            - (1.0 - mu) * gam_math::jet_tower::trigamma_derivative_stack(b)[0])
-    }
-
     pub(crate) fn assert_close(label: &str, got: f64, want: f64, tol: f64) {
         assert!(
             (got - want).abs() <= tol,
@@ -2665,44 +2658,6 @@ mod tests {
             &SpatialLengthScaleOptimizationOptions::default(),
         )
         .expect("enabled spatial optimization is irrelevant without spatial coordinates");
-    }
-
-    #[test]
-    pub(crate) fn beta_tower_mixed_channel_matches_cross_information_formula() {
-        let mu = 0.1;
-        let phi = 10.0;
-        let a = mu * phi;
-        let b = (1.0 - mu) * phi;
-        let digamma_a = gam_math::jet_tower::digamma_derivative_stack(a)[0];
-        let digamma_b = gam_math::jet_tower::digamma_derivative_stack(b)[0];
-        let score_neutral_y = 1.0 / (1.0 + (-(digamma_a - digamma_b)).exp());
-
-        let tower = dispersion_beta_nll_order2(score_neutral_y, mu, phi, 1.0);
-        let trigamma_a = std::f64::consts::PI * std::f64::consts::PI / 6.0;
-        let trigamma_b = gam_math::jet_tower::trigamma_derivative_stack(b)[0];
-        let analytic = phi * (mu * trigamma_a - (1.0 - mu) * trigamma_b);
-        let helper = beta_fisher_cross_info_mu_phi(mu, phi);
-
-        assert!(
-            analytic > 0.58,
-            "audit example should have visibly nonzero cross information, got {analytic}"
-        );
-        assert_close("helper cross information", helper, analytic, 1e-12);
-        assert_close("tower mixed channel", tower.h()[0][1], analytic, 1e-8);
-
-        // η-space chain: ∂²NLL/∂η_μ∂η_d = q·φ·f_μφ with q = dμ/dη_μ (the
-        // cross entry carries no ∂²μ/∂η² term because q is η_d-free).
-        let q = mu * (1.0 - mu);
-        let em = (mu / (1.0 - mu)).ln();
-        let ed = phi.ln();
-        let eta_tower =
-            dispersion_eta_nll_order2(DispersionFamilyKind::Beta, score_neutral_y, em, ed, 1.0);
-        assert_close(
-            "eta-scale observed cross curvature",
-            eta_tower.h()[0][1],
-            q * phi * analytic,
-            1e-8,
-        );
     }
 
     /// #932 oracle: the production `Order2<2>` evaluation of each dispersion

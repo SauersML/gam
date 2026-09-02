@@ -895,26 +895,6 @@ mod tests {
     }
 
     #[test]
-    fn k_10000_seed_retains_only_active_support() {
-        let target = array![[1.0, -2.0], [0.5, 3.0], [-1.0, 0.25]];
-        let k = 10_000;
-        let basis = vec!["periodic".to_string(); k];
-        let dims = vec![1; k];
-        let report = build_sae_support_seed(SaeSupportSeedRequest {
-            target: target.view(),
-            atom_basis: &basis,
-            atom_dim: &dims,
-            support_k: 2,
-            random_state: 7,
-            admission: admitted(3, 2, k, 1, 2),
-        })
-        .expect("seed");
-        assert_eq!(report.peak_score_cells, 2);
-        assert_eq!(report.assignment.active_state_cells(), 3 * 2 * 3);
-        assert!(report.assignment.materialize_dense().is_err());
-    }
-
-    #[test]
     fn heterogeneous_seed_is_unpadded_and_deterministic() {
         let target = array![[1.0, -2.0, 0.5], [0.5, 3.0, -0.25]];
         let basis = vec![

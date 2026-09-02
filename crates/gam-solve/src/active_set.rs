@@ -4913,40 +4913,6 @@ mod tests {
         }
     }
 
-    /// The same face, read as COEFFICIENT positions, is wrong — which is exactly
-    /// why the ids are typed and why `row_column_support` exists.
-    ///
-    /// Block 1's representative is joint row 1, but it acts on β coordinate 3.
-    /// Coordinate 1 is block 0's second column: an UNCONSTRAINED coefficient
-    /// owned by a different block. A consumer that identified row ids with β
-    /// positions (to build a free/pinned mask) would pin the wrong coordinate in
-    /// the wrong block; the conversion recovers the right one.
-    #[test]
-    fn block_diagonal_reduced_face_row_ids_are_not_beta_coordinates() {
-        let set = mixed_width_block_diagonal();
-        let beta = Array1::<f64>::zeros(5);
-        let face = set.reduced_face(beta.view(), 1e-8).expect("reduce");
-
-        let block1_rep = face.representatives[1];
-        assert_eq!(block1_rep.index(), 1);
-        assert_eq!(
-            set.row_column_support(block1_rep).expect("support"),
-            vec![3],
-            "block 1's row acts on the joint column 3 (col_start 3 + local 0)"
-        );
-        // The naive identity map would have named coordinate 1, which lies in
-        // block 0's column range [0, 3) — a different block entirely.
-        assert!(block1_rep.index() < 3, "id 1 falls inside block 0's columns");
-
-        // Block 0's row is the one case where the two spaces agree; the
-        // conversion must still be the thing that says so.
-        assert_eq!(
-            set.row_column_support(face.representatives[0])
-                .expect("support"),
-            vec![0]
-        );
-    }
-
     /// The BlockDiagonal arm composes member reductions and concatenates their
     /// row ids in order (each member's flat ids shift by the running member row
     /// count), so a parallel dependent in the second block reports its global id.

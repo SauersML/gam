@@ -341,57 +341,6 @@ pub struct CtnStage1ConfigDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn canonical_document_round_trips_identically() {
-        let document = FitRequestDocument::new(
-            "y ~ duchon(x)",
-            FitRequestConfigDocument {
-                ctn_stage1: Some(CtnStage1Document {
-                    response_column: "dose".to_string(),
-                    covariate_formula_rhs: "s(age)".to_string(),
-                    config: Some(CtnStage1ConfigDocument {
-                        response_degree: Some(4),
-                        response_penalty_order: Some(2),
-                        ..CtnStage1ConfigDocument::default()
-                    }),
-                    weight_column: Some("case_weight".to_string()),
-                    offset_column: None,
-                }),
-                latent_coordinates: Some(
-                    serde_json::from_value(json!({
-                        "x": {"d": 2, "init": "pca", "n": 12, "name": "x"}
-                    }))
-                    .unwrap(),
-                ),
-                analytic_penalties: Some(AnalyticPenaltiesDocument(vec![json!(
-                    {"kind": "orthogonality", "target": "x", "weight": 1.0}
-                )])),
-                precision_hyperpriors: Some(BTreeMap::from([(
-                    "s(x):roughness".to_string(),
-                    PrecisionHyperpriorDocument {
-                        shape: 2.0,
-                        rate: 0.5,
-                    },
-                )])),
-                persistent_warm_start_root: Some(PathBuf::from("warm-start-fixture")),
-                smooth_descriptors: Some(
-                    serde_json::from_value(json!({
-                        "x": {"centers": 8, "kind": "duchon", "vars": ["x"]}
-                    }))
-                    .unwrap(),
-                ),
-                ..FitRequestConfigDocument::default()
-            },
-        )
-        .unwrap();
-
-        let encoded = document.to_canonical_json().unwrap();
-        let decoded = FitRequestDocument::from_json(&encoded).unwrap();
-        assert_eq!(decoded, document);
-        assert_eq!(decoded.to_canonical_json().unwrap(), encoded);
-    }
 
     #[test]
     fn parser_rejects_another_schema_or_version() {

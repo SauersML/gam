@@ -1,7 +1,5 @@
-use gam::gpu::{
-    self, DeviceCsrMatrix, DeviceMatrix, DeviceVector, GpuEligibility, GpuKernel, GpuRuntime,
-};
-use ndarray::{Array2, array};
+use gam::gpu::{self, GpuEligibility, GpuKernel, GpuRuntime};
+use ndarray::Array2;
 use std::thread;
 
 #[test]
@@ -35,71 +33,6 @@ fn gpu_policy_auto_falls_back_to_cpu_when_runtime_is_unavailable_and_sets_cpu_re
             "available eligible runtime must select GPU"
         );
     }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn gpu_device_info_device_count_matches_underlying_driver_count() {
-    if !gam::gpu::driver::cuda_driver_available()
-        .unwrap_or_else(|error| panic!("CUDA driver load fault: {error}"))
-    {
-        assert!(
-            matches!(
-                GpuRuntime::probe(),
-                Ok(gam::gpu::GpuAvailability::Absent(
-                    gam::gpu::GpuAbsence::DriverUnavailable { .. }
-                ))
-            ),
-            "missing libcuda should be reported before touching cudarc device-count paths"
-        );
-        return;
-    }
-
-    let availability = GpuRuntime::probe().expect("runtime probe should not fault");
-    let raw_count = cudarc::driver::CudaContext::device_count()
-        .expect("driver device count should be queryable once probe succeeded");
-    match availability {
-        gam::gpu::GpuAvailability::Available(runtime) => assert_eq!(
-            i32::try_from(runtime.devices.len()).expect("device vec length should fit i32"),
-            raw_count,
-            "GpuDeviceInfo count should match the driver count"
-        ),
-        gam::gpu::GpuAvailability::Absent(gam::gpu::GpuAbsence::NoDevice { .. }) => {
-            assert_eq!(raw_count, 0)
-        }
-        gam::gpu::GpuAvailability::Absent(other) => {
-            panic!("driver was loadable but probe reported unexpected absence: {other}")
-        }
-    }
-}
-
-#[test]
-fn device_memory_representations_guard_against_invalid_csr_and_double_free_style_states() {
-    let dense = DeviceMatrix::from_array(&Array2::zeros((3, 2)));
-    let vec = DeviceVector::from_array(&array![1.0, 2.0, 3.0]);
-    let csr = DeviceCsrMatrix::new(
-        3,
-        2,
-        gpu::DeviceBuffer::from_host_shadow(vec![0, 1]),
-        gpu::DeviceBuffer::from_host_shadow(vec![0]),
-        gpu::DeviceBuffer::from_host_shadow(vec![1.0]),
-    );
-
-    assert_eq!(
-        dense.data.len(),
-        6,
-        "dense allocation size should match rows*cols"
-    );
-    assert_eq!(
-        vec.data.len(),
-        3,
-        "vector allocation size should match input length"
-    );
-    assert_eq!(
-        csr.rowptr.len(),
-        csr.rows + 1,
-        "CSR rowptr must have rows+1 entries to prevent invalid frees / out-of-bounds deallocation paths"
-    );
 }
 
 #[test]

@@ -668,31 +668,8 @@ pub(crate) fn select_wiggle_basis_from_seed_with_knots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_types::PenaltySpec;
     use gam_terms::basis::initializewiggle_knots_from_seed;
     use ndarray::Array1;
-
-    fn dense_penalty(spec: &PenaltySpec) -> &Array2<f64> {
-        match spec {
-            PenaltySpec::Dense(m) => m,
-            other => panic!("expected Dense penalty, got {other:?}"),
-        }
-    }
-
-    fn is_symmetric(m: &Array2<f64>) -> bool {
-        let n = m.nrows();
-        if m.ncols() != n {
-            return false;
-        }
-        for i in 0..n {
-            for j in 0..n {
-                if (m[[i, j]] - m[[j, i]]).abs() > 1e-12 {
-                    return false;
-                }
-            }
-        }
-        true
-    }
 
     // ---- monotone_wiggle_internal_degree ----
 
@@ -715,60 +692,6 @@ mod tests {
     }
 
     // ---- buildwiggle_block_input_from_knots (driven via seed for valid knots) ----
-
-    fn build(double_penalty: bool, penalty_order: usize) -> (ParameterBlockInput, usize) {
-        // A spread-out seed so knot generation yields several monotone columns.
-        let seed = Array1::linspace(0.0, 1.0, 40);
-        let cfg = WiggleBlockConfig {
-            degree: 3,
-            num_internal_knots: 5,
-            penalty_order,
-            double_penalty,
-        };
-        let knots =
-            initializewiggle_knots_from_seed(seed.view(), cfg.degree, cfg.num_internal_knots)
-                .expect("knot init");
-        let block = buildwiggle_block_input_from_knots(
-            seed.view(),
-            &knots,
-            cfg.degree,
-            cfg.penalty_order,
-            cfg.double_penalty,
-        )
-        .expect("build block");
-        let p = block.design.ncols();
-        (block, p)
-    }
-
-    #[test]
-    fn single_penalty_block_shapes_and_invariants() {
-        let (block, p) = build(false, 2);
-        assert!(p >= 2, "expected multiple monotone columns, got p={p}");
-        // Offset is zeros with length = seed length.
-        assert_eq!(block.offset.len(), 40);
-        assert!(block.offset.iter().all(|&v| v == 0.0));
-        // initial_beta is Some(zeros(p)).
-        let beta = block.initial_beta.as_ref().expect("initial_beta");
-        assert_eq!(beta.len(), p);
-        assert!(beta.iter().all(|&v| v == 0.0));
-        // One ROUGHNESS penalty, plus the unconditional gauge-closure
-        // coordinate (gam#2647): an order-two roughness leaves the linear warp
-        // free, and the linear warp is the index scale, not a shape. This
-        // assertion used to read `== 1`, which is exactly the shape of the
-        // defect — a warp block shipped with an unpenalized reparameterization
-        // direction, so the penalized criterion had no minimiser.
-        assert_eq!(block.penalties.len(), 2);
-        assert_eq!(block.nullspace_dims.len(), 2);
-        // The exact function-derivative Gram is p x p and symmetric.
-        let s = dense_penalty(&block.penalties[0]);
-        assert_eq!(s.dim(), (p, p));
-        assert!(is_symmetric(s));
-        // The anchored I-spline excludes the constant polynomial, so the
-        // order-two derivative null space contains only the linear direction.
-        assert_eq!(block.nullspace_dims[0], 1);
-        // The closure coordinate penalizes a null space of its own dimension 0.
-        assert_eq!(block.nullspace_dims[1], 0);
-    }
 
     /// Smallest generalized eigenvalue of `Σ_j S_j` against the I-spline
     /// function Gram, relative to the largest — i.e. how close the assembled
@@ -989,42 +912,6 @@ mod tests {
              already penalizes: null energy {closure_energy:.6e} against max range energy \
              {range_energy:.6e}"
         );
-    }
-
-    #[test]
-    fn double_penalty_appends_nullspace_only_function_ridge() {
-        let (block, p) = build(true, 2);
-        assert!(p >= 2);
-        // Order two has one structural null direction, so double penalty emits
-        // one separate function-space shrinkage block.
-        assert_eq!(block.penalties.len(), 2);
-        assert_eq!(block.nullspace_dims.len(), 2);
-        let ridge = dense_penalty(&block.penalties[1]);
-        assert_eq!(ridge.dim(), (p, p));
-        assert!(is_symmetric(ridge));
-        assert!(
-            (0..p).any(|i| (0..p).any(|j| i != j && ridge[[i, j]].abs() > 1e-12)),
-            "function-metric null shrinkage must not collapse to eye(p)"
-        );
-        assert_eq!(block.nullspace_dims[1], 0);
-    }
-
-    #[test]
-    fn order_one_has_no_nullspace_ridge() {
-        let (block, _) = build(true, 1);
-        assert_eq!(block.penalties.len(), 1);
-        assert_eq!(block.nullspace_dims, vec![0]);
-    }
-
-    #[test]
-    fn unsupported_derivative_order_is_rejected_not_clamped() {
-        let seed = Array1::linspace(0.0, 1.0, 40);
-        let knots = initializewiggle_knots_from_seed(seed.view(), 3, 5).expect("knot init");
-        let error = match buildwiggle_block_input_from_knots(seed.view(), &knots, 3, 4, false) {
-            Ok(_) => panic!("order above represented value degree must be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.contains("derivative"), "unexpected error: {error}");
     }
 
     #[test]

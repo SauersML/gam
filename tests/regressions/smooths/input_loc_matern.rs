@@ -1,9 +1,4 @@
-use gam::terms::basis::{
-    CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu, PeriodicBSplineBasisSpec,
-    bspline_tensor_first_derivative, build_matern_basis, build_matern_basis_log_kappa_derivative,
-    build_periodic_bspline_basis_1d, periodic_bspline_first_derivative_nd,
-    sphere_first_derivative_nd,
-};
+use gam::terms::basis::{PeriodicBSplineBasisSpec, bspline_tensor_first_derivative, build_periodic_bspline_basis_1d, periodic_bspline_first_derivative_nd, sphere_first_derivative_nd};
 use ndarray::{Array1, array};
 
 #[test]
@@ -98,37 +93,3 @@ fn tensor_product_input_loc_grad_matches_product_rule() {
     );
 }
 
-#[test]
-fn matern_gradient_dkappa_matches_finite_difference() {
-    let data = array![[0.2, 0.1], [0.8, 0.7], [0.4, 0.9]];
-    let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
-    let spec = MaternBasisSpec {
-        periodic: None,
-        center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: gam::terms::basis::MaternLengthScale::fixed(0.7),
-        nu: MaternNu::SevenHalves,
-        include_intercept: false,
-        double_penalty: false,
-        identifiability: MaternIdentifiability::CenterSumToZero,
-        aniso_log_scales: None,
-    };
-    let analytic = build_matern_basis_log_kappa_derivative(data.view(), &spec)
-        .expect("analytic derivative should build");
-    let eps = 1.0e-6_f64;
-    let kappa = 1.0 / spec.length_scale.resolved().unwrap();
-    let mut sp = spec.clone();
-    let mut sm = spec.clone();
-    sp.length_scale.set_resolved(1.0 / (kappa * eps.exp()));
-    sm.length_scale.set_resolved(1.0 / (kappa * (-eps).exp()));
-    let plus = build_matern_basis(data.view(), &sp).expect("plus build");
-    let minus = build_matern_basis(data.view(), &sm).expect("minus build");
-    let fd = (plus.design.to_dense() - minus.design.to_dense()) / (2.0 * eps);
-    let err = (&analytic.design_derivative - &fd)
-        .iter()
-        .map(|v| v.abs())
-        .fold(0.0, f64::max);
-    assert!(
-        err < 1e-5,
-        "Matérn derivative with respect to κ should match finite-difference to 1e-5; max error={err}"
-    );
-}

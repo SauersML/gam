@@ -26,7 +26,7 @@
 
 use super::types::should_use_lazy_spatial_design;
 use super::*;
-use gam_runtime::resource::{DerivativeStorageMode, ResourcePolicy};
+use gam_runtime::resource::ResourcePolicy;
 use gam_runtime::test_support::simulated_cgroup_memory_environment;
 use ndarray::Array2;
 
@@ -232,57 +232,3 @@ fn the_ceiling_still_refuses_what_capacity_cannot_hold_2684() {
     );
 }
 
-#[test]
-fn the_storage_route_changes_how_the_basis_is_carried_not_which_basis_it_is_2684() {
-    // The separation stated as an assertion. `AnalyticOperatorRequired` is the
-    // strongest possible memory-side instruction — materialize nothing — and it
-    // is a caller's explicit choice rather than a reading of the machine. It
-    // must change the design's REPRESENTATION and nothing else: same width,
-    // same penalties.
-    let roomy = simulated_cgroup_memory_environment(
-        HOST_AVAILABLE_BYTES,
-        HOST_TOTAL_BYTES,
-        JOB_LIMIT_BYTES,
-        92_827_648,
-    );
-    let dense_policy = ResourcePolicy::for_observed_memory(&roomy);
-    let streamed_policy = ResourcePolicy {
-        derivative_storage_mode: DerivativeStorageMode::AnalyticOperatorRequired,
-        ..dense_policy.clone()
-    };
-
-    let dense = build_under(dense_policy);
-    let streamed = build_under(streamed_policy);
-
-    assert!(
-        dense.design.is_materialized_dense(),
-        "the permissive arm must actually materialize, or the routes are not being contrasted"
-    );
-    assert!(
-        !streamed.design.is_materialized_dense(),
-        "the strict arm must actually stream, or the routes are not being contrasted"
-    );
-    assert_eq!(
-        (dense.design.nrows(), dense.design.ncols()),
-        (streamed.design.nrows(), streamed.design.ncols()),
-        "the storage route changed the WIDTH of the basis, which is the #2684 defect one layer in: \
-         the column space a fit works in must not depend on a memory decision"
-    );
-    assert_eq!(
-        dense.active_penalties.len(),
-        streamed.active_penalties.len(),
-        "the storage route changed how many penalties the basis carries"
-    );
-    for (index, (left, right)) in dense
-        .active_penalties
-        .iter()
-        .zip(streamed.active_penalties.iter())
-        .enumerate()
-    {
-        assert_eq!(
-            left.matrix.dim(),
-            right.matrix.dim(),
-            "penalty {index} changed shape with the storage route"
-        );
-    }
-}

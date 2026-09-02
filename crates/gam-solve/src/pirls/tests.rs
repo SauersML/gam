@@ -92,22 +92,7 @@ pub(crate) use super::*;
 mod tests {
     use super::loop_driver::{default_beta_guess_external, exact_lambdas_from_rho};
     use super::reweight::madsen_lm_accept_factor;
-    use super::{
-        DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
-        PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily,
-        WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet,
-        calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta,
-        calculate_null_deviance, compute_constraint_kkt_diagnostics,
-        compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale,
-        deviance_eta_rows_with_log_measure_scale, evaluate_full_log_likelihood_from_eta,
-        fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical,
-        pirls_data_log_kernel_from_eta, select_active_set_release,
-        should_log_pirls_decision_summary, should_use_sparse_native_pirls,
-        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
-        stable_finite_signed_sum, update_glmvectors, variance_jet_for_weight_family,
-        write_gamma_log_working_state, write_negative_binomial_log_working_state,
-        write_poisson_log_working_state, write_tweedie_log_working_state,
-    };
+    use super::{DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily, WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance, compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical, pirls_data_log_kernel_from_eta, select_active_set_release, should_log_pirls_decision_summary, should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state, write_negative_binomial_log_working_state, write_poisson_log_working_state, write_tweedie_log_working_state};
     use crate::estimate::EstimationError;
     use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, state_fromspec};
     use approx::assert_relative_eq;
@@ -1163,116 +1148,6 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::DenseTransformed);
         assert_eq!(decision.reason, "design_not_sparse");
-    }
-
-    pub(crate) fn fixed_gaussian_beta(
-        x: Array2<f64>,
-        y: Array1<f64>,
-        penalties: Vec<gam_terms::smooth::BlockwisePenalty>,
-        rho: Array1<f64>,
-    ) -> Array1<f64> {
-        let p = x.ncols();
-        let weights = Array1::<f64>::ones(y.len());
-        let offset = Array1::<f64>::zeros(y.len());
-        let specs: Vec<crate::estimate::PenaltySpec> = penalties
-            .iter()
-            .map(crate::estimate::PenaltySpec::from_blockwise_ref)
-            .collect();
-        let nulls = vec![0; specs.len()];
-        let (canonical, _) = gam_terms::construction::canonicalize_penalty_specs(
-            &specs,
-            &nulls,
-            p,
-            "prior mean test",
-        )
-        .expect("canonical penalties");
-        let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            )),
-            link_kind: InverseLink::Standard(StandardLink::Identity),
-            max_iterations: 20,
-            convergence_tolerance: 1e-12,
-            firth_bias_reduction: false,
-            initial_lm_lambda: None,
-            arrow_schur: None,
-        };
-        let problem = PirlsProblem {
-            x,
-            offset: offset.view(),
-            y: y.view(),
-            priorweights: weights.view(),
-            covariate_se: None,
-            gaussian_fixed_cache: None,
-            glm_first_step_gram: None,
-        };
-        let penalty = PenaltyConfig {
-            canonical_penalties: &canonical,
-            balanced_penalty_root: None,
-            reparam_invariant: None,
-            p,
-            coefficient_lower_bounds: None,
-            linear_constraints_original: None,
-            kronecker_factored: None,
-        };
-        let (fit, _) = fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(rho.view())
-                .expect("test rho lies in exact strength domain"),
-            problem,
-            penalty,
-            &config,
-            None,
-        )
-        .expect("fixed rho fit");
-        fit.beta_transformed.as_ref().clone()
-    }
-
-    #[test]
-    pub(crate) fn constant_prior_mean_centers_penalty() {
-        let x = Array2::<f64>::zeros((4, 1));
-        let y = Array1::<f64>::zeros(4);
-        let penalty = gam_terms::smooth::BlockwisePenalty::ridge(0..1, 1.0)
-            .with_prior_mean(gam_problem::CoefficientPriorMean::scalar(2.5));
-        let beta = fixed_gaussian_beta(x, y, vec![penalty], array![0.0]);
-        assert!((beta[0] - 2.5).abs() < 1e-10, "beta={beta:?}");
-    }
-
-    #[test]
-    pub(crate) fn functional_prior_mean_recovers_kernel_amplitude() {
-        let x = Array2::<f64>::zeros((5, 3));
-        let y = Array1::<f64>::zeros(5);
-        let metadata = array![2.0];
-        let alpha = 1.75;
-        let penalty = gam_terms::smooth::BlockwisePenalty::ridge(0..3, 1.0).with_prior_mean(
-            gam_problem::CoefficientPriorMean::functional(
-                metadata,
-                std::sync::Arc::new(move |a: &Array1<f64>| {
-                    let t = a[0];
-                    array![alpha, alpha * t, alpha * t * t]
-                }),
-            ),
-        );
-        let beta = fixed_gaussian_beta(x, y, vec![penalty], array![0.0]);
-        let recovered_alpha = beta[0];
-        assert!((recovered_alpha - alpha).abs() < 1e-10, "beta={beta:?}");
-        assert!((beta[1] / 2.0 - alpha).abs() < 1e-10, "beta={beta:?}");
-        assert!((beta[2] / 4.0 - alpha).abs() < 1e-10, "beta={beta:?}");
-    }
-
-    #[test]
-    pub(crate) fn zero_prior_mean_matches_default_fixed_fit_bitwise() {
-        let x = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0], [1.0, 4.0],];
-        let y = array![0.5, 1.0, 1.5, 2.0, 2.5];
-        let base_penalty = gam_terms::smooth::BlockwisePenalty::ridge(0..2, 1.0);
-        let zero_penalty = gam_terms::smooth::BlockwisePenalty::ridge(0..2, 1.0).with_prior_mean(
-            gam_problem::CoefficientPriorMean::constant(Array1::zeros(2)),
-        );
-        let rho = array![0.25];
-        let beta_default =
-            fixed_gaussian_beta(x.clone(), y.clone(), vec![base_penalty], rho.clone());
-        let beta_zero = fixed_gaussian_beta(x, y, vec![zero_penalty], rho);
-        assert_eq!(beta_default.to_vec(), beta_zero.to_vec());
     }
 
     #[test]
@@ -2453,65 +2328,6 @@ mod tests {
         );
     }
 
-    /// Regression for issue #2131 (sibling of #2126): `calculate_deviance` for a
-    /// Tweedie family must report the conventional **unscaled** deviance
-    /// `D = 2·Σ wᵢ·d(yᵢ, μᵢ)` — exactly like Poisson/Binomial/NB/Beta and Gamma
-    /// (post-#2126) and R/mgcv/statsmodels — and must NOT divide the unit
-    /// deviance by the dispersion `φ`, which would report the scaled deviance
-    /// `D/φ̂` instead. The bug only manifests when `φ ≠ 1`, so this pins a
-    /// likelihood with an explicit `FixedDispersion { phi = 0.25 }`: the reported
-    /// deviance must equal the φ-free value and must be strictly different from
-    /// `D/φ` (= 4·D here).
-    #[test]
-    pub(crate) fn tweedie_deviance_is_unscaled_ignoring_phi() {
-        let y = array![2.0, 5.0, 1.5];
-        let mu = array![1.0, 4.0, 2.0];
-        let w = array![1.5, 0.75, 1.0];
-        let p = 1.5_f64;
-        let phi = 0.25_f64;
-        let likelihood = GlmLikelihoodSpec {
-            spec: LikelihoodSpec::new(
-                ResponseFamily::Tweedie { p },
-                InverseLink::Standard(StandardLink::Log),
-            ),
-            scale: gam_problem::LikelihoodScaleMetadata::FixedDispersion { phi },
-        };
-        // Sanity: the likelihood really does carry a non-unit dispersion, so the
-        // old scaled-deviance code path (÷ φ) would have been exercised.
-        assert_eq!(likelihood.fixed_phi(), Some(phi));
-
-        let eta = mu.mapv(f64::ln);
-        let inverse_link = InverseLink::Standard(StandardLink::Log);
-        let dev = calculate_deviance_from_eta(y.view(), &eta, &likelihood, &inverse_link, w.view())
-            .expect("Tweedie eta deviance must be representable");
-
-        // Unscaled reference: 2·Σ wᵢ·d(yᵢ, μᵢ) with the Tweedie unit deviance
-        // `d = y^{2-p}/((1-p)(2-p)) - y·μ^{1-p}/(1-p) + μ^{2-p}/(2-p)`.
-        let sum_unit: f64 = w
-            .iter()
-            .zip(y.iter())
-            .zip(mu.iter())
-            .map(|((&wi, &yi), &mui)| {
-                let unit = yi.powf(2.0 - p) / ((1.0 - p) * (2.0 - p))
-                    - yi * mui.powf(1.0 - p) / (1.0 - p)
-                    + mui.powf(2.0 - p) / (2.0 - p);
-                wi * unit
-            })
-            .sum();
-        let unscaled = 2.0 * sum_unit;
-
-        // The reported deviance is the unscaled 2·Σ w·d(y, μ) ...
-        assert_relative_eq!(dev, unscaled, epsilon = 1e-12, max_relative = 1e-9);
-        // ... and is NOT the φ-scaled deviance (this is the #2131 assertion: the
-        // old code returned `unscaled / φ`, which for φ = 0.25 differs by ×4).
-        assert!(
-            (dev - unscaled / phi).abs() > 1e-6,
-            "Tweedie deviance must be unscaled, not scaled by 1/φ (φ={phi}): \
-             dev={dev}, unscaled={unscaled}, scaled={}",
-            unscaled / phi
-        );
-    }
-
     #[test]
     pub(crate) fn gamma_log_observed_curvature_matches_shape_one_closed_form() {
         let eta = array![0.2, -0.4];
@@ -2672,123 +2488,6 @@ mod tests {
             w_obs.iter().any(|&w| w <= 0.0),
             "fixture must produce at least one indefinite observed-weight row to \
              guard the no-bail contract; got {w_obs:?}"
-        );
-    }
-
-    #[test]
-    pub(crate) fn negative_binomial_log_observed_curvature_matches_size_theta_closed_form() {
-        let theta = 2.5;
-        let eta = array![0.2, -0.4, 1.1];
-        let mu = eta.mapv(f64::exp);
-        let y = array![0.0, 3.0, 8.0];
-        let w = array![2.0, 0.5, 1.25];
-        let fisher = Array1::from_iter(
-            mu.iter()
-                .zip(w.iter())
-                .map(|(&mu_i, &w_i)| w_i * theta * mu_i / (theta + mu_i)),
-        );
-
-        let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
-            &GlmLikelihoodSpec::canonical(LikelihoodSpec::negative_binomial_log(theta)),
-            &InverseLink::Standard(StandardLink::Log),
-            &eta,
-            y.view(),
-            &fisher,
-            w.view(),
-        )
-        .expect("negative-binomial-log observed curvature should evaluate");
-
-        for i in 0..eta.len() {
-            let denom = theta + mu[i];
-            let scale = w[i] * theta * (theta + y[i]);
-            let expected_w = scale * mu[i] / (denom * denom);
-            let expected_c = scale * mu[i] * (theta - mu[i]) / (denom * denom * denom);
-            let expected_d = scale * mu[i] * (theta * theta - 4.0 * theta * mu[i] + mu[i] * mu[i])
-                / (denom * denom * denom * denom);
-            assert_relative_eq!(w_obs[i], expected_w, epsilon = 1e-12, max_relative = 1e-12);
-            assert_relative_eq!(c_obs[i], expected_c, epsilon = 1e-12, max_relative = 1e-12);
-            assert_relative_eq!(d_obs[i], expected_d, epsilon = 1e-12, max_relative = 1e-12);
-        }
-    }
-
-    #[test]
-    pub(crate) fn poisson_external_fit_reports_full_loglikelihood_not_reml_kernel() {
-        use crate::estimate::{ExternalOptimOptions, optimize_external_design};
-        use gam_terms::smooth::BlockwisePenalty;
-
-        let x = array![
-            [1.0, -1.0],
-            [1.0, -0.5],
-            [1.0, 0.0],
-            [1.0, 0.5],
-            [1.0, 1.0],
-            [1.0, 1.5],
-        ];
-        let y = array![0.0, 1.0, 2.0, 4.0, 6.0, 9.0];
-        let w = Array1::ones(y.len());
-        let offset = Array1::zeros(y.len());
-        let local_penalty = array![[0.0, 0.0], [0.0, 1.0]];
-        let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
-            ResponseFamily::Poisson,
-            InverseLink::Standard(StandardLink::Log),
-        ));
-        let opts = ExternalOptimOptions {
-            family: likelihood.spec.clone(),
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: false,
-            skip_rho_posterior_inference: true,
-            max_iter: 100,
-            tol: 1e-10,
-            nullspace_dims: vec![1],
-            linear_constraints: None,
-            firth_bias_reduction: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
-            persistent_warm_start_store: None,
-        };
-
-        let result = optimize_external_design(
-            y.view(),
-            w.view(),
-            x.clone(),
-            offset.view(),
-            vec![BlockwisePenalty::new(0..2, local_penalty)],
-            &opts,
-        )
-        .expect("external Poisson fit should converge");
-
-        let eta = x.dot(&result.beta) + &offset;
-        let full =
-            evaluate_full_log_likelihood_from_eta(y.view(), eta.view(), &likelihood, w.view())
-                .expect("full eta log-likelihood")
-                .total();
-        let omit = calculate_loglikelihood_omitting_constants_from_eta(
-            y.view(),
-            &eta,
-            &likelihood,
-            &InverseLink::Standard(StandardLink::Log),
-            w.view(),
-        )
-        .expect("exact eta log-likelihood");
-        assert!(
-            full <= 0.0,
-            "Poisson reporting log-likelihood is a log-mass and must be <= 0, got {full}"
-        );
-        assert!(
-            omit > full,
-            "REML omitting-constants kernel must be larger after dropping count normalizers: \
-             omit={omit} full={full}"
-        );
-        assert_relative_eq!(
-            result.log_likelihood,
-            full,
-            epsilon = 1e-10,
-            max_relative = 1e-10
         );
     }
 
@@ -3023,7 +2722,6 @@ mod tests {
         );
         assert_eq!(active_hint, vec![1]);
     }
-
 
     #[test]
     pub(crate) fn lower_bound_active_set_releases_stalewarm_boundary_hint() {

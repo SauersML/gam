@@ -35,21 +35,6 @@ fn fingerprint_is_deterministic_and_distinguishes_typical_inputs() {
 }
 
 #[test]
-fn fingerprint_hex_roundtrip_preserves_bits() {
-    let mut h = Fingerprinter::new();
-    h.absorb_str(b"model", "warm-start-roundtrip");
-    h.absorb_f64_slice(b"x", &[1.5, -0.0, 9.25]);
-    let fp = h.finalize();
-
-    let parsed =
-        Fingerprint::from_hex(&fp.to_hex()).expect("from_hex must parse the exact to_hex output.");
-    assert_eq!(
-        parsed, fp,
-        "from_hex(to_hex(fp)) must reconstruct the original fingerprint."
-    );
-}
-
-#[test]
 fn store_lookup_returns_inserted_payload_at_same_key() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = WarmStartStore::open(

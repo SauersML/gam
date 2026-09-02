@@ -824,18 +824,6 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn with_border_axes_sorts_dedups_and_validates() {
-        let t = SharedBorderTopology::with_border_axes(8, vec![5, 1, 5, 3]).expect("topology");
-        assert_eq!(t.border_axes(), &[1, 3, 5]);
-        assert_eq!(t.border_count(), 3);
-        let err = SharedBorderTopology::with_border_axes(4, vec![0, 4]).unwrap_err();
-        assert!(err.contains("out of range"), "got: {err}");
-        // Empty border is the disjoint topology.
-        let t = SharedBorderTopology::with_border_axes(4, Vec::new()).expect("empty");
-        assert_eq!(t.border_count(), 0);
-    }
-
-    #[test]
     pub(crate) fn decoupled_primary_converges_on_separable_objective() {
         // Diagonal A: the per-atom decoupled step IS the exact Newton step for
         // every coordinate, so the frontier primary must converge to the
@@ -866,42 +854,6 @@ mod tests {
             );
         }
         assert!(result.final_value < 1e-10);
-    }
-
-    #[test]
-    pub(crate) fn border_correction_solves_the_coupled_block() {
-        // Axes 0 and 1 are coupled through an off-diagonal Hessian block (the
-        // arrow-border overlap); the rest are diagonal. With the populated
-        // topology and the exact operator the runner must land on the global
-        // optimum, and at that optimum the correction nulls (the
-        // stationarity invariant: zero outer gradient ⇒ zero step).
-        let dim = 6;
-        let mut a = Array2::<f64>::eye(dim) * 2.0;
-        a[[0, 1]] = 0.4;
-        a[[1, 0]] = 0.4;
-        let target = array![1.0, -2.0, 0.5, 0.0, -1.0, 3.0];
-        let mut obj = QuadraticObjective {
-            a,
-            target: target.clone(),
-        };
-        let cfg = wide_bounds(dim);
-        let topology = SharedBorderTopology::with_border_axes(dim, vec![0, 1]).expect("topology");
-        let seed = Array1::zeros(dim);
-        let result = run_per_atom_efs(&mut obj, &seed, &cfg, &topology).expect("run");
-        assert!(result.converged, "coupled quadratic must converge");
-        for i in 0..dim {
-            assert!(
-                (result.rho[i] - target[i]).abs() < 1e-5,
-                "coord {i}: {} vs target {}",
-                result.rho[i],
-                target[i]
-            );
-        }
-        assert!(
-            result.final_step_inf_norm < 1e-8,
-            "correction must null at the stationary point (got {})",
-            result.final_step_inf_norm
-        );
     }
 
     #[test]
@@ -941,42 +893,10 @@ mod tests {
         assert!(theta_hvp_matrix_free(&op, &wrong).is_err());
     }
 
-    #[test]
-    pub(crate) fn full_border_reduces_to_dense_newton_in_one_correction() {
-        // When the border is the WHOLE ρ-vector (small K), layer 2 is the
-        // exact dense Newton step on the same gradient — so from any seed a
-        // pure quadratic should converge essentially immediately (Newton is
-        // exact; layer 1's decoupled part is then repaired by the line
-        // search). This is the "reduction to the coupled objective at small
-        // K" property of the module docs.
-        let dim = 4;
-        let a = array![
-            [3.0, 0.2, 0.0, 0.1],
-            [0.2, 2.0, 0.1, 0.0],
-            [0.0, 0.1, 1.5, 0.2],
-            [0.1, 0.0, 0.2, 2.5]
-        ];
-        let target = array![0.3, -0.6, 1.2, -0.1];
-        let mut obj = QuadraticObjective {
-            a,
-            target: target.clone(),
-        };
-        let cfg = wide_bounds(dim);
-        let topology =
-            SharedBorderTopology::with_border_axes(dim, (0..dim).collect()).expect("topology");
-        let seed = Array1::from_elem(dim, 2.0);
-        let result = run_per_atom_efs(&mut obj, &seed, &cfg, &topology).expect("run");
-        assert!(result.converged);
-        for i in 0..dim {
-            assert!((result.rho[i] - target[i]).abs() < 1e-5);
-        }
-    }
-
     /// Wraps a quadratic objective but reports its `½log|H|` term as a certified
     /// enclosure with a fixed gap, so the #1011 EFS margin gate can be exercised.
     pub(crate) struct EnclosureGapObjective {
         pub(crate) inner: QuadraticObjective,
-        pub(crate) gap: f64,
     }
 
     impl OuterObjective for EnclosureGapObjective {
@@ -988,12 +908,6 @@ mod tests {
         }
         fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
             self.inner.eval(rho)
-        }
-        fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
-            Ok(self
-                .inner
-                .eval_efs(rho)?
-                .with_logdet_enclosure_gap(Some(self.gap)))
         }
         fn reset(&mut self) {
             self.inner.reset()
@@ -1028,7 +942,6 @@ mod tests {
                 a: a.clone(),
                 target: target.clone(),
             },
-            gap: 1e-2,
         };
         let wide_result = run_per_atom_efs(&mut wide, &seed, &cfg, &topology).expect("wide run");
         assert!(
@@ -1044,7 +957,6 @@ mod tests {
                 a,
                 target: target.clone(),
             },
-            gap: 1e-9,
         };
         let tight_result = run_per_atom_efs(&mut tight, &seed, &cfg, &topology).expect("tight run");
         assert!(

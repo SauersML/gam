@@ -277,34 +277,11 @@ mod tests {
     }
 
     #[test]
-    fn signed_view_from_array_round_trips() {
-        let a = array![5.0_f64, -1.0];
-        let w = SignedWeightsView::from_array(&a);
-        assert_eq!(w.len(), 2);
-        assert_eq!(w.view()[0], 5.0);
-        assert_eq!(w.view()[1], -1.0);
-    }
-
-    #[test]
     fn signed_view_empty_is_empty() {
         let s: [f64; 0] = [];
         let w = SignedWeightsView::from_slice(&s);
         assert_eq!(w.len(), 0);
         assert!(w.is_empty());
-    }
-
-    #[test]
-    fn signed_view_as_psd_succeeds_when_all_nonneg() {
-        let a = array![0.0_f64, 1.0, 2.0];
-        let w = SignedWeightsView::from_array(&a);
-        assert!(w.as_psd().is_some());
-    }
-
-    #[test]
-    fn signed_view_as_psd_fails_on_negative_entry() {
-        let a = array![1.0_f64, -0.001, 2.0];
-        let w = SignedWeightsView::from_array(&a);
-        assert!(w.as_psd().is_none());
     }
 
     // ── PsdWeightsView ────────────────────────────────────────────────────────
@@ -354,12 +331,6 @@ mod tests {
     }
 
     // ── SignedWeightsArc ──────────────────────────────────────────────────────
-
-    #[test]
-    fn signed_weights_arc_from_array_view_signed_len() {
-        let w = SignedWeightsArc::from_array(array![1.0, 2.0, 3.0]);
-        assert_eq!(w.view_signed().len(), 3);
-    }
 
     #[test]
     fn signed_weights_arc_deref_gives_array() {

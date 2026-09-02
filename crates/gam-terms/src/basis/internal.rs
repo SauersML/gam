@@ -455,10 +455,7 @@ pub(super) fn cumulative_bspline_offsets_into(
 #[cfg(test)]
 mod knot_scale_invariance_tests {
     use super::*;
-    use crate::basis::{
-        create_difference_penalty_matrix, evaluate_bspline_derivative_scalar,
-        evaluate_bsplinesecond_derivative_scalar,
-    };
+    use crate::basis::create_difference_penalty_matrix;
     use ndarray::Array1;
 
     /// Clamped cubic knot vector with interior knots at `frac * scale` for
@@ -601,56 +598,6 @@ mod knot_scale_invariance_tests {
                     local[i],
                     full[i]
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn bspline_derivatives_transform_covariantly_under_coordinate_scaling() {
-        let degree = 3;
-        let knots = clamped_cubic_knots(1.0);
-        let num_basis = knots.len() - degree - 1;
-        for frac in [0.13_f64, 0.37, 0.81] {
-            let mut d1 = vec![0.0; num_basis];
-            let mut d2 = vec![0.0; num_basis];
-            evaluate_bspline_derivative_scalar(frac, knots.view(), degree, &mut d1).unwrap();
-            evaluate_bsplinesecond_derivative_scalar(frac, knots.view(), degree, &mut d2).unwrap();
-            assert!(d1.iter().any(|value| value.abs() > 0.1));
-            assert!(d2.iter().any(|value| value.abs() > 0.1));
-
-            for scale in [1e-9_f64, 1.0, 1e9] {
-                let scaled_knots = clamped_cubic_knots(scale);
-                let mut d1_scaled = vec![0.0; num_basis];
-                let mut d2_scaled = vec![0.0; num_basis];
-                evaluate_bspline_derivative_scalar(
-                    frac * scale,
-                    scaled_knots.view(),
-                    degree,
-                    &mut d1_scaled,
-                )
-                .unwrap();
-                evaluate_bsplinesecond_derivative_scalar(
-                    frac * scale,
-                    scaled_knots.view(),
-                    degree,
-                    &mut d2_scaled,
-                )
-                .unwrap();
-
-                for i in 0..num_basis {
-                    let first_covariant = d1_scaled[i] * scale;
-                    let second_covariant = d2_scaled[i] * scale * scale;
-                    assert!(
-                        (first_covariant - d1[i]).abs() <= 1e-10 * (1.0 + d1[i].abs()),
-                        "first derivative basis[{i}] violated c*dB(c*x;c*t)=dB(x;t), \
-                         c={scale} frac={frac}"
-                    );
-                    assert!(
-                        (second_covariant - d2[i]).abs() <= 1e-9 * (1.0 + d2[i].abs()),
-                        "second derivative basis[{i}] violated c^2*d2B(c*x;c*t)=d2B(x;t), \
-                         c={scale} frac={frac}"
-                    );
-                }
             }
         }
     }

@@ -130,59 +130,6 @@ pub struct MultinomialLogitRowProgram<'row> {
 }
 
 impl<'row> MultinomialLogitRowProgram<'row> {
-    /// Construct one validated row. `eta` contains the active-class logits and
-    /// `response` contains the complete simplex row, including the implicit
-    /// reference class in its last slot.
-    pub fn new(eta: &'row [f64], response: &'row [f64], weight: f64) -> Result<Self, String> {
-        let active_classes = eta.len();
-        if active_classes == 0 {
-            return Err("MultinomialLogitRowProgram requires at least one active class".into());
-        }
-        if response.len() != active_classes + 1 {
-            return Err(format!(
-                "MultinomialLogitRowProgram response length {} must equal active classes + reference = {}",
-                response.len(),
-                active_classes + 1,
-            ));
-        }
-        if !weight.is_finite() || weight < 0.0 {
-            return Err(format!(
-                "MultinomialLogitRowProgram weight must be finite and non-negative, got {weight}"
-            ));
-        }
-        if let Some((axis, value)) = eta
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, value)| !value.is_finite())
-        {
-            return Err(format!(
-                "MultinomialLogitRowProgram eta[{axis}] must be finite, got {value}"
-            ));
-        }
-        if let Some((class, value)) = response
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, value)| !value.is_finite() || *value < 0.0)
-        {
-            return Err(format!(
-                "MultinomialLogitRowProgram response[{class}] must be finite and non-negative, got {value}"
-            ));
-        }
-        let response_mass: f64 = response.iter().sum();
-        let simplex_tolerance = 1.0e-10 * (1.0 + response.len() as f64);
-        if (response_mass - 1.0).abs() > simplex_tolerance {
-            return Err(format!(
-                "MultinomialLogitRowProgram response must sum to one, got {response_mass}"
-            ));
-        }
-        Ok(Self {
-            eta,
-            response,
-            weight,
-        })
-    }
 
     fn require_row(row: usize) -> Result<(), String> {
         if row != 0 {
@@ -387,6 +334,60 @@ impl<'row> MultinomialLogitRowProgram<'row> {
             }
         }
         value
+    }
+
+    /// Construct one validated row. `eta` contains the active-class logits and
+    /// `response` contains the complete simplex row, including the implicit
+    /// reference class in its last slot.
+    pub fn new(eta: &'row [f64], response: &'row [f64], weight: f64) -> Result<Self, String> {
+        let active_classes = eta.len();
+        if active_classes == 0 {
+            return Err("MultinomialLogitRowProgram requires at least one active class".into());
+        }
+        if response.len() != active_classes + 1 {
+            return Err(format!(
+                "MultinomialLogitRowProgram response length {} must equal active classes + reference = {}",
+                response.len(),
+                active_classes + 1,
+            ));
+        }
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(format!(
+                "MultinomialLogitRowProgram weight must be finite and non-negative, got {weight}"
+            ));
+        }
+        if let Some((axis, value)) = eta
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "MultinomialLogitRowProgram eta[{axis}] must be finite, got {value}"
+            ));
+        }
+        if let Some((class, value)) = response
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || *value < 0.0)
+        {
+            return Err(format!(
+                "MultinomialLogitRowProgram response[{class}] must be finite and non-negative, got {value}"
+            ));
+        }
+        let response_mass: f64 = response.iter().sum();
+        let simplex_tolerance = 1.0e-10 * (1.0 + response.len() as f64);
+        if (response_mass - 1.0).abs() > simplex_tolerance {
+            return Err(format!(
+                "MultinomialLogitRowProgram response must sum to one, got {response_mass}"
+            ));
+        }
+        Ok(Self {
+            eta,
+            response,
+            weight,
+        })
     }
 }
 
@@ -936,6 +937,7 @@ struct MultinomialClassChannelJacobian {
 }
 
 impl MultinomialClassChannelJacobian {
+
     fn new(inner: AdditiveBlockJacobian) -> Self {
         Self { inner }
     }
@@ -1118,95 +1120,6 @@ impl MultinomialFamily {
     /// Total number of active blocks, `M = K − 1`.
     pub const fn active_classes(&self) -> usize {
         self.total_classes - 1
-    }
-
-    /// Validate inputs and construct the family.
-    ///
-    /// All shape and finiteness invariants are checked here so the
-    /// `CustomFamily` methods can rely on pre-validated geometry.
-    pub fn new(
-        y_one_hot: Array2<f64>,
-        weights: Array1<f64>,
-        total_classes: usize,
-        design: Arc<Array2<f64>>,
-        penalties: Arc<Vec<PenaltyMatrix>>,
-    ) -> Result<Self, String> {
-        if total_classes < 2 {
-            return Err(format!(
-                "MultinomialFamily requires K ≥ 2 classes (got {total_classes})"
-            ));
-        }
-        let (n, k) = y_one_hot.dim();
-        if k != total_classes {
-            return Err(format!(
-                "MultinomialFamily: y_one_hot has {k} columns but total_classes = {total_classes}"
-            ));
-        }
-        if weights.len() != n {
-            return Err(format!(
-                "MultinomialFamily: weights length {} != N = {n}",
-                weights.len()
-            ));
-        }
-        for (i, &v) in weights.iter().enumerate() {
-            if !(v.is_finite() && v >= 0.0) {
-                return Err(format!(
-                    "MultinomialFamily: weights[{i}] must be finite and non-negative (got {v})"
-                ));
-            }
-        }
-        if design.nrows() != n {
-            return Err(format!(
-                "MultinomialFamily: design has {} rows, expected {n}",
-                design.nrows()
-            ));
-        }
-        let p = design.ncols();
-        for (t, penalty) in penalties.iter().enumerate() {
-            if penalty.shape() != (p, p) {
-                return Err(format!(
-                    "MultinomialFamily: penalties[{t}] shape {:?} != (P, P) = ({p}, {p})",
-                    penalty.shape()
-                ));
-            }
-            for ((i, j), &v) in penalty.to_dense().indexed_iter() {
-                if !v.is_finite() {
-                    return Err(format!(
-                        "MultinomialFamily: penalties[{t}][{i},{j}] must be finite (got {v})"
-                    ));
-                }
-            }
-        }
-        validate_multinomial_simplex(y_one_hot.view(), "MultinomialFamily")
-            .map_err(|e| e.to_string())?;
-        for ((i, j), &v) in design.indexed_iter() {
-            if !v.is_finite() {
-                return Err(format!(
-                    "MultinomialFamily: design[{i},{j}] must be finite (got {v})"
-                ));
-            }
-        }
-
-        // Likelihood owns its own copy of the row weights so the family is
-        // self-contained — `evaluate` does not need to refresh it.
-        let likelihood = MultinomialLogitLikelihood::with_classes(total_classes)
-            .map_err(|e| format!("MultinomialFamily: {e}"))?
-            .with_row_weights(weights.clone())
-            .map_err(|e| format!("MultinomialFamily: {e}"))?;
-
-        Ok(Self {
-            y_one_hot,
-            weights,
-            total_classes,
-            design,
-            penalties,
-            likelihood,
-            axis_derivative_cache: Arc::new(Mutex::new(None)),
-            joint_jeffreys_term_strength: 1.0,
-            initial_log_lambda: 0.0,
-            joint_initial_log_lambdas: None,
-            joint_jeffreys_span: None,
-        })
     }
 
     /// Install the MEASURED Jeffreys/Firth span (gam#2612).
@@ -2654,6 +2567,95 @@ impl MultinomialFamily {
         });
         result
     }
+
+    /// Validate inputs and construct the family.
+    ///
+    /// All shape and finiteness invariants are checked here so the
+    /// `CustomFamily` methods can rely on pre-validated geometry.
+    pub fn new(
+        y_one_hot: Array2<f64>,
+        weights: Array1<f64>,
+        total_classes: usize,
+        design: Arc<Array2<f64>>,
+        penalties: Arc<Vec<PenaltyMatrix>>,
+    ) -> Result<Self, String> {
+        if total_classes < 2 {
+            return Err(format!(
+                "MultinomialFamily requires K ≥ 2 classes (got {total_classes})"
+            ));
+        }
+        let (n, k) = y_one_hot.dim();
+        if k != total_classes {
+            return Err(format!(
+                "MultinomialFamily: y_one_hot has {k} columns but total_classes = {total_classes}"
+            ));
+        }
+        if weights.len() != n {
+            return Err(format!(
+                "MultinomialFamily: weights length {} != N = {n}",
+                weights.len()
+            ));
+        }
+        for (i, &v) in weights.iter().enumerate() {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(format!(
+                    "MultinomialFamily: weights[{i}] must be finite and non-negative (got {v})"
+                ));
+            }
+        }
+        if design.nrows() != n {
+            return Err(format!(
+                "MultinomialFamily: design has {} rows, expected {n}",
+                design.nrows()
+            ));
+        }
+        let p = design.ncols();
+        for (t, penalty) in penalties.iter().enumerate() {
+            if penalty.shape() != (p, p) {
+                return Err(format!(
+                    "MultinomialFamily: penalties[{t}] shape {:?} != (P, P) = ({p}, {p})",
+                    penalty.shape()
+                ));
+            }
+            for ((i, j), &v) in penalty.to_dense().indexed_iter() {
+                if !v.is_finite() {
+                    return Err(format!(
+                        "MultinomialFamily: penalties[{t}][{i},{j}] must be finite (got {v})"
+                    ));
+                }
+            }
+        }
+        validate_multinomial_simplex(y_one_hot.view(), "MultinomialFamily")
+            .map_err(|e| e.to_string())?;
+        for ((i, j), &v) in design.indexed_iter() {
+            if !v.is_finite() {
+                return Err(format!(
+                    "MultinomialFamily: design[{i},{j}] must be finite (got {v})"
+                ));
+            }
+        }
+
+        // Likelihood owns its own copy of the row weights so the family is
+        // self-contained — `evaluate` does not need to refresh it.
+        let likelihood = MultinomialLogitLikelihood::with_classes(total_classes)
+            .map_err(|e| format!("MultinomialFamily: {e}"))?
+            .with_row_weights(weights.clone())
+            .map_err(|e| format!("MultinomialFamily: {e}"))?;
+
+        Ok(Self {
+            y_one_hot,
+            weights,
+            total_classes,
+            design,
+            penalties,
+            likelihood,
+            axis_derivative_cache: Arc::new(Mutex::new(None)),
+            joint_jeffreys_term_strength: 1.0,
+            initial_log_lambda: 0.0,
+            joint_initial_log_lambdas: None,
+            joint_jeffreys_span: None,
+        })
+    }
 }
 
 impl CustomFamily for MultinomialFamily {
@@ -4000,531 +4002,6 @@ mod tests {
             }
         }
 
-        struct FirstFisherBuffers {
-            normalized: Vec<f64>,
-            derivative: Vec<f64>,
-            fisher: Vec<f64>,
-        }
-
-        impl FirstFisherBuffers {
-            fn new(m: usize) -> Self {
-                Self {
-                    normalized: vec![0.0; m],
-                    derivative: vec![0.0; m],
-                    fisher: vec![0.0; m * m],
-                }
-            }
-        }
-
-        struct SecondFisherBuffers {
-            normalized: Vec<[f64; 3]>,
-            derivative_u: Vec<f64>,
-            derivative_v: Vec<f64>,
-            mixed_derivative: Vec<f64>,
-            fisher: Vec<f64>,
-        }
-
-        impl SecondFisherBuffers {
-            fn new(m: usize) -> Self {
-                Self {
-                    normalized: vec![[0.0; 3]; m],
-                    derivative_u: vec![0.0; m],
-                    derivative_v: vec![0.0; m],
-                    mixed_derivative: vec![0.0; m],
-                    fisher: vec![0.0; m * m],
-                }
-            }
-        }
-
-        #[inline(never)]
-        fn compiled_first_fisher<const M: usize>(
-            probability: &[f64; M],
-            direction: &[f64; M],
-            weight: f64,
-            buffers: &mut FirstFisherBuffers,
-        ) {
-            softmax_fisher_perturbation::<OneSeed<0>>(
-                M,
-                weight,
-                |axis| probability[axis],
-                |axis| direction[axis],
-                |_| 0.0,
-                &mut buffers.normalized,
-                &mut buffers.fisher,
-            );
-        }
-
-        /// Direct, non-abstracted first directional derivative of
-        /// `weight * (diag(p) - p p')`. The observation weight is folded into
-        /// the probability derivative before matrix assembly, and the output
-        /// loop uses the same ISA-optimal triangular/full-row choice available
-        /// to a manually tuned implementation.
-        #[inline(never)]
-        fn strongest_hand_first_fisher<const M: usize>(
-            probability: &[f64; M],
-            direction: &[f64; M],
-            weight: f64,
-            buffers: &mut FirstFisherBuffers,
-        ) {
-            let mut mean = 0.0;
-            for axis in 0..M {
-                mean += probability[axis] * direction[axis];
-            }
-            for axis in 0..M {
-                buffers.derivative[axis] = weight * probability[axis] * (direction[axis] - mean);
-            }
-            if fisher_output_schedule::<OneSeed<0>>(M) == FisherOutputSchedule::ContiguousFull {
-                for row in 0..M {
-                    let probability_row = probability[row];
-                    let derivative_row = buffers.derivative[row];
-                    for column in 0..M {
-                        buffers.fisher[row * M + column] = -(derivative_row * probability[column]
-                            + probability_row * buffers.derivative[column]);
-                    }
-                    buffers.fisher[row * M + row] += derivative_row;
-                }
-                return;
-            }
-            for row in 0..M {
-                let probability_row = probability[row];
-                let derivative_row = buffers.derivative[row];
-                buffers.fisher[row * M + row] =
-                    derivative_row - 2.0 * derivative_row * probability_row;
-                for column in (row + 1)..M {
-                    let coefficient = -(derivative_row * probability[column]
-                        + probability_row * buffers.derivative[column]);
-                    buffers.fisher[row * M + column] = coefficient;
-                    buffers.fisher[column * M + row] = coefficient;
-                }
-            }
-        }
-
-        #[inline(never)]
-        fn compiled_second_fisher<const M: usize>(
-            probability: &[f64; M],
-            direction_u: &[f64; M],
-            direction_v: &[f64; M],
-            weight: f64,
-            buffers: &mut SecondFisherBuffers,
-        ) {
-            softmax_fisher_perturbation::<TwoSeed<0>>(
-                M,
-                weight,
-                |axis| probability[axis],
-                |axis| direction_u[axis],
-                |axis| direction_v[axis],
-                &mut buffers.normalized,
-                &mut buffers.fisher,
-            );
-        }
-
-        /// Direct, non-abstracted mixed second directional derivative of
-        /// `weight * (diag(p) - p p')`. Every probability derivative is
-        /// materialized exactly once, and symmetry halves the matrix work.
-        #[inline(never)]
-        fn strongest_hand_second_fisher<const M: usize>(
-            probability: &[f64; M],
-            direction_u: &[f64; M],
-            direction_v: &[f64; M],
-            weight: f64,
-            buffers: &mut SecondFisherBuffers,
-        ) {
-            let mut mean_u = 0.0;
-            let mut mean_v = 0.0;
-            for axis in 0..M {
-                mean_u += probability[axis] * direction_u[axis];
-                mean_v += probability[axis] * direction_v[axis];
-            }
-            for axis in 0..M {
-                buffers.derivative_u[axis] = probability[axis] * (direction_u[axis] - mean_u);
-                buffers.derivative_v[axis] = probability[axis] * (direction_v[axis] - mean_v);
-            }
-            let mut mixed_mean = 0.0;
-            for axis in 0..M {
-                mixed_mean += buffers.derivative_v[axis] * direction_u[axis];
-            }
-            for axis in 0..M {
-                buffers.mixed_derivative[axis] = buffers.derivative_v[axis]
-                    * (direction_u[axis] - mean_u)
-                    - probability[axis] * mixed_mean;
-            }
-            for row in 0..M {
-                let probability_row = probability[row];
-                let derivative_u_row = buffers.derivative_u[row];
-                let derivative_v_row = buffers.derivative_v[row];
-                let mixed_row = buffers.mixed_derivative[row];
-                buffers.fisher[row * M + row] = weight
-                    * (mixed_row
-                        - 2.0 * mixed_row * probability_row
-                        - 2.0 * derivative_u_row * derivative_v_row);
-                for column in (row + 1)..M {
-                    let coefficient = weight
-                        * (-(mixed_row * probability[column]
-                            + derivative_u_row * buffers.derivative_v[column]
-                            + derivative_v_row * buffers.derivative_u[column]
-                            + probability_row * buffers.mixed_derivative[column]));
-                    buffers.fisher[row * M + column] = coefficient;
-                    buffers.fisher[column * M + row] = coefficient;
-                }
-            }
-        }
-
-        fn fisher_checksum(values: &[f64]) -> f64 {
-            values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| value * (1 + index % 17) as f64)
-                .sum()
-        }
-
-        /// Binding #932 release gate for multinomial higher-order production.
-        ///
-        /// `softmax_fisher_perturbation` differentiates one canonical
-        /// normalized-mass/Fisher expression and demand-prunes it to either the
-        /// first or mixed-second directional coefficient. The opponents below
-        /// are independent direct analytic schedules with no jet, scalar-field,
-        /// or compiler abstraction. They cache every probability derivative
-        /// once, exploit matrix symmetry where profitable, and select the same
-        /// ISA-shaped full-row schedule as production for large first-order
-        /// blocks.
-        ///
-        /// Both sides cross the same outlined ABI, receive the same 256 varied
-        /// rows, reuse caller-owned scratch, and return the complete `M*M`
-        /// matrix. Every matrix channel enters a feedback-coupled checksum;
-        /// seven samples alternate contender order and the paired medians must
-        /// be strict production wins at every representative width.
-        /// Not `#[ignore]`d. The parity block below is build-independent and
-        /// was dead coverage for as long as this test was ignored; it now runs
-        /// in every build. The timing gate is reached only under `--release`,
-        /// matching `release_measure_multinomial_specialized_vs_generic_tower_932`
-        /// directly below, which is also a #932 release timing gate and is
-        /// likewise not ignored.
-        #[test]
-        fn release_measure_multinomial_fisher_vs_strongest_hand_932() {
-            use gam_math::paired_timing::{SpeedGate, paired_interleaved};
-
-            fn measure<const M: usize>(gate: Option<&mut SpeedGate>, seed: u64, repetitions: usize) {
-                const ROWS: usize = 256;
-                let mut rng = Lcg(seed);
-                let probability: Vec<[f64; M]> = (0..ROWS)
-                    .map(|_| {
-                        let raw: [f64; M] = std::array::from_fn(|_| rng.uniform(0.1, 1.0));
-                        let scale = rng.uniform(0.35, 0.95) / raw.iter().sum::<f64>();
-                        raw.map(|mass| mass * scale)
-                    })
-                    .collect();
-                let direction_u: Vec<[f64; M]> = (0..ROWS)
-                    .map(|_| std::array::from_fn(|_| rng.uniform(-0.8, 0.8)))
-                    .collect();
-                let direction_v: Vec<[f64; M]> = (0..ROWS)
-                    .map(|_| std::array::from_fn(|_| rng.uniform(-0.8, 0.8)))
-                    .collect();
-                let weights: Vec<f64> = (0..ROWS).map(|_| rng.uniform(0.25, 2.5)).collect();
-
-                let mut compiled_first = FirstFisherBuffers::new(M);
-                let mut hand_first = FirstFisherBuffers::new(M);
-                let mut compiled_second = SecondFisherBuffers::new(M);
-                let mut hand_second = SecondFisherBuffers::new(M);
-
-                for row in 0..ROWS {
-                    compiled_first_fisher(
-                        &probability[row],
-                        &direction_u[row],
-                        weights[row],
-                        &mut compiled_first,
-                    );
-                    strongest_hand_first_fisher(
-                        &probability[row],
-                        &direction_u[row],
-                        weights[row],
-                        &mut hand_first,
-                    );
-                    compiled_second_fisher(
-                        &probability[row],
-                        &direction_u[row],
-                        &direction_v[row],
-                        weights[row],
-                        &mut compiled_second,
-                    );
-                    strongest_hand_second_fisher(
-                        &probability[row],
-                        &direction_u[row],
-                        &direction_v[row],
-                        weights[row],
-                        &mut hand_second,
-                    );
-                    for index in 0..M * M {
-                        close(
-                            compiled_first.fisher[index],
-                            hand_first.fisher[index],
-                            3.0e-15,
-                            &format!("M={M} first strongest-hand parity[{row},{index}]"),
-                        );
-                        close(
-                            compiled_second.fisher[index],
-                            hand_second.fisher[index],
-                            5.0e-15,
-                            &format!("M={M} second strongest-hand parity[{row},{index}]"),
-                        );
-                    }
-                }
-
-                // Everything above is a parity assertion and holds in any
-                // build. The sweeps below cost roughly four million row
-                // evaluations per width, and a hand-vs-compiled ratio measured
-                // without optimization would gate on noise, so debug stops
-                // here rather than asserting something it cannot observe.
-                // Parity above runs in every build; the speed contract only when
-                // the gate is open (release profile).
-                let Some(gate) = gate else {
-                    return;
-                };
-
-                let compiled_first_sweep = |nudge: f64, buffers: &mut FirstFisherBuffers| {
-                    let mut checksum = nudge;
-                    for row in 0..ROWS {
-                        compiled_first_fisher(
-                            &probability[row],
-                            &direction_u[row],
-                            weights[row] + checksum * 1.0e-18,
-                            buffers,
-                        );
-                        checksum += fisher_checksum(&buffers.fisher);
-                    }
-                    checksum
-                };
-                let hand_first_sweep = |nudge: f64, buffers: &mut FirstFisherBuffers| {
-                    let mut checksum = nudge;
-                    for row in 0..ROWS {
-                        strongest_hand_first_fisher(
-                            &probability[row],
-                            &direction_u[row],
-                            weights[row] + checksum * 1.0e-18,
-                            buffers,
-                        );
-                        checksum += fisher_checksum(&buffers.fisher);
-                    }
-                    checksum
-                };
-                let compiled_second_sweep = |nudge: f64, buffers: &mut SecondFisherBuffers| {
-                    let mut checksum = nudge;
-                    for row in 0..ROWS {
-                        compiled_second_fisher(
-                            &probability[row],
-                            &direction_u[row],
-                            &direction_v[row],
-                            weights[row] + checksum * 1.0e-18,
-                            buffers,
-                        );
-                        checksum += fisher_checksum(&buffers.fisher);
-                    }
-                    checksum
-                };
-                let hand_second_sweep = |nudge: f64, buffers: &mut SecondFisherBuffers| {
-                    let mut checksum = nudge;
-                    for row in 0..ROWS {
-                        strongest_hand_second_fisher(
-                            &probability[row],
-                            &direction_u[row],
-                            &direction_v[row],
-                            weights[row] + checksum * 1.0e-18,
-                            buffers,
-                        );
-                        checksum += fisher_checksum(&buffers.fisher);
-                    }
-                    checksum
-                };
-
-                // One paired, interleaved, order-RANDOMISED measurement per
-                // channel. This gate was already the best-built of the #932
-                // population: it interleaved by round with `(round + side) % 2`
-                // and took a MEDIAN, not a minimum. What it still did was divide
-                // two PER-ARM medians -- so the pairing the interleave created
-                // was discarded at the last step, and nothing reported whether a
-                // verdict cleared the measurement's own resolution.
-                let sweeps = (repetitions / 2).max(1);
-                let first = paired_interleaved(
-                    15,
-                    sweeps,
-                    seed ^ 0x1111_1111,
-                    |nudge| compiled_first_sweep(nudge, &mut compiled_first),
-                    |nudge| hand_first_sweep(nudge, &mut hand_first),
-                );
-                let second = paired_interleaved(
-                    15,
-                    sweeps,
-                    seed ^ 0x2222_2222,
-                    |nudge| compiled_second_sweep(nudge, &mut compiled_second),
-                    |nudge| hand_second_sweep(nudge, &mut hand_second),
-                );
-                // `median_ratio` is hand / compiled, so above 1 means the
-                // compiled lowering is faster -- the same orientation as the
-                // `hand_over_compiled` token this gate has always printed. The
-                // unit is ns per SWEEP over ROWS rows, not the historical
-                // ns/row; the ratio the verdict rests on is unit-free either way.
-                // CONTRACT UNCHANGED: the compiled lowering must beat the
-                // strongest hand restatement, on both channels. The bar is
-                // `median_ratio` ALONE: `wins_fraction` is a within-run
-                // confidence statement at the host's noise level, so as a
-                // gating conjunct it can only manufacture failures on a busy
-                // runner. It stays on the summary lines above as evidence.
-                gate.faster(
-                    &format!("M={M} rows={ROWS} channel=first"),
-                    &first,
-                    "compiled",
-                    "strongest_hand",
-                );
-                gate.faster(
-                    &format!("M={M} rows={ROWS} channel=second"),
-                    &second,
-                    "compiled",
-                    "strongest_hand",
-                );
-            }
-
-            let mut gate = (!cfg!(debug_assertions)).then(|| SpeedGate::open("MULTINOMIAL-HAND-932"));
-            measure::<2>(gate.as_mut(), 0x9322_0002_face_cafe, 2_000);
-            measure::<3>(gate.as_mut(), 0x9323_0003_face_cafe, 2_000);
-            measure::<8>(gate.as_mut(), 0x9328_0008_face_cafe, 600);
-            measure::<32>(gate.as_mut(), 0x9332_0032_face_cafe, 80);
-            measure::<64>(gate.as_mut(), 0x9364_0064_face_cafe, 24);
-            if let Some(gate) = gate {
-                gate.finish();
-            }
-        }
-
-        /// #932 release speed gate for the multinomial-logit row. Production
-        /// is the structure-compiled softmax lowering
-        /// ([`MultinomialLogitRowProgram::value_gradient_hessian_into`], with
-        /// const-hinted small-`M` shapes of its single body), timed against
-        /// the generic gam-math forward-mode jet tower
-        /// ([`program_row_kernel`]) — the naive automatic-differentiation
-        /// baseline the retained specialization must beat, since #932 removed
-        /// this family's `cfg(test)` hand restatement. Emits the diagnostic
-        /// `generic_tower_over_production` (generic-tower time over production
-        /// time) per active-class width. This validates the specialization
-        /// against its generic oracle, but is deliberately not strongest-hand
-        /// closure evidence.
-        ///
-        /// The batch of distinct rows supplies genuine per-row input variation, so
-        /// the optimizer cannot hoist the pure row call out of the sweep, and the
-        /// finite checksum over every returned channel keeps the whole sweep live
-        /// without `std::hint::black_box`.
-        #[test]
-        fn release_measure_multinomial_specialized_vs_generic_tower_932() {
-            use gam_math::paired_timing::{SpeedGate, paired_interleaved};
-
-            fn measure<const M: usize>(gate: Option<&mut SpeedGate>, seed: u64) {
-                const ROWS: usize = 512;
-                let mut rng = Lcg(seed);
-                let mut etas: Vec<[f64; M]> = Vec::with_capacity(ROWS);
-                let mut responses: Vec<Vec<f64>> = Vec::with_capacity(ROWS);
-                let mut weights: Vec<f64> = Vec::with_capacity(ROWS);
-                for row in 0..ROWS {
-                    let eta: [f64; M] = std::array::from_fn(|_| rng.uniform(-2.5, 2.5));
-                    let observed = row % (M + 1);
-                    let mut response = vec![0.0; M + 1];
-                    response[observed] = 1.0;
-                    etas.push(eta);
-                    responses.push(response);
-                    weights.push(rng.uniform(0.25, 2.5));
-                }
-                let programs: Vec<MultinomialLogitRowProgram> = (0..ROWS)
-                    .map(|row| {
-                        MultinomialLogitRowProgram::new(&etas[row], &responses[row], weights[row])
-                            .expect("valid multinomial batch row")
-                    })
-                    .collect();
-
-                let mut probabilities = vec![0.0_f64; M + 1];
-                let mut gradient = vec![0.0_f64; M];
-                let mut hessian = vec![0.0_f64; M * M];
-
-                // Warm both paths and pin that the production lowering and the
-                // generic tower emit the same V/G/H, so the two timings measure
-                // equal work.
-                for program in &programs {
-                    let (tower_value, tower_gradient, tower_hessian) =
-                        program_row_kernel::<M, _>(program, 0).expect("tower warm kernel");
-                    let production_value = program.value_gradient_hessian_into(
-                        &mut probabilities,
-                        &mut gradient,
-                        &mut hessian,
-                    );
-                    close(
-                        tower_value,
-                        production_value,
-                        JET_TOL,
-                        &format!("M={M} release-measure value parity"),
-                    );
-                    for a in 0..M {
-                        close(
-                            tower_gradient[a],
-                            gradient[a],
-                            JET_TOL,
-                            &format!("M={M} release-measure gradient[{a}] parity"),
-                        );
-                        for b in 0..M {
-                            close(
-                                tower_hessian[a][b],
-                                hessian[a * M + b],
-                                JET_TOL,
-                                &format!("M={M} release-measure hessian[{a}][{b}] parity"),
-                            );
-                        }
-                    }
-                }
-
-                // Parity above runs in every build; the speed contract below only
-                // when the gate is open (release profile). One arm call is one
-                // sweep over the batch of distinct rows; the nudge enters the
-                // fold, since the programs hold their rows immutably.
-                let Some(gate) = gate else {
-                    return;
-                };
-                let timing = paired_interleaved(
-                    15,
-                    20,
-                    seed ^ 0x9320_0000,
-                    |nudge| {
-                        let mut checksum = nudge;
-                        for program in &programs {
-                            let value = program.value_gradient_hessian_into(
-                                &mut probabilities,
-                                &mut gradient,
-                                &mut hessian,
-                            );
-                            checksum += value + gradient[0] + hessian[0];
-                        }
-                        checksum
-                    },
-                    |nudge| {
-                        let mut checksum = nudge;
-                        for program in &programs {
-                            let (value, tower_gradient, tower_hessian) =
-                                program_row_kernel::<M, _>(program, 0).expect("tower kernel");
-                            checksum += value + tower_gradient[0] + tower_hessian[0][0];
-                        }
-                        checksum
-                    },
-                );
-                gate.faster(
-                    &format!("M={M} rows={ROWS}"),
-                    &timing,
-                    "production",
-                    "generic_tower",
-                );
-            }
-
-            let mut gate = (!cfg!(debug_assertions)).then(|| SpeedGate::open("MULTINOMIAL-RELEASE-932"));
-            measure::<2>(gate.as_mut(), 0x9322_2020_0715_face);
-            measure::<3>(gate.as_mut(), 0x0bad_c0de_0715_2020);
-            measure::<4>(gate.as_mut(), 0x5eed_4444_0722_beef);
-            measure::<8>(gate.as_mut(), 0x1234_5678_0715_abcd);
-            if let Some(gate) = gate {
-                gate.finish();
-            }
-        }
     }
 
     impl MultinomialFamily {
@@ -5018,58 +4495,6 @@ mod tests {
                 window[1].gauge_priority,
             );
         }
-    }
-
-    /// #2744, the other end of the same contract: the CANONICALISER must honour
-    /// the raw-width declaration on a shared design that is genuinely
-    /// rank-deficient.
-    ///
-    /// The failing arm's design is `s(x1) + s(x2) + te(x1, x2)`, where the
-    /// tensor term re-spans its own marginals — one column lies in the span of
-    /// two others. That shape is reproduced here directly, so the audit has a
-    /// real deficiency to attribute and the assertion is not vacuous: without
-    /// the lock the `#933` path reduces both class blocks and the family's flat
-    /// layout no longer describes the specs the solver holds.
-    #[test]
-    fn canonicalisation_keeps_multinomial_blocks_at_raw_width_2744() {
-        let (n, p, k) = (48, 4, 3);
-        let mut family = toy_family(n, p, k);
-        // Column `p-1` becomes an exact linear combination of columns 0 and 1 —
-        // the marginal/tensor confounding, not a duplicated-column alias pair.
-        let deficient = {
-            let mut design = (*family.design).clone();
-            let combo = &design.column(0).to_owned() * 0.75 + &design.column(1).to_owned() * 0.5;
-            design.column_mut(p - 1).assign(&combo);
-            design
-        };
-        family.design = Arc::new(deficient);
-        let specs = family.build_block_specs();
-
-        let canonical = gam_identifiability::canonical::canonicalize_for_identifiability(
-            &specs,
-            &vec![gam_problem::CoefficientCoordinate::Spanning; specs.len()],
-        )
-            .expect("a rank-deficient shared design must canonicalise, not fail closed");
-
-        // NON-VACUITY CONTROL: the audit must actually have found the
-        // deficiency. If it attributed nothing there would be no reduction to
-        // suppress and the width assertion below would pass on any code.
-        assert!(
-            !canonical.audit.dropped_columns.is_empty(),
-            "the fixture must present the audit with a real rank deficiency to attribute; \
-             it reported none, so the raw-width assertion would be vacuous"
-        );
-        for (raw, reduced) in specs.iter().zip(canonical.reduced_specs.iter()) {
-            assert_eq!(
-                reduced.design.ncols(),
-                raw.design.ncols(),
-                "block '{}' was column-reduced despite locking its raw width",
-                raw.name,
-            );
-        }
-        family
-            .check_spec_coefficient_width(&canonical.reduced_specs, "canonicalised specs")
-            .expect("the canonicalised specs must still match the family's flat layout");
     }
 
     #[test]

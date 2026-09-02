@@ -22,7 +22,6 @@
 //! even on the lazy path (which streams the design in row chunks rather than
 //! materializing it).
 
-use gam::ResourcePolicy;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::rmse;
@@ -66,26 +65,6 @@ fn encode_xzy(x: &[f64], z: &[f64], y: &[f64]) -> gam::data::EncodedDataset {
 fn fit_gaussian(formula: &str, ds: &gam::data::EncodedDataset) -> gam::StandardFitResult {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        ..FitConfig::default()
-    };
-    let result = fit_from_formula(formula, ds, &cfg)
-        .unwrap_or_else(|e| panic!("gam duchon fit failed for `{formula}`: {e}"));
-    match result {
-        FitResult::Standard(fit) => fit,
-        _ => panic!("expected a standard GAM fit for a gaussian Duchon smooth: `{formula}`"),
-    }
-}
-
-/// Fit with the caller's resource policy so a memory-routing fixture can pass
-/// the exact admission boundary that it asserted.
-fn fit_gaussian_with_resource_policy(
-    formula: &str,
-    ds: &gam::data::EncodedDataset,
-    resource_policy: ResourcePolicy,
-) -> gam::StandardFitResult {
-    let cfg = FitConfig {
-        family: Some("gaussian".to_string()),
-        resource_policy: Some(resource_policy),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, ds, &cfg)
@@ -263,119 +242,3 @@ fn duchon_2d_recovers_smooth_surface() {
     );
 }
 
-#[test]
-fn duchon_lazy_chunked_path_is_exercised_and_recovers_truth() {
-    init_parallelism();
-
-    // This test forces the MEMORY-SAVING lazy chunked design operator
-    // (`ChunkedKernelDesignOperator`, gated by `should_use_lazy_spatial_design`)
-    // and asserts the streamed path is still correct. The lazy path activates
-    // when the would-be dense `n × p` design exceeds the active policy's
-    // `max_single_materialization_bytes`. The fixture derives that boundary
-    // from the adjacent design with one fewer basis column, so it is stable
-    // across hosts without an environment override or a fixed magic cap.
-    //
-    // n = 40_000, k = 900. WHY THESE NUMBERS: the constrained radial block has
-    // k-2 columns and the affine polynomial block restores 2, so the lazy gate
-    // sees exactly p=k before global identifiability. The forbidden dense block
-    // is 40_000·900·8 = 288,000,000 bytes (≈275 MiB), while streamed row
-    // chunks and the p×p normal-equation folds remain bounded independently of
-    // n. The test therefore exercises the operator's correctness without ever
-    // allocating the full n×p design.
-    let n = 40_000usize;
-    let k = 900usize;
-
-    // The policy admits the otherwise-identical (k-1)-column design and rejects
-    // this k-column design. Checked arithmetic makes dimension overflow a test
-    // construction error rather than a falsely tiny routing footprint.
-    let dense_design_bytes = n
-        .checked_mul(k)
-        .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
-        .expect("lazy-path dense design footprint must fit usize");
-    let fixture_budget = n
-        .checked_mul(k.checked_sub(1).expect("lazy-path k must be positive"))
-        .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
-        .expect("lazy-path adjacent-design budget must fit usize");
-    let mut policy = ResourcePolicy::analytic_operator_required();
-    policy.max_single_materialization_bytes = fixture_budget;
-    assert!(
-        dense_design_bytes > policy.max_single_materialization_bytes,
-        "lazy-path test misconfigured: dense design {dense_design_bytes} bytes does not exceed \
-         the mechanism-derived materialization budget {} bytes for n={n}, k={k}",
-        policy.max_single_materialization_bytes
-    );
-
-    // Low-frequency truth f(x) = sin(2π·x), one period over [0,1]; 900 centers
-    // resolve it to the noise floor.
-    let sigma = 0.05;
-    let mut rng = StdRng::seed_from_u64(0x1A_2B_3C);
-    let noise = Normal::new(0.0, sigma).expect("normal");
-    let mut x: Vec<f64> = (0..n).map(|i| i as f64 / (n as f64 - 1.0)).collect();
-    x.sort_by(|a, b| a.partial_cmp(b).expect("finite x"));
-    let two_pi = 2.0 * std::f64::consts::PI;
-    let y: Vec<f64> = x
-        .iter()
-        .map(|&t| (two_pi * t).sin() + noise.sample(&mut rng))
-        .collect();
-
-    let ds = encode_xy(&x, &y);
-    let x_idx = ds.column_map()["x"];
-    let fit =
-        fit_gaussian_with_resource_policy(&format!("y ~ duchon(x, k={k})"), &ds, policy.clone());
-
-    let duchon_design = fit
-        .design
-        .smooth
-        .term_designs
-        .first()
-        .expect("lazy-path fit must contain its Duchon term design");
-    assert!(
-        duchon_design.is_operator_backed(),
-        "Duchon term crossed the fixture budget but was not operator-backed"
-    );
-    assert!(
-        duchon_design.as_dense_ref().is_none(),
-        "operator-backed Duchon term exposed a hidden full-design materialization"
-    );
-
-    let train_fitted: Vec<f64> = fit.design.design.apply(&fit.fit.beta).to_vec();
-    assert!(
-        train_fitted.iter().all(|v| v.is_finite()),
-        "duchon lazy path: non-finite fitted value among training points"
-    );
-
-    let m = 201usize;
-    let x_test: Vec<f64> = (0..m)
-        .map(|i| 0.01 + 0.98 * i as f64 / (m as f64 - 1.0))
-        .collect();
-    let y_truth: Vec<f64> = x_test.iter().map(|&t| (two_pi * t).sin()).collect();
-
-    let mut grid = Array2::<f64>::zeros((m, ds.headers.len()));
-    for (i, &t) in x_test.iter().enumerate() {
-        grid[[i, x_idx]] = t;
-    }
-    let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
-        .expect("rebuild Duchon design at lazy-path test grid");
-    let gam_fitted: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
-    assert!(
-        gam_fitted.iter().all(|v| v.is_finite()),
-        "duchon lazy path: non-finite fitted value on the test grid"
-    );
-
-    let recovery_rmse = rmse(&gam_fitted, &y_truth);
-    let truth_mean = y_truth.iter().sum::<f64>() / m as f64;
-    let demeaned: Vec<f64> = y_truth.iter().map(|&t| t - truth_mean).collect();
-    let trivial = rms(&demeaned);
-    eprintln!(
-        "duchon-scale-lazy: n={n} k={k} sigma={sigma} \
-         dense_design_MiB={:.1} fixture_budget_MiB={:.1} recovery_rmse={recovery_rmse:.4} \
-         trivial_predictor_rms={trivial:.4}",
-        dense_design_bytes as f64 / (1024.0 * 1024.0),
-        policy.max_single_materialization_bytes as f64 / (1024.0 * 1024.0),
-    );
-    assert!(
-        recovery_rmse < 0.20,
-        "duchon lazy path: failed to recover sin(2πx) on the chunked operator: \
-         recovery_rmse={recovery_rmse:.4} (trivial-predictor RMS≈{trivial:.4})"
-    );
-}

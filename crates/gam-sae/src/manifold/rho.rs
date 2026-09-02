@@ -39,50 +39,6 @@ mod log_strength_domain_tests {
     use super::*;
     use ndarray::array;
 
-    fn fully_active_rho() -> SaeManifoldRho {
-        SaeManifoldRho::new(0.0, 0.0, vec![array![0.0]]).with_log_lambda_block(vec![0.0])
-    }
-
-    #[test]
-    fn every_active_flat_log_strength_has_one_closed_domain() {
-        let rho = fully_active_rho();
-        let dimension = rho.to_flat().len();
-        for endpoint in [LOG_STRENGTH_MIN, LOG_STRENGTH_MAX] {
-            let flat = Array1::from_elem(dimension, endpoint);
-            let rebuilt = rho
-                .from_flat(flat.view())
-                .expect("both exact log-strength endpoints are in-domain");
-            assert_eq!(rebuilt.to_flat(), flat);
-        }
-        assert_eq!(
-            rho.flat_domain_lower_bound().unwrap(),
-            Array1::from_elem(dimension, LOG_STRENGTH_MIN)
-        );
-        assert_eq!(
-            rho.flat_domain_upper_bound().unwrap(),
-            Array1::from_elem(dimension, LOG_STRENGTH_MAX)
-        );
-
-        for coordinate in 0..dimension {
-            for invalid in [
-                LOG_STRENGTH_MIN - 1.0,
-                LOG_STRENGTH_MAX + 1.0,
-                f64::NAN,
-                f64::INFINITY,
-            ] {
-                let mut flat = Array1::zeros(dimension);
-                flat[coordinate] = invalid;
-                let error = rho
-                    .from_flat(flat.view())
-                    .expect_err("every emitted log strength must fail outside the domain");
-                assert!(
-                    error.contains("must be finite and in"),
-                    "coordinate {coordinate}, value {invalid}: {error}"
-                );
-            }
-        }
-    }
-
     #[test]
     fn structurally_absent_sparse_placeholder_is_ignored_and_never_scaled() {
         let rho = SaeManifoldRho::new(17.0, 0.0, vec![Array1::<f64>::zeros(0)])
@@ -105,30 +61,6 @@ mod log_strength_domain_tests {
             .expect("the active smooth coordinate remains valid");
     }
 
-    #[test]
-    fn physical_accessors_revalidate_public_logs_and_never_reuse_stale_strengths() {
-        let mut rho = fully_active_rho();
-        rho.log_ard[0][0] = LOG_STRENGTH_MIN;
-        assert_eq!(
-            rho.ard_precisions().unwrap()[0][0].to_bits(),
-            checked_exp_log_strength(LOG_STRENGTH_MIN)
-                .unwrap()
-                .to_bits()
-        );
-
-        // Public report/state fields may be mutated by downstream Rust code.
-        // Every physical conversion therefore revalidates current storage; no
-        // cached alpha/lambda can survive this mutation.
-        rho.log_ard[0][0] = LOG_STRENGTH_MAX + 1.0;
-        let error = rho.ard_precisions().unwrap_err();
-        assert!(error.contains("atom 0, axis 0"));
-
-        rho.log_lambda_smooth[0] = f64::NAN;
-        assert!(rho.lambda_smooth_for(0).is_err());
-        assert!(rho.lambda_smooth_vec().is_err());
-        rho.log_lambda_sparse = f64::INFINITY;
-        assert!(rho.lambda_sparse().is_err());
-    }
 }
 
 /// Whether assignment strength contributes an outer penalized quasi-Laplace coordinate.

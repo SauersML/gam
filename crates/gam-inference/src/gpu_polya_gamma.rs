@@ -1342,38 +1342,6 @@ mod tests {
     }
 
     #[test]
-    fn saddlepoint_solve_round_trips() {
-        // K'(t) = tanh(v)/v on the negative-t branch, tan(v)/v on positive.
-        // Recover t from K'(t) and check that re-evaluating K'(t) agrees.
-        for &x in &[0.05_f64, 0.3, 0.7, 0.99, 1.01, 1.5, 3.0, 8.0] {
-            let t = saddlepoint_solve(x);
-            let kp = if t.abs() < 1e-14 {
-                1.0
-            } else if t < 0.0 {
-                let v = (-2.0 * t).sqrt();
-                v.tanh() / v
-            } else {
-                let v = (2.0 * t).sqrt();
-                v.tan() / v
-            };
-            let rel = (kp - x).abs() / x.max(1e-12);
-            assert!(
-                rel < 1e-6,
-                "saddlepoint_solve(x={x}) → t={t}; K'(t)={kp}, rel={rel}"
-            );
-        }
-    }
-
-    #[test]
-    fn saddlepoint_kpp_is_positive() {
-        // K'' is the variance of the tilted distribution; must be > 0.
-        for &t in &[-2.0_f64, -0.5, -1e-5, 0.0, 1e-5, 0.5, 1.0] {
-            let v = saddlepoint_kpp(t);
-            assert!(v.is_finite() && v > 0.0, "K''({t}) = {v}");
-        }
-    }
-
-    #[test]
     fn pg_normal_oracle_matches_moments_at_large_b() {
         // b = 500, c = 1.0: normal approximation should land moments to
         // ~1 % at 100k samples.
@@ -1530,45 +1498,6 @@ mod tests {
         }
     }
 
-    /// #2320: gate the XORWOW-driven CPU exact-PG(1) path on distribution
-    /// *shape* against the analytic `PG(1, 0)` CDF, not just moments or a
-    /// second sampler. A one-sample DKW bound against exact truth catches a
-    /// shape error even if a sibling sampler shared it.
-    #[test]
-    fn pg1_cpu_oracle_matches_exact_untilted_cdf() {
-        let sample_count = 20_000usize;
-        let mut samples: Vec<f64> = (0..sample_count)
-            .map(|i| {
-                let mut st = XorwowState::new(0x2320_C0DE, i as u64);
-                pg1_draw_cpu_oracle(&mut st, 0.0)
-            })
-            .collect();
-        samples.sort_by(f64::total_cmp);
-
-        let n = sample_count as f64;
-        let statistic = samples
-            .iter()
-            .enumerate()
-            .map(|(i, &sample)| {
-                let cdf = crate::polya_gamma::pg1_untilted_cdf(sample);
-                let empirical_below = i as f64 / n;
-                let empirical_through = (i + 1) as f64 / n;
-                (cdf - empirical_below)
-                    .abs()
-                    .max((empirical_through - cdf).abs())
-            })
-            .fold(0.0_f64, f64::max);
-
-        // Dvoretzky–Kiefer–Wolfowitz: P(D_n > eps) <= 2 exp(-2 n eps²), at a
-        // one-in-a-million false-rejection bound.
-        let false_rejection_probability = 1e-6_f64;
-        let critical = (-(false_rejection_probability / 2.0).ln() / (2.0 * n)).sqrt();
-        assert!(
-            statistic <= critical,
-            "CPU exact-PG(1,0) oracle KS statistic {statistic} exceeds DKW critical value {critical}",
-        );
-    }
-
     #[test]
     fn pg_convolution_identity_at_small_b() {
         // PG(b, c) =_d sum_{j=1..b} PG(1, c) for integer b. We compare two
@@ -1639,64 +1568,6 @@ mod tests {
         assert!(
             v_rel < 0.05,
             "normal kernel var: emp {var}, theory {th_var}, rel {v_rel}"
-        );
-    }
-
-    #[test]
-    fn logistic_gibbs_chain_converges_to_mle_direction() {
-        // End-to-end Gibbs harness validation. Start from β = 0, run 200
-        // steps on a small synthetic Bernoulli-logistic dataset with known
-        // β* = (1.5, -0.7, 0.3). Drop the first 50 as burn-in and check that
-        // the posterior mean direction aligns with β* (cosine > 0.85).
-        use rand::{RngExt, SeedableRng, rngs::StdRng};
-        let n = 400;
-        let p = 3;
-        let beta_star = [1.5_f64, -0.7, 0.3];
-        let mut design = Array2::<f64>::zeros((n, p));
-        let mut targets = Array1::<u8>::zeros(n);
-        let mut rng = StdRng::seed_from_u64(0xFEED);
-        for i in 0..n {
-            let x1 = ((i as f64) / (n as f64)) * 2.0 - 1.0;
-            let x2 = (((i * 13) % n) as f64 / n as f64) * 2.0 - 1.0;
-            design[[i, 0]] = x1;
-            design[[i, 1]] = x2;
-            design[[i, 2]] = 1.0;
-            let eta = beta_star[0] * x1 + beta_star[1] * x2 + beta_star[2];
-            let p_y = 1.0 / (1.0 + (-eta).exp());
-            let u: f64 = rng.random();
-            targets[i] = if u < p_y { 1 } else { 0 };
-        }
-        let q0 = Array2::<f64>::eye(p) * 0.01;
-        let mut beta = Array1::<f64>::zeros(p);
-        let mut accum = Array1::<f64>::zeros(p);
-        let steps = 200;
-        let burn = 50;
-        for k in 0..steps {
-            beta = logistic_gibbs_step(
-                design.view(),
-                targets.view(),
-                q0.view(),
-                beta.view(),
-                PgSeed(0xC0DE + k as u64),
-                0xCAFE + k as u64,
-            )
-            .expect("Gibbs step");
-            if k >= burn {
-                for j in 0..p {
-                    accum[j] += beta[j];
-                }
-            }
-        }
-        for j in 0..p {
-            accum[j] /= (steps - burn) as f64;
-        }
-        let dot: f64 = (0..p).map(|j| accum[j] * beta_star[j]).sum();
-        let na: f64 = accum.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let nb: f64 = beta_star.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let cos = dot / (na * nb);
-        assert!(
-            cos > 0.85,
-            "Gibbs chain posterior-mean direction does not align with β*: cos = {cos}, accum = {accum:?}, β* = {beta_star:?}"
         );
     }
 

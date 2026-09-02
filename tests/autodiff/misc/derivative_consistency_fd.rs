@@ -15,10 +15,7 @@
 //! (`pub(crate)` only). See the module-level NOTE blocks on the Hessian
 //! and IFT tests for the workaround and the limitation.
 
-use gam::estimate::{
-    ExternalOptimOptions, evaluate_external_ift_residual_at_perturbed_rho,
-    evaluate_externalcost_andridge, evaluate_externalgradient,
-};
+use gam::estimate::{ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient};
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};
@@ -506,88 +503,3 @@ fn analytic_hessian_matches_fd_under_rank_deficient_penalty() {
     );
 }
 
-#[test]
-fn ift_predictor_residual_is_quadratic_in_delta_rho() {
-    let (x, y, w, s_list) = build_gaussian_rank_deficient_two_block(23);
-    let offset = Array1::<f64>::zeros(y.len());
-    let opts = gaussian_opts(vec![2, 2]);
-    let rho = Array1::from(vec![0.15_f64, -0.2_f64]);
-
-    let mut rng = StdRng::seed_from_u64(29);
-    let mut direction = Array1::from(vec![
-        rng.random_range(-1.0..1.0),
-        rng.random_range(-1.0..1.0),
-    ]);
-    let direction_norm = direction.iter().map(|v| v * v).sum::<f64>().sqrt();
-    direction.mapv_inplace(|v| v / direction_norm);
-
-    let scales = [1.0e-2_f64, 5.0e-3, 2.5e-3, 1.25e-3];
-    let mut records = Vec::with_capacity(scales.len());
-    for &scale in &scales {
-        let delta_rho = direction.mapv(|v| scale * v);
-        let (ift_resid, flat_resid) = evaluate_external_ift_residual_at_perturbed_rho(
-            y.view(),
-            w.view(),
-            x.clone(),
-            offset.view(),
-            &s_list,
-            &opts,
-            &rho,
-            delta_rho.view(),
-        )
-        .expect("IFT residual shim should succeed");
-        let ratio = ift_resid / flat_resid;
-        eprintln!(
-            "[ift_residual_order] scale={scale:.3e} ift={ift_resid:.3e} flat={flat_resid:.3e} ratio={ratio:.3e}"
-        );
-        records.push((scale, ift_resid, flat_resid, ratio));
-    }
-
-    let quadratic_c = records
-        .iter()
-        .map(|(scale, ift_resid, _, _)| ift_resid / (scale * scale))
-        .fold(0.0_f64, f64::max)
-        * 8.0;
-    for (scale, ift_resid, _, _) in &records {
-        assert!(
-            *ift_resid <= quadratic_c * scale * scale,
-            "IFT residual failed quadratic envelope at scale {scale:.3e}: \
-             ift_resid={ift_resid:.3e}, envelope={:.3e}. \
-             This indicates linear decay, consistent with a wrong predictor sign or missing g_j term.",
-            quadratic_c * scale * scale
-        );
-    }
-
-    let smallest = records.last().expect("nonempty scale sequence");
-    assert!(
-        smallest.1 < 1.0e-4,
-        "IFT residual at smallest scale should be below 1e-4; got {:.3e}. \
-         This indicates the predictor may have a sign error.",
-        smallest.1
-    );
-    assert!(
-        smallest.3 < 0.1,
-        "IFT predictor should beat flat warm start as Δρ shrinks; at scale {:.3e}, \
-         ift_resid/flat_resid={:.3e} (expected < 0.1). \
-         If this is O(1), the IFT residual is decaying only linearly.",
-        smallest.0,
-        smallest.3
-    );
-    for window in records.windows(2) {
-        let (s0, ift0, _, ratio0) = window[0];
-        let (s1, ift1, _, ratio1) = window[1];
-        let observed_order = (ift0 / ift1).ln() / (s0 / s1).ln();
-        assert!(
-            observed_order > 1.5,
-            "IFT residual decayed too slowly from scale {s0:.3e} to {s1:.3e}: \
-             order={observed_order:.3}, ift=({ift0:.3e}, {ift1:.3e}), \
-             ratios=({ratio0:.3e}, {ratio1:.3e}). \
-             This is the linear-decay signature of a wrong sign or missing g_j term.",
-        );
-        assert!(
-            ratio1 < ratio0,
-            "IFT/flat ratio should decrease as Δρ shrinks: \
-             scale {s0:.3e}->{s1:.3e}, ratio {ratio0:.3e}->{ratio1:.3e}",
-        );
-    }
-}

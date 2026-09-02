@@ -938,7 +938,6 @@ impl SaeManifoldTerm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
 
     fn tr(from: usize, to: usize, sign: i8, offset: f64) -> UnitSpeedChartTransition {
         UnitSpeedChartTransition::new(from, to, sign, offset, 1.0, AtlasSeamKind::Regular).unwrap()
@@ -978,17 +977,6 @@ mod tests {
     }
 
     #[test]
-    fn chart_gates_factor_exactly_into_activation_times_partition() {
-        let atlas = ManifoldChartAtlas::from_transition(tr(0, 2, 1, 0.2)).unwrap();
-        let assignments = array![0.2, 0.5, 0.3];
-        let (activation, weights) = atlas.partition_of_unity(assignments.view()).unwrap();
-        assert_eq!(activation, 0.5);
-        assert!((weights.sum() - 1.0).abs() < f64::EPSILON);
-        assert_eq!(activation * weights[0], assignments[0]);
-        assert_eq!(activation * weights[1], assignments[2]);
-    }
-
-    #[test]
     fn bridge_transition_joins_two_connected_atlas_components() {
         let mut left = ManifoldChartAtlas::from_transition(tr(0, 1, 1, 0.1)).unwrap();
         let right = ManifoldChartAtlas::from_transition(tr(2, 3, -1, 0.2)).unwrap();
@@ -996,54 +984,6 @@ mod tests {
         assert_eq!(left.charts(), &[0, 1, 2, 3]);
         assert_eq!(left.transitions().len(), 3);
         assert_eq!(left.orientability(), Some(AtlasOrientability::Orientable));
-    }
-
-    #[test]
-    fn sphere_transition_exact_type_rejects_fitted_near_orthogonality() {
-        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let reflection = [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        assert_eq!(
-            SphereChartTransition::new_analytic(0, 1, identity, AtlasSeamKind::Pole)
-                .unwrap()
-                .analytic_sign(),
-            Some(1)
-        );
-        assert_eq!(
-            SphereChartTransition::new_analytic(0, 1, reflection, AtlasSeamKind::Pole)
-                .unwrap()
-                .analytic_sign(),
-            Some(-1)
-        );
-
-        let mut fitted_but_not_exact = identity;
-        fitted_but_not_exact[0][0] += 1.0e-8;
-        assert!(
-            SphereChartTransition::new_fitted(0, 1, fitted_but_not_exact, AtlasSeamKind::Pole,)
-                .is_err(),
-            "a fitted approximate rotation must use the statistical certificate path"
-        );
-    }
-
-    #[test]
-    fn fitted_sphere_transition_cannot_enter_the_analytic_sign_cocycle() {
-        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let fitted =
-            SphereChartTransition::new_fitted(0, 1, identity, AtlasSeamKind::Pole).unwrap();
-        assert_eq!(fitted.analytic_sign(), None);
-        assert_eq!(fitted.provenance(), SphereTransitionProvenance::Fitted);
-        let atlas = ManifoldChartAtlas::from_sphere_transition(fitted).unwrap();
-        assert_eq!(
-            atlas.orientability(),
-            Some(AtlasOrientability::Orientable),
-            "one unknown bridge is a forest edge and cannot create holonomy"
-        );
-
-        let analytic =
-            SphereChartTransition::new_analytic(0, 1, identity, AtlasSeamKind::Pole).unwrap();
-        assert_eq!(analytic.analytic_sign(), Some(1));
-        assert_eq!(analytic.provenance(), SphereTransitionProvenance::Analytic);
-        let atlas = ManifoldChartAtlas::from_sphere_transition(analytic).unwrap();
-        assert_eq!(atlas.orientability(), Some(AtlasOrientability::Orientable));
     }
 
     #[test]

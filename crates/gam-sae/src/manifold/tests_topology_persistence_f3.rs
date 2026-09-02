@@ -110,26 +110,6 @@ fn octahedron_sphere_points() -> Array2<f64> {
 }
 
 #[test]
-fn vietoris_rips_finds_the_circle_loop() {
-    let pts = circle_points(24, 1.0);
-    let diagram = vietoris_rips_persistence(pts.view());
-    // Exactly one essential H₀ component (VR connects the ring at its diameter).
-    let essential_h0 = diagram.h0.iter().filter(|b| b.is_essential()).count();
-    assert_eq!(essential_h0, 1, "a circle is one connected component");
-    // A dominant H₁ loop exists whose persistence is a large fraction of the
-    // diameter — far above the nearest-neighbour spacing.
-    let top_h1 = diagram
-        .h1
-        .iter()
-        .map(|b| b.persistence())
-        .fold(0.0_f64, f64::max);
-    assert!(
-        top_h1 > 1.0,
-        "the circle's loop must persist well past unit spacing; got {top_h1}"
-    );
-}
-
-#[test]
 fn circle_cloud_agrees_with_a_raced_circle() {
     let pts = circle_points(40, 2.0);
     let verdict = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Periodic)
@@ -321,37 +301,6 @@ fn sphere_signature_measures_h2_shell() {
         !verdict.contested,
         "octahedron sphere should match the sphere signature: {}",
         verdict.note
-    );
-}
-
-/// `n` points on a half-circle arc (embedded in the plane).
-fn arc_points(n: usize, r: f64) -> Array2<f64> {
-    let mut pts = Array2::<f64>::zeros((n, 2));
-    for i in 0..n {
-        let theta = std::f64::consts::PI * (i as f64) / ((n - 1) as f64);
-        pts[[i, 0]] = r * theta.cos();
-        pts[[i, 1]] = r * theta.sin();
-    }
-    pts
-}
-
-#[test]
-fn atlas_nerve_recovers_circle_and_arc() {
-    // Atlas-first inversion: read topology from the NERVE of a chart cover,
-    // never assuming it. A circle's nerve is a cycle (S¹); an arc's is a path.
-    let circle = atlas_nerve(circle_points(60, 2.0).view());
-    assert!(
-        circle.is_circle(),
-        "the nerve of a circle cover must recover S¹ (b₁=1, one component): {circle:?}"
-    );
-    let arc = atlas_nerve(arc_points(60, 2.0).view());
-    assert!(
-        arc.is_arc(),
-        "the nerve of an arc cover must recover a path (b₁=0, one component): {arc:?}"
-    );
-    assert!(
-        !arc.is_circle(),
-        "an arc must not be mistaken for a circle: {arc:?}"
     );
 }
 

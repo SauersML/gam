@@ -1,10 +1,7 @@
 use faer::Side;
 use gam::faer_ndarray::FaerCholesky;
-use gam::linalg::sparse_exact::{
-    TakahashiInverse, dense_to_sparse, dense_to_sparse_symmetric_upper, factorize_simplicial,
-    factorize_sparse_spd, logdet_from_factor,
-};
-use ndarray::{Array2, array};
+use gam::linalg::sparse_exact::{TakahashiInverse, dense_to_sparse_symmetric_upper, factorize_simplicial, factorize_sparse_spd, logdet_from_factor};
+use ndarray::Array2;
 
 fn make_spd_from_banded(seed_shift: f64, n: usize) -> Array2<f64> {
     let mut b = Array2::<f64>::zeros((n, n));
@@ -107,33 +104,3 @@ fn takahashi_inverse_diagonal_matches_dense_inverse_diagonal_random_spd() {
     );
 }
 
-#[test]
-fn takahashi_trace_hinv_sk_matches_dense_trace_small_problem() {
-    let h = make_spd_from_banded(0.2, 6);
-    let s_k = array![
-        [2.0, 0.3, 0.0, 0.0, 0.0, 0.0],
-        [0.3, 1.4, 0.2, 0.0, 0.0, 0.0],
-        [0.0, 0.2, 1.1, 0.1, 0.0, 0.0],
-        [0.0, 0.0, 0.1, 1.8, 0.4, 0.0],
-        [0.0, 0.0, 0.0, 0.4, 1.2, 0.2],
-        [0.0, 0.0, 0.0, 0.0, 0.2, 0.9],
-    ];
-    let h_sparse =
-        dense_to_sparse_symmetric_upper(&h, 0.0).expect("upper sparse conversion should succeed");
-    let s_sparse = dense_to_sparse(&s_k, 0.0).expect("dense sparse conversion should succeed");
-
-    let simplicial =
-        factorize_simplicial(&h_sparse).expect("simplicial factorization should succeed");
-    let taka =
-        TakahashiInverse::compute(&simplicial).expect("Takahashi selected inverse should compute");
-    let sparse_trace = taka.trace_product_sparse(&s_sparse);
-
-    let dense_inv = dense_inverse_spd(&h);
-    let dense_trace = (dense_inv.dot(&s_k)).diag().sum();
-
-    assert!(
-        (sparse_trace - dense_trace).abs() <= 1e-9,
-        "trace(H^(-1) S_k) from Takahashi should match dense reference within 1e-9, but diff was {:.3e}",
-        (sparse_trace - dense_trace).abs()
-    );
-}

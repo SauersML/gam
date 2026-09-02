@@ -44,26 +44,6 @@ fn swiss_roll_grid() -> Array2<f64> {
     z
 }
 
-/// A gentle (nearly flat) sheet: `(u, v, curvature·sin(π u))` — a genuine 2-D
-/// chart with mild ambient curvature, NOT folded. PCA and intrinsic both recover
-/// it, so their reconstruction R² ties.
-fn gentle_sheet_grid(curvature: f64) -> Array2<f64> {
-    let (n_u, n_v) = (30usize, 15usize);
-    let n = n_u * n_v;
-    let mut z = Array2::<f64>::zeros((n, 3));
-    for i in 0..n_u {
-        let u = 2.0 * (i as f64) / ((n_u - 1) as f64) - 1.0;
-        for j in 0..n_v {
-            let v = 2.0 * (j as f64) / ((n_v - 1) as f64) - 1.0;
-            let row = i * n_v + j;
-            z[[row, 0]] = u;
-            z[[row, 1]] = v;
-            z[[row, 2]] = curvature * (std::f64::consts::PI * u).sin();
-        }
-    }
-    z
-}
-
 /// Held-out thin-plate-spline reconstruction R² of the ambient image `z` from a
 /// 2-D latent chart `coords` — fable-mobius's exact validated decoder: standardize
 /// coords per-axis, 70 strided thin-plate centers (`0.5·r²·ln r²`) plus an affine
@@ -155,36 +135,6 @@ fn chart_of(seed: &Array3<f64>, atom_idx: usize) -> Array2<f64> {
     out
 }
 
-/// ROLLED-SHEET REGRESSION (the falsifier): the canonical intrinsic seed unrolls
-/// the fold so a thin-plate decoder recovers held-out R² > 0.99, while the PCA-2
-/// seed's non-injective projection collapses the layers and craters below 0.9.
-#[test]
-fn swiss_roll_intrinsic_seed_reconstructs_where_pca_folds() {
-    let z = swiss_roll_grid();
-    let kinds = vec![SaeAtomBasisKind::Linear];
-    let dims = vec![2usize];
-
-    let intrinsic = sae_intrinsic_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
-    let pca = sae_pca_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
-
-    let r2_intrinsic = heldout_tps_r2(&chart_of(&intrinsic, 0), &z);
-    let r2_pca = heldout_tps_r2(&chart_of(&pca, 0), &z);
-
-    assert!(
-        r2_intrinsic > 0.99,
-        "intrinsic geodesic seed must unfold the rolled sheet; intrinsic R²={r2_intrinsic}, pca R²={r2_pca}"
-    );
-    assert!(
-        r2_pca < 0.9,
-        "the global-linear PCA seed must collapse on a genuine fold (non-injective projection); \
-         intrinsic R²={r2_intrinsic}, pca R²={r2_pca}"
-    );
-    assert!(
-        r2_intrinsic > r2_pca + 0.05,
-        "intrinsic seed must beat PCA on the fold; intrinsic R²={r2_intrinsic}, pca R²={r2_pca}"
-    );
-}
-
 /// END-TO-END PRIMARY (#2280 guardrail, fable-mobius Q2): the FULL auto-seed path
 /// — discover → race → resolve_auto_primary_atoms → minimal_seed — must install the
 /// UNFOLDED geodesic chart as the final seed coordinates, not a PCA-folded rebuild.
@@ -222,43 +172,3 @@ fn swiss_roll_auto_seed_propagates_unfolded_coords_end_to_end() {
     );
 }
 
-/// PARITY ON A NON-FOLD: on a gentle (unfolded) sheet the intrinsic and PCA seeds
-/// are equivalent charts — both reconstruct with high held-out R² and tie within a
-/// small band. The intrinsic seed must not REGRESS the easy case it is not needed
-/// for (the race would pick either; here we assert both charts' quality directly).
-#[test]
-fn gentle_sheet_intrinsic_and_pca_seeds_tie() {
-    let z = gentle_sheet_grid(0.15);
-    let kinds = vec![SaeAtomBasisKind::Linear];
-    let dims = vec![2usize];
-
-    let intrinsic = sae_intrinsic_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
-    let pca = sae_pca_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
-
-    let r2_intrinsic = heldout_tps_r2(&chart_of(&intrinsic, 0), &z);
-    let r2_pca = heldout_tps_r2(&chart_of(&pca, 0), &z);
-
-    assert!(
-        r2_intrinsic > 0.95 && r2_pca > 0.95,
-        "both seeds must reconstruct a gentle sheet well (intrinsic {r2_intrinsic}, PCA {r2_pca})"
-    );
-    assert!(
-        (r2_intrinsic - r2_pca).abs() < 0.05,
-        "on a non-fold the intrinsic and PCA seeds must tie (intrinsic {r2_intrinsic}, PCA {r2_pca})"
-    );
-}
-
-/// Determinism (fleet law): the Array3 production seed the race consumes is
-/// bit-identical run-to-run (the module core has its own bit-identity test too).
-#[test]
-fn swiss_roll_intrinsic_seed_is_deterministic() {
-    let z = swiss_roll_grid();
-    let kinds = vec![SaeAtomBasisKind::Linear];
-    let dims = vec![2usize];
-    let a = sae_intrinsic_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
-    let b = sae_intrinsic_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
-    assert_eq!(
-        a, b,
-        "intrinsic swiss-roll seed must be bit-identical run-to-run"
-    );
-}

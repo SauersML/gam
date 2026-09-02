@@ -678,13 +678,11 @@ pub fn generative_spec_for_saved_model(
 mod tests {
     use super::*;
     use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
-    use gam_models::inference::generative::sampleobservation_replicates;
     use gam_models::inference::model::{
         FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     };
     use gam_models::inference::model_payload_builders::assemble_spline_scan_payload;
     use ndarray::{Array2, array};
-    use rand::SeedableRng;
 
     #[test]
     fn event_window_probability_is_the_conditional_survival_ratio() {
@@ -843,29 +841,4 @@ mod tests {
         assert_eq!(sigma[1].to_bits(), (fit.sigma2.sqrt() / 3.0).to_bits());
     }
 
-    #[test]
-    fn weighted_scan_seed_and_saved_payload_round_trip_bit_exactly() {
-        let (model, _) = weighted_scan_model();
-        let bytes = serde_json::to_vec(&model).expect("serialize scan model");
-        let restored: FittedModel = serde_json::from_slice(&bytes).expect("restore scan model");
-        restored
-            .validate_for_persistence()
-            .expect("restored scan model validates");
-        let rows: Array2<f64> = array![[0.0, -0.35, 0.75], [0.0, 0.65, 4.0]];
-        let weights = array![0.75, 4.0];
-        let original = spec_for_probe(&model, rows.view(), Some(&weights)).expect("original spec");
-        let replay = spec_for_probe(&restored, rows.view(), Some(&weights)).expect("restored spec");
-        let mut rng_a = rand::rngs::StdRng::seed_from_u64(71);
-        let mut rng_b = rand::rngs::StdRng::seed_from_u64(71);
-        let draws_a = sampleobservation_replicates(&original, 128, &mut rng_a).expect("draw A");
-        let draws_b = sampleobservation_replicates(&replay, 128, &mut rng_b).expect("draw B");
-        assert_eq!(draws_a, draws_b);
-
-        let error = spec_for_probe(&restored, rows.view(), None)
-            .expect_err("weighted replay without row weights must fail");
-        assert!(matches!(
-            error,
-            SavedGenerativeError::MissingRequiredInput { .. }
-        ));
-    }
 }

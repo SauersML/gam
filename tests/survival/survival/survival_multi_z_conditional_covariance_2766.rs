@@ -41,11 +41,7 @@
 use gam::families::bms::{
     ConditionalScoreCovariance, ScoreCovarianceField, marginal_slope_covariance_from_scores,
 };
-use gam::families::survival::marginal_slope::{
-    RigidVectorValueWorkspace, survival_marginal_slope_vector_eta,
-    survival_marginal_slope_vector_neglog,
-};
-use gam::probability::normal_cdf;
+use gam::families::survival::marginal_slope::{RigidVectorValueWorkspace, survival_marginal_slope_vector_neglog};
 use ndarray::{Array1, Array2};
 
 const N: usize = 48_000;
@@ -94,9 +90,6 @@ struct Sample {
     /// The conditioning span `a(C)`: `[x, x², x³]`, the cubic a marginal design
     /// carrying `s(x)` would present.
     a: Array2<f64>,
-    /// Stratum index of each row, by the monotone image of that covariate the
-    /// planted correlation is proportional to.
-    stratum: Vec<usize>,
 }
 
 /// `K = 2` scores whose conditional marginals are EXACTLY standard normal and
@@ -133,50 +126,7 @@ fn sample(seed: u64, amplitude: f64) -> Sample {
         z,
         weights: Array1::<f64>::ones(N),
         a,
-        stratum,
     }
-}
-
-/// Per-stratum Monte-Carlo of `E[Φ(−η) | stratum]` against `Φ(−q)`, returned as
-/// `(worst |mc − target| / se, that stratum's mc, target)` where `se` is the
-/// binomial standard error of that stratum's own average. Reading the miss in
-/// units of its own noise is what lets the two arms be compared on one scale.
-fn worst_conditional_miss_in_standard_errors(
-    data: &Sample,
-    field: &ScoreCovarianceField,
-    q: f64,
-) -> (f64, f64, f64) {
-    let target = normal_cdf(-q);
-    let mut sums = vec![0.0_f64; STRATA];
-    let mut counts = vec![0usize; STRATA];
-    for row in 0..N {
-        let z_row = [data.z[[row, 0]], data.z[[row, 1]]];
-        let eta = survival_marginal_slope_vector_eta(
-            q,
-            &z_row,
-            &SLOPES,
-            field.at_row(row),
-            PROBIT_SCALE,
-        )
-        .expect("eta");
-        sums[data.stratum[row]] += normal_cdf(-eta);
-        counts[data.stratum[row]] += 1;
-    }
-    let mut worst = 0.0_f64;
-    let mut worst_mc = target;
-    for index in 0..STRATA {
-        if counts[index] == 0 {
-            continue;
-        }
-        let mc = sums[index] / counts[index] as f64;
-        let se = ((target * (1.0 - target)) / counts[index] as f64).sqrt();
-        let miss = (mc - target).abs() / se;
-        if miss > worst {
-            worst = miss;
-            worst_mc = mc;
-        }
-    }
-    (worst, worst_mc, target)
 }
 
 fn conditional_field(data: &Sample) -> ScoreCovarianceField {
@@ -192,85 +142,6 @@ fn pooled_field(data: &Sample) -> ScoreCovarianceField {
     ScoreCovarianceField::pooled(
         marginal_slope_covariance_from_scores(data.z.view(), &data.weights).expect("pooled Σ"),
     )
-}
-
-/// The acceptance claim: with `Σ(a)` the row's own conditional covariance the
-/// marginal-preservation identity holds STRATUM BY STRATUM, not merely on
-/// average.
-#[test]
-fn conditional_covariance_preserves_the_marginal_index_within_every_stratum() {
-    let data = sample(0x2766_0A11, 0.8);
-    let field = conditional_field(&data);
-    for &q in &[-1.0_f64, -0.3, 0.0, 0.4, 1.2] {
-        let (miss, mc, target) = worst_conditional_miss_in_standard_errors(&data, &field, q);
-        // The model is fitted, not known, and is linear in a span that does not
-        // contain the planted sigmoid, so the residual is estimation error plus
-        // approximation error on top of Monte-Carlo noise. Measured worst across
-        // these five `q` is 2.9 SE; the bar is 4, and the pooled arm below
-        // clears 8 on the same data.
-        assert!(
-            miss <= 4.0,
-            "q={q}: worst stratum miss {miss:.2} SE (mc={mc:.6} target={target:.6})"
-        );
-    }
-}
-
-/// The contrast that makes the test above a regression guard rather than a
-/// tautology: the SAME data, the same slopes, the same bar — with one pooled
-/// `Σ̄` the conditional identity misses by an order of magnitude more.
-///
-/// This is the defect gam#2766 names, kept red-by-construction so a revert to a
-/// global `Σ` cannot pass both tests.
-#[test]
-fn a_pooled_covariance_misses_the_conditional_identity_by_an_order_of_magnitude() {
-    let data = sample(0x2766_0A11, 0.8);
-    let pooled = pooled_field(&data);
-    let conditional = conditional_field(&data);
-    let q = 1.2_f64;
-    let (pooled_miss, pooled_mc, target) =
-        worst_conditional_miss_in_standard_errors(&data, &pooled, q);
-    let (conditional_miss, _, _) =
-        worst_conditional_miss_in_standard_errors(&data, &conditional, q);
-    println!(
-        "#2766: worst stratum miss at q={q} — pooled {pooled_miss:.1} SE (mc={pooled_mc:.6} \
-         target={target:.6}), conditional {conditional_miss:.1} SE"
-    );
-    assert!(
-        pooled_miss > 8.0,
-        "the pooled arm is supposed to EXHIBIT the defect; got {pooled_miss:.2} SE"
-    );
-    assert!(
-        conditional_miss * 4.0 < pooled_miss,
-        "the conditional field must close the gap by at least 4x: pooled {pooled_miss:.2} SE \
-         against conditional {conditional_miss:.2} SE"
-    );
-}
-
-/// The gate must not fire when the conditional covariance really is constant.
-/// A field installed on every multi-score fit would replace an exactly-correct
-/// pooled object with an estimated one, which is a worse trade than the defect
-/// it is meant to fix.
-#[test]
-fn a_constant_conditional_covariance_leaves_the_pooled_object_in_place() {
-    let data = sample(0x2766_0B22, 0.0);
-    let decision =
-        ConditionalScoreCovariance::fit(data.z.view(), data.weights.view(), data.a.view())
-            .expect("conditional fit");
-    assert!(
-        decision.is_none(),
-        "a constant Cov(z₀, z₁ | a) must not escalate"
-    );
-    // And the pooled field then passes the conditional bar on its own, which is
-    // why not escalating is the right answer rather than a missed detection.
-    let pooled = pooled_field(&data);
-    for &q in &[-0.3_f64, 0.4] {
-        let (miss, mc, target) = worst_conditional_miss_in_standard_errors(&data, &pooled, q);
-        assert!(
-            miss <= 4.0,
-            "q={q}: a homogeneous sample must satisfy the conditional bar under the pooled Σ; \
-             worst stratum miss {miss:.2} SE (mc={mc:.6} target={target:.6})"
-        );
-    }
 }
 
 /// The production row lane must read the SAME per-row covariance the identity

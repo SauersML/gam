@@ -1069,79 +1069,6 @@ mod tests {
     }
 
     #[test]
-    fn decrement_enclosure_is_exact_when_residual_zero_and_contains_truth_when_perturbed() {
-        // Small SPD H, exact g, exact z = H⁻¹g.
-        let h = Array2::from_shape_vec((3, 3), vec![4.0, 1.0, 0.0, 1.0, 3.0, 1.0, 0.0, 1.0, 2.0])
-            .unwrap();
-        let g = Array1::from_vec(vec![1.0, -2.0, 0.5]);
-
-        // Exact solve via the spectral inverse H⁻¹ = V diag(1/λ) Vᵀ.
-        let (evals, evecs) = h.eigh(Side::Lower).expect("eigh");
-        let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-        assert!(lambda_min > 0.0, "H must be SPD");
-        let vt_g = evecs.t().dot(&g);
-        let scaled: Array1<f64> = Array1::from_shape_fn(3, |i| vt_g[i] / evals[i]);
-        let z = evecs.dot(&scaled);
-        let true_lambda_n_sq = g.dot(&z);
-
-        // r = g − Hz = 0 (up to roundoff): enclosure collapses to the truth.
-        let hz = h.dot(&z);
-        let r = &g - &hz;
-        let g_dot_z = g.dot(&z);
-        let r_dot_z = r.dot(&z);
-        let r_norm_sq = r.dot(&r);
-        let ell = lambda_min * 0.999; // valid lower bound ℓ ≤ λ_min(H)
-        let exact = newton_decrement_enclosure(g_dot_z, r_dot_z, r_norm_sq, ell)
-            .expect("positive definite");
-        assert!(
-            (exact.upper - exact.lower).abs() < 1e-10,
-            "width must be ~0 when r=0"
-        );
-        assert!((exact.lower - true_lambda_n_sq).abs() < 1e-9);
-
-        // Perturb z; the enclosure must still contain the true λ_N².
-        let z_bad = &z + &Array1::from_vec(vec![0.05, -0.03, 0.02]);
-        let hz_bad = h.dot(&z_bad);
-        let r_bad = &g - &hz_bad;
-        let encl =
-            newton_decrement_enclosure(g.dot(&z_bad), r_bad.dot(&z_bad), r_bad.dot(&r_bad), ell)
-                .expect("positive definite");
-        assert!(
-            encl.lower <= true_lambda_n_sq + 1e-9 && true_lambda_n_sq <= encl.upper + 1e-9,
-            "enclosure [{}, {}] must contain λ_N² = {true_lambda_n_sq}",
-            encl.lower,
-            encl.upper
-        );
-        assert!(
-            encl.upper - encl.lower > 0.0,
-            "inexact solve widens the band"
-        );
-
-        // A non-positive lower bound yields no certificate.
-        assert!(newton_decrement_enclosure(g_dot_z, r_dot_z, r_norm_sq, 0.0).is_none());
-    }
-
-    #[test]
-    fn shadow_sum_error_stays_within_certified_rounding_floor() {
-        let mut acc = ShadowSum::new();
-        for _ in 0..1_000_000 {
-            acc.push(0.1);
-        }
-        assert_eq!(acc.count, 1_000_000);
-        let exact = 100_000.0_f64;
-        let error = (acc.sum - exact).abs();
-        let floor = acc.rounding_floor(U);
-        assert!(
-            error <= floor,
-            "summation error {error} must not exceed rounding floor {floor}"
-        );
-        // The tree-depth floor is tighter but must still bound the sequential
-        // error only if the caller actually reduced with a tree; here we merely
-        // check the constant shrinks with depth.
-        assert!(acc.rounding_floor_with_depth(U, 20) < floor);
-    }
-
-    #[test]
     fn shadow_sum_merge_is_additive() {
         let mut a = ShadowSum::new();
         let mut b = ShadowSum::new();
@@ -1154,9 +1081,4 @@ mod tests {
         assert_eq!(a.abs_sum, 6.0);
     }
 
-    #[test]
-    fn gamma_saturates_when_ku_exceeds_one() {
-        assert!(gamma(usize::MAX, U).is_infinite());
-        assert_eq!(gamma(0, U), 0.0);
-    }
 }

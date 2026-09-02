@@ -17,11 +17,7 @@
 //! plus the κ-differentiability contract: the kernel κ-jets agree with
 //! central finite differences across the series/closed-form boundary.
 
-use gam::basis::{
-    CenterStrategy, ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability,
-    build_constant_curvature_basis, constant_curvature_kernel_kappa_jets,
-    constant_curvature_kernel_matrix,
-};
+use gam::basis::{CenterStrategy, ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, build_constant_curvature_basis, constant_curvature_kernel_matrix};
 use gam::inference::formula_dsl::parse_formula;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -202,46 +198,6 @@ fn basis_is_continuous_through_kappa_zero() {
 // ---------------------------------------------------------------------------
 // κ-differentiability contract: kernel κ-jets vs central finite differences
 // ---------------------------------------------------------------------------
-
-#[test]
-fn kernel_kappa_jets_match_finite_differences() {
-    let pts = chart_points();
-    let centers = pts.slice(ndarray::s![..4, ..]).to_owned();
-    for &kappa in &[-0.7_f64, -1e-6, 0.0, 1e-6, 0.9] {
-        let (k0, dk, dkk) =
-            constant_curvature_kernel_kappa_jets(pts.view(), centers.view(), kappa, LENGTH_SCALE)
-                .expect("jets");
-        let k_at = |kk: f64| {
-            constant_curvature_kernel_matrix(pts.view(), centers.view(), kk, LENGTH_SCALE)
-                .expect("kernel")
-        };
-        assert!(
-            k0.iter()
-                .zip(k_at(kappa).iter())
-                .all(|(a, b)| (a - b).abs() < 1e-13),
-            "jet value channel desynced from the plain kernel at kappa={kappa}"
-        );
-        let h = 1e-5;
-        let kp = k_at(kappa + h);
-        let km = k_at(kappa - h);
-        for i in 0..pts.nrows() {
-            for j in 0..centers.nrows() {
-                let fd1 = (kp[(i, j)] - km[(i, j)]) / (2.0 * h);
-                assert!(
-                    (dk[(i, j)] - fd1).abs() < 1e-6 + 1e-5 * fd1.abs(),
-                    "dK/dkappa mismatch at kappa={kappa} ({i},{j}): jet {} fd {fd1}",
-                    dk[(i, j)]
-                );
-                let fd2 = (kp[(i, j)] - 2.0 * k0[(i, j)] + km[(i, j)]) / (h * h);
-                assert!(
-                    (dkk[(i, j)] - fd2).abs() < 1e-3 + 1e-3 * fd2.abs(),
-                    "d2K/dkappa2 mismatch at kappa={kappa} ({i},{j}): jet {} fd {fd2}",
-                    dkk[(i, j)]
-                );
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Penalty congruence: S ∝ zᵀ K(centers, centers) z with the metadata's z

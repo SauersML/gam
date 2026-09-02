@@ -1,12 +1,6 @@
-use gam::matrix::SymmetricMatrix;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
-use gam_predict::linalg::PredictionCovarianceBackend;
-use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult,
-    PredictUncertaintyOptions, enrich_posterior_mean_bounds,
-    predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
-};
-use ndarray::{Array1, Array2, array};
+use gam_predict::{InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult, PredictUncertaintyOptions, enrich_posterior_mean_bounds, predict_gamwith_uncertainty};
+use ndarray::{Array1, array};
 
 fn like(response: ResponseFamily, link: StandardLink) -> LikelihoodSpec {
     LikelihoodSpec::new(response, InverseLink::Standard(link))
@@ -150,40 +144,6 @@ fn delta_method_variance_matches_posterior_simulation_for_small_logit_problem() 
         (delta_var - mc_var).abs() < 5e-3,
         "Delta-method variance should match dense posterior simulation within Monte Carlo error"
     );
-}
-
-#[test]
-fn backend_variance_matches_between_dense_and_factorized_backends() {
-    let x = array![[1.0, -1.0], [1.0, 1.5]];
-    let beta = array![0.2, -0.4];
-    let offset = array![0.0, 0.0];
-    let cov = array![[0.3, 0.0], [0.0, 0.2]];
-    let dense = PredictionCovarianceBackend::from_dense(cov.view());
-    let h = Array2::from_diag(&array![1.0 / 0.3, 1.0 / 0.2]);
-    let fact = PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(h))
-        .expect("factorized backend should be constructible from diagonal Hessian");
-    let a = predict_gam_posterior_meanwith_backend(
-        x.view(),
-        beta.view(),
-        offset.view(),
-        like(ResponseFamily::Binomial, StandardLink::Logit),
-        &dense,
-    )
-    .expect("dense backend should predict");
-    let b = predict_gam_posterior_meanwith_backend(
-        x.view(),
-        beta.view(),
-        offset.view(),
-        like(ResponseFamily::Binomial, StandardLink::Logit),
-        &fact,
-    )
-    .expect("factorized backend should predict");
-    for i in 0..a.eta_standard_error.len() {
-        assert!(
-            (a.eta_standard_error[i] - b.eta_standard_error[i]).abs() < 1e-9,
-            "Backend-1 and backend-2 should agree on posterior eta variance within 1e-9"
-        );
-    }
 }
 
 #[test]

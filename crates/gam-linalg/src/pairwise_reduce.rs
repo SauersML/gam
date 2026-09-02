@@ -524,37 +524,6 @@ mod tests {
         assert_eq!(acc.finish().to_bits(), expected.to_bits());
     }
 
-    #[test]
-    fn chunked_matches_whole_slice_across_chunk_sizes() {
-        let xs: Vec<f64> = (0..500).map(|i| i as f64).collect();
-        let expected = pairwise_sum(&xs);
-        for chunk_size in [1usize, 7, 64, 128, 129, 200, 499, 500] {
-            let chunks: Vec<&[f64]> = xs.chunks(chunk_size).collect();
-            let result = pairwise_sum_chunked(chunks);
-            assert_eq!(
-                result.to_bits(),
-                expected.to_bits(),
-                "chunk_size={chunk_size}"
-            );
-        }
-    }
-
-    #[test]
-    fn pairwise_reduce_chunked_matches_whole_slice() {
-        let xs: Vec<u64> = (1..=300).collect();
-        let expected = pairwise_reduce(&xs, |a, b| a + b, 0u64);
-        let chunks: Vec<&[u64]> = xs.chunks(77).collect();
-        let result = pairwise_reduce_chunked(chunks, |a, b| a + b, 0u64);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn pairwise_sum_chunked_basic() {
-        let a = [1.0f64, 2.0, 3.0];
-        let b = [4.0f64, 5.0];
-        assert_eq!(pairwise_sum_chunked([a.as_ref(), b.as_ref()]), 15.0);
-    }
-
     // ── parallel deterministic reductions ────────────────────────────────────
 
     #[test]

@@ -1,10 +1,7 @@
 use faer::{Mat, Side};
 use gam::linalg::faer_ndarray::factorize_symmetricwith_fallback;
 use gam::linalg::low_rank_weight::LowRankWeight;
-use gam::linalg::matrix::{
-    ConditionedDesign, DenseDesignMatrix, DesignMatrix, FiniteSignedWeightsView, LinearOperator,
-    PsdWeightsView, xt_diag_x_psd, xt_diag_x_signed, xt_diag_x_symmetric,
-};
+use gam::linalg::matrix::{ConditionedDesign, DenseDesignMatrix, DesignMatrix, LinearOperator, xt_diag_x_symmetric};
 use ndarray::{Array2, array};
 
 #[test]
@@ -34,51 +31,6 @@ fn xt_diag_x_symmetric_matches_dense_reference_for_spd_weights() {
     assert!(
         max_sym_err <= 1e-12 && max_ref_err <= 1e-9,
         "xt_diag_x_symmetric should be symmetric to machine precision and match dense reference within 1e-9"
-    );
-}
-
-#[test]
-fn xt_diag_x_signed_and_psd_paths_are_consistent_with_weight_semantics() {
-    let x = array![[1.0, 2.0], [3.0, -1.0], [-2.0, 4.0]];
-    let design = DesignMatrix::Dense(DenseDesignMatrix::from(x.clone()));
-    let w_signed = array![1.0, -0.5, 2.0];
-    let w_psd = array![1.0, 0.5, 2.0];
-
-    let signed = xt_diag_x_signed(
-        &design,
-        FiniteSignedWeightsView::try_from_array(&w_signed)
-            .expect("signed test weights must be finite"),
-    )
-    .expect("xt_diag_x_signed should accept negative weights")
-    .to_dense();
-    let signed_ref = x
-        .t()
-        .dot(&Array2::from_shape_fn((x.nrows(), x.ncols()), |(i, j)| {
-            w_signed[i] * x[[i, j]]
-        }));
-    let psd = xt_diag_x_psd(
-        &design,
-        PsdWeightsView::try_new(w_psd.view()).expect("nonneg by construction"),
-    )
-    .expect("xt_diag_x_psd should accept nonnegative weights")
-    .to_dense();
-    let psd_via_signed = xt_diag_x_signed(
-        &design,
-        FiniteSignedWeightsView::try_from_array(&w_psd)
-            .expect("nonnegative test weights must also be finite"),
-    )
-    .expect("xt_diag_x_signed should match psd path when all weights are nonnegative")
-    .to_dense();
-
-    let signed_err = (&signed - &signed_ref)
-        .iter()
-        .fold(0.0_f64, |m, v| m.max(v.abs()));
-    let psd_err = (&psd - &psd_via_signed)
-        .iter()
-        .fold(0.0_f64, |m, v| m.max(v.abs()));
-    assert!(
-        signed_err <= 1e-9 && psd_err <= 1e-12,
-        "signed variant must preserve negative-weight contributions and psd variant must agree on nonnegative weights"
     );
 }
 

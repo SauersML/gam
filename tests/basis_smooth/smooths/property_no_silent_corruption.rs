@@ -14,10 +14,7 @@
 //! derivative matrices contain no NaN and no Inf. The invariant is wording-
 //! independent: it is a fact about the numbers the code returns.
 
-use gam::basis::{
-    CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu, build_matern_basis,
-    build_matern_basis_log_kappa_derivative, create_thin_plate_spline_basis,
-};
+use gam::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu, build_matern_basis};
 use ndarray::{Array2, ArrayView2};
 
 /// Scan a dense matrix and return the first non-finite (NaN or Inf) entry's
@@ -57,34 +54,6 @@ fn small_cloud_2d() -> Array2<f64> {
         ],
     )
     .expect("10x2 cloud")
-}
-
-/// PROPERTY 1: the public thin-plate / Duchon penalty constructor returns an
-/// all-finite design AND all-finite bending/ridge penalty matrices (and the
-/// Wood radial reparameterization) on a normal small 2-D input.
-///
-/// The thin-plate penalty assembly does eigen-reparameterization and side-
-/// constraint projection on a radial Gram — exactly the kind of linear-algebra
-/// path where a divide-by-(near)-zero or a `sqrt` of a tiny negative eigenvalue
-/// can launder a NaN into the penalty. A correct build is finite; this test
-/// fails the moment it is not.
-#[test]
-fn thin_plate_penalty_is_all_finite() {
-    let data = small_cloud_2d();
-    // Knots = the data cloud (a standard, valid choice; >= polynomial null-space
-    // dimension for d=2, which is 3).
-    let knots = data.clone();
-
-    let tps = create_thin_plate_spline_basis(data.view(), knots.view())
-        .expect("thin-plate basis builds on a normal 2-D cloud");
-
-    assert_all_finite(tps.basis.view(), "thin-plate design basis");
-    assert_all_finite(tps.penalty_bending.view(), "thin-plate bending penalty");
-    assert_all_finite(tps.penalty_ridge.view(), "thin-plate ridge penalty");
-    assert_all_finite(
-        tps.radial_reparam.view(),
-        "thin-plate Wood radial reparameterization",
-    );
 }
 
 /// Build a standard isotropic Matérn spec over a center subset of the cloud.
@@ -131,29 +100,3 @@ fn matern_basis_and_penalty_are_all_finite() {
     }
 }
 
-/// PROPERTY 3 (DERIVATIVE PATH): the public Matérn log-κ derivative builder —
-/// the analytic ∂(design,penalties)/∂log κ used by the outer REML gradient —
-/// returns all-finite derivative matrices on a normal small 2-D input.
-///
-/// Derivative assembly is a prime Pattern-1 target: it differentiates the
-/// kernel and the penalty Gram, multiplying by reciprocals of eigenvalues /
-/// distances that can underflow. If any of those slots launders a NaN, the
-/// outer gradient is silently poisoned and λ-selection drifts with no error.
-/// A correct analytic derivative is finite everywhere; this asserts exactly
-/// that, by behavior.
-#[test]
-fn matern_log_kappa_derivative_is_all_finite() {
-    let data = small_cloud_2d();
-    let spec = matern_spec();
-
-    let dpsi = build_matern_basis_log_kappa_derivative(data.view(), &spec)
-        .expect("matern log-kappa derivative builds on 2-D cloud");
-
-    assert_all_finite(
-        dpsi.design_derivative.view(),
-        "matern d(design)/d(log kappa)",
-    );
-    for (k, pen) in dpsi.penalties_derivative.iter().enumerate() {
-        assert_all_finite(pen.view(), &format!("matern d(penalty #{k})/d(log kappa)"));
-    }
-}

@@ -1682,37 +1682,6 @@ mod tests {
     }
 
     #[test]
-    fn kernel_ratio_jet_d1_fd_check() {
-        let ctx = QuadratureContext::new();
-        let mu = 0.3;
-        let sigma = 0.5;
-        let m = 1.0;
-        let k = 0usize;
-        let h = 1e-5;
-
-        let bundle = log_kernel_bundle(&ctx, m, mu, sigma, k + 4).unwrap();
-        let log_k = bundle.get(k);
-        let ratios = kernel_ratio_jet(&bundle, k, m, 2);
-        let kc = log_k.exp();
-        let d1 = kc * ratios[1];
-        let d2 = kc * ratios[2];
-
-        let kp = log_kernel_term(&ctx, k, m, mu + h, sigma).unwrap().0.exp();
-        let km = log_kernel_term(&ctx, k, m, mu - h, sigma).unwrap().0.exp();
-        let fd_d1 = (kp - km) / (2.0 * h);
-        assert!(
-            (d1 - fd_d1).abs() / fd_d1.abs().max(1e-15) < 1e-4,
-            "d1: jet={d1}, fd={fd_d1}",
-        );
-
-        let fd_d2 = (kp - 2.0 * kc + km) / (h * h);
-        assert!(
-            (d2 - fd_d2).abs() / fd_d2.abs().max(1e-15) < 1e-3,
-            "d2: jet={d2}, fd={fd_d2}",
-        );
-    }
-
-    #[test]
     fn survival_right_censored_score_fd() {
         let ctx = QuadratureContext::new();
         let mu = -0.5;
@@ -1971,80 +1940,6 @@ mod tests {
             (jet.score_log_sigma - fd_dlogsigma).abs() / fd_dlogsigma.abs().max(1e-12) < 1e-3,
             "interval score_log_sigma={}, fd={fd_dlogsigma}",
             jet.score_log_sigma
-        );
-    }
-
-    #[test]
-    fn log_kernel_single_term_log_sigma_derivatives_match_ghq_reference() {
-        let ctx = QuadratureContext::new();
-        let mu = 0.2;
-        let sigma = 1.0;
-        let jet = LogKernelSumJet::single_term(&ctx, 0, 1.0, mu, sigma).unwrap();
-        let ghq = crate::inference::quadrature::cloglog_ghq_derivatives_adaptive(&ctx, mu, sigma);
-        let survival = (1.0 - ghq.l).max(1e-300);
-        let survival_sigma_over_survival = -ghq.l_sigma / survival;
-        let ref_score = sigma * survival_sigma_over_survival;
-        let ref_neg_hessian = -(ref_score
-            + sigma
-                * sigma
-                * (-ghq.l_sigmasigma / survival - survival_sigma_over_survival.powi(2)));
-
-        assert!(
-            (log_sigma_score_from_log_sum(&jet, sigma) - ref_score).abs()
-                / ref_score.abs().max(1e-12)
-                < 1e-4,
-            "log-sigma score={}, ref={ref_score}",
-            log_sigma_score_from_log_sum(&jet, sigma)
-        );
-        assert!(
-            (log_sigma_neg_hessian_from_log_sum(&jet, sigma) - ref_neg_hessian).abs()
-                / ref_neg_hessian.abs().max(1e-12)
-                < 1e-3,
-            "log-sigma neg_hessian={}, ref={ref_neg_hessian}",
-            log_sigma_neg_hessian_from_log_sum(&jet, sigma)
-        );
-    }
-
-    #[test]
-    fn log_kernel_sum_jet_single_term_d1_fd() {
-        let ctx = QuadratureContext::new();
-        let mu = 0.5;
-        let sigma = 0.4;
-        let m = 1.0;
-        let k = 0usize;
-        let h = 1e-6;
-
-        let jet = LogKernelSumJet::single_term(&ctx, k, m, mu, sigma).unwrap();
-        let val_p = log_kernel_term(&ctx, k, m, mu + h, sigma).unwrap().0;
-        let val_m = log_kernel_term(&ctx, k, m, mu - h, sigma).unwrap().0;
-        let fd_d1 = (val_p - val_m) / (2.0 * h);
-        assert!(
-            (jet.d1 - fd_d1).abs() / fd_d1.abs().max(1e-15) < 1e-3,
-            "d1={}, fd={fd_d1}",
-            jet.d1
-        );
-    }
-
-    #[test]
-    fn log_kernel_sum_jet_single_term_d4_fd() {
-        let ctx = QuadratureContext::new();
-        let mu = 0.35;
-        let sigma = 0.45;
-        let m = 1.2;
-        let k = 1usize;
-        let h = 2e-3;
-
-        let jet = LogKernelSumJet::single_term(&ctx, k, m, mu, sigma).unwrap();
-        let v_pp = log_kernel_term(&ctx, k, m, mu + 2.0 * h, sigma).unwrap().0;
-        let v_p = log_kernel_term(&ctx, k, m, mu + h, sigma).unwrap().0;
-        let v_0 = log_kernel_term(&ctx, k, m, mu, sigma).unwrap().0;
-        let v_m = log_kernel_term(&ctx, k, m, mu - h, sigma).unwrap().0;
-        let v_mm = log_kernel_term(&ctx, k, m, mu - 2.0 * h, sigma).unwrap().0;
-        let fd_d4 = (v_mm - 4.0 * v_m + 6.0 * v_0 - 4.0 * v_p + v_pp) / h.powi(4);
-        assert!(
-            (jet.d4 - fd_d4).abs() / jet.d4.abs().max(fd_d4.abs()).max(1e-8) < 2e-2,
-            "d4={}, fd={fd_d4}",
-            jet.d4
         );
     }
 

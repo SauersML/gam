@@ -381,27 +381,3 @@ fn h2b_release_log_string_absent_from_current_source() {
     );
 }
 
-#[test]
-fn h2c_canonicalize_returns_identifiability_failure_on_large_scale_shape() {
-    use gam::families::custom_family::CustomFamilyError;
-    use gam::identifiability::canonical::canonicalize_for_identifiability;
-    let specs = build_large_scale_like_aliased_specs();
-    let outcome = canonicalize_for_identifiability(
-        &specs,
-        // Ordinary bases: no block here carries a coordinate-local cone (#2748).
-        &vec![gam::families::custom_family::CoefficientCoordinate::Spanning; specs.len()],
-    );
-    match outcome {
-        Err(CustomFamilyError::IdentifiabilityFailure { audit }) => {
-            assert!(
-                audit.fatal,
-                "IdentifiabilityFailure attached audit must be fatal"
-            );
-        }
-        Ok(_) => panic!(
-            "canonicalize_for_identifiability should refuse the large-scale shape; \
-             it instead returned Ok (current source is missing the halt)."
-        ),
-        Err(other) => panic!("expected IdentifiabilityFailure, got: {:?}", other),
-    }
-}

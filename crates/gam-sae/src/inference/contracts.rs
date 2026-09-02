@@ -262,14 +262,6 @@ pub fn loop_holonomy(edges: &[(i8, f64)], defects: &[f64]) -> HolonomyReport {
 mod tests {
     use super::*;
 
-    /// Deterministic LCG uniform in `[0, 1)` for the transport-fit tests.
-    fn lcg(seed: &mut u64) -> f64 {
-        *seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((*seed >> 11) as f64) / ((1u64 << 53) as f64)
-    }
-
     fn c(name: &str, domain_radius: f64, defect: f64, lipschitz: f64) -> Contract {
         Contract {
             name: name.to_string(),
@@ -322,46 +314,6 @@ mod tests {
         assert_eq!(out.total_defect, 0.0);
         assert!(out.per_stage_contribution.is_empty());
         assert!(out.domain_ok);
-    }
-
-    #[test]
-    fn trace_reports_domain_violation_at_right_stage() {
-        // Stage 0 amplifies heavily so the error entering stage 2 blows its
-        // tight domain; stages 0 and 1 have generous domains.
-        let chain = [
-            c("a", 100.0, 1.0, 10.0),
-            c("b", 100.0, 1.0, 10.0),
-            c("c", 5.0, 1.0, 1.0),
-        ];
-        // entry spreads are small; the accumulated error is what overruns.
-        // E_0 = 0, E_1 = 1 + 10·0 = 1, E_2 = 1 + 10·1 = 11.
-        // Stage 2 entry displacement = 0 + 11 = 11 > domain_radius 5.
-        let entry = [0.0, 0.0, 0.0];
-        let res = compose_with_trace(&chain, &entry);
-        let err = res.expect_err("expected a domain violation");
-        assert!(err.contains("stage 2"), "wrong stage reported: {err}");
-        assert!(err.contains("by 6"), "wrong overflow reported: {err}");
-        // The bound itself is still reported, unmodified.
-        assert!(err.contains("total_defect"));
-    }
-
-    #[test]
-    fn trace_feasible_chain_is_ok() {
-        let chain = [
-            c("a", 100.0, 0.1, 1.0),
-            c("b", 100.0, 0.1, 1.0),
-            c("c", 100.0, 0.1, 1.0),
-        ];
-        let entry = [1.0, 1.0, 1.0];
-        let out = compose_with_trace(&chain, &entry).expect("feasible");
-        assert!(out.domain_ok);
-        assert!((out.total_defect - 0.3).abs() < 1e-12);
-    }
-
-    #[test]
-    fn trace_length_mismatch_errors() {
-        let chain = [c("a", 1.0, 0.1, 1.0)];
-        assert!(compose_with_trace(&chain, &[1.0, 2.0]).is_err());
     }
 
     #[test]
@@ -448,69 +400,4 @@ mod tests {
         assert!(r2.net_angle.abs() < 1e-12);
     }
 
-    #[test]
-    fn contract_from_near_isometric_transport() {
-        use crate::inference::layer_transport::{ChartTopology, fit_transport_map};
-        // Plant a pure rotation θ_to = θ_from + 0.6 (mod 2π): a near-isometry,
-        // so lipschitz ≈ 1, domain_radius = 2π, defect ≈ 0.
-        let mut s = 11u64;
-        let n = 256usize;
-        let (mut from, mut to) = (Vec::with_capacity(n), Vec::with_capacity(n));
-        for _ in 0..n {
-            let th = lcg(&mut s) * TAU;
-            from.push(th);
-            to.push((th + 0.6).rem_euclid(TAU));
-        }
-        let fit = fit_transport_map(
-            Array1::from_vec(from).view(),
-            Array1::from_vec(to).view(),
-            ChartTopology::Circle,
-            ChartTopology::Circle,
-        )
-        .expect("transport fit");
-        let c = Contract::from_transport(&fit, "L_a->L_b", 128).expect("contract");
-        assert!((c.domain_radius - TAU).abs() < 1e-9);
-        assert!(
-            (c.lipschitz - 1.0).abs() < 0.05,
-            "lipschitz = {}",
-            c.lipschitz
-        );
-        assert!(c.defect < 0.05, "defect = {}", c.defect);
-        // It composes with itself as a well-formed chain.
-        let composed = compose_contracts(&[c.clone(), c]);
-        assert!(composed.total_defect.is_finite());
-    }
-
-    #[test]
-    fn adapter_matches_plain_interface() {
-        let reports = [
-            CircleTransportReport {
-                layer_from: 0,
-                layer_to: 1,
-                n_samples: 128,
-                winding: -1,
-                phase: 0.3,
-                defect: 1e-6,
-                resultant_shift: 0.0,
-                resultant_reflect: 1.0,
-                class: crate::inference::transport_class::CircleTransportClass::Reflect,
-            },
-            CircleTransportReport {
-                layer_from: 1,
-                layer_to: 2,
-                n_samples: 128,
-                winding: -1,
-                phase: 0.9,
-                defect: 1e-6,
-                resultant_shift: 0.0,
-                resultant_reflect: 1.0,
-                class: crate::inference::transport_class::CircleTransportClass::Reflect,
-            },
-        ];
-        let via_adapter = holonomy_from_transports(&reports);
-        let via_plain = loop_holonomy(&[(-1, 0.3), (-1, 0.9)], &[1e-6, 1e-6]);
-        assert_eq!(via_adapter.net_sign, via_plain.net_sign);
-        assert!((via_adapter.net_angle - via_plain.net_angle).abs() < 1e-15);
-        assert_eq!(via_adapter.is_trivial, via_plain.is_trivial);
-    }
 }

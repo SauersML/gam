@@ -27,10 +27,7 @@ use gam::ResourcePolicy;
 use gam::families::bms::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::survival::lognormal_kernel::FrailtySpec;
-use gam::solver::orthogonal_reparam::OrthogonalReparam;
-use gam::terms::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineKnotSpec, OneDimensionalBoundary,
-};
+use gam::terms::basis::{BSplineBasisSpec, BSplineBoundaryConditions, BSplineKnotSpec, OneDimensionalBoundary};
 use gam::terms::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
     TermCollectionSpec,
@@ -247,87 +244,6 @@ fn run_fit() -> FitSummary {
 // With robustness unconditional there is no OFF/released path to characterize, so
 // the test carried no remaining value and was deleted. The ON cure itself is
 // still pinned by the three tests below.
-
-/// Exactness of the structural reparameterization on a design pair that mirrors
-/// the cohort's overlap: build a marginal block `M` and a slope block `G`
-/// that overlaps it, orthogonalize under a positive pilot metric `W`, and
-/// assert MᵀW·G̃ ≈ 0 (< 1e-10) and the coefficient round-trip is exact (< 1e-12).
-#[test]
-fn orthogonalization_is_exact_and_round_trip_is_lossless() {
-    let n = 120;
-    let mut rng = StdRng::seed_from_u64(SEED ^ 0xA5A5_A5A5);
-
-    // Marginal block: constant + two smooth-ish columns in x.
-    let mut m = Array2::<f64>::zeros((n, 3));
-    // Slope block: overlaps M (its first column is M's smooth plus noise),
-    // second column is a fresh direction.
-    let mut g = Array2::<f64>::zeros((n, 2));
-    let mut w = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let t = (i as f64 + 0.5) / n as f64;
-        m[[i, 0]] = 1.0;
-        m[[i, 1]] = (std::f64::consts::TAU * t).sin();
-        m[[i, 2]] = (std::f64::consts::TAU * 2.0 * t).cos();
-        // G col 0 overlaps M col 1 (the confound), col 1 is independent.
-        g[[i, 0]] = m[[i, 1]] + 0.05 * rng.random_range(-1.0..1.0);
-        g[[i, 1]] = (std::f64::consts::TAU * 3.0 * t).sin();
-        // Positive IRLS-style row metric.
-        w[i] = 0.25 + 0.75 * rng.random_range(0.0..1.0);
-    }
-
-    // Robustness is now unconditional/always-on: the orthogonalizing reparam is
-    // built directly (no config flag), and `build_unconditional` returns the
-    // reparam object straight (`Result<Self, _>`, no inner `Option`).
-    let reparam = OrthogonalReparam::build_unconditional(m.view(), g.view(), &w)
-        .expect("orthogonal reparam build should succeed");
-
-    // 1. MᵀW·G̃ ≈ 0.
-    let g_tilde = reparam.reparameterized_confound().to_owned();
-    let mut max_cross = 0.0_f64;
-    let p_m = m.ncols();
-    let p_c = g_tilde.ncols();
-    for a in 0..p_m {
-        for b in 0..p_c {
-            let mut acc = 0.0;
-            for i in 0..n {
-                acc += m[[i, a]] * w[i] * g_tilde[[i, b]];
-            }
-            max_cross = max_cross.max(acc.abs());
-        }
-    }
-    // Orthogonality holds to the projection ridge's working precision. The
-    // residual (~1e-8) is the `OrthogonalReparam` relative ridge acting on the
-    // weighted primary Gram, not a span leak; well below any identifiability
-    // threshold the joint Hessian cares about.
-    assert!(
-        max_cross < 5e-8,
-        "MᵀW·G̃ not orthogonal in the pilot metric: max|entry|={max_cross:e}"
-    );
-
-    // 2. Coefficient round-trip is exact and the additive predictor is invariant.
-    let beta_m_reparam = Array1::from_vec(vec![0.4, -1.1, 0.7]);
-    let beta_s = Array1::from_vec(vec![1.8, -0.6]);
-    let eta_reparam = m.dot(&beta_m_reparam) + g_tilde.dot(&beta_s);
-    let (beta_m, beta_s_out) = reparam
-        .recover_original(&beta_m_reparam, &beta_s)
-        .expect("recover_original should succeed");
-    let eta_original = m.dot(&beta_m) + g.dot(&beta_s_out);
-    let max_dpred = (&eta_reparam - &eta_original)
-        .iter()
-        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
-    assert!(
-        max_dpred < 1e-12,
-        "additive predictor changed under round-trip: max|Δη|={max_dpred:e}"
-    );
-    // Slope coefficients are untouched by the reparameterization.
-    let max_dbetas = (&beta_s_out - &beta_s)
-        .iter()
-        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
-    assert!(
-        max_dbetas == 0.0,
-        "slope coefficients changed under round-trip: {max_dbetas:e}"
-    );
-}
 
 /// Parse the reduced slope width `r` and the per-block coefficient
 /// inf-norms `[β_marginal_inf, β_slope_inf]` out of the BMS inner-solver

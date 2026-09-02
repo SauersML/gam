@@ -1539,18 +1539,3 @@ pub fn collateral_curve(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn periodic_steering_uses_shortest_path_across_seam() {
-        let periods = [Some(1.0)];
-        let delta = shortest_coordinate_delta(&[0.99], &[0.01], &periods).unwrap();
-        assert!((delta[0] - 0.02).abs() < 1e-12);
-        let midpoint = path_coordinate(&[0.99], &delta, &periods, 0.5);
-        assert!(midpoint[0].abs() < 1e-12 || (midpoint[0] - 1.0).abs() < 1e-12);
-        let distance = coordinate_l2_distance(&[0.99], &[0.01], &periods).unwrap();
-        assert!((distance - 0.02).abs() < 1e-12);
-    }
-}

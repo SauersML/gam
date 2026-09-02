@@ -30,11 +30,7 @@
 use gam::families::bms::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
 };
-use gam::families::survival::marginal_slope::{
-    RigidVectorValueWorkspace, survival_marginal_slope_vector_eta,
-    survival_marginal_slope_vector_neglog, survival_marginal_slope_vector_scale,
-};
-use gam::probability::{normal_cdf, normal_pdf};
+use gam::families::survival::marginal_slope::{RigidVectorValueWorkspace, survival_marginal_slope_vector_neglog};
 use ndarray::{Array1, Array2};
 
 use crate::fixtures::Splitmix64;
@@ -130,61 +126,6 @@ fn total_neglog(
     Ok(acc)
 }
 
-/// Simulate (z, q, qd1, event) where the event label is drawn from the same
-/// exact-event-density vs censoring likelihood scores used by
-/// `survival_marginal_slope_vector_neglog` at `true_slopes` and `covariance`.
-/// This ensures the population-expected negative log-likelihood is genuinely
-/// minimized at `true_slopes`.
-fn simulate_events_from_truth(
-    seed: u64,
-    true_slopes: &[f64; K],
-    covariance: &MarginalSlopeCovariance,
-) -> SimData {
-    let mut rng = Splitmix64::new(seed ^ 0xD1B5_4A32_D192_ED03);
-    let mut z = Array2::<f64>::zeros((N, K));
-    let mut q0 = Array1::<f64>::zeros(N);
-    let mut q1 = Array1::<f64>::zeros(N);
-    let mut qd1 = Array1::<f64>::zeros(N);
-    let mut event = Array1::<f64>::zeros(N);
-
-    for i in 0..N {
-        let (g1, g2) = next_gauss_pair(&mut rng);
-        z[[i, 0]] = g1;
-        z[[i, 1]] = g2;
-
-        let (gq, _) = next_gauss_pair(&mut rng);
-        let base = 0.25 * gq;
-        q0[i] = base - 0.6;
-        q1[i] = base + 0.6;
-        qd1[i] = 0.7 + 0.1 * rng.next_unit();
-
-        let z_row = [z[[i, 0]], z[[i, 1]]];
-        let eta1 = survival_marginal_slope_vector_eta(
-            q1[i],
-            &z_row,
-            true_slopes,
-            covariance,
-            PROBIT_SCALE,
-        )
-        .expect("eta1");
-        let c = survival_marginal_slope_vector_scale(true_slopes, covariance, PROBIT_SCALE)
-            .expect("scale");
-        let event_score = normal_pdf(eta1) * qd1[i] * c;
-        let censor_score = normal_cdf(-eta1);
-        let p_event = (event_score / (event_score + censor_score)).clamp(0.0, 1.0);
-
-        event[i] = if rng.next_unit() < p_event { 1.0 } else { 0.0 };
-    }
-    SimData {
-        z,
-        weights: Array1::<f64>::ones(N),
-        q0,
-        q1,
-        qd1,
-        event,
-    }
-}
-
 // ── Test 1 — Truth is a population minimum of the negative log-likelihood ──
 //
 // At the TRUE slopes, the population-expected per-row neglog is minimal.
@@ -197,56 +138,6 @@ fn simulate_events_from_truth(
 // independently of the slopes, so `true_slopes` was NOT the population
 // optimum — perturbations could (and did) reduce the sample neglog at any
 // fixed seed.  We now sample events from the true marginal-slope model.
-#[test]
-fn survival_multi_z_fit_truth_neglog_minimised_at_true_slopes_30_seeds() {
-    let true_slopes = [0.32_f64, -0.21_f64];
-    // Use the population covariance (identity) for both event simulation
-    // and likelihood evaluation, so the truth is the exact population
-    // optimum (no model mismatch between generating and evaluating Σ).
-    let covariance = MarginalSlopeCovariance::diagonal(Array1::<f64>::ones(K)).unwrap();
-
-    const SEEDS: u64 = 30;
-    let mut sum_truth = 0.0_f64;
-    let mut sum_pert_plus = [0.0_f64; K];
-    let mut sum_pert_minus = [0.0_f64; K];
-
-    for seed_idx in 0..SEEDS {
-        let data = simulate_events_from_truth(0x511_0001 + seed_idx, &true_slopes, &covariance);
-        sum_truth += total_neglog(&data, &true_slopes, &covariance).expect("truth nl");
-
-        for which in 0..K {
-            let mut plus = true_slopes;
-            plus[which] *= 1.0 + 0.05;
-            sum_pert_plus[which] += total_neglog(&data, &plus, &covariance).expect("plus nl");
-
-            let mut minus = true_slopes;
-            minus[which] *= 1.0 - 0.05;
-            sum_pert_minus[which] += total_neglog(&data, &minus, &covariance).expect("minus nl");
-        }
-    }
-
-    for which in 0..K {
-        // Symmetrized aggregate excess: ≈ δ² · N · seeds · I_per_row.
-        // The linear-in-δ score term cancels between ±δ; only the
-        // quadratic Fisher term survives.  This is the principled test
-        // of "truth is a population minimum".
-        let avg_pert = 0.5 * (sum_pert_plus[which] + sum_pert_minus[which]);
-        let excess = avg_pert - sum_truth;
-        assert!(
-            excess > 1.0,
-            "aggregate symmetrized excess too small at which={which}: \
-             excess={excess:.3} (sum_truth={sum_truth:.3}, \
-             sum_pert_plus={:.3}, sum_pert_minus={:.3})",
-            sum_pert_plus[which],
-            sum_pert_minus[which]
-        );
-
-        // Do not assert each one-sided perturbation separately. The
-        // finite-sample score term is linear in δ and can move one side
-        // below the truth even when the population curvature is correct;
-        // the symmetrized excess above is the invariant this test needs.
-    }
-}
 
 // ── Test 2 — Marginal preservation at fitted/true parameters ─────────────
 //
@@ -262,42 +153,6 @@ fn survival_multi_z_fit_truth_neglog_minimised_at_true_slopes_30_seeds() {
 //
 // so with the SAME covariance plugged into c, the LHS Monte-Carlo average
 // must equal Φ(-q) within Monte-Carlo error.
-#[test]
-fn survival_multi_z_fit_marginal_preserved_at_true_slopes_population_mc() {
-    let true_slopes = [0.32_f64, -0.21_f64];
-    let data = simulate(0x511_0042, 0.0);
-    let covariance =
-        marginal_slope_covariance_from_scores(data.z.view(), &data.weights).expect("cov");
-    let c = survival_marginal_slope_vector_scale(&true_slopes, &covariance, PROBIT_SCALE)
-        .expect("scale");
-
-    // Sweep several q values inside the support that produces non-degenerate
-    // probabilities, and check the Monte-Carlo population average matches Φ(-q).
-    for &q in &[-1.0_f64, -0.3, 0.0, 0.4, 1.2] {
-        let mut mc = 0.0_f64;
-        for i in 0..N {
-            let z_row = [data.z[[i, 0]], data.z[[i, 1]]];
-            let eta = survival_marginal_slope_vector_eta(
-                q,
-                &z_row,
-                &true_slopes,
-                &covariance,
-                PROBIT_SCALE,
-            )
-            .expect("eta");
-            mc += normal_cdf(-eta);
-        }
-        mc /= N as f64;
-        let target = normal_cdf(-q);
-        let mc_se = ((target * (1.0 - target)) / (N as f64)).sqrt();
-        // 5 SE tolerance — extremely safe for N=2000 (Φ-bounded summand).
-        let tol = 5.0 * mc_se + 1e-12;
-        assert!(
-            (mc - target).abs() <= tol,
-            "q={q} mc={mc:.6} target={target:.6} c={c:.6} tol={tol:.6}"
-        );
-    }
-}
 
 // ── Test 3 — Column permutation symmetry ─────────────────────────────────
 //

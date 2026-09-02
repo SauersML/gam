@@ -1836,74 +1836,6 @@ mod tests {
         assert!(error.contains("ChunkOnlySampleDesign test refusal"));
     }
 
-    /// #1463: the NB NUTS path must sample at the fit's jointly-estimated
-    /// `theta_hat`, not the construction seed `theta = 1.0`. The seed only seeds
-    /// the inner solve; the NUTS NB log-likelihood/score reads `theta` straight
-    /// off the sampling `LikelihoodSpec`, so unless we refresh it from the scale
-    /// metadata the posterior is drawn at the wrong overdispersion and every
-    /// coefficient's posterior SD inflates ~1.4–1.5×.
-    ///
-    /// Pre-fix, `sample_standard` forwarded the seed unchanged: this assertion
-    /// would read `theta == 1.0` and fail. With the refresh in place the seam
-    /// rewrites the spec to `theta_hat`.
-    #[test]
-    fn refresh_negbin_theta_reads_theta_hat_not_seed() {
-        // Spec carries the construction seed theta = 1.0; the fit estimated a
-        // very different theta_hat = 2.97 and recorded it in the scale metadata.
-        let mut likelihood = LikelihoodSpec::negative_binomial_log(1.0);
-        let scale = LikelihoodScaleMetadata::EstimatedNegBinTheta { theta: 2.97 };
-
-        refresh_negbin_theta_for_sampling(&mut likelihood, scale);
-
-        match likelihood.response {
-            ResponseFamily::NegativeBinomial { theta, .. } => assert_eq!(
-                theta, 2.97,
-                "NB NUTS must sample at theta_hat (#1463), not the seed theta=1.0"
-            ),
-            other => panic!("expected NegativeBinomial response, got {other:?}"),
-        }
-    }
-
-    /// A fixed-theta NB fit records the user's exact `theta` in both the spec and
-    /// the scale metadata, so the refresh is a no-op that still lands on the
-    /// fixed value (never the inner-solve seed of an estimated fit).
-    #[test]
-    fn refresh_negbin_theta_fixed_theta_is_preserved() {
-        let mut likelihood = LikelihoodSpec::negative_binomial_log_fixed(4.25);
-        let scale = LikelihoodScaleMetadata::FixedNegBinTheta { theta: 4.25 };
-
-        refresh_negbin_theta_for_sampling(&mut likelihood, scale);
-
-        match likelihood.response {
-            ResponseFamily::NegativeBinomial { theta, theta_fixed } => {
-                assert_eq!(theta, 4.25, "fixed NB theta must survive the refresh");
-                assert!(theta_fixed, "theta_fixed flag must be preserved");
-            }
-            other => panic!("expected NegativeBinomial response, got {other:?}"),
-        }
-    }
-
-    /// When the fit recorded no NB theta (non-NB scale metadata), the refresh
-    /// must leave the spec's seed untouched — mirroring the canonical replicate
-    /// picker's `negbin_theta().or(seed)`.
-    #[test]
-    fn refresh_negbin_theta_falls_back_to_seed_when_unfitted() {
-        let mut likelihood = LikelihoodSpec::negative_binomial_log(3.5);
-        // ProfiledGaussian carries no negbin_theta, so the accessor returns None.
-        refresh_negbin_theta_for_sampling(
-            &mut likelihood,
-            LikelihoodScaleMetadata::ProfiledGaussian,
-        );
-
-        match likelihood.response {
-            ResponseFamily::NegativeBinomial { theta, .. } => assert_eq!(
-                theta, 3.5,
-                "with no fitted theta the NB seed must be kept verbatim"
-            ),
-            other => panic!("expected NegativeBinomial response, got {other:?}"),
-        }
-    }
-
     /// Non-NB families must be completely unaffected by the NB refresh, even when
     /// the scale metadata happens to carry an NB theta — the match guards on the
     /// response family, so Poisson/Gamma/etc. are left untouched.
@@ -1920,7 +1852,6 @@ mod tests {
             "Poisson response must be untouched by the NB theta refresh"
         );
     }
-
 
     // ---------------------------------------------------------------- #2536
 

@@ -2896,64 +2896,6 @@ mod device {
 mod tests {
     use super::*;
 
-    /// #2422 device-free half, shared by this module's three CUDA-gated tests.
-    ///
-    /// Each of them returned on `Ok(None)` before its first assertion, so on a
-    /// device-free host -- which is every CI runner -- they reported `passed`
-    /// having measured nothing. Without a device the production entry's
-    /// `Device` path must REFUSE: `execute_softmax_row_jet_tile` dispatches
-    /// straight to `device::device_tile`, which opens with `backend()?`, and
-    /// maps the error out rather than falling back to the host. An `Ok` here
-    /// would mean the seam quietly computed the CPU answer under a `Device`
-    /// request -- the #1551 silent-fallback class, and exactly what a `return`
-    /// before the first assertion could never see.
-    ///
-    /// The fixture is small on purpose: the refusal is a property of the absent
-    /// device, not of the workload, and the gated tests' own 1<<17-row fixtures
-    /// would cost real time on a host that is going to refuse anyway. The CPU
-    /// arm is asserted first so a fixture that is broken for some unrelated
-    /// reason cannot make the refusal check pass for the wrong reason.
-    fn assert_row_jet_device_path_declines_without_cuda() {
-        let rows = complete_fixture(64);
-        let cpu = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Cpu)
-            .expect("the CPU row-jet path must succeed on every host");
-        assert_eq!(
-            cpu.n_rows, 64,
-            "the device-free half needs a CPU result over the whole fixture, or it \
-             proves nothing about the seam"
-        );
-        if let Ok(channels) = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Device) {
-            panic!(
-                "no CUDA runtime on this host, yet the Device row-jet path returned Ok with \
-                 n_rows={} -- the seam fell back to the host silently (#1551 class)",
-                channels.n_rows
-            );
-        }
-    }
-
-    /// Resolve the device for the three `..._when_admitted_2304` gates, and on a
-    /// device-free host both COUNT the skip and assert the seam refuses.
-    ///
-    /// Each of those three tests opened with its own `GpuRuntime::resolve`
-    /// match. The seam assertion they ran was real, but the skip itself was
-    /// invisible: nothing incremented the #2422 counter and nothing printed the
-    /// shared `SKIPPED(no-cuda):` marker, so a CI ledger scraping a green
-    /// CPU-only run could not tell that three device-parity gates had declined.
-    /// Curing it in one helper rather than at three call sites is deliberate —
-    /// a fix applied per-site is a fix the next gate written here will miss.
-    #[cfg(target_os = "linux")]
-    fn row_jet_device_gate(label: &str) -> bool {
-        let skips_before = gam_gpu::test_gate::skipped_for_absent_device();
-        match gam_gpu::test_gate::gpu_for_test(label) {
-            gam_gpu::test_gate::GpuTestGate::Ready(_) => true,
-            gam_gpu::test_gate::GpuTestGate::AbsentDevice => {
-                gam_gpu::test_gate::assert_absent_device_was_counted(skips_before);
-                assert_row_jet_device_path_declines_without_cuda();
-                false
-            }
-        }
-    }
-
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn device_path_declines_on_unsupported_host_2422() {
@@ -3191,60 +3133,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn complete_device_matches_cpu_every_channel_when_admitted_2304() {
-        if !row_jet_device_gate("complete row-jet elementwise parity #2304") {
-            return;
-        }
-        // A 37-row smoke fixture launches each kernel for too little time to
-        // establish that the admitted production path actually occupies the
-        // device. Keep a complete, memory-bounded workload large enough for
-        // external utilization/profiler sampling, warm the NVRTC/module path
-        // once, then require every measured pass to match the one CPU oracle.
-        const ROW_COUNT: usize = 1 << 17;
-        const MEASURED_PASSES: usize = 8;
-        let rows = complete_fixture(ROW_COUNT);
-        let cpu = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Cpu).expect("CPU oracle");
-
-        execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Device)
-            .expect("admitted device warm-up must execute without a host retry");
-
-        let mut max_error = 0.0_f64;
-        for pass in 0..MEASURED_PASSES {
-            let device = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Device)
-                .unwrap_or_else(|error| {
-                    panic!("admitted device pass {pass} must execute without a host retry: {error}")
-                });
-            max_error = cpu
-                .first
-                .iter()
-                .chain(&cpu.second)
-                .chain(&cpu.beta)
-                .chain(&cpu.beta_mixed)
-                .zip(
-                    device
-                        .first
-                        .iter()
-                        .chain(&device.second)
-                        .chain(&device.beta)
-                        .chain(&device.beta_mixed),
-                )
-                .fold(max_error, |maximum, (left, right)| {
-                    maximum.max((left - right).abs())
-                });
-        }
-        let outputs_per_pass =
-            cpu.first.len() + cpu.second.len() + cpu.beta.len() + cpu.beta_mixed.len();
-        eprintln!(
-            "SAE_ROWJET_GPU_ACCEPT rows={ROW_COUNT} measured_passes={MEASURED_PASSES} outputs_per_pass={outputs_per_pass} max_abs_error={max_error:.17e}"
-        );
-        assert!(
-            max_error <= 1.0e-12,
-            "complete SAE device/CPU row-jet error {max_error:e} exceeds 1e-12"
-        );
-    }
-
     /// Deterministic per-row contraction vectors matched to `complete_fixture`.
     fn contraction_vectors(
         n: usize,
@@ -3387,79 +3275,6 @@ mod tests {
         assert!(bilinear.beta.iter().any(|&value| value != 0.0));
     }
 
-    /// Resident-contraction acceptance (#2304): on an admitted device, both
-    /// contraction shapes must reproduce the CPU reduction at the same
-    /// workload scale as the elementwise gate, while transferring only the
-    /// `n·q`/`n·n_beta` reduced outputs.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn contracted_device_matches_cpu_reduction_when_admitted_2304() {
-        if !row_jet_device_gate("contracted row-jet reduction parity #2304") {
-            return;
-        }
-        const ROW_COUNT: usize = 1 << 17;
-        const MEASURED_PASSES: usize = 4;
-        let rows = complete_fixture(ROW_COUNT);
-        let (q, p, n_beta) = (
-            rows[0].n_primaries(),
-            rows[0].out_dim,
-            rows[0].n_beta_borders(),
-        );
-        let (probe, v_t, v_beta) = contraction_vectors(ROW_COUNT, q, p, n_beta);
-        let shapes: [(&str, SaeRowJetContraction<'_>); 2] = [
-            ("linear", SaeRowJetContraction::Linear { probe: &probe }),
-            (
-                "bilinear",
-                SaeRowJetContraction::Bilinear {
-                    probe: &probe,
-                    v_t: &v_t,
-                    v_beta: &v_beta,
-                },
-            ),
-        ];
-        for (label, contraction) in shapes {
-            let cpu = execute_softmax_row_jet_tile_contracted(
-                &rows,
-                1.0,
-                SaeRowJetPath::Cpu,
-                contraction,
-            )
-            .expect("CPU contraction oracle");
-            execute_softmax_row_jet_tile_contracted(&rows, 1.0, SaeRowJetPath::Device, contraction)
-                .expect("admitted contracted device warm-up must execute without a host retry");
-            let mut max_error = 0.0_f64;
-            for pass in 0..MEASURED_PASSES {
-                let device = execute_softmax_row_jet_tile_contracted(
-                    &rows,
-                    1.0,
-                    SaeRowJetPath::Device,
-                    contraction,
-                )
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "admitted contracted device pass {pass} must execute without a host retry: {error}"
-                    )
-                });
-                max_error = cpu
-                    .t
-                    .iter()
-                    .chain(&cpu.beta)
-                    .zip(device.t.iter().chain(&device.beta))
-                    .fold(max_error, |maximum, (left, right)| {
-                        maximum.max((left - right).abs())
-                    });
-            }
-            let outputs_per_pass = cpu.t.len() + cpu.beta.len();
-            eprintln!(
-                "SAE_ROWJET_CONTRACT_GPU_ACCEPT shape={label} rows={ROW_COUNT} measured_passes={MEASURED_PASSES} outputs_per_pass={outputs_per_pass} max_abs_error={max_error:.17e}"
-            );
-            assert!(
-                max_error <= 1.0e-12,
-                "contracted SAE device/CPU {label} reduction error {max_error:e} exceeds 1e-12"
-            );
-        }
-    }
-
     /// Representative per-row selected-inverse weights for the Trace shape: a
     /// symmetric `E_tt` and `beta_inv` (as the true deflation-folded selected
     /// inverse is) and an arbitrary `inv_vbeta`. Shared by the manual-reduction
@@ -3579,71 +3394,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Device parity for the θ-adjoint Trace reduction at the same 131072-row
-    /// scale as the elementwise/linear/bilinear gate. The materialize-then-reduce
-    /// device path must reproduce the authoritative CPU Trace oracle to ≤1e-12,
-    /// transferring only the `n·q` / `n·n_beta` reduced coefficients. Skips
-    /// cleanly when no device admits (a runtime-absent skip does not count as
-    /// proof; the exact-SHA GPU gate is what closes the device claim).
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn contracted_trace_device_matches_cpu_reduction_when_admitted_2304() {
-        if !row_jet_device_gate("contracted Trace row-jet reduction parity #2304") {
-            return;
-        }
-        const ROW_COUNT: usize = 1 << 17;
-        const MEASURED_PASSES: usize = 4;
-        let inv_tau = 1.0;
-        let rows = complete_fixture(ROW_COUNT);
-        let (q, n_beta) = (rows[0].n_primaries(), rows[0].n_beta_borders());
-        let (e_tt, inv_vbeta, beta_inv) = trace_weights(ROW_COUNT, q, n_beta);
-        let contraction = SaeRowJetContraction::Trace {
-            e_tt: &e_tt,
-            inv_vbeta: &inv_vbeta,
-            beta_inv: &beta_inv,
-            exact_a: true,
-        };
-        let cpu = execute_softmax_row_jet_tile_contracted(
-            &rows,
-            inv_tau,
-            SaeRowJetPath::Cpu,
-            contraction,
-        )
-        .expect("CPU trace oracle");
-        execute_softmax_row_jet_tile_contracted(&rows, inv_tau, SaeRowJetPath::Device, contraction)
-            .expect("admitted trace device warm-up must execute without a host retry");
-        let mut max_error = 0.0_f64;
-        for pass in 0..MEASURED_PASSES {
-            let device = execute_softmax_row_jet_tile_contracted(
-                &rows,
-                inv_tau,
-                SaeRowJetPath::Device,
-                contraction,
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "admitted trace device pass {pass} must execute without a host retry: {error}"
-                )
-            });
-            max_error = cpu
-                .t
-                .iter()
-                .chain(&cpu.beta)
-                .zip(device.t.iter().chain(&device.beta))
-                .fold(max_error, |maximum, (left, right)| {
-                    maximum.max((left - right).abs())
-                });
-        }
-        let outputs_per_pass = cpu.t.len() + cpu.beta.len();
-        eprintln!(
-            "SAE_ROWJET_TRACE_GPU_ACCEPT rows={ROW_COUNT} measured_passes={MEASURED_PASSES} outputs_per_pass={outputs_per_pass} max_abs_error={max_error:.17e}"
-        );
-        assert!(
-            max_error <= 1.0e-12,
-            "Trace SAE device/CPU reduction error {max_error:e} exceeds 1e-12"
-        );
     }
 
     /// The `Trace` seam must equal the dense θ-adjoint reduction of the

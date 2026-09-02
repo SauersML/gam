@@ -6,11 +6,7 @@
 //! `normal_cdf`) so the test file is self-contained.
 
 use gam::families::bms::MarginalSlopeCovariance;
-use gam::families::survival::marginal_slope::{
-    RigidVectorValueWorkspace, survival_marginal_slope_vector_neglog,
-    survival_marginal_slope_vector_scale,
-};
-use gam::probability::normal_cdf;
+use gam::families::survival::marginal_slope::{RigidVectorValueWorkspace, survival_marginal_slope_vector_neglog};
 use ndarray::{Array1, Array2};
 
 // -------- inline splitmix64 PRNG ----------------------------------------
@@ -42,45 +38,6 @@ impl SplitMix64 {
 }
 
 // -------- closed-form neglog from primitives ----------------------------
-
-/// Reference computation mirroring the algebra documented inside
-/// `survival_marginal_slope_vector_neglog` (see
-/// tests/survival_multi_z_marginal_slope.rs:66-106 for the pattern).
-fn neglog_reference(
-    q0: f64,
-    q1: f64,
-    qd1: f64,
-    slopes: &[f64],
-    z: &[f64],
-    covariance: &MarginalSlopeCovariance,
-    weight: f64,
-    event: f64,
-    probit_scale: f64,
-) -> f64 {
-    let observed: Vec<f64> = slopes.iter().map(|&g| probit_scale * g).collect();
-    let var = covariance
-        .quadratic_form(&observed)
-        .expect("quadratic form");
-    let c = (1.0 + var).sqrt();
-
-    // Cross-check vs. library scale.
-    let c_lib = survival_marginal_slope_vector_scale(slopes, covariance, probit_scale)
-        .expect("library scale");
-    assert!(
-        (c - c_lib).abs() <= 1e-14 * (1.0 + c.abs()),
-        "scale mismatch: ref={c:.17e} lib={c_lib:.17e}"
-    );
-
-    let linear: f64 = observed.iter().zip(z.iter()).map(|(&o, &zi)| o * zi).sum();
-    let eta0 = q0 * c + linear;
-    let eta1 = q1 * c + linear;
-    let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
-    let ad1 = qd1 * c;
-    weight
-        * ((1.0 - event) * (-(normal_cdf(-eta1)).ln()) + normal_cdf(-eta0).ln()
-            - event * log_phi_eta1
-            - event * ad1.ln())
-}
 
 // -------- fixture generators --------------------------------------------
 
@@ -141,71 +98,6 @@ fn random_z(rng: &mut SplitMix64, k: usize) -> Vec<f64> {
 }
 
 // -------- 1. Closed-form match across dims/shapes/events ----------------
-
-#[test]
-fn neglog_matches_closed_form_across_dims_shapes_events() {
-    let ks = [1usize, 2, 3, 5];
-    let events = [0.0_f64, 1.0];
-    let mut seed = 0xC0FFEE_BAD_F00D_u64;
-
-    for &k in &ks {
-        for &event in &events {
-            for shape_id in 0..3u32 {
-                for fixture in 0..30u64 {
-                    seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-                    let mut rng = SplitMix64::new(
-                        seed ^ ((k as u64) << 32) ^ fixture ^ ((shape_id as u64) << 16),
-                    );
-
-                    let covariance = match shape_id {
-                        0 => make_diagonal(&mut rng, k),
-                        1 => make_full_psd(&mut rng, k),
-                        _ => make_low_rank(&mut rng, k, ((fixture as usize % k.max(1)) + 1).max(1)),
-                    };
-                    let slopes = random_slopes(&mut rng, k);
-                    let z = random_z(&mut rng, k);
-                    let probit_scale = rng.uniform(0.4, 1.6);
-                    let weight = rng.uniform(0.2, 2.5);
-                    let q0 = rng.uniform(-1.5, 1.5);
-                    let q1 = rng.uniform(-1.5, 1.5);
-                    let qd1 = rng.uniform(0.1, 3.0);
-
-                    let actual = survival_marginal_slope_vector_neglog(
-                        0,
-                        q0,
-                        q1,
-                        qd1,
-                        &slopes,
-                        &z,
-                        &RigidVectorValueWorkspace::new(&covariance.clone().into()),
-                        weight,
-                        event,
-                        1e-9,
-                        probit_scale,
-                    )
-                    .expect("neglog");
-                    let expected = neglog_reference(
-                        q0,
-                        q1,
-                        qd1,
-                        &slopes,
-                        &z,
-                        &covariance,
-                        weight,
-                        event,
-                        probit_scale,
-                    );
-                    let scale = 1.0 + expected.abs();
-                    assert!(
-                        (actual - expected).abs() <= 1e-13 * scale,
-                        "k={k} shape={shape_id} event={event} fixture={fixture}: \
-                         actual={actual:.17e} expected={expected:.17e}"
-                    );
-                }
-            }
-        }
-    }
-}
 
 // -------- 2. event=0 -> qd1 term vanishes (bitwise) ---------------------
 

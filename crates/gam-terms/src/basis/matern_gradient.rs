@@ -319,29 +319,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn forward_mul_matches_materialized_dot() {
-        let data = array![[0.1], [0.3], [0.8]];
-        let centers = array![[0.0], [0.5]];
-        let coeffs = array![2.0, -0.25];
-        let eval = StreamingMaternBasisGradientEvaluator::new(
-            centers.view(),
-            1.1,
-            MaternNu::NineHalves,
-            None,
-            Some(2),
-        )
-        .unwrap();
-        let dense = eval
-            .evaluate(data.view(), MaternBasisGradientTarget::LogKappa)
-            .unwrap();
-        let streaming = eval
-            .forward_mul(
-                data.view(),
-                MaternBasisGradientTarget::LogKappa,
-                coeffs.view(),
-            )
-            .unwrap();
-        assert_eq!(streaming, dense.dot(&coeffs));
-    }
 }

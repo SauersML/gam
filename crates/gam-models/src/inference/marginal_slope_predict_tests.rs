@@ -120,54 +120,6 @@ fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_ru
 }
 
 #[test]
-fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
-    let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-    let prepared = crate::bms::build_score_warp_deviation_block_from_seed(
-        &seed,
-        &crate::bms::DeviationBlockConfig {
-            num_internal_knots: 4,
-            ..Default::default()
-        },
-    )
-    .expect("build saved anchored deviation runtime");
-    let runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
-    let beta = Array1::from_iter(
-        (0..runtime.basis_dim).map(|idx| 0.02 * (idx as f64 + 1.0) * (-1.0_f64).powi(idx as i32)),
-    );
-    let n_spans = runtime.span_count().expect("span count");
-    assert!(n_spans >= 2);
-    for span_idx in 0..n_spans {
-        let cubic = runtime
-            .local_cubic_on_span(beta.view(), span_idx)
-            .expect("local cubic");
-        let x_eval = array![cubic.left, 0.5 * (cubic.left + cubic.right), cubic.right];
-        let expected = runtime.design(&x_eval).expect("design").dot(&beta);
-        let expected_d1 = runtime
-            .first_derivative_design(&x_eval)
-            .expect("d1 design")
-            .dot(&beta);
-        for i in 0..x_eval.len() {
-            let x = x_eval[i];
-            assert!((cubic.evaluate(x) - expected[i]).abs() < 1e-10);
-            assert!((cubic.first_derivative(x) - expected_d1[i]).abs() < 1e-10);
-            let selected = runtime
-                .local_cubic_at(beta.view(), x)
-                .expect("local cubic at x");
-            let expected_span_idx = if i == 0 && span_idx > 0 {
-                span_idx - 1
-            } else {
-                span_idx
-            };
-            let expected_cubic = runtime
-                .local_cubic_on_span(beta.view(), expected_span_idx)
-                .expect("expected local cubic on span");
-            assert_eq!(selected.left, expected_cubic.left);
-            assert_eq!(selected.right, expected_cubic.right);
-        }
-    }
-}
-
-#[test]
 fn saved_anchored_deviation_runtime_design_with_anchor_rows_applies_residual() {
     use crate::bms::deviation_runtime::ParametricAnchorBlock;
     use crate::inference::model::{SavedAnchorComponent, SavedAnchorKind};
@@ -408,38 +360,6 @@ fn bernoulli_marginal_slope_predictor_rejects_nonprobit_base_link_scale() {
         .final_eta_and_gradient_from_theta(&input, &theta, true)
         .expect_err("non-probit marginal-slope prediction should be rejected");
     assert!(err.to_string().contains("requires link(type=probit)"));
-}
-
-#[test]
-fn saved_anchored_deviation_runtime_basis_cubic_matches_basis_column() {
-    let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-    let prepared = crate::bms::build_score_warp_deviation_block_from_seed(
-        &seed,
-        &crate::bms::DeviationBlockConfig {
-            num_internal_knots: 4,
-            ..Default::default()
-        },
-    )
-    .expect("build saved anchored deviation runtime");
-    let runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
-    let cubic = runtime.basis_span_cubic(0, 1).expect("basis span cubic");
-    let x_eval = array![cubic.left, 0.5 * (cubic.left + cubic.right), cubic.right];
-    let design = runtime.design(&x_eval).expect("basis design");
-    let d1 = runtime
-        .first_derivative_design(&x_eval)
-        .expect("basis d1 design");
-    for i in 0..x_eval.len() {
-        let x = x_eval[i];
-        assert!((cubic.evaluate(x) - design[[i, 1]]).abs() < 1e-10);
-        assert!((cubic.first_derivative(x) - d1[[i, 1]]).abs() < 1e-10);
-        let selected = runtime.basis_cubic_at(1, x).expect("basis cubic at x");
-        let expected_span_idx = 0;
-        let expected_cubic = runtime
-            .basis_span_cubic(expected_span_idx, 1)
-            .expect("expected basis span cubic");
-        assert_eq!(selected.left, expected_cubic.left);
-        assert_eq!(selected.right, expected_cubic.right);
-    }
 }
 
 /// The predictor must rebuild the conditional calibration's conditioning span

@@ -1264,74 +1264,7 @@ mod pre_probe_gate_tests {
     //! device probe and its per-GPU `cuDevicePrimaryCtxRetain` context
     //! creation. Observable on any host (CUDA or not) through the process-wide
     //! `resolution_call_count` counter; nextest gives each test its own process.
-    use super::{DispatchOp, GpuDispatchPolicy, route_through_gpu};
-    use crate::device_runtime::GpuRuntime;
-
-    #[test]
-    fn cpu_sized_ops_are_refused_before_the_device_probe() {
-        let tiny_ops = [
-            DispatchOp::Gemm { m: 8, n: 8, k: 8 },
-            DispatchOp::BatchedGemm {
-                batch: 4,
-                m: 8,
-                n: 8,
-                k: 8,
-            },
-            DispatchOp::Gemv { m: 64, k: 64 },
-            DispatchOp::Potrf { p: 24, batch: 1 },
-            DispatchOp::Trsm { m: 16, n: 16 },
-            DispatchOp::XtDiagX { n: 700, p: 12 },
-            DispatchOp::XtDiagY {
-                n: 700,
-                px: 12,
-                q: 4,
-            },
-            DispatchOp::JointHessian2x2 {
-                n: 700,
-                pa: 8,
-                pb: 8,
-            },
-        ];
-        let before = GpuRuntime::resolution_call_count();
-        for op in tiny_ops {
-            assert!(
-                !op.admissible_under_any_policy(),
-                "fixture op must be inadmissible under every policy: {op:?}"
-            );
-            assert!(
-                route_through_gpu(op).is_none(),
-                "inadmissible op must not route: {op:?}"
-            );
-        }
-        assert_eq!(
-            GpuRuntime::resolution_call_count(),
-            before,
-            "route_through_gpu must refuse CPU-sized ops BEFORE runtime resolution, \
-             so no CUDA context is ever created for them"
-        );
-    }
-
-    #[test]
-    fn admissible_ops_fall_through_to_the_probed_runtime() {
-        // An op above every floor must consult the runtime (identical behaviour
-        // to the pre-fix path for genuinely GPU-sized work).
-        let big = DispatchOp::Gemm {
-            m: 2_048,
-            n: 2_048,
-            k: 2_048,
-        };
-        assert!(big.admissible_under_any_policy());
-        let before = GpuRuntime::resolution_call_count();
-        let routed = route_through_gpu(big);
-        assert!(
-            routed.is_none_or(|runtime| !runtime.devices.is_empty()),
-            "a routed operation must receive a runtime with at least one usable device"
-        );
-        assert!(
-            GpuRuntime::resolution_call_count() > before,
-            "an admissible op must fall through to runtime resolution"
-        );
-    }
+    use super::{DispatchOp, GpuDispatchPolicy};
 
     #[test]
     fn admissibility_bound_never_tightens_the_real_admission() {

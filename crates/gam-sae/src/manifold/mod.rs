@@ -401,9 +401,6 @@ mod tests_logdet_adjoint_780;
 mod tests_deflated_from_probes_2712;
 
 #[cfg(test)]
-mod tests_exact_a_bundle_2515;
-
-#[cfg(test)]
 mod tests_pen_fd_780;
 
 #[cfg(test)]

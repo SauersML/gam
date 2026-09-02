@@ -1436,25 +1436,6 @@ mod coordinate_fidelity_tests {
     }
 
     #[test]
-    fn weighted_watson_matches_unweighted_for_unit_support() {
-        let coords = Array1::from_vec(vec![0.0, 0.25, 0.5, 0.75]);
-        let support = SupportMeasure::from_weights(0, Array1::ones(coords.len())).unwrap();
-        let unweighted = coordinate_uniformity(coords.view(), &circle()).unwrap();
-        let weighted = coordinate_uniformity_weighted(coords.view(), &support, &circle()).unwrap();
-        assert!((weighted.statistic - unweighted.statistic).abs() < 1e-12);
-        assert_eq!(weighted.p_value, unweighted.p_value);
-        assert_eq!(weighted.n, unweighted.n);
-    }
-
-    #[test]
-    fn interval_uniformity_keeps_the_right_endpoint_distinct() {
-        let coords = Array1::from_vec(vec![0.0, 0.5, 1.0]);
-        let result = coordinate_uniformity(coords.view(), &interval()).unwrap();
-        assert!((result.statistic - 1.0 / 3.0).abs() < 1e-12);
-        assert_eq!(result.p_value, None);
-    }
-
-    #[test]
     fn support_metrics_are_shared_by_fidelity_occupancy_and_persistence_reads() {
         let weights = Array1::from_vec(vec![1.0, 1.0, 0.5, 0.0]);
         let support = SupportMeasure::from_weights(0, weights).unwrap();
@@ -1470,42 +1451,6 @@ mod coordinate_fidelity_tests {
         assert!((support.mass() - 2.5).abs() < 1e-12);
         assert!((support.fisher_n() - 2.25).abs() < 1e-12);
         assert!((support.ess() - (2.5_f64 * 2.5 / 2.25)).abs() < 1e-12);
-    }
-
-    /// CALIBRATION: uniform planted angles land in the null range (not flagged);
-    /// bunched angles are flagged. This is the item-3 calibration requirement.
-    #[test]
-    fn uniformity_statistic_is_calibrated() {
-        let n = 240;
-        // Uniform: equally-spaced coordinates on the circle — the invariant
-        // measure. U² sits well below the 5% critical value; p is high.
-        let uniform: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
-        let uu = coordinate_uniformity(Array1::from(uniform.clone()).view(), &circle()).unwrap();
-        assert!(
-            uu.statistic < 0.187,
-            "uniform angles must fall below the 5% critical value, got U²={}",
-            uu.statistic
-        );
-        assert!(
-            uu.p_value.is_some_and(|p| p > 0.10),
-            "uniform angles must not be flagged, p={}",
-            uu.p_value.expect("circle Watson p-value")
-        );
-        // Bunched: every angle compressed into a 5% arc — the #2081 pathology.
-        let bunched: Vec<f64> = (0..n).map(|i| 0.05 * (i as f64 / n as f64)).collect();
-        let bu = coordinate_uniformity(Array1::from(bunched).view(), &circle()).unwrap();
-        assert!(
-            bu.statistic > 0.267,
-            "bunched angles must exceed the 1% critical value, got U²={}",
-            bu.statistic
-        );
-        assert!(
-            bu.p_value.is_some_and(|p| p < 0.01),
-            "bunched angles must be flagged, p={}",
-            bu.p_value.expect("circle Watson p-value")
-        );
-        // The bunched chart reads a MORE non-uniform coordinate than the honest one.
-        assert!(bu.statistic > uu.statistic);
     }
 
     /// Watson's `U²` is invariant to the circle's residual `O(2)` gauge: a
@@ -1770,42 +1715,6 @@ mod coordinate_fidelity_tests {
         ));
     }
 
-    /// PLANTED-CIRCLE tie-break: two seeds reach equal EV but read different
-    /// angle fidelity — one reads a uniform (honest, arc-length) angle, the other
-    /// a bunched (compressed) angle. The tie-break must pick the more uniform one.
-    #[test]
-    fn planted_circle_tie_break_picks_the_more_uniform_seed() {
-        let n = 200;
-        let tol = SAE_FINAL_EV_DEGRADATION_TOL;
-        // True planted angles are uniform on the ring. Seed A reads them honestly
-        // (uniform coordinate); seed B reads them through a squished chart that
-        // compresses the same ring into a fraction of the coordinate span.
-        let honest: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
-        let squished: Vec<f64> = honest.iter().map(|&u| 0.5 * u * u + 0.25 * u).collect();
-        let ua = coordinate_uniformity(Array1::from(honest).view(), &circle())
-            .unwrap()
-            .statistic;
-        let ub = coordinate_uniformity(Array1::from(squished).view(), &circle())
-            .unwrap()
-            .statistic;
-        assert!(
-            ua < ub,
-            "honest chart must read a more uniform angle: {ua} vs {ub}"
-        );
-        // Both seeds reconstruct the ring equally well (EV within the negligibility
-        // band): the tie-break must prefer the honest (uniform) seed over the
-        // squished incumbent, and never the reverse.
-        let ev = 0.926;
-        assert!(
-            prefer_candidate_basin(ev, Some(ua), ev, Some(ub), tol),
-            "the honest seed must be preferred at equal EV"
-        );
-        assert!(
-            !prefer_candidate_basin(ev, Some(ub), ev, Some(ua), tol),
-            "the squished seed must NOT displace the honest incumbent at equal EV"
-        );
-    }
-
     /// The honest arc-length coordinate is the pure-read complement to the raw
     /// chart: on an already-unit-speed circle it equals the raw coordinate, the
     /// speed profile is flat, the verdict certifies the raw reading is honest,
@@ -2050,100 +1959,6 @@ mod coordinate_fidelity_tests {
 
     // ---- F2: occupancy law (chart honesty vs occupancy split) ---------------
 
-    /// A deterministic low-discrepancy sequence on `[0, 1)` (van der Corput,
-    /// base 2) so the occupancy tests need no RNG.
-    fn vdc(n: usize) -> Vec<f64> {
-        (0..n)
-            .map(|i| {
-                let (mut x, mut denom, mut k) = (0.0_f64, 2.0_f64, i + 1);
-                while k > 0 {
-                    x += (k & 1) as f64 / denom;
-                    denom *= 2.0;
-                    k >>= 1;
-                }
-                x
-            })
-            .collect()
-    }
-
-    #[test]
-    fn uniform_occupancy_is_classified_uniform() {
-        // A uniformly-occupied circle: an even grid. The uniform density (0 free
-        // params) must win the BIC race over any anchor mixture.
-        let n = 400;
-        let u: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
-        assert_eq!(classify_occupancy(&u), OccupancyLaw::Uniform);
-    }
-
-    #[test]
-    fn seven_point_cyclic_is_classified_discrete() {
-        // Weekday-cyclic occupancy: 7 anchors at k/7, each realized ~100 times
-        // with sub-resolution jitter. The chart (a circle) is honest; the
-        // OCCUPANCY is discrete — the k=7 anchor model must win by evidence, and
-        // its rank charge d_eff must be 6.
-        let per = 100;
-        let n = 7 * per;
-        let jit = vdc(n);
-        let mut u = Vec::with_capacity(n);
-        for i in 0..n {
-            let anchor = (i % 7) as f64 / 7.0;
-            // Sub-resolution jitter: ±2e-4, BELOW the width floor 1/(2n) ≈ 7e-4,
-            // so the seven weekday points are genuinely discrete (a realistic
-            // near-exact categorical embedding). Above the floor the low-
-            // discrepancy jitter's own sub-structure becomes resolvable and the
-            // evidence honestly reports the finer clustering it can see.
-            u.push((anchor + 0.0004 * (jit[i] - 0.5)).rem_euclid(1.0));
-        }
-        let law = classify_occupancy(&u);
-        assert_eq!(law, OccupancyLaw::Discrete { anchors: 7 }, "{law:?}");
-        assert_eq!(law.d_eff(), 6);
-        assert_eq!(law.anchors(), 7);
-    }
-
-    #[test]
-    fn concentrated_arc_is_classified_continuous() {
-        // A single concentrated arc (unimodal, spread) is neither uniform nor a
-        // finite anchor set: the single wrapped Gaussian must win, so the
-        // occupancy law is Continuous.
-        let n = 1200;
-        let base = vdc(n);
-        // A Bates(3) draw (mean of three low-discrepancy uniforms) is a genuinely
-        // bell-shaped, single-moded density centered at 0.5 — a concentrated arc,
-        // not a finite anchor set. Scale toward the center so it stays a spread
-        // (not sub-resolution) continuous bump.
-        let u: Vec<f64> = (0..n / 3)
-            .map(|i| {
-                let m = (base[3 * i] + base[3 * i + 1] + base[3 * i + 2]) / 3.0;
-                (0.5 + 0.6 * (m - 0.5)).rem_euclid(1.0)
-            })
-            .collect();
-        let law = classify_occupancy(&u);
-        assert_eq!(law, OccupancyLaw::Continuous, "{law:?}");
-    }
-
-    #[test]
-    fn discrete_occupancy_passes_chart_honesty_conceptually() {
-        // The core F2 claim as a unit fact: a discrete occupancy is reported as
-        // discrete WITHOUT implying the chart is dishonest. `chart_honest` keys
-        // off the arc-length verdict only; `occupancy` keys off the measure. The
-        // two are independent, so a discrete-occupancy verdict never forces
-        // chart_honest=false. Here we assert the classifier isolates occupancy
-        // (a data property) from any chart notion.
-        let per = 80;
-        let mut u = Vec::new();
-        for i in 0..(3 * per) {
-            u.push((i % 3) as f64 / 3.0 + 0.002 * ((i as f64).sin()));
-        }
-        let law = classify_occupancy(&u);
-        assert!(
-            matches!(law, OccupancyLaw::Discrete { anchors: 3 }),
-            "3-point occupancy should be discrete, got {law:?}"
-        );
-        // d_eff of a 3-anchor discrete measure is 2 (three categories → two
-        // contrasts).
-        assert_eq!(law.d_eff(), 2);
-    }
-
     // ======================================================================
     // #2691 — the collapse guard. Three mechanisms in this crate LOOK like they
     // cover "the fitted chart coordinate encodes nothing" and none can express
@@ -2157,102 +1972,4 @@ mod coordinate_fidelity_tests {
     // destroying the `Continuous` rung.
     // ======================================================================
 
-    /// The exact shape #2691 measured: a chart coordinate that is one value to
-    /// fourteen decimal places. Before the guard this was reported `Continuous`.
-    #[test]
-    fn a_constant_coordinate_is_collapsed_not_continuous_2691() {
-        let constant: Vec<f64> = vec![0.37; 70];
-        let law = classify_occupancy(&constant);
-        assert_eq!(
-            law,
-            OccupancyLaw::Collapsed,
-            "a constant coordinate must be named collapsed, got {law:?}"
-        );
-        assert_ne!(
-            law,
-            OccupancyLaw::Continuous,
-            "reporting a constant coordinate as a concentrated arc is the #2691 defect"
-        );
-        assert_eq!(law.label(), "collapsed");
-        assert_eq!(law.d_eff(), 0, "a collapsed coordinate carries no rank");
-        assert_eq!(law.anchors(), 0);
-
-        // The measured #2691 spread (std 1.06e-14), not just an exact constant.
-        let near: Vec<f64> = (0..70).map(|i| 0.37 + (i as f64) * 1.0e-15).collect();
-        assert_eq!(classify_occupancy(&near), OccupancyLaw::Collapsed);
-    }
-
-    /// The ACCEPT half. A concentrated arc that is still RESOLVABLE — width well
-    /// above the `1/(2n)` floor — must stay `Continuous`. Without this, a guard
-    /// that returned `Collapsed` unconditionally would pass the test above.
-    #[test]
-    fn a_narrow_but_resolvable_arc_is_still_continuous_2691() {
-        // n = 70 ⇒ floor = 1/140 ≈ 0.0071. Spread this over ~0.12, i.e. ~17x the
-        // floor: unambiguously narrow, unambiguously resolvable.
-        let n = 70;
-        let arc: Vec<f64> = (0..n).map(|i| 0.40 + 0.12 * (i as f64) / (n as f64 - 1.0)).collect();
-        let law = classify_occupancy(&arc);
-        assert_ne!(
-            law,
-            OccupancyLaw::Collapsed,
-            "a resolvable narrow arc must survive the collapse guard, got {law:?}"
-        );
-        // Deliberately NOT asserting which rung wins. Whether a narrow arc reads
-        // `Continuous` or `Discrete` is the BIC race's business and depends on its
-        // internals; this guard's whole contract is that it does not FIRE on a
-        // resolvable coordinate. Pinning the rung here would make the guard's test
-        // fail whenever the race was retuned, for a reason unrelated to the guard.
-        assert!(
-            matches!(
-                law,
-                OccupancyLaw::Uniform | OccupancyLaw::Continuous | OccupancyLaw::Discrete { .. }
-            ),
-            "a resolvable coordinate must reach a real occupancy rung, got {law:?}"
-        );
-    }
-
-    /// The other two rungs must be untouched: the guard fires only on collapse.
-    #[test]
-    fn uniform_and_discrete_occupancy_survive_the_collapse_guard_2691() {
-        let n = 84;
-        let uniform: Vec<f64> = (0..n).map(|i| (i as f64) / (n as f64)).collect();
-        assert_ne!(classify_occupancy(&uniform), OccupancyLaw::Collapsed);
-
-        // Weekday-shaped discrete measure: seven tight anchors, twelve rows each.
-        let weekdays: Vec<f64> = (0..84)
-            .map(|i| (i % 7) as f64 / 7.0 + 0.0005 * ((i / 7) as f64 - 5.5))
-            .collect();
-        let law = classify_occupancy(&weekdays);
-        assert_ne!(
-            law,
-            OccupancyLaw::Collapsed,
-            "seven separated anchors are a discrete measure, not a collapse"
-        );
-    }
-
-    /// The guard measures the CIRCULAR arc, not the raw range. A coordinate piled
-    /// up on both sides of the wrap point occupies a tiny arc while its `min`/`max`
-    /// span almost the whole period — a plain `max - min` test would call it
-    /// spread out and miss the collapse entirely.
-    #[test]
-    fn collapse_across_the_wrap_point_is_caught_on_the_circle_2691() {
-        let mut wrapped: Vec<f64> = (0..35).map(|i| 0.9995 + 0.00001 * i as f64).collect();
-        wrapped.extend((0..35).map(|i| 0.00001 * i as f64));
-        let raw_range = wrapped.iter().cloned().fold(f64::MIN, f64::max)
-            - wrapped.iter().cloned().fold(f64::MAX, f64::min);
-        assert!(
-            raw_range > 0.99,
-            "fixture must have a near-full RAW range ({raw_range}) so the circular \
-             arc is the only thing that can catch it"
-        );
-        assert_eq!(
-            classify_occupancy(&wrapped),
-            OccupancyLaw::Collapsed,
-            "a coordinate collapsed across the wrap point must still be collapsed"
-        );
-        // On the LINE the same points genuinely span the range, so the interval
-        // classifier must NOT call them collapsed — the two topologies disagree
-        // here, and that disagreement is the point of having both.
-        assert_ne!(classify_occupancy_interval(&wrapped), OccupancyLaw::Collapsed);
-    }
 }

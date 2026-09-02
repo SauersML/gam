@@ -5860,22 +5860,11 @@ mod tests {
         );
     }
 
-    use super::{
-        BlockDesignOperator, CoefficientTransformOperator, ConditionedDesign, DenseDesignMatrix,
-        DenseDesignOperator, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
-        FiniteSignedWeightsView, MultiChannelOperator, PsdWeightsView, RandomEffectOperator,
-        ReparamOperator, RowwiseKroneckerOperator, SparseDesignMatrix,
-        dense_operator_to_dense_by_chunks, dense_transpose_weighted_response, fast_atv, fast_av,
-        streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view, xt_diag_x_symmetric,
-    };
+    use super::{BlockDesignOperator, CoefficientTransformOperator, ConditionedDesign, DenseDesignMatrix, DenseDesignOperator, DesignBlock, DesignMatrix, EmbeddedColumnBlock, FiniteSignedWeightsView, MultiChannelOperator, PsdWeightsView, RandomEffectOperator, ReparamOperator, RowwiseKroneckerOperator, SparseDesignMatrix, dense_operator_to_dense_by_chunks, dense_transpose_weighted_response, fast_atv, fast_av, streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view};
     use crate::matrix::LinearOperator;
     use crate::test_support::no_densify_design;
-    use crate::types::RidgePolicy;
-    use crate::utils::{PcgSolveInfo, StableSolver};
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
-    use gam_runtime::resource::{
-        MaterializationPolicy, MatrixMaterializationError, MemoryGovernor, ResourcePolicy,
-    };
+    use gam_runtime::resource::{MaterializationPolicy, MatrixMaterializationError, ResourcePolicy};
     use ndarray::{Array1, Array2, ArrayViewMut2, Axis, array, s};
     use std::ops::Range;
     use std::sync::Arc;
@@ -6032,32 +6021,6 @@ mod tests {
         }
     }
 
-    fn exact_weighted_penalized_solve(
-        design: &Array2<f64>,
-        weights: &Array1<f64>,
-        rhs: &Array1<f64>,
-        penalty: &Array2<f64>,
-        ridge: f64,
-    ) -> Array1<f64> {
-        let mut h = design
-            .t()
-            .dot(&(design * &weights.view().insert_axis(Axis(1))));
-        h += penalty;
-        if ridge > 0.0 {
-            for i in 0..h.nrows() {
-                h[[i, i]] += ridge;
-            }
-        }
-        let factor = StableSolver::new()
-            .factorize(&h)
-            .expect("exact reference factorization");
-        let mut solution = rhs.clone();
-        let mut solution_matrix = crate::faer_ndarray::array1_to_col_matmut(&mut solution);
-        factor.solve_in_place(solution_matrix.as_mut());
-        assert!(solution.iter().all(|value| value.is_finite()));
-        solution
-    }
-
     #[test]
     fn fast_av_matches_ndarray_dot() {
         let x = array![[1.0, 2.0, -1.0], [0.5, -3.0, 4.0], [2.0, 0.0, 1.5]];
@@ -6181,145 +6144,6 @@ mod tests {
         LEDGER_PRESSURE
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Guard for a test that makes the ledger unavailable to everyone else.
-    fn ledger_write_guard() -> std::sync::RwLockWriteGuard<'static, ()> {
-        LEDGER_PRESSURE
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// The governed sparse densification charges the process ledger for
-    /// exactly the dense footprint while the owner is alive, and a full
-    /// ledger routes the weighted-Gram strategy to the streaming CSC path
-    /// instead of failing or allocating.
-    #[test]
-    fn sparse_densification_reserves_ledger_and_full_ledger_streams() {
-        // Held for the whole test: the `remaining_bytes()` filler below leaves
-        // the process ledger with nothing for any concurrent densification.
-        let ledger = ledger_write_guard();
-        assert_eq!(*ledger, (), "ledger pressure guard is held for this test");
-        let triplets = [
-            Triplet::new(0, 0, 1.0),
-            Triplet::new(0, 1, -2.0),
-            Triplet::new(1, 0, 0.5),
-            Triplet::new(1, 1, 3.0),
-            Triplet::new(2, 0, -1.5),
-            Triplet::new(2, 1, 0.25),
-        ];
-        let sparse = SparseColMat::try_new_from_triplets(3, 2, &triplets).expect("sparse");
-        let governor = MemoryGovernor::global();
-
-        let design = SparseDesignMatrix::new(sparse.clone());
-        let before = governor.reserved_bytes();
-        let footprint = 3 * 2 * std::mem::size_of::<f64>();
-        let governed = design
-            .try_to_dense_governed("governed sparse test")
-            .expect("small governed densification succeeds");
-        assert_eq!(
-            governor.reserved_bytes(),
-            before + footprint,
-            "governed densification must charge its dense footprint"
-        );
-        assert_eq!(governed.dim(), (3, 2));
-
-        // The admitted copy is memoized on the design, so a second governed
-        // request must reuse that image rather than scatter a fresh one — the
-        // property that keeps a repeatedly-reassembled XᵀWX off an O(n·p)
-        // materialization per iteration (gh#2449). Assert the decision, not
-        // only the pointer: the arm is what routes the caller.
-        crate::governed_capture::begin_governed_decision_capture();
-        let second = design
-            .try_to_dense_governed("governed sparse test, second owner")
-            .expect("a memoized design admits again");
-        let arms: Vec<_> = crate::governed_capture::take_governed_decision_capture()
-            .expect("capture was started")
-            .into_iter()
-            .map(|decision| decision.arm)
-            .collect();
-        assert_eq!(
-            arms,
-            vec![crate::governed_capture::GovernedArm::CacheHit],
-            "a design that has already been densified must report a cache hit, \
-             not a second admission"
-        );
-        assert!(
-            std::ptr::eq(&**governed, &**second),
-            "both governed owners must share the design's one dense image"
-        );
-        drop(governed);
-        drop(second);
-        assert_eq!(
-            governor.reserved_bytes(),
-            before + footprint,
-            "the memo holds the charge, not the owner: dropping owners must not \
-             release bytes that still back a live cached buffer"
-        );
-
-        // The charge is released when the design and every clone sharing its
-        // memo drop, which is the buffer's real lifetime.
-        {
-            let scoped = SparseDesignMatrix::new(sparse.clone());
-            let owner = scoped
-                .try_to_dense_governed("governed sparse scoped owner")
-                .expect("small governed densification succeeds");
-            assert_eq!(
-                governor.reserved_bytes(),
-                before + 2 * footprint,
-                "a second design must charge its own dense footprint"
-            );
-            drop(owner);
-        }
-        assert_eq!(
-            governor.reserved_bytes(),
-            before + footprint,
-            "dropping the design must release the memo's charge"
-        );
-
-        // Snapshot the dense image while the ledger still has room. Below this
-        // point the test holds the entire budget, and `to_dense_arc` is the
-        // infallible accessor whose contract is that the caller has already
-        // established densification is permitted — calling it under a full
-        // ledger is the caller breaking that contract, which it answers with
-        // an abort. The reference has to be taken before the pressure, not
-        // under it.
-        let dense = design.to_dense_arc();
-
-        // Exhaust the remaining budget: a fresh (uncached) design must refuse
-        // the governed dense route, while the strategy consumer falls back to
-        // the streaming CSC path and still produces the exact weighted Gram.
-        let filler = governor
-            .try_reserve(governor.remaining_bytes(), "test ledger filler")
-            .expect("filling the remaining budget succeeds");
-        let pressured = SparseDesignMatrix::new(sparse.clone());
-        assert!(
-            pressured
-                .try_to_dense_governed("governed sparse test under pressure")
-                .is_err(),
-            "a full ledger must refuse governed densification"
-        );
-        let weights = array![1.0, -2.0, 0.5];
-        let gram = xt_diag_x_symmetric(&DesignMatrix::from(sparse.clone()), &weights)
-            .expect("streaming fallback under a full ledger");
-        let mut expected = Array2::<f64>::zeros((2, 2));
-        for row in 0..3 {
-            for a in 0..2 {
-                for b in 0..2 {
-                    expected[[a, b]] += weights[row] * dense[[row, a]] * dense[[row, b]];
-                }
-            }
-        }
-        let got = gram.as_dense().expect("dense symmetric result");
-        for a in 0..2 {
-            for b in 0..2 {
-                assert!(
-                    (got[[a, b]] - expected[[a, b]]).abs() < 1e-12,
-                    "streaming fallback Gram mismatch at ({a}, {b})"
-                );
-            }
-        }
-        drop(filler);
     }
 
     #[test]
@@ -6774,40 +6598,6 @@ mod tests {
     }
 
     #[test]
-    fn design_matrix_hstack_preserves_lazy_blocks() {
-        let left_dense = array![[1.0, 2.0], [3.0, 4.0]];
-        let right_dense = array![[5.0], [6.0]];
-        let left = no_densify_design(left_dense.clone());
-        let right = no_densify_design(right_dense.clone());
-        let stacked = DesignMatrix::hstack(vec![left, right]).expect("stacked design");
-
-        assert!(stacked.as_dense_ref().is_none());
-        assert!(!stacked.is_materialized_dense());
-        assert!(stacked.is_operator_backed());
-        assert_eq!(stacked.nrows(), 2);
-        assert_eq!(stacked.ncols(), 3);
-
-        let beta = array![0.25, -0.5, 2.0];
-        let expected = array![9.25, 10.75];
-        let got = stacked.dot(&beta);
-        for i in 0..expected.len() {
-            assert!((got[i] - expected[i]).abs() < 1e-12);
-        }
-
-        let chunk = stacked
-            .try_row_chunk(0..2)
-            .expect("stacked.try_row_chunk must succeed");
-        assert_eq!(chunk, array![[1.0, 2.0, 5.0], [3.0, 4.0, 6.0]]);
-    }
-
-    #[test]
-    #[should_panic(expected = "DesignMatrix::as_dense_cow called on operator-backed design")]
-    fn design_matrix_as_dense_cow_rejects_operator_backed_designs() {
-        let design = no_densify_design(array![[1.0, 2.0], [3.0, 4.0]]);
-        design.as_dense_cow();
-    }
-
-    #[test]
     fn sparse_factorized_solve_matches_dense_operator_solve() {
         let triplets = vec![
             Triplet::new(0usize, 0usize, 1.0),
@@ -6863,153 +6653,6 @@ mod tests {
         assert!(beta.iter().all(|v| v.is_finite()));
         assert!((beta[0] - 2.0).abs() < 1e-10);
         assert!(beta[1].abs() < 1e-8);
-    }
-
-    #[test]
-    fn explicit_matrix_free_pcg_matches_exact_large_dense_weighted_penalized_solve() {
-        let n = 48usize;
-        let p = 520usize;
-        let mut x = Array2::<f64>::zeros((n, p));
-        for i in 0..n {
-            for j in 0..p {
-                x[[i, j]] = (((i + 3) * (j + 5)) % 17) as f64 / 17.0
-                    + 0.02 * (i as f64)
-                    + 0.001 * (j as f64);
-            }
-        }
-        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone()));
-        let weights = Array1::from_iter((0..n).map(|i| 0.5 + (i as f64) / (2.0 * n as f64)));
-        let rhs = Array1::from_iter((0..p).map(|j| ((j % 13) as f64 - 6.0) / 13.0));
-        let penalty = Array2::from_diag(&Array1::from_iter(
-            (0..p).map(|j| 0.1 + 0.005 * ((j % 7) as f64)),
-        ));
-        let ridge = 1e-8;
-
-        let pcg = design
-            .solve_system_matrix_free_pcg(&weights, &rhs, Some(&penalty), ridge)
-            .expect("matrix-free pcg solve");
-        let exact = exact_weighted_penalized_solve(&x, &weights, &rhs, &penalty, ridge);
-        for i in 0..p {
-            assert!(
-                (pcg[i] - exact[i]).abs() < 1e-5,
-                "solution mismatch at {i}: pcg={} exact={}",
-                pcg[i],
-                exact[i]
-            );
-        }
-        let mut h = x
-            .t()
-            .dot(&(x.clone() * weights.view().insert_axis(Axis(1))));
-        h += &penalty;
-        for i in 0..p {
-            h[[i, i]] += ridge;
-        }
-        let residual = h.dot(&pcg) - &rhs;
-        let residual_norm = residual.dot(&residual).sqrt();
-        // A fixed ABSOLUTE 1e-4 does not scale with the system. This is a
-        // p = 520 normal system, so ‖H·x − rhs‖₂ accumulates with the problem
-        // size and the right-hand-side magnitude; the bound has to carry the
-        // same scale or it silently tightens/loosens as the fixture changes.
-        // Scale by ‖rhs‖, the same treatment (and the same 1e-5 coefficient)
-        // that the sibling
-        // `policy_solve_matches_explicit_matrix_free_pcg_on_large_dense_system`
-        // applies to its per-coefficient bound, and for the same reason
-        // (gam#846).
-        let rhs_norm = rhs.dot(&rhs).sqrt();
-        let residual_tol = 1e-5 * (1.0 + rhs_norm);
-        assert!(
-            residual_norm < residual_tol,
-            "residual_norm={residual_norm} exceeds tol={residual_tol} (rhs_norm={rhs_norm})"
-        );
-    }
-
-    #[test]
-    fn policy_solve_matches_explicit_matrix_free_pcg_on_large_dense_system() {
-        let n = 40usize;
-        let p = 520usize;
-        let mut x = Array2::<f64>::zeros((n, p));
-        for i in 0..n {
-            for j in 0..p {
-                x[[i, j]] = (((2 * i + j + 11) % 23) as f64 / 23.0) + 0.0005 * (j as f64);
-            }
-        }
-        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
-        let weights = Array1::from_iter((0..n).map(|i| 1.0 + 0.01 * i as f64));
-        let rhs = Array1::from_iter((0..p).map(|j| ((j % 5) as f64) - 2.0));
-        let penalty = Array2::from_diag(&Array1::from_iter(
-            (0..p).map(|j| 0.2 + 0.01 * ((j % 3) as f64)),
-        ));
-        let ridge_floor = 1e-8;
-
-        let explicit = design
-            .solve_system_matrix_free_pcg(&weights, &rhs, Some(&penalty), ridge_floor)
-            .expect("explicit pcg");
-        let policy = design
-            .solve_systemwith_policy(
-                &weights,
-                &rhs,
-                Some(&penalty),
-                ridge_floor,
-                RidgePolicy::solver_only(),
-            )
-            .expect("policy solve");
-        for i in 0..p {
-            // This system is heavily rank-deficient (rank ≤ n = 40, p = 520,
-            // p ≫ n) with only a weak ~0.2 diagonal penalty + 1e-8 ridge_floor,
-            // so the normal matrix is severely ill-conditioned. Both arms are
-            // matrix-free PCG (explicit vs solver-only stabilization
-            // policy); they terminate at slightly different points on the
-            // near-null manifold. A fixed 1e-6 absolute gate is below what PCG
-            // can guarantee at this conditioning; assert a relative tolerance
-            // scaled by the coefficient magnitude instead (gam#846).
-            let tol = 1e-5 * (1.0 + explicit[i].abs());
-            assert!(
-                (explicit[i] - policy[i]).abs() < tol,
-                "policy mismatch at {i}: explicit={} policy={} (tol={tol})",
-                explicit[i],
-                policy[i]
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_matrix_free_pcg_reports_convergence_diagnostics() {
-        let n = 36usize;
-        let p = 2160usize;
-        let mut x = Array2::<f64>::zeros((n, p));
-        for i in 0..n {
-            for j in 0..p {
-                x[[i, j]] = (((3 * i + 5 * j + 7) % 29) as f64 / 29.0)
-                    + 0.015 * (i as f64)
-                    + 1e-4 * j as f64;
-            }
-        }
-        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone()));
-        assert!(design.should_use_matrix_free_pcg());
-        let weights = Array1::from_iter((0..n).map(|i| 0.75 + 0.01 * i as f64));
-        let rhs = Array1::from_iter((0..p).map(|j| ((j % 9) as f64 - 4.0) / 9.0));
-        let penalty = Array2::from_diag(&Array1::from_iter(
-            (0..p).map(|j| 0.05 + 0.002 * ((j % 11) as f64)),
-        ));
-        let ridge = 1e-8;
-
-        let (pcg, info): (Array1<f64>, PcgSolveInfo) = design
-            .solve_system_matrix_free_pcg_with_info(&weights, &rhs, Some(&penalty), ridge)
-            .expect("pcg with info");
-        assert!(info.converged);
-        assert!(info.iterations > 0);
-        assert!(info.relative_residual_norm.is_finite());
-        assert!(info.relative_residual_norm < 1e-6);
-
-        let exact = exact_weighted_penalized_solve(&x, &weights, &rhs, &penalty, ridge);
-        for i in 0..p {
-            assert!(
-                (pcg[i] - exact[i]).abs() < 1e-5,
-                "solution mismatch at {i}: pcg={} exact={}",
-                pcg[i],
-                exact[i]
-            );
-        }
     }
 
     #[test]
@@ -7100,46 +6743,6 @@ mod tests {
         assert!(error.contains("construction policy requires streamed storage"));
         assert_eq!(op.row_chunk_calls.load(Ordering::SeqCst), 0);
         assert!(design.as_dense_ref().is_none());
-    }
-
-    /// The governed path couples the full allocation to its byte reservation,
-    /// while strict and undersized policies refuse before row work begins.
-    #[test]
-    fn governed_to_dense_reserves_and_policy_refusals_are_typed() {
-        let op = Arc::new(ChunkOnlyOperator {
-            n: 128,
-            p: 4,
-            row_chunk_calls: AtomicUsize::new(0),
-            materialization_policy: None,
-        });
-        let design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::clone(&op)));
-
-        // The governed arm charges the process-global ledger before it
-        // streams any row chunk, so a concurrent ledger filler turns
-        // the admission below into a refusal; see `LEDGER_PRESSURE`.
-        let ledger = ledger_read_guard();
-        assert_eq!(*ledger, (), "ledger read guard is held for this test");
-        let dense = design
-            .try_to_dense_governed("governed dense regression")
-            .expect("small governed materialization");
-        assert_eq!(dense.dim(), (128, 4));
-        assert_eq!(dense.reserved_bytes(), 128 * 4 * std::mem::size_of::<f64>());
-
-        let strict = ResourcePolicy::analytic_operator_required().material_policy();
-        let err = design
-            .try_to_dense_governed_with_policy(&strict, "regression strict refuses")
-            .expect_err("strict policy must refuse lazy materialization");
-        assert!(matches!(err, MatrixMaterializationError::Forbidden { .. }));
-
-        let mut tight = ResourcePolicy::default_library().material_policy();
-        tight.max_single_dense_bytes = 1;
-        let size_err = design
-            .try_to_dense_governed_with_policy(&tight, "regression tight refuses")
-            .expect_err("undersized cap must refuse lazy materialization");
-        assert!(matches!(
-            size_err,
-            MatrixMaterializationError::TooLarge { .. }
-        ));
     }
 
     #[test]

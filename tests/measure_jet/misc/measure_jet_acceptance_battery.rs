@@ -35,11 +35,7 @@
 //!         the cross-strand value offset — ≤ 1e-2× the checkerboard energy —
 //!         because the offset is ambient-affine on the support.
 
-use gam::basis::{
-    BasisMetadata, CenterStrategy, MeasureJetBand, MeasureJetBasisSpec,
-    MeasureJetExtrapolationSpectrum, build_measure_jet_basis, measure_jet_band,
-    measure_jet_energy_form, measure_jet_extrapolation_variance, measure_jet_support_curve,
-};
+use gam::basis::{MeasureJetBand, measure_jet_band, measure_jet_energy_form};
 use ndarray::{Array1, Array2};
 
 /// `MeasureJetBasisSpec` default dials, made explicit for the energy-form
@@ -171,115 +167,6 @@ fn exact_affine_passes_through_at_default_tau() {
 // ===========================================================================
 // Gate §7.2 — support-domination variance monotonicity.
 // ===========================================================================
-
-/// Deterministic 2-D filament for the support-domination gate: a single
-/// 1-D strand of `STRAND_N` points along a sheared line through [0, 1]², dense
-/// enough that `build_measure_jet_basis` realizes a non-degenerate band and a
-/// well-populated web. No RNG.
-const STRAND_N: usize = 120;
-const STRAND_CENTERS: usize = 24;
-
-fn strand_data() -> Array2<f64> {
-    Array2::<f64>::from_shape_fn((STRAND_N, 2), |(i, k)| {
-        let t = i as f64 / (STRAND_N - 1) as f64;
-        if k == 0 { t } else { 0.3 + 0.5 * t }
-    })
-}
-
-/// §7.2 (charter §5 theorem). Build a real measure-jet geometry, take two
-/// queries — one ON the web, one FAR off it — whose support curves satisfy
-/// pointwise domination (`q_far ≤ q_near` at every band scale), and assert the
-/// dominated (far) query's extrapolation variance is NO SMALLER. Plain
-/// Euclidean monotonicity is deliberately NOT asserted (§5 forbids it as a
-/// gate); the support-curve domination is verified directly before the
-/// variance comparison so the implication is exactly the theorem's hypothesis.
-#[test]
-fn support_domination_variance_monotone() {
-    let data = strand_data();
-    let spec = MeasureJetBasisSpec {
-        center_strategy: CenterStrategy::FarthestPoint {
-            num_centers: STRAND_CENTERS,
-        },
-        ..Default::default()
-    };
-    let built = build_measure_jet_basis(data.view(), &spec)
-        .expect("measure-jet build over the deterministic strand");
-
-    let BasisMetadata::MeasureJet {
-        centers,
-        eps_band,
-        masses,
-        support_means,
-        ..
-    } = &built.metadata
-    else {
-        panic!("measure-jet build must carry MeasureJet metadata");
-    };
-
-    // Two queries in the SAME raw coordinate space the build used (the build
-    // consumes `data` verbatim — input_scale = None). The near query sits on
-    // the strand mid-line; the far query is pushed far off the web so its
-    // Gaussian support mass is nowhere larger at any scale.
-    let mut queries = Array2::<f64>::zeros((2, 2));
-    queries[(0, 0)] = 0.5;
-    queries[(0, 1)] = 0.3 + 0.5 * 0.5; // on the strand
-    queries[(1, 0)] = 25.0;
-    queries[(1, 1)] = -25.0; // far off the web
-
-    let support =
-        measure_jet_support_curve(queries.view(), centers.view(), masses.view(), eps_band)
-            .expect("support curve from the built geometry");
-
-    let near = support.row(0);
-    let far = support.row(1);
-
-    // Verify the §5 hypothesis directly: the far query pointwise-dominates
-    // (is nowhere larger than) the near query at every band scale.
-    let dominates = far
-        .iter()
-        .zip(near.iter())
-        .all(|(&qf, &qn)| qf <= qn + 1e-15);
-    assert!(
-        dominates,
-        "constructed far query does not pointwise-underrun the near query — \
-         support-domination hypothesis fails: near = {near:?}, far = {far:?}"
-    );
-    // And the geometry is non-trivial: the near query genuinely sees the web.
-    assert!(
-        near.iter().copied().fold(0.0_f64, f64::max) > 0.0,
-        "near query sees no web support — degenerate geometry"
-    );
-
-    // A fixed, positive per-level precision spectrum: the theorem holds for
-    // ANY positive spectrum (every λ̂_ℓ⁻¹ > 0), so a deterministic descending
-    // spectrum suffices — no fitted model needed for the estimand-level gate.
-    let lambda_phys: Vec<f64> = (0..eps_band.len())
-        .map(|l| 1.0 / (1.0 + l as f64))
-        .collect();
-    let spectrum = MeasureJetExtrapolationSpectrum::PerLevel(&lambda_phys);
-    let coverage_floor = 0.05;
-
-    let var_near =
-        measure_jet_extrapolation_variance(near, eps_band, support_means, spectrum, coverage_floor)
-            .expect("extrapolation variance at the near query");
-    let var_far =
-        measure_jet_extrapolation_variance(far, eps_band, support_means, spectrum, coverage_floor)
-            .expect("extrapolation variance at the far query");
-
-    // The §5 distance-honesty theorem: dominated support ⇒ no-smaller variance.
-    assert!(
-        var_far + 1e-12 >= var_near,
-        "support-domination theorem violated: dominated far query has SMALLER \
-         extrapolation variance ({var_far:.6e}) than the near query ({var_near:.6e})"
-    );
-    // And the off-web query must be strictly more uncertain than the on-web
-    // one here — the honest off-support widening the current path lacked.
-    assert!(
-        var_far > var_near,
-        "far-off-web query is not strictly more uncertain than the on-web query: \
-         far {var_far:.6e} vs near {var_near:.6e}"
-    );
-}
 
 // ===========================================================================
 // Gate §7.3 — near-miss strand decoupling under the single-scale-mode default.

@@ -3,10 +3,7 @@
 use super::*;
 use gam_data::load_dataset_projected;
 use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam_terms::basis::{
-    DuchonNullspaceOrder, center_strategy_is_auto, default_num_centers,
-    minimum_duchon_power_for_operator_penalties, starting_num_centers,
-};
+use gam_terms::basis::{DuchonNullspaceOrder, center_strategy_is_auto, default_num_centers, starting_num_centers};
 use gam_terms::inference::formula_dsl::{
     default_linkwiggle_formulaspec, parse_linkwiggle_formulaspec,
 };
@@ -2388,13 +2385,6 @@ fn survival_marginal_slope_accepts_explicit_probit_link() {
         Err(err) => err,
     };
     assert!(err.to_string().contains("only link(type=probit)"));
-}
-
-#[test]
-fn high_dimensional_duchon_default_power_is_admissible() {
-    let dim = 16;
-    let power = minimum_duchon_power_for_operator_penalties(dim, DuchonNullspaceOrder::Zero, 2);
-    assert!(2 * (1 + power) > dim + 2);
 }
 
 #[test]

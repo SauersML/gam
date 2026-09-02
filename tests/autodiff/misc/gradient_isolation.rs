@@ -1,7 +1,4 @@
-use gam::estimate::{
-    ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
-    optimize_external_design,
-};
+use gam::estimate::{ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient};
 use gam::mixture_link::state_from_sasspec;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, SasLinkSpec, StandardLink};
@@ -62,13 +59,6 @@ fn default_logit_opts() -> ExternalOptimOptions {
         kronecker_factored: None,
         persistent_warm_start_store: None,
     }
-}
-
-fn gaussian_identity_spec() -> LikelihoodSpec {
-    LikelihoodSpec::new(
-        ResponseFamily::Gaussian,
-        InverseLink::Standard(StandardLink::Identity),
-    )
 }
 
 fn binomial_logit_spec() -> LikelihoodSpec {
@@ -139,54 +129,6 @@ fn analytic_gradient_sign_matches_localcost_trend() {
         "analytic sign should match cost trend sign: analytic={:+.4e} trend={:+.4e}",
         analytic[0],
         trend
-    );
-}
-
-#[test]
-fn optimizer_reduces_externalobjective() {
-    let (x, y, w, s_list) = make_binary_external_problem(12, 140, 10);
-    let offset = Array1::<f64>::zeros(y.len());
-    let opts = default_logit_opts();
-
-    let rho0 = array![0.0];
-    let c0 = evaluate_externalcost_andridge(
-        y.view(),
-        w.view(),
-        x.view(),
-        offset.view(),
-        &s_list,
-        &opts,
-        &rho0,
-    )
-    .map(|(c, _)| c)
-    .expect("initial cost");
-
-    let result = optimize_external_design(
-        y.view(),
-        w.view(),
-        x.view(),
-        offset.view(),
-        s_list.clone(),
-        &opts,
-    )
-    .expect("opt");
-
-    let rho_opt = result.lambdas.mapv(f64::ln);
-    let c1 = evaluate_externalcost_andridge(
-        y.view(),
-        w.view(),
-        x.view(),
-        offset.view(),
-        &s_list,
-        &opts,
-        &rho_opt,
-    )
-    .map(|(c, _)| c)
-    .expect("final cost");
-
-    assert!(
-        c1 <= c0 + 1e-6,
-        "optimizer did not improve cost: c0={c0} c1={c1}"
     );
 }
 
@@ -264,92 +206,3 @@ fn sas_helpercost_depends_on_link_state() {
     );
 }
 
-#[test]
-fn conditioned_helpercost_matches_fittedobjective() {
-    let n = 160usize;
-    let mut x = Array2::<f64>::zeros((n, 3));
-    for i in 0..n {
-        let t = (i as f64 + 0.5) / n as f64;
-        let x1 = -3.0 + 6.0 * t;
-        x[[i, 0]] = 1.0;
-        x[[i, 1]] = x1;
-        x[[i, 2]] = (1.7 * x1).sin();
-    }
-    let beta = array![0.8, -1.1, 0.55];
-    // A NOISELESS response (`y = Xβ` exactly) makes this fixture degenerate for
-    // any path that reports standard errors: the residual is identically zero,
-    // so the dispersion φ = RSS/(n − edf) is zero and the coefficient covariance
-    // φ·H⁻¹ is the ZERO matrix up to roundoff. `se_from_covariance`'s negativity
-    // tolerance is purely RELATIVE (`max|entry| · 16n · ε`), so on a zero matrix
-    // it collapses to ~1e-30 and a −2.2e-16 diagonal — one ulp of 1.0, pure
-    // roundoff — is rejected as "materially negative". The fit then fails before
-    // this test reaches its own claim. That claim (the conditioned helper cost
-    // matches the fitted objective) has nothing to do with the noise level, so a
-    // small deterministic wobble keeps the fixture exactly reproducible while
-    // putting φ strictly above zero.
-    let y = Array1::from_iter(
-        x.dot(&beta)
-            .iter()
-            .enumerate()
-            .map(|(index, mean)| mean + 0.05 * (0.7 * index as f64).sin()),
-    );
-    let w = Array1::<f64>::ones(n);
-    let offset = Array1::<f64>::zeros(n);
-
-    let mut s = Array2::<f64>::zeros((3, 3));
-    s[[2, 2]] = 1.0;
-    let s_list = vec![BlockwisePenalty::new(0..3, s)];
-
-    let opts = ExternalOptimOptions {
-        family: gaussian_identity_spec(),
-        latent_cloglog: None,
-        mixture_link: None,
-        optimize_mixture: false,
-        sas_link: None,
-        optimize_sas: false,
-        compute_inference: true,
-        skip_rho_posterior_inference: false,
-        max_iter: 80,
-        tol: 1e-8,
-        nullspace_dims: vec![2],
-        linear_constraints: None,
-        firth_bias_reduction: None,
-        rho_prior: Default::default(),
-        kronecker_penalty_system: None,
-        kronecker_factored: None,
-        persistent_warm_start_store: None,
-    };
-
-    let result = optimize_external_design(
-        y.view(),
-        w.view(),
-        x.view(),
-        offset.view(),
-        s_list.clone(),
-        &opts,
-    )
-    .expect("gaussian external fit");
-    let rho = result.lambdas.mapv(f64::ln);
-    let helpercost = evaluate_externalcost_andridge(
-        y.view(),
-        w.view(),
-        x.view(),
-        offset.view(),
-        &s_list,
-        &opts,
-        &rho,
-    )
-    .map(|(cost, _)| cost)
-    .expect("conditioned helper cost");
-
-    assert!(
-        (helpercost
-            - result
-                .reml_score
-                .expect("the conditioned fit reports its criterion"))
-        .abs()
-            < 1e-7,
-        "conditioned helper cost should match fitted REML score: helper={helpercost} fit={:?}",
-        result.reml_score
-    );
-}

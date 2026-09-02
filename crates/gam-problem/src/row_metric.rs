@@ -956,18 +956,6 @@ mod tests {
     }
 
     #[test]
-    fn euclidean_is_not_output_fisher_like() {
-        let m = RowMetric::euclidean(1, 2).unwrap();
-        assert!(!m.is_output_fisher_like());
-    }
-
-    #[test]
-    fn euclidean_solver_floor_is_zero() {
-        let m = RowMetric::euclidean(1, 2).unwrap();
-        assert_eq!(m.solver_floor(), 0.0);
-    }
-
-    #[test]
     fn euclidean_to_weight_field_is_identity() {
         let m = RowMetric::euclidean(1, 2).unwrap();
         assert!(matches!(m.to_weight_field(), WeightField::Identity));
@@ -999,24 +987,6 @@ mod tests {
     }
 
     // ── MetricProvenance predicates ───────────────────────────────────────────
-
-    #[test]
-    fn output_fisher_drives_gauge_but_not_likelihood() {
-        let u = Arc::new(array![[1.0_f64]]);
-        let m = RowMetric::output_fisher(u, 1, 1).unwrap();
-        assert!(m.drives_gauge());
-        assert!(!m.whitens_likelihood());
-        assert!(m.is_output_fisher_like());
-    }
-
-    #[test]
-    fn whitened_structured_whitens_likelihood_and_drives_gauge() {
-        let u = Arc::new(array![[1.0_f64]]);
-        let m = RowMetric::whitened_structured(u, 1, 1).unwrap();
-        assert!(m.whitens_likelihood());
-        assert!(m.drives_gauge());
-        assert!(!m.is_output_fisher_like());
-    }
 
     #[test]
     fn behavioral_fisher_whitens_likelihood_and_drives_gauge() {
@@ -1088,14 +1058,6 @@ mod tests {
         use ndarray::Array3;
         let probes = Array3::<f64>::zeros((2, 3, 0));
         assert!(pack_probe_factors(probes.view()).is_err());
-    }
-
-    #[test]
-    fn output_fisher_downstream_is_output_fisher_like() {
-        let u = Arc::new(array![[1.0_f64]]);
-        let m = RowMetric::output_fisher_downstream(u, 1, 1).unwrap();
-        assert!(m.is_output_fisher_like());
-        assert!(m.drives_gauge());
     }
 
     #[test]

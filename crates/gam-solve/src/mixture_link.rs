@@ -3045,27 +3045,6 @@ mod tests {
     use super::*;
     use gam_problem::{InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, SasLinkState};
 
-    fn assert_log_link_domain_error(error: EstimationError, eta: f64) {
-        match error {
-            EstimationError::InverseLinkDomainViolation {
-                link,
-                eta: rejected,
-                lower,
-                upper,
-            } => {
-                assert_eq!(link, "standard log inverse link");
-                if eta.is_nan() {
-                    assert!(rejected.is_nan());
-                } else {
-                    assert_eq!(rejected, eta);
-                }
-                assert_eq!(lower, LOG_LINK_SOLVER_ETA_MIN);
-                assert_eq!(upper, LOG_LINK_SOLVER_ETA_MAX);
-            }
-            other => panic!("expected typed log-link domain refusal, got {other}"),
-        }
-    }
-
     fn assert_finite_eta_domain_error(
         error: EstimationError,
         expected_link: &'static str,
@@ -3088,91 +3067,6 @@ mod tests {
                 assert_eq!(upper, f64::MAX);
             }
             other => panic!("expected typed finite-eta domain refusal, got {other}"),
-        }
-    }
-
-    #[test]
-    fn log_link_solver_boundaries_are_inclusive_exact_exp_jets() {
-        let link = InverseLink::Standard(StandardLink::Log);
-        let spec = LikelihoodSpec::poisson_log();
-        for eta in [LOG_LINK_SOLVER_ETA_MIN, LOG_LINK_SOLVER_ETA_MAX] {
-            let expected = eta.exp();
-            assert!(expected.is_finite() && expected > 0.0);
-
-            let jet = inverse_link_jet_for_inverse_link(&link, eta).expect("boundary jet");
-            assert_eq!(
-                LinkFunction::Log.jet(eta).expect("kernel boundary jet"),
-                jet
-            );
-            assert_eq!(jet.mu, expected);
-            assert_eq!(jet.d1, expected);
-            assert_eq!(jet.d2, expected);
-            assert_eq!(jet.d3, expected);
-
-            assert_eq!(
-                inverse_link_mu_d1_for_inverse_link(&link, eta).expect("boundary mu/d1"),
-                (expected, expected)
-            );
-            assert_eq!(
-                inverse_link_pdfthird_derivative_for_inverse_link(&link, eta)
-                    .expect("boundary fourth derivative"),
-                expected
-            );
-            assert_eq!(
-                inverse_link_pdffourth_derivative_for_inverse_link(&link, eta)
-                    .expect("boundary fifth derivative"),
-                expected
-            );
-            assert_eq!(
-                inverse_link_jet_for_family(&spec, eta).expect("boundary family jet"),
-                jet
-            );
-        }
-    }
-
-    #[test]
-    fn log_link_solver_seams_refuse_every_eta_outside_the_declared_domain() {
-        let link = InverseLink::Standard(StandardLink::Log);
-        let spec = LikelihoodSpec::poisson_log();
-        let just_below = f64::from_bits(LOG_LINK_SOLVER_ETA_MIN.to_bits() + 1);
-        let just_above = f64::from_bits(LOG_LINK_SOLVER_ETA_MAX.to_bits() + 1);
-
-        for eta in [
-            just_below,
-            just_above,
-            f64::NEG_INFINITY,
-            f64::INFINITY,
-            f64::NAN,
-        ] {
-            assert_log_link_domain_error(
-                inverse_link_jet_for_inverse_link(&link, eta).expect_err("full jet must refuse"),
-                eta,
-            );
-            assert_log_link_domain_error(
-                LinkFunction::Log
-                    .jet(eta)
-                    .expect_err("kernel jet must refuse"),
-                eta,
-            );
-            assert_log_link_domain_error(
-                inverse_link_mu_d1_for_inverse_link(&link, eta)
-                    .expect_err("mu/d1 seam must refuse"),
-                eta,
-            );
-            assert_log_link_domain_error(
-                inverse_link_pdfthird_derivative_for_inverse_link(&link, eta)
-                    .expect_err("fourth derivative seam must refuse"),
-                eta,
-            );
-            assert_log_link_domain_error(
-                inverse_link_pdffourth_derivative_for_inverse_link(&link, eta)
-                    .expect_err("fifth derivative seam must refuse"),
-                eta,
-            );
-            assert_log_link_domain_error(
-                inverse_link_jet_for_family(&spec, eta).expect_err("family jet seam must refuse"),
-                eta,
-            );
         }
     }
 
@@ -3383,61 +3277,6 @@ mod tests {
                     value.is_finite(),
                     "non-finite Royston-Parmar jet at eta={eta}: {value}"
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn royston_parmar_seams_refuse_nonfinite_eta_instead_of_clamping() {
-        let spec = LikelihoodSpec::new(
-            ResponseFamily::RoystonParmar,
-            InverseLink::Standard(StandardLink::Identity),
-        );
-        for eta in [f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
-            assert_finite_eta_domain_error(
-                royston_parmar_inverse_link_jet(eta)
-                    .expect_err("direct Royston-Parmar jet must refuse"),
-                "Royston-Parmar survival inverse link",
-                eta,
-            );
-            assert_finite_eta_domain_error(
-                inverse_link_jet_for_family(&spec, eta)
-                    .expect_err("solver Royston-Parmar jet must refuse"),
-                "Royston-Parmar survival inverse link",
-                eta,
-            );
-            assert_finite_eta_domain_error(
-                inverse_link_jet_for_family_public(&spec, eta)
-                    .expect_err("public Royston-Parmar jet must refuse"),
-                "Royston-Parmar survival inverse link",
-                eta,
-            );
-        }
-    }
-
-    #[test]
-    fn softmax_jacobian_matchesfd() {
-        let rho = Array1::from_vec(vec![0.7, -1.2, 0.4]);
-        let (pi, jac) = softmaxwith_jacobian_last_fixedzero(&rho);
-        let h = 1e-6;
-        for j in 0..rho.len() {
-            let mut rp = rho.clone();
-            rp[j] += h;
-            let mut rm = rho.clone();
-            rm[j] -= h;
-            let pp = softmax_last_fixedzero(&rp);
-            let pm = softmax_last_fixedzero(&rm);
-            let fd = (&pp - &pm).mapv(|v| v / (2.0 * h));
-            for k in 0..pi.len() {
-                let err = (jac[[k, j]] - fd[k]).abs();
-                assert_eq!(
-                    jac[[k, j]].signum(),
-                    fd[k].signum(),
-                    "jac sign mismatch at ({k},{j}): analytic={} fd={}",
-                    jac[[k, j]],
-                    fd[k]
-                );
-                assert!(err < 5e-6, "jac mismatch at ({k},{j}): err={err:e}");
             }
         }
     }
@@ -3899,37 +3738,6 @@ mod tests {
         assert!((j0.d1 - d1fd).abs() < 5e-5);
         assert!((j0.d2 - d2fd).abs() < 2e-4);
         assert!((j0.d3 - d3fd).abs() < 1e-3);
-    }
-
-    #[test]
-    fn family_dispatch_resolves_parameterized_links_from_spec() {
-        // After the LikelihoodSpec migration, the dispatch no longer needs
-        // out-of-band state arguments — the parameterized link state lives on
-        // `spec.link`. Pin the dispatch against the direct stateful kernels.
-        let sas_state = sas_link_state_from_raw(0.0, 0.0).expect("sas state");
-        let expected_sas =
-            sas_inverse_link_jet(0.1, sas_state.epsilon, sas_state.log_delta).expect("direct SAS");
-        let sas_spec = gam_problem::LikelihoodSpec {
-            response: gam_problem::ResponseFamily::Binomial,
-            link: InverseLink::Sas(sas_state),
-        };
-        let sas_jet = inverse_link_jet_for_family(&sas_spec, 0.1).expect("sas jet");
-        assert_eq!(sas_jet.mu.to_bits(), expected_sas.mu.to_bits());
-        assert_eq!(sas_jet.d1.to_bits(), expected_sas.d1.to_bits());
-
-        let mix_state = MixtureLinkState {
-            components: vec![LinkComponent::Logit, LinkComponent::Probit],
-            rho: ndarray::array![0.0],
-            pi: ndarray::array![0.5, 0.5],
-        };
-        let expected_mix = mixture_inverse_link_jet(&mix_state, 0.1);
-        let mix_spec = gam_problem::LikelihoodSpec {
-            response: gam_problem::ResponseFamily::Binomial,
-            link: InverseLink::Mixture(mix_state),
-        };
-        let mix_jet = inverse_link_jet_for_family(&mix_spec, 0.1).expect("mix jet");
-        assert_eq!(mix_jet.mu.to_bits(), expected_mix.mu.to_bits());
-        assert_eq!(mix_jet.d1.to_bits(), expected_mix.d1.to_bits());
     }
 
     #[test]

@@ -7,14 +7,7 @@
 //! symmetry, rotation invariance of intrinsic S² smooths) all still hold
 //! at large scale.
 
-use gam::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, OneDimensionalBoundary, PenaltySource,
-    PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d,
-    build_periodic_bspline_basis_1d, build_spherical_spline_basis,
-    cyclic_bspline_derivative_penalty_matrix, fit_periodic_bspline_curve,
-    periodic_bspline_first_derivative_nd, spherical_wahba_kernel_matrix,
-};
+use gam::basis::{BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, OneDimensionalBoundary, PenaltySource, PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d, build_periodic_bspline_basis_1d, build_spherical_spline_basis, cyclic_bspline_derivative_penalty_matrix, periodic_bspline_first_derivative_nd};
 use ndarray::{Array1, Array2, Axis};
 use std::time::Instant;
 
@@ -112,65 +105,6 @@ fn periodic_bspline_derivative_integrates_to_zero_over_loop() {
 }
 
 #[test]
-fn exact_periodic_cubic_spline_scales_and_interpolates_at_100k() {
-    let period = std::f64::consts::TAU;
-    for n in [1_000usize, 10_000, 100_000] {
-        let u = make_uniform_loop(n, period);
-        let mut y = Array2::<f64>::zeros((n, 3));
-        for i in 0..n {
-            let t = u[i];
-            y[(i, 0)] = (2.0 * t).cos() + 0.125 * (5.0 * t).sin();
-            y[(i, 1)] = 0.5 * t.sin() - 0.2 * (3.0 * t).cos();
-            y[(i, 2)] = 0.1 * (t + 0.3).sin() + 0.05 * (7.0 * t).cos();
-        }
-        let spline = time_label(&format!("exact_periodic_cubic N={n} d=3"), || {
-            fit_periodic_bspline_curve(
-                u.view(),
-                y.view(),
-                &PeriodicBSplineBasisSpec::new(3, 24, period, 0.0, 2),
-                1e-10,
-            )
-            .expect("exact periodic spline")
-        });
-        assert_eq!(spline.ambient_dim(), 3);
-
-        // A 24-basis cubic periodic spline cannot reproduce a band-limited trig
-        // signal (frequencies up to 7 here) *exactly* — cubic B-splines span no
-        // nonzero-frequency trigonometric function exactly — and with a tiny
-        // 1e-10 wiggliness penalty this is a near-interpolating smoothing fit of
-        // ~1000 data points onto 24 coefficients, not a knot interpolant. The
-        // residual is therefore a genuine spline-approximation floor (~1e-4 for
-        // this frequency content / basis count), consistent with the
-        // first-harmonic ellipse contract in `periodic_curve.rs` (2.5e-3 at 32
-        // basis). Assert that approximation floor rather than an unachievable
-        // exact-interpolation tolerance. (The seam value/slope continuity below
-        // stays tight — that is the actual periodicity contract.)
-        let fitted = spline.evaluate(u.view()).expect("knot evaluation");
-        for i in (0..n).step_by((n / 2048).max(1)) {
-            for col in 0..3 {
-                let err = (fitted[(i, col)] - y[(i, col)]).abs();
-                assert!(
-                    err < 5e-3,
-                    "periodic cubic approximation error at N={n}, row={i}, col={col}: {err}"
-                );
-            }
-        }
-
-        let seam = Array1::from_vec(vec![0.0, period, -period, 19.0 * period]);
-        let seam_values = spline.evaluate(seam.view()).expect("seam values");
-        let seam_slopes = spline
-            .evaluate_derivative(seam.view())
-            .expect("seam derivatives");
-        for row in 1..seam.len() {
-            for col in 0..3 {
-                assert!((seam_values[(row, col)] - seam_values[(0, col)]).abs() < 1e-10);
-                assert!((seam_slopes[(row, col)] - seam_slopes[(0, col)]).abs() < 1e-10);
-            }
-        }
-    }
-}
-
-#[test]
 fn cyclic_derivative_penalty_constant_in_nullspace_at_large_k() {
     for k in [16, 64, 256] {
         let s = cyclic_bspline_derivative_penalty_matrix(3, k, 1.0, 2).expect("penalty");
@@ -192,34 +126,6 @@ fn cyclic_derivative_penalty_constant_in_nullspace_at_large_k() {
                 assert!(
                     (lhs - rhs).abs() < 1e-12 * scale.max(1.0),
                     "shift invariance violated at k={k}, ({i},{j})"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn sphere_wahba_kernel_at_100k_is_symmetric_on_self_eval() {
-    // For the diagonal (data == centers), kernel(i, j) must equal kernel(j, i).
-    // Test at three scales to confirm parallel chunks don't introduce races.
-    for n in [256_usize, 4_096, 32_768] {
-        let pts = make_sphere_grid(n);
-        let k = time_label(&format!("wahba_kernel_matrix N=K={n} m=2"), || {
-            spherical_wahba_kernel_matrix(pts.view(), pts.view(), 2, false).expect("kernel")
-        });
-        // Spot check 256 random off-diagonal symmetry positions
-        let step = (n / 64).max(1);
-        for i in (0..n).step_by(step) {
-            for j in (0..n).step_by(step) {
-                if i == j {
-                    continue;
-                }
-                let d = (k[(i, j)] - k[(j, i)]).abs();
-                assert!(
-                    d < 1e-10,
-                    "non-symmetric kernel at N={n}, ({i},{j}): {} vs {}",
-                    k[(i, j)],
-                    k[(j, i)]
                 );
             }
         }

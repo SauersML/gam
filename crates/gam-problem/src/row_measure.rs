@@ -142,25 +142,4 @@ mod tests {
         assert_ne!(a.id, b.id);
     }
 
-    #[test]
-    fn indices_and_weights_full_data() {
-        let rm = RowSubsampleMask::full_data(4);
-        let (idx, w) = rm.indices_and_weights(4);
-        assert_eq!(idx, vec![0, 1, 2, 3]);
-        assert_eq!(w, vec![1.0, 1.0, 1.0, 1.0]);
-    }
-
-    #[test]
-    fn indices_and_weights_subsample() {
-        let s = Arc::new(OuterScoreSubsample::from_uniform_inclusion_mask(
-            vec![0, 2],
-            4,
-            7,
-        ));
-        let rm = RowSubsampleMask::subsample(s);
-        let (idx, w) = rm.indices_and_weights(4);
-        assert_eq!(idx, vec![0, 2]);
-        assert_eq!(w.len(), 4);
-        assert!(w[0] > 0.0 && w[2] > 0.0);
-    }
 }

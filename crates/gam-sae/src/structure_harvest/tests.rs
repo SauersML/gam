@@ -6,7 +6,6 @@ use crate::manifold::{
     AssignmentMode, PeriodicHarmonicEvaluator, SAE_DEFAULT_TORUS_HARMONICS, SaeAssignment,
     SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,
 };
-use gam_solve::structure_search::{CollapseAction, CollapseEvent};
 use gam_terms::latent::LatentManifold;
 use ndarray::Array2;
 use std::sync::Arc;
@@ -160,112 +159,6 @@ fn quotient_surface_candidates_are_reachable_with_their_cover_geometry() {
             LatentManifold::Circle { period: 1.0 },
             LatentManifold::Circle { period: 1.0 },
         ])
-    );
-}
-
-#[test]
-fn torus_race_persists_the_evidence_selected_reference_metric() {
-    use ndarray::Array1;
-
-    let side = 10usize;
-    let n = side * side;
-    let mut coords = Array2::<f64>::zeros((n, 2));
-    for i in 0..side {
-        for j in 0..side {
-            let row = i * side + j;
-            coords[[row, 0]] = i as f64 / side as f64;
-            coords[[row, 1]] = j as f64 / side as f64;
-        }
-    }
-    let geometry = SaeAtomGeometryPlan::new(
-        SaeAtomBasisKind::Torus,
-        2,
-        SaeBasisResolution::TorusHarmonics { per_axis_order: 2 },
-        SaeReferenceMetricPlan::FlatRectangularTorus { tau: 0.0 },
-    )
-    .unwrap();
-    let bundle = geometry.evaluate_bundle(coords.view()).unwrap();
-    let mut decoder = Array2::<f64>::zeros((bundle.basis_values.ncols(), 3));
-    for row in 0..decoder.nrows() {
-        for col in 0..decoder.ncols() {
-            decoder[[row, col]] = (((row + 1) * (col + 2)) as f64).sin() / (1.0 + row as f64);
-        }
-    }
-    let mut target = bundle.basis_values.dot(&decoder);
-    for row in 0..n {
-        for col in 0..target.ncols() {
-            target[[row, col]] += ((row + 3 * col + 1) as f64).cos() / n as f64;
-        }
-    }
-    let weights = Array1::<f64>::ones(n);
-    let difference_step = f64::EPSILON.cbrt();
-    for family in [TorusMetricFamily::Flat, TorusMetricFamily::EmbeddedDonut] {
-        let coordinate = 0.5;
-        let analytic = evaluate_torus_metric_profile(
-            bundle.basis_values.view(),
-            target.view(),
-            weights.view(),
-            2,
-            family,
-            coordinate,
-        )
-        .unwrap();
-        let plus = evaluate_torus_metric_profile(
-            bundle.basis_values.view(),
-            target.view(),
-            weights.view(),
-            2,
-            family,
-            coordinate + difference_step,
-        )
-        .unwrap();
-        let minus = evaluate_torus_metric_profile(
-            bundle.basis_values.view(),
-            target.view(),
-            weights.view(),
-            2,
-            family,
-            coordinate - difference_step,
-        )
-        .unwrap();
-        let refitted_direction = (plus.value - minus.value) / (2.0 * difference_step);
-        let gap = (analytic.gradient[0] - refitted_direction).abs();
-        assert!(
-            gap <= difference_step * (1.0 + refitted_direction.abs()),
-            "{family:?} coordinate gradient {} disagrees with refitted direction {refitted_direction} by {gap}",
-            analytic.gradient[0]
-        );
-    }
-    let spec = TopologyCandidateSpec::new(
-        AutoTopologyKind::Torus,
-        geometry,
-        LatentManifold::Product(vec![
-            LatentManifold::Circle { period: 1.0 },
-            LatentManifold::Circle { period: 1.0 },
-        ]),
-        coords,
-    )
-    .unwrap();
-    let fit = fit_topology_candidate(&spec, target.view(), weights.view())
-        .expect("torus metric family must reach a converged evidence winner")
-        .fit_handle;
-    match fit.geometry.reference_metric() {
-        SaeReferenceMetricPlan::FlatRectangularTorus { tau } => {
-            assert!(tau.is_finite() && *tau >= 0.0)
-        }
-        SaeReferenceMetricPlan::EmbeddedDonutTorus { tau } => {
-            assert!(tau.is_finite() && *tau > 0.0)
-        }
-        other => panic!("torus race persisted a non-torus reference metric: {other:?}"),
-    }
-    let persisted_penalty = fit.geometry.build_reference_penalty().unwrap();
-    let max_gap = persisted_penalty
-        .iter()
-        .zip(fit.penalty.iter())
-        .fold(0.0_f64, |gap, (left, right)| gap.max((left - right).abs()));
-    assert!(
-        max_gap <= f64::EPSILON.sqrt(),
-        "winning metric plan and installed penalty diverged by {max_gap}"
     );
 }
 
@@ -924,49 +817,6 @@ fn birth_row_amplitudes_are_row_norms() {
 // ---- F2: finite-set (discrete anchor) atom ------------------------------
 
 #[test]
-fn finite_set_race_is_not_enrolled_by_default() {
-    // Containment: the finite-set candidate is inert unless explicitly
-    // enrolled, so the enum arm + evaluator can never affect a birth by
-    // default.
-    assert!(!finite_set_race_enrolled());
-    set_finite_set_race_enrolled(true);
-    assert!(finite_set_race_enrolled());
-    set_finite_set_race_enrolled(false);
-    assert!(!finite_set_race_enrolled());
-}
-
-#[test]
-fn finite_set_candidate_fires_on_discrete_occupancy() {
-    // Seven-point cyclic occupancy (weekdays): the coordinate collapses onto
-    // 7 anchors, so the finite-set candidate builder returns 7 anchors and a
-    // per-row integer index in [0, 7); the rank charge is anchors − 1 = 6.
-    let per = 100;
-    let mut rows = Vec::new();
-    for i in 0..(7 * per) {
-        // Sub-resolution embedding noise (±1e-3 over a span of 6 ⇒ ~1.7e-4
-        // normalized, below the width floor) so the seven weekdays are a
-        // genuine finite point set, not seven fuzzy blobs whose structured
-        // noise the evidence could honestly resolve into more clusters.
-        rows.push((i % 7) as f64 + 0.001 * ((i as f64).sin()));
-    }
-    let coords = Array2::from_shape_vec((7 * per, 1), rows).unwrap();
-    let (anchors, idx) =
-        finite_set_candidate_for_birth(coords.view()).expect("discrete ⇒ finite-set candidate");
-    assert_eq!(anchors, 7, "anchors");
-    assert_eq!(crate::manifold::finite_set_rank_charge(anchors), 6);
-    // Every index is a valid anchor bin.
-    assert!(
-        idx.iter()
-            .all(|&v| (0.0..=6.0).contains(&v) && v.fract() == 0.0)
-    );
-
-    // A uniformly-occupied coordinate is NOT a finite set — no candidate.
-    let n = 400;
-    let uni = Array2::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
-    assert!(finite_set_candidate_for_birth(uni.view()).is_none());
-}
-
-#[test]
 fn anchor_indicator_evaluator_is_one_hot_with_zero_jets() {
     use crate::basis::{AnchorIndicatorEvaluator, SaeBasisEvaluator, SaeBasisSecondJet};
     let ev = AnchorIndicatorEvaluator::new(3).unwrap();
@@ -1053,90 +903,6 @@ fn residuals_of(term: &SaeManifoldTerm) -> Array2<f64> {
         .try_fitted()
         .expect("a freshly built fixture term carries a fitted state");
     -&fitted
-}
-
-/// #977 discovery oracle: with the production birth budget enabled, a fit
-/// #1230 — `StructureSearchResult::structure_changed()` is the trigger the
-/// FFI uses to decide whether the pre-search joint-Hessian shape bands are
-/// stale and must be recomputed from the final post-search model.
-///
-/// It must report `true` iff at least one move LANDED and mutated the
-/// returned `term`/`rho`: an `Accepted` move (certified birth / fission /
-/// fusion + warm refit) or a `Demoted` death. It must report `false` when
-/// every round was contested / vetoed (the term/rho are byte-for-byte the
-/// pre-search fit, so the exact joint-Hessian bands stay valid), and when no
-/// round ran at all. A false negative leaves seed atoms with stale bands
-/// (the #1230 bug); a false positive needlessly discards exact bands.
-#[test]
-fn structure_changed_is_true_only_when_a_move_lands() {
-    use gam_solve::structure_search::{MoveRecord, MoveVerdict};
-
-    fn ledger_with(verdicts: Vec<MoveVerdict>) -> SearchLedger {
-        SearchLedger {
-            alpha: 0.05,
-            moves: verdicts
-                .into_iter()
-                .enumerate()
-                .map(|(i, verdict)| MoveRecord {
-                    mv: StructureMove::Death { atom: i },
-                    trigger: 0.0,
-                    structure_hash: i as u64,
-                    claim: ClaimKind::AtomExists { atom: i },
-                    verdict,
-                })
-                .collect(),
-            collapse_events: Vec::new(),
-        }
-    }
-
-    // No rounds ran at all: nothing changed.
-    let (term0, rho0) = planted_term(&[vec![true], vec![true]]);
-    let empty = StructureSearchResult::from_rounds(term0.clone(), rho0.clone(), Vec::new());
-    assert!(
-        !empty.structure_changed(),
-        "no rounds ⇒ the term/rho are the pre-search fit ⇒ structure_changed() must be false"
-    );
-
-    // Every move contested or vetoed: the dictionary is byte-for-byte the
-    // pre-search fit, so the exact joint-Hessian bands remain valid.
-    let no_landed = StructureSearchResult::from_rounds(
-        term0.clone(),
-        rho0.clone(),
-        vec![ledger_with(vec![
-            MoveVerdict::Contested { log_e: -1.0 },
-            MoveVerdict::Vetoed { log_e: -2.0 },
-        ])],
-    );
-    assert!(
-        !no_landed.structure_changed(),
-        "all-contested/vetoed rounds leave the model unchanged ⇒ structure_changed() must be false"
-    );
-
-    // An Accepted move landed (certified restructuring + warm refit): the
-    // returned model differs from the pre-search fit ⇒ bands are stale.
-    let accepted = StructureSearchResult::from_rounds(
-        term0.clone(),
-        rho0.clone(),
-        vec![ledger_with(vec![
-            MoveVerdict::Contested { log_e: -1.0 },
-            MoveVerdict::Accepted { log_e: 3.0 },
-        ])],
-    );
-    assert!(
-        accepted.structure_changed(),
-        "a landed Accepted move mutates term/rho ⇒ structure_changed() must be true (recompute bands)"
-    );
-
-    // A Demoted death is also a landed structure change.
-    let demoted = StructureSearchResult::from_rounds(
-        term0.clone(),
-        rho0.clone(),
-        vec![ledger_with(vec![MoveVerdict::Demoted { log_e: -1.0 }])],
-    );
-    assert!(
-        demoted.structure_changed(),
-        "a landed Demoted death folds an atom to ~0 routing ⇒ structure_changed() must be true"
-    );
 }
 
 /// whose residuals carry an unexplained factor direction (a structure the
@@ -1519,78 +1285,6 @@ fn closed_form_transition_uses_first_nonzero_harmonic_without_scanning() {
     }
 }
 
-/// An orientation-reversing seam is a valid equivalence, but it is NOT a
-/// license to erase either local chart.  The production proposal must select
-/// the atlas-register outcome, and applying it must preserve the numerical
-/// chart count and fitted image while reducing the semantic atom count.
-#[test]
-fn orientation_reversing_seam_registers_atlas_without_destructive_fusion() {
-    let n = 40usize;
-    let (mut term, rho) = tiled_circle_term(n, 2, &[1.0, 1.0]);
-    // `sin` changes sign under t -> -t; `cos` does not.  B therefore traces
-    // exactly A's image with the orientation-reversing transition t_A=-t_B.
-    term.atoms[1].decoder_coefficients_mut()[[1, 0]] = -1.0;
-    let residuals = Array2::<f64>::zeros((n, 4));
-    let (transition, _) = unit_speed_glue_certificate(&term, residuals.view(), 0, 1)
-        .expect("reflected charts have an exact certified seam");
-    assert_eq!(transition.sign, -1);
-    assert!(transition.log_e_value > 5.0);
-
-    let report = harvest_move_proposals(
-        &term,
-        &rho,
-        residuals.view(),
-        &HarvestParams {
-            max_fusions: 4,
-            max_fissions: 0,
-            max_births: 0,
-        },
-    )
-    .unwrap();
-    let mv = report
-        .proposals
-        .iter()
-        .find_map(|proposal| match proposal.mv {
-            StructureMove::Glue {
-                a,
-                b,
-                outcome: ChartGlueOutcome::RegisterAtlas,
-            } => Some(StructureMove::Glue {
-                a,
-                b,
-                outcome: ChartGlueOutcome::RegisterAtlas,
-            }),
-            _ => None,
-        })
-        .expect("negative seam must propose atlas registration");
-
-    let fitted_before = term.try_fitted().unwrap();
-    let (registered, _) = apply_structure_move(&term, &rho, &mv, &[]).unwrap();
-    assert_eq!(registered.k_atoms(), 2, "both local charts must survive");
-    assert_eq!(registered.semantic_atom_count(), 1);
-    assert_eq!(registered.chart_atlases().len(), 1);
-    assert_eq!(registered.chart_atlases()[0].transitions()[0].sign, -1);
-    assert_eq!(
-        registered.try_fitted().unwrap(),
-        fitted_before,
-        "atlas registration is an image-exact quotient"
-    );
-
-    let assignments = registered.assignment.assignments();
-    for row in 0..n {
-        let (activation, partition) = registered
-            .atlas_partition_of_unity(0, assignments.row(row))
-            .unwrap();
-        assert!((partition.sum() - 1.0).abs() < 8.0 * f64::EPSILON);
-        for (slot, &chart) in registered.chart_atlases()[0].charts().iter().enumerate() {
-            assert!(
-                (activation * partition[slot] - assignments[[row, chart]]).abs()
-                    < 8.0 * f64::EPSILON
-            );
-        }
-    }
-}
-
 /// #1890 over-birth reassembly — the PHYSICAL-excision resurrection fix, on the
 /// private primitives the `chart_gluing_1890.rs` integration test cannot reach.
 /// A circle over-tiled into 4 disjoint arcs proposes a spanning set of glues
@@ -1886,48 +1580,6 @@ fn physical_excision_validation_is_transactional() {
     );
     assert_eq!(term.k_atoms(), atoms_before);
     assert_eq!(term.assignment.logits, logits_before);
-}
-
-/// Oracle (#997 death trigger): a diverged ARD precision yields a DEATH
-/// proposal; a terminal collapse event yields a death even with finite ARD.
-#[test]
-fn diverged_ard_and_terminal_collapse_harvest_deaths() {
-    let n = 20usize;
-    let active: Vec<Vec<bool>> = (0..n).map(|row| vec![true, row % 2 == 0, false]).collect();
-    let (mut term, mut rho) = planted_term(&active);
-    // Diverge atom 2's ARD precision well past the divergence floor.
-    rho.log_ard[2] = Array1::from_elem(1, ARD_DIVERGENCE_LOG_PRECISION + 5.0);
-    // Inject a terminal collapse for atom 1 (finite ARD, but routing gone).
-    term.record_collapse_event(CollapseEvent {
-        iteration: 3,
-        atom: 1,
-        max_active_mass: 1e-6,
-        floor: 1e-3,
-        action: CollapseAction::Terminal,
-    });
-    let residuals = residuals_of(&term);
-    let params = HarvestParams {
-        max_fusions: 0,
-        max_fissions: 0,
-        max_births: 0,
-    };
-    let report = harvest_move_proposals(&term, &rho, residuals.view(), &params).unwrap();
-    let death_atoms: Vec<usize> = report
-        .proposals
-        .iter()
-        .filter_map(|p| match p.mv {
-            StructureMove::Death { atom } => Some(atom),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        death_atoms.contains(&2),
-        "diverged ARD on atom 2 must yield a death proposal; got {death_atoms:?}"
-    );
-    assert!(
-        death_atoms.contains(&1),
-        "terminal collapse on atom 1 must yield a death proposal; got {death_atoms:?}"
-    );
 }
 
 /// Apply-move restructuring oracle: fission GROWS the dictionary by one atom

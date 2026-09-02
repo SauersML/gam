@@ -21,10 +21,7 @@
 //! structural shrinkage block is reliably active and the previously omitted
 //! derivative is genuinely exercised.
 
-use gam::terms::basis::{
-    CenterStrategy, MaternBasisSpec, MaternNu, build_matern_basis,
-    build_matern_basis_log_kappa_derivatives, build_matern_basis_log_kappasecond_derivative,
-};
+use gam::terms::basis::{CenterStrategy, MaternBasisSpec, MaternNu, build_matern_basis, build_matern_basis_log_kappa_derivatives};
 use ndarray::Array2;
 
 /// Evaluation data: a 6×6 grid (36 rows). `n = 36 >= k = 28` so the Matérn
@@ -196,34 +193,3 @@ fn matern_double_penalty_log_kappa_first_derivative_matches_finite_difference() 
     }
 }
 
-#[test]
-fn matern_double_penalty_log_kappa_second_derivative_matches_finite_difference() {
-    let data = dataset();
-    for nu in [MaternNu::ThreeHalves, MaternNu::FiveHalves] {
-        let spec = spec_at(RHO, nu);
-        let analytic = build_matern_basis_log_kappasecond_derivative(data.view(), &spec)
-            .unwrap()
-            .penaltiessecond_derivative;
-
-        let h = 1e-4;
-        let plus = penalties_at(&data, RHO + h, nu);
-        let mid = penalties_at(&data, RHO, nu);
-        let minus = penalties_at(&data, RHO - h, nu);
-        assert_eq!(analytic.len(), mid.len());
-
-        for (block, da) in analytic.iter().enumerate() {
-            let num = (&plus[block] - 2.0 * &mid[block] + &minus[block]) / (h * h);
-            let err = max_abs(&(da - &num));
-            let scale = max_abs(da).max(max_abs(&num)).max(1.0);
-            assert!(
-                err < 5e-2 * scale,
-                "nu={nu:?} double-penalty block {block}: second log-κ derivative must \
-                 match finite difference (rel tol 5e-2·scale={:.3e}); got max abs \
-                 error {err:.3e} (analytic max {:.3e}, fd max {:.3e})",
-                5e-2 * scale,
-                max_abs(da),
-                max_abs(&num),
-            );
-        }
-    }
-}

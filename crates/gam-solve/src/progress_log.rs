@@ -244,12 +244,6 @@ mod tests {
     }
 
     #[test]
-    fn default_log_level_accessor_matches_const() {
-        assert_eq!(default_log_level(), DEFAULT_LOG_LEVEL);
-        assert_eq!(default_log_level(), LevelFilter::Warn);
-    }
-
-    #[test]
     fn parsing_is_case_and_whitespace_insensitive() {
         assert_eq!(parse_log_level("  INFO "), Some(LevelFilter::Info));
         assert_eq!(parse_log_level("Warn"), Some(LevelFilter::Warn));

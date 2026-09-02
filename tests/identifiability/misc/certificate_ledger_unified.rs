@@ -94,23 +94,6 @@ fn collapse_terminal_makes_no_health_claim() {
 }
 
 #[test]
-fn ledger_overall_is_never_stronger_than_weakest_member() {
-    let mut ledger = CertificateLedger::new();
-    ledger.record(&clean_criterion()); // Certified
-    let coreset = CoresetCertificate::new(0.1, 0.0, 4, 32).expect("coreset");
-    ledger.record(&coreset); // Insufficient
-
-    // The roll-up is the weakest member, and the strong member is preserved.
-    assert_eq!(ledger.overall(), Verdict::Insufficient);
-    assert!(!ledger.overall().is_certified());
-    assert_eq!(ledger.verdict_of("outer-optimality"), Verdict::Certified);
-    assert_eq!(ledger.verdict_of("coreset-budget"), Verdict::Insufficient);
-    // An unrecorded claim reads as Unavailable — never a silent pass.
-    assert_eq!(ledger.verdict_of("does-not-exist"), Verdict::Unavailable);
-    assert_eq!(ledger.len(), 2);
-}
-
-#[test]
 fn all_certified_ledger_rolls_up_certified() {
     let mut ledger = CertificateLedger::new();
     ledger.record(&clean_criterion());

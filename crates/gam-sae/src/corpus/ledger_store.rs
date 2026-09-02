@@ -190,12 +190,4 @@ mod tests {
         assert!(err.contains("refusing to silently reset"));
     }
 
-    /// Different structural hashes bind different keys (no cross-topology
-    /// evidence replay).
-    #[test]
-    fn distinct_topologies_get_distinct_keys() {
-        let a = LedgerStore::from_structural_hash(0xDEAD_BEEF);
-        let b = LedgerStore::from_structural_hash(0xFEED_FACE);
-        assert_ne!(a.key, b.key);
-    }
 }

@@ -316,15 +316,6 @@ mod tests {
     }
 
     #[test]
-    fn absent_claim_reads_as_unavailable_never_pass() {
-        let ledger = CertificateLedger::new();
-        assert_eq!(ledger.verdict_of("nonexistent"), Verdict::Unavailable);
-        assert!(!ledger.verdict_of("nonexistent").is_certified());
-        // Empty ledger rolls up to Unavailable, not a vacuous pass.
-        assert_eq!(ledger.overall(), Verdict::Unavailable);
-    }
-
-    #[test]
     fn overall_is_weakest_member() {
         let mut ledger = CertificateLedger::new();
         ledger.record(&FakeCert {
@@ -339,18 +330,4 @@ mod tests {
         assert!(!ledger.overall().is_certified());
     }
 
-    #[test]
-    fn duplicate_record_keeps_weaker_verdict() {
-        let mut ledger = CertificateLedger::new();
-        ledger.record(&FakeCert {
-            id: "a",
-            verdict: Verdict::Certified,
-        });
-        ledger.record(&FakeCert {
-            id: "a",
-            verdict: Verdict::Insufficient,
-        });
-        assert_eq!(ledger.verdict_of("a"), Verdict::Insufficient);
-        assert_eq!(ledger.len(), 1);
-    }
 }

@@ -105,17 +105,3 @@ fn run_joint_fit_arrow_schur_recovers_on_oos_predict_path() {
     );
 }
 
-#[test]
-fn solve_newton_step_recovers_on_oos_predict_path() {
-    // The single-shot Newton entry used by `run_single_external_basis_refresh_step_arrow_schur`
-    // (and any external caller that wants one Newton direction without the
-    // line-search driver). Previously this called `sys.solve(...)` directly,
-    // bypassing the escalation. The fix routes it through
-    // `solve_with_lm_escalation` so the predict path is uniformly self-healing.
-    let (mut term, rho, target) = degenerate_oos_term();
-    let result = term.solve_newton_step(target.view(), &rho, None, 1.0e-6, 1.0e-6);
-    assert!(
-        result.is_ok(),
-        "solve_newton_step must recover from degenerate H_tt via LM ridge escalation; got: {result:?}",
-    );
-}

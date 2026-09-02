@@ -85,6 +85,12 @@ pub struct DeviationBlockConfig {
     pub monotonicity_eps: f64,
 }
 
+impl DeviationBlockConfig {
+    pub fn triple_penalty_default() -> Self {
+        Self::default()
+    }
+}
+
 impl Default for DeviationBlockConfig {
     fn default() -> Self {
         WigglePenaltyConfig::cubic_triple_operator_default().into()

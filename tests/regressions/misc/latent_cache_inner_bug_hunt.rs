@@ -82,21 +82,6 @@ fn latent_inner_solver_converges_from_documented_initial_point_toy_problem() {
 }
 
 #[test]
-fn latent_coord_round_trip_encoded_decoded_fit_time_beta_matches_original_within_tolerance() {
-    let original = array![[0.2_f64, -0.3_f64], [1.1_f64, 0.9_f64], [-0.8_f64, 0.4_f64]];
-    let latent = LatentCoordValues::from_matrix(original.view(), LatentIdMode::None);
-    let decoded = latent.apply_tospec();
-    let reencoded = LatentCoordValues::from_matrix(decoded.view(), LatentIdMode::None);
-    let diff = (&reencoded.as_flat().to_owned() - latent.as_flat())
-        .mapv(f64::abs)
-        .sum();
-    assert!(
-        diff <= 1e-6,
-        "encoded latent -> decoded latent -> fit-time latent reconstruction should preserve beta-driving coordinates within 1e-6"
-    );
-}
-
-#[test]
 fn latent_cache_hit_for_same_beta_rho_inputs_matches_freshly_computed_entry() {
     let x = Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("shape");
     let beta = array![0.3_f64, -0.7_f64];

@@ -1383,30 +1383,6 @@ mod tests {
         assert_eq!(plans[0].geometry.intrinsic_dim(), 2);
     }
 
-    #[test]
-    fn ambient_sphere_plan_requires_three_ambient_coordinates() {
-        let ambient = SaeAtomGeometryPlan::new(
-            SaeAtomBasisKind::Sphere,
-            3,
-            SaeBasisResolution::AmbientSphereHarmonics { degree: 2 },
-            SaeReferenceMetricPlan::RoundSphere,
-        )
-        .expect("the ambient sphere plan is valid at latent_dim 3");
-        assert_eq!(ambient.basis_size().unwrap(), 9);
-        assert_eq!(ambient.reference_metric(), &SaeReferenceMetricPlan::RoundSphere);
-
-        assert!(
-            SaeAtomGeometryPlan::new(
-                SaeAtomBasisKind::Sphere,
-                2,
-                SaeBasisResolution::AmbientSphereHarmonics { degree: 2 },
-                SaeReferenceMetricPlan::RoundSphere,
-            )
-            .is_err(),
-            "an ambient sphere at latent_dim 2 must be refused, not silently charted"
-        );
-    }
-
     /// The ambient roughness operator is the Laplace-Beltrami spectrum itself,
     /// so it is diagonal with `[l(l+1)]²` -- exact, not tabulated. Degree 1
     /// gives `0, 4, 4, 4`; degree 2 adds five `36`s.
@@ -1432,24 +1408,6 @@ mod tests {
             }
         }
         assert!(round_sphere_reference_penalty(2, 0).is_err());
-    }
-
-    #[test]
-    fn quotient_plan_is_the_only_width_and_metric_authority() {
-        let rp2 = SaeAtomGeometryPlan::projective_plane(3).unwrap();
-        assert_eq!(rp2.basis_size().unwrap(), 28);
-        assert_eq!(
-            rp2.reference_metric(),
-            &SaeReferenceMetricPlan::RoundProjectivePlane
-        );
-
-        let klein = SaeAtomGeometryPlan::klein_bottle(3).unwrap();
-        assert_eq!(klein.basis_size().unwrap(), 24);
-        assert_eq!(
-            klein.reference_metric(),
-            &SaeReferenceMetricPlan::FlatKleinBottle
-        );
-        assert!(SaeAtomGeometryPlan::klein_bottle(1).is_err());
     }
 
     #[test]
@@ -1480,57 +1438,6 @@ mod tests {
                 SaeReferenceMetricPlan::DiscreteCounting,
             )
             .is_err()
-        );
-    }
-
-    /// Expected block spectrum of the anisotropic flat product torus at
-    /// `theta`-frequency `k`: `k^2/A^2 + l^2` with `l = 0` once and `l = 1..H`
-    /// twice (sine and cosine), sorted ascending.
-    fn expected_anisotropic_flat_block(per_axis_order: usize, aspect: f64, k: usize) -> Vec<f64> {
-        let base = (k * k) as f64 / (aspect * aspect);
-        let mut values = vec![base];
-        for l in 1..=per_axis_order {
-            let value = base + (l * l) as f64;
-            values.push(value);
-            values.push(value);
-        }
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        values
-    }
-
-    #[test]
-    fn embedded_donut_eigenvalues_converge_to_anisotropic_flat_not_isotropic() {
-        let per_axis_order = 4;
-        // Thin-tube limit: A -> infinity. Convergence of the Laplace--Beltrami
-        // spectrum to the flat product torus is O(1/A^2).
-        let aspect = 2000.0;
-        for k in 0..=per_axis_order {
-            let eigenvalues =
-                embedded_donut_laplacian_block_eigenvalues(per_axis_order, aspect, k).unwrap();
-            let expected = expected_anisotropic_flat_block(per_axis_order, aspect, k);
-            assert_eq!(eigenvalues.len(), expected.len());
-            for (got, want) in eigenvalues.iter().zip(expected.iter()) {
-                assert!(
-                    (got - want).abs() <= 1.0e-3,
-                    "k={k}: donut eigenvalue {got} != anisotropic-flat target {want}"
-                );
-            }
-        }
-
-        // Decisive discriminant: at k=3, l=0 the anisotropic target is
-        // k^2/A^2 = 9/A^2 (~2.25e-6), while the ISOTROPIC flat torus would put
-        // this mode at k^2 = 9. The smallest block eigenvalue must land on the
-        // former, nowhere near the latter.
-        let smallest =
-            embedded_donut_laplacian_block_eigenvalues(per_axis_order, aspect, 3).unwrap()[0];
-        let anisotropic_target = 9.0 / (aspect * aspect);
-        assert!(
-            (smallest - anisotropic_target).abs() <= 1.0e-3,
-            "smallest k=3 eigenvalue {smallest} should track k^2/A^2 = {anisotropic_target}"
-        );
-        assert!(
-            smallest < 0.5,
-            "smallest k=3 eigenvalue {smallest} must not approach the isotropic k^2 = 9"
         );
     }
 

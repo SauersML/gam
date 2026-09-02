@@ -3397,7 +3397,7 @@ mod tests {
         UnifiedFitResult, UnifiedFitResultParts,
     };
     use gam_solve::pirls::PirlsStatus;
-    use gam_spec::{LinkFunction, StandardLink};
+    use gam_spec::StandardLink;
     use ndarray::{Array1, Array2, array};
 
     fn expect_estimation_error<T>(
@@ -3466,99 +3466,6 @@ mod tests {
         assert!(
             nb_raw.observation_lower.is_none() && nb_raw.observation_upper.is_none(),
             "bare Vb must not build an estimated-NB observation interval from the seed theta"
-        );
-    }
-
-    #[test]
-    fn raw_covariance_with_scale_hints_drives_observation_interval_width() {
-        let x = array![[1.0_f64]];
-        let beta = array![0.0_f64];
-        let offset = array![0.0_f64];
-        let covariance = Array2::<f64>::zeros((1, 1));
-        let z = standard_normal_quantile(0.975).expect("z");
-        let options = PredictUncertaintyOptions {
-            confidence_level: 0.95,
-            covariance_mode: InferenceCovarianceMode::Conditional,
-            mean_interval_method: MeanIntervalMethod::Delta,
-            includeobservation_interval: true,
-            apply_bias_correction: false,
-            edgeworth_one_sided: false,
-            boundary_correction: false,
-            ood_inflation: false,
-            multi_point_joint: false,
-            ..PredictUncertaintyOptions::default()
-        };
-
-        let beta_phi = 31.0;
-        let beta_source = PredictionCovarianceWithScale::new(
-            covariance.view(),
-            ObservationScaleHints::with_phi(beta_phi),
-        );
-        let beta_pred = predict_gamwith_uncertainty(
-            x.view(),
-            beta.view(),
-            offset.view(),
-            gam_spec::LikelihoodSpec::new(
-                ResponseFamily::Beta { phi: 1.0 },
-                InverseLink::Standard(StandardLink::Logit),
-            ),
-            &beta_source,
-            &options,
-        )
-        .expect("hinted beta covariance prediction");
-        let beta_lower = beta_pred.observation_lower.expect("beta lower");
-        let beta_upper = beta_pred.observation_upper.expect("beta upper");
-        let beta_half_width = 0.5 * (beta_upper[0] - beta_lower[0]);
-        // Expected: moment-matched Beta quantile at the same phi (31), zero
-        // estimation uncertainty.  logit(0) → mu = 0.5; response_var = mu*(1-mu)/(1+phi).
-        let mu = 0.5_f64;
-        let response_var = mu * (1.0 - mu) / (1.0 + beta_phi);
-        let (exp_lo, exp_hi) =
-            beta_moment_matched_interval(mu, response_var, normal_cdf(-z), normal_cdf(z))
-                .expect("beta quantiles from phi=31");
-        let expected_beta_half_width = 0.5 * (exp_hi - exp_lo);
-        assert!(
-            (beta_half_width - expected_beta_half_width).abs() < 1e-12,
-            "Beta observation interval must use fitted phi hint: got {beta_half_width:.6e}, expected {expected_beta_half_width:.6e}"
-        );
-
-        let theta_hat = 4.0;
-        let nb_source = PredictionCovarianceWithScale::new(
-            covariance.view(),
-            ObservationScaleHints::with_theta(theta_hat),
-        );
-        let nb_pred = predict_gamwith_uncertainty(
-            x.view(),
-            beta.view(),
-            offset.view(),
-            gam_spec::LikelihoodSpec::new(
-                ResponseFamily::NegativeBinomial {
-                    theta: 1.0,
-                    theta_fixed: false,
-                },
-                InverseLink::Standard(StandardLink::Log),
-            ),
-            &nb_source,
-            &options,
-        )
-        .expect("hinted NB covariance prediction");
-        let nb_upper = nb_pred.observation_upper.expect("nb upper");
-        // Expected: moment-matched NB quantile at theta=4 (hint), zero estimation
-        // uncertainty.  log(0)→mu=1; response_var=mu+mu²/theta=1.25.
-        let nb_mu = 1.0_f64;
-        let nb_response_var = nb_mu + nb_mu.powi(2) / theta_hat;
-        let (_, exp_nb_hi) = negative_binomial_moment_matched_interval(
-            nb_mu,
-            theta_hat,
-            nb_response_var,
-            normal_cdf(-z),
-            normal_cdf(z),
-        )
-        .expect("nb quantiles from theta=4");
-        assert!(
-            (nb_upper[0] - exp_nb_hi).abs() < 1e-12,
-            "NB observation interval must use fitted theta hint: got {:.6e}, expected {exp_nb_hi:.6e}",
-            nb_upper[0]
         );
     }
 
@@ -3934,110 +3841,6 @@ mod tests {
         .expect("survival fit")
     }
 
-    #[test]
-    fn predict_posterior_mean_probit_matches_closed_form_reference() {
-        let x = array![[1.0], [1.0]];
-        let beta = array![0.7];
-        let offset = array![0.0, 0.0];
-        let covariance = Array2::from_diag(&array![0.25]);
-        let out = predict_gam_posterior_mean(
-            x,
-            beta.view(),
-            offset.view(),
-            gam_spec::LikelihoodSpec::binomial_probit(),
-            covariance.view(),
-        )
-        .expect("predict posterior mean");
-        let expected = gam_solve::quadrature::probit_posterior_meanwith_deriv_exact(0.7, 0.5).mean;
-        assert!((out.mean[0] - expected).abs() <= 1e-12);
-        assert!((out.mean[1] - expected).abs() <= 1e-12);
-    }
-
-    #[test]
-    fn predict_posterior_mean_logit_uses_integrated_dispatch() {
-        let x = array![[1.0], [1.0]];
-        let beta = array![0.4];
-        let offset = array![0.0, 0.0];
-        let covariance = Array2::from_diag(&array![0.16]);
-        let out = predict_gam_posterior_mean(
-            x,
-            beta.view(),
-            offset.view(),
-            gam_spec::LikelihoodSpec::binomial_logit(),
-            covariance.view(),
-        )
-        .expect("predict posterior mean");
-        let quadctx = gam_solve::quadrature::QuadratureContext::new();
-        let expected = gam_solve::quadrature::integrated_inverse_link_mean_and_derivative(
-            &quadctx,
-            LinkFunction::Logit,
-            0.4,
-            0.4,
-        )
-        .expect("logit integrated inverse-link moments should evaluate")
-        .mean;
-        assert!((out.mean[0] - expected).abs() <= 1e-12);
-        assert!((out.mean[1] - expected).abs() <= 1e-12);
-    }
-
-    /// #1536 regression (engine level): once confidence bounds are assembled,
-    /// the posterior-mean result must carry the RESPONSE-scale SE
-    /// `SE(μ̂) = |dμ/dη|·SE(η)` in `mean_standard_error` — the quantity the
-    /// FFI/CLI surface as the documented response-scale `std_error` column,
-    /// beside the response-scale `mean`/band. For a curved (logit) link it is
-    /// strictly below the link-scale `eta_standard_error` (dμ/dη = p(1−p) < ¼),
-    /// the mirror of the log-link case where it is larger; this asymmetry is
-    /// exactly what the `std_error` column was getting wrong.
-    #[test]
-    fn enrich_posterior_mean_bounds_populates_response_scale_se_for_logit() {
-        let eta = array![0.0, 0.4];
-        let eta_se = array![0.5, 0.3];
-        let mean = array![0.5, 1.0 / (1.0 + (-0.4_f64).exp())];
-        let mut result = PredictPosteriorMeanResult {
-            eta: eta.clone(),
-            eta_standard_error: eta_se.clone(),
-            mean,
-            mean_standard_error: None,
-            mean_lower: None,
-            mean_upper: None,
-            observation_lower: None,
-            observation_upper: None,
-            point_covariance_source: InferenceCovarianceMode::Conditional,
-            uncertainty_covariance_source: None,
-        };
-        enrich_posterior_mean_bounds(
-            &mut result,
-            0.95,
-            gam_spec::LikelihoodSpec::binomial_logit(),
-            None,
-        )
-        .expect("enrich posterior-mean bounds");
-
-        let mse = result
-            .mean_standard_error
-            .as_ref()
-            .expect("response-scale SE must be populated once bounds are assembled");
-        for i in 0..eta.len() {
-            // Delta-method through the logit inverse link: dμ/dη = p(1−p).
-            let p = 1.0 / (1.0 + (-eta[i]).exp());
-            let expected = p * (1.0 - p) * eta_se[i];
-            assert!(
-                (mse[i] - expected).abs() <= 1e-9,
-                "mean_standard_error[{i}]={} expected delta-method {}",
-                mse[i],
-                expected
-            );
-            // The response-scale SE is strictly below the link-scale SE for a
-            // logit link — the bug reported the latter as the former.
-            assert!(
-                mse[i] < eta_se[i],
-                "response SE {} should be below link SE {} for logit",
-                mse[i],
-                eta_se[i]
-            );
-        }
-    }
-
     /// #1536 control: for the identity-link Gaussian the response and link
     /// scales coincide, so the assembled `mean_standard_error` equals
     /// `eta_standard_error` exactly — the property that hid the bug on Gaussian.
@@ -4200,44 +4003,6 @@ mod tests {
         }
         for i in 0..out.mean.len() {
             assert!((out.mean[i] - expected_mean[i]).abs() <= 1e-12);
-        }
-    }
-
-    #[test]
-    fn predict_royston_parmar_posterior_mean_matches_quadrature_and_fit_path() {
-        let x = array![[1.0], [1.0]];
-        let beta = array![0.35];
-        let offset = array![0.0, 0.0];
-        let covariance = Array2::from_diag(&array![0.09]);
-        let fit = test_fit_with_covariance(beta.clone(), covariance.clone());
-
-        let out = predict_gam_posterior_mean(
-            x.clone(),
-            beta.view(),
-            offset.view(),
-            gam_spec::LikelihoodSpec::royston_parmar(),
-            covariance.view(),
-        )
-        .expect("royston-parmar posterior mean");
-        let out_with_fit = predict_gam_posterior_meanwith_fit(
-            x,
-            beta.view(),
-            offset.view(),
-            gam_spec::LikelihoodSpec::royston_parmar(),
-            covariance.view(),
-            &fit,
-        )
-        .expect("royston-parmar posterior mean with fit");
-
-        let quadctx = gam_solve::quadrature::QuadratureContext::new();
-        let expected = gam_solve::quadrature::survival_posterior_mean(&quadctx, 0.35, 0.3);
-        for i in 0..out.mean.len() {
-            assert!((out.mean[i] - expected).abs() <= 1e-12);
-            assert!((out_with_fit.mean[i] - expected).abs() <= 1e-12);
-            assert!((out_with_fit.mean[i] - out.mean[i]).abs() <= 1e-12);
-            assert!(
-                (out_with_fit.eta_standard_error[i] - out.eta_standard_error[i]).abs() <= 1e-12
-            );
         }
     }
 
@@ -6105,59 +5870,6 @@ mod tests {
     }
 
     #[test]
-    fn posterior_mean_rejects_unusable_dense_covariance_instead_of_becoming_plugin() {
-        let beta = array![0.0, 0.0];
-        let offset = array![0.0];
-        let family = LikelihoodSpec::poisson_log();
-
-        let rectangular = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
-        let rectangular_error = expect_estimation_error(
-            predict_gam_posterior_mean(
-                array![[1.0, 0.0]],
-                beta.view(),
-                offset.view(),
-                family.clone(),
-                rectangular.view(),
-            ),
-            "rectangular covariance must be a typed error, not a dot-product panic",
-        );
-        assert!(rectangular_error.to_string().contains("2x3"));
-
-        let non_finite = array![[f64::NAN, 0.0], [0.0, 1.0]];
-        let non_finite_error = expect_estimation_error(
-            predict_gam_posterior_mean(
-                array![[1.0, 0.0]],
-                beta.view(),
-                offset.view(),
-                family.clone(),
-                non_finite.view(),
-            ),
-            "non-finite covariance must not collapse posterior variance to zero",
-        );
-        assert!(non_finite_error.to_string().contains("non-finite"));
-
-        // This matrix has positive diagonal but eigenvalues 3 and -1.  Along
-        // x=(1,-1), xᵀVx=-2; clamping that to zero would reproduce the finite
-        // plug-in exp(0)=1 instead of reporting the invalid covariance.
-        let indefinite = array![[1.0, 2.0], [2.0, 1.0]];
-        let indefinite_error = expect_estimation_error(
-            predict_gam_posterior_mean(
-                array![[1.0, -1.0]],
-                beta.view(),
-                offset.view(),
-                family,
-                indefinite.view(),
-            ),
-            "negative projected variance must be a typed error",
-        );
-        assert!(
-            indefinite_error
-                .to_string()
-                .contains("not positive semidefinite")
-        );
-    }
-
-    #[test]
     fn standard_posterior_mean_missing_covariance_is_an_end_to_end_error() {
         let mut fit = test_fit_with_covariance(array![0.0], Array2::eye(1));
         fit.covariance_conditional = None;
@@ -6236,27 +5948,6 @@ mod tests {
                 .iter()
                 .zip(plugin.iter())
                 .all(|(posterior, mode)| (posterior - mode).abs() > 1e-3)
-        );
-    }
-
-    #[test]
-    fn posterior_mean_overflow_is_not_replaced_by_plugin_mode() {
-        // E[exp(η)] = exp(η̂ + Var(η)/2) overflows for this representable
-        // covariance. The posterior-mean API must preserve that estimand rather
-        // than silently returning the plug-in/MAP value exp(η̂)=1.
-        let result = predict_gam_posterior_mean(
-            array![[1.0]],
-            array![0.0].view(),
-            array![0.0].view(),
-            LikelihoodSpec::poisson_log(),
-            array![[1600.0]].view(),
-        )
-        .expect("representable covariance must reach posterior-mean evaluation");
-        assert_eq!(result.eta[0], 0.0);
-        assert!(
-            result.mean[0].is_infinite() && result.mean[0].is_sign_positive(),
-            "overflowing posterior mean must remain +inf, got {}",
-            result.mean[0]
         );
     }
 

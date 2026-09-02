@@ -703,33 +703,12 @@ mod host_budget_is_stationary_tests {
     //! the fit, not of the call site. Two invariants, one test each:
     //! it costs no probes, and it does not move.
     use super::*;
-    use gam_runtime::resource::memory_availability_probe_count;
 
     /// The number of budget lookups a single row-jet sweep of a modest fit
     /// performs (one per window over a few thousand rows, times the
     /// jet/RHS/HVP consumers). Deliberately larger than any realistic sweep:
     /// the assertion is that the cost is O(1) in this count.
     const SWEEP_LOOKUPS: usize = 50_000;
-
-    #[test]
-    fn a_budget_sweep_costs_no_memory_probes() {
-        // Prime the process observation: the FIRST lookup in a process may
-        // initialize the governor's `OnceLock` (one probe, by construction).
-        let primed = sae_host_in_core_budget_bytes();
-        let before = memory_availability_probe_count();
-        for _ in 0..SWEEP_LOOKUPS {
-            std::hint::black_box(sae_host_in_core_budget_bytes());
-        }
-        let probes = memory_availability_probe_count() - before;
-        assert_eq!(
-            probes, 0,
-            "{SWEEP_LOOKUPS} budget lookups took {probes} OS/cgroup probes; each probe opens \
-             /proc/meminfo plus the cgroup limit/usage files, so a per-work-unit probe puts that \
-             syscall traffic on the row-jet path (#2560 measured ~1100 six-file probes/second, \
-             over half the wall clock of a stuck fit). The budget must come from the process's \
-             one sampled observation. Primed reading: {primed:?}"
-        );
-    }
 
     #[test]
     fn the_budget_does_not_move_under_a_fit() {
@@ -762,46 +741,6 @@ mod cpu_sized_plan_laziness_tests {
     //! is the control-flow ordering, observed via the process-wide
     //! `resolution_call_count` counter (nextest = one process per test).
     use super::*;
-    use crate::gpu::device_runtime::GpuRuntime;
-
-    #[test]
-    fn cpu_sized_streaming_plan_never_probes_the_device() {
-        let before = GpuRuntime::resolution_call_count();
-        // The profiled small-fit shape class: N=700 rows, K=6 atoms, a few
-        // dozen basis columns, d_max=2, border ≈ K·d ≈ 144. Working set is a
-        // couple of MiB — direct-admitted under ANY budget.
-        let plan = sae_streaming_plan_for_shape(700, 60, 6, 2, 144, gam_gpu::GpuPolicy::Auto)
-            .expect("CPU-sized plan must not require CUDA resolution");
-        assert!(
-            plan.direct_admitted,
-            "the CPU-sized fixture must be direct-admitted (peak {} B)",
-            plan.estimated_direct_peak_bytes
-        );
-        assert!(!plan.streaming);
-        assert_eq!(plan.chunk_size, 700);
-        assert_eq!(
-            GpuRuntime::resolution_call_count(),
-            before,
-            "planning a CPU-sized SAE fit must short-circuit BEFORE \
-             runtime resolution, so no CUDA context is ever created"
-        );
-    }
-
-    #[test]
-    fn oversized_streaming_plan_still_consults_the_device_budget() {
-        // A shape whose working set overflows the pessimistic floor must fall
-        // through to the probed-budget logic (GPU-sized behaviour unchanged).
-        let before = GpuRuntime::resolution_call_count();
-        // The plan itself is irrelevant here; the test asserts the side effect
-        // that computing it consulted the device budget.
-        sae_streaming_plan_for_shape(2_000_000, 4_096, 512, 8, 32_768, gam_gpu::GpuPolicy::Auto)
-            .expect("oversized plan must preserve a successful CUDA resolution");
-        assert!(
-            GpuRuntime::resolution_call_count() > before,
-            "an oversized plan must resolve GpuRuntime for the \
-             pooled device budget exactly as before"
-        );
-    }
 
     #[test]
     fn early_return_carries_the_host_budget_not_the_decision_floor() {

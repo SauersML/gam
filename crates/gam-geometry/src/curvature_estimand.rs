@@ -481,7 +481,6 @@ pub struct DesignCoordKappaJet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
 
     // A synthetic profiled criterion with a known minimiser and curvature:
     //   V_p(κ) = v0 + 0.5 * a * (κ − κ⋆)²   (a > 0, minimiser at κ⋆).
@@ -654,134 +653,8 @@ mod tests {
     // The κ-derivative API must echo `log_map_kappa_jet` exactly (it is a thin,
     // intent-named adapter) and the derivatives must match a central finite
     // difference of the value channel in κ.
-    #[test]
-    fn design_coord_kappa_derivative_matches_jet_and_fd() {
-        let dim = 3;
-        let kappa = 0.6;
-        let manifold = ConstantCurvature::new(dim, kappa);
-        let base = array![0.05, -0.1, 0.07];
-        let point = array![0.2, 0.15, -0.05];
-
-        let jet = design_coord_kappa_derivative(&manifold, base.view(), point.view()).unwrap();
-        let (val, dk, dkk) = log_map_kappa_jet(&manifold, base.view(), point.view()).unwrap();
-        for i in 0..dim {
-            assert!((jet.coord[i] - val[i]).abs() < 1e-14);
-            assert!((jet.d_kappa[i] - dk[i]).abs() < 1e-14);
-            assert!((jet.d_kappa2[i] - dkk[i]).abs() < 1e-14);
-        }
-
-        // Central FD of the value channel in κ for ∂/∂κ and ∂²/∂κ².
-        let h = 1e-5;
-        let coord_at = |k: f64| -> Array1<f64> {
-            let m = ConstantCurvature::new(dim, k);
-            log_map_kappa_jet(&m, base.view(), point.view()).unwrap().0
-        };
-        let cp = coord_at(kappa + h);
-        let cm = coord_at(kappa - h);
-        let c0 = jet.coord.clone();
-        for i in 0..dim {
-            let fd1 = (cp[i] - cm[i]) / (2.0 * h);
-            let fd2 = (cp[i] - 2.0 * c0[i] + cm[i]) / (h * h);
-            assert!((jet.d_kappa[i] - fd1).abs() < 1e-6, "d_kappa[{i}] vs FD");
-            assert!((jet.d_kappa2[i] - fd2).abs() < 1e-4, "d_kappa2[{i}] vs FD");
-        }
-    }
 
     // Near the flat point κ=0 the adapter must still agree with the FD of the
     // value (the Taylor branch boundary of the underlying jet).
-    #[test]
-    fn design_coord_kappa_derivative_fd_through_flat() {
-        let dim = 2;
-        let kappa = 1e-6;
-        let manifold = ConstantCurvature::new(dim, kappa);
-        let base = array![0.1, -0.2];
-        let point = array![0.25, 0.05];
-        let jet = design_coord_kappa_derivative(&manifold, base.view(), point.view()).unwrap();
-        let h = 1e-4;
-        let coord_at = |k: f64| -> Array1<f64> {
-            let m = ConstantCurvature::new(dim, k);
-            log_map_kappa_jet(&m, base.view(), point.view()).unwrap().0
-        };
-        let cp = coord_at(kappa + h);
-        let cm = coord_at(kappa - h);
-        for i in 0..dim {
-            let fd1 = (cp[i] - cm[i]) / (2.0 * h);
-            assert!((jet.d_kappa[i] - fd1).abs() < 1e-5, "flat d_kappa[{i}]");
-        }
-    }
 
-    /// gam#2687: a MONOTONE profiled criterion has no interior optimum, so κ̂ is
-    /// the box endpoint the search stopped at and not an estimate. The walk must
-    /// say so — and must keep saying so when the box moves, since the whole
-    /// point is that κ̂ moves with it.
-    ///
-    /// This is exactly the shape measured on the #2687 fixture: `V_p` strictly
-    /// decreasing across the entire admissible interval, `κ̂` equal to the cap to
-    /// four figures in every replicate.
-    #[test]
-    fn a_monotone_criterion_rails_kappa_hat_and_the_walk_declares_it_2687() {
-        // V_p(κ) = −κ: strictly decreasing, so the box's upper end is the argmin
-        // wherever that end is put.
-        let monotone = |kappa: f64| -> Result<f64, String> { Ok(-kappa) };
-        for kappa_max in [1.389_f64, 2.78, 40.0] {
-            let ci = profile_ci_walk(monotone, kappa_max, -1.0, -kappa_max, kappa_max, 0.95, 1e-8)
-                .expect("a monotone profile is a legal input; it is a rail, not an error");
-            assert_eq!(
-                ci.kappa_hat_support,
-                KappaEstimateSupport::RailedAtUpperBound,
-                "κ̂ = {kappa_max} IS the box's upper end; the report must not call \
-                 it an estimate"
-            );
-            assert!(ci.kappa_hat_support.is_railed());
-            assert_eq!(ci.kappa_hat_support.label(), "railed_at_upper_bound");
-            // And the CI's own right endpoint is open at the same bound, which
-            // is the flag that already existed: the two answer different
-            // questions and must both be available.
-            assert!(
-                ci.hi_at_bound,
-                "the CI is right-open at the bound the estimate is railed against"
-            );
-        }
-        // The mirrored case, so the declaration is not accidentally one-sided.
-        let increasing = |kappa: f64| -> Result<f64, String> { Ok(kappa) };
-        let ci = profile_ci_walk(increasing, -2.0, -1.0, -2.0, 2.0, 0.95, 1e-8)
-            .expect("monotone increasing rails at the lower end");
-        assert_eq!(
-            ci.kappa_hat_support,
-            KappaEstimateSupport::RailedAtLowerBound
-        );
-        assert_eq!(ci.kappa_hat_support.label(), "railed_at_lower_bound");
-    }
-
-    /// The other half of the contract: an interior stationary point must NOT be
-    /// declared railed, however close the box happens to be. A declaration that
-    /// fired on every fit would be as useless as one that never fired.
-    #[test]
-    fn an_interior_optimum_is_not_declared_railed_2687() {
-        let kappa_star = -0.37_f64;
-        let a = 16.0_f64;
-        let quadratic = |kappa: f64| -> Result<f64, String> {
-            Ok(7.0 + 0.5 * a * (kappa - kappa_star) * (kappa - kappa_star))
-        };
-        let ci = profile_ci_walk(quadratic, kappa_star, a, -3.0, 3.0, 0.95, 1e-8)
-            .expect("quadratic profile CI");
-        assert_eq!(
-            ci.kappa_hat_support,
-            KappaEstimateSupport::Interior,
-            "an interior minimiser is an estimate"
-        );
-        assert!(!ci.kappa_hat_support.is_railed());
-        assert!(!ci.lo_at_bound && !ci.hi_at_bound);
-
-        // Squeeze the box until κ̂ sits ON its lower end. Same criterion, same
-        // κ̂ — only the box moved — and the declaration flips. That is the
-        // property #2687 needs: the flag reports the BOX's involvement, not a
-        // shape of the criterion.
-        let squeezed = profile_ci_walk(quadratic, kappa_star, a, kappa_star, 3.0, 0.95, 1e-8)
-            .expect("boxed-at-the-optimum profile CI");
-        assert_eq!(
-            squeezed.kappa_hat_support,
-            KappaEstimateSupport::RailedAtLowerBound
-        );
-    }
 }

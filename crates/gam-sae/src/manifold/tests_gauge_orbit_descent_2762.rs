@@ -389,7 +389,6 @@ fn zz2762_removed_span_slope_and_layout_census() {
     eprintln!("[zz2762] material floor={floor:.6e}");
 }
 
-
 /// The largest `|gᵀvᵢ|` over the removed span at the term's current state.
 fn removed_span_max_slope(
     term: &mut SaeManifoldTerm,

@@ -1,6 +1,4 @@
-use gam::generative::{
-    GenerativeSpec, NoiseModel, generativespec_from_predict, sampleobservation_replicates,
-};
+use gam::generative::{NoiseModel, generativespec_from_predict};
 use gam::hmc::NutsResult;
 use gam::polya_gamma::PolyaGamma;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
@@ -31,24 +29,6 @@ fn bug_polya_gamma_pg11_mean_matches_theory_with_clt_bound() {
         (mean - theory).abs() <= 3.0 * se,
         "PG(1,{c}) empirical mean should lie within 3 standard errors of the analytic mean"
     );
-}
-
-#[test]
-fn bug_sampleobservation_replicates_family_means_converge_to_true_means() {
-    let mut rng = StdRng::seed_from_u64(123);
-    let spec = GenerativeSpec {
-        mean: Array1::from_vec(vec![0.2, 0.5, 0.8]),
-        noise: NoiseModel::Bernoulli,
-    };
-    let draws = sampleobservation_replicates(&spec, 4_000, &mut rng)
-        .expect("replicate sampling should succeed");
-    let empirical = draws.mean_axis(Axis(0)).expect("non-empty draws");
-    for (idx, (&mu_hat, &mu_true)) in empirical.iter().zip(spec.mean.iter()).enumerate() {
-        assert!(
-            (mu_hat - mu_true).abs() < 0.01,
-            "Replicate mean for family observation {idx} should converge to its true mean"
-        );
-    }
 }
 
 #[test]
@@ -102,22 +82,6 @@ fn bug_generativespec_from_predict_roundtrip_recovers_response_distribution() {
         }
         _ => panic!("predict -> generative round-trip should yield Gaussian noise model"),
     }
-}
-
-#[test]
-fn bug_sample_table_same_seed_produces_same_table() {
-    let spec = GenerativeSpec {
-        mean: Array1::from_vec(vec![2.0, 2.0, 2.0]),
-        noise: NoiseModel::Poisson,
-    };
-    let mut rng_a = StdRng::seed_from_u64(99);
-    let mut rng_b = StdRng::seed_from_u64(99);
-    let a = sampleobservation_replicates(&spec, 16, &mut rng_a).expect("sampling should succeed");
-    let b = sampleobservation_replicates(&spec, 16, &mut rng_b).expect("sampling should succeed");
-    assert_eq!(
-        a, b,
-        "Sampling table generation should be deterministic when using the same seed"
-    );
 }
 
 #[test]

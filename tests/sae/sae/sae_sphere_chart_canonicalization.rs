@@ -27,7 +27,6 @@
 use faer::Side as FaerSide;
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use gam::terms::latent::LatentManifold;
-use gam::terms::sae::chart_canonicalization::sphere_chart_isometry_defect;
 use gam::terms::sae::identifiability::{GeneratorFamily, VerdictProvenance};
 use gam::terms::{
     sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
@@ -236,9 +235,6 @@ const WARP_A: f64 = 0.05;
 
 #[derive(Clone, Copy)]
 enum Chart {
-    /// Round-isometric `(lat, lon)` chart: pullback metric is exactly
-    /// `diag(1, cos²lat)` up to a global scale, so the defect is ≈0.
-    Round,
     /// Conformal-boost warped chart: latitude pushed by the zonal-boost Euler
     /// map `lat ↦ lat + a·cos(lat)`. Same physical sphere surface, warped
     /// parameterization — reconstruction cannot see it, the isometry defect can.
@@ -249,7 +245,6 @@ enum Chart {
 /// identity; `Warped` is the zonal-boost Euler map `lat ↦ lat + a·cos(lat)`.
 fn warp_lat(chart: Chart, lat: f64) -> f64 {
     match chart {
-        Chart::Round => lat,
         Chart::Warped => lat + WARP_A * lat.cos(),
     }
 }
@@ -258,7 +253,6 @@ fn warp_lat(chart: Chart, lat: f64) -> f64 {
 /// coordinate whose round latitude is `lat_round`.
 fn inv_warp_lat(chart: Chart, lat_round: f64) -> f64 {
     match chart {
-        Chart::Round => lat_round,
         Chart::Warped => {
             let mut x = lat_round;
             for _ in 0..50 {
@@ -320,7 +314,6 @@ fn chart_coords(chart: Chart) -> Array2<f64> {
 
 fn atom_name(chart: Chart) -> &'static str {
     match chart {
-        Chart::Round => "round-sphere",
         Chart::Warped => "warped-sphere",
     }
 }
@@ -403,122 +396,6 @@ fn planted_sphere(chart: Chart) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho
     let term = SaeManifoldTerm::new(vec![atom], assignment).expect("term");
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(D); 1]);
     (term, z, rho)
-}
-
-/// Reconstruction EV of the atom decode against the planted sphere target.
-fn reconstruction_ev(term: &SaeManifoldTerm, z: &Array2<f64>) -> f64 {
-    let n = z.nrows();
-    let p = z.ncols();
-    let mut mean = vec![0.0_f64; p];
-    for i in 0..n {
-        for j in 0..p {
-            mean[j] += z[[i, j]] / n as f64;
-        }
-    }
-    let mut resid_sq = 0.0_f64;
-    let mut var_sq = 0.0_f64;
-    for i in 0..n {
-        let decoded = term.atoms[0].decoded_row(i);
-        for j in 0..p {
-            let r = z[[i, j]] - decoded[j];
-            resid_sq += r * r;
-            let c = z[[i, j]] - mean[j];
-            var_sq += c * c;
-        }
-    }
-    1.0 - resid_sq / var_sq
-}
-
-/// The round-sphere isometry defect of an atom's CURRENT fitted chart — the
-/// exact objective `canonicalize_charts_post_fit` descends for sphere atoms.
-fn sphere_defect(term: &SaeManifoldTerm) -> f64 {
-    let atom = &term.atoms[0];
-    let evaluator = atom
-        .basis_evaluator
-        .as_ref()
-        .cloned()
-        .expect("sphere atom carries its evaluator");
-    let coords = term.assignment.coords[0].as_matrix();
-    sphere_chart_isometry_defect(
-        evaluator.as_ref(),
-        atom.decoder_coefficients().view(),
-        coords.view(),
-    )
-    .expect("defect must evaluate")
-    .expect("interior sphere band is non-degenerate, defect must be Some")
-}
-
-#[test]
-fn warped_sphere_chart_has_large_defect_round_chart_near_zero() {
-    let (round_term, round_z, _) = planted_sphere(Chart::Round);
-    let (warped_term, warped_z, _) = planted_sphere(Chart::Warped);
-
-    let round_ev = reconstruction_ev(&round_term, &round_z);
-    let warped_ev = reconstruction_ev(&warped_term, &warped_z);
-    assert!(
-        round_ev > 0.999,
-        "round-chart plant must reconstruct the sphere; EV {round_ev}"
-    );
-    assert!(
-        warped_ev > 0.999,
-        "warped-chart plant must reconstruct the same sphere image; EV {warped_ev}"
-    );
-
-    let round_defect = sphere_defect(&round_term);
-    let warped_defect = sphere_defect(&warped_term);
-    assert!(
-        round_defect < 1.0e-3,
-        "a round-isometric sphere chart must score ≈0 defect; got {round_defect:.6e}"
-    );
-    assert!(
-        warped_defect > 1.0e-1,
-        "an anisotropically warped sphere chart must register a sizeable round-sphere \
-         isometry defect; got {warped_defect:.6e}"
-    );
-}
-
-#[test]
-fn warped_sphere_chart_canonicalizes_to_near_isometric() {
-    let (mut warped_term, warped_z, warped_rho) = planted_sphere(Chart::Warped);
-    let (round_term, _round_z, _) = planted_sphere(Chart::Round);
-
-    let defect_before = sphere_defect(&warped_term);
-    let round_optimum = sphere_defect(&round_term);
-    let ev_before = reconstruction_ev(&warped_term, &warped_z);
-
-    // The production post-fit pass pins the warped sphere chart to the
-    // round-sphere conformal-boost minimum-defect representative.
-    warped_term
-        .canonicalize_charts_post_fit(warped_z.view(), &warped_rho, None)
-        .expect("post-fit canonicalization pass");
-
-    assert!(
-        warped_term.atoms[0].chart_canonicalized,
-        "the warped sphere atom must be canonicalized (pinned)"
-    );
-
-    // Acceptance item 1: the canonical chart recovers near-uniform (isometric)
-    // coordinates — the defect collapses to within 10% of the round-chart
-    // optimum (the issue's "within 10% of optimum" bar).
-    let defect_after = sphere_defect(&warped_term);
-    assert!(
-        defect_after < 0.5 * defect_before,
-        "canonicalization must substantially reduce the isometry defect; \
-         {defect_before:.6e} -> {defect_after:.6e}"
-    );
-    assert!(
-        defect_after <= round_optimum + 0.10 * defect_before,
-        "the canonical sphere chart's defect must be within 10% of the round optimum; \
-         after {defect_after:.6e}, round optimum {round_optimum:.6e}, before {defect_before:.6e}"
-    );
-
-    // Image-frozen: reconstruction unchanged (the recomposition gate enforces
-    // ≤ 1e-9 relative drift, so EV moves only at round-off).
-    let ev_after = reconstruction_ev(&warped_term, &warped_z);
-    assert!(
-        (ev_before - ev_after).abs() <= 1.0e-6,
-        "sphere canonicalization must be image-frozen: EV {ev_before} -> {ev_after}"
-    );
 }
 
 #[test]

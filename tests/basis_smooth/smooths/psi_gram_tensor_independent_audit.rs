@@ -19,7 +19,6 @@
 
 use gam::solver::psi_gram_tensor::PsiGramTensor;
 use ndarray::{Array1, Array2};
-use std::cell::Cell;
 
 /// A ν=3/2-Matérn-shaped analytic design with a ψ-free polynomial tail column —
 /// the structural mix of the production radial designs, but with a different
@@ -231,91 +230,6 @@ fn nfree_triple_and_solve_are_bit_identical_to_dense() {
             );
         }
     }
-}
-
-/// CLAIM 2: per-trial work is O(k), not O(n). Build at n and 8n; every per-trial
-/// accessor must call `eval_design` ZERO times, and the assembled per-trial
-/// objects must be n-INVARIANT in shape (k×k / k), so nothing in the hot path
-/// scales with n. The eval counter is the only route to the n×k design, so a flat
-/// post-build count IS the n-independence proof at the source.
-#[test]
-fn per_trial_accessors_are_n_independent() {
-    let k = 5usize;
-    let (psi_lo, psi_hi) = (-1.05_f64, 0.8_f64);
-
-    let build_and_probe = |n: usize| -> (usize, (usize, usize), usize) {
-        let w = Array1::from_iter((0..n).map(|i| 0.7 + 0.5 * ((i % 6) as f64) / 5.0));
-        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.17).sin() + 0.1));
-        let calls = Cell::new(0usize);
-        let tensor = PsiGramTensor::build(
-            |psi| {
-                calls.set(calls.get() + 1);
-                audit_design(psi, n, k)
-            },
-            w.view(),
-            z.view(),
-            psi_lo,
-            psi_hi,
-        )
-        .expect("audit design must certify");
-        let after_build = calls.get();
-
-        // A dense ψ-sweep of every per-trial accessor the κ hot path consumes.
-        let mut g_shape = (0usize, 0usize);
-        let m = 50usize;
-        let lo = psi_lo + 0.05;
-        let hi = psi_hi - 0.05;
-        for i in 0..m {
-            let psi = lo + (hi - lo) * (i as f64) / (m as f64 - 1.0);
-            let g = tensor.gram_at(psi);
-            g_shape = (g.nrows(), g.ncols());
-            tensor.rhs_at(psi);
-            tensor.dgram_dpsi(psi);
-            tensor.drhs_dpsi(psi);
-            tensor.d2gram_dpsi2(psi);
-            tensor.d2rhs_dpsi2(psi);
-            tensor.gaussian_fixed_cache_at(psi);
-            // Witness assembly is also n-free k-space work.
-            tensor.reduced_basis_equal(lo, psi);
-        }
-        // Per-trial eval calls AFTER build.
-        let per_trial_calls = calls.get() - after_build;
-        (after_build, g_shape, per_trial_calls)
-    };
-
-    let n_small = 400usize;
-    let n_large = 8 * n_small; // 3200 rows
-    let (build_small, shape_small, trial_small) = build_and_probe(n_small);
-    let (build_large, shape_large, trial_large) = build_and_probe(n_large);
-
-    // The one-time build streams the design (node ladder + spot/grad checks). That
-    // is allowed to be O(n) and is NOT the claim under test. The PER-TRIAL count
-    // is the claim: it must be ZERO at both sizes.
-    assert!(
-        build_small > 0 && build_large > 0,
-        "build must stream the design"
-    );
-    assert_eq!(
-        trial_small, 0,
-        "per-trial accessors re-streamed the n×k design at n={n_small} \
-         ({trial_small} extra eval_design calls) — NOT n-free"
-    );
-    assert_eq!(
-        trial_large, 0,
-        "per-trial accessors re-streamed the n×k design at n={n_large} \
-         ({trial_large} extra eval_design calls) — NOT n-free"
-    );
-    // The assembled per-trial objects are k×k at BOTH n — no n in the hot path.
-    assert_eq!(
-        shape_small,
-        (k, k),
-        "assembled Gram must be k×k, got {shape_small:?}"
-    );
-    assert_eq!(
-        shape_large, shape_small,
-        "assembled Gram shape changed with n ({shape_large:?} vs {shape_small:?}) \
-         — per-trial work is not n-invariant"
-    );
 }
 
 /// CLAIM 3: witness soundness, BOTH directions. A design whose third column

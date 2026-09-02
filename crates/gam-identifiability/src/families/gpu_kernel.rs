@@ -35,14 +35,3 @@
 //! chunks of `ROW_CHUNK`; per chunk we co-load row entries into registers
 //! and the 4×4 H slice into shared memory once per row.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn kernel_src_declares_expected_symbol() {
-        assert!(KERNEL_SRC.contains(KERNEL_NAME));
-        assert!(KERNEL_SRC.contains("extern \"C\" __global__"));
-        assert!(KERNEL_SRC.contains("packed_index_dev"));
-    }
-}

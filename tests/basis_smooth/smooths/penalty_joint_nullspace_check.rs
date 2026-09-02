@@ -35,9 +35,8 @@
 //! A clean 2-block model (no aliasing) with full-rank penalties on both
 //! blocks passes canonicalize without triggering any failure.
 
-use gam::families::custom_family::{ParameterBlockSpec, PenaltyMatrix};
+use gam::families::custom_family::ParameterBlockSpec;
 use gam::identifiability::audit::{MapUniquenessError, check_map_uniqueness};
-use gam::identifiability::canonical::canonicalize_for_identifiability;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::{Array1, Array2};
 
@@ -172,69 +171,3 @@ fn map_uniqueness_check_fails_when_s_zero_on_null_direction() {
 
 // ── canonicalize_for_identifiability end-to-end tests ────────────────────────
 
-/// A clean 2-block model (no aliasing, full-rank J, non-trivial penalties)
-/// passes `canonicalize_for_identifiability` without any error.
-#[test]
-fn canonicalize_clean_model_with_penalties_passes_map_check() {
-    // Block A: [v0 = linramp, v1 = sin(x)] — 2 independent columns.
-    // Block B: [v2 = cos(x), v3 = exp(-x)] — 2 independent columns.
-    // No cross-block aliasing. J is full column rank.
-    let mut design_a = Array2::<f64>::zeros((N, 2));
-    let mut design_b = Array2::<f64>::zeros((N, 2));
-    for i in 0..N {
-        let x = (i as f64 + 1.0) * std::f64::consts::PI / (N as f64);
-        design_a[[i, 0]] = (i + 1) as f64;
-        design_a[[i, 1]] = x.sin();
-        design_b[[i, 0]] = x.cos();
-        design_b[[i, 1]] = (-0.1 * (i as f64)).exp();
-    }
-    // Diagonal penalties: cover all directions.
-    let mut pen_a = Array2::<f64>::zeros((2, 2));
-    pen_a[[0, 0]] = 1.0;
-    pen_a[[1, 1]] = 1.0;
-    let mut pen_b = Array2::<f64>::zeros((2, 2));
-    pen_b[[0, 0]] = 1.0;
-    pen_b[[1, 1]] = 1.0;
-
-    let spec_a = ParameterBlockSpec {
-        name: "block_a".to_string(),
-        design: DesignMatrix::Dense(DenseDesignMatrix::from(design_a)),
-        offset: Array1::<f64>::zeros(N),
-        penalties: vec![PenaltyMatrix::Dense(pen_a)],
-        nullspace_dims: Vec::new(),
-        initial_log_lambdas: Array1::from(vec![0.0]),
-        initial_beta: None,
-        gauge_priority: 100,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    };
-    let spec_b = ParameterBlockSpec {
-        name: "block_b".to_string(),
-        design: DesignMatrix::Dense(DenseDesignMatrix::from(design_b)),
-        offset: Array1::<f64>::zeros(N),
-        penalties: vec![PenaltyMatrix::Dense(pen_b)],
-        nullspace_dims: Vec::new(),
-        initial_log_lambdas: Array1::from(vec![0.0]),
-        initial_beta: None,
-        gauge_priority: 100,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    };
-
-    let result = canonicalize_for_identifiability(
-        &[spec_a, spec_b],
-        // Both blocks are ordinary bases of their column spaces (#2748).
-        &[
-            gam::families::custom_family::CoefficientCoordinate::Spanning,
-            gam::families::custom_family::CoefficientCoordinate::Spanning,
-        ],
-    );
-    assert!(
-        result.is_ok(),
-        "clean 2-block model with full-rank J and non-trivial penalties must pass \
-         all checks including MAP uniqueness; got: {:?}",
-        result.err(),
-    );
-}

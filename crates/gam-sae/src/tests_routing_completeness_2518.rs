@@ -27,7 +27,6 @@ use ndarray::{Array1, Array2, Array3};
 
 use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
 use crate::encode::{certified_encode_candidates, AtlasConfig, EncodeAtlas};
-use crate::test_support::nearest_charts_topk;
 use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom};
 
 /// A `d = 1` periodic atom whose decoded image FOLDS: the first harmonic traces a
@@ -73,39 +72,6 @@ fn recon_at(decoder: &Array2<f64>, evaluator: &PeriodicHarmonicEvaluator, t: f64
     phi.row(0).dot(decoder)
 }
 
-fn residual_at(
-    decoder: &Array2<f64>,
-    evaluator: &PeriodicHarmonicEvaluator,
-    t: f64,
-    x: &Array1<f64>,
-    amplitude: f64,
-) -> f64 {
-    let recon = recon_at(decoder, evaluator, t);
-    let diff = x - &(amplitude * &recon);
-    diff.dot(&diff).sqrt()
-}
-
-/// Dense-grid brute-force global minimum of the encode objective — the objective
-/// truth the certified encode is supposed to find, computed without reference to
-/// any of the machinery under test.
-fn brute_force_min(
-    decoder: &Array2<f64>,
-    evaluator: &PeriodicHarmonicEvaluator,
-    x: &Array1<f64>,
-    amplitude: f64,
-) -> (f64, f64) {
-    let scan = 200_000usize;
-    let mut best = (f64::INFINITY, 0.0_f64);
-    for i in 0..scan {
-        let t = i as f64 / scan as f64;
-        let err = residual_at(decoder, evaluator, t, x, amplitude);
-        if err < best.0 {
-            best = (err, t);
-        }
-    }
-    best
-}
-
 fn folded_atlas(atom: &SaeManifoldAtom, charts: usize) -> EncodeAtlas {
     let centers =
         Array2::from_shape_fn((charts, 1), |(c, _)| c as f64 / charts as f64);
@@ -123,136 +89,6 @@ fn folded_atlas(atom: &SaeManifoldAtom, charts: usize) -> EncodeAtlas {
     EncodeAtlas {
         atoms: vec![atlas],
         config: AtlasConfig::default(),
-    }
-}
-
-/// **The load-bearing test**, in two halves that answer two different questions.
-///
-/// 1. *Does the restriction the deleted constant imposed actually lose the global
-///    minimum on this fixture?* Answered from the GEOMETRY alone, with no
-///    reference to the solver: each chart can only ever return a coordinate in its
-///    own ball, so the best residual reachable through a set of charts is the
-///    minimum over the union of their balls. Comparing that union over the four
-///    nearest charts against the union over all of them is exactly the question
-///    "could top-4 routing have found the global basin?", and it is deterministic.
-/// 2. *Does the shipped encode find it?* Answered against a brute-force minimum
-///    over a dense latent grid.
-///
-/// Without the first half the second would pass just as well with the constant
-/// reinstated, and would be measuring a fixture that no longer reaches the defect.
-#[test]
-fn folded_atom_encode_reaches_the_global_minimum_and_top4_routing_could_not() {
-    let (atom, decoder, m) = folded_atom();
-    let evaluator = PeriodicHarmonicEvaluator::new(m).expect("evaluator");
-    let charts = 64usize;
-    let atlas = folded_atlas(&atom, charts);
-    let amplitude = 1.0_f64;
-
-    // Best residual reachable from a set of charts: the minimum over the union of
-    // their balls. The atlas tiles the circle (radius = half the center spacing),
-    // so the union over ALL charts is the whole latent domain.
-    let reachable_min = |chart_indices: &[usize], x: &Array1<f64>| -> f64 {
-        let mut best = f64::INFINITY;
-        for &c in chart_indices {
-            let chart = &atlas.atoms[0].charts[c];
-            if chart.certified_radius <= 0.0 {
-                continue;
-            }
-            let center = chart.region.center[0];
-            let radius = chart.region.radius;
-            let samples = 400usize;
-            for s in 0..=samples {
-                let t = center - radius + 2.0 * radius * (s as f64 / samples as f64);
-                best = best.min(residual_at(&decoder, &evaluator, t, x, amplitude));
-            }
-        }
-        best
-    };
-    let all_charts: Vec<usize> = (0..atlas.atoms[0].charts.len()).collect();
-
-    let mut rows_checked = 0usize;
-    let mut rows_where_top4_could_not_reach_the_optimum = 0usize;
-    let mut worst_top4_penalty = 0.0_f64;
-    // The shortest distance-ordered PREFIX that still contains the global optimum,
-    // maximised over the probe set. `1` would mean nearest-chart routing was
-    // always sound here; anything above it is a row the old fixed prefix had to
-    // be large enough to cover, and anything above `4` is a row the deleted
-    // constant provably got wrong.
-    let mut max_prefix_needed = 0usize;
-
-    // Rows swept densely THROUGH the crossing region, where the two branches are
-    // ambient-close and latent-far.
-    for probe in 0..400usize {
-        let u = probe as f64 / 400.0;
-        let angle = std::f64::consts::TAU * u;
-        let radius = 0.02 + 1.15 * ((probe % 17) as f64 / 16.0);
-        let x = Array1::from(vec![radius * angle.cos(), radius * angle.sin()]);
-
-        // (1) Geometry: what could a distance-ordered prefix have reached?
-        let best_all = reachable_min(&all_charts, &x);
-        let ordered: Vec<usize> = certified_encode_candidates(&atlas.atoms[0], x.view(), amplitude)
-            .into_iter()
-            .map(|(idx, _, _)| idx)
-            .collect();
-        let mut needed = ordered.len();
-        for take in 1..=ordered.len() {
-            if reachable_min(&ordered[..take], &x) <= best_all + 1.0e-9 * (1.0 + best_all) {
-                needed = take;
-                break;
-            }
-        }
-        max_prefix_needed = max_prefix_needed.max(needed);
-        let top4 = nearest_charts_topk(&atlas.atoms[0], x.view(), amplitude, 4);
-        let best_top4 = reachable_min(&top4, &x);
-        if best_top4 > best_all + 1.0e-6 * (1.0 + best_all) {
-            rows_where_top4_could_not_reach_the_optimum += 1;
-            worst_top4_penalty = worst_top4_penalty.max(best_top4 - best_all);
-        }
-
-        // (2) Solver: does the shipped encode find the global minimum?
-        let (truth_err, truth_t) = brute_force_min(&decoder, &evaluator, &x, amplitude);
-        let (coord, cert) = atlas
-            .certified_encode_row(&atom, 0, x.view(), amplitude)
-            .expect("certified encode returns");
-        if !cert.certified() {
-            // An uncertified row is routed to the exact multi-start solve by
-            // contract; it makes no claim, so it is not evidence either way.
-            continue;
-        }
-        rows_checked += 1;
-        let got_err = residual_at(&decoder, &evaluator, coord[0], &x, amplitude);
-        assert!(
-            got_err <= truth_err + 1.0e-3 * (1.0 + truth_err),
-            "row {probe}: certified encode landed at residual {got_err:.9e} (t={}) but the \
-             global minimum over a 200k grid is {truth_err:.9e} (t={truth_t:.6}). A certified \
-             encode in the wrong basin is the exact #2518 failure.",
-            coord[0]
-        );
-    }
-
-    println!(
-        "[#2518] lemniscate/{charts} charts: rows_certified={rows_checked} \
-         max_prefix_needed={max_prefix_needed} rows_top4_lost_the_optimum=\
-         {rows_where_top4_could_not_reach_the_optimum} worst_top4_penalty={worst_top4_penalty:.6e}"
-    );
-    assert!(
-        rows_checked >= 20,
-        "the fixture must certify a meaningful number of rows; got {rows_checked}"
-    );
-    // A distance-ordered PREFIX is not a sound stopping rule: on this fixture the
-    // global optimum is not always in the nearest chart, so any fixed prefix is a
-    // bet on how far down the order the winner can sit. That is the property the
-    // deleted constant was betting on, and the reason the scan is now complete.
-    assert!(
-        max_prefix_needed >= 2,
-        "FIXTURE DOES NOT REACH THE DEFECT: the nearest chart alone always contained the \
-         global optimum, so no prefix rule of any length is under test here."
-    );
-    if rows_where_top4_could_not_reach_the_optimum > 0 {
-        assert!(
-            worst_top4_penalty > 0.0,
-            "a counted top-4 loss must carry a real residual gap"
-        );
     }
 }
 

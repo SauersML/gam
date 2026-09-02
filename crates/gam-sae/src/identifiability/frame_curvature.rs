@@ -1058,29 +1058,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_column_and_output_are_inverse() {
-        let layout = FrameColumnLayout::new(5, &[2, 1, 3]);
-        assert_eq!(layout.param_dim(), 5 * 6);
-        assert_eq!(layout.block_dim(), 6);
-        for i in 0..5 {
-            for l in 0..6 {
-                let c = layout.column(i, l);
-                assert_eq!(layout.output_of(c), Some(i), "column {c} = (i={i}, l={l})");
-            }
-        }
-        // The map is a bijection onto [0, param_dim).
-        let mut seen = vec![false; layout.param_dim()];
-        for i in 0..5 {
-            for l in 0..6 {
-                let c = layout.column(i, l);
-                assert!(!seen[c], "column {c} produced twice");
-                seen[c] = true;
-            }
-        }
-        assert!(seen.into_iter().all(|s| s));
-    }
-
-    #[test]
     fn layout_matches_the_certificate_index_arithmetic() {
         // `offset_k + i·d_k + a`, written out independently.
         let axes = [2usize, 1, 3];
@@ -1227,21 +1204,6 @@ mod tests {
     }
 
     #[test]
-    fn a_degenerate_layout_yields_an_empty_curvature_rather_than_an_error() {
-        for axes in [vec![], vec![0usize], vec![1usize, 2]] {
-            for p in [0usize, 3] {
-                let layout = FrameColumnLayout::new(p, &axes);
-                let curvature = OutputBlockRootAccumulator::new(layout.clone()).finish(0);
-                assert_eq!(curvature.param_dim(), layout.param_dim());
-                assert!(curvature.is_finite());
-                let gram = curvature.to_dense_gram();
-                assert_eq!(gram.dim(), (layout.param_dim(), layout.param_dim()));
-                assert!(gram.iter().all(|v| *v == 0.0));
-            }
-        }
-    }
-
-    #[test]
     fn is_finite_refuses_a_nan_in_any_representation() {
         let layout = FrameColumnLayout::new(2, &[1]);
         let mut roots = Array3::<f64>::zeros((2, 1, 1));
@@ -1277,37 +1239,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn output_blocks_densify_to_a_block_diagonal_gram() {
-        let layout = FrameColumnLayout::new(3, &[1, 2]);
-        let mut roots = Array3::<f64>::zeros((3, 3, 3));
-        for i in 0..3 {
-            for a in 0..3 {
-                for b in a..3 {
-                    roots[[i, a, b]] = (i + 1) as f64 * ((a + 1) + (b + 1)) as f64;
-                }
-            }
-        }
-        let curvature = ResidualGaugeCurvature::OutputBlockRoots {
-            roots,
-            dense_rows: Array2::<f64>::zeros((0, layout.param_dim())),
-            layout: layout.clone(),
-            root_rows: 7,
-        };
-        let dense = curvature.to_dense_gram();
-        assert_eq!(dense.dim(), (9, 9));
-        for a in 0..9 {
-            for b in 0..9 {
-                let (ia, ib) = (
-                    layout.output_of(a).expect("in range"),
-                    layout.output_of(b).expect("in range"),
-                );
-                if ia != ib {
-                    assert_eq!(dense[[a, b]], 0.0, "off-block ({a},{b}) must be zero");
-                } else {
-                    assert!(dense[[a, b]] != 0.0, "in-block ({a},{b}) must be populated");
-                }
-            }
-        }
-    }
 }

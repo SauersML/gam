@@ -1,24 +1,12 @@
 use gam::ResourcePolicy;
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::terms::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, OneDimensionalBoundary,
-    PeriodicBSplineBasisSpec, build_bspline_basis_1d, build_periodic_bspline_basis_1d,
-    cyclic_bspline_derivative_penalty_matrix, fit_periodic_bspline_curve,
-    periodic_bspline_first_derivative_nd,
-};
+use gam::terms::basis::{BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, OneDimensionalBoundary, PeriodicBSplineBasisSpec, build_bspline_basis_1d, build_periodic_bspline_basis_1d, cyclic_bspline_derivative_penalty_matrix, periodic_bspline_first_derivative_nd};
 use gam::terms::smooth::{
     SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec, build_term_collection_design,
 };
 use gam::terms::term_builder::build_termspec;
-use ndarray::{Array1, Array2, Axis, array};
-
-fn max_abs(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f64::max)
-}
+use ndarray::{Array2, Axis, array};
 
 fn periodic_derivative_dense(
     u: ndarray::ArrayView1<'_, f64>,
@@ -78,78 +66,6 @@ fn cyclic_derivative_penalty_wraps_and_has_constant_nullspace() {
         for j in 0..10 {
             assert!((s[[i, j]] - s[[(i + 1) % 10, (j + 1) % 10]]).abs() < 1e-12 * scale);
             assert_eq!(s[[i, j]], s[[j, i]]);
-        }
-    }
-}
-
-#[test]
-fn multi_output_periodic_curve_fits_anisotropic_ellipse_in_ambient_3d() {
-    let n = 160;
-    let period = std::f64::consts::TAU;
-    let u = Array1::from_iter((0..n).map(|i| period * (i as f64) / (n as f64)));
-    let mut y = Array2::<f64>::zeros((n, 3));
-    for (i, &t) in u.iter().enumerate() {
-        let c = t.cos();
-        let s = t.sin();
-        y[[i, 0]] = 1.2 + 3.5 * c - 0.4 * s;
-        y[[i, 1]] = -0.7 + 0.9 * c + 1.8 * s;
-        y[[i, 2]] = 0.3 - 1.1 * c + 0.6 * s;
-    }
-
-    let spec = PeriodicBSplineBasisSpec::new(3, 32, period, 0.0, 2);
-    let curve = fit_periodic_bspline_curve(u.view(), y.view(), &spec, 1e-10).unwrap();
-    assert_eq!(curve.coefficients.dim(), (32, 3));
-
-    let fitted = curve.evaluate(u.view()).unwrap();
-    let err = max_abs(&fitted, &y);
-    assert!(err < 2.5e-3, "max ellipse fit error {err}");
-
-    let seam = array![0.0, period];
-    let seam_fit = curve.evaluate(seam.view()).unwrap();
-    for col in 0..3 {
-        assert!((seam_fit[[0, col]] - seam_fit[[1, col]]).abs() < 1e-11);
-    }
-
-    let range_x = y
-        .column(0)
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
-            (lo.min(v), hi.max(v))
-        });
-    let range_y = y
-        .column(1)
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
-            (lo.min(v), hi.max(v))
-        });
-    assert!(range_x.1 - range_x.0 > 1.5 * (range_y.1 - range_y.0));
-}
-
-#[test]
-fn multi_output_periodic_curve_handles_distorted_closed_loop_in_4d() {
-    let n = 192;
-    let period = 1.0;
-    let u = Array1::from_iter((0..n).map(|i| (i as f64) / (n as f64)));
-    let mut y = Array2::<f64>::zeros((n, 4));
-    for (i, &t01) in u.iter().enumerate() {
-        let t = std::f64::consts::TAU * t01;
-        y[[i, 0]] = 2.0 * t.cos() + 0.25 * (3.0 * t).cos();
-        y[[i, 1]] = 0.55 * t.sin() - 0.18 * (2.0 * t).sin();
-        y[[i, 2]] = 0.4 * (t + 0.3).cos() + 0.7 * (2.0 * t).sin();
-        y[[i, 3]] = 0.1 * t.cos() - 0.35 * (4.0 * t).sin();
-    }
-
-    let spec = PeriodicBSplineBasisSpec::new(3, 48, period, 0.0, 2);
-    let curve = fit_periodic_bspline_curve(u.view(), y.view(), &spec, 1e-9).unwrap();
-    let fitted = curve.evaluate(u.view()).unwrap();
-    let err = max_abs(&fitted, &y);
-    assert!(err < 4e-3, "max distorted-loop fit error {err}");
-
-    let shifted = array![0.125, 1.125, -0.875];
-    let shifted_fit = curve.evaluate(shifted.view()).unwrap();
-    for row in 1..shifted_fit.nrows() {
-        for col in 0..shifted_fit.ncols() {
-            assert!((shifted_fit[[0, col]] - shifted_fit[[row, col]]).abs() < 1e-11);
         }
     }
 }

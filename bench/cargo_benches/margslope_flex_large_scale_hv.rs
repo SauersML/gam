@@ -15,13 +15,13 @@
 mod margslope_flex_equivalence;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use margslope_flex_equivalence::{
-    build_large_scale_shape_problem, cycle_capped_options, fit_problem,
-};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+use margslope_flex_equivalence::fit_problem;
+use margslope_flex_equivalence::cycle_capped_options;
+use margslope_flex_equivalence::build_large_scale_shape_problem;
 
 const DEFAULT_REPRO_N: usize = 50_000;
 const BENCH_INNER_CYCLES: usize = 1;

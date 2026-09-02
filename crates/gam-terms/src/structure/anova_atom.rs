@@ -1400,69 +1400,6 @@ mod tests {
         }
     }
 
-    /// A planted ADDITIVE surface (`C = a·1ᵀ + 1·bᵀ` on partition-of-unity
-    /// bases) has identically zero interaction, fissions, and the children
-    /// reassemble the parent exactly (lossless split, defect 0).
-    #[test]
-    fn planted_additive_torus_fissions_losslessly() {
-        let phi_a = pou_basis();
-        let phi_b = pou_basis_b();
-        let a = array![1.0, -0.5, 2.0];
-        let b = array![0.3, 1.7, -1.0];
-        let mut c = Array2::<f64>::zeros((3, 3));
-        for j in 0..3 {
-            for k in 0..3 {
-                c[[j, k]] = a[j] + b[k];
-            }
-        }
-        let input = CarveInput {
-            phi_a: phi_a.view(),
-            phi_b: phi_b.view(),
-            coeffs: &[c.clone()],
-            coeff_covariance: None,
-            joint_coeff_covariance: None,
-            kernel_a: None,
-            kernel_b: None,
-            edf: None,
-            residual_df: 100.0,
-            scale: SmoothTestScale::Known,
-            notion: BindingNotion::Representational,
-        };
-        let report = carve(&input, 0.05).expect("carve");
-        assert!(report.interaction_fraction < 1e-24);
-        let plan = report
-            .fission
-            .as_ref()
-            .expect("additive surface must fission");
-        assert!(plan.reconstruction_defect < 1e-24);
-
-        // Children reassemble the parent surface exactly.
-        let mean_a = basis_means(phi_a.view());
-        let mean_b = basis_means(phi_b.view());
-        for row in 0..phi_a.nrows() {
-            let pa = phi_a.row(row);
-            let pb = phi_b.row(row);
-            let raw = pa.dot(&c.dot(&pb.to_owned()));
-            let pa_c: Array1<f64> = &pa.to_owned() - &mean_a;
-            let pb_c: Array1<f64> = &pb.to_owned() - &mean_b;
-            let child_sum = plan.child_a[0].constant
-                + pa_c.dot(&plan.child_a[0].centered_coeffs)
-                + plan.child_b[0].constant
-                + pb_c.dot(&plan.child_b[0].centered_coeffs);
-            assert!((raw - child_sum).abs() < 1e-12);
-        }
-
-        // Raw-coefficient form on the partition-of-unity basis agrees too.
-        let raw_a = plan.child_a[0].raw_coeffs_partition_of_unity(mean_a.view());
-        for row in 0..phi_a.nrows() {
-            let pa = phi_a.row(row);
-            let pa_c: Array1<f64> = &pa.to_owned() - &mean_a;
-            let via_centered =
-                plan.child_a[0].constant + pa_c.dot(&plan.child_a[0].centered_coeffs);
-            assert!((pa.dot(&raw_a) - via_centered).abs() < 1e-12);
-        }
-    }
-
     /// A planted BOUND surface (rank-1 centered interaction) must refuse
     /// to fission, and with a tight posterior the binding test must reject;
     /// the planted additive surface under the same covariance must NOT

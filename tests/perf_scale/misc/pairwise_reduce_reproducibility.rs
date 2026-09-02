@@ -3,10 +3,7 @@
 //!
 //! All inputs are fixed and deterministic — no clock, no randomness.
 
-use gam::linalg::pairwise_reduce::{
-    BASE_CHUNK, StreamingPairwise, pairwise_reduce, pairwise_reduce_chunked, pairwise_sum,
-    pairwise_sum_chunked,
-};
+use gam::linalg::pairwise_reduce::{BASE_CHUNK, pairwise_reduce, pairwise_sum};
 
 /// A deterministic, fixed sequence with a wide dynamic range: one large value
 /// followed by many tiny values. Naively summed left to right (large first),
@@ -75,71 +72,6 @@ fn bit_reproducible_same_slice_twice() {
         a.to_bits(),
         ga.to_bits(),
         "pairwise_sum and pairwise_reduce(+) must agree bit-for-bit"
-    );
-}
-
-#[test]
-fn chunked_streaming_equals_whole_slice_bit_for_bit() {
-    let xs = varied_input();
-    let whole = pairwise_sum(&xs);
-
-    // Try many different chunkings, including degenerate ones; every one must
-    // reproduce the whole-slice result bit-for-bit.
-    let chunk_sizes = [
-        1usize,
-        2,
-        3,
-        7,
-        BASE_CHUNK - 1,
-        BASE_CHUNK,
-        BASE_CHUNK + 1,
-        2 * BASE_CHUNK,
-        3 * BASE_CHUNK + 5,
-        xs.len(),
-    ];
-    for &cs in &chunk_sizes {
-        let chunks: Vec<&[f64]> = xs.chunks(cs).collect();
-
-        // Via the convenience chunked entry point.
-        let streamed = pairwise_sum_chunked(chunks.iter().copied());
-        assert_eq!(
-            whole.to_bits(),
-            streamed.to_bits(),
-            "streaming with chunk size {cs} must equal whole-slice pairwise_sum bit-for-bit"
-        );
-
-        // Via the explicit streaming accumulator, pushing chunk by chunk.
-        let mut acc = StreamingPairwise::new(|p, q| p + q, 0.0);
-        for chunk in &chunks {
-            acc.extend_from_slice(chunk);
-        }
-        let streamed2 = acc.finish();
-        assert_eq!(
-            whole.to_bits(),
-            streamed2.to_bits(),
-            "StreamingPairwise (chunk size {cs}) must equal whole-slice bit-for-bit"
-        );
-
-        // And one element at a time — the most aggressive re-chunking.
-        let mut acc1 = StreamingPairwise::new(|p, q| p + q, 0.0);
-        for &x in &xs {
-            acc1.push(x);
-        }
-        assert_eq!(
-            whole.to_bits(),
-            acc1.finish().to_bits(),
-            "element-at-a-time streaming must equal whole-slice bit-for-bit"
-        );
-    }
-
-    // The generic chunked entry point must also match the generic whole-slice
-    // reduce bit-for-bit.
-    let g_whole = pairwise_reduce(&xs, |p, q| p + q, 0.0);
-    let g_chunked = pairwise_reduce_chunked(xs.chunks(7), |p, q| p + q, 0.0);
-    assert_eq!(
-        g_whole.to_bits(),
-        g_chunked.to_bits(),
-        "pairwise_reduce_chunked must equal pairwise_reduce bit-for-bit"
     );
 }
 

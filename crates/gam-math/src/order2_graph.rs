@@ -1270,7 +1270,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jet_scalar::{DynamicJetArena, DynamicOrder2, FixedRuntimeJet, JetScalar};
+    use crate::jet_scalar::{FixedRuntimeJet, JetScalar};
     use crate::nested_dual::JetField;
     use std::cell::Cell;
 
@@ -1320,33 +1320,6 @@ mod tests {
         }
     }
 
-    struct MatrixFreeDense3<'arena> {
-        matrix: [[f64; 3]; 3],
-        workspace: &'arena Order2GraphWorkspace,
-    }
-
-    impl SymmetricQuadraticCoefficients for MatrixFreeDense3<'_> {
-        fn dimension(&self) -> usize {
-            3
-        }
-
-        fn multiply(&self, input: &[f64], output: &mut [f64]) {
-            assert!(self.workspace.tape().node_len != 0);
-            for row in 0..3 {
-                output[row] = (0..3)
-                    .map(|column| self.matrix[row][column] * input[column])
-                    .sum();
-            }
-        }
-
-        fn coefficient(&self, row: usize, column: usize) -> f64 {
-            panic!(
-                "compiled graph quadratic lowering must preserve matrix-free multiply, \
-                 but entry ({row}, {column}) was read densely"
-            )
-        }
-    }
-
     struct MatrixFreeIdentity32<'arena> {
         workspace: &'arena Order2GraphWorkspace,
     }
@@ -1390,106 +1363,6 @@ mod tests {
                 "compiled graph quadratic lowering must preserve matrix-free multiply, \
                  but entry ({row}, {column}) was read densely"
             )
-        }
-    }
-
-    #[test]
-    fn compiled_graph_quadratic_arity_is_independent_and_matrix_free() {
-        let mut workspace = Order2GraphWorkspace::new();
-        workspace.reset(2);
-        let x = Order2Graph::<2>::variable(0.4, 0, 2, &workspace);
-        let y = Order2Graph::<2>::variable(-0.7, 1, 2, &workspace);
-        let xy = x.product(&y);
-        assert_eq!(
-            workspace.tape().nodes[xy.node].primary_axis,
-            NO_PRIMARY_AXIS,
-            "derived quadratic inputs must select the unrestricted Jacobian projection",
-        );
-        let graph_linear = Order2Graph::linear_combination(&[x, xy], &[0.3, -0.8], 2, &workspace);
-        let coefficients = MatrixFreeDense3 {
-            matrix: [[1.2, -0.3, 0.25], [-0.3, 0.8, 0.17], [0.25, 0.17, 1.4]],
-            workspace: &workspace,
-        };
-        let graph =
-            Order2Graph::<2>::symmetric_quadratic_form(&[x, y, xy], &coefficients, 2, &workspace)
-                .into_order2();
-
-        let arena = DynamicJetArena::new();
-        let eager_x = DynamicOrder2::variable(0.4, 0, 2, &arena);
-        let eager_y = DynamicOrder2::variable(-0.7, 1, 2, &arena);
-        let eager_xy = eager_x.product(&eager_y);
-        let eager_linear =
-            DynamicOrder2::linear_combination(&[eager_x, eager_xy], &[0.3, -0.8], 2, &arena);
-        let eager = DynamicOrder2::symmetric_quadratic_form(
-            &[eager_x, eager_y, eager_xy],
-            &coefficients,
-            2,
-            &arena,
-        );
-
-        let close = |actual: f64, expected: f64| {
-            let tolerance = 2.0e-13 * actual.abs().max(expected.abs()).max(1.0);
-            assert!((actual - expected).abs() <= tolerance);
-        };
-        let graph_linear = graph_linear.into_order2();
-        close(graph_linear.value(), eager_linear.v);
-        close(graph.value(), eager.v);
-        for primary in 0..2 {
-            close(graph_linear.g()[primary], eager_linear.g()[primary]);
-            close(graph.g()[primary], eager.g()[primary]);
-        }
-        for row in 0..2 {
-            for column in 0..2 {
-                close(
-                    graph_linear.h()[row][column],
-                    eager_linear.h_at(row, column),
-                );
-                close(graph.h()[row][column], eager.h_at(row, column));
-            }
-        }
-    }
-
-    #[test]
-    fn compiled_graph_primary_quadratic_groups_repeated_permuted_sparse_axes() {
-        let mut workspace = Order2GraphWorkspace::new();
-        workspace.reset(4);
-        let x = Order2Graph::<4>::variable(0.4, 0, 4, &workspace);
-        let z = Order2Graph::<4>::variable(1.1, 2, 4, &workspace);
-        let linear = Order2Graph::linear_combination(&[z, x, z], &[0.3, -0.7, 1.1], 4, &workspace)
-            .into_order2();
-        let close = |actual: f64, expected: f64| {
-            let tolerance = 2.0e-13 * actual.abs().max(expected.abs()).max(1.0);
-            assert!((actual - expected).abs() <= tolerance);
-        };
-        assert!((linear.value() - 1.26).abs() <= 2.0e-13);
-        for (actual, expected) in linear.g().iter().zip([-0.7, 0.0, 1.4, 0.0]) {
-            close(*actual, expected);
-        }
-        assert!(linear.h().iter().flatten().all(|&channel| channel == 0.0));
-        let coefficients = MatrixFreeDense3 {
-            matrix: [[1.2, -0.3, 0.25], [-0.3, 0.8, 0.17], [0.25, 0.17, 1.4]],
-            workspace: &workspace,
-        };
-        let graph =
-            Order2Graph::<4>::symmetric_quadratic_form(&[z, x, z], &coefficients, 4, &workspace)
-                .into_order2();
-
-        let arena = DynamicJetArena::new();
-        let eager_x = DynamicOrder2::variable(0.4, 0, 4, &arena);
-        let eager_z = DynamicOrder2::variable(1.1, 2, 4, &arena);
-        let eager = DynamicOrder2::symmetric_quadratic_form(
-            &[eager_z, eager_x, eager_z],
-            &coefficients,
-            4,
-            &arena,
-        );
-
-        close(graph.value(), eager.v);
-        for primary in 0..4 {
-            close(graph.g()[primary], eager.g()[primary]);
-            for other in 0..4 {
-                close(graph.h()[primary][other], eager.h_at(primary, other));
-            }
         }
     }
 

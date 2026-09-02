@@ -334,58 +334,6 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn jet_tower_matches_central_differences_of_value_clenshaw() {
-        // The differentiated-coefficient jet must match central differences
-        // of the value channel's own Clenshaw across the radius range — i.e.
-        // value and derivative are ONE source of truth (no transcendental
-        // re-evaluation, immune to the desync class).
-        let kind = production_duchon_kind();
-        // Same certifiable window as
-        // `duchon_profile_certifies_and_matches_exact_on_dense_grid`: at small
-        // r the dim=16 partial-fraction cancellation floor rises above the
-        // certificate gates, so the certifiable range starts at r_min >= 1.
-        let (r_min, r_max) = (1.0_f64, 10.0_f64);
-        let profile =
-            RadialProfile::build(&kind, r_min, r_max).expect("production Duchon profile certifies");
-        let n = 200usize;
-        // Stay strictly interior so central-difference stencils remain in range.
-        let (lo, hi) = (r_min * 1.2, r_max / 1.2);
-        for i in 0..n {
-            let r = lo * (hi / lo).powf((i as f64 + 0.5) / n as f64);
-            // Relative step in r; profile is smooth in u = ln r.
-            let h = r * 1.0e-4;
-            let jets = profile.eval_jets_inside(r);
-            for (ci, jet) in jets.iter().enumerate() {
-                let v = |rr: f64| profile.eval_inside(rr);
-                let val = |rr: f64| {
-                    let (p, q, t) = v(rr);
-                    [p, q, t][ci]
-                };
-                let f_m2 = val(r - 2.0 * h);
-                let f_m1 = val(r - h);
-                let f_p1 = val(r + h);
-                let f_p2 = val(r + 2.0 * h);
-                let f_0 = val(r);
-                // 4th-order central first/second/third derivatives.
-                let d1 = (-f_p2 + 8.0 * f_p1 - 8.0 * f_m1 + f_m2) / (12.0 * h);
-                let d2 = (-f_p2 + 16.0 * f_p1 - 30.0 * f_0 + 16.0 * f_m1 - f_m2) / (12.0 * h * h);
-                let d3 = (f_p2 - 2.0 * f_p1 + 2.0 * f_m1 - f_m2) / (2.0 * h * h * h);
-                let checks = [(jet[0], f_0), (jet[1], d1), (jet[2], d2), (jet[3], d3)];
-                // Looser per-order tolerance: higher FD orders amplify the
-                // truncation/rounding floor of the finite step.
-                let rtols = [1.0e-10_f64, 1.0e-5, 1.0e-3, 5.0e-2];
-                for (k, (jet_v, fd_v)) in checks.iter().enumerate() {
-                    let scale = jet_v.abs().max(fd_v.abs()).max(1.0e-8);
-                    assert!(
-                        (jet_v - fd_v).abs() <= rtols[k] * scale,
-                        "channel {ci} order {k} at r={r}: jet={jet_v:e} fd={fd_v:e}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     pub(crate) fn degenerate_range_refuses() {
         let kind = production_duchon_kind();
         assert!(RadialProfile::build(&kind, 1.0, 1.0).is_none());

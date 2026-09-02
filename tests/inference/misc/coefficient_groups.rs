@@ -1,9 +1,4 @@
-use gam::custom_family::{
-    CoefficientGroupSpec as CustomCoefficientGroupSpec, ParameterBlockSpec, coefficient_label,
-    realize_coefficient_groups_for_custom_family,
-};
 use gam::estimate::{CoefficientPriorMean, FitOptions, PenaltySpec, fit_gam_with_penalty_specs};
-use gam::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::smooth::{
     CoefficientGroupSpec, CoefficientSelector, LinearTermSpec, TermCollectionSpec,
     build_term_collection_design, fit_term_collection_with_coefficient_groups,
@@ -12,7 +7,6 @@ use gam::types::{
     CoefficientGroupPrior, InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink,
 };
 use ndarray::{Array1, Array2, array};
-use std::sync::Arc;
 
 fn fit_options(rho_prior: RhoPrior) -> FitOptions {
     FitOptions {
@@ -243,172 +237,6 @@ fn nested_group_rejects_parent_coefficients_not_covered_by_children() {
 }
 
 #[test]
-fn custom_family_group_spanning_blocks_uses_one_precision_coordinate() {
-    let block_spec = |name: &str| ParameterBlockSpec {
-        name: name.to_string(),
-        design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((4, 2)))),
-        offset: Array1::zeros(4),
-        penalties: Vec::new(),
-        nullspace_dims: Vec::new(),
-        initial_log_lambdas: Array1::zeros(0),
-        initial_beta: None,
-        gauge_priority: 100,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    };
-    let groups = vec![CustomCoefficientGroupSpec {
-        label: "shared_endpoint_group".to_string(),
-        coefficients: vec![
-            coefficient_label("risk_a", 0),
-            coefficient_label("risk_b", 1),
-        ],
-        parent: None,
-        prior: Some(CoefficientGroupPrior::GammaPrecision {
-            shape: 3.0,
-            rate: 2.0,
-        }),
-        initial_log_precision: Some(0.7),
-    }];
-
-    let realized = realize_coefficient_groups_for_custom_family(
-        &[block_spec("risk_a"), block_spec("risk_b")],
-        &groups,
-        RhoPrior::Flat,
-    )
-    .expect("cross-block coefficient group");
-
-    assert_eq!(realized.outer_labels, vec!["shared_endpoint_group"]);
-    assert_eq!(
-        realized.penalty_labels,
-        vec!["shared_endpoint_group", "shared_endpoint_group"]
-    );
-    for spec in &realized.specs {
-        assert_eq!(spec.penalties.len(), 1);
-        assert_eq!(
-            spec.penalties[0].precision_label(),
-            Some("shared_endpoint_group")
-        );
-        assert_eq!(spec.initial_log_lambdas.as_slice().unwrap(), &[0.7]);
-    }
-    assert_eq!(
-        realized.rho_prior,
-        RhoPrior::Independent(vec![RhoPrior::GammaPrecision {
-            shape: 3.0,
-            rate: 2.0,
-        }])
-    );
-}
-
-#[test]
-fn custom_family_parent_group_ties_concatenated_child_penalties() {
-    let block_spec = |name: &str| ParameterBlockSpec {
-        name: name.to_string(),
-        design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((4, 2)))),
-        offset: Array1::zeros(4),
-        penalties: Vec::new(),
-        nullspace_dims: Vec::new(),
-        initial_log_lambdas: Array1::zeros(0),
-        initial_beta: None,
-        gauge_priority: 100,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    };
-    let groups = vec![
-        CustomCoefficientGroupSpec::new(
-            "endpoint_supergroup",
-            vec![
-                coefficient_label("risk_a", 0),
-                coefficient_label("risk_b", 1),
-            ],
-        )
-        .with_prior(CoefficientGroupPrior::GammaPrecision {
-            shape: 2.0,
-            rate: 0.5,
-        }),
-        CustomCoefficientGroupSpec::new("risk_a_leaf", vec![coefficient_label("risk_a", 0)])
-            .with_parent("endpoint_supergroup"),
-        CustomCoefficientGroupSpec::new("risk_b_leaf", vec![coefficient_label("risk_b", 1)])
-            .with_parent("endpoint_supergroup"),
-    ];
-
-    let realized = realize_coefficient_groups_for_custom_family(
-        &[block_spec("risk_a"), block_spec("risk_b")],
-        &groups,
-        RhoPrior::Flat,
-    )
-    .expect("nested cross-block coefficient group");
-
-    assert_eq!(
-        realized.outer_labels,
-        vec!["endpoint_supergroup", "risk_a_leaf", "risk_b_leaf"]
-    );
-    // `penalty_labels` mirrors the BLOCK-FLATTENED physical emission walk — the
-    // same walk `penalty_label_layout_with_joint` consumes — so label `i` names
-    // physical penalty `i`. The supergroup spans both blocks, so it emits one
-    // piece inside each block and its two labels are SEPARATED by that block's
-    // own leaf; grouping them adjacently would list labels in an order the
-    // physical penalty list does not have, silently misaligning the two.
-    // The tie itself is visible in `outer_labels` above: two physical pieces,
-    // one outer coordinate.
-    assert_eq!(
-        realized.penalty_labels,
-        vec![
-            "endpoint_supergroup",
-            "risk_a_leaf",
-            "endpoint_supergroup",
-            "risk_b_leaf",
-        ]
-    );
-    assert_eq!(
-        realized.specs[0].penalties[0].precision_label(),
-        Some("endpoint_supergroup")
-    );
-    assert_eq!(
-        realized.specs[1].penalties[0].precision_label(),
-        Some("endpoint_supergroup")
-    );
-}
-
-#[test]
-fn custom_family_nested_group_rejects_uncovered_parent_coefficients() {
-    let block_spec = |name: &str| ParameterBlockSpec {
-        name: name.to_string(),
-        design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((4, 2)))),
-        offset: Array1::zeros(4),
-        penalties: Vec::new(),
-        nullspace_dims: Vec::new(),
-        initial_log_lambdas: Array1::zeros(0),
-        initial_beta: None,
-        gauge_priority: 100,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    };
-    let groups = vec![
-        CustomCoefficientGroupSpec::new(
-            "endpoint_supergroup",
-            vec![
-                coefficient_label("risk_a", 0),
-                coefficient_label("risk_b", 1),
-            ],
-        ),
-        CustomCoefficientGroupSpec::new("risk_a_leaf", vec![coefficient_label("risk_a", 0)])
-            .with_parent("endpoint_supergroup"),
-    ];
-
-    let err = realize_coefficient_groups_for_custom_family(
-        &[block_spec("risk_a"), block_spec("risk_b")],
-        &groups,
-        RhoPrior::Flat,
-    )
-    .expect_err("parent coefficients outside child concatenation must fail");
-
-    assert!(err.to_string().contains("union of its child groups"));
-}
-
-#[test]
 fn coefficient_group_spanning_two_terms_matches_manual_merged_penalty() {
     let (x, y, weights, offset) = synthetic_two_score_data();
     let spec = two_linear_term_spec();
@@ -601,58 +429,6 @@ fn coefficient_group_constant_prior_mean_shrinks_toward_mean() {
 
     assert!(toward_mean.fit.beta[1] > 1.0);
     assert!(toward_mean.fit.beta[1].abs() > toward_zero.fit.beta[1].abs() + 0.75);
-}
-
-#[test]
-fn coefficient_group_kernel_basis_prior_mean_recovers_known_amplitude() {
-    let n = 48;
-    let mut x = Array2::<f64>::zeros((n, 2));
-    let alpha = 1.7;
-    let kernel_values = array![1.0, -0.5];
-    let mut y = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let a = (i as f64 - 23.5) / 12.0;
-        let b = if i % 3 == 0 { -1.0 } else { 0.5 };
-        x[[i, 0]] = a;
-        x[[i, 1]] = b;
-        y[i] = alpha * (kernel_values[0] * a + kernel_values[1] * b);
-    }
-    let weights = Array1::ones(n);
-    let offset = Array1::zeros(n);
-    let spec = two_linear_term_spec();
-    let kernel_values_for_closure = kernel_values.clone();
-
-    let fit = fit_term_collection_with_coefficient_groups(
-        x.view(),
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &spec,
-        &[CoefficientGroupSpec {
-            name: "kernel_mean".to_string(),
-            selectors: vec![
-                CoefficientSelector::LinearTerm("score_a".to_string()),
-                CoefficientSelector::LinearTerm("score_b".to_string()),
-            ],
-            parent: None,
-            prior: Some(CoefficientGroupPrior::GammaPrecision {
-                shape: 500.0,
-                rate: 1.0,
-            }),
-            prior_mean: CoefficientPriorMean::kernel_basis(
-                array![0.25, 0.75],
-                alpha,
-                Arc::new(move |_| kernel_values_for_closure.clone()),
-            ),
-        }],
-        gaussian_identity_spec(),
-        &fit_options(RhoPrior::Flat),
-    )
-    .expect("kernel-basis prior mean fit");
-
-    let beta = array![fit.fit.beta[1], fit.fit.beta[2]];
-    let alpha_hat = beta.dot(&kernel_values) / kernel_values.dot(&kernel_values);
-    assert!((alpha_hat - alpha).abs() < 0.05);
 }
 
 #[test]

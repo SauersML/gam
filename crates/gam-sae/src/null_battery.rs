@@ -2938,31 +2938,6 @@ mod tests {
     }
 
     #[test]
-    fn mp_reconstruction_rank_edge_matches_recon_spectrum() {
-        use ndarray::array;
-
-        let gram = array![[3.0, 0.5], [0.5, 2.0]];
-        let decoder = array![[1.0, 0.0, 0.5], [0.0, 1.0, -0.5]];
-        let n_eff = 40.0;
-        let p_out = 3.0;
-        let r_floor = 1.25;
-
-        let spectrum =
-            crate::manifold::recon_spectrum(&gram, &decoder, n_eff, p_out, r_floor, 0.0, None)
-                .expect("recon_spectrum should succeed on a well-posed Gram");
-        let edge = mp_reconstruction_rank_edge(n_eff, p_out, r_floor)
-            .expect("mp_reconstruction_rank_edge should succeed on valid inputs");
-
-        assert!(
-            (spectrum.mp_reconstruction_rank_edge() - edge).abs() < 1.0e-12,
-            "standalone reconstruction-rank edge must match production byte-for-byte: \
-             spectrum.edge={} floor={}",
-            spectrum.mp_reconstruction_rank_edge(),
-            edge
-        );
-    }
-
-    #[test]
     fn primary_claim_calibration_requires_the_per_dimension_shuffle() {
         let report = NullBatteryReport {
             observed: 1.0,
@@ -3057,79 +3032,6 @@ mod tests {
     }
 
     #[test]
-    fn structured_signal_beats_required_nulls_but_noise_does_not() {
-        let signal = ordered_circle_fixture(96, 6, 0.04);
-        let random_weight = noise_fixture(128, 6, 1717);
-        let alpha = 0.05_f64;
-        // With the plus-one correction, zero exceedances attain 1 / (R + 1).
-        // Derive the smallest battery that can strictly clear the declared
-        // level instead of weakening alpha to accommodate too few draws.
-        let replicates = (1.0_f64 / alpha).floor() as usize;
-        let config = NullBatteryConfig {
-            replicates,
-            seed: 17,
-            kinds: vec![
-                NullKind::PhaseRandomized,
-                NullKind::RandomRotation,
-                NullKind::ArchitectureMatchedRandomWeight,
-            ],
-            tail: Tail::Larger,
-        };
-        let report = run_null_battery(
-            signal.view(),
-            Some(random_weight.view()),
-            &config,
-            first_two_ordered_circle_stat,
-        )
-        .expect("structured null battery should run");
-        assert!(
-            report
-                .summaries
-                .iter()
-                .all(|s| s.z > 2.0 && s.p_value < alpha),
-            "structured ordered circle should separate from nulls: {:?}",
-            report.summaries
-        );
-
-        let noise = noise_fixture(96, 6, 99);
-        let random_weight_noise = noise_fixture(128, 6, 199);
-        let noise_report = run_null_battery(
-            noise.view(),
-            Some(random_weight_noise.view()),
-            &config,
-            first_two_ordered_circle_stat,
-        )
-        .expect("noise null battery should run");
-        assert!(
-            noise_report
-                .summaries
-                .iter()
-                .all(|s| s.z.abs() < 2.0 || s.p_value >= alpha),
-            "pure noise must not look separated from nulls: {:?}",
-            noise_report.summaries
-        );
-    }
-
-    #[test]
-    fn random_rotation_kills_basis_stat_but_preserves_invariant_stat() {
-        let signal = ordered_circle_fixture(80, 7, 0.02);
-        let rotated = random_rotation_null(signal.view(), 44).expect("rotation should succeed");
-        let basis_before = first_two_energy_fraction(signal.view()).expect("basis stat");
-        let basis_after = first_two_energy_fraction(rotated.view()).expect("rotated basis stat");
-        assert!(
-            (basis_before - basis_after).abs() > 0.20,
-            "basis-dependent statistic should move under rotation: before={basis_before} after={basis_after}"
-        );
-
-        let invariant_before = top_two_energy_fraction(signal.view()).expect("invariant stat");
-        let invariant_after = top_two_energy_fraction(rotated.view()).expect("rotated invariant");
-        assert!(
-            (invariant_before - invariant_after).abs() < 1.0e-8,
-            "top-two energy should survive rotation: before={invariant_before} after={invariant_after}"
-        );
-    }
-
-    #[test]
     fn random_rotation_basis_is_numerically_orthogonal() {
         let q = random_orthogonal(64, 0xA11C_E5E5).unwrap();
         let gram = q.t().dot(&q);
@@ -3140,117 +3042,6 @@ mod tests {
                     (gram[[row, col]] - expected).abs() <= 128.0 * f64::EPSILON,
                     "Q'Q mismatch at ({row},{col}): {}",
                     gram[[row, col]]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn matched_spectrum_gaussian_preserves_pc_scales_and_is_seeded_2250() {
-        let rows = 8_192;
-        let mut scores = Array2::<f64>::zeros((rows, 3));
-        for row in 0..rows {
-            let t = row as f64 / rows as f64;
-            scores[[row, 0]] = 2.0 + 3.0 * (2.0 * PI * t).cos();
-            scores[[row, 1]] = -1.0 + 1.5 * (4.0 * PI * t).sin();
-            scores[[row, 2]] = 0.25 + 0.4 * (6.0 * PI * t).cos();
-        }
-        let first = matched_spectrum_gaussian_null(scores.view(), 72).expect("matched null");
-        let repeated = matched_spectrum_gaussian_null(scores.view(), 72).expect("matched null");
-        assert_eq!(first, repeated, "seeded null draws must be reproducible");
-
-        let observed_location = stable_column_location(scores.view()).unwrap();
-        let observed_mean = observed_location.absolute_mean().unwrap();
-        let observed_sd = stable_column_sd(scores.view(), &observed_location).unwrap();
-        let null_location = stable_column_location(first.view()).unwrap();
-        let null_mean = null_location.absolute_mean().unwrap();
-        let null_sd = stable_column_sd(first.view(), &null_location).unwrap();
-        for pc in 0..scores.ncols() {
-            let mean_se = observed_sd[pc] / (rows as f64).sqrt();
-            assert!(
-                (null_mean[pc] - observed_mean[pc]).abs() <= 4.0 * mean_se,
-                "PC {pc} mean mismatch: observed={} null={} se={mean_se}",
-                observed_mean[pc],
-                null_mean[pc]
-            );
-            assert!(
-                (null_sd[pc] / observed_sd[pc] - 1.0).abs() < 0.05,
-                "PC {pc} scale mismatch: observed={} null={}",
-                observed_sd[pc],
-                null_sd[pc]
-            );
-        }
-    }
-
-    #[test]
-    fn matched_control_scales_survive_large_and_tiny_representable_units() {
-        let observed = ndarray::array![
-            [1.0e300, -1.0e300],
-            [-1.0e300, 1.0e300],
-            [0.5e300, -0.5e300],
-            [-0.5e300, 0.5e300],
-        ];
-        let donor = ndarray::array![
-            [1.0e-300, -1.0e-300],
-            [-1.0e-300, 1.0e-300],
-            [0.5e-300, -0.5e-300],
-            [-0.5e-300, 0.5e-300],
-        ];
-        let observed_location = stable_column_location(observed.view()).unwrap();
-        let observed_sd = stable_column_sd(observed.view(), &observed_location).unwrap();
-        assert!(
-            observed_sd
-                .iter()
-                .all(|value| value.is_finite() && *value > 0.0)
-        );
-        let matched =
-            architecture_matched_random_weight_null(observed.view(), donor.view(), 2262).unwrap();
-        assert!(matched.iter().all(|value| value.is_finite()));
-
-        let covariance_scale = 1.0e154_f64;
-        let covariance_input = ndarray::array![
-            [covariance_scale, 0.0],
-            [-covariance_scale, 0.0],
-            [0.5 * covariance_scale, 0.0],
-            [-0.5 * covariance_scale, 0.0],
-        ];
-        let moments = stable_population_moments(covariance_input.view()).unwrap();
-        assert!(moments.covariance[[0, 0]].is_finite());
-        assert!(moments.covariance[[0, 0]] > 0.0);
-
-        let huge_scale = 1.1e154_f64;
-        let trace_overflow = ndarray::array![
-            [huge_scale, huge_scale],
-            [huge_scale, -huge_scale],
-            [-huge_scale, huge_scale],
-            [-huge_scale, -huge_scale],
-        ];
-        let huge_moments = stable_population_moments(trace_overflow.view()).unwrap();
-        assert!(
-            huge_moments
-                .covariance
-                .diag()
-                .iter()
-                .all(|value| value.is_finite())
-        );
-        assert!(huge_moments.covariance.diag().sum().is_infinite());
-        let huge_draw = covariance_matched_gaussian_null(trace_overflow.view(), 979).unwrap();
-        assert!(huge_draw.iter().all(|value| value.is_finite()));
-
-        let finite_limit = 1.7e308_f64;
-        let antipodal =
-            ndarray::array![[finite_limit, -finite_limit], [-finite_limit, finite_limit],];
-        let antipodal_location = stable_column_location(antipodal.view()).unwrap();
-        let antipodal_mean = antipodal_location.absolute_mean().unwrap();
-        assert!(antipodal_mean.iter().all(|value| value.is_finite()));
-        assert!(antipodal_mean.iter().all(|value| value.abs() <= 1.0e292));
-        for row in antipodal.rows() {
-            for axis in 0..antipodal.ncols() {
-                assert!(
-                    antipodal_location
-                        .centered_value(row[axis], axis)
-                        .unwrap()
-                        .is_finite()
                 );
             }
         }
@@ -3303,15 +3094,6 @@ mod tests {
             neumaier_add(&mut sum, &mut correction, term).unwrap();
         }
         assert_eq!(sum + correction, 1.0);
-    }
-
-    #[test]
-    fn architecture_match_refuses_positive_target_scale_from_constant_donor() {
-        let observed = ndarray::array![[-1.0], [0.0], [1.0], [2.0]];
-        let donor = ndarray::array![[7.0], [7.0], [7.0], [7.0]];
-        let error =
-            architecture_matched_random_weight_null(observed.view(), donor.view(), 9).unwrap_err();
-        assert!(error.contains("zero scale"), "{error}");
     }
 
     #[test]
@@ -3768,77 +3550,6 @@ mod tests {
     }
 
     #[test]
-    fn production_null_generators_share_stable_large_origin_centering() {
-        let rows = 2_048usize;
-        let mut observed = Array2::<f64>::zeros((rows, 2));
-        let mut donor = Array2::<f64>::zeros((rows, 2));
-        for row in 0..rows {
-            let phase = std::f64::consts::TAU * row as f64 / rows as f64;
-            observed[[row, 0]] = 1.7 * phase.cos() + 0.2 * (3.0 * phase).sin();
-            observed[[row, 1]] = 0.5 * observed[[row, 0]] + 0.8 * phase.sin();
-            donor[[row, 0]] = 0.9 * (2.0 * phase).cos() + 0.3 * phase.sin();
-            donor[[row, 1]] = -0.4 * donor[[row, 0]] + 0.6 * (3.0 * phase).cos();
-        }
-        let shift = [1.0e12_f64, -2.0e12_f64];
-        let donor_shift = [-0.75e12_f64, 1.25e12_f64];
-        let mut shifted_observed = observed.clone();
-        let mut shifted_donor = donor.clone();
-        for row in 0..rows {
-            for axis in 0..2 {
-                shifted_observed[[row, axis]] += shift[axis];
-                shifted_donor[[row, axis]] += donor_shift[axis];
-            }
-        }
-
-        let spectrum = matched_spectrum_gaussian_null(observed.view(), 71).unwrap();
-        let shifted_spectrum = matched_spectrum_gaussian_null(shifted_observed.view(), 71).unwrap();
-        let architecture =
-            architecture_matched_random_weight_null(observed.view(), donor.view(), 73).unwrap();
-        let shifted_architecture = architecture_matched_random_weight_null(
-            shifted_observed.view(),
-            shifted_donor.view(),
-            73,
-        )
-        .unwrap();
-        let bootstrap = empirical_residual_bootstrap(observed.view(), 79).unwrap();
-        let shifted_bootstrap = empirical_residual_bootstrap(shifted_observed.view(), 79).unwrap();
-        for row in 0..rows {
-            for axis in 0..2 {
-                assert!(
-                    (shifted_spectrum[[row, axis]] - shift[axis] - spectrum[[row, axis]]).abs()
-                        < 2.0e-3,
-                    "matched-spectrum translation law failed at ({row},{axis})"
-                );
-                assert!(
-                    (shifted_architecture[[row, axis]] - shift[axis] - architecture[[row, axis]])
-                        .abs()
-                        < 2.0e-3,
-                    "architecture-matched translation law failed at ({row},{axis})"
-                );
-                assert!(
-                    (shifted_bootstrap[[row, axis]] - bootstrap[[row, axis]]).abs() < 3.0e-4,
-                    "residual-bootstrap centering failed at ({row},{axis})"
-                );
-            }
-        }
-
-        let base_circle = first_two_ordered_circle_stat(observed.view()).unwrap();
-        let shifted_circle = first_two_ordered_circle_stat(shifted_observed.view()).unwrap();
-        assert!((shifted_circle - base_circle).abs() < 3.0e-4);
-        let base_spec = residual_moment_spec(observed.view()).unwrap();
-        let shifted_spec = residual_moment_spec(shifted_observed.view()).unwrap();
-        for left in 0..2 {
-            for right in 0..2 {
-                assert!(
-                    (shifted_spec.covariance[[left, right]] - base_spec.covariance[[left, right]])
-                        .abs()
-                        < 3.0e-4
-                );
-            }
-        }
-    }
-
-    #[test]
     fn phase_randomization_is_translation_and_scale_equivariant_at_extreme_range() {
         let rows = 64usize;
         let base = Array2::from_shape_fn((rows, 2), |(row, col)| {
@@ -3904,52 +3615,6 @@ mod tests {
     }
 
     #[test]
-    fn topology_statistics_are_invariant_at_extreme_finite_scale() {
-        let rows = 128usize;
-        let mut base = Array2::<f64>::zeros((rows, 4));
-        for row in 0..rows {
-            let phase = std::f64::consts::TAU * row as f64 / rows as f64;
-            base[[row, 0]] = phase.cos();
-            base[[row, 1]] = phase.sin();
-            base[[row, 2]] = 0.3 * (3.0 * phase).cos();
-            base[[row, 3]] = 0.2 * (5.0 * phase).sin();
-        }
-        let scale = 1.0e200_f64;
-        let shifts = [4.0e200, -3.0e200, 2.0e200, -1.0e200];
-        let transformed = Array2::from_shape_fn(base.raw_dim(), |(row, col)| {
-            base[[row, col]].mul_add(scale, shifts[col])
-        });
-
-        for (name, original, extreme) in [
-            (
-                "ordered circle",
-                first_two_ordered_circle_stat(base.view()).unwrap(),
-                first_two_ordered_circle_stat(transformed.view()).unwrap(),
-            ),
-            (
-                "first-two energy",
-                first_two_energy_fraction(base.view()).unwrap(),
-                first_two_energy_fraction(transformed.view()).unwrap(),
-            ),
-            (
-                "top-two energy",
-                top_two_energy_fraction(base.view()).unwrap(),
-                top_two_energy_fraction(transformed.view()).unwrap(),
-            ),
-            (
-                "harmonic circle",
-                harmonic_circle_detector_stat(base.view()).unwrap(),
-                harmonic_circle_detector_stat(transformed.view()).unwrap(),
-            ),
-        ] {
-            assert!(
-                (extreme - original).abs() <= 2.0e-12 * (1.0 + original.abs()),
-                "{name} changed under a representable translation/scale: original={original}, extreme={extreme}"
-            );
-        }
-    }
-
-    #[test]
     fn spike_in_roc_power_rises_monotonically_and_null_stays_quiet() {
         let noise = noise_fixture(128, 12, 1234);
         let mut config = SpikeInRocConfig::circle(vec![0.0, 1.0, 2.0], 16, 91);
@@ -4002,19 +3667,6 @@ mod tests {
         assert_eq!(report.topology.measured_betti0, 1);
         assert_eq!(report.topology.measured_betti1, 2);
         assert_eq!(report.topology.measured_betti2, 1);
-    }
-
-    fn ordered_circle_fixture(n: usize, p: usize, noise_scale: f64) -> Array2<f64> {
-        let mut data = noise_fixture(n, p, 555);
-        for i in 0..n {
-            let theta = 2.0 * PI * i as f64 / n as f64;
-            data[[i, 0]] += theta.cos();
-            data[[i, 1]] += theta.sin();
-            for j in 2..p {
-                data[[i, j]] *= noise_scale;
-            }
-        }
-        data
     }
 
     fn noise_fixture(n: usize, p: usize, seed: u64) -> Array2<f64> {

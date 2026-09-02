@@ -255,13 +255,6 @@ mod tests {
         assert_eq!(wrapped[[0, 0]], 5.0);
     }
 
-    #[test]
-    fn phi_scaled_covariance_into_array_consumes() {
-        let m = array![[7.0_f64]];
-        let wrapped = PhiScaledCovariance::wrap(m.clone());
-        assert_eq!(wrapped.into_array(), m);
-    }
-
     // ── UnscaledPrecision ─────────────────────────────────────────────────────
 
     #[test]

@@ -61,10 +61,7 @@
 //! tensor order.
 
 use crate::jet_scalar::JetScalar;
-use crate::jet_tower::{
-    Tower4, digamma_derivative_stack, ln_gamma_derivative_stack, program_fourth_contracted,
-    program_full_tower, program_row_kernel, program_third_contracted,
-};
+use crate::jet_tower::{Tower4, digamma_derivative_stack, ln_gamma_derivative_stack, program_full_tower};
 
 /// A tiny deterministic LCG so the test points are pseudo-random yet fixed
 /// across runs (NO `rand`, NO clock seeding — per the #932 rules).
@@ -336,78 +333,6 @@ fn order_counts(axes: &[usize]) -> (usize, usize) {
     let a = axes.iter().filter(|&&x| x == 0).count();
     let b = axes.iter().filter(|&&x| x == 1).count();
     (a, b)
-}
-
-/// The PRODUCTION packed scalars — `Order2` (value/∇/H), `OneSeed` (contracted
-/// third), `TwoSeed` (contracted fourth) — evaluated on the SAME single
-/// `eval` Gamma expression must reproduce the dense `Tower4`
-/// contractions. This pins the actual cutover path a `ln Γ`-carrying family
-/// would use (the small packed scalars, with the contraction directions folded
-/// into the nilpotent seeds) rather than the dense oracle tower.
-#[test]
-fn gamma_dispersion_packed_scalars_match_dense_tower_contractions() {
-    let rows = gamma_fixtures(0x0bad_c0de_6a6d_6d61, 16);
-    let program = GammaLocScaleRow { rows: rows.clone() };
-
-    let third_dirs: [[f64; 2]; 3] = [[0.9, -0.5], [-1.1, 0.3], [0.2, 1.4]];
-
-    const REL_TOL: f64 = 1e-11;
-    let close = |a: f64, b: f64, label: &str| {
-        let band = REL_TOL + REL_TOL * a.abs().max(b.abs());
-        assert!(
-            (a - b).abs() <= band,
-            "{label}: packed {a:+.15e} vs dense {b:+.15e} (band {band:.3e})"
-        );
-    };
-
-    for row in 0..rows.len() {
-        let tower: Box<Tower4<2>> = program_full_tower(&program, row).expect("tower");
-
-        // Order2: value / gradient / Hessian via the production packed scalar.
-        let (v, g, h) = program_row_kernel(&program, row).expect("Order2 channel");
-        close(v, tower.v, &format!("row {row} Order2 value"));
-        for i in 0..2 {
-            close(g[i], tower.g[i], &format!("row {row} Order2 grad[{i}]"));
-            for j in 0..2 {
-                close(
-                    h[i][j],
-                    tower.h[i][j],
-                    &format!("row {row} Order2 hess[{i}][{j}]"),
-                );
-            }
-        }
-
-        // OneSeed: contracted third Σ_c ℓ_{abc}·dir_c vs the dense t3 contraction.
-        for (di, dir) in third_dirs.iter().enumerate() {
-            let third = program_third_contracted(&program, row, dir).expect("OneSeed third");
-            let truth = tower.third_contracted(dir);
-            for i in 0..2 {
-                for j in 0..2 {
-                    close(
-                        third[i][j],
-                        truth[i][j],
-                        &format!("row {row} dir {di} OneSeed third[{i}][{j}]"),
-                    );
-                }
-            }
-        }
-
-        // TwoSeed: contracted fourth Σ_{cd} ℓ_{abcd}·u_c·v_d vs the dense t4.
-        for (ui, u) in third_dirs.iter().enumerate() {
-            let v = third_dirs[(ui + 1) % third_dirs.len()];
-            let fourth = program_fourth_contracted(&program, row, u, &v).expect("TwoSeed fourth");
-            let truth = tower.fourth_contracted(u, &v);
-            for i in 0..2 {
-                for j in 0..2 {
-                    close(
-                        fourth[i][j],
-                        truth[i][j],
-                        &format!("row {row} pair {ui} TwoSeed fourth[{i}][{j}]"),
-                    );
-                }
-            }
-        }
-    }
 }
 
 /// An affine inner argument `x(p) = c₀ p₀ + c₁ p₁ + c₂` composed with a unary

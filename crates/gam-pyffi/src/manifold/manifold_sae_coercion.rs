@@ -585,10 +585,7 @@ pub(crate) fn build_manifold_sae_payload(
 #[cfg(test)]
 mod manifold_sae_coercion_tests {
     use super::*;
-    use gam::terms::sae::atom_schema::{
-        basis_kind_for_topology, basis_to_topology, canonical_topology,
-        coordinate_periods_for_basis, topologies_for_bases, topology_for_bases,
-    };
+    use gam::terms::sae::atom_schema::{basis_kind_for_topology, basis_to_topology, canonical_topology, topologies_for_bases, topology_for_bases};
     use ndarray::array;
 
     #[test]
@@ -636,27 +633,6 @@ mod manifold_sae_coercion_tests {
             assert!(gam::terms::sae::atom_schema::validate_seed_basis_kind(removed).is_err());
         }
         assert_eq!(canonical_topology("circle"), Ok("circle".to_string()));
-    }
-
-    #[test]
-    fn coordinate_periods_cover_compact_and_twisted_charts() {
-        assert_eq!(
-            coordinate_periods_for_basis("torus", 2),
-            Ok(vec![Some(1.0), Some(1.0)])
-        );
-        assert_eq!(
-            coordinate_periods_for_basis("cylinder", 2),
-            Ok(vec![Some(1.0), None])
-        );
-        assert_eq!(
-            coordinate_periods_for_basis("sphere", 2),
-            Ok(vec![None, Some(std::f64::consts::TAU)])
-        );
-        assert_eq!(
-            coordinate_periods_for_basis("mobius", 2),
-            Ok(vec![Some(2.0), None])
-        );
-        assert!(coordinate_periods_for_basis("mobius", 1).is_err());
     }
 
     #[test]

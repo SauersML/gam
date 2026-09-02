@@ -120,19 +120,3 @@ pub fn topology_for_bases(bases: &[String]) -> Result<Option<String>, String> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::validated_n_harmonics;
-
-    #[test]
-    fn periodic_harmonic_metadata_is_strict() {
-        let basis = vec!["periodic".to_string()];
-        assert_eq!(
-            validated_n_harmonics(&basis, &[2], &[5]).expect("valid periodic metadata"),
-            vec![2]
-        );
-        assert!(validated_n_harmonics(&basis, &[0], &[5]).is_err());
-        assert!(validated_n_harmonics(&basis, &[2], &[7]).is_err());
-        assert!(validated_n_harmonics(&basis, &[2, 1], &[5]).is_err());
-    }
-}

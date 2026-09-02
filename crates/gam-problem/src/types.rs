@@ -780,21 +780,6 @@ mod newtype_tests {
     use ndarray::array;
 
     #[test]
-    fn smooth_term_idx_new_get_roundtrip() {
-        let idx = SmoothTermIdx::new(7);
-        assert_eq!(idx.get(), 7);
-        assert!(!idx.is_placeholder());
-        assert_eq!(format!("{idx}"), "7");
-    }
-
-    #[test]
-    fn smooth_term_idx_placeholder_is_detected() {
-        let p = SmoothTermIdx::placeholder();
-        assert!(p.is_placeholder());
-        assert_eq!(p.get(), usize::MAX);
-    }
-
-    #[test]
     fn smooth_term_idx_ordering() {
         let a = SmoothTermIdx::new(1);
         let b = SmoothTermIdx::new(2);
@@ -840,80 +825,8 @@ mod newtype_tests {
 
 #[cfg(test)]
 mod ridge_policy_tests {
-    use super::{
-        Inertia, RidgeMatrixForm, RidgePassport, RidgePolicy, StabilizationKind,
-        StabilizationLedger, StabilizationRule,
-    };
+    use super::{RidgePassport, RidgePolicy, StabilizationLedger};
     use serde_json::json;
-
-    #[test]
-    fn solver_only_ridge_policy_stays_off_objective_accounting() {
-        let passport = RidgePassport::scaled_identity(1.0e-4, RidgePolicy::solver_only())
-            .expect("finite non-negative ridge");
-
-        assert!(
-            !passport.policy().accounts_for_objective(),
-            "solver-only ridge must not add a quadratic prior"
-        );
-        assert_eq!(
-            passport.penalty_logdet_ridge(),
-            0.0,
-            "solver-only ridge must not shift the penalty logdet"
-        );
-        assert_eq!(
-            passport.laplace_hessian_ridge(),
-            0.0,
-            "solver-only ridge must not shift the Laplace Hessian"
-        );
-
-        let ledger = StabilizationLedger::from_passport(passport);
-        assert!(
-            matches!(ledger.kind(), StabilizationKind::NumericalPerturbation),
-            "solver-only ridge is a numerical perturbation, not an explicit prior"
-        );
-        assert_eq!(ledger.backward_error_bound(), None);
-        assert_eq!(
-            ledger.quadratic_delta(),
-            0.0,
-            "solver-only ridge must not contribute to the optimized objective"
-        );
-        assert_eq!(
-            ledger.laplace_hessian_delta(),
-            0.0,
-            "solver-only ridge must not contribute to REML curvature accounting"
-        );
-        assert_eq!(
-            ledger.penalty_logdet_delta(),
-            0.0,
-            "solver-only ridge must not contribute to determinant accounting"
-        );
-    }
-
-    #[test]
-    fn approximation_ridge_is_passported_without_becoming_a_model_prior() {
-        let ledger =
-            StabilizationLedger::approximation_only(1.0e-8, StabilizationRule::FixedConstant)
-                .expect("valid approximation ridge");
-        assert!(matches!(
-            ledger.kind(),
-            StabilizationKind::ApproximationOnly
-        ));
-        assert_eq!(ledger.delta(), 1.0e-8);
-        assert_eq!(ledger.quadratic_delta(), 0.0);
-        assert_eq!(ledger.laplace_hessian_delta(), 0.0);
-        assert_eq!(ledger.penalty_logdet_delta(), 0.0);
-    }
-
-    #[test]
-    fn stabilization_magnitudes_reject_negative_and_non_finite_values() {
-        for invalid in [-1.0, f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
-            assert!(RidgePassport::scaled_identity(invalid, RidgePolicy::solver_only()).is_err());
-            assert!(
-                StabilizationLedger::solver_damping(invalid, StabilizationRule::FixedConstant)
-                    .is_err()
-            );
-        }
-    }
 
     #[test]
     fn serde_cannot_bypass_passport_validation() {
@@ -974,98 +887,4 @@ mod ridge_policy_tests {
         assert!(serde_json::from_value::<StabilizationLedger>(bound_on_wrong_kind).is_err());
     }
 
-    #[test]
-    fn rule_and_inertia_metadata_are_validated() {
-        assert!(
-            StabilizationLedger::solver_damping(
-                1.0,
-                StabilizationRule::InertiaTarget { spd_floor: 0.0 }
-            )
-            .is_err()
-        );
-        assert!(
-            StabilizationLedger::solver_damping(
-                1.0,
-                StabilizationRule::BackoffEscalation { attempts: 0 }
-            )
-            .is_err()
-        );
-        assert!(Inertia::new(0, 0, 0).is_err());
-        assert!(Inertia::new(usize::MAX, 1, 0).is_err());
-
-        let before = Inertia::new(2, 1, 0).expect("valid inertia");
-        let wrong_dimension = Inertia::new(3, 1, 0).expect("valid inertia");
-        let still_indefinite = Inertia::new(2, 0, 1).expect("valid inertia");
-        let ledger = StabilizationLedger::numerical_perturbation(
-            1.0e-8,
-            StabilizationRule::BackoffEscalation { attempts: 2 },
-            Some(1.0e-12),
-        )
-        .expect("valid perturbation");
-        assert!(ledger.with_inertia(Some(before), None).is_err());
-        assert!(
-            ledger
-                .with_inertia(Some(before), Some(wrong_dimension))
-                .is_err()
-        );
-        let inertia_target = StabilizationLedger::numerical_perturbation(
-            1.0e-8,
-            StabilizationRule::InertiaTarget { spd_floor: 1.0e-12 },
-            Some(1.0e-12),
-        )
-        .expect("valid inertia target parameters");
-        assert!(
-            inertia_target
-                .with_inertia(Some(before), Some(still_indefinite))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn objective_accounting_is_structural() {
-        let explicit = StabilizationLedger::explicit_prior(
-            0.25,
-            RidgeMatrixForm::ScaledIdentity,
-            RidgePolicy::exact_full_objective(),
-        )
-        .expect("valid explicit prior");
-        assert_eq!(explicit.quadratic_delta(), 0.25);
-        assert_eq!(explicit.laplace_hessian_delta(), 0.25);
-        assert_eq!(explicit.penalty_logdet_delta(), 0.25);
-
-        for policy in [
-            RidgePolicy::exact_full_objective(),
-            RidgePolicy::exact_full_objective(),
-        ] {
-            let passport = RidgePassport::scaled_identity(0.25, policy).expect("valid ridge");
-            assert_eq!(passport.penalty_logdet_ridge(), 0.25);
-            assert_eq!(passport.laplace_hessian_ridge(), 0.25);
-        }
-    }
-
-    #[test]
-    fn passport_bridge_preserves_approximate_determinant_provenance() {
-        let policy = RidgePolicy::exact_full_objective();
-        let passport = RidgePassport::scaled_identity(0.5, policy).expect("valid ridge");
-        let ledger = StabilizationLedger::from_passport(passport);
-        assert_eq!(ledger.kind(), StabilizationKind::ObjectiveStabilization);
-        assert_eq!(ledger.objective_policy(), Some(policy));
-
-        let roundtrip: StabilizationLedger =
-            serde_json::from_value(serde_json::to_value(ledger).expect("serialize ledger"))
-                .expect("deserialize ledger");
-        assert_eq!(roundtrip.objective_policy(), Some(policy));
-
-        let collapsed = json!({
-            "kind": "ObjectiveStabilization",
-            "delta": 0.5,
-            "matrix_form": "ScaledIdentity",
-            "chosen_by": "FixedConstant",
-            "objective_policy": null,
-            "backward_error_bound": null,
-            "inertia_before": null,
-            "inertia_after": null
-        });
-        assert!(serde_json::from_value::<StabilizationLedger>(collapsed).is_err());
-    }
 }

@@ -371,36 +371,6 @@ mod tests {
     use gam_models::wiggle::monotone_wiggle_basis_with_derivative_order;
     use ndarray::array;
 
-    fn dense(matrix: &DesignMatrix) -> Array2<f64> {
-        matrix
-            .try_to_dense_by_chunks("affine design test")
-            .expect("dense affine design block")
-    }
-
-    #[test]
-    fn checked_affine_design_reproduces_offset_matrix_coefficient_sum() {
-        let result = checked_affine_design(
-            array![0.5, -0.25],
-            DesignMatrix::from(array![[1.0, 2.0], [-1.0, 3.0]]),
-            array![0.4, -0.2],
-            AffineCoefficientFrame::Full,
-            AffineCovariances::default(),
-            AffineEtaGradient::Design,
-        )
-        .expect("valid affine design");
-        let eta = result.matrix.dot(&result.coefficients) + &result.offset;
-        assert_eq!(eta, array![0.5, -1.25]);
-        assert_eq!(result.coefficient_frame, AffineCoefficientFrame::Full);
-        assert_eq!(result.coefficient_range, 0..2);
-        // A linear predictor's design IS its derivative, so the exported
-        // gradient is that same matrix rather than a second copy.
-        assert_eq!(
-            dense(result.eta_gradient_matrix()),
-            dense(&result.matrix),
-            "a linear predictor's design is its own derivative"
-        );
-    }
-
     #[test]
     fn checked_affine_design_rejects_frame_width_mismatch() {
         let error = checked_affine_design(

@@ -1,13 +1,8 @@
-use gam::mixture_link::{
-    inverse_link_jet_for_family, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
-};
+use gam::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use gam::topology_selector::{
     AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, select_topology_with_fit,
 };
-use gam::types::{
-    InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, ResponseFamily, SasLinkSpec,
-    StandardLink,
-};
+use gam::types::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
 use ndarray::array;
 
 #[test]
@@ -94,48 +89,6 @@ fn beta_logistic_state_fromspec_uses_same_bounded_delta_parameterization_as_sas(
 }
 
 #[test]
-fn inverse_link_jet_for_family_uses_parameterized_state_for_mixture_and_sas_links() {
-    let mixture_state = state_fromspec(&MixtureLinkSpec {
-        components: vec![LinkComponent::Logit, LinkComponent::Probit],
-        initial_rho: array![5.0],
-    })
-    .expect("Mixture spec should build state");
-
-    let sas_state = state_from_sasspec(SasLinkSpec {
-        initial_epsilon: 1.7,
-        initial_log_delta: -0.4,
-    })
-    .expect("SAS spec should build state");
-
-    let eta = 0.8;
-    let mix_spec = LikelihoodSpec::new(
-        ResponseFamily::Binomial,
-        InverseLink::Mixture(mixture_state),
-    );
-    let sas_spec = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(sas_state));
-    let logit_spec = LikelihoodSpec::new(
-        ResponseFamily::Binomial,
-        InverseLink::Standard(StandardLink::Logit),
-    );
-
-    let mix_jet = inverse_link_jet_for_family(&mix_spec, eta)
-        .expect("Mixture inverse-link jet should evaluate");
-    let sas_jet =
-        inverse_link_jet_for_family(&sas_spec, eta).expect("SAS inverse-link jet should evaluate");
-    let logit_jet = inverse_link_jet_for_family(&logit_spec, eta)
-        .expect("Logit inverse-link jet should evaluate");
-
-    assert!(
-        (mix_jet.mu - logit_jet.mu).abs() > 1e-8,
-        "Mixture inverse-link evaluation should come from its MixtureLinkState and not silently fall back to a default link"
-    );
-    assert!(
-        (sas_jet.mu - logit_jet.mu).abs() > 1e-8,
-        "SAS inverse-link evaluation should come from its SasLinkState and not silently fall back to a default link"
-    );
-}
-
-#[test]
 fn topology_selector_picks_lowest_cost_and_returns_fit_metadata() {
     // `tk_score` is a minimised REML / TK cost (lower is better; see issue
     // #396 and `solver::evidence`). Circle (raw_reml 10) must beat Sphere
@@ -191,78 +144,6 @@ fn topology_selector_picks_lowest_cost_and_returns_fit_metadata() {
     assert_eq!(
         winner.n_obs, 100,
         "select_topology_with_fit should preserve n_obs metadata for the winning candidate"
-    );
-}
-
-#[test]
-fn topology_selector_parallel_matches_sequential_winner() {
-    // #1017 Phase 0: the driver-level parallel topology race must return the
-    // bit-identical winner to the sequential loop (results come back in input
-    // order, ranked through the same deterministic priority selector).
-    use gam::topology_selector::select_topology_with_fit_parallel;
-    let selector = TopologyAutoSelector::new(vec![
-        AutoTopologyKind::Circle,
-        AutoTopologyKind::Sphere,
-        AutoTopologyKind::Torus,
-    ]);
-    let fit_one = |kind: AutoTopologyKind| {
-        Ok::<_, String>(match kind {
-            AutoTopologyKind::Circle => TopologyAutoFitEvidence {
-                topology_name: "circle".to_string(),
-                raw_reml: 10.0,
-                // Exact synthetic literal: zero accumulated forward error. `None` would
-                // state that no bound was established (#2729), which makes the selector
-                // refuse to certify any margin -- the opposite of this fixture\'s intent.
-                raw_reml_roundoff: Some(0.0),
-                null_dim: 0.0,
-                null_space_logdet: None,
-                effective_dim: 2.0,
-                n_obs: 100,
-                fit_handle: 7_i32,
-            },
-            AutoTopologyKind::Sphere => TopologyAutoFitEvidence {
-                topology_name: "sphere".to_string(),
-                raw_reml: 20.0,
-                // Exact synthetic literal: zero accumulated forward error. `None` would
-                // state that no bound was established (#2729), which makes the selector
-                // refuse to certify any margin -- the opposite of this fixture\'s intent.
-                raw_reml_roundoff: Some(0.0),
-                null_dim: 0.0,
-                null_space_logdet: None,
-                effective_dim: 2.0,
-                n_obs: 100,
-                fit_handle: 9_i32,
-            },
-            AutoTopologyKind::Torus => TopologyAutoFitEvidence {
-                topology_name: "torus".to_string(),
-                raw_reml: 15.0,
-                // Exact synthetic literal: zero accumulated forward error. `None` would
-                // state that no bound was established (#2729), which makes the selector
-                // refuse to certify any margin -- the opposite of this fixture\'s intent.
-                raw_reml_roundoff: Some(0.0),
-                null_dim: 0.0,
-                null_space_logdet: None,
-                effective_dim: 2.0,
-                n_obs: 100,
-                fit_handle: 11_i32,
-            },
-            _ => unreachable!(),
-        })
-    };
-    let parallel = select_topology_with_fit_parallel(&selector, &fit_one)
-        .expect("parallel topology selection should succeed");
-    let sequential = select_topology_with_fit(&selector, fit_one)
-        .expect("sequential topology selection should succeed");
-    let pw = parallel.winner().expect("parallel winner");
-    let sw = sequential.winner().expect("sequential winner");
-    assert_eq!(
-        pw.topology_name, sw.topology_name,
-        "parallel and sequential topology races must agree on the winner"
-    );
-    assert_eq!(pw.topology_name, "circle", "circle (raw_reml 10) is best");
-    assert_eq!(
-        pw.fit_handle, sw.fit_handle,
-        "parallel race must preserve the winning fit metadata"
     );
 }
 

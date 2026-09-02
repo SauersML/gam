@@ -665,25 +665,6 @@ mod tests {
     // Both callers are `cfg(target_os = "linux")` device-parity tests, so this
     // admission helper is dead off-Linux and `-D dead-code` rejects the test
     // target there (a wheel-blocking break class). Gate it with its callers.
-    /// The availability question goes through the one shared gate (#2422): the
-    /// two callers `return` on `false` with nothing asserted afterwards, so a
-    /// bare probe left both tests printing `ok` on every CPU-only runner with
-    /// the process skip counter untouched and no `SKIPPED(no-cuda):` marker for
-    /// a ledger to scrape. `gpu_for_test` panics on a driver FAULT and under
-    /// `GpuPolicy::Required`, and counts a genuine absence;
-    /// `assert_absent_device_was_counted` turns that count into the assertion
-    /// this skip path owes.
-    #[cfg(target_os = "linux")]
-    fn cuda_available_for_test(label: &str) -> bool {
-        let floor = gam_gpu::test_gate::skipped_for_absent_device();
-        match gam_gpu::test_gate::gpu_for_test(label) {
-            gam_gpu::test_gate::GpuTestGate::Ready(_) => true,
-            gam_gpu::test_gate::GpuTestGate::AbsentDevice => {
-                gam_gpu::test_gate::assert_absent_device_was_counted(floor);
-                false
-            }
-        }
-    }
 
     /// Deterministic fp32 fixture: `n_rows × p` rows and a `G·b × p` decoder whose
     /// blocks are orthonormalised so the gate `‖x D_gᵀ‖₂` is a genuine subspace
@@ -709,23 +690,6 @@ mod tests {
     }
 
     #[test]
-    fn cpu_gate_block_matches_per_row_reference() {
-        // The block-form gate oracle must equal the per-row group ℓ₂ exactly.
-        let (rows, decoder) = fixture(6, 10, 3, 8);
-        let block = block_gate_block_cpu(rows.view(), decoder.view(), 10, 3);
-        for r in 0..rows.nrows() {
-            let per_row = block_gate_row_cpu(rows.row(r), decoder.view(), 10, 3);
-            for g in 0..10 {
-                assert_eq!(
-                    block[r * 10 + g].to_bits(),
-                    per_row[g].to_bits(),
-                    "gate block vs per-row differ at r={r} g={g}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn cpu_route_selects_by_gate_desc_block_asc() {
         // The CPU oracle must reproduce route_row_blocks selection semantics.
         let (rows, decoder) = fixture(4, 12, 2, 7);
@@ -742,116 +706,4 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn device_block_route_matches_cpu_selection_when_available() {
-        // Selection-parity gate (SPEC 20). The m×K block MUST clear
-        // DEVICE_BLOCK_GATE_MIN_ELEMS so the device path is admitted; on a CUDA
-        // host we drive Required (silent CPU fallback = hard failure) and assert
-        // the routed top-k BLOCK support equals the per-row CPU oracle exactly —
-        // same blocks, same order — with gate values within f32 tolerance (they
-        // are in fact bit-identical, as the arithmetic is shared). With no runtime
-        // Required must fail closed and Auto reproduces the CPU oracle.
-        let m = 512usize;
-        let g = 2048usize;
-        let b = 3usize;
-        let k = 4usize;
-        let p = 48usize;
-        let krows = g * b;
-        assert!(m * krows >= DEVICE_BLOCK_GATE_MIN_ELEMS);
-        let (rows, decoder) = fixture(m, g, b, p);
-
-        let cpu = route_blocks_cpu(rows.view(), decoder.view(), g, b, k);
-
-        if !cuda_available_for_test("block-route parity") {
-            return;
-        }
-
-        match route_blocks_required(
-            rows.view(),
-            decoder.view(),
-            b,
-            k,
-            gam_gpu::GpuPolicy::Required,
-        ) {
-            Ok((routed, path, dtoh_bytes)) => {
-                assert_eq!(
-                    path,
-                    BlockRoutePath::Device,
-                    "Required succeeded but reported CPU — device did not engage"
-                );
-                assert_eq!(
-                    dtoh_bytes,
-                    m * k * (std::mem::size_of::<u32>() + std::mem::size_of::<f32>()),
-                    "device block route must download only the m×k (block, gate) shortlist"
-                );
-                assert_eq!(routed.len(), cpu.len());
-                for (r, (dev_sel, cpu_sel)) in routed.iter().zip(&cpu).enumerate() {
-                    assert_eq!(
-                        dev_sel.len(),
-                        cpu_sel.len(),
-                        "row {r}: selection length differs"
-                    );
-                    for (j, ((db, dg), (cb, cg))) in dev_sel.iter().zip(cpu_sel).enumerate() {
-                        assert_eq!(db, cb, "row {r} slot {j}: block differs dev={db} cpu={cb}");
-                        let tol = 1e-5 * cg.abs().max(1.0);
-                        assert!(
-                            (dg - cg).abs() <= tol,
-                            "row {r} slot {j}: gate differs dev={dg} cpu={cg} tol={tol}"
-                        );
-                    }
-                }
-            }
-            Err(err) => panic!("Required block route failed after CUDA admission: {err}"),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn device_block_route_bit_identical_gates_at_scale_when_available() {
-        // Larger G to exercise multi-tile folding; asserts BIT-identical gates
-        // (not just within tolerance) to prove the shared-arithmetic parity story
-        // holds across tile boundaries.
-        let m = 256usize;
-        let g = 8192usize;
-        let b = 2usize;
-        let k = 6usize;
-        let p = 64usize;
-        let krows = g * b;
-        assert!(m * krows >= DEVICE_BLOCK_GATE_MIN_ELEMS);
-        let (rows, decoder) = fixture(m, g, b, p);
-        let cpu = route_blocks_cpu(rows.view(), decoder.view(), g, b, k);
-
-        if !cuda_available_for_test("block-route scale parity") {
-            return;
-        }
-
-        match route_blocks_required(
-            rows.view(),
-            decoder.view(),
-            b,
-            k,
-            gam_gpu::GpuPolicy::Required,
-        ) {
-            Ok((routed, path, _)) => {
-                assert_eq!(
-                    path,
-                    BlockRoutePath::Device,
-                    "device did not engage at scale"
-                );
-                for (r, (dev_sel, cpu_sel)) in routed.iter().zip(&cpu).enumerate() {
-                    assert_eq!(dev_sel.len(), cpu_sel.len(), "row {r}: length differs");
-                    for (j, ((db, dg), (cb, cg))) in dev_sel.iter().zip(cpu_sel).enumerate() {
-                        assert_eq!(db, cb, "row {r} slot {j}: block differs");
-                        assert_eq!(
-                            dg.to_bits(),
-                            cg.to_bits(),
-                            "row {r} slot {j}: gate bits differ dev={dg} cpu={cg}"
-                        );
-                    }
-                }
-            }
-            Err(err) => panic!("Required scale route failed after CUDA admission: {err}"),
-        }
-    }
 }

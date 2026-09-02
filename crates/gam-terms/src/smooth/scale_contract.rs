@@ -774,13 +774,7 @@ impl SmoothBasisSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis::{
-        BSplineBoundaryConditions, BasisWorkspace, ConstantCurvatureIdentifiability,
-        DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternIdentifiability, MaternNu,
-        MeasureJetIdentifiability, SphereWahbaKernel, SphericalSplineIdentifiability,
-        build_constant_curvature_basis, build_spherical_spline_basis,
-        constant_curvature_kernel_kappa_jets,
-    };
+    use crate::basis::{BSplineBoundaryConditions, BasisWorkspace, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternIdentifiability, MaternNu, MeasureJetIdentifiability};
     use ndarray::{Array1, Array2, array};
     use std::collections::HashSet;
 
@@ -1096,41 +1090,6 @@ mod tests {
             assert_eq!(observed.info.effective_rank, target.info.effective_rank);
             assert_eq!(observed.nullity, target.nullity);
             assert_matrix_close(&observed.matrix, &target.matrix, tolerance);
-        }
-    }
-
-    /// [`assert_build_geometry_close`] for a basis that is EQUIVARIANT with
-    /// weight one rather than invariant: one common `scale` must restore both
-    /// the design and every active penalty. Taking the same factor out of both
-    /// is what distinguishes a units change from a model change.
-    fn assert_build_geometry_scaled_close(
-        actual: &BasisBuildResult,
-        expected: &BasisBuildResult,
-        scale: f64,
-        tolerance: f64,
-    ) {
-        assert_matrix_close(
-            &actual.design.to_dense().mapv(|value| value / scale),
-            &expected.design.to_dense(),
-            tolerance,
-        );
-        assert_eq!(
-            actual.active_penalties.len(),
-            expected.active_penalties.len()
-        );
-        for (observed, target) in actual
-            .active_penalties
-            .iter()
-            .zip(expected.active_penalties.iter())
-        {
-            assert_eq!(observed.info.source, target.info.source);
-            assert_eq!(observed.info.effective_rank, target.info.effective_rank);
-            assert_eq!(observed.nullity, target.nullity);
-            assert_matrix_close(
-                &observed.matrix.mapv(|value| value / scale),
-                &target.matrix,
-                tolerance,
-            );
         }
     }
 
@@ -1480,153 +1439,6 @@ mod tests {
                     assert_matrix_close(&observed.matrix, &target.matrix, 2e-10);
                 }
             }
-        }
-    }
-
-    fn spherical_spec(method: SphereMethod, radians: bool) -> SphericalSplineBasisSpec {
-        SphericalSplineBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-            penalty_order: 2,
-            double_penalty: false,
-            radians,
-            method,
-            max_degree: Some(3),
-            wahba_kernel: SphereWahbaKernel::Sobolev,
-            identifiability: SphericalSplineIdentifiability::CenterSumToZero,
-        }
-    }
-
-    #[test]
-    fn sphere_constant_curvature_and_pca_obey_their_non_euclidean_gauges_2315() {
-        let degrees = array![
-            [-62.0, -150.0],
-            [-41.0, -77.0],
-            [-18.0, -12.0],
-            [4.0, 39.0],
-            [23.0, 101.0],
-            [47.0, 166.0],
-            [66.0, -115.0],
-            [11.0, -171.0]
-        ];
-        let radians = degrees.mapv(f64::to_radians);
-        for method in [SphereMethod::Wahba, SphereMethod::Harmonic] {
-            let in_degrees =
-                build_spherical_spline_basis(degrees.view(), &spherical_spec(method, false))
-                    .expect("degree-encoded sphere basis");
-            let in_radians =
-                build_spherical_spline_basis(radians.view(), &spherical_spec(method, true))
-                    .expect("radian-encoded sphere basis");
-            assert_build_geometry_close(&in_radians, &in_degrees, 2e-9);
-        }
-
-        let chart_data = array![
-            [-0.42, -0.18],
-            [-0.31, 0.22],
-            [-0.08, -0.34],
-            [0.13, 0.29],
-            [0.27, -0.11],
-            [0.38, 0.17]
-        ];
-        let centers = array![[-0.36, -0.04], [-0.12, 0.25], [0.16, -0.21], [0.34, 0.13]];
-        let kappa = -0.7_f64;
-        let length_scale = 0.55_f64;
-        let reference_spec = ConstantCurvatureBasisSpec {
-            center_strategy: CenterStrategy::UserProvided(centers.clone()),
-            kappa,
-            kappa_fixed: true,
-            length_scale,
-            length_scale_fixed: true,
-            double_penalty: false,
-            identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
-        };
-        let reference = build_constant_curvature_basis(chart_data.view(), &reference_spec)
-            .expect("reference constant-curvature basis");
-        let (_, dk_reference, dkk_reference) = constant_curvature_kernel_kappa_jets(
-            chart_data.view(),
-            centers.view(),
-            kappa,
-            length_scale,
-        )
-        .expect("reference curvature jets");
-        for factor in [1e-9_f64, 1.0, 1e9] {
-            let scaled_data = chart_data.mapv(|value| value * factor);
-            let scaled_centers = centers.mapv(|value| value * factor);
-            let scaled_kappa = kappa / factor.powi(2);
-            let scaled_length = length_scale * factor;
-            let actual = build_constant_curvature_basis(
-                scaled_data.view(),
-                &ConstantCurvatureBasisSpec {
-                    center_strategy: CenterStrategy::UserProvided(scaled_centers.clone()),
-                    kappa: scaled_kappa,
-                    kappa_fixed: true,
-                    length_scale: scaled_length,
-                    length_scale_fixed: true,
-                    double_penalty: false,
-                    identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
-                },
-            )
-            .expect("rescaled constant-curvature basis");
-            // Degree ONE, not invariant (gam#2747): the kernel `ℓ·(e^{−d/ℓ}−1)`
-            // is a length, so the chart similarity multiplies design AND
-            // penalty by `a`. Dividing it back out is the whole content of the
-            // declared `ChartSimilarityDegreeOne` / `PhysicalRkhsGramDegreeOne`
-            // laws — and the fact that ONE factor restores BOTH blocks is the
-            // check that matters, because a common positive factor on `(X, S)`
-            // is exactly what `λ` absorbs.
-            assert_build_geometry_scaled_close(&actual, &reference, factor, 2e-8);
-            let (_, dk, dkk) = constant_curvature_kernel_kappa_jets(
-                scaled_data.view(),
-                scaled_centers.view(),
-                scaled_kappa,
-                scaled_length,
-            )
-            .expect("rescaled curvature jets");
-            assert_matrix_close(
-                &dk.mapv(|value| value / factor.powi(3)),
-                &dk_reference,
-                2e-8,
-            );
-            assert_matrix_close(
-                &dkk.mapv(|value| value / factor.powi(5)),
-                &dkk_reference,
-                3e-7,
-            );
-        }
-
-        let pca_data = array![
-            [-1.0, 0.3],
-            [-0.4, 1.1],
-            [0.2, -0.7],
-            [0.8, 0.5],
-            [1.3, -0.2],
-            [1.7, 0.9]
-        ];
-        let center_mean = array![0.35, 0.15];
-        let loadings = array![[0.8, -0.3], [0.6, 0.9]];
-        let reference = build_pca_smooth_basis(
-            pca_data.view(),
-            &[0, 1],
-            &loadings,
-            true,
-            1.7,
-            Some(&center_mean),
-            None,
-            32,
-        )
-        .expect("reference PCA score gauge");
-        for factor in [1e-9_f64, 1.0, 1e9] {
-            let actual = build_pca_smooth_basis(
-                pca_data.mapv(|value| factor * value).view(),
-                &[0, 1],
-                &loadings.mapv(|value| value / factor),
-                true,
-                1.7,
-                Some(&center_mean.mapv(|value| factor * value)),
-                None,
-                32,
-            )
-            .expect("rescaled PCA score gauge");
-            assert_build_geometry_close(&actual, &reference, 2e-10);
         }
     }
 

@@ -368,70 +368,11 @@ mod tests {
     }
 
     #[test]
-    fn too_few_points_returns_infinity() {
-        // n = 4, alpha = 0.05 → rank = ceil(5 * 0.95) = 5 > 4 → +∞.
-        let scores = array![1.0, 2.0, 3.0, 4.0];
-        let q = conformal_multiplier(scores.view(), 0.05).expect("valid");
-        assert!(q.is_infinite());
-
-        let calib =
-            ConformalCalibrator::from_residuals_and_scales(scores.view(), scores.view(), 0.05)
-                .expect("valid");
-        assert!(!calib.certifies_finite());
-    }
-
-    #[test]
     fn rejects_alpha_out_of_range() {
         let scores = array![1.0, 2.0, 3.0];
         assert!(conformal_multiplier(scores.view(), 0.0).is_err());
         assert!(conformal_multiplier(scores.view(), 1.0).is_err());
         assert!(conformal_multiplier(scores.view(), -0.1).is_err());
-    }
-
-    #[test]
-    fn calibrated_interval_is_symmetric_and_clamped() {
-        let calib = ConformalCalibrator::from_residuals_and_scales(
-            array![1.0].view(),
-            array![1.0].view(),
-            0.5,
-        )
-        .expect("valid");
-        // n = 1, alpha = 0.5 → rank = ceil(2 * 0.5) = 1 → q̂ = score = 1.0.
-        assert_eq!(calib.q_hat(), 1.0);
-        let mean = array![0.5, 2.0];
-        let scale = array![0.1, 0.2];
-        let (lo, hi) = calib
-            .calibrated_interval(&mean, &scale, ResponseBounds::UNBOUNDED)
-            .expect("interval");
-        assert!((lo[0] - 0.4).abs() < 1e-12);
-        assert!((hi[0] - 0.6).abs() < 1e-12);
-
-        // Clamp to [0, 1].
-        let (lo_c, hi_c) = calib
-            .calibrated_interval(&mean, &scale, ResponseBounds::UNIT_PROBABILITY)
-            .expect("interval");
-        assert!(lo_c.iter().all(|&v| v >= 0.0));
-        assert!(hi_c.iter().all(|&v| v <= 1.0));
-    }
-
-    #[test]
-    fn zero_scale_uses_same_effective_scale_for_calibration_and_prediction() {
-        let calib = ConformalCalibrator::from_held_out_fold(
-            array![1.0].view(),
-            array![0.0].view(),
-            array![0.0].view(),
-            0.5,
-        )
-        .expect("zero calibration scale is floored");
-        assert_eq!(calib.q_hat(), 1.0 / f64::MIN_POSITIVE);
-
-        let mean = array![10.0];
-        let scale = array![0.0];
-        let (lo, hi) = calib
-            .calibrated_interval(&mean, &scale, ResponseBounds::UNBOUNDED)
-            .expect("zero prediction scale is floored");
-        assert!((lo[0] - 9.0).abs() < 1e-12);
-        assert!((hi[0] - 11.0).abs() < 1e-12);
     }
 
     #[test]

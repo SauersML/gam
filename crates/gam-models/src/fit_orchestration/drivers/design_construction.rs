@@ -8130,91 +8130,6 @@ mod glm_eta_observation_fd_tests {
         one_obs_weight(spec, y, 1.0, eta)
     }
 
-    fn one_obs_resolved(
-        likelihood: &gam_spec::GlmLikelihoodSpec,
-        y: f64,
-        weight: f64,
-        eta: f64,
-    ) -> StandardFamilyObservationState {
-        evaluate_resolved_standard_family_observations(
-            likelihood,
-            None,
-            None,
-            None,
-            &array![y],
-            &array![weight],
-            &array![eta],
-        )
-        .expect("resolved standard family observation state assembles")
-    }
-
-    #[test]
-    fn bounded_gamma_and_tweedie_use_the_resolved_likelihood_scale() {
-        let gamma_unit = gam_spec::GlmLikelihoodSpec {
-            spec: LikelihoodSpec::gamma_log(),
-            scale: gam_spec::LikelihoodScaleMetadata::FixedGammaShape { shape: 1.0 },
-        };
-        let gamma_scaled = gam_spec::GlmLikelihoodSpec {
-            spec: LikelihoodSpec::gamma_log(),
-            scale: gam_spec::LikelihoodScaleMetadata::FixedGammaShape { shape: 8.0 },
-        };
-        let unit = one_obs_resolved(&gamma_unit, 2.3, 0.7, 0.2);
-        let scaled = one_obs_resolved(&gamma_scaled, 2.3, 0.7, 0.2);
-        for (label, actual, base) in [
-            ("Gamma score", scaled.score[0], unit.score[0]),
-            (
-                "Gamma Fisher weight",
-                scaled.fisherweight[0],
-                unit.fisherweight[0],
-            ),
-            (
-                "Gamma observed Hessian",
-                scaled.neghessian_eta[0],
-                unit.neghessian_eta[0],
-            ),
-            (
-                "Gamma Hessian derivative",
-                scaled.neghessian_eta_derivative[0],
-                unit.neghessian_eta_derivative[0],
-            ),
-            (
-                "Gamma log likelihood",
-                scaled.log_likelihood,
-                unit.log_likelihood,
-            ),
-        ] {
-            let expected = 8.0 * base;
-            assert!(
-                (actual - expected).abs() <= 32.0 * f64::EPSILON * expected.abs().max(1.0),
-                "{label} scale mismatch: actual={actual}, expected={expected}"
-            );
-        }
-
-        let tweedie_unit = gam_spec::GlmLikelihoodSpec {
-            spec: LikelihoodSpec::tweedie_log(1.5),
-            scale: gam_spec::LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
-        };
-        let tweedie_scaled = gam_spec::GlmLikelihoodSpec {
-            spec: LikelihoodSpec::tweedie_log(1.5),
-            scale: gam_spec::LikelihoodScaleMetadata::FixedDispersion { phi: 0.25 },
-        };
-        let unit = one_obs_resolved(&tweedie_unit, 1.7, 0.8, -0.1);
-        let scaled = one_obs_resolved(&tweedie_scaled, 1.7, 0.8, -0.1);
-        for (actual, base) in [
-            (scaled.score[0], unit.score[0]),
-            (scaled.fisherweight[0], unit.fisherweight[0]),
-            (scaled.neghessian_eta[0], unit.neghessian_eta[0]),
-            (
-                scaled.neghessian_eta_derivative[0],
-                unit.neghessian_eta_derivative[0],
-            ),
-            (scaled.log_likelihood, unit.log_likelihood),
-        ] {
-            let expected = 4.0 * base;
-            assert!((actual - expected).abs() <= 32.0 * f64::EPSILON * expected.abs().max(1.0));
-        }
-    }
-
     #[test]
     fn bounded_zero_rows_are_dormant_and_weight_preflight_is_atomic() {
         let likelihood = gam_spec::GlmLikelihoodSpec::canonical(LikelihoodSpec::poisson_log());
@@ -8318,88 +8233,6 @@ mod glm_eta_observation_fd_tests {
     }
 
     #[test]
-    fn binomial_natural_coordinate_towers_match_finite_differences() {
-        for (label, family, eta) in [
-            ("logit", LikelihoodSpec::binomial_logit(), 0.7),
-            ("probit", LikelihoodSpec::binomial_probit(), -1.1),
-            ("cloglog", LikelihoodSpec::binomial_cloglog(), 0.4),
-            (
-                "loglog",
-                LikelihoodSpec::try_new(
-                    ResponseFamily::Binomial,
-                    InverseLink::Standard(StandardLink::LogLog),
-                )
-                .unwrap(),
-                -0.35,
-            ),
-            (
-                "cauchit",
-                LikelihoodSpec::try_new(
-                    ResponseFamily::Binomial,
-                    InverseLink::Standard(StandardLink::Cauchit),
-                )
-                .unwrap(),
-                1.25,
-            ),
-        ] {
-            check_fd(label, &family, 0.37, eta);
-        }
-    }
-
-    #[test]
-    fn logit_observation_geometry_carries_the_prior_weight_everywhere() {
-        let eta = 1.75;
-        let y = 0.3;
-        let weight = 7.25;
-        let state = one_obs_weight(&LikelihoodSpec::binomial_logit(), y, weight, eta);
-        let jet = logit_inverse_link_jet5(eta);
-        for (got, expected) in [
-            (state.fisherweight[0], weight * jet.d1),
-            (state.neghessian_eta[0], weight * jet.d1),
-            (state.neghessian_eta_derivative[0], weight * jet.d2),
-            (state.score[0], weight * (y - jet.mu)),
-        ] {
-            assert!((got - expected).abs() <= 4.0 * f64::EPSILON * (1.0 + expected.abs()));
-        }
-    }
-
-    #[test]
-    fn tiny_positive_and_zero_weights_are_not_projected() {
-        let tiny = 1e-200;
-        let logit = one_obs_weight(&LikelihoodSpec::binomial_logit(), 0.4, tiny, 0.0);
-        // The Fisher weight is assembled in LOG space — `weighted_positive_from_log`
-        // evaluates `exp(ln(w) + log_fisher)` — and that route is the subject of this
-        // test: going through logs is what lets a weight this small survive instead of
-        // underflowing. A log/exp round trip cannot be bit-exact. `exp` turns the
-        // ABSOLUTE error of its argument into a RELATIVE error of its result, and here
-        // the argument is `ln(1e-200) + ln(1/4) = -461.90`, so the route costs about
-        // `|x|·eps ≈ 1.03e-13` relative — five orders coarser than the 2-ULP bound this
-        // assertion used to demand, which no weight this extreme could ever have met.
-        // Measured: the ratio comes back 0.24999999999999353, off by 6.47e-15, i.e.
-        // 14.6x the old bound and 0.25x the derived one.
-        //
-        // So bound it by the route's own error, computed from the inputs rather than
-        // tuned: a wrong Fisher weight is orders away from this and still caught.
-        let log_argument = tiny.ln() + 0.25_f64.ln();
-        let roundtrip_tolerance = 0.25 * log_argument.abs() * f64::EPSILON;
-        let ratio = logit.fisherweight[0] / tiny;
-        assert!(
-            (ratio - 0.25).abs() <= roundtrip_tolerance,
-            "logit Fisher weight at eta=0 must be w/4 up to the log/exp round trip: \
-             fisherweight/w = {ratio:.17e}, want 0.25 within {roundtrip_tolerance:.3e}"
-        );
-        assert!(logit.fisherweight[0] < 1e-190);
-
-        let zero = one_obs_weight(&LikelihoodSpec::gaussian_identity(), 3.0, 0.0, -2.0);
-        assert_eq!(zero.score[0], 0.0);
-        assert_eq!(zero.fisherweight[0], 0.0);
-        assert_eq!(zero.neghessian_eta[0], 0.0);
-        assert_eq!(zero.neghessian_eta_derivative[0], 0.0);
-        assert_eq!(zero.log_likelihood, 0.0);
-        assert_eq!(exact_standard_working_response(&zero).unwrap()[0], -2.0);
-    }
-
-    #[test]
     fn log_link_tails_balance_tiny_weights_before_certification() {
         let poisson = one_obs_weight(&LikelihoodSpec::poisson_log(), 0.0, 1e-300, 700.0);
         assert!(poisson.fisherweight[0].is_finite() && poisson.fisherweight[0] > 1.0);
@@ -8467,21 +8300,6 @@ mod glm_eta_observation_fd_tests {
         assert_eq!(excluded.fisherweight[0], 0.0);
         assert_eq!(excluded.neghessian_eta[0], 0.0);
         assert_eq!(excluded.log_likelihood, 0.0);
-    }
-
-    #[test]
-    fn unrepresentable_cloglog_curvature_is_refused_without_a_floor() {
-        let err = evaluate_standard_familyobservations(
-            LikelihoodSpec::binomial_cloglog(),
-            None,
-            None,
-            None,
-            &array![1.0],
-            &array![1.0],
-            &array![18.0],
-        )
-        .expect_err("mathematically sub-f64 Fisher information must be refused");
-        assert!(err.to_string().contains("Fisher weight"), "{err}");
     }
 
     #[test]

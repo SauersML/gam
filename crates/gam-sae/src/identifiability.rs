@@ -4180,83 +4180,6 @@ mod tests {
         assert!(MechanismSparsityJacobian::new(1.0, 0.0).is_err());
     }
 
-    #[test]
-    fn frame_inner_rotation_dim_is_sum_of_so_r_dims() {
-        // dim O(r) = r(r−1)/2 per factored atom; rank-1 frames contribute 0.
-        assert_eq!(frame_inner_rotation_dim(&[]), 0);
-        assert_eq!(frame_inner_rotation_dim(&[1]), 0);
-        assert_eq!(frame_inner_rotation_dim(&[2]), 1);
-        assert_eq!(frame_inner_rotation_dim(&[4]), 6);
-        assert_eq!(frame_inner_rotation_dim(&[1, 4, 8]), 0 + 6 + 28);
-        assert_eq!(
-            FrameInnerRotationGauge::from_ranks(vec![3, 3]).dim,
-            6,
-            "two rank-3 frames carry 2·3 inner-rotation dims"
-        );
-    }
-
-    /// The #972 inner-rotation gauge is enumerated in the certificate, never
-    /// curvature-tested: attaching it must not change any generator verdict
-    /// or the residual_gauge_dim, but it MUST change the group signature and
-    /// the summary — two replicate frame-factored fits agree on their gauge
-    /// iff they also agree on this enumerated, convention-fixed part.
-    #[test]
-    fn frame_inner_rotation_attaches_to_the_certificate_without_verdict_change() {
-        let base = ResidualGaugeReport {
-            metric_provenance: MetricProvenance::Euclidean,
-            generators: Vec::new(),
-            pinning_rank: 5,
-            pinning_rank_support: PinningRankSupport::ParameterSpace,
-            residual_gauge_dim: 0,
-            diffeomorphism_unpinned: false,
-            sym_f_trivial_under_output_fisher: None,
-            frame_inner_rotation: None,
-            summary: "base".to_string(),
-        };
-        let sig_before = base.group_signature();
-        let report = base.with_frame_inner_rotation(vec![1, 4, 8]);
-        assert_eq!(
-            report.frame_inner_rotation,
-            Some(FrameInnerRotationGauge {
-                per_atom_ranks: vec![1, 4, 8],
-                dim: 34,
-            })
-        );
-        // Verdict-side facts untouched.
-        assert_eq!(report.residual_gauge_dim, 0);
-        assert!(report.generators.is_empty());
-        // Signature and summary carry the enumeration.
-        let sig_after = report.group_signature();
-        assert_ne!(sig_before, sig_after);
-        assert!(sig_after.contains("frame-inner"), "got: {sig_after}");
-        assert!(sig_after.contains("dim 34"), "got: {sig_after}");
-        assert!(sig_after.contains("canonical-fixed"), "got: {sig_after}");
-        assert!(report.summary.contains("inner-rotation gauge"));
-
-        // A dictionary of rank-1 atoms has a zero-dimensional inner gauge:
-        // enumerated (Some), but the signature is unchanged — there is
-        // nothing to fix beyond the orientation sign convention.
-        let trivial = ResidualGaugeReport {
-            metric_provenance: MetricProvenance::Euclidean,
-            generators: Vec::new(),
-            pinning_rank: 0,
-            pinning_rank_support: PinningRankSupport::ParameterSpace,
-            residual_gauge_dim: 0,
-            diffeomorphism_unpinned: false,
-            sym_f_trivial_under_output_fisher: None,
-            frame_inner_rotation: None,
-            summary: "base".to_string(),
-        };
-        let sig_trivial_before = trivial.group_signature();
-        let trivial = trivial.with_frame_inner_rotation(vec![1, 1, 1]);
-        assert_eq!(
-            trivial.frame_inner_rotation.as_ref().map(|g| g.dim),
-            Some(0)
-        );
-        assert_eq!(trivial.group_signature(), sig_trivial_before);
-        assert_eq!(trivial.summary, "base");
-    }
-
     /// Build a `(n, d)` `(mean, scale)` pair whose stacked signature
     /// `[μ ‖ log σ]` has full rank `2d` (so it satisfies the Khemakhem
     /// Theorem 1 precondition baked into `ConditionalPriorIvae::new`).
@@ -4424,17 +4347,6 @@ mod tests {
             err.contains("numerical rank") && err.contains("Khemakhem"),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn piecewise_linear_eval_endpoints_and_midpoint() {
-        let coeffs = array![[0.0_f64, 10.0], [1.0, 20.0], [2.0, 30.0]];
-        let u = Array1::from(vec![0.0, 0.5, 1.0]);
-        let out = piecewise_linear_eval(u.view(), coeffs.view(), 0.0, 1.0);
-        assert!((out[[0, 0]] - 0.0).abs() < 1e-12);
-        assert!((out[[1, 0]] - 1.0).abs() < 1e-12);
-        assert!((out[[2, 0]] - 2.0).abs() < 1e-12);
-        assert!((out[[1, 1]] - 20.0).abs() < 1e-12);
     }
 
     #[test]

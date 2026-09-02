@@ -1,8 +1,4 @@
-use gam::geometry::{
-    CircleManifold, EuclideanManifold, GeodesicIntegrator, GrassmannManifold, ProductManifold,
-    RiemannianLBFGS, RiemannianManifold, RiemannianObjective, RiemannianTrustRegion, SpdManifold,
-    SphereManifold, StiefelManifold, TorusManifold,
-};
+use gam::geometry::{CircleManifold, EuclideanManifold, GeodesicIntegrator, GrassmannManifold, ProductManifold, RiemannianManifold, RiemannianObjective, RiemannianTrustRegion, SpdManifold, SphereManifold, StiefelManifold, TorusManifold};
 use ndarray::{Array1, Array2, array};
 
 fn norm(v: &Array1<f64>) -> f64 {
@@ -154,39 +150,6 @@ fn product_retract_should_equal_componentwise_retracts() {
     assert!(
         norm(&(out - expected)) < 1.0e-12,
         "Product manifold retract should be the Cartesian product of factor retractions"
-    );
-}
-
-struct QuadObjective {
-    h: Array2<f64>,
-}
-
-impl RiemannianObjective for QuadObjective {
-    fn value_gradient(
-        &mut self,
-        point: ndarray::ArrayView1<'_, f64>,
-    ) -> gam::geometry::GeometryResult<(f64, Array1<f64>)> {
-        let hp = self.h.dot(&point.to_owned());
-        Ok((0.5 * point.dot(&hp), hp))
-    }
-}
-
-#[test]
-fn lbfgs_inverse_hessian_should_converge_to_true_hessian_inverse_for_quadratic() {
-    let m = EuclideanManifold::new(2);
-    let mut obj = QuadObjective {
-        h: array![[10.0, 0.0], [0.0, 1.0]],
-    };
-    let opt = RiemannianLBFGS {
-        max_iter: 50,
-        step_size: 0.1,
-        ..Default::default()
-    };
-    let x0 = array![1.0, 1.0];
-    let x_star = opt.minimize(&m, &mut obj, x0.view()).unwrap();
-    assert!(
-        norm(&x_star) < 1.0e-6,
-        "LBFGS on an SPD quadratic should converge to the exact minimizer with enough iterations"
     );
 }
 

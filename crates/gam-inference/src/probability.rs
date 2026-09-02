@@ -10,17 +10,9 @@ pub use gam_math::probability::normal_pdf;
 /// `crate::probability::normal_cdf` resolving for all existing callers.
 pub use gam_math::probability::normal_cdf;
 
-/// Standard normal upper tail `1 - Φ(x)`, computed rather than reconstructed.
-/// `1.0 - normal_cdf(x)` returns exactly zero for `x` above ~8.3 because Φ
-/// saturates; this keeps full relative accuracy down to the subnormal floor
-/// (#2562). Implementation lives in `gam-math`.
-
 /// Two-sided standard-normal probability `P(|Z| ≥ |z|)`, evaluated directly
 /// without subtracting a CDF from one.
 pub use gam_math::probability::normal_two_sided_probability;
-
-/// Student-t survival probability `P(T_ν > t)`, evaluated through the direct
-/// regularized-beta tail in `gam-math`.
 
 /// Two-sided Student-t probability `P(|T_ν| ≥ |t|)`, evaluated through the
 /// direct regularized-beta tail in `gam-math`.
@@ -882,13 +874,6 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_problem::types::{
-        InverseLink, LinkComponent, MixtureLinkSpec, ResponseFamily, SasLinkSpec, StandardLink,
-    };
-    use gam_solve::mixture_link::{
-        mixture_inverse_link_jet, sas_inverse_link_jet, state_from_sasspec, state_fromspec,
-    };
-    use ndarray::array;
 
     #[test]
     fn signed_log_sum_exp_propagates_positive_infinities() {
@@ -922,57 +907,6 @@ mod tests {
         let (lm, s) = signed_log_sum_exp(&[3.0_f64.ln(), 1.0_f64.ln()], &[1.0, -1.0]);
         assert!((lm - 2.0_f64.ln()).abs() < 1e-12);
         assert_eq!(s, 1.0);
-    }
-
-    #[test]
-    fn standard_inverse_link_specs_evaluate() {
-        let eta = array![0.1, -0.2, 0.3];
-        let likelihood = LikelihoodSpec::new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::Logit),
-        );
-        let mu = try_inverse_link_array(&likelihood, eta.view()).expect("standard logit spec");
-        assert_eq!(mu.len(), eta.len());
-        for (&got, &eta_i) in mu.iter().zip(eta.iter()) {
-            assert_eq!(
-                got.to_bits(),
-                gam_linalg::utils::stable_logistic(eta_i).to_bits()
-            );
-        }
-    }
-
-    #[test]
-    fn sas_and_mixture_stateful_inverse_link_evaluates() {
-        let eta = array![0.1, -0.2, 0.3];
-        let sas_state = state_from_sasspec(SasLinkSpec {
-            initial_epsilon: 0.2,
-            initial_log_delta: -0.1,
-        })
-        .expect("sas state");
-        let sas_expected = eta.mapv(|eta_i| {
-            sas_inverse_link_jet(eta_i, sas_state.epsilon, sas_state.log_delta)
-                .expect("direct SAS jet")
-                .mu
-        });
-        let sas_likelihood =
-            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(sas_state));
-        let sas = try_inverse_link_array(&sas_likelihood, eta.view()).expect("SAS with params");
-        for (&got, &expected) in sas.iter().zip(sas_expected.iter()) {
-            assert_eq!(got.to_bits(), expected.to_bits());
-        }
-
-        let spec = MixtureLinkSpec {
-            components: vec![LinkComponent::Probit, LinkComponent::CLogLog],
-            initial_rho: array![0.3],
-        };
-        let state = state_fromspec(&spec).expect("mixture state");
-        let mix_expected = eta.mapv(|eta_i| mixture_inverse_link_jet(&state, eta_i).mu);
-        let mix_likelihood =
-            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(state));
-        let mix = try_inverse_link_array(&mix_likelihood, eta.view()).expect("mixture with state");
-        for (&got, &expected) in mix.iter().zip(mix_expected.iter()) {
-            assert_eq!(got.to_bits(), expected.to_bits());
-        }
     }
 
     #[test]

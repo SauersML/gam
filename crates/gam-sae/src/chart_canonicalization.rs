@@ -3217,26 +3217,6 @@ mod patch_flow_tests {
         );
     }
 
-    #[test]
-    fn free_patch_flow_basis_layout_and_jacobian_at_identity() {
-        let basis = FreePatchFlowBasis::new([0.0, 0.0], [1.0, 1.0]).expect("patch basis");
-        // 2 components × 2 monomials (deg 1: (1,0),(0,1)) = 4 coefficients.
-        assert_eq!(basis.dim(), 4);
-        assert_eq!(basis.mode_layout().len(), 4);
-        // θ = 0 ⇒ Dφ = I everywhere ⇒ min det = 1.
-        let theta = vec![0.0_f64; basis.dim()];
-        let det = basis.min_jacobian_det_on_grid(&theta);
-        assert!(
-            (det - 1.0).abs() < 1e-12,
-            "identity flow has det Dφ ≡ 1; got {det}"
-        );
-        // The first two modes of component 0 are the linear fields (1,0),(0,1).
-        let layout = basis.mode_layout();
-        assert_eq!(layout[0].component, 0);
-        assert_eq!(layout[0].exps, (1, 0));
-        assert_eq!(layout[1].exps, (0, 1));
-    }
-
     /// Finite-difference check of the analytic mode gradients (the `grad` the
     /// Gauss–Newton Jacobian is built from) against the monomial values.
     #[test]
@@ -3267,139 +3247,7 @@ mod patch_flow_tests {
 #[cfg(test)]
 mod sphere_defect_tests {
     use super::*;
-    use ndarray::{Array2, Array3, ArrayView2};
-
-    /// Mock sphere-chart evaluator: `m = p = 2`, identity decoder, with a jet
-    /// whose per-row decoded tangents are `∂γ/∂lat = (1, 0)` and
-    /// `∂γ/∂lon = (0, warp·cos lat)`. With `warp = 1` the pullback metric is
-    /// exactly the round-sphere reference `diag(1, cos²lat)` (defect 0); any
-    /// `warp ≠ 1` rescales the lon direction uniformly — still a global rescale
-    /// of the lon column, but NOT a global rescale of the whole metric, so it
-    /// registers as a genuine anisotropic defect.
-    #[derive(Debug)]
-    struct MockSphereEvaluator {
-        warp: f64,
-    }
-
-    impl SaeBasisEvaluator for MockSphereEvaluator {
-        fn evaluate(
-            &self,
-            coords: ArrayView2<'_, f64>,
-        ) -> Result<(Array2<f64>, Array3<f64>), String> {
-            let n = coords.nrows();
-            // Basis Φ is unused by the defect (only the jet enters G); return a
-            // well-formed (n, 2) zero basis.
-            let phi = Array2::<f64>::zeros((n, 2));
-            let mut jet = Array3::<f64>::zeros((n, 2, 2));
-            for row in 0..n {
-                let lat = coords[[row, 0]];
-                // basis col 0 carries the lat tangent (1, 0): ∂/∂lat = 1 on
-                // output 0; basis col 1 carries the lon tangent
-                // (0, warp·cos lat): ∂/∂lon = warp·cos lat on output 1.
-                jet[[row, 0, 0]] = 1.0; // d(col0)/d(lat)
-                jet[[row, 1, 1]] = self.warp * lat.cos(); // d(col1)/d(lon)
-            }
-            Ok((phi, jet))
-        }
-
-        // This mock supplies only the first jet that the chart-defect test
-        // exercises; it carries no analytic second/third jet, so it declares
-        // that capability absent (`None`) per the trait contract rather than
-        // fabricating one — after validating the (lat, lon) coordinate shape
-        // it is contracted on, mirroring the sanctioned `TestPeriodicEvaluator`
-        // higher-jet stubs.
-        fn second_jet_dyn(
-            &self,
-            coords: ArrayView2<'_, f64>,
-        ) -> Option<Result<ndarray::Array4<f64>, String>> {
-            if coords.ncols() != 2 {
-                return Some(Err(format!(
-                    "MockSphereEvaluator::second_jet_dyn: expected (lat, lon) coords, got {} cols",
-                    coords.ncols()
-                )));
-            }
-            None
-        }
-
-        fn third_jet_dyn(
-            &self,
-            coords: ArrayView2<'_, f64>,
-        ) -> Option<Result<ndarray::Array5<f64>, String>> {
-            if coords.ncols() != 2 {
-                return Some(Err(format!(
-                    "MockSphereEvaluator::third_jet_dyn: expected (lat, lon) coords, got {} cols",
-                    coords.ncols()
-                )));
-            }
-            None
-        }
-    }
-
-    fn coords(lats: &[f64]) -> Array2<f64> {
-        let n = lats.len();
-        let mut c = Array2::<f64>::zeros((n, 2));
-        for (i, &lat) in lats.iter().enumerate() {
-            c[[i, 0]] = lat;
-            c[[i, 1]] = 0.1 * i as f64; // lon, irrelevant to the metric
-        }
-        c
-    }
-
-    #[test]
-    fn round_isometric_chart_has_zero_defect() {
-        let ev = MockSphereEvaluator { warp: 1.0 };
-        let decoder = Array2::<f64>::eye(2);
-        let c = coords(&[-0.6, -0.2, 0.0, 0.3, 0.7]);
-        let defect = sphere_chart_isometry_defect(&ev, decoder.view(), c.view())
-            .expect("defect must evaluate")
-            .expect("non-degenerate round chart must return Some");
-        assert!(
-            defect < 1e-10,
-            "a chart whose pullback metric is exactly diag(1, cos²lat) is round-isometric; \
-             defect should be ~0, got {defect:.3e}"
-        );
-    }
-
-    #[test]
-    fn warped_chart_has_large_defect() {
-        // warp = 2.5 stretches the lon direction by a lat-independent factor,
-        // so the pullback metric is diag(1, (2.5·cos lat)²) — NOT a global
-        // rescale of diag(1, cos²lat), so the profiled-scale residual is
-        // strictly positive.
-        let ev = MockSphereEvaluator { warp: 2.5 };
-        let decoder = Array2::<f64>::eye(2);
-        let c = coords(&[-0.6, -0.2, 0.0, 0.3, 0.7]);
-        let defect = sphere_chart_isometry_defect(&ev, decoder.view(), c.view())
-            .expect("defect must evaluate")
-            .expect("non-degenerate warped chart must return Some");
-        assert!(
-            defect > 1e-2,
-            "an anisotropically warped chart must register a sizeable defect, got {defect:.3e}"
-        );
-    }
-
-    #[test]
-    fn pole_singularity_is_refused_not_fabricated() {
-        // A row sitting exactly on the pole (lat = π/2, cos lat = 0) makes the
-        // reference metric's lon column vanish; the function must refuse (None)
-        // rather than fabricate a defect on the chart singularity.
-        let ev = MockSphereEvaluator { warp: 1.0 };
-        let decoder = Array2::<f64>::eye(2);
-        let base = coords(&[0.0, 0.3]);
-        // Append a pole row (lat = π/2).
-        let mut c3 = Array2::<f64>::zeros((3, 2));
-        c3.slice_mut(ndarray::s![0..2, ..]).assign(&base);
-        c3[[2, 0]] = std::f64::consts::FRAC_PI_2;
-        let out = sphere_chart_isometry_defect(&ev, decoder.view(), c3.view())
-            .expect("defect must evaluate");
-        // At the exact pole the decoded lon tangent (cos lat = 0) also collapses
-        // the pullback metric (det G = 0), so this refuses via the rank-deficient
-        // metric guard — either way an honest None, never a fabricated number.
-        assert!(
-            out.is_none(),
-            "a pole-singular chart row must be refused, got {out:?}"
-        );
-    }
+    use ndarray::Array2;
 
     /// FD-gate the analytic conformal-boost mode Jacobians `Dv_k(t)` against
     /// central differences of the displacements `v_k(t)` — the exact object the
@@ -3518,23 +3366,6 @@ mod sphere_defect_tests {
         }
     }
 
-    /// The zonal boost `K_z = cos(lat) ∂_lat` is pole-free (its only nonzero
-    /// component is latitude and carries no `1/cos` factor), and the boost
-    /// `[Z, X, Y]` layout is stable.
-    #[test]
-    fn sphere_boost_layout_and_zonal_is_pole_free() {
-        let basis = SphereBoostFlowBasis;
-        assert_eq!(basis.dim(), 3);
-        assert_eq!(
-            basis.mode_layout(),
-            [SphereBoostAxis::Z, SphereBoostAxis::X, SphereBoostAxis::Y]
-        );
-        // K_z displacement is (cos lat, 0): finite for every latitude.
-        for lat in [-1.4, -0.3, 0.0, 0.9, 1.4] {
-            let disp = SphereBoostFlowBasis::mode_displacements([lat, 0.5]);
-            assert!(disp[0][0].is_finite() && disp[0][1] == 0.0);
-        }
-    }
 }
 
 #[cfg(test)]

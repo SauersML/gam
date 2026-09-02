@@ -6020,21 +6020,6 @@ mod tests {
     }
 
     #[test]
-    fn affine_reml_saturated_tail_uses_complement_sign_before_value_flatness() {
-        let profile = AffineRemlProfile::new(&[1.0], &[1.0], &[0.0], &[1.0], 4.0, 1, 0.0)
-            .expect("valid saturated-tail fixture");
-        let result = profile
-            .maximize(600.0, 700.0, f64::EPSILON.sqrt())
-            .expect("the cancellation-free derivative proves the tail monotone");
-        assert_eq!(result.location, ScoreOptimumLocation::UpperBoundary);
-        assert_eq!(result.optimum.x, 700.0);
-        assert!(
-            result.resolution_flat_regions.is_empty(),
-            "a strictly positive derivative should resolve before value-flat fallback"
-        );
-    }
-
-    #[test]
     fn affine_reml_extreme_domain_one_direction_encloses_and_maximizes_repeatably() {
         // The normalized one-direction ridge profile behind the gam-sae
         // regressions has

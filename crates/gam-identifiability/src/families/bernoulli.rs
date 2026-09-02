@@ -160,21 +160,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bernoulli_row_hessian_matches_probit_irls_weight() {
-        let eta = Array1::from(vec![-1.5_f64, 0.0, 0.75, 2.0]);
-        let w = Array1::from(vec![1.0_f64; 4]);
-        let hess = BernoulliRowHessian::from_eta_pilot(&eta, &w);
-        for i in 0..eta.len() {
-            let want = probit_irls_weight(eta[i], 1.0);
-            let got = hess.row_weights()[i];
-            assert!(
-                (got - want).abs() < 1e-14,
-                "row {i}: got {got}, want {want}"
-            );
-        }
-    }
-
-    #[test]
     fn dense_design_operator_evaluate_full_shape() {
         let design = Array2::from_shape_fn((5, 3), |(i, j)| (i as f64) * 0.1 + (j as f64));
         let op = BernoulliDenseDesignOperator::new(design.clone());

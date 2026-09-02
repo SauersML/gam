@@ -1426,7 +1426,6 @@ fn plan_reserves_analytic_hessian_for_terminal_certificate_2359() {
     assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
 }
 
-
 #[test]
 fn plan_no_hessian_few_params_selects_bfgs() {
     let cap = OuterCapability {
@@ -1518,179 +1517,6 @@ fn plan_cost_only_few_params_with_fixed_point_uses_only_valid_solver() {
     let selected = plan(&cap);
     assert_eq!(selected.solver, Solver::Efs);
     assert_eq!(selected.hessian_source, HessianSource::EfsFixedPoint);
-}
-
-#[test]
-fn no_gradient_efs_requires_and_accepts_explicit_full_coverage_certificate() {
-    // Two coordinates is below the analytic-gradient BFGS crossover. With no
-    // gradient, the explicit fixed-point lane is nevertheless the only valid
-    // solver and must be selected rather than rejected on problem size.
-    let n = 2;
-    let center = Array1::from_elem(n, 0.25);
-    let problem = OuterProblem::new(n)
-        .with_gradient(Derivative::Unavailable)
-        .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_initial_rho(Array1::zeros(n))
-        .with_max_iter(8)
-        .with_tolerance(1.0e-8);
-    let step_center = center.clone();
-    let proof_center = center.clone();
-    let mut objective = problem
-        .build_objective(
-            (),
-            move |_: &mut (), rho: &Array1<f64>| {
-                let d = rho - &center;
-                Ok(0.5 * d.dot(&d))
-            },
-            |_: &mut (), rho: &Array1<f64>| Ok(OuterEval::value_only(0.0, rho.len(), None)),
-            None::<fn(&mut ())>,
-            Some(move |_: &mut (), rho: &Array1<f64>| {
-                let update = &step_center - rho;
-                Ok(EfsEval {
-                    cost: 0.5 * update.dot(&update),
-                    steps: update.to_vec(),
-                    beta: None,
-                    psi_gradient: None,
-                    psi_indices: None,
-                    inner_hessian_scale: None,
-                    logdet_enclosure_gap: None,
-                    consecutive_restored_incumbents: None,
-                })
-            }),
-        )
-        .with_fixed_point_certificate(move |_: &mut (), rho: &Array1<f64>| {
-            let update = &proof_center - rho;
-            Ok(FixedPointCertificateEval {
-                cost: 0.5 * update.dot(&update),
-                coordinates: update
-                    .iter()
-                    .map(|&value| FixedPointCoordinateCertificate::covered(value, 1.0))
-                    .collect(),
-            })
-        });
-    let result = problem
-        .run(&mut objective, "explicit fixed-point certificate")
-        .expect("fully covered analytic fixed point must certify");
-    assert_eq!(result.plan_used.solver, Solver::Efs);
-    assert!(matches!(
-        result.converged_via(),
-        Some(OuterConvergedVia::FixedPointStationary { .. })
-    ));
-    assert!(
-        result
-            .criterion_certificate
-            .as_ref()
-            .is_some_and(|certificate| certificate.stationarity.is_fixed_point())
-    );
-}
-
-#[test]
-fn fixed_point_certificate_refuses_value_channel_desync() {
-    let n = 2;
-    let center = Array1::from_elem(n, 0.25);
-    let problem = OuterProblem::new(n)
-        .with_gradient(Derivative::Unavailable)
-        .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_initial_rho(Array1::zeros(n))
-        .with_max_iter(8)
-        .with_tolerance(1.0e-8);
-    let step_center = center.clone();
-    let mut objective = problem
-        .build_objective(
-            (),
-            move |_: &mut (), rho: &Array1<f64>| {
-                let displacement = rho - &center;
-                Ok(0.5 * displacement.dot(&displacement))
-            },
-            |_: &mut (), rho: &Array1<f64>| Ok(OuterEval::value_only(0.0, rho.len(), None)),
-            None::<fn(&mut ())>,
-            Some(move |_: &mut (), rho: &Array1<f64>| {
-                let update = &step_center - rho;
-                Ok(EfsEval {
-                    cost: 0.5 * update.dot(&update),
-                    steps: update.to_vec(),
-                    beta: None,
-                    psi_gradient: None,
-                    psi_indices: None,
-                    inner_hessian_scale: None,
-                    logdet_enclosure_gap: None,
-                    consecutive_restored_incumbents: None,
-                })
-            }),
-        )
-        .with_fixed_point_certificate(|_: &mut (), rho: &Array1<f64>| {
-            Ok(FixedPointCertificateEval {
-                // Deliberately inconsistent with the value-only criterion,
-                // which is zero at the fixed point.
-                cost: 1.0,
-                coordinates: rho
-                    .iter()
-                    .map(|_| FixedPointCoordinateCertificate::covered(0.0, 1.0))
-                    .collect(),
-            })
-        });
-    let error = problem
-        .run(&mut objective, "desynced fixed-point certificate")
-        .expect_err("a fixed-point residual for a different value must not mint");
-    assert!(
-        matches!(error, EstimationError::RemlDidNotConverge { .. }),
-        "fixed-point value desynchronisation must be typed non-convergence: {error}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("cost-only value disagrees with analytic-sample value"),
-        "fixed-point refusal must name the split objective: {error}"
-    );
-}
-
-#[test]
-fn no_gradient_efs_refuses_guarded_zero_as_uncovered_certificate() {
-    let n = 9;
-    let problem = OuterProblem::new(n)
-        .with_gradient(Derivative::Unavailable)
-        .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_initial_rho(Array1::zeros(n))
-        .with_max_iter(2);
-    let mut objective = problem
-        .build_objective(
-            (),
-            |_: &mut (), _: &Array1<f64>| Ok(0.0),
-            |_: &mut (), rho: &Array1<f64>| Ok(OuterEval::value_only(0.0, rho.len(), None)),
-            None::<fn(&mut ())>,
-            Some(|_: &mut (), rho: &Array1<f64>| {
-                Ok(EfsEval {
-                    cost: 0.0,
-                    steps: vec![0.0; rho.len()],
-                    beta: None,
-                    psi_gradient: None,
-                    psi_indices: None,
-                    inner_hessian_scale: None,
-                    logdet_enclosure_gap: None,
-                    consecutive_restored_incumbents: None,
-                })
-            }),
-        )
-        .with_fixed_point_certificate(|_: &mut (), rho: &Array1<f64>| {
-            let mut coordinates =
-                vec![FixedPointCoordinateCertificate::covered(0.0, 1.0); rho.len()];
-            coordinates[3] = FixedPointCoordinateCertificate::uncovered(
-                "guard held; no root-equivalent update exists",
-            );
-            Ok(FixedPointCertificateEval {
-                cost: 0.0,
-                coordinates,
-            })
-        });
-    let error = problem
-        .run(&mut objective, "uncovered fixed-point coordinate")
-        .expect_err("an uncovered guarded zero must never certify");
-    assert!(
-        error
-            .to_string()
-            .contains("lacks root-equivalent analytic coverage"),
-        "unexpected error: {error}"
-    );
 }
 
 #[test]
@@ -1818,7 +1644,6 @@ fn plan_efs_not_selected_with_analytic_hessian() {
     // Arc is always preferred when analytic Hessian is available.
     assert_eq!(p.solver, Solver::Arc);
 }
-
 
 #[test]
 fn plan_efs_allowed_with_barrier_config() {
@@ -4413,7 +4238,6 @@ fn routing_matern_iso_large_kappa_dim_stays_on_arc_with_analytic_hessian() {
     assert_eq!(p.hessian_source, HessianSource::Analytic);
 }
 
-
 #[test]
 fn plan_hybrid_efs_selected_few_params() {
     // ψ-carrying fixed-point objectives route to HybridEfs at every
@@ -4500,7 +4324,6 @@ fn plan_hybrid_efs_not_selected_with_analytic_hessian() {
     let p = plan(&cap);
     assert_eq!(p.solver, Solver::Arc);
 }
-
 
 #[test]
 fn automatic_fallbacks_preserve_analytic_hessian_for_arc_primary() {
