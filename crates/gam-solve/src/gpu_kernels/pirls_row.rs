@@ -221,20 +221,6 @@ pub struct RowOutput {
     pub deviance: f64,
 }
 
-/// Reference CPU evaluator for one row. `mode` selects `w_hessian` curvature.
-///
-/// `gamma_shape` is the Gamma dispersion shape parameter (α > 0). It is only
-/// used when `family == GammaLog`; all other families ignore it. Pass `1.0`
-/// for non-Gamma fits.
-pub fn row_reweight_cpu(
-    family: PirlsRowFamily,
-    mode: CurvatureMode,
-    input: RowInput,
-    gamma_shape: f64,
-) -> Result<RowOutput, EstimationError> {
-    row_reweight_cpu_at(0, family, mode, input, gamma_shape)
-}
-
 /// Indexed form of [`row_reweight_cpu`], used to reproduce a device refusal
 /// with the correct row in its typed error.
 pub fn row_reweight_cpu_at(
@@ -1184,60 +1170,6 @@ impl JitFamilySpec {
         }
     }
 
-    /// The `extern "C"` kernel symbol the JIT-compiled module exposes.
-    pub fn kernel_name(&self) -> String {
-        format!("pirls_row_jit_{}", self.spec_id)
-    }
-
-    /// Build the full CUDA source ready for NVRTC compilation. The
-    /// shell + prolog match the built-in `cuda_source_for` so the JIT
-    /// kernel ABI is bit-identical to the cached built-ins;
-    /// [`launch_row_reweight_on_stream`] cannot tell the difference.
-    #[cfg(target_os = "linux")]
-    pub fn cuda_source(&self, curvature: CurvatureMode) -> String {
-        let curvature_define = match curvature {
-            CurvatureMode::Fisher => "#define PIRLS_CURVATURE_FISHER 1",
-            CurvatureMode::Observed => "#define PIRLS_CURVATURE_OBSERVED 1",
-        };
-        let kernel_name = self.kernel_name();
-        let body = &self.body;
-        format!(
-            r#"
-{curvature_define}
-{prolog}
-
-extern "C" __global__ void {kernel_name}(
-    int            n,
-    const double* __restrict__ eta,
-    const double* __restrict__ y,
-    const double* __restrict__ prior_w,
-    double* __restrict__ mu_out,
-    double* __restrict__ grad_eta_out,
-    double* __restrict__ w_hessian_out,
-    double* __restrict__ w_solver_out,
-    double* __restrict__ deviance_out,
-    unsigned int* __restrict__ status_out
-) {{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    unsigned int status = PIRLS_OK;
-    double eta_i = eta[i];
-    double y_i = y[i];
-    double wp = prior_w[i];
-{body}
-    if (status == PIRLS_OK) {{
-        mu_out[i] = mu;
-        grad_eta_out[i] = grad_eta;
-        w_hessian_out[i] = w_hessian;
-        w_solver_out[i] = w_solver;
-        deviance_out[i] = dev;
-    }}
-    status_out[i] = status;
-}}
-"#,
-            prolog = common_device_prolog(),
-        )
-    }
 }
 
 /// Device-resident per-row output buffers for the GPU row-reweight kernel.
@@ -1459,7 +1391,6 @@ pub fn launch_row_reweight_on_stream(
         .gpu_ctx_with(|err| format!("row reweight launch({}): {err}", family.kernel_name()))?;
     Ok(())
 }
-
 
 /// **solve-row** mode launcher.
 ///

@@ -813,45 +813,6 @@ impl ResidentBaseArrowFrameHandle {
         }
     }
 
-    /// As [`Self::refactor_and_solve`], but solves for a FRESH gradient instead
-    /// of the one captured at construction (#2539).
-    ///
-    /// [`Self::refactor_and_solve`] was built for the LM ridge ladder, whose
-    /// trials re-solve the SAME system at escalating ridges, so it reads the
-    /// resident `g_t`/`g_β`. An inner Newton moves the gradient every iterate
-    /// while the Hessian blocks stay fixed, so it needs this variant: `g_t`
-    /// (`n·d` doubles) and `g_β` (`k`) cross to the device in place of the
-    /// device-to-device copy of the resident gradient, and the `D`/`B`/`H_ββ`
-    /// blocks stay resident exactly as they do there. Everything after the
-    /// gradient sourcing — POTRF/TRSM/Schur/back-substitution and their order —
-    /// is the same code, so a solve here is bit-identical to a
-    /// [`ResidentArrowFrameHandle`] rebuild at the same ridge and gradient.
-    pub fn refactor_and_solve_with_gradient(
-        &self,
-        ridge_t: f64,
-        ridge_beta: f64,
-        g_t: &[f64],
-        g_beta: &[f64],
-    ) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            if ridge_t.is_nan()
-                || ridge_beta.is_nan()
-                || g_t.iter().chain(g_beta).any(|v| !v.is_finite())
-            {
-                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
-                    reason: "ridge or gradient entry is not finite".to_string(),
-                });
-            }
-            Err(ArrowSchurGpuFailure::Unavailable)
-        }
-        #[cfg(target_os = "linux")]
-        {
-            self.inner
-                .refactor_and_solve_with_gradient(ridge_t, ridge_beta, g_t, g_beta)
-        }
-    }
-
     /// Run only the ridge-dependent FACTOR work and hand the factors back, so a
     /// caller whose ridge does not move on the next iterate can re-solve without
     /// re-factoring (#2539).
@@ -1237,37 +1198,6 @@ fn build_row_procedural_matvec(
         });
 
     Ok(closure)
-}
-
-/// Solve the reduced shared β-system `S·δβ = r` fully on device with a
-/// Jacobi-preconditioned conjugate-gradient (Steihaug truncated-CG) loop.
-///
-/// `S` is the already-reduced symmetric positive-definite `K × K` Schur
-/// complement the streaming SAE joint fit accumulates across minibatches
-/// (`StreamingArrowSchur::take_accumulators` summed over chunks, with the
-/// global β ridge folded in). The per-row latent blocks have already been
-/// eliminated into `S` on the host streaming path; the device's job is the
-/// dense `K`-dimensional solve, which is the dominant cost at `K = 100K`.
-///
-/// The dense `S·p` matvec runs on device via cuBLAS `Dgemv`, and the PCG state
-/// vectors (`x`, `r`, `z`, `p`, `S·p`) remain device-resident for the solve.
-/// Jacobi preconditioning is an elementwise CUDA kernel; only convergence
-/// scalars (`pᵀSp`, `rᵀz`, `‖r‖`) cross the host boundary per iteration, plus the
-/// final solution vector.
-///
-/// Returns `Err(ArrowSchurGpuFailure::Unavailable)` when CUDA is unavailable
-/// or the workload is below the dispatch policy; the caller then runs the CPU
-/// reduced-β solve. Returns `Err(ArrowSchurGpuFailure::SchurFactorFailed)`
-/// when `S` carries a non-positive Jacobi diagonal (caller escalates the
-/// proximal ridge).
-pub fn solve_reduced_beta_pcg(
-    s_acc: &Array2<f64>,
-    rhs_beta: &Array1<f64>,
-    max_iterations: usize,
-    relative_tolerance: f64,
-) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
-    solve_reduced_beta_pcg_with_diagnostics(s_acc, rhs_beta, max_iterations, relative_tolerance)
-        .map(|(x, _)| x)
 }
 
 pub fn solve_reduced_beta_pcg_with_diagnostics(
@@ -1785,53 +1715,6 @@ pub fn compute_ainv_host(
     Ok(ainv)
 }
 
-/// #1551 kernel-isolating parity probe: run the framed reduced-Schur matvec
-/// `out = S·x` exactly once on the device and return it (no PCG, no offload-floor
-/// gate). The test suite diffs this element-wise against the CPU oracle
-/// [`sae_framed_schur_matvec_cpu`] to prove the GPU kernel computes the SAME
-/// operator — a check that is independent of solver conditioning (unlike a
-/// solved-`δβ` comparison, which can diverge purely because dense Cholesky and
-/// iterative PCG resolve an ill-conditioned `S` to different accuracies).
-#[cfg(target_os = "linux")]
-pub fn framed_schur_matvec_once_on_device(
-    sys: &ArrowSchurSystem,
-    data: &DeviceSaePcgData,
-    ridge_t: f64,
-    ridge_beta: f64,
-    x: &Array1<f64>,
-) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
-    if sys.k != data.beta_dim || x.len() != data.beta_dim || data.p == 0 {
-        return Err(ArrowSchurGpuFailure::Unavailable);
-    }
-    if data.frame.is_none() {
-        return Err(ArrowSchurGpuFailure::Unavailable);
-    }
-    cuda::framed_schur_matvec_once_on_device(sys, data, ridge_t, ridge_beta, x)
-}
-
-/// #1017 evidence-lane probe: the DETERMINISTIC framed reduced-Schur matvec
-/// `out = S·x` (host penalty + atomics-free device reduced-Schur term), computed
-/// once. The test harness diffs it against [`sae_framed_schur_matvec_cpu`] AND
-/// runs it twice to prove run-to-run bit stability — the two gates that let this
-/// operator feed the SLQ `log|S|` evidence lane without breaking its determinism
-/// contract.
-#[cfg(target_os = "linux")]
-pub fn framed_reduced_schur_det_once_on_device(
-    sys: &ArrowSchurSystem,
-    data: &DeviceSaePcgData,
-    ridge_t: f64,
-    ridge_beta: f64,
-    x: &Array1<f64>,
-) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
-    if sys.k != data.beta_dim || x.len() != data.beta_dim || data.p == 0 {
-        return Err(ArrowSchurGpuFailure::Unavailable);
-    }
-    if data.frame.is_none() {
-        return Err(ArrowSchurGpuFailure::Unavailable);
-    }
-    cuda::framed_reduced_schur_det_once_on_device(sys, data, ridge_t, ridge_beta, x)
-}
-
 /// Reference dense back-end used by tests and as the fallback when the
 /// GPU declines. Kept here (not in `arrow_schur_gpu.rs`) so the validation
 /// suite has one canonical baseline.
@@ -1964,77 +1847,6 @@ pub fn sae_framed_penalty_matvec_cpu(
             }
         }
     }
-}
-
-/// Frames-engaged FULL reduced-Schur matvec `out = S·x` purely from the device
-/// data, where `S = (P_ββ + ρ_β I) − Σ_i H_βt^(i)(H_tt^(i)+ρ_t I)⁻¹ H_tβ^(i)`
-/// (issue #1017/#1026). The penalty side is [`sae_framed_penalty_matvec_cpu`];
-/// the per-row reduced term reads the dense `frame.row_htbeta[i]`
-/// (`q_i × border_dim`, row-major), solves against the row's
-/// `H_tt^(i)+ρ_t I` Cholesky factor, and scatters the transpose back. This is
-/// the size-independent bit-parity oracle the device kernel mirrors; it is also
-/// the matvec the GPU PCG iterates.
-pub fn sae_framed_schur_matvec_cpu(
-    sys: &ArrowSchurSystem,
-    data: &DeviceSaePcgData,
-    ridge_t: f64,
-    ridge_beta: f64,
-    x: &[f64],
-    out: &mut [f64],
-) -> Result<(), String> {
-    let frame = data
-        .frame
-        .as_ref()
-        .ok_or("sae_framed_schur_matvec_cpu requires frame metadata")?;
-    let k = data.beta_dim;
-    sae_framed_penalty_matvec_cpu(data, ridge_beta, x, out);
-    if frame.row_htbeta.len() != sys.rows.len() {
-        return Err(format!(
-            "sae_framed_schur_matvec_cpu: {} row_htbeta slabs but {} rows",
-            frame.row_htbeta.len(),
-            sys.rows.len()
-        ));
-    }
-    for (i, row) in sys.rows.iter().enumerate() {
-        let slab = &frame.row_htbeta[i];
-        if slab.is_empty() {
-            continue;
-        }
-        let qi = sys.row_dims[i];
-        if qi == 0 || slab.len() != qi * k {
-            continue;
-        }
-        // h = H_tβ^(i) · x  (length q_i).
-        let mut h = vec![0.0_f64; qi];
-        for c in 0..qi {
-            let base = c * k;
-            let mut acc = 0.0_f64;
-            for a in 0..k {
-                acc += slab[base + a] * x[a];
-            }
-            h[c] = acc;
-        }
-        // solve (H_tt^(i)+ρ_t I) s = h.
-        let mut block = row.htt.clone();
-        for d in 0..qi {
-            block[[d, d]] += ridge_t;
-        }
-        let factor = cholesky_factor_in_place(block.view(), CholeskyGuard::NonnegativePivot)
-            .ok_or_else(|| format!("sae_framed_schur_matvec_cpu: row {i} H_tt not PD"))?;
-        let s = cholesky_solve_vector(factor.view(), Array1::from_vec(h).view());
-        // out -= H_βt^(i) · s = (H_tβ^(i))ᵀ · s.
-        for c in 0..qi {
-            let sc = s[c];
-            if sc == 0.0 {
-                continue;
-            }
-            let base = c * k;
-            for a in 0..k {
-                out[a] -= slab[base + a] * sc;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -5089,21 +4901,6 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             self.refactor_and_solve_from(ridge_t, ridge_beta, None)
         }
 
-        /// #2539: as [`Self::refactor_and_solve`] but against a caller-supplied
-        /// gradient. The inner Newton this serves moves the gradient every
-        /// iterate while `D`/`B`/`H_ββ` stay fixed, so the resident gradient the
-        /// LM ladder solves is stale for it.
-        pub(super) fn refactor_and_solve_with_gradient(
-            &self,
-            ridge_t: f64,
-            ridge_beta: f64,
-            g_t: &[f64],
-            g_beta: &[f64],
-        ) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
-            self.check_gradient_lens(g_t, g_beta)?;
-            self.refactor_and_solve_from(ridge_t, ridge_beta, Some((g_t, g_beta)))
-        }
-
         /// #2539: solve against ALREADY-BUILT factors for a fresh gradient. The
         /// checked entry point behind
         /// [`super::ResidentBaseArrowFrameHandle::solve_with_factors`]; the
@@ -6452,119 +6249,6 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         unsafe { b.launch(cfg) }
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         Ok(())
-    }
-
-    /// #1551 kernel-isolating seam: evaluate the framed reduced-Schur matvec
-    /// `out = S·x` EXACTLY ONCE on the device (no PCG, no offload-floor gate) and
-    /// return `out`. This is the parity probe the test harness diffs against the
-    /// CPU oracle [`super::sae_framed_schur_matvec_cpu`] element-by-element, so a
-    /// kernel/marshalling defect is exposed directly — independent of how the
-    /// iterative solver behaves on an ill-conditioned assembled `S` (where dense
-    /// Cholesky and PCG legitimately disagree at the solution level). Declines
-    /// (`Unavailable`) only when CUDA is genuinely absent so the test skips
-    /// cleanly off-device; it deliberately does NOT consult the offload policy so
-    /// even a tiny verifiable fixture runs on the GPU.
-    pub(super) fn framed_schur_matvec_once_on_device(
-        sys: &ArrowSchurSystem,
-        data: &DeviceSaePcgData,
-        ridge_t: f64,
-        ridge_beta: f64,
-        x: &Array1<f64>,
-    ) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
-        let k = x.len();
-        if k == 0 || data.beta_dim != k || sys.k != k {
-            return Err(ArrowSchurGpuFailure::Unavailable);
-        }
-        let frame = data
-            .frame
-            .as_ref()
-            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        // No offload-policy filter here: the seam exists to validate the kernel on
-        // ANY device, including the smallest hand-checkable fixture.
-        let runtime = super::resolve_runtime_for_device_path()?
-            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
-            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let stream = ctx
-            .new_stream()
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        let vector_module = pcg_vector_module(&ctx)?;
-        let mut buffers = flatten_device_sae_frame_data(sys, data, frame, ridge_t, &stream)?;
-        let x_dev = stream
-            .clone_htod(x.as_slice().ok_or(ArrowSchurGpuFailure::Unavailable)?)
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        let mut out_dev = stream
-            .alloc_zeros::<f64>(k)
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        launch_sae_frame_matvec(
-            &stream,
-            vector_module,
-            &mut buffers,
-            &x_dev,
-            &mut out_dev,
-            ridge_beta,
-        )?;
-        let out = stream
-            .clone_dtoh(&out_dev)
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        Ok(Array1::from_vec(out))
-    }
-
-    /// #1017 evidence-lane probe: the DETERMINISTIC framed reduced-Schur matvec
-    /// `out = S·x` computed once (host penalty via `sae_framed_penalty_matvec_cpu`
-    /// + the atomics-free device reduced-Schur term
-    /// [`launch_sae_frame_reduced_schur_det`]). Mirrors
-    /// [`framed_schur_matvec_once_on_device`] but produces a run-to-run bit-stable
-    /// result, so the test harness uses it as BOTH the CPU-parity oracle
-    /// comparison and the run-twice determinism probe. No PCG, no offload gate.
-    pub(super) fn framed_reduced_schur_det_once_on_device(
-        sys: &ArrowSchurSystem,
-        data: &DeviceSaePcgData,
-        ridge_t: f64,
-        ridge_beta: f64,
-        x: &Array1<f64>,
-    ) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
-        let k = x.len();
-        if k == 0 || data.beta_dim != k || sys.k != k {
-            return Err(ArrowSchurGpuFailure::Unavailable);
-        }
-        let frame = data
-            .frame
-            .as_ref()
-            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let runtime = super::resolve_runtime_for_device_path()?
-            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
-            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let stream = ctx
-            .new_stream()
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        let vector_module = pcg_vector_module(&ctx)?;
-        let mut buffers = flatten_device_sae_frame_data(sys, data, frame, ridge_t, &stream)?;
-        let x_slice = x.as_slice().ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let x_dev = stream
-            .clone_htod(x_slice)
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        let mut reduced_dev = stream
-            .alloc_zeros::<f64>(k)
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        launch_sae_frame_reduced_schur_det(
-            &stream,
-            vector_module,
-            &mut buffers,
-            &x_dev,
-            &mut reduced_dev,
-        )?;
-        let reduced = stream
-            .clone_dtoh(&reduced_dev)
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        // out = (P_ββ + ρ_β I)x  (deterministic host penalty)  +  reduced (= -Σ term).
-        let mut out = vec![0.0_f64; k];
-        super::sae_framed_penalty_matvec_cpu(data, ridge_beta, x_slice, &mut out);
-        for a in 0..k {
-            out[a] += reduced[a];
-        }
-        Ok(Array1::from_vec(out))
     }
 
     pub(super) fn solve_sae_matrix_free_pcg_framed(

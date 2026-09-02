@@ -1067,61 +1067,6 @@ pub fn jeffreys_subspace_from_penalty(
     Ok(JeffreysSubspace { columns })
 }
 
-/// The directions a symmetric curvature `A` fails to bound: an orthonormal basis
-/// of `A`'s eigenvectors whose eigenvalue is below ONE observation-equivalent
-/// (gam#2612).
-///
-/// # Why this is the object the Jeffreys span should be built from
-///
-/// The two derived spans this module has shipped are the two endpoints of one
-/// question, and both are wrong for the same reason — they answer it structurally
-/// instead of measuring it:
-///
-/// * the FULL identifiable span says "the model bounds nothing", justified by
-///   "the Jeffreys score is `O(1)` against the data's `O(n)` Fisher
-///   information". On a quasi-separated softmax the data's information is not
-///   `O(n)` in any direction (`W = diag(p) − ppᵀ ≈ 0.005` per row), so the
-///   premise fails and the term acts at full strength on directions the penalty
-///   bounds up to `2298`;
-/// * `ker(S_aggregate)` says "the model bounds `range(S)`", justified by
-///   `(H + S_λ)v = Hv + λSv`. True for any `λ > 0` and false in magnitude when
-///   `λ` rails at its floor: on the penguins witness the worst-bounded direction
-///   carries `5.1e-5` of curvature and is NOT in the kernel.
-///
-/// The measured set answers the question directly, with the threshold the module
-/// already owns: `CONDITIONING_GATE_ABSOLUTE` is this codebase's statement of how
-/// much curvature one observation contributes to a unit-scale direction, and it
-/// already decides whether the term FIRES. Deciding the term's SUPPORT with the
-/// same number asks one question once rather than two questions that can
-/// disagree — and the measured set contains the separating members of the kernel
-/// while excluding its well-determined ones, so it is strictly better than either
-/// endpoint on both sides.
-///
-/// The caller owns the constancy contract: `A` moves with `β` and `ρ`, so a
-/// caller that reads this LIVE would break every `Φ` derivative formula (all of
-/// which hold `Z_J` fixed). The multinomial caller measures it once, at the
-/// unbiased probe's certified mode and its selected `λ`, and freezes it for the
-/// armed refit.
-pub fn under_identified_subspace(a: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    let p = a.nrows();
-    if a.ncols() != p {
-        return Err(format!(
-            "under_identified_subspace: curvature must be square, got {}x{}",
-            a.nrows(),
-            a.ncols()
-        ));
-    }
-    if p == 0 {
-        return Ok(Array2::zeros((0, 0)));
-    }
-    let mut symmetric = a.to_owned();
-    symmetrize_contiguous(&mut symmetric);
-    let (eigenvalues, eigenvectors) = symmetric.eigh(Side::Lower).map_err(|e| {
-        format!("under_identified_subspace: curvature eigendecomposition failed: {e}")
-    })?;
-    Ok(select_under_identified_columns(&eigenvalues, &eigenvectors))
-}
-
 /// The same measurement, taken in a METRIC rather than in the raw coordinates:
 /// the span of generalized eigenvectors of `A v = μ G v` with `μ` below one
 /// observation-equivalent, returned as an orthonormal basis.

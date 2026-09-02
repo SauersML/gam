@@ -571,25 +571,6 @@ impl OuterProblem {
             force_cold: signal,
         })
     }
-    pub fn with_operator_initial_trust_radius(mut self, radius: Option<f64>) -> Self {
-        self.operator_initial_trust_radius = sanitized_operator_trust_restart_radius(radius);
-        self
-    }
-
-    /// Override the ARC initial cubic-regularization parameter sigma
-    /// (default in `opt`: 1.0). Smaller sigma → less cubic penalty on the
-    /// first step → larger first move on benign objectives. The matrix-
-    /// free Newton-TR analog is `with_operator_initial_trust_radius`.
-    ///
-    /// Used by Gaussian-identity REML at large-scale n: the objective is
-    /// quadratic-like in log-λ near the optimum (sigma is the right
-    /// scale), and log-λ moves of 2–4 units in the early iters
-    /// otherwise burn 4–8 iters of trust-region expansion before the
-    /// model trusts the analytic Hessian.
-    pub fn with_arc_initial_regularization(mut self, sigma: Option<f64>) -> Self {
-        self.arc_initial_regularization = sigma.filter(|v| v.is_finite() && *v > 0.0);
-        self
-    }
 
     /// Set the objective's natural magnitude scale, used to derive an
     /// `n`-aware absolute gradient-norm floor. When set to `Some(s)`,
@@ -9444,7 +9425,6 @@ pub(crate) fn outer_stationarity_band_and_rung_at(
     }
 }
 
-
 pub(crate) fn outer_max_iterations(value: usize) -> Result<MaxIterations, EstimationError> {
     MaxIterations::new(value)
         .map_err(|err| EstimationError::InvalidInput(format!("outer max_iter is invalid: {err}")))
@@ -9827,7 +9807,6 @@ mod rail_barrier_removal_tests;
 #[cfg(test)]
 #[path = "certify_resume_progress_tests.rs"]
 mod certify_resume_progress_tests;
-
 
 #[cfg(test)]
 #[path = "outer_stationarity_band_tests.rs"]

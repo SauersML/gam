@@ -29,7 +29,7 @@ use std::fmt;
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 pub use crate::model_types::{CoefficientPriorMean, Dispersion, EstimationError, PenaltySpec};
 use crate::pirls::{self, PirlsResult};
-use gam_linalg::matrix::{DesignMatrix, LinearOperator};
+use gam_linalg::matrix::DesignMatrix;
 use gam_linalg::utils::{KahanSum, row_mismatch_message};
 use gam_problem::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata,
@@ -83,28 +83,19 @@ pub use crate::model_types::{
     validate_dense_hessian_export, validate_explicit_dense_hessian_for_whitening,
 };
 pub use edf_accounting::{EdfBundle, collapsed_to_penalty_null_space, penalized_edf_bundle};
-pub use evaluation::{
-    evaluate_external_ift_residual_at_perturbed_rho, evaluate_externalcost_andridge,
-    evaluate_externalgradient,
-};
+pub use evaluation::{evaluate_externalcost_andridge, evaluate_externalgradient};
 pub use external_options::{ExternalOptimOptions, ExternalOptimResult};
 pub(crate) use external_options::{
     effective_sas_link_for_family, resolved_external_config, validate_penalty_spec_shape,
 };
-pub use fit::{fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas};
+pub use fit::{fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas};
 pub use gam_problem::{ensure_finite_scalar, validate_all_finite};
 pub use joint_hyper::{
     ExternalJointHyperEvaluator, gaussian_identity_outer_response_conditioning,
 };
 pub(crate) use optimizer::optimize_external_designwith_heuristic_lambdas_andwarm_start;
-pub use optimizer::{optimize_external_design, optimize_external_designwith_heuristic_lambdas};
-pub use outer_eval_capture::{
-    OuterCurvatureDriftAudit, OuterCurvatureSnapshot, OuterEvalRecord, OuterGradientFdAtoms,
-    OuterGradientFdDecomposition, OuterGradientFdRecord, OuterGradientFdRhoBlock,
-    enable_outer_eval_capture, enable_outer_gradient_fd_capture,
-    enable_outer_gradient_fd_capture_over_theta, take_outer_eval_capture,
-    take_outer_gradient_fd_capture,
-};
+pub use optimizer::optimize_external_designwith_heuristic_lambdas;
+pub use outer_eval_capture::{OuterCurvatureDriftAudit, OuterCurvatureSnapshot, OuterEvalRecord, OuterGradientFdAtoms, OuterGradientFdDecomposition, OuterGradientFdRecord, OuterGradientFdRhoBlock, enable_outer_gradient_fd_capture_over_theta, take_outer_gradient_fd_capture};
 pub(crate) use penalty::{
     ParametricColumnConditioning, faer_frob_inner, kahan_sum, map_hessian_to_original_basis,
 };

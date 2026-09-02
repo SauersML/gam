@@ -1,8 +1,6 @@
 use crate::active_set::ConstraintKktDiagnostics;
 use crate::estimate::EstimationError;
-use gam_linalg::matrix::{
-    DesignMatrix, PsdWeightsView, ReparamOperator, SignedWeightsView, SymmetricMatrix,
-};
+use gam_linalg::matrix::{DesignMatrix, ReparamOperator, SignedWeightsView, SymmetricMatrix};
 use gam_problem::LinearInequalityConstraints;
 use gam_problem::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, RidgePassport};
 use gam_terms::construction::ReparamResult;
@@ -555,19 +553,6 @@ impl PirlsResult {
     #[inline]
     pub fn final_weights_signed(&self) -> SignedWeightsView<'_> {
         SignedWeightsView::new(self.finalweights.view())
-    }
-
-    /// Typed view of the score-side Fisher weights `W_F = h'²/(φ V(μ)) ≥ 0`
-    /// stored on this result, PSD-by-construction. Used by PSD-Gram kernels
-    /// (`dense_xtwx_view`, `sparse_csr_weighted_xtwx_*`, `xt_diag_x_psd_op`)
-    /// without a runtime sign scan; the PSD obligation is discharged
-    /// algebraically by the Fisher formula at the construction site in
-    /// `solver/pirls/mod.rs`. New callers that need the same diagonal under
-    /// a sign-honest API should route through `as_signed()` on the returned
-    /// view rather than reconstructing from the raw array.
-    #[inline]
-    pub fn solve_weights_psd(&self) -> PsdWeightsView<'_> {
-        PsdWeightsView::from_view_unchecked(self.solveweights.view())
     }
 
     /// Scale-invariant relative gradient residual at the accepted PIRLS state.

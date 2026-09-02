@@ -715,16 +715,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.psi_gram_tensor.is_some()
     }
 
-    /// Shared handle to the installed certified ψ-Gram tensor, if any (#1033
-    /// instrumentation accessor). Used by the re-homed fast-path diagnostic to
-    /// read the interpolated Gram/RHS at a trial ψ (`gram_at` / `rhs_at`) for
-    /// the interpolation-residual attribution ladder, without the
-    /// cross-crate-private field access the pre-#1521 monolith test relied on.
-    pub fn psi_gram_tensor_handle(
-        &self,
-    ) -> Option<std::sync::Arc<crate::psi_gram_tensor::PsiGramTensor>> {
-        self.psi_gram_tensor.clone()
-    }
     /// Lowest ψ at/above which the installed tensor's conditioned Gram holds its
     /// maximal numerical rank — the floor below which the design-revision skip's
     /// `reduced_basis_equal` witness must (soundly) refuse because the reduced

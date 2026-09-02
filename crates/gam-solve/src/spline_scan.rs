@@ -5127,21 +5127,6 @@ impl SplineScanFit {
             .sum()
     }
 
-    /// Posterior `(mean, variance)` of the derivative `f′` at a knot index.
-    ///
-    /// `None` at order `m = 1`: the latent process is Brownian motion, which
-    /// is almost surely nondifferentiable — there is no derivative state, and
-    /// fabricating a "known zero" `(0, 0)` would assert certainty about a
-    /// quantity that does not exist.
-    pub fn deriv_at_knot(&self, t: usize) -> Option<(f64, f64)> {
-        (self.order >= 2).then(|| {
-            (
-                self.smoothed_state[t][1],
-                self.smoothed_cov[t][1][1] * self.sigma2,
-            )
-        })
-    }
-
     /// Selected smoothing parameter `λ = e^{log λ}` (#1046).
     pub fn lambda(&self) -> f64 {
         gam_problem::checked_exp_log_strength(self.log_lambda)
@@ -5207,8 +5192,6 @@ mod tests {
         }
         state
     }
-
-
 
     /// Compaction must preserve the signed directions that make a contracting
     /// recursion contract.  Fresh roundoff enters as axis generators, so age

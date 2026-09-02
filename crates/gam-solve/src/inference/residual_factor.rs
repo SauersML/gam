@@ -405,12 +405,6 @@ impl StructuredResidualModel {
         self.diagonal.view()
     }
 
-    /// The per-row activity scale `c(z_n) > 0`, length `n`. Recovers the smooth
-    /// activity-scale law evaluated at every observed `z_n`.
-    pub fn row_scale(&self) -> ArrayView1<'_, f64> {
-        self.row_scale.view()
-    }
-
     /// The penalized Gaussian log-evidence the rank-selection ladder maximized.
     pub fn log_evidence(&self) -> f64 {
         self.log_evidence
@@ -631,17 +625,6 @@ impl StructuredResidualModel {
             return Err(err);
         }
         RowMetric::whitened_structured(Arc::new(u), p, p)
-    }
-
-    /// Convenience for the #2021 fit-path install seam: fit the structured
-    /// residual model on `input` and immediately materialize its per-row
-    /// `WhitenedStructured` [`RowMetric`] over all `input.residuals.nrows()`
-    /// rows. Equivalent to `Self::fit(input)?.row_metric(n)` — the single call
-    /// the outer alternation loop consumes when it installs the whitening metric
-    /// but does not also need the fitted factor (`factor()` / birth mining).
-    pub fn fit_row_metric(input: ResidualFactorInput<'_>) -> Result<RowMetric, String> {
-        let n = input.residuals.nrows();
-        Self::fit(input)?.row_metric(n)
     }
 
     /// The model's isotropic (iid-MLE) dispersion: the per-coordinate average of

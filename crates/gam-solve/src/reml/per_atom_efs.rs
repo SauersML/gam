@@ -192,32 +192,6 @@ impl SharedBorderTopology {
         }
     }
 
-    /// A topology with a populated shared border: `axes` are the ρ-coordinates
-    /// whose penalty blocks overlap through the arrow border (shared global
-    /// block / shared design columns) and therefore receive the coupled
-    /// `m × m` Newton correction on top of their decoupled step.
-    ///
-    /// Axes are sorted and deduplicated; an out-of-range axis is rejected
-    /// loudly. A caller passing every axis (`axes == 0..rho_dim`) recovers the
-    /// exact dense Newton correction on the full ρ-vector — the small-K
-    /// reduction-to-coupled-objective configuration the module docs describe.
-    pub fn with_border_axes(rho_dim: usize, axes: Vec<usize>) -> Result<Self, String> {
-        let mut border_axes = axes;
-        border_axes.sort_unstable();
-        border_axes.dedup();
-        if let Some(&last) = border_axes.last() {
-            if last >= rho_dim {
-                return Err(format!(
-                    "SharedBorderTopology: border axis {last} out of range (rho_dim = {rho_dim})"
-                ));
-            }
-        }
-        Ok(Self {
-            border_axes,
-            rho_dim,
-        })
-    }
-
     /// Indices of the shared-border axes (sorted, deduplicated, in range).
     #[inline]
     pub fn border_axes(&self) -> &[usize] {
