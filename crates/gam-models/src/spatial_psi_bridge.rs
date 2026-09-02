@@ -491,9 +491,7 @@ pub(crate) fn build_block_spatial_psi_derivatives_with_transform(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom_family::resolve_custom_family_x_psi_psi_map;
     use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
-    use gam_runtime::resource::ResourcePolicy;
     use gam_terms::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
     use gam_terms::smooth::{
         ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, build_term_collection_design,

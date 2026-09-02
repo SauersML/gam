@@ -131,18 +131,6 @@ struct IsoKappaFdReport {
     analytic_by_probe: Vec<(String, Array1<f64>)>,
 }
 
-fn iso_kappa_fd_variant_driver(
-    label: &str,
-    n: usize,
-    family: LikelihoodSpec,
-    skip_psi: bool,
-    well_conditioned: bool,
-    extra_rho_probes: &[f64],
-) -> IsoKappaFdReport {
-    let fixture = build_iso_kappa_fixture(label, n, family, well_conditioned);
-    iso_kappa_fd_variant_driver_on(&fixture, label, skip_psi, extra_rho_probes)
-}
-
 /// The realized fixture behind [`iso_kappa_fd_variant_driver`], split out so a
 /// targeted diagnostic can probe ONE θ with its own finite-difference stencil
 /// instead of re-running the driver's whole probe grid at the driver's single

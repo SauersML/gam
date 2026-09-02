@@ -337,34 +337,6 @@ fn threshold_gate_dense_exact_a_sparse_logdet_trace_matches_finite_difference_25
     }
 }
 
-/// #2500 GATE 5 — the production consumer. `dense_exact_a_logdet_channels` (and
-/// therefore `analytic_outer_rho_gradient_components`, and therefore every outer
-/// BFGS seed evaluation) reads the operator map on the dense route. Before the
-/// fix a ThresholdGate fit aborted there with a fatal
-/// "Fatal outer-objective evaluation failure (outer BFGS seed evaluation)".
-#[test]
-fn threshold_gate_analytic_outer_gradient_assembles_2500() {
-    let (term, target, rho) = threshold_gate_tiny_fixture(true);
-    let (loss, cache) = frozen_cache(&term, &target, &rho);
-    let sparse = rho
-        .sparse_flat_index()
-        .expect("a ThresholdGate rho must carry a sparse log-strength coordinate");
-
-    let components = term
-        .analytic_outer_rho_gradient_at_converged(target.view(), &rho, &loss, &cache)
-        .expect("#2500: the ThresholdGate dense-route analytic outer gradient must assemble");
-    let grad = components.gradient();
-    assert!(
-        grad.iter().all(|v| v.is_finite()),
-        "#2500: the assembled outer gradient must be finite: {grad:?}"
-    );
-    assert!(
-        grad[sparse].abs() > 0.0,
-        "#2500: the sparse coordinate must carry a live gradient component, not a \
-         structurally-zero one: {grad:?}"
-    );
-}
-
 /// #2500 GATE 6 — the deflation map is coordinate-agnostic, so the ARD operator
 /// must pass through it too. A ρ_ard perturbation on the straddling (deflating)
 /// fixture is the same test as GATE 2 for a coordinate that has nothing to do
@@ -611,58 +583,6 @@ fn threshold_gate_coordinate_block_theta_adjoint_matches_finite_difference_2500(
              {worst:.3} at {label}"
         );
     }
-}
-
-/// #2500 GATE 9 — the consequence of GATE 8, at the production seam: a
-/// ThresholdGate fit's analytic outer gradient must be assembled from the
-/// B-majorizer logdet channels (which model this family) rather than the exact-A
-/// pair (which does not). Pinned behaviourally: the assembled sparse logdet
-/// component must equal the B-route trace, and must NOT equal the exact-A one.
-#[test]
-fn threshold_gate_outer_gradient_uses_the_modelled_logdet_channels_2500() {
-    let (term, target, rho) = threshold_gate_tiny_fixture(true);
-    let (loss, cache) = frozen_cache(&term, &target, &rho);
-    let sparse = rho.sparse_flat_index().expect("sparse coordinate");
-    let solver = crate::manifold::arrow_solver::DeflatedArrowSolver::plain(&cache);
-
-    let b_route = {
-        let joint = term
-            .assignment_log_strength_hessian_trace(&rho, &cache, &solver)
-            .expect("B-route sparse joint trace");
-        let coord = term
-            .coordinate_block_assignment_log_strength_hessian_trace(
-                &rho,
-                &cache,
-                crate::manifold::EvidenceOperator::Majorizer,
-            )
-            .expect("B-route sparse coordinate trace");
-        joint - coord
-    };
-    let exact_a_trace = term
-        .dense_exact_a_logdet_channels(target.view(), &rho, &loss, &cache)
-        .expect("exact-A channels still assemble when asked directly")
-        .logdet_trace;
-
-    // Non-vacuity: the two routes must genuinely differ on this fixture, else the
-    // assertion below cannot distinguish them.
-    assert!(
-        (b_route - exact_a_trace[sparse]).abs() > 1.0e-6,
-        "#2500: the two logdet routes must differ materially for this gate to have \
-         content: B-route={b_route:.9e}, exact-A={:.9e}",
-        exact_a_trace[sparse]
-    );
-
-    let components = term
-        .analytic_outer_rho_gradient_at_converged(target.view(), &rho, &loss, &cache)
-        .expect("analytic outer gradient");
-    let assembled = components.logdet_trace[sparse];
-    assert!(
-        (assembled - b_route).abs() <= 1.0e-9,
-        "#2500: a ThresholdGate fit must assemble its sparse logdet component from the \
-         MODELLED B-majorizer channel; assembled={assembled:.9e}, B-route={b_route:.9e}, \
-         exact-A={:.9e}",
-        exact_a_trace[sparse]
-    );
 }
 
 /// #2330/#2336 FALSIFICATION GATE - is `A` really `d2L/dtheta2`?

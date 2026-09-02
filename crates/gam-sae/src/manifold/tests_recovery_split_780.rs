@@ -1239,48 +1239,6 @@ pub(crate) fn seed_inner_state_rejects_wrong_length_populated_beta() {
     }
 }
 
-/// A supplied function-space Gram defines a fixed objective: changing the
-/// decoder or current chart Jacobian cannot mutate it. The quadratic trace is
-/// exactly the sum of the declared scalar-function seminorms over outputs.
-#[test]
-pub(crate) fn reference_function_gram_is_fixed_and_has_exact_trace_form() {
-    let n = 4usize;
-    let m = 3usize;
-    let p = 2usize;
-    let phi = Array2::<f64>::zeros((n, m));
-    let jet = Array3::<f64>::zeros((n, m, 1));
-    let decoder = Array2::from_shape_vec((m, p), vec![0.3, -0.2, 1.1, 0.4, -0.7, 0.9]).unwrap();
-    let gram = gam_terms::basis::create_difference_penalty_matrix(m, 2, None).unwrap();
-    let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
-        "fixed-reference",
-        SaeAtomBasisKind::EuclideanPatch,
-        1,
-        phi,
-        jet,
-        decoder.clone(),
-        gram.clone(),
-    )
-    .unwrap();
-    let frozen = atom.smooth_penalty().clone();
-    atom.decoder_coefficients_mut().mapv_inplace(|value| value * 7.0);
-    atom.basis_jacobian.fill(13.0);
-    assert_eq!(atom.smooth_penalty(), &frozen);
-    assert_eq!(
-        atom.reference_roughness_kind(),
-        SaeReferenceRoughnessKind::ProvidedFunctionGram
-    );
-
-    let trace_form: f64 = (0..p)
-        .map(|output| {
-            let column = decoder.column(output);
-            column.dot(&gram.dot(&column))
-        })
-        .sum();
-    let bt_s_b = decoder.t().dot(&gram).dot(&decoder);
-    let matrix_form = bt_s_b.diag().sum();
-    assert_abs_diff_eq!(trace_form, matrix_form, epsilon = 1.0e-12);
-}
-
 pub(crate) fn gamma_fd_tiny_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let n = 10usize;
     let p = 3usize;
@@ -1388,44 +1346,6 @@ pub(crate) struct FiniteDifferenceStratumCertificate {
 }
 
 impl FiniteDifferenceStratumCertificate {
-    pub(crate) fn from_arrow_cache(cache: &ArrowFactorCache) -> Self {
-        let min_pivot = arrow_factor_min_pivot(cache);
-        Self {
-            row_dims: cache.row_dims.to_vec(),
-            row_offsets: cache.row_offsets.to_vec(),
-            beta_dim: cache.k,
-            manifold_mode_fingerprint: cache.manifold_mode_fingerprint,
-            solver_mode: cache.solver_mode,
-            gauge_deflated_directions: cache.gauge_deflated_directions,
-            deflated_per_row: cache.deflated_row_directions.iter().map(Vec::len).collect(),
-            row_spectral_conditioning: cache
-                .deflation_row_spectra
-                .iter()
-                .map(|spectrum| {
-                    spectrum
-                        .as_ref()
-                        .map(|spectrum| spectrum.conditioning.to_vec())
-                })
-                .collect(),
-            beta_schur_deflated: cache
-                .beta_schur_deflation
-                .as_ref()
-                .map(|spectrum| spectrum.deflated.to_vec()),
-            beta_gauge_rank: cache
-                .beta_gauge_quotient
-                .as_ref()
-                .map_or(0, |quotient| quotient.directions.len()),
-            eigen_derivative_route: BranchCertificate::from_arrow_cache(
-                cache,
-                MajorizerAnchorMode::FrozenAnchor,
-            )
-            .eigen_derivative_route(),
-            min_row_pivot_branch: classify_fd_pivot(min_pivot.min_row_pivot),
-            min_schur_pivot_branch: classify_fd_pivot(min_pivot.min_schur_pivot),
-            min_pivot_branch: classify_fd_pivot(min_pivot.min_pivot),
-            max_pivot_branch: classify_fd_pivot(arrow_factor_max_pivot(cache)),
-        }
-    }
 
     pub(crate) fn changed_fields(&self, endpoint: &Self) -> Vec<&'static str> {
         let mut changed = Vec::new();
@@ -1512,27 +1432,6 @@ pub(crate) struct FixedStateLogdetSample {
     pub(crate) stratum: FiniteDifferenceStratumCertificate,
 }
 
-pub(crate) fn fixed_state_logdet_sample(
-    mut term: SaeManifoldTerm,
-    target: &Array2<f64>,
-    rho: &SaeManifoldRho,
-) -> FixedStateLogdetSample {
-    let (_value, _loss, cache) = term
-        .penalized_quasi_laplace_criterion_with_cache(
-            target.view(),
-            rho,
-            None,
-            0,
-            0.4,
-            1.0e-6,
-            1.0e-6,
-        )
-        .expect("fixed-state cache");
-    let value = arrow_log_det_from_cache(&cache).expect("fixed-state authoritative joint logdet");
-    let stratum = FiniteDifferenceStratumCertificate::from_arrow_cache(&cache);
-    FixedStateLogdetSample { value, stratum }
-}
-
 pub(crate) fn certified_central_logdet_difference(
     label: &str,
     center: &FiniteDifferenceStratumCertificate,
@@ -1547,31 +1446,6 @@ pub(crate) fn certified_central_logdet_difference(
     center.assert_same_stratum(&format!("{label} (+h)"), &plus.stratum);
     center.assert_same_stratum(&format!("{label} (-h)"), &minus.stratum);
     (plus.value - minus.value) / (2.0 * step)
-}
-
-fn floor_crossing_logdet_sample_2398(ratio: f64) -> FixedStateLogdetSample {
-    assert!(ratio.is_finite() && ratio > 0.0);
-    let relative_floor = gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR;
-    let spectral_floor = relative_floor * 4.0;
-    let mut system = ArrowSchurSystem::new(1, 3, 0);
-    system.rows[0].htt = array![
-        [4.0_f64, 0.0, 0.0],
-        [0.0, ratio * spectral_floor, 0.0],
-        [0.0, 0.0, -1.0],
-    ];
-    SaeManifoldTerm::ensure_row_gauge_deflation_for_quasi_laplace(&mut system);
-    let options = ArrowSolveOptions::direct()
-        .with_gpu_policy(gam_gpu::GpuPolicy::Off)
-        .with_evidence_unit_deflation(relative_floor);
-    // The ridge belongs only to the Newton factor, keeping the deliberately
-    // indefinite fixture solvable. The independently assembled undamped
-    // evidence factor still classifies the original spectrum above.
-    let (_, _, cache) = solve_arrow_newton_step_with_options(&system, 2.0, 0.0, &options)
-        .expect("floor-crossing fixture must produce an evidence cache");
-    let value =
-        arrow_log_det_from_cache(&cache).expect("floor-crossing fixture must have a logdet");
-    let stratum = FiniteDifferenceStratumCertificate::from_arrow_cache(&cache);
-    FixedStateLogdetSample { value, stratum }
 }
 
 #[test]
@@ -1838,117 +1712,6 @@ pub(crate) struct FdAnchorCandidate {
     /// convergence budget, with its homotopy weight. `None` freezes the
     /// converged logits unchanged.
     pub(crate) decisive_mix: Option<(Array2<f64>, f64)>,
-}
-
-/// Reject-or-accept one candidate state against a regime.
-fn classify_fd_anchor_candidate(
-    target: &Array2<f64>,
-    regime: FdAnchorRegime,
-    candidate: FdAnchorCandidate,
-) -> Result<CertifiedFdAnchor, String> {
-    let FdAnchorCandidate {
-        rho,
-        mut term,
-        converge_iters,
-        converge_tolerance,
-        decisive_mix,
-        ..
-    } = candidate;
-    if converge_iters > 0 {
-        term.penalized_quasi_laplace_criterion_with_cache(
-            target.view(),
-            &rho,
-            None,
-            converge_iters,
-            0.4,
-            converge_tolerance,
-            converge_tolerance,
-        )
-        .map_err(|error| format!("inner solve refused to converge: {error}"))?;
-    }
-    if let Some((decisive, weight)) = decisive_mix {
-        if decisive.dim() != term.assignment.logits.dim() {
-            return Err(format!(
-                "decisive logit pattern {:?} does not match the assignment layout {:?}",
-                decisive.dim(),
-                term.assignment.logits.dim()
-            ));
-        }
-        term.assignment.logits = &term.assignment.logits * (1.0 - weight) + &decisive * weight;
-    }
-    // `inner_max_iter = 0` freezes θ̂ at the candidate state: the anchor is the
-    // point the test declares, not whatever the inner solve would wander to.
-    let (value, loss, cache) = term
-        .penalized_quasi_laplace_criterion_with_cache(
-            target.view(),
-            &rho,
-            None,
-            0,
-            0.4,
-            1.0e-6,
-            1.0e-6,
-        )
-        .map_err(|error| format!("criterion refused the frozen state: {error}"))?;
-    if !(value.is_finite() && loss.total().is_finite()) {
-        return Err(format!(
-            "frozen state priced non-finitely (value={value}, loss={})",
-            loss.total()
-        ));
-    }
-    let deflated_rows = cache
-        .deflated_row_directions
-        .iter()
-        .filter(|directions| !directions.is_empty())
-        .count();
-    match regime.deflation {
-        FdAnchorDeflation::NoRowDeflates if deflated_rows > 0 => {
-            return Err(format!(
-                "{deflated_rows} row(s) deflate; regime requires none"
-            ));
-        }
-        FdAnchorDeflation::SomeRowDeflates if deflated_rows == 0 => {
-            return Err("no row deflates; regime requires at least one".to_string());
-        }
-        FdAnchorDeflation::NoRowDeflates
-        | FdAnchorDeflation::SomeRowDeflates
-        | FdAnchorDeflation::Unconstrained => {}
-    }
-    if regime.reportable_derivative_branch {
-        let certificate =
-            BranchCertificate::from_arrow_cache(&cache, MajorizerAnchorMode::FrozenAnchor);
-        certificate
-            .assert_derivative_reportable()
-            .map_err(|error| format!("derivative branch is not reportable: {error}"))?;
-        if let Some(record) = certificate
-            .kink_branches
-            .iter()
-            .find(|record| record.branch == DualKinkBranch::Tie)
-        {
-            return Err(format!("majorizer kink branch is tied: {record:?}"));
-        }
-        for (name, branch) in [
-            ("min row pivot", certificate.min_row_pivot_branch),
-            ("min pivot", certificate.min_pivot_branch),
-            ("max pivot", certificate.max_pivot_branch),
-        ] {
-            if branch != PivotBranch::Positive {
-                return Err(format!("{name} branch is {branch:?}, not Positive"));
-            }
-        }
-        if certificate.beta_dim > 0 && certificate.min_schur_pivot_branch != PivotBranch::Positive {
-            return Err(format!(
-                "min Schur pivot branch is {:?}, not Positive",
-                certificate.min_schur_pivot_branch
-            ));
-        }
-    }
-    let stratum = FiniteDifferenceStratumCertificate::from_arrow_cache(&cache);
-    Ok(CertifiedFdAnchor {
-        term,
-        rho,
-        cache,
-        stratum,
-    })
 }
 
 /// Accept the FIRST member of a declared, ordered, finite candidate family

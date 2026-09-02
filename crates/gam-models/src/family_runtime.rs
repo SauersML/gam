@@ -423,7 +423,6 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
 mod log_link_public_jet_tests {
     use super::*;
     use gam_problem::LikelihoodSpec;
-    use gam_solve::mixture_link::inverse_link_jet_for_family;
     use ndarray::Array1;
 
     /// The PUBLIC predict surface for a log-link family (Poisson/Gamma/Tweedie/

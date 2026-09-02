@@ -361,7 +361,6 @@ mod device {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use gam_math::nested_dual::JetField;
 
     fn fixture(n: usize) -> Vec<SurvivalRowInputs> {
         (0..n)

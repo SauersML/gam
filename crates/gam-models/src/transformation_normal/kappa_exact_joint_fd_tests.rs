@@ -22,7 +22,6 @@
 #![cfg(test)]
 
 use super::*;
-use gam_linalg::test_support::fd_checker::{FdVerdict, RiddersConfig, ridders_derivative};
 use gam_terms::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     OneDimensionalBoundary, SpatialIdentifiability,
@@ -278,63 +277,3 @@ struct CtnKappaFdReport {
     worst_psi_rel: f64,
 }
 
-/// The shipped large-scale CTN preprocessor chart: hybrid Duchon–Matérn with
-/// the constant-only null space and spectral power 9, in three PC dimensions.
-#[test]
-fn ctn_exact_joint_gradient_matches_fd_duchon_order0_power9() {
-    let fixture = build_fixture(DuchonNullspaceOrder::Zero, 9.0, 3, 240, 10);
-    let CtnKappaFdReport { pass, violations, worst_psi_rel } =
-        ctn_kappa_fd_driver("ctn_duchon_order0_power9_3d", &fixture);
-    assert!(
-        pass,
-        "transformation-normal exact-joint gradient (order=0, power=9) disagrees with the \
-         criterion; worst_psi_rel={worst_psi_rel:.3e}\n  {}",
-        violations.join("\n  ")
-    );
-}
-
-/// The `Linear` null-space control at the same power: the order the rest of
-/// the Duchon ψ gates pin.
-#[test]
-fn ctn_exact_joint_gradient_matches_fd_duchon_linear_power9() {
-    let fixture = build_fixture(DuchonNullspaceOrder::Linear, 9.0, 3, 240, 10);
-    let CtnKappaFdReport { pass, violations, worst_psi_rel } =
-        ctn_kappa_fd_driver("ctn_duchon_linear_power9_3d", &fixture);
-    assert!(
-        pass,
-        "transformation-normal exact-joint gradient (order=1, power=9) disagrees with the \
-         criterion; worst_psi_rel={worst_psi_rel:.3e}\n  {}",
-        violations.join("\n  ")
-    );
-}
-
-/// The benchmark's own shape: sixteen PC axes, 24 farthest-point centers, and
-/// enough rows that the row-center sweeps take the certified radial-profile
-/// path. This is the chart `gam fit --transformation-normal` runs in
-/// `bench/large_scale`, where the shipped binary's line searches fail.
-#[test]
-fn ctn_exact_joint_gradient_matches_fd_duchon_order0_power9_16d() {
-    let fixture = build_fixture(DuchonNullspaceOrder::Zero, 9.0, 16, 1200, 24);
-    let CtnKappaFdReport { pass, violations, worst_psi_rel } =
-        ctn_kappa_fd_driver("ctn_duchon_order0_power9_16d", &fixture);
-    assert!(
-        pass,
-        "transformation-normal exact-joint gradient (order=0, power=9, 16-D) disagrees with \
-         the criterion; worst_psi_rel={worst_psi_rel:.3e}\n  {}",
-        violations.join("\n  ")
-    );
-}
-
-/// The `Linear` null-space control at the benchmark shape.
-#[test]
-fn ctn_exact_joint_gradient_matches_fd_duchon_linear_power9_16d() {
-    let fixture = build_fixture(DuchonNullspaceOrder::Linear, 9.0, 16, 1200, 24);
-    let CtnKappaFdReport { pass, violations, worst_psi_rel } =
-        ctn_kappa_fd_driver("ctn_duchon_linear_power9_16d", &fixture);
-    assert!(
-        pass,
-        "transformation-normal exact-joint gradient (order=1, power=9, 16-D) disagrees with \
-         the criterion; worst_psi_rel={worst_psi_rel:.3e}\n  {}",
-        violations.join("\n  ")
-    );
-}

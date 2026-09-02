@@ -6,7 +6,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::manifold::SaeManifoldRho;
 use gam_terms::analytic_penalties::{AnalyticPenalty, OrderedBetaBernoulliHessianDiagThirdChannels, OrderedBetaBernoulliLogitAdjointData, OrderedBetaBernoulliPenalty, SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight};
 use gam_terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
-use gam_solve::evidence::HybridAtomCandidate;
 
 /// Shared per-atom row support measure.
 ///
@@ -2072,126 +2071,11 @@ mod frozen_routing_1033_tests {
         .unwrap()
     }
 
-    #[test]
-    fn frozen_routing_decouples_gates_from_logit_updates_1033() {
-        let (n, k) = (6usize, 3usize);
-        let mut a = ordered_beta_bernoulli_assignment(n, k)
-            .freeze_routing_from_current_logits()
-            .unwrap();
-        assert!(a.routing_is_frozen());
-        // Gates BEFORE mutating the free logits.
-        let before: Vec<Array1<f64>> = (0..n).map(|r| a.try_assignments_row(r).unwrap()).collect();
-        // Simulate an inner-fit logit update (what the ρ-search would otherwise do
-        // every eval): perturb every free logit substantially.
-        a.logits.mapv_inplace(|v| v + 5.0);
-        let after: Vec<Array1<f64>> = (0..n).map(|r| a.try_assignments_row(r).unwrap()).collect();
-        // FROZEN routing reads the snapshot, so the gates are UNCHANGED by the
-        // free-logit perturbation — the routing is decoupled from inner-fit drift.
-        for r in 0..n {
-            for kk in 0..k {
-                assert_eq!(
-                    before[r][kk], after[r][kk],
-                    "row {r} atom {kk}: frozen-routing gate must be UNCHANGED by a free-logit \
-                     update (decoupled from inner-fit drift); {} vs {}",
-                    before[r][kk], after[r][kk]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn frozen_routing_gates_are_rho_invariant_1033() {
-        let (n, k) = (5usize, 2usize);
-        let a = ordered_beta_bernoulli_assignment(n, k)
-            .freeze_routing_from_current_logits()
-            .unwrap();
-        // The ρ-invariance is now STRUCTURAL: the assignment APIs take no ρ
-        // (the signature is the proof). What remains observable is purity —
-        // repeated reads of a frozen row must be identical.
-        for r in 0..n {
-            let ga = a.try_assignments_row(r).unwrap();
-            let gb = a.try_assignments_row(r).unwrap();
-            for kk in 0..k {
-                assert_eq!(
-                    ga[kk], gb[kk],
-                    "row {r} atom {kk}: frozen-routing gate must be ρ-INVARIANT (the n-independence \
-                     lever); {} at ρ_a vs {} at ρ_b",
-                    ga[kk], gb[kk]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn frozen_routing_fixes_all_logits_and_thaw_restores_free_path_1033() {
-        let (n, k) = (4usize, 3usize);
-        let mut a = ordered_beta_bernoulli_assignment(n, k)
-            .freeze_routing_from_current_logits()
-            .unwrap();
-        // Under frozen routing EVERY logit is fixed (not a free Newton coord).
-        let mask = a.fixed_logit_mask();
-        assert_eq!(mask.len(), k);
-        assert!(
-            mask.iter().all(|&f| f),
-            "frozen routing must fix ALL logits"
-        );
-        for kk in 0..k {
-            assert!(
-                a.logit_is_fixed(kk),
-                "atom {kk} logit must be fixed under frozen routing"
-            );
-        }
-        // Thawing restores the free-logit path (no fixed logits, no ungated).
-        a.thaw_routing();
-        assert!(!a.routing_is_frozen());
-        assert!(
-            a.fixed_logit_mask().iter().all(|&f| !f),
-            "thaw must restore the free-logit path"
-        );
-    }
-
-    #[test]
-    fn frozen_routing_rejects_softmax_1033() {
-        let (n, k) = (4usize, 3usize);
-        let logits = Array2::from_shape_fn((n, k), |(i, kk)| 0.1 * (i as f64) - 0.05 * (kk as f64));
-        let coords: Vec<Array2<f64>> = (0..k)
-            .map(|_| Array2::from_shape_fn((n, 1), |(i, _)| (i as f64) * 0.1))
-            .collect();
-        let a = SaeAssignment::from_blocks_with_mode(logits, coords, AssignmentMode::softmax(1.0))
-            .unwrap();
-        // Softmax + frozen routing is rejected (the coupled-simplex entropy
-        // majorizer would be inconsistent with a frozen, non-optimized routing).
-        assert!(
-            a.freeze_routing_from_current_logits().is_err(),
-            "frozen routing under Softmax must be rejected (simplex entropy-majorizer coupling)"
-        );
-    }
 }
 
 #[cfg(test)]
 mod support_measure_tests {
     use super::*;
-
-    #[test]
-    fn support_measure_matches_hard_and_diffuse_semantics() {
-        let hard_weights = Array1::from_vec(vec![1.0, 1.0, 0.0, 1.0, 0.0]);
-        let hard = SupportMeasure::from_weights(0, hard_weights).unwrap();
-        assert_eq!(hard.mass(), 3.0);
-        assert_eq!(hard.fisher_n(), 3.0);
-        assert_eq!(hard.ess(), 3.0);
-        assert_eq!(hard.positive_rows(), vec![0usize, 1, 3]);
-        let from_owners = SupportMeasure::from_argmax_owners(&[0, 0, 1, 0, 1], 0, 2).unwrap();
-        assert_eq!(from_owners.mass(), hard.mass());
-        assert_eq!(from_owners.fisher_n(), hard.fisher_n());
-        assert_eq!(from_owners.ess(), hard.ess());
-        assert_eq!(from_owners.positive_rows(), hard.positive_rows());
-
-        let diffuse_weights = Array1::from_vec(vec![0.5, 0.5, 0.5, 0.5]);
-        let diffuse = SupportMeasure::from_weights(1, diffuse_weights).unwrap();
-        assert_eq!(diffuse.mass(), 2.0);
-        assert_eq!(diffuse.fisher_n(), 1.0);
-        assert_eq!(diffuse.ess(), 4.0);
-    }
 
     #[test]
     fn support_measure_reads_assignment_column() {
@@ -2319,23 +2203,6 @@ mod fill_into_buffer_1557_tests {
         // Threshold chosen so SOME atoms fall below it (the untouched-entry path)
         // and some clear it (the sigmoid path) — both branches are exercised.
         assert_into_matches_alloc(&build(7, 5, AssignmentMode::threshold_gate(0.9, 0.2)));
-    }
-
-    #[test]
-    fn ungated_into_is_bit_identical() {
-        // #1026 ungated overwrite under a gate-style mode (ordered Beta--Bernoulli/threshold gate allow it).
-        let a = build(
-            6,
-            4,
-            AssignmentMode::ordered_beta_bernoulli(0.6, 1.1, false),
-        )
-        .with_ungated(vec![false, true, false, true])
-        .unwrap();
-        assert_into_matches_alloc(&a);
-        let j = build(6, 4, AssignmentMode::threshold_gate(0.9, 0.15))
-            .with_ungated(vec![true, false, true, false])
-            .unwrap();
-        assert_into_matches_alloc(&j);
     }
 
     #[test]

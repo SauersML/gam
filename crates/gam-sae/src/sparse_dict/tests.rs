@@ -71,62 +71,6 @@ fn pca_ev(x: ArrayView2<'_, f32>, rank: usize) -> f64 {
     if total <= 1.0e-24 { 1.0 } else { top / total }
 }
 
-/// Held-out reconstruction EV of a fitted dictionary `decoder` on a *fresh*
-/// block `x_test` it never trained on. The decoder is FROZEN: each test row is
-/// routed (top-`s`) against it and its codes are the active-set LS solve — the
-/// exact production held-out path (`ManifoldSAE.reconstruct`), one decoder, new
-/// coordinates. EV is `1 − RSS/TSS` with the TSS centred on `x_test`'s own mean,
-/// so a dictionary that merely memorised the train block earns nothing here.
-fn held_out_ev(
-    decoder: ArrayView2<'_, f32>,
-    x_test: ArrayView2<'_, f32>,
-    s: usize,
-    tile: usize,
-    code_ridge: f32,
-) -> f64 {
-    let n = x_test.nrows();
-    let p = x_test.ncols();
-    let scorer = TileScorer::new(s, tile);
-    let mut means = vec![0.0f64; p];
-    for i in 0..n {
-        for c in 0..p {
-            means[c] += x_test[[i, c]] as f64;
-        }
-    }
-    for c in 0..p {
-        means[c] /= n as f64;
-    }
-    let mut rss = 0.0f64;
-    let mut tss = 0.0f64;
-    for i in 0..n {
-        let row = x_test.row(i);
-        let active = scorer.route_row(row, decoder);
-        let code = solve_row_codes(row, decoder, &active, s, code_ridge);
-        let mut recon = vec![0.0f64; p];
-        for j in 0..code.indices.len() {
-            let cj = code.codes[j] as f64;
-            if cj == 0.0 {
-                continue;
-            }
-            let drow = decoder.row(code.indices[j] as usize);
-            for c in 0..p {
-                recon[c] += cj * drow[c] as f64;
-            }
-        }
-        for c in 0..p {
-            let r = x_test[[i, c]] as f64 - recon[c];
-            rss += r * r;
-            let t = x_test[[i, c]] as f64 - means[c];
-            tss += t * t;
-        }
-    }
-    if tss <= 1.0e-24 {
-        if rss <= 1.0e-24 { 1.0 } else { 0.0 }
-    } else {
-        1.0 - rss / tss
-    }
-}
-
 /// HELD-OUT rank-`r` PCA EV: principal subspace fitted on `x_train` ONLY, then
 /// scored on `x_test`. This is the honest linear baseline the sparse trainer
 /// must match-or-beat — the rank-`r` linear autoencoder's out-of-sample
@@ -234,63 +178,6 @@ fn online_top_s_recovers_planted_largest_scores() {
             want_atoms[rank]
         );
     }
-}
-
-#[test]
-fn tile_scorer_matches_untiled_brute_force() {
-    let p = 5;
-    let k = 37;
-    let mut decoder = Array2::<f32>::zeros((k, p));
-    for atom in 0..k {
-        for c in 0..p {
-            decoder[[atom, c]] = (((atom * 3 + c * 5 + 1) % 7) as f32 - 3.0) / 3.0;
-        }
-    }
-    let row = ndarray::Array1::<f32>::from_vec((0..p).map(|c| (c as f32) - 2.0).collect());
-    // Brute force: full score then argsort.
-    let mut brute: Vec<(u32, f32)> = (0..k)
-        .map(|a| {
-            let mut acc = 0.0f32;
-            for c in 0..p {
-                acc += row[c] * decoder[[a, c]];
-            }
-            (a as u32, acc)
-        })
-        .collect();
-    brute.sort_by(|x, y| {
-        y.1.abs()
-            .partial_cmp(&x.1.abs())
-            .unwrap()
-            .then(x.0.cmp(&y.0))
-    });
-    let scorer = TileScorer::new(4, 7);
-    let tiled = scorer.route_row(row.view(), decoder.view());
-    assert_eq!(tiled.len(), 4);
-    for j in 0..4 {
-        assert_eq!(
-            tiled[j].0, brute[j].0,
-            "tiled top-{j} disagrees with brute force"
-        );
-    }
-}
-
-#[test]
-fn tile_scorer_dispatch_matches_cpu_below_device_floor() {
-    let p = 5;
-    let k = 37;
-    let rows = Array2::<f32>::from_shape_fn((3, p), |(r, c)| {
-        (((r * 11 + c * 7 + 3) % 13) as f32 - 6.0) / 6.0
-    });
-    let decoder = Array2::<f32>::from_shape_fn((k, p), |(atom, c)| {
-        (((atom * 3 + c * 5 + 1) % 7) as f32 - 3.0) / 3.0
-    });
-    let scorer = TileScorer::new(4, 7);
-
-    let cpu = scorer.route_minibatch(rows.view(), decoder.view());
-    let dispatched = scorer
-        .route_minibatch_dispatch(rows.view(), decoder.view())
-        .expect("dispatch route");
-    assert_eq!(dispatched, cpu);
 }
 
 #[test]

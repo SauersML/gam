@@ -43,9 +43,6 @@
 use ndarray::Array2;
 
 use crate::sparse_dict::BlockChartComposeConfig;
-use crate::manifold::SaeManifoldRho;
-use crate::manifold::SaeManifoldTerm;
-use ndarray::Array3;
 
 /// Result of the arrow-Schur-routed co-fit linear tier (Stage 1).
 #[derive(Clone, Debug)]
@@ -108,9 +105,6 @@ impl Default for ArrowCofitConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparse_dict::{
-        BlockSparseConfig, fit_block_sparse_dictionary, reconstruct_block_sparse_rows,
-    };
     use ndarray::Array2;
 
     /// Orthonormal-per-block decoder with a planted overlap, mirroring the fixture

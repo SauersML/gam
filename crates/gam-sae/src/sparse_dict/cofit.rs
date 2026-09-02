@@ -56,7 +56,6 @@
 use ndarray::{Array2, Array3};
 
 use super::block_chart::{BlockChartComposeConfig, BlockChartComposeResult};
-use super::codes::solve_row_codes;
 
 /// Configuration for [`cofit_block_and_curved`].
 #[derive(Clone, Debug)]
@@ -142,7 +141,6 @@ pub struct CofitReport {
 #[cfg(test)]
 mod cofit_tests {
     use super::*;
-    use crate::sparse_dict::reconstruct_block_sparse_rows;
 
     /// Orthonormal-per-block decoder for the planted trap. Three blocks of size
     /// b=2 in P=5:

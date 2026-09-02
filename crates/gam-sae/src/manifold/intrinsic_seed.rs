@@ -44,7 +44,6 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use faer::Side;
-use super::SaeAtomBasisKind;
 
 /// An MDS eigenvalue counts as a genuine embedding axis only when it is POSITIVE
 /// and clears this fraction of the leading (largest) eigenvalue. Classical MDS on

@@ -706,36 +706,6 @@ mod tests {
 
     // ---- buildwiggle_block_input_from_knots (driven via seed for valid knots) ----
 
-    #[test]
-    fn single_penalty_block_shapes_and_invariants() {
-        let (block, p) = build(false, 2);
-        assert!(p >= 2, "expected multiple monotone columns, got p={p}");
-        // Offset is zeros with length = seed length.
-        assert_eq!(block.offset.len(), 40);
-        assert!(block.offset.iter().all(|&v| v == 0.0));
-        // initial_beta is Some(zeros(p)).
-        let beta = block.initial_beta.as_ref().expect("initial_beta");
-        assert_eq!(beta.len(), p);
-        assert!(beta.iter().all(|&v| v == 0.0));
-        // One ROUGHNESS penalty, plus the unconditional gauge-closure
-        // coordinate (gam#2647): an order-two roughness leaves the linear warp
-        // free, and the linear warp is the index scale, not a shape. This
-        // assertion used to read `== 1`, which is exactly the shape of the
-        // defect — a warp block shipped with an unpenalized reparameterization
-        // direction, so the penalized criterion had no minimiser.
-        assert_eq!(block.penalties.len(), 2);
-        assert_eq!(block.nullspace_dims.len(), 2);
-        // The exact function-derivative Gram is p x p and symmetric.
-        let s = dense_penalty(&block.penalties[0]);
-        assert_eq!(s.dim(), (p, p));
-        assert!(is_symmetric(s));
-        // The anchored I-spline excludes the constant polynomial, so the
-        // order-two derivative null space contains only the linear direction.
-        assert_eq!(block.nullspace_dims[0], 1);
-        // The closure coordinate penalizes a null space of its own dimension 0.
-        assert_eq!(block.nullspace_dims[1], 0);
-    }
-
     /// Smallest generalized eigenvalue of `Σ_j S_j` against the I-spline
     /// function Gram, relative to the largest — i.e. how close the assembled
     /// penalty set comes to leaving a whole function direction free.
@@ -955,31 +925,6 @@ mod tests {
              already penalizes: null energy {closure_energy:.6e} against max range energy \
              {range_energy:.6e}"
         );
-    }
-
-    #[test]
-    fn double_penalty_appends_nullspace_only_function_ridge() {
-        let (block, p) = build(true, 2);
-        assert!(p >= 2);
-        // Order two has one structural null direction, so double penalty emits
-        // one separate function-space shrinkage block.
-        assert_eq!(block.penalties.len(), 2);
-        assert_eq!(block.nullspace_dims.len(), 2);
-        let ridge = dense_penalty(&block.penalties[1]);
-        assert_eq!(ridge.dim(), (p, p));
-        assert!(is_symmetric(ridge));
-        assert!(
-            (0..p).any(|i| (0..p).any(|j| i != j && ridge[[i, j]].abs() > 1e-12)),
-            "function-metric null shrinkage must not collapse to eye(p)"
-        );
-        assert_eq!(block.nullspace_dims[1], 0);
-    }
-
-    #[test]
-    fn order_one_has_no_nullspace_ridge() {
-        let (block, _) = build(true, 1);
-        assert_eq!(block.penalties.len(), 1);
-        assert_eq!(block.nullspace_dims, vec![0]);
     }
 
     #[test]

@@ -55,7 +55,6 @@
 use std::collections::BTreeMap;
 
 use ndarray::{Array1, Array2};
-use faer::Side;
 
 /// Designed certification target per atom. This is the reviewer's requested
 /// `~10^4` scale, expressed as a named certifier policy rather than an

@@ -3932,12 +3932,7 @@ mod blended_mixture_link_solve_tests {
     //! to keep the Newton system SPD, so the array build must tolerate a finite
     //! non-positive observed weight rather than hard-bail on it.
 
-    use crate::estimate::external_options::ExternalOptimOptions;
-    use gam_problem::{
-        InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, ResponseFamily, StandardLink,
-    };
-    use gam_terms::smooth::BlockwisePenalty;
-    use ndarray::{Array1, Array2};
+    use ndarray::Array1;
 
     fn pearson(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
         let n = a.len() as f64;
@@ -3980,12 +3975,7 @@ mod reported_loglikelihood_normalization_tests {
     //! `crate::pirls::tests::reporting_loglikelihood_tests`.
 
     use crate::estimate::external_options::ExternalOptimOptions;
-    use gam_problem::{
-        InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization,
-        ResponseFamily, StandardLink,
-    };
-    use gam_terms::smooth::BlockwisePenalty;
-    use ndarray::{Array1, Array2};
+    use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 
     fn poisson_opts() -> ExternalOptimOptions {
         ExternalOptimOptions {
@@ -4027,10 +4017,7 @@ mod reported_loglikelihood_normalization_tests {
 #[cfg(test)]
 mod negative_binomial_joint_certificate_tests {
     use super::negbin_theta_stationarity_residual;
-    use crate::estimate::external_options::ExternalOptimOptions;
     use crate::pirls::{NEGBIN_THETA_MAX, NEGBIN_THETA_MIN};
-    use gam_problem::{EstimationError, LikelihoodSpec};
-    use ndarray::{Array1, Array2, array};
 
     #[test]
     fn theta_residual_is_the_log_scale_newton_displacement() {
@@ -4076,7 +4063,6 @@ mod negative_binomial_joint_certificate_tests {
 
 #[cfg(test)]
 mod constrained_posterior_transport_tests {
-    use super::optimize_external_design;
     use crate::estimate::external_options::ExternalOptimOptions;
     use gam_problem::{
         InverseLink, LikelihoodSpec, LinearInequalityConstraints, ResponseFamily, StandardLink,

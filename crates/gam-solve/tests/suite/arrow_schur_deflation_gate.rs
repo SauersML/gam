@@ -17,11 +17,6 @@
 //! this one binary) so it is immune to unrelated tears in the crate's `#[cfg(test)]`
 //! unit-test modules.
 
-use gam_solve::arrow_schur::{
-    ArrowSchurSystem, ArrowSolveOptions, solve_arrow_newton_step_with_options,
-};
-use ndarray::{Array1, array};
-
 /// `|a - b| <= tol` with a helpful panic message.
 fn close(a: f64, b: f64, tol: f64, what: &str) {
     assert!(

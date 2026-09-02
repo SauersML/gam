@@ -20,7 +20,3 @@
 
 #![cfg(test)]
 
-use ndarray::{Array2, ArrayView2};
-
-use super::*;
-

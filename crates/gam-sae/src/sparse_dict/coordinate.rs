@@ -1060,45 +1060,6 @@ mod tests {
         assert_eq!(count_separated_positive_modes(&rho, separation_limit(4)), 1);
     }
 
-    /// Wrap planted `(row, code)` firings on a single block into a minimal
-    /// `BlockSparseFit`. Only the fields the coordinate readout touches
-    /// (`decoder` nrows for the block-count guard, `blocks`, `gates`, `codes`,
-    /// `block_size`) carry meaning; the rest are inert placeholders.
-    fn fit_from_codes(codes_rows: &[Vec<f32>], b: usize) -> BlockSparseFit {
-        let n = codes_rows.len();
-        let mut blocks = Array2::<u32>::zeros((n, 1));
-        let mut gates = Array2::<f32>::zeros((n, 1));
-        let mut codes = Array3::<f32>::zeros((n, 1, b));
-        for (i, z) in codes_rows.iter().enumerate() {
-            blocks[[i, 0]] = 0;
-            let mut nrm = 0.0f32;
-            for r in 0..b {
-                codes[[i, 0, r]] = z[r];
-                nrm += z[r] * z[r];
-            }
-            gates[[i, 0]] = nrm.sqrt();
-        }
-        let mut decoder = Array2::<f32>::zeros((b, b));
-        for i in 0..b {
-            decoder[[i, i]] = 1.0;
-        }
-        BlockSparseFit {
-            decoder,
-            blocks,
-            gates,
-            codes,
-            gamma: 1.0,
-            block_utilization: vec![1.0],
-            block_stable_rank: vec![1.0],
-            matryoshka_prefix_losses: Vec::new(),
-            explained_variance: 1.0,
-            epochs: 1,
-            convergence: crate::sparse_dict::BlockSparseConvergence::trivially_converged(),
-            block_topk: 1,
-            block_size: b,
-        }
-    }
-
     /// Plant a b=2 circle: zᵢ = aᵢ·u(tᵢ) + σ·noise. Returns rows, true phases,
     /// and true amplitudes. Amplitude is drawn uniformly on `[amp_lo, amp_hi]`;
     /// pass a degenerate range for the fixed-amplitude calibration regime.

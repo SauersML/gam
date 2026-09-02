@@ -21,28 +21,4 @@
 //! execution path; the CPU reference is therefore the single implementation
 //! until a real batched kernel exists end to end.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A well-posed K=1 arrow/border atom: PD per-row blocks, a PD border, and a
-    /// small deterministic cross-block, so the dense reference solves cleanly.
-    fn pd_k1_system(n: usize, d: usize, k: usize, seed: f64) -> ArrowSchurSystem {
-        let mut sys = ArrowSchurSystem::new(n, d, k);
-        for (i, row) in sys.rows.iter_mut().enumerate() {
-            for r in 0..d {
-                row.htt[[r, r]] = 2.0 + seed;
-                row.gt[r] = 0.1 * (i as f64 + 1.0) + seed;
-                for c in 0..k {
-                    row.htbeta[[r, c]] = 0.05 * ((r + c + i) as f64 + 1.0);
-                }
-            }
-        }
-        for r in 0..k {
-            sys.hbb[[r, r]] = 2.0 + seed;
-            sys.gb[r] = 0.2 * (r as f64 + 1.0) + seed;
-        }
-        sys
-    }
-
-}
+use crate::arrow_schur::ArrowSchurSystem;

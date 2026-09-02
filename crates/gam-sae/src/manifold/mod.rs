@@ -122,7 +122,7 @@ pub use gam_terms::analytic_penalties::resolve_learnable_weight;
 pub use gam_terms::latent::LatentManifold;
 pub(crate) use gam_terms::latent::{LatentCoordValues, LatentIdMode};
 
-pub(crate) use gam_linalg::faer_ndarray::{FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_atb, with_nested_parallel, fast_abt};
+pub(crate) use gam_linalg::faer_ndarray::{FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_atb, with_nested_parallel};
 
 pub(crate) use gam_linalg::triangular::cholesky_solve_vector;
 
@@ -636,4 +636,3 @@ pub use terracini::*;
 pub use transport_law::*;
 pub use wbic_audit::*;
 pub use weight_frame_catalog::*;
-pub(crate) use crate::criterion_atoms::SaeCriterion;

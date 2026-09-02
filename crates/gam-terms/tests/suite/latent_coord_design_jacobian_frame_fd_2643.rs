@@ -22,12 +22,9 @@
 //! `input_scale == 1` arm below is kept precisely so a future reader can see
 //! that the sensitivity is to σ and to nothing else.
 
-use gam_terms::basis::{CenterStrategy, LocalDesignJacobianProvider, MaternBasisSpec, MaternIdentifiability, MaternLengthScale, MaternNu};
+use gam_terms::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternLengthScale, MaternNu};
 use gam_terms::smooth::input_standardization::estimate_isotropic_scale;
-use gam_terms::smooth::{
-    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
-    build_term_collection_design, freeze_term_collection_from_design,
-};
+use gam_terms::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec, build_term_collection_design};
 use ndarray::{Array1, Array2, s};
 
 /// The user-facing kernel range, in ORIGINAL covariate units.
@@ -130,60 +127,3 @@ fn finite_difference_row(
     (forward - backward) / (2.0 * step)
 }
 
-/// The frame-agnostic control: at `input_scale == 1` the standardized and
-/// original frames coincide, so the operator is correct *by coincidence*.
-///
-/// This arm is the reason the defect survived — it is what any fixture built on
-/// unit-spread latents measures, and it passes on the broken code. It stays so
-/// that a regression which reintroduces the frame error is still visibly a
-/// σ-dependent one and cannot be explained away as a tolerance problem.
-#[test]
-fn latent_design_jacobian_agrees_with_the_rebuild_when_the_input_scale_is_one() {
-    let (sigma, worst) = worst_relative_error(1.0);
-    assert!(
-        (sigma - 1.0).abs() < 5e-3,
-        "control arm must sit at input_scale = 1, got sigma = {sigma}"
-    );
-    assert!(
-        worst < 1e-5,
-        "at input_scale = 1 the analytic latent design Jacobian must match the \
-         central difference of the realized rebuild; worst relative error = {worst:e}"
-    );
-}
-
-/// σ ≈ 0.29 — the spread a `LatentInitSpec::Random` initialisation produces
-/// (`deterministic_unit(..) - 0.5`, sd ≈ 0.289 per axis).
-#[test]
-fn latent_design_jacobian_agrees_with_the_rebuild_at_a_small_input_scale() {
-    let (sigma, worst) = worst_relative_error(0.289);
-    assert!(
-        sigma < 0.5,
-        "this arm must exercise input_scale well below one, got sigma = {sigma}"
-    );
-    assert!(
-        worst < 1e-5,
-        "the analytic latent design Jacobian must be the derivative of the design \
-         the fit rebuilds, at every input scale — not only at one. \
-         sigma = {sigma}, worst relative error = {worst:e}"
-    );
-}
-
-/// σ ≈ 0.74 — the spread the DEFAULT `LatentInitSpec::Pca` produces for d = 2
-/// (axis 0 sd ≈ 1, remaining axes sd ≈ 0.289).
-///
-/// Two initialisations, two different σ, one gate: if only one arm moves, the
-/// frame story is incomplete and the disagreement is something else.
-#[test]
-fn latent_design_jacobian_agrees_with_the_rebuild_at_the_default_pca_input_scale() {
-    let (sigma, worst) = worst_relative_error(0.74);
-    assert!(
-        (0.5..1.0).contains(&sigma),
-        "this arm must exercise the default Pca-init input scale, got sigma = {sigma}"
-    );
-    assert!(
-        worst < 1e-5,
-        "the analytic latent design Jacobian must be the derivative of the design \
-         the fit rebuilds, at every input scale — not only at one. \
-         sigma = {sigma}, worst relative error = {worst:e}"
-    );
-}

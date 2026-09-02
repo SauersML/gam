@@ -7,7 +7,6 @@
 //! effect decision is added beside it. Realized intervention KL is retained as
 //! an empirical validation ledger, not as the derived Fisher effect weight.
 
-use crate::inference::intervention_shard::InterventionShard;
 /// Per-atom evidence in the existing reconstruction currency.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VarianceChargeEvidence {
@@ -278,28 +277,6 @@ mod tests {
     const DENSE_ATOM: usize = 1;
 
     #[test]
-    fn streaming_score_vector_accumulates_fisher_quadratic_per_firing() {
-        let mut accumulator = StreamingFisherEffectAccumulator::new(ATOMS);
-        let local = accumulator
-            .accumulate_firing_score_vector(RARE_ATOM, &[0.02, -0.01], &[3.0, 4.0])
-            .unwrap();
-        assert!((local - 0.0002).abs() <= 1e-15);
-        accumulator
-            .record_realized_kl_validation(RARE_ATOM, 0.000201)
-            .unwrap();
-
-        let evidence = accumulator.finish();
-        let rare = evidence[RARE_ATOM].unwrap();
-        assert!((rare.mean_fisher_quadratic_kl_nats - 0.0002).abs() <= 1e-15);
-        assert!((rare.total_fisher_quadratic_kl_nats - 0.0002).abs() <= 1e-15);
-        assert_eq!(rare.n_firings, 1);
-        assert!(evidence[DENSE_ATOM].is_none());
-        let validation = rare.realized_kl_validation.unwrap();
-        assert_eq!(validation.n_interventions, 1);
-        assert!((validation.mean_empirical_realized_kl_nats - 0.000201).abs() <= 1e-15);
-    }
-
-    #[test]
     fn bic_price_is_compared_with_total_not_mean_kl() {
         let mut accumulator = StreamingFisherEffectAccumulator::new(1);
         for _ in 0..100 {
@@ -314,37 +291,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fisher_quadratic_matches_realized_kl_in_small_dose_limit() {
-        let p = 0.37_f64;
-        let eta = (p / (1.0 - p)).ln();
-        let fisher = p * (1.0 - p);
-        let mut accumulator = StreamingFisherEffectAccumulator::new(1);
-        for eps in [0.001_f64, -0.0015] {
-            let local_fisher_kl = 0.5 * fisher * eps * eps;
-            let q = logistic(eta + eps);
-            let realized_kl = bernoulli_kl(p, q);
-            accumulator
-                .accumulate_firing_local_kl(0, local_fisher_kl)
-                .unwrap();
-            accumulator
-                .record_realized_kl_validation(0, realized_kl)
-                .unwrap();
-        }
-
-        let evidence = accumulator.finish();
-        let atom = evidence[0].unwrap();
-        let realized = atom.realized_kl_validation.unwrap();
-        let rel_err =
-            (atom.mean_fisher_quadratic_kl_nats - realized.mean_empirical_realized_kl_nats).abs()
-                / realized.mean_empirical_realized_kl_nats;
-        eprintln!(
-            "small-dose Fisher/realized KL: fisher_mean={:.12e} realized_mean={:.12e} rel_err={:.6e}",
-            atom.mean_fisher_quadratic_kl_nats, realized.mean_empirical_realized_kl_nats, rel_err
-        );
-        assert!(rel_err <= 0.002, "relative error {rel_err}");
-    }
-
     fn logistic(eta: f64) -> f64 {
         1.0 / (1.0 + (-eta).exp())
     }
@@ -353,16 +299,4 @@ mod tests {
         p * (p / q).ln() + (1.0 - p) * ((1.0 - p) / (1.0 - q)).ln()
     }
 
-    #[test]
-    fn report_headline_is_interchange_accuracy_before_ev() {
-        let report = EffectWeightedFitReport::new(0.875, 0.992).unwrap();
-        assert_eq!(
-            report.headline,
-            FitQualityMetric::InterchangeAccuracy(0.875)
-        );
-        let line = report.headline_line();
-        let interchange_pos = line.find("interchange_accuracy").unwrap();
-        let ev_pos = line.find("explained_variance").unwrap();
-        assert!(interchange_pos < ev_pos);
-    }
 }

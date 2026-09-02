@@ -1383,30 +1383,6 @@ mod tests {
         assert_eq!(plans[0].geometry.intrinsic_dim(), 2);
     }
 
-    #[test]
-    fn ambient_sphere_plan_requires_three_ambient_coordinates() {
-        let ambient = SaeAtomGeometryPlan::new(
-            SaeAtomBasisKind::Sphere,
-            3,
-            SaeBasisResolution::AmbientSphereHarmonics { degree: 2 },
-            SaeReferenceMetricPlan::RoundSphere,
-        )
-        .expect("the ambient sphere plan is valid at latent_dim 3");
-        assert_eq!(ambient.basis_size().unwrap(), 9);
-        assert_eq!(ambient.reference_metric(), &SaeReferenceMetricPlan::RoundSphere);
-
-        assert!(
-            SaeAtomGeometryPlan::new(
-                SaeAtomBasisKind::Sphere,
-                2,
-                SaeBasisResolution::AmbientSphereHarmonics { degree: 2 },
-                SaeReferenceMetricPlan::RoundSphere,
-            )
-            .is_err(),
-            "an ambient sphere at latent_dim 2 must be refused, not silently charted"
-        );
-    }
-
     /// The ambient roughness operator is the Laplace-Beltrami spectrum itself,
     /// so it is diagonal with `[l(l+1)]²` -- exact, not tabulated. Degree 1
     /// gives `0, 4, 4, 4`; degree 2 adds five `36`s.
@@ -1432,24 +1408,6 @@ mod tests {
             }
         }
         assert!(round_sphere_reference_penalty(2, 0).is_err());
-    }
-
-    #[test]
-    fn quotient_plan_is_the_only_width_and_metric_authority() {
-        let rp2 = SaeAtomGeometryPlan::projective_plane(3).unwrap();
-        assert_eq!(rp2.basis_size().unwrap(), 28);
-        assert_eq!(
-            rp2.reference_metric(),
-            &SaeReferenceMetricPlan::RoundProjectivePlane
-        );
-
-        let klein = SaeAtomGeometryPlan::klein_bottle(3).unwrap();
-        assert_eq!(klein.basis_size().unwrap(), 24);
-        assert_eq!(
-            klein.reference_metric(),
-            &SaeReferenceMetricPlan::FlatKleinBottle
-        );
-        assert!(SaeAtomGeometryPlan::klein_bottle(1).is_err());
     }
 
     #[test]

@@ -5409,7 +5409,7 @@ mod patterned_order2_perf_tests {
     }
 
     type SlsOrder2 = gam_math::jet_scalar::PatternedOrder2<SlsHessianPattern, SLS_ROW_K, 24>;
-    use gam_math::paired_timing::{SpeedGate, paired_interleaved};
+    use gam_math::paired_timing::SpeedGate;
 
     fn fixture() -> ([f64; SLS_ROW_K], SurvivalExactRowKernel) {
         (

@@ -34,15 +34,11 @@ use super::tests_frame_curvature_2757::{
     planted_term_for_probe, reference_dense_gram,
     reference_dense_root, source_root_rows, source_stored_scalars, source_structure_tag,
 };
-use crate::identifiability::{
-    FrameColumnLayout, PinningRankSupport, ResidualGaugeReport, StreamedFrameCurvature,
-    residual_gauge_exact_from_curvature, residual_gauge_exact_from_streamed, root_spectral_rank,
-    streamed_lambda_max,
-};
+use crate::identifiability::{FrameColumnLayout, PinningRankSupport, ResidualGaugeReport, StreamedFrameCurvature, residual_gauge_exact_from_curvature, residual_gauge_exact_from_streamed, streamed_lambda_max};
 use crate::manifold::construction::ResidualGaugeCurvatureSource;
 use crate::manifold::streamed_frame_curvature::StreamedFrameCurvatureOperator;
 use crate::manifold::SaeManifoldTerm;
-use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
+use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array1, Array2, ArrayView1};
 use std::sync::Arc;
 
@@ -218,45 +214,6 @@ fn the_streamed_lambda_max_is_the_dense_spectrums() {
         streamed.lambda_max,
         streamed.trace / (param_dim as f64)
     );
-}
-
-/// Build both certificates for one fit: the materialized route (the retained
-/// witness) and the streamed one.
-fn both_routes(
-    n: usize,
-    p: usize,
-    k_atoms: usize,
-    rank: usize,
-    factor_scale: f64,
-    seed: u64,
-) -> (ResidualGaugeReport, ResidualGaugeReport) {
-    let (term, metric, layout) = gauge_driving_term(n, p, k_atoms, rank, factor_scale, seed);
-    let param_dim = layout.param_dim();
-    let pin = Array2::<f64>::zeros((0, param_dim));
-    let (model, _) = term
-        .to_residual_gauge_model(metric.clone(), None, false)
-        .expect("certificate model");
-    let views = term.atom_parameter_views();
-    let ops: Vec<Option<crate::identifiability::OrbitPenaltyOperator>> =
-        (0..k_atoms).map(|_| None).collect();
-
-    let materialized = term
-        .residual_gauge_streamed_data_curvature(&metric, &layout, pin.clone())
-        .expect("materialized curvature");
-    assert_eq!(materialized.structure_tag(), "dual_root");
-    assert_eq!(
-        materialized.stored_scalars(),
-        param_dim * param_dim,
-        "the witness must be the param_dim-square object this route exists to avoid"
-    );
-    let from_stored = residual_gauge_exact_from_curvature(&model, &views, &ops, materialized)
-        .expect("materialized certificate");
-
-    let operator =
-        StreamedFrameCurvatureOperator::new(&term, &metric, &layout, &pin, n * rank).expect("op");
-    let from_streamed = residual_gauge_exact_from_streamed(&model, &views, &ops, &operator)
-        .expect("streamed certificate");
-    (from_stored, from_streamed)
 }
 
 fn assert_same_certificate(

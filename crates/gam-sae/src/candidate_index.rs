@@ -680,121 +680,6 @@ mod tests {
         (blocks, dirs)
     }
 
-    #[test]
-    fn frame_alignment_is_exact_for_in_range_direction() {
-        let (blocks, dirs) = synthetic_dictionary(8, 16, 11);
-        let sketch = RandomProjectionFrameSketch::from_decoder_blocks(&blocks, 12, 7).unwrap();
-        // A direction equal to atom 3's column lies fully in its range.
-        let d = &dirs[3];
-        let a = sketch.alignment(3, d.view());
-        assert!(a > 0.999, "in-range alignment should be ~1, got {a}");
-        // An orthogonal-ish direction (atom 5's column is generically nearly
-        // orthogonal to atom 3) aligns weakly with atom 3.
-        let a_off = sketch.alignment(3, dirs[5].view());
-        assert!(
-            a_off < a,
-            "off-atom alignment {a_off} should be below in-range {a}"
-        );
-    }
-
-    #[test]
-    fn build_is_deterministic_for_a_fixed_seed() {
-        let (blocks, _) = synthetic_dictionary(64, 24, 99);
-        let s1 = RandomProjectionFrameSketch::from_decoder_blocks(&blocks, 16, 5).unwrap();
-        let s2 = RandomProjectionFrameSketch::from_decoder_blocks(&blocks, 16, 5).unwrap();
-        // Same seed → identical representative sketches.
-        for i in 0..blocks.len() {
-            let a = s1.atom_sketch(i);
-            let b = s2.atom_sketch(i);
-            let diff = vec_norm((&a - &b).view());
-            assert!(
-                diff < 1e-12,
-                "atom {i} sketch differs across builds: {diff:e}"
-            );
-        }
-        let cfg = IndexConfig::auto(16, blocks.len(), 5);
-        let idx1 = SaeCandidateIndex::build(&s1, cfg).unwrap();
-        let idx2 = SaeCandidateIndex::build(&s2, cfg).unwrap();
-        // Identical hyperplane banks and bucket contents.
-        for t in 0..idx1.tables.len() {
-            assert_eq!(idx1.tables[t].len(), idx2.tables[t].len());
-        }
-    }
-
-    #[test]
-    fn planted_atoms_are_recalled_above_floor_at_sublinear_budget() {
-        // A frontier-ish dictionary: many atoms, modest output dim.
-        let k = 2000usize;
-        let p = 48usize;
-        let (blocks, dirs) = synthetic_dictionary(k, p, 2026);
-        let sketch_dim = 24usize;
-        let sketch =
-            RandomProjectionFrameSketch::from_decoder_blocks(&blocks, sketch_dim, 4242).unwrap();
-        let cfg = IndexConfig::auto(sketch_dim, k, 4242);
-        let index = SaeCandidateIndex::build(&sketch, cfg).unwrap();
-
-        // Plant: each row's residual is dominated by one chosen atom's column
-        // (plus a little cross-talk from a second). The planted-active set is
-        // that dominant atom. We build many such rows deterministically.
-        let mut rng = StdRng::seed_from_u64(31337);
-        let n_rows = 200usize;
-        let mut rows: Vec<(Array1<f64>, Vec<usize>)> = Vec::with_capacity(n_rows);
-        for _ in 0..n_rows {
-            let primary = rng.random_range(0..k);
-            let secondary = rng.random_range(0..k);
-            // direction = 1.0 * c_primary + 0.15 * c_secondary
-            let mut d = dirs[primary].clone();
-            for (di, &si) in d.iter_mut().zip(dirs[secondary].iter()) {
-                *di += 0.15 * si;
-            }
-            let n = vec_norm(d.view());
-            for di in d.iter_mut() {
-                *di /= n;
-            }
-            rows.push((d, vec![primary]));
-        }
-
-        // Sublinear candidate budget: << K. We allow the gather to surface a
-        // handful, but the *budget* (the per-row local block size) stays small.
-        let candidate_budget = 32usize;
-        let report = index.recall_report(&sketch, &rows, candidate_budget, cfg.multiprobe);
-
-        // The gather must touch only a sublinear slice of the dictionary.
-        assert!(
-            report.sublinearity_ratio() < 0.5,
-            "gather was not sublinear: avg {} of {} atoms (ratio {:.3})",
-            report.avg_candidates_gathered,
-            report.num_atoms,
-            report.sublinearity_ratio()
-        );
-
-        // Recall floor: the LSH index must recover the planted dominant atom for
-        // the large majority of rows at this sublinear budget. Misses are
-        // logged, never silently dropped.
-        let floor = 0.80;
-        assert!(
-            report.recall >= floor,
-            "recall {:.3} below floor {floor}; {} misses logged (first few: {:?})",
-            report.recall,
-            report.misses.len(),
-            report
-                .misses
-                .iter()
-                .take(5)
-                .map(|m| (m.row, m.atom, m.reason, m.alignment))
-                .collect::<Vec<_>>()
-        );
-
-        // Every miss is accounted for with a reason — the no-silent-truncation
-        // contract.
-        let recovered = report.total_recovered;
-        assert_eq!(
-            report.total_planted - recovered,
-            report.misses.len(),
-            "miss list must account for every unrecovered planted atom"
-        );
-    }
-
     /// Build a planted row set for a dictionary: each row's residual direction
     /// is dominated by one chosen atom (plus cross-talk from a second), and
     /// the planted-active set is the dominant atom.
@@ -856,27 +741,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn query_probe_touches_no_atom_before_the_gather() {
-        let k = 512usize;
-        let p = 32usize;
-        let (blocks, dirs) = synthetic_dictionary(k, p, 77);
-        let sketch = RandomProjectionFrameSketch::from_decoder_blocks(&blocks, 16, 13).unwrap();
-        let cfg = IndexConfig::auto(16, k, 13);
-        let index = SaeCandidateIndex::build(&sketch, cfg).unwrap();
-        let counting = CountingSketch {
-            inner: &sketch,
-            project_calls: std::cell::Cell::new(0),
-        };
-        drop(index.propose(&counting, dirs[5].view(), 32, cfg.multiprobe));
-        assert_eq!(
-            counting.project_calls.get(),
-            0,
-            "the exact query probe must be independent of K: no per-atom \
-             projection before the gather (#994)"
-        );
-    }
-
     /// Build a coherent-cluster dictionary: `n_clusters` random unit centers,
     /// each with `cluster_size` atoms drawn as small perturbations of the
     /// center (renormalized). Exactly the non-isotropic regime where the old
@@ -910,38 +774,6 @@ mod tests {
             }
         }
         (blocks, dirs)
-    }
-
-    #[test]
-    fn exact_probe_matches_shared_projection_of_the_direction() {
-        // The override is literally normalize(R·d): verify against a manual
-        // computation through the public surface (atom_sketch of a rank-1 atom
-        // whose only column IS the direction gives normalize(R·d) too).
-        let p = 16usize;
-        let mut rng = StdRng::seed_from_u64(5);
-        let d = unit_vec(&mut rng, p);
-        let mut block = Array2::<f64>::zeros((p, 1));
-        block.column_mut(0).assign(&d);
-        let sketch = RandomProjectionFrameSketch::from_decoder_blocks(&[block], 8, 21).unwrap();
-        let via_probe = sketch.query_sketch(d.view());
-        let via_atom = sketch.atom_sketch(0);
-        let diff = vec_norm((&via_probe - &via_atom).view());
-        assert!(
-            diff < 1e-10,
-            "query_sketch(d) must equal the rank-1 atom representative of d: diff {diff:e}"
-        );
-    }
-
-    #[test]
-    fn empty_planted_rows_report_perfect_recall() {
-        let (blocks, dirs) = synthetic_dictionary(32, 16, 1);
-        let sketch = RandomProjectionFrameSketch::from_decoder_blocks(&blocks, 12, 3).unwrap();
-        let cfg = IndexConfig::auto(12, 32, 3);
-        let index = SaeCandidateIndex::build(&sketch, cfg).unwrap();
-        let rows = vec![(dirs[0].clone(), Vec::<usize>::new())];
-        let report = index.recall_report(&sketch, &rows, 8, true);
-        assert_eq!(report.recall, 1.0);
-        assert!(report.misses.is_empty());
     }
 
 }

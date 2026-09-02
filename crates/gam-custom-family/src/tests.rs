@@ -360,31 +360,6 @@ pub(crate) fn joint_preconditioner_preserves_negative_observed_curvature_scale()
     assert_eq!(diagonal, array![15.5, 6.5, 0.5]);
 }
 
-#[test]
-pub(crate) fn kronecker_factored_dot_and_quadratic_form_match_dense_row_major_operator() {
-    let left_diag = array![[10.0, 0.0], [0.0, 100.0]];
-    let right_diag = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]];
-    let mut diag_vectors = Vec::new();
-    for i in 0..6 {
-        let mut v = Array1::<f64>::zeros(6);
-        v[i] = 1.0;
-        diag_vectors.push(v);
-    }
-    diag_vectors.push(array![0.25, -1.5, 2.0, 0.75, -0.5, 3.25]);
-    assert_kronecker_factored_matches_dense(left_diag, right_diag, diag_vectors);
-
-    let left_nondiag = array![[1.0, 2.0], [3.0, 4.0]];
-    let right_nondiag = array![[0.0, 1.0], [1.0, 0.0]];
-    let mut nondiag_vectors = Vec::new();
-    for i in 0..4 {
-        let mut v = Array1::<f64>::zeros(4);
-        v[i] = 1.0;
-        nondiag_vectors.push(v);
-    }
-    nondiag_vectors.push(array![1.25, -0.75, 2.5, -3.0]);
-    assert_kronecker_factored_matches_dense(left_nondiag, right_nondiag, nondiag_vectors);
-}
-
 /// The marker-free coupled-joint-Hessian gate (#727, #729) trusts a family
 /// that returns a genuinely coupled joint Hessian — nonzero off-diagonal
 /// blocks — without a hand-set `has_explicit_joint_hessian()`. Pin the

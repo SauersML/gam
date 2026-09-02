@@ -1431,7 +1431,6 @@ mod soft_abs_gershgorin_2339_tests {
     use super::*;
     use approx::assert_abs_diff_eq;
     use gam_linalg::utils::splitmix64;
-    use ndarray::Array2;
 
     /// (1) The envelope is an UPPER bound on `|·|` — unconditionally, including
     /// where `f64` rounding of `sqrt(x² + ε²)` would otherwise land below `|x|` —

@@ -469,7 +469,6 @@ pub fn explained_variance_from_sums(rss: f64, tss: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparse_dict::DecoderSolveStats;
     use ndarray::array;
 
     #[test]

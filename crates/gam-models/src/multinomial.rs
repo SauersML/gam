@@ -5673,7 +5673,6 @@ mod reference_class_invariance_tests {
 
     use super::*;
     use gam_data::load_dataset_projected;
-    use gam_linalg::faer_ndarray::FaerEigh;
     use std::fmt::Write as _;
     use std::fs;
     use tempfile::tempdir;

@@ -2,8 +2,6 @@
 // `pair_phase.rs` via `include!` so the helpers below share its private items.
 
 use super::*;
-use ndarray::Array2;
-use ndarray::Array1;
 
 fn lcg(s: &mut u64) -> f64 {
     *s = s

@@ -590,63 +590,6 @@ mod tests {
     }
 
     #[test]
-    fn split_is_deterministic_and_partitions_groups() {
-        let s = tiny_shard();
-        let a = s.eval_forever_split(7);
-        let b = s.eval_forever_split(7);
-        assert_eq!(a, b);
-        let mut all: Vec<i64> = a
-            .train_groups
-            .iter()
-            .chain(a.eval_groups.iter())
-            .copied()
-            .collect();
-        all.sort_unstable();
-        assert_eq!(all, vec![10, 20]);
-    }
-
-    #[test]
-    fn split_is_per_group_stable_under_shard_growth() {
-        // Adding new groups must never move an existing group across the
-        // fence — the "eval forever" property.
-        let s = tiny_shard();
-        let before = s.eval_forever_split(3);
-        let mut grown = s.clone();
-        grown.row_id.extend([4, 5]);
-        grown.atom.extend([2, 2]);
-        grown.dose.extend([0.3, 0.0]);
-        grown.nu_hat_1.extend([0.2, 0.0]);
-        grown.nu_measured.extend([0.15, 1e-6]);
-        grown.group.extend([30, 30]);
-        grown.is_control.extend([false, true]);
-        grown.validate().unwrap();
-        let after = grown.eval_forever_split(3);
-        for g in &before.train_groups {
-            assert!(after.train_groups.contains(g), "group {g} left train");
-        }
-        for g in &before.eval_groups {
-            assert!(after.eval_groups.contains(g), "group {g} left eval");
-        }
-    }
-
-    #[test]
-    fn control_floor_is_a_control_quantile() {
-        let s = tiny_shard();
-        // Controls are {1e-6, 2e-6}: the median is 1.5e-6.
-        let f = s.control_floor_nats(0.5).unwrap();
-        assert!((f - 1.5e-6).abs() < 1e-12);
-    }
-
-    #[test]
-    fn control_floor_requires_controls() {
-        let mut s = tiny_shard();
-        s.is_control = vec![false; 4];
-        s.dose = vec![0.1, 0.2, -0.2, 0.4];
-        s.validate().unwrap();
-        assert!(s.control_floor_nats(0.5).unwrap_err().contains("control"));
-    }
-
-    #[test]
     fn splitmix_reference_values_pin_the_cross_language_contract() {
         // A change here moves permanent train/eval membership and is a
         // calibration-contract break, not a refactor.

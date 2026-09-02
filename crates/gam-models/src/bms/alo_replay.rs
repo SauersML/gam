@@ -456,7 +456,7 @@ pub(crate) fn replay_saved_bernoulli_marginal_slope_alo(
 mod tests {
     use super::*;
     use gam_linalg::matrix::DenseDesignMatrix;
-    use gam_math::probability::{normal_cdf, normal_pdf};
+    use gam_math::probability::normal_cdf;
     use gam_problem::StandardLink;
 
     fn assert_close(label: &str, actual: f64, expected: f64, tolerance: f64) {

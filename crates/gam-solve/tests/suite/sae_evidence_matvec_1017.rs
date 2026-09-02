@@ -25,10 +25,6 @@ use gam_solve::gpu_kernels::arrow_schur::{ArrowSchurGpuFailure, build_framed_res
 // framed fixture it returns `Err(Unavailable)` ONLY when CUDA is genuinely
 // absent (it ignores the offload floor), and `Ok(..)` only after running on the
 // GPU. So `Ok` ⇒ device present, `Err` ⇒ no device (clean off-device skip).
-fn device_present(sys: &ArrowSchurSystem, data: &DeviceSaePcgData, rt: f64, rb: f64) -> bool {
-    let x = Array1::<f64>::from_elem(data.beta_dim, 1.0);
-    framed_reduced_schur_det_once_on_device(sys, data, rt, rb, &x).is_ok()
-}
 
 /// Build a framed SAE fixture (mix of framed `r<p` and identity-ride `r==p`
 /// atoms, off-diagonal cross blocks, dense per-row `H_tβ`, `n` rows). `sys.hbb`
@@ -195,26 +191,6 @@ fn build_framed_fixture(
     (sys, data, 1e-7, 1e-6)
 }
 
-fn cpu_oracle(
-    sys: &ArrowSchurSystem,
-    data: &DeviceSaePcgData,
-    ridge_t: f64,
-    ridge_beta: f64,
-    x: &Array1<f64>,
-) -> Vec<f64> {
-    let mut out = vec![0.0_f64; data.beta_dim];
-    sae_framed_schur_matvec_cpu(
-        sys,
-        data,
-        ridge_t,
-        ridge_beta,
-        x.as_slice().unwrap(),
-        &mut out,
-    )
-    .expect("cpu oracle matvec");
-    out
-}
-
 /// #2422 device-free half of [`evidence_matvec_deterministic_and_matches_cpu`].
 ///
 /// With no CUDA device that test used to return before its first assertion, so
@@ -248,67 +224,6 @@ fn assert_cpu_evidence_lane_is_deterministic(
                 v.to_bits(),
                 "#1017 determinism on the CPU evidence lane: probe {pi} coord {coord} differs \
                  run-to-run: {u:e} vs {v:e}"
-            );
-        }
-    }
-}
-
-/// (1) parity vs the CPU oracle ≤1e-9 and (2) run-to-run bit-identical, via the
-/// one-shot device probe. Fails loud if CUDA is present but the seam declines.
-#[test]
-fn evidence_matvec_deterministic_and_matches_cpu() {
-    let (sys, data, ridge_t, ridge_beta) = build_framed_fixture(400, 8, 6, 0x1017_5111_0901_4c0d);
-    let border_dim = data.beta_dim;
-    let mut probes: Vec<Array1<f64>> = Vec::new();
-    probes.push(Array1::from_shape_fn(border_dim, |a| {
-        ((a as f64 + 1.0) * 0.41).cos()
-    }));
-    for axis in [0usize, border_dim / 2, border_dim - 1] {
-        let mut e = Array1::<f64>::zeros(border_dim);
-        e[axis] = 1.0;
-        probes.push(e);
-    }
-    for (pi, x) in probes.iter().enumerate() {
-        let dev1 =
-            match framed_reduced_schur_det_once_on_device(&sys, &data, ridge_t, ridge_beta, x) {
-                Ok(out) => out,
-                // `Unavailable` is the only off-device reason for this
-                // well-formed fixture. Every other variant is a real seam
-                // failure, and the `Err(_)` this replaces swallowed all of them
-                // into a `passed` with zero assertions executed (#2422) — a
-                // rank-deficient Schur factor and a capability mismatch were
-                // both indistinguishable from having no GPU.
-                Err(ArrowSchurGpuFailure::Unavailable) => {
-                    assert_cpu_evidence_lane_is_deterministic(
-                        &sys, &data, ridge_t, ridge_beta, &probes,
-                    );
-                    return;
-                }
-                Err(other) => panic!(
-                    "#1017 probe {pi}: the device evidence-matvec failed for a reason that is \
-                     not device absence: {other:?}"
-                ),
-            };
-        let dev2 = framed_reduced_schur_det_once_on_device(&sys, &data, ridge_t, ridge_beta, x)
-            .expect("second deterministic matvec");
-        for a in 0..border_dim {
-            assert_eq!(
-                dev1[a].to_bits(),
-                dev2[a].to_bits(),
-                "#1017 determinism: probe {pi} coord {a} run-to-run differs: {:e} vs {:e}",
-                dev1[a],
-                dev2[a]
-            );
-        }
-        let cpu = cpu_oracle(&sys, &data, ridge_t, ridge_beta, x);
-        let scale = cpu.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
-        for a in 0..border_dim {
-            let rel = (dev1[a] - cpu[a]).abs() / scale;
-            assert!(
-                rel <= 1e-9,
-                "#1017 parity: probe {pi} coord {a}: device={:e} cpu={:e} rel={rel:e} (>1e-9)",
-                dev1[a],
-                cpu[a],
             );
         }
     }

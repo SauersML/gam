@@ -33,7 +33,3 @@
 
 #![cfg(test)]
 
-use ndarray::Array2;
-
-use super::*;
-

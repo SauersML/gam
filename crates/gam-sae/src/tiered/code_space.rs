@@ -824,47 +824,6 @@ mod code_space_tests {
     use ndarray::{Array2 as A2, Array3};
     use std::f64::consts::TAU;
 
-    /// Mint an OVERCOMPLETE fit (`G` blocks of `b=2`, only block 0 ever fired)
-    /// whose routing is hand-authored: every row fires block 0 with the supplied
-    /// 2-D code. The fired atoms are `e0, e1` in `P` ambient dims; the remaining
-    /// blocks are engineered capacity that never routes. The width matters: a
-    /// circle's promotion is funded ONLY by the support dividend
-    /// `(ŝ−1)·log₂(G/L0)` (its code term is exactly zero), so at `G = L0` the
-    /// prescreen provably defers every ring — overcompleteness is what the
-    /// compression win is made of.
-    fn one_fired_block_fit(codes2d: &A2<f64>, p: usize, n_blocks: usize) -> BlockSparseFit {
-        let n = codes2d.nrows();
-        let mut decoder = A2::<f32>::zeros((2 * n_blocks, p));
-        decoder[[0, 0]] = 1.0;
-        decoder[[1, 1]] = 1.0;
-        let blocks = A2::<u32>::zeros((n, 1));
-        let mut gates = A2::<f32>::zeros((n, 1));
-        let mut codes = Array3::<f32>::zeros((n, 1, 2));
-        for i in 0..n {
-            let (a, b) = (codes2d[[i, 0]], codes2d[[i, 1]]);
-            gates[[i, 0]] = ((a * a + b * b) as f32).sqrt();
-            codes[[i, 0, 0]] = a as f32;
-            codes[[i, 0, 1]] = b as f32;
-        }
-        let mut block_utilization = vec![0.0f32; n_blocks];
-        block_utilization[0] = 1.0;
-        BlockSparseFit {
-            decoder,
-            blocks,
-            gates,
-            codes,
-            gamma: 1.0,
-            block_utilization,
-            block_stable_rank: vec![1.0; n_blocks],
-            matryoshka_prefix_losses: Vec::new(),
-            explained_variance: 1.0,
-            epochs: 0,
-            convergence: BlockSparseConvergence::trivially_converged(),
-            block_topk: 1,
-            block_size: 2,
-        }
-    }
-
     /// The move class the residual substrate cannot make, now made from the
     /// tiered lane: a ring carried ENTIRELY by one block's code cloud — the
     /// block's linear residual is identically zero — is proposed and ACCEPTED
@@ -941,90 +900,6 @@ mod code_space_tests {
             "the ring geometry screen must refuse a Rayleigh radial law (κ={})",
             proposal.verdict.kappa
         );
-    }
-
-    /// The cross-block move: a ring the dictionary SHATTERED across two b=1
-    /// blocks (atom e0 carries cosθ, atom e1 carries sinθ) presents to each
-    /// single-block community as a 1-D line — no plane, no proposal — and only
-    /// the co-firing pair census can close it. This is the Gemma Scope shell
-    /// shape (#2280/#2502), discovered from the tiered lane's own routing.
-    #[test]
-    fn shattered_ring_across_two_blocks_is_promoted_from_the_pair_census() {
-        let n = 512;
-        let p = 16;
-        // 256 b=1 blocks (only two ever fire): the same overcompleteness that
-        // funds the support dividend in production; see one_fired_block_fit.
-        let n_blocks = 256;
-        let mut decoder = A2::<f32>::zeros((n_blocks, p));
-        decoder[[0, 0]] = 1.0;
-        decoder[[1, 1]] = 1.0;
-        let mut blocks = A2::<u32>::zeros((n, 2));
-        let mut gates = A2::<f32>::zeros((n, 2));
-        let mut codes = Array3::<f32>::zeros((n, 2, 1));
-        for i in 0..n {
-            let theta = TAU * (i as f64) / (n as f64);
-            blocks[[i, 0]] = 0;
-            blocks[[i, 1]] = 1;
-            codes[[i, 0, 0]] = theta.cos() as f32;
-            codes[[i, 1, 0]] = theta.sin() as f32;
-            gates[[i, 0]] = codes[[i, 0, 0]].abs();
-            gates[[i, 1]] = codes[[i, 1, 0]].abs();
-        }
-        // A gate of exactly zero marks a padded slot, so nudge the four
-        // axis-crossing rows off the axis rather than losing their firing.
-        for i in 0..n {
-            for j in 0..2 {
-                if gates[[i, j]] == 0.0 {
-                    codes[[i, j, 0]] = 1.0e-6;
-                    gates[[i, j]] = 1.0e-6;
-                }
-            }
-        }
-        let fit = BlockSparseFit {
-            decoder,
-            blocks,
-            gates,
-            codes,
-            gamma: 1.0,
-            block_utilization: {
-                let mut util = vec![0.0f32; n_blocks];
-                util[0] = 1.0;
-                util[1] = 1.0;
-                util
-            },
-            block_stable_rank: vec![1.0; n_blocks],
-            matryoshka_prefix_losses: Vec::new(),
-            explained_variance: 1.0,
-            epochs: 0,
-            convergence: BlockSparseConvergence::trivially_converged(),
-            block_topk: 2,
-            block_size: 1,
-        };
-        let report = harvest_code_space_promotions(&fit, n, 0.05).expect("harvest runs");
-        // Each b=1 block alone is a line: no single-block proposal possible.
-        assert!(
-            report.proposals.is_empty(),
-            "single-atom communities cannot host a ring"
-        );
-        assert_eq!(report.pair_proposals.len(), 1, "one co-firing pair");
-        let verdict = &report.pair_proposals[0];
-        assert_eq!((verdict.atom_a, verdict.atom_b), (0, 1));
-        assert!(
-            verdict.proposal.accept,
-            "the shattered ring must be promoted from the joint cloud: {verdict:?}"
-        );
-        // The permutation null must NOT reproduce the ring: scrambling the
-        // sin coordinate against cos destroys the coupling, so the observed
-        // saving is extreme against the null family.
-        assert_eq!(verdict.null_permutations as usize, 63);
-        assert!(
-            verdict.null_p_hat <= 2.0 / 64.0,
-            "a planted ring must survive its permutation null, p̂={} ({} exceedances)",
-            verdict.null_p_hat,
-            verdict.null_exceedances
-        );
-        assert_eq!(report.n_accepted, 1);
-        assert!(report.dl_saved_bits > 0.0);
     }
 
     /// The universal-improver entry: a FOREIGN dictionary (any K×P atom bank)

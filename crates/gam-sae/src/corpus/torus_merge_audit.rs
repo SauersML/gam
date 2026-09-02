@@ -69,7 +69,6 @@ impl MergeCandidate {
 #[cfg(test)]
 mod tests {
     use gam_linalg::utils::splitmix64_hash;
-    use ndarray::Array2;
 
     fn uniform01(counter: &mut u64) -> f64 {
         *counter = counter.wrapping_add(1);

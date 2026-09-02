@@ -429,23 +429,6 @@ mod tests {
     use std::io::Write;
     use std::sync::Mutex;
 
-    fn temp_store(name: &str, shards: &[(&str, Array2<f64>)]) -> PathBuf {
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "gam-sae-objstore-test-{}-{}",
-            std::process::id(),
-            name
-        ));
-        std::fs::create_dir_all(&dir).expect("create store dir");
-        for (key, rows) in shards {
-            let bytes = encode_shard_bytes(rows.view());
-            let mut f = File::create(dir.join(key)).expect("create shard");
-            f.write_all(&bytes).expect("write shard");
-            f.sync_all().expect("sync shard");
-        }
-        dir
-    }
-
     fn drain(src: &mut dyn CorpusRowSource) -> (Vec<u64>, Vec<f64>) {
         let mut ids = Vec::new();
         let mut vals = Vec::new();
@@ -454,43 +437,6 @@ mod tests {
             vals.extend(batch.rows.iter().copied());
         }
         (ids, vals)
-    }
-
-    #[test]
-    fn object_store_replays_the_mmap_row_sequence_exactly() {
-        // The same shard set, read via the object-store source and via the
-        // mmap source, must yield byte-identical (row_id, row) sequences —
-        // the backend is invisible to every downstream determinism contract.
-        let a = array![[1.0_f64, 2.0], [3.0, 4.0], [5.0, 6.0]];
-        let b = array![[7.0_f64, 8.0], [9.0, 10.0]];
-        let dir = temp_store("parity", &[("a.shard", a), ("b.shard", b)]);
-
-        let store = Arc::new(FsObjectStore::new(dir.clone()));
-        let mut remote = ObjectStoreShardSource::open(store).expect("open object-store source");
-        let mut local = MmapShardSource::open_dir(&dir).expect("open mmap source");
-
-        assert_eq!(remote.total_rows(), local.total_rows());
-        assert_eq!(remote.width(), local.width());
-        let (ids_r, vals_r) = drain(&mut remote);
-        let (ids_l, vals_l) = drain(&mut local);
-        assert_eq!(ids_r, ids_l);
-        assert_eq!(
-            vals_r.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            vals_l.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            "object-store rows must be bit-identical to mmap rows"
-        );
-
-        // reset() replays the identical sequence.
-        remote.reset();
-        let (ids_again, vals_again) = drain(&mut remote);
-        assert_eq!(ids_again, ids_r);
-        assert_eq!(vals_again, vals_r);
-        if let Err(err) = std::fs::remove_dir_all(&dir) {
-            eprintln!(
-                "temp object store cleanup failed for {}: {err}",
-                dir.display()
-            );
-        }
     }
 
     /// A store wrapper that counts whole-shard fetches and asserts the

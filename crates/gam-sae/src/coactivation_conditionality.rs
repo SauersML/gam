@@ -341,7 +341,6 @@ pub fn conditional_coactivation_influence_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
 
     #[test]
     fn robustness_radius_matches_direct_adversarial_reweighting_search() {

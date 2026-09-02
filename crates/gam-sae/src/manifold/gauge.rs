@@ -14,9 +14,6 @@ use ndarray::ArrayView1;
 
 use gam_math::special::{digamma, trigamma};
 use opt::{BacktrackConfig, backtracking_line_search};
-use ndarray::Array2;
-use ndarray::ArrayView2;
-use super::SaeBasisEvaluator;
 
 /// The two-parameter affine transition `t_a ≈ slope·t_b + offset` relating the
 /// arc-length coordinate of curve B to that of curve A, the object SAC's birth
@@ -353,7 +350,7 @@ fn ln_gamma(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array1, Array3, array};
+    use ndarray::{Array1, array};
 
     // ---- F1: amplitude-concentration certificate ----------------------------
 

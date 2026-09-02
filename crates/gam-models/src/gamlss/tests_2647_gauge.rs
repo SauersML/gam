@@ -6,7 +6,3 @@
 // the property they established, asserted rather than printed.
 #![cfg(test)]
 
-use super::*;
-use faer::Side;
-use gam_linalg::faer_ndarray::FaerEigh;
-

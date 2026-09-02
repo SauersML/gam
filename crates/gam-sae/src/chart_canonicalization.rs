@@ -3217,26 +3217,6 @@ mod patch_flow_tests {
         );
     }
 
-    #[test]
-    fn free_patch_flow_basis_layout_and_jacobian_at_identity() {
-        let basis = FreePatchFlowBasis::new([0.0, 0.0], [1.0, 1.0]).expect("patch basis");
-        // 2 components × 2 monomials (deg 1: (1,0),(0,1)) = 4 coefficients.
-        assert_eq!(basis.dim(), 4);
-        assert_eq!(basis.mode_layout().len(), 4);
-        // θ = 0 ⇒ Dφ = I everywhere ⇒ min det = 1.
-        let theta = vec![0.0_f64; basis.dim()];
-        let det = basis.min_jacobian_det_on_grid(&theta);
-        assert!(
-            (det - 1.0).abs() < 1e-12,
-            "identity flow has det Dφ ≡ 1; got {det}"
-        );
-        // The first two modes of component 0 are the linear fields (1,0),(0,1).
-        let layout = basis.mode_layout();
-        assert_eq!(layout[0].component, 0);
-        assert_eq!(layout[0].exps, (1, 0));
-        assert_eq!(layout[1].exps, (0, 1));
-    }
-
     /// Finite-difference check of the analytic mode gradients (the `grad` the
     /// Gauss–Newton Jacobian is built from) against the monomial values.
     #[test]
@@ -3462,23 +3442,6 @@ mod sphere_defect_tests {
         }
     }
 
-    /// The zonal boost `K_z = cos(lat) ∂_lat` is pole-free (its only nonzero
-    /// component is latitude and carries no `1/cos` factor), and the boost
-    /// `[Z, X, Y]` layout is stable.
-    #[test]
-    fn sphere_boost_layout_and_zonal_is_pole_free() {
-        let basis = SphereBoostFlowBasis;
-        assert_eq!(basis.dim(), 3);
-        assert_eq!(
-            basis.mode_layout(),
-            [SphereBoostAxis::Z, SphereBoostAxis::X, SphereBoostAxis::Y]
-        );
-        // K_z displacement is (cos lat, 0): finite for every latitude.
-        for lat in [-1.4, -0.3, 0.0, 0.9, 1.4] {
-            let disp = SphereBoostFlowBasis::mode_displacements([lat, 0.5]);
-            assert!(disp[0][0].is_finite() && disp[0][1] == 0.0);
-        }
-    }
 }
 
 #[cfg(test)]

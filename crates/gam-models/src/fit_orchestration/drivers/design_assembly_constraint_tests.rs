@@ -22,16 +22,10 @@ mod design_assembly_constraint_tests {
     // and `MaternIdentifiability` already arrive via `super::*` (the drivers'
     // explicit `gam_terms::basis` import), so re-listing them here would collide
     // (E0252); every other name is pulled in explicitly.
-    use gam_terms::basis::{
-        BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-        BSplineIdentifiability, BSplineKnotSpec, BasisOptions, Dense, DuchonBasisSpec,
-        DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KnotSource, MaternBasisSpec,
-        MaternNu, OneDimensionalBoundary, SpatialIdentifiability, SphericalSplineBasisSpec,
-        ThinPlateBasisSpec, build_bspline_basis_1d,
-    };
+    use gam_terms::basis::{BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternNu, OneDimensionalBoundary, SpatialIdentifiability, SphericalSplineBasisSpec, ThinPlateBasisSpec, build_bspline_basis_1d};
     use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
     use gam_model_api::OuterEvalOrder;
-    use ndarray::{Axis, array};
+    use ndarray::array;
     use rand::RngExt as _;
     use rand::SeedableRng as _;
     use rand::rngs::StdRng;

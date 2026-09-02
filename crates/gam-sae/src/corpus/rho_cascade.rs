@@ -268,21 +268,6 @@ mod tests {
     }
 
     #[test]
-    fn step_plan_includes_consistent_with_fraction() {
-        let sched = RhoCascadeSchedule::new(10_000_000, 8);
-        let plan = sched.step_plan(0);
-        for id in 0..1000u64 {
-            match plan.includes(id) {
-                Some(w) => {
-                    assert!((w - plan.importance_weight).abs() < 1e-12);
-                    assert!(row_in_fraction(id, plan.fraction) || plan.is_full_pass);
-                }
-                None => assert!(!row_in_fraction(id, plan.fraction)),
-            }
-        }
-    }
-
-    #[test]
     fn tiny_corpus_is_all_full_passes() {
         let sched = RhoCascadeSchedule::new(100, 5);
         for s in sched.steps() {

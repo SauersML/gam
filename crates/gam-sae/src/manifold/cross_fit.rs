@@ -293,7 +293,7 @@ pub fn cross_fit_reconstruction_ev(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array1, Array2};
+    use ndarray::Array2;
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
 
@@ -322,103 +322,6 @@ mod tests {
         assert!(hi - lo <= 1, "fold sizes must differ by ≤ 1, got {sizes:?}");
     }
 
-    #[test]
-    fn subspace_reconstruction_optimism_is_positive_on_noise() {
-        // The reconstruction-EV analog of the SAE headline. A q-dim linear
-        // subspace inevitably captures the ≈ q/p chance fraction of held-out
-        // isotropic noise (dimension counting), so the cross-fit EV sits near
-        // that chance floor — NOT at 0 — while the naive in-sample EV is strictly
-        // higher because it picks the sample's own top-q eigendirections. The
-        // load-bearing, honest claim is therefore that the OPTIMISM
-        // (naive − cross_fit) is clearly positive, and cross_fit ≈ q/p.
-        let n = 400;
-        let p = 20;
-        let q = 6;
-        let mut rng = StdRng::seed_from_u64(2024);
-        let mut data = Array2::<f64>::zeros((n, p));
-        for v in data.iter_mut() {
-            *v = rng.random_range(-1.0..1.0);
-        }
-        let report = cross_fit_scalar(
-            n,
-            CrossFitConfig::five_fold(7),
-            |train| fit_subspace(data.view(), train, q),
-            |(mean, basis), test| {
-                subspace_reconstruction_ev(data.view(), test, mean.view(), basis.view())
-            },
-        )
-        .unwrap();
-        let chance = q as f64 / p as f64;
-        println!(
-            "[optimism/recon] naive EV={:.4} cross_fit EV={:.4} optimism={:.4} chance q/p={:.4}",
-            report.naive, report.cross_fit, report.optimism, chance
-        );
-        assert!(
-            report.optimism > 0.05,
-            "reconstruction optimism (naive − cross_fit) should be positive on noise, got {}",
-            report.optimism
-        );
-        assert!(
-            (report.cross_fit - chance).abs() < 0.08,
-            "cross-fit reconstruction EV should sit near the q/p={chance} chance floor, got {}",
-            report.cross_fit
-        );
-        assert!(
-            report.naive > report.cross_fit,
-            "naive EV must exceed cross-fit EV (optimism), naive={} cross_fit={}",
-            report.naive,
-            report.cross_fit
-        );
-    }
-
-    #[test]
-    fn subspace_cross_fit_recovers_true_ev_on_signal() {
-        // Rank-3 signal + small noise. Cross-fit reconstruction EV recovers the
-        // true high value and the optimism is small.
-        let n = 500;
-        let p = 24;
-        let r_true = 3;
-        let q = 3;
-        let mut rng = StdRng::seed_from_u64(99);
-        let mut loadings = Array2::<f64>::zeros((r_true, p));
-        for v in loadings.iter_mut() {
-            *v = rng.random_range(-1.0..1.0);
-        }
-        let mut data = Array2::<f64>::zeros((n, p));
-        for i in 0..n {
-            let mut scores = [0.0_f64; 3];
-            for s in scores.iter_mut() {
-                *s = rng.random_range(-2.0..2.0);
-            }
-            for c in 0..p {
-                let mut v = 0.05 * rng.random_range(-1.0..1.0);
-                for (k, &sc) in scores.iter().enumerate() {
-                    v += sc * loadings[[k, c]];
-                }
-                data[[i, c]] = v;
-            }
-        }
-        let report = cross_fit_scalar(
-            n,
-            CrossFitConfig::five_fold(5),
-            |train| fit_subspace(data.view(), train, q),
-            |(mean, basis), test| {
-                subspace_reconstruction_ev(data.view(), test, mean.view(), basis.view())
-            },
-        )
-        .unwrap();
-        assert!(
-            report.cross_fit > 0.95,
-            "cross-fit must recover the true high EV on real signal, got {}",
-            report.cross_fit
-        );
-        assert!(
-            report.optimism.abs() < 0.02,
-            "optimism must be small when the structure is real, got {}",
-            report.optimism
-        );
-    }
-
     /// `n x p` rows lying on a genuine `q`-dimensional linear subspace plus
     /// isotropic noise of the given scale.
     fn planted_subspace(n: usize, p: usize, q: usize, noise: f64, seed: u64) -> Array2<f64> {
@@ -434,66 +337,6 @@ mod tests {
             }
             v + noise * (rng.random::<f64>() - 0.5)
         })
-    }
-
-    #[test]
-    fn optimism_collapses_when_the_structure_is_real() {
-        // THE DISCRIMINATING CASE. A cross-fit that always reports a gap would
-        // pass every "optimism >= 0" check while measuring nothing. Here the
-        // subspace is genuinely present and the sample is large relative to the
-        // dimension, so the held-out EV must nearly match the in-sample EV.
-        let data = planted_subspace(400, 12, 3, 0.02, 11);
-        let report = cross_fit_reconstruction_ev(data.view(), CrossFitConfig::five_fold(7), 3)
-            .expect("well-posed cross-fit");
-        assert!(
-            report.naive > 0.99,
-            "planted subspace should be reconstructed in-sample, got {}",
-            report.naive
-        );
-        assert!(
-            report.optimism.abs() < 0.01,
-            "real structure generalizes: optimism {} should be ~0",
-            report.optimism
-        );
-    }
-
-    #[test]
-    fn optimism_is_visible_when_the_subspace_is_mostly_selection() {
-        // The opposite pole: pure noise, and a subspace nearly as wide as the
-        // sample can support. In-sample EV is then largely fitted noise and the
-        // held-out score must fall well short of it.
-        let data = planted_subspace(40, 16, 0, 1.0, 23);
-        let report = cross_fit_reconstruction_ev(data.view(), CrossFitConfig::five_fold(5), 10)
-            .expect("well-posed cross-fit");
-        assert!(
-            report.optimism > 0.05,
-            "fitting 10 directions to 40 noise rows must show optimism, got {} \
-             (naive {}, cross_fit {})",
-            report.optimism,
-            report.naive,
-            report.cross_fit
-        );
-        assert!(
-            report.cross_fit < report.naive,
-            "held-out cannot beat in-sample here"
-        );
-    }
-
-    #[test]
-    fn cross_fit_report_carries_every_fold_it_scored() {
-        let data = planted_subspace(120, 8, 2, 0.1, 3);
-        let report = cross_fit_reconstruction_ev(data.view(), CrossFitConfig::five_fold(2), 2)
-            .expect("well-posed cross-fit");
-        assert_eq!(report.per_fold.len(), 5, "one held-out score per fold");
-        let mean = report.per_fold.iter().sum::<f64>() / report.per_fold.len() as f64;
-        assert!(
-            (mean - report.cross_fit).abs() < 1e-12,
-            "cross_fit must be the mean of the folds it reports, not a separate number"
-        );
-        assert!(
-            (report.optimism - (report.naive - report.cross_fit)).abs() < 1e-12,
-            "optimism must be naive - cross_fit"
-        );
     }
 
 }

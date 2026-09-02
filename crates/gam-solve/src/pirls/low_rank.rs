@@ -176,8 +176,7 @@ pub fn dense_block_xtwy(
 
 #[cfg(test)]
 mod low_rank_weight_pirls_tests {
-    use super::{DesignMatrix, PirlsWorkspace, dense_block_xtwx};
-    use gam_linalg::matrix::{FiniteSignedWeightsView, LinearOperator};
+    use super::{DesignMatrix, dense_block_xtwx};
     use ndarray::{Array2, Array3, array, s};
 
     fn tiny_design() -> DesignMatrix {

@@ -32,9 +32,6 @@
 //! `‖z − Σ_j a_j Φ(t_j)‖²` given a caller-supplied basis evaluation, and reports
 //! the final residual so a caller can gate acceptance.
 
-use ndarray::Array1;
-use ndarray::Array2;
-use std::f64::consts::TAU;
 // ============================================================================
 // Shared order selection (mirrors `super_resolution`'s derived thresholds)
 // ============================================================================
@@ -156,9 +153,6 @@ pub struct PolishResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngExt as _;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
 
     // ---- Sphere ----------------------------------------------------------
 

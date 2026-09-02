@@ -35,64 +35,6 @@ mod tests {
         pub stride: usize,
     }
 
-    /// Run the CPU evaluator on every accepted cell so the test suite can check
-    /// substrate moments against an independent host reference.
-    fn build_host_moments(
-        view: &CubicCellDerivativeMomentHostView<'_>,
-    ) -> Result<HostMomentBatch, String> {
-        validate_host_view(view)?;
-        let n_cells = view.cells.len();
-        let stride = view.max_degree + 1;
-        let mut moments = vec![0.0_f64; n_cells.saturating_mul(stride)];
-        let mut status = vec![CubicCellMomentStatus::Ok; n_cells];
-
-        for (i, &gpu_cell) in view.cells.iter().enumerate() {
-            let row = &mut moments[i * stride..(i + 1) * stride];
-
-            let host_tag = match classify_cell_for_gpu(gpu_cell) {
-                Ok(tag) => tag,
-                Err(code) => {
-                    status[i] = code;
-                    continue;
-                }
-            };
-            let cpu_cell = DenestedCubicCell {
-                left: gpu_cell.left,
-                right: gpu_cell.right,
-                c0: gpu_cell.c0,
-                c1: gpu_cell.c1,
-                c2: gpu_cell.c2,
-                c3: gpu_cell.c3,
-            };
-            match evaluate_cell_derivative_moments_uncached(cpu_cell, view.max_degree) {
-                Ok(state) => {
-                    let copy_len = state.moments.len().min(stride);
-                    row[..copy_len].copy_from_slice(&state.moments[..copy_len]);
-                    if row.iter().any(|x| !x.is_finite()) {
-                        for slot in row.iter_mut() {
-                            *slot = 0.0;
-                        }
-                        status[i] = CubicCellMomentStatus::NonFiniteEvaluation;
-                    }
-                }
-                Err(_) => {
-                    status[i] = match host_tag {
-                        GpuCellBranchTag::AffineTail => {
-                            CubicCellMomentStatus::NonAffineInfiniteInterval
-                        }
-                        _ => CubicCellMomentStatus::InvalidInterval,
-                    };
-                }
-            }
-        }
-
-        Ok(HostMomentBatch {
-            moments,
-            status,
-            stride,
-        })
-    }
-
     fn gpu_from_cpu(cpu: DenestedCubicCell) -> GpuDenestedCubicCell {
         GpuDenestedCubicCell {
             left: cpu.left,

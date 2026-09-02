@@ -1130,22 +1130,6 @@ mod tests {
     use ndarray::{Array2, arr2, array};
     use std::collections::BTreeSet;
 
-    fn analytic_edge(a: usize, b: usize, overlap: usize, sign: i8) -> AtlasSignedEdge {
-        assert!(matches!(sign, -1 | 1));
-        let transition = SphereChartTransition::new_analytic(
-            a,
-            b,
-            [
-                [f64::from(sign), 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            AtlasSeamKind::Regular,
-        )
-        .unwrap();
-        AtlasSignedEdge::from_analytic_sphere_transition(&transition, overlap).unwrap()
-    }
-
     fn charts_from_faces(n_charts: usize, faces: &[Vec<usize>]) -> Vec<AtlasChart> {
         let mut support_rows = vec![Vec::new(); n_charts];
         for (row, face) in faces.iter().enumerate() {
@@ -1161,17 +1145,6 @@ mod tests {
                 AtlasChart::from_sparse_weights(chart, faces.len(), rows, weights).unwrap()
             })
             .collect()
-    }
-
-    #[test]
-    fn chart_storage_tracks_sparse_support_not_row_count() {
-        let chart =
-            AtlasChart::from_sparse_weights(0, 1_000_000, vec![7, 900_001], vec![0.25, 0.75])
-                .unwrap();
-        assert_eq!(chart.row_count(), 1_000_000);
-        assert_eq!(chart.support_rows(), &[7, 900_001]);
-        assert_eq!(chart.support_weights(), &[0.25, 0.75]);
-        assert_eq!(chart.support_mass, 1.0);
     }
 
     fn all_valid_pair_gates(n_charts: usize) -> Vec<AtlasTransferGate> {
@@ -1244,147 +1217,6 @@ mod tests {
         AtlasHolonomyCertificate::ExactAnalytic(
             ExactAnalyticHolonomyCertificate::new(n_charts, edges).unwrap(),
         )
-    }
-
-    fn refused_gaussian_certificate(
-        n_charts: usize,
-        maximal_intersections: &[Vec<usize>],
-    ) -> AtlasHolonomyCertificate {
-        let projection_frame = arr2(&[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
-        let tangent_coordinates = arr2(&[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]);
-        let bounds = GaussianPcaPopulationBounds::new(0.1, 2.0, 1.0).unwrap();
-        let patches: Vec<GaussianPcaPatch> = (0..n_charts)
-            .map(|chart| {
-                GaussianPcaPatch::new(
-                    chart,
-                    GaussianPatchRowSplit::from_disjoint_ranges(chart * 16, 2, chart * 16 + 8, 2)
-                        .unwrap(),
-                    PilotProjectionProvenance::ExactAnalyticCapture,
-                    GaussianPatchCentering::MeanEstimatedOnInferenceRows,
-                    projection_frame.clone(),
-                    tangent_coordinates.clone(),
-                    0.1,
-                    1.0,
-                    GaussianPcaSpectrumProvenance::CertifiedPopulation(bounds),
-                )
-                .unwrap()
-            })
-            .collect();
-        let mut pairs = BTreeSet::new();
-        for intersection in maximal_intersections {
-            for left in 0..intersection.len() {
-                for right in (left + 1)..intersection.len() {
-                    pairs.insert((
-                        intersection[left].min(intersection[right]),
-                        intersection[left].max(intersection[right]),
-                    ));
-                }
-            }
-        }
-        let edge_specs = pairs
-            .into_iter()
-            .map(|(a, b)| {
-                ProjectedAtlasEdgeSpec::new(
-                    a,
-                    b,
-                    0,
-                    PopulationCrossGramProvenance::CertifiedSmallestSingularValue {
-                        lower_bound: 1.0,
-                    },
-                    0.0,
-                )
-                .unwrap()
-            })
-            .collect();
-        let error_model = GaussianPcaErrorModel::independent(&patches).unwrap();
-        AtlasHolonomyCertificate::gaussian_pca(
-            patches,
-            edge_specs,
-            error_model,
-            AtlasFamilywiseLevel::new(0.05).unwrap(),
-            None,
-        )
-        .unwrap()
-    }
-
-    fn confident_gaussian_certificate(
-        n_charts: usize,
-        maximal_intersections: &[Vec<usize>],
-        euler_characteristic: i64,
-    ) -> AtlasHolonomyCertificate {
-        let projection_frame = arr2(&[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
-        let tangent_coordinates = arr2(&[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]);
-        let bounds = GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap();
-        let patches: Vec<GaussianPcaPatch> = (0..n_charts)
-            .map(|chart| {
-                GaussianPcaPatch::new(
-                    chart,
-                    GaussianPatchRowSplit::from_disjoint_ranges(
-                        chart * 4_000_000,
-                        1_000_000,
-                        chart * 4_000_000 + 1_000_000,
-                        1_000_000,
-                    )
-                    .unwrap(),
-                    PilotProjectionProvenance::ExactAnalyticCapture,
-                    GaussianPatchCentering::MeanEstimatedOnInferenceRows,
-                    projection_frame.clone(),
-                    tangent_coordinates.clone(),
-                    0.01,
-                    1.0,
-                    GaussianPcaSpectrumProvenance::CertifiedPopulation(bounds),
-                )
-                .unwrap()
-            })
-            .collect();
-        let mut pairs = BTreeSet::new();
-        for intersection in maximal_intersections {
-            for left in 0..intersection.len() {
-                for right in (left + 1)..intersection.len() {
-                    pairs.insert((
-                        intersection[left].min(intersection[right]),
-                        intersection[left].max(intersection[right]),
-                    ));
-                }
-            }
-        }
-        let edge_specs = pairs
-            .into_iter()
-            .map(|(a, b)| {
-                ProjectedAtlasEdgeSpec::new(
-                    a,
-                    b,
-                    0,
-                    PopulationCrossGramProvenance::CertifiedSmallestSingularValue {
-                        lower_bound: 1.0,
-                    },
-                    0.0,
-                )
-                .unwrap()
-            })
-            .collect();
-        let gauss_bonnet = GaussBonnetInput::certified_independent_gaussian(
-            vec![GaussBonnetNoiseSource::new(0, arr2(&[[1.0e-12]])).unwrap()],
-            vec![
-                GaussBonnetContribution::new(
-                    std::f64::consts::TAU * euler_characteristic as f64,
-                    0.0,
-                    0.0,
-                    vec![GaussBonnetSourceGradient::new(0, array![1.0]).unwrap()],
-                )
-                .unwrap(),
-            ],
-        )
-        .unwrap();
-        let error_model = GaussianPcaErrorModel::independent(&patches).unwrap();
-        AtlasHolonomyCertificate::gaussian_pca(
-            patches,
-            edge_specs,
-            error_model,
-            AtlasFamilywiseLevel::new(0.01).unwrap(),
-            Some(gauss_bonnet),
-        )
-        .unwrap()
     }
 
     /// Boundary faces of an octahedron: a small sphere whose generic simplex

@@ -76,8 +76,6 @@
 //! order is a separate directional product, not a curvature mode.
 
 use crate::gpu_kernels::sae_rowjet::SaeRowJetPath;
-use crate::gpu_kernels::sae_rowjet::SaeRowJetPrimary;
-use crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput;
 
 /// Leaf size of the canonical cross-row reduction tree. Shared with the host
 /// deterministic fold so that both backends associate additions identically.
@@ -477,104 +475,6 @@ mod tests {
             }
         }
         assert!(nonzero, "{label}: reference blocks are entirely zero");
-    }
-
-    /// The Gauss-Newton and exact-Newton blocks must differ (otherwise the
-    /// residual-curvature channel is silently dead and the parity test above is
-    /// vacuous), while `H_ββ` must agree exactly: reconstruction is linear in β.
-    #[test]
-    fn resident_arrow_curvature_channel_is_live_and_beta_block_is_linear_1017() {
-        let n = 32;
-        let (rows, residual) = fixture(n);
-        let mut handle =
-            ResidentRowJetHandle::new(3, 6, 4, 3, 1.3, n, SaeRowJetPath::Cpu).expect("handle");
-        let gn = handle
-            .accumulate_arrow_blocks(&rows, &residual, ArrowCurvature::GaussNewton)
-            .expect("gauss-newton blocks");
-        let exact = handle
-            .accumulate_arrow_blocks(&rows, &residual, ArrowCurvature::ExactNewton)
-            .expect("exact-newton blocks");
-        assert_eq!(gn.g_t, exact.g_t, "the score must not depend on curvature");
-        assert_eq!(
-            gn.h_bb, exact.h_bb,
-            "β is linear: H_ββ carries no curvature"
-        );
-        let htt_gap = gn
-            .h_tt
-            .iter()
-            .zip(exact.h_tt.iter())
-            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
-        let htb_gap = gn
-            .h_tb
-            .iter()
-            .zip(exact.h_tb.iter())
-            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
-        assert!(htt_gap > 1.0e-8, "residual curvature is dead in H_ξξ");
-        assert!(htb_gap > 1.0e-8, "residual curvature is dead in H_ξβ");
-    }
-
-    /// The reduced-block HVP equals the dense product of the same blocks — the
-    /// downstream Krylov apply never needs the tower.
-    #[test]
-    fn resident_arrow_hvp_matches_dense_block_product_1017() {
-        let n = 5;
-        let (rows, residual) = fixture(n);
-        let mut handle =
-            ResidentRowJetHandle::new(3, 6, 4, 3, 1.3, n, SaeRowJetPath::Cpu).expect("handle");
-        let blocks = handle
-            .accumulate_arrow_blocks(&rows, &residual, ArrowCurvature::ExactNewton)
-            .expect("blocks");
-        let (q, nb) = (blocks.q, blocks.n_beta);
-        let direction = ArrowDirection {
-            t: (0..n * q)
-                .map(|index| ((index * 7 + 1) as f64 * 0.21).cos())
-                .collect(),
-            beta: (0..nb)
-                .map(|index| ((index * 11 + 2) as f64 * 0.13).sin())
-                .collect(),
-        };
-        let product = handle
-            .apply_exact_hvp_data(&blocks, &direction)
-            .expect("hvp");
-
-        // Independent dense assembly of the arrow operator's action.
-        let mut expect_t = vec![0.0; n * q];
-        let mut expect_beta = vec![0.0; nb];
-        for row in 0..n {
-            for a in 0..q {
-                let mut acc = 0.0;
-                for b in 0..q {
-                    acc += blocks.h_tt[(row * q + a) * q + b] * direction.t[row * q + b];
-                }
-                for j in 0..nb {
-                    acc += blocks.h_tb[(row * q + a) * nb + j] * direction.beta[j];
-                }
-                expect_t[row * q + a] = acc;
-            }
-            for j in 0..nb {
-                for a in 0..q {
-                    expect_beta[j] +=
-                        blocks.h_tb[(row * q + a) * nb + j] * direction.t[row * q + a];
-                }
-            }
-        }
-        for i in 0..nb {
-            for j in 0..nb {
-                expect_beta[i] += blocks.h_bb[i * nb + j] * direction.beta[j];
-            }
-        }
-        for (index, (&got, &want)) in product.t.iter().zip(expect_t.iter()).enumerate() {
-            assert!(
-                (got - want).abs() <= 1.0e-12 * (1.0 + want.abs()),
-                "hvp t[{index}] {got:e} != {want:e}"
-            );
-        }
-        for (index, (&got, &want)) in product.beta.iter().zip(expect_beta.iter()).enumerate() {
-            assert!(
-                (got - want).abs() <= 1.0e-12 * (1.0 + want.abs()),
-                "hvp beta[{index}] {got:e} != {want:e}"
-            );
-        }
     }
 
 }

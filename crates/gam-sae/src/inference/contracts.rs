@@ -27,7 +27,6 @@
 //!    DERIVED from the loop's own defects (never a magic constant).
 
 use std::f64::consts::{PI, TAU};
-use ndarray::Array1;
 
 /// One component map of a chart-coordinate pipeline, abstracted to exactly the
 /// three numbers a composition bound needs.

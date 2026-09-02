@@ -57,7 +57,6 @@ mod tests {
     use super::*;
     use crate::identifiability::{FittedAtom, FittedSaeManifold};
     use gam_problem::RowMetric;
-    use ndarray::array;
 
     fn model(frames: Vec<Array2<f64>>) -> FittedSaeManifold {
         let atoms = frames

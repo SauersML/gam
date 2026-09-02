@@ -35,7 +35,6 @@
 use ndarray::Array2;
 
 use gam_solve::row_sampling_measure::MeasureProvenance;
-use gam_solve::row_sampling_measure::RowSamplingMeasure;
 
 /// Default designed-sample budget once [`designed_sampling_mandatory`] fires.
 /// Auto-derived policy, not a knob: 2·10⁶ rows is comfortably in-memory at any
@@ -81,8 +80,6 @@ impl DesignedCorpusTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::super::shard_reader::{MmapShardSource, encode_shard_bytes};
-    use super::*;
     use ndarray::Array2 as NdArray2;
     use std::io::Write;
     use std::path::PathBuf;

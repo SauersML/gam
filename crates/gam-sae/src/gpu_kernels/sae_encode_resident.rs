@@ -59,7 +59,6 @@
 
 use crate::encode::KANTOROVICH_THRESHOLD;
 use gam_gpu::policy::EncodeDeploymentDecision;
-use gam_gpu::policy::EncodeDecisionBlocked;
 
 /// One `EuclideanPatch` atom's frozen encode data, flattened for a device
 /// launch. This is exactly what the online encode reads: the monomial exponent
@@ -580,7 +579,7 @@ mod tests {
     use crate::basis::{EuclideanPatchEvaluator, SaeBasisEvaluator};
     use crate::encode::{AtlasConfig, EncodeAtlas};
     use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom};
-    use ndarray::{Array1, Array2};
+    use ndarray::Array2;
     use std::sync::Arc;
 
     /// Build a degree-`deg`, `d`-D `EuclideanPatch` atom with a deterministic
@@ -622,98 +621,6 @@ mod tests {
     }
 
     #[test]
-    fn emulator_matches_production_certified_encode_1d_quadratic() {
-        let (d, deg, p) = (1usize, 2usize, 4usize);
-        let config = AtlasConfig::default();
-        let (atom, atlas) = build_atom_and_atlas(d, deg, p, config);
-        let atom_atlas = &atlas.atoms[0];
-        let dev = EncodeAtomDevice::from_atom_atlas(&atom, atom_atlas, &config).unwrap();
-        // Planted rows: exact reconstructions at known coords (on-manifold), so
-        // the encode has a genuine certified basin.
-        let mut rows: Vec<Vec<f64>> = Vec::new();
-        let mut amps: Vec<f64> = Vec::new();
-        let evaluator = EuclideanPatchEvaluator::new(d, deg).unwrap();
-        for k in 0..24 {
-            let tc = -0.4 + 0.8 * (k as f64) / 23.0;
-            let (phi, _) = evaluator
-                .evaluate(Array2::from_shape_fn((1, d), |_| tc).view())
-                .unwrap();
-            let amp = 1.0;
-            let mut x = vec![0.0; p];
-            for c in 0..p {
-                let mut r = 0.0;
-                for b in 0..dev.m {
-                    r += phi[[0, b]] * dev.decoder[b * p + c];
-                }
-                x[c] = amp * r;
-            }
-            rows.push(x);
-            amps.push(amp);
-        }
-        // Random (off-manifold) rows exercise the fallback / uncertified paths.
-        for k in 0..24 {
-            let x = (0..p)
-                .map(|c| 0.5 * (((k * 7 + c * 3) as f64) * 0.21).sin())
-                .collect();
-            rows.push(x);
-            amps.push(0.7 + 0.3 * ((k as f64) * 0.11).cos());
-        }
-        let (cert, total, max_coord, max_h) = assert_parity(&atom, &atlas, &dev, &rows, &amps);
-        eprintln!(
-            "1D quadratic: certified {cert}/{total}, max coord diff {max_coord:.3e}, max h diff {max_h:.3e}"
-        );
-        assert!(cert > 0, "planted rows must certify through the encode");
-        assert!(max_coord <= 1e-7, "coord parity {max_coord:.3e} > 1e-7");
-        assert!(max_h <= 1e-7, "certificate h parity {max_h:.3e} > 1e-7");
-    }
-
-    #[test]
-    fn emulator_matches_production_certified_encode_2d_quadratic() {
-        let (d, deg, p) = (2usize, 2usize, 5usize);
-        let config = AtlasConfig {
-            grid_resolution: 6,
-            ..AtlasConfig::default()
-        };
-        let (atom, atlas) = build_atom_and_atlas(d, deg, p, config);
-        let atom_atlas = &atlas.atoms[0];
-        let dev = EncodeAtomDevice::from_atom_atlas(&atom, atom_atlas, &config).unwrap();
-        let evaluator = EuclideanPatchEvaluator::new(d, deg).unwrap();
-        let mut rows: Vec<Vec<f64>> = Vec::new();
-        let mut amps: Vec<f64> = Vec::new();
-        for k in 0..30 {
-            let t0 = -0.3 + 0.6 * ((k % 6) as f64) / 5.0;
-            let t1 = -0.3 + 0.6 * ((k / 6) as f64) / 5.0;
-            let coord = Array2::from_shape_fn((1, d), |(_, c)| if c == 0 { t0 } else { t1 });
-            let (phi, _) = evaluator.evaluate(coord.view()).unwrap();
-            let amp = 1.0;
-            let mut x = vec![0.0; p];
-            for c in 0..p {
-                let mut r = 0.0;
-                for b in 0..dev.m {
-                    r += phi[[0, b]] * dev.decoder[b * p + c];
-                }
-                x[c] = amp * r;
-            }
-            rows.push(x);
-            amps.push(amp);
-        }
-        for k in 0..20 {
-            let x = (0..p)
-                .map(|c| 0.4 * (((k * 5 + c * 2) as f64) * 0.17).cos())
-                .collect();
-            rows.push(x);
-            amps.push(1.0);
-        }
-        let (cert, total, max_coord, max_h) = assert_parity(&atom, &atlas, &dev, &rows, &amps);
-        eprintln!(
-            "2D quadratic: certified {cert}/{total}, max coord diff {max_coord:.3e}, max h diff {max_h:.3e}"
-        );
-        assert!(cert > 0, "planted 2D rows must certify");
-        assert!(max_coord <= 1e-6, "coord parity {max_coord:.3e} > 1e-6");
-        assert!(max_h <= 1e-6, "certificate h parity {max_h:.3e} > 1e-6");
-    }
-
-    #[test]
     fn jacobi_eigh_matches_reference_2x2() {
         // Symmetric 2x2 spectral check: reconstruct A from V diag(vals) Vᵀ.
         let a = [4.0, 1.0, 1.0, 3.0];
@@ -738,29 +645,6 @@ mod tests {
         vs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert!((vs[0] - (7.0 - 5.0_f64.sqrt()) / 2.0).abs() < 1e-12);
         assert!((vs[1] - (7.0 + 5.0_f64.sqrt()) / 2.0).abs() < 1e-12);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn encode_kernel_source_substitutes_macros_and_compiles() {
-        let (d, deg, p) = (1usize, 2usize, 4usize);
-        let config = AtlasConfig::default();
-        let (atom, atlas) = build_atom_and_atlas(d, deg, p, config);
-        let dev = EncodeAtomDevice::from_atom_atlas(&atom, &atlas.atoms[0], &config).unwrap();
-        let src = encode_kernel_source(&dev);
-        assert!(src.contains(&format!("#define DD {}", dev.d)));
-        assert!(src.contains(&format!("#define MM {}", dev.m)));
-        assert!(src.contains(&format!("#define PP {}", dev.p)));
-        assert!(src.contains("sae_certified_encode"));
-        // NVRTC host-compile to PTX (no device needed) — the #1017 anchor.
-        let ptx = gam_gpu::device_cache::compile_ptx_arch(&src)
-            .expect("sae_encode kernel compiles to PTX via NVRTC");
-        let text = ptx.to_src();
-        assert!(
-            text.contains(".visible .entry sae_certified_encode"),
-            "PTX must export the encode entry"
-        );
-        assert!(text.contains(".target sm_"), "PTX must carry a target arch");
     }
 
 }

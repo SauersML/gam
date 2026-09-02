@@ -39,10 +39,6 @@ mod log_strength_domain_tests {
     use super::*;
     use ndarray::array;
 
-    fn fully_active_rho() -> SaeManifoldRho {
-        SaeManifoldRho::new(0.0, 0.0, vec![array![0.0]]).with_log_lambda_block(vec![0.0])
-    }
-
     #[test]
     fn every_active_flat_log_strength_has_one_closed_domain() {
         let rho = fully_active_rho();

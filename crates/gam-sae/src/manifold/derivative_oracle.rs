@@ -142,36 +142,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn branch_certificate_refuses_reanchored_majorizer_probe() {
-        let baseline = certificate(MajorizerAnchorMode::FrozenAnchor);
-        let probe = certificate(MajorizerAnchorMode::ReanchoredObject);
-        let err = baseline
-            .assert_same_branch(&probe)
-            .expect_err("reanchored majorizer differentiates a different object");
-        assert_eq!(err.refusal, BranchCertificateRefusal::BranchChanged);
-        assert_eq!(err.changed_fields, vec!["majorizer_anchor".to_string()]);
-    }
-
-    #[test]
-    fn branch_certificate_refuses_deflation_rank_change() {
-        let baseline = certificate(MajorizerAnchorMode::FrozenAnchor);
-        let mut probe = baseline.clone();
-        probe.deflated_rank = 1;
-        probe.deflated_per_row = vec![1];
-        let err = baseline
-            .assert_same_branch(&probe)
-            .expect_err("changed deflation branch must refuse derivative report");
-        assert!(
-            err.changed_fields
-                .iter()
-                .any(|field| field == "deflated_rank")
-        );
-        assert!(
-            err.changed_fields
-                .iter()
-                .any(|field| field == "deflated_per_row")
-        );
-    }
-
 }

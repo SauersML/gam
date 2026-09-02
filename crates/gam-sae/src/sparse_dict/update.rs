@@ -5442,55 +5442,6 @@ mod exact_solve_tests {
         use crate::sparse_dict::codes::solve_row_codes;
 
         // Held-out EV of a frozen decoder on a fresh block (production path).
-        fn held_out_ev(
-            decoder: ArrayView2<'_, f32>,
-            x_test: ArrayView2<'_, f32>,
-            s: usize,
-            tile: usize,
-            code_ridge: f32,
-        ) -> f64 {
-            let n = x_test.nrows();
-            let p = x_test.ncols();
-            let scorer = TileScorer::new(s, tile);
-            let mut means = vec![0.0f64; p];
-            for i in 0..n {
-                for c in 0..p {
-                    means[c] += x_test[[i, c]] as f64;
-                }
-            }
-            for m in means.iter_mut() {
-                *m /= n as f64;
-            }
-            let mut rss = 0.0f64;
-            let mut tss = 0.0f64;
-            for i in 0..n {
-                let row = x_test.row(i);
-                let active = scorer.route_row(row, decoder);
-                let code = solve_row_codes(row, decoder, &active, s, code_ridge);
-                let mut recon = vec![0.0f64; p];
-                for j in 0..code.indices.len() {
-                    let cj = code.codes[j] as f64;
-                    if cj == 0.0 {
-                        continue;
-                    }
-                    let drow = decoder.row(code.indices[j] as usize);
-                    for c in 0..p {
-                        recon[c] += cj * drow[c] as f64;
-                    }
-                }
-                for c in 0..p {
-                    let r = x_test[[i, c]] as f64 - recon[c];
-                    rss += r * r;
-                    let t = x_test[[i, c]] as f64 - means[c];
-                    tss += t * t;
-                }
-            }
-            if tss <= 1.0e-24 {
-                if rss <= 1.0e-24 { 1.0 } else { 0.0 }
-            } else {
-                1.0 - rss / tss
-            }
-        }
 
         // Planted 2-sparse mixture with modest noise (so REML has a real ridge to
         // select), deterministic 80/20 stride split.

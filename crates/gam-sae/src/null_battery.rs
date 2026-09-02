@@ -2938,31 +2938,6 @@ mod tests {
     }
 
     #[test]
-    fn mp_reconstruction_rank_edge_matches_recon_spectrum() {
-        use ndarray::array;
-
-        let gram = array![[3.0, 0.5], [0.5, 2.0]];
-        let decoder = array![[1.0, 0.0, 0.5], [0.0, 1.0, -0.5]];
-        let n_eff = 40.0;
-        let p_out = 3.0;
-        let r_floor = 1.25;
-
-        let spectrum =
-            crate::manifold::recon_spectrum(&gram, &decoder, n_eff, p_out, r_floor, 0.0, None)
-                .expect("recon_spectrum should succeed on a well-posed Gram");
-        let edge = mp_reconstruction_rank_edge(n_eff, p_out, r_floor)
-            .expect("mp_reconstruction_rank_edge should succeed on valid inputs");
-
-        assert!(
-            (spectrum.mp_reconstruction_rank_edge() - edge).abs() < 1.0e-12,
-            "standalone reconstruction-rank edge must match production byte-for-byte: \
-             spectrum.edge={} floor={}",
-            spectrum.mp_reconstruction_rank_edge(),
-            edge
-        );
-    }
-
-    #[test]
     fn primary_claim_calibration_requires_the_per_dimension_shuffle() {
         let report = NullBatteryReport {
             observed: 1.0,

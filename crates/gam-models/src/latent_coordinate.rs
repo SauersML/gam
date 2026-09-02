@@ -340,7 +340,7 @@ impl<E: StdError + 'static> LatentCoordinateOptimizationError<E> {
 
 #[cfg(test)]
 mod tests {
-    use ndarray::{Array1, ArrayView1, array};
+    use ndarray::{Array1, ArrayView1};
     use thiserror::Error;
 
     use super::*;

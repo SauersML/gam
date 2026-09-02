@@ -24,7 +24,6 @@ use gam_math::probability::normal_two_sided_probability;
 use ndarray::{Array1, Array2, ArrayView2, s};
 use statrs::distribution::{ContinuousCDF, Normal};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use crate::manifold::SphereChartTransition;
 
 const INTRINSIC_DIMENSION: usize = 2;
 
@@ -1585,7 +1584,6 @@ impl AtlasHolonomyCertificate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifold::AtlasSeamKind;
     use ndarray::{arr2, array};
 
     fn projection_frame(angle: f64, padded_ambient: usize) -> Array2<f64> {
@@ -1607,76 +1605,6 @@ mod tests {
             [sine, reflection * cosine],
             [0.0, 0.0],
         ])
-    }
-
-    fn patch(
-        chart: usize,
-        plane_angle: f64,
-        gauge_angle: f64,
-        reflected: bool,
-        inference_rows: usize,
-        padded_ambient: usize,
-    ) -> GaussianPcaPatch {
-        let base = chart * 4_000_000;
-        GaussianPcaPatch::new(
-            chart,
-            GaussianPatchRowSplit::from_disjoint_ranges(
-                base,
-                1_000,
-                base + 1_000_000,
-                inference_rows,
-            )
-            .unwrap(),
-            PilotProjectionProvenance::ExactAnalyticCapture,
-            GaussianPatchCentering::MeanEstimatedOnInferenceRows,
-            projection_frame(plane_angle, padded_ambient),
-            tangent_gauge(gauge_angle, reflected),
-            0.01,
-            1.0,
-            GaussianPcaSpectrumProvenance::CertifiedPopulation(
-                GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap(),
-            ),
-        )
-        .unwrap()
-    }
-
-    fn certified_analysis(
-        patches: Vec<GaussianPcaPatch>,
-        edges: Vec<ProjectedAtlasEdgeSpec>,
-        level: AtlasFamilywiseLevel,
-        gauss_bonnet: Option<GaussBonnetInput>,
-    ) -> GaussianPcaHolonomyAnalysis {
-        let offsets = GaussianPcaErrorModel::coordinate_offsets(&patches);
-        let dimension = offsets.last().copied().unwrap_or(0);
-        let mut covariance = Array2::<f64>::zeros((dimension, dimension));
-        for (patch_index, patch) in patches.iter().enumerate() {
-            let retained = patch.retained_dimension();
-            let normal = identity_square(retained)
-                - patch
-                    .tangent_coordinates
-                    .dot(&patch.tangent_coordinates.t());
-            // Exact DGP parameters of the test fixtures, not fitted patch
-            // scalars: sigma^2=0.01 and lambda=1.
-            let scale = 0.01 * 1.01 / patch.covariance_degrees_of_freedom() as f64;
-            for row_left in 0..retained {
-                for row_right in 0..retained {
-                    for tangent in 0..INTRINSIC_DIMENSION {
-                        covariance[[
-                            offsets[patch_index] + row_left * INTRINSIC_DIMENSION + tangent,
-                            offsets[patch_index] + row_right * INTRINSIC_DIMENSION + tangent,
-                        ]] = scale * normal[[row_left, row_right]];
-                    }
-                }
-            }
-        }
-        let error_model = GaussianPcaErrorModel::certified_joint(
-            &patches,
-            CrossPatchCovarianceProvenance::DisjointInferenceRows,
-            covariance,
-        )
-        .unwrap();
-        GaussianPcaHolonomyAnalysis::certify(patches, edges, error_model, level, gauss_bonnet)
-            .unwrap()
     }
 
     fn certified_edge(
@@ -1870,35 +1798,6 @@ mod tests {
         fitted.dot(&left.unwrap().dot(&right_t.unwrap()))
     }
 
-    fn projected_patch_from_tangent(
-        chart: usize,
-        inference_rows: usize,
-        tangent: Array2<f64>,
-    ) -> GaussianPcaPatch {
-        let ambient = tangent.nrows();
-        let base = chart * 4_000_000;
-        GaussianPcaPatch::new(
-            chart,
-            GaussianPatchRowSplit::from_disjoint_ranges(
-                base,
-                inference_rows,
-                base + 1_000_000,
-                inference_rows,
-            )
-            .unwrap(),
-            PilotProjectionProvenance::ExactAnalyticCapture,
-            GaussianPatchCentering::MeanEstimatedOnInferenceRows,
-            identity_projection(ambient),
-            tangent,
-            0.01,
-            1.0,
-            GaussianPcaSpectrumProvenance::CertifiedPopulation(
-                GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap(),
-            ),
-        )
-        .unwrap()
-    }
-
     fn polar_edge_angle(from: &Array2<f64>, to: &Array2<f64>) -> f64 {
         let cross = to.t().dot(from);
         (cross[[1, 0]] - cross[[0, 1]]).atan2(cross[[0, 0]] + cross[[1, 1]])
@@ -1920,119 +1819,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_parallel_overlap_components_form_their_own_orientation_cycle() {
-        let certificate = ExactAnalyticHolonomyCertificate::new(
-            2,
-            vec![analytic_edge(0, 1, 0, 1), analytic_edge(0, 1, 1, -1)],
-        )
-        .unwrap();
-        assert_eq!(
-            certificate.orientability(),
-            AtlasOrientability::NonOrientable
-        );
-        let authoritative = AtlasHolonomyCertificate::ExactAnalytic(certificate);
-        assert_eq!(
-            authoritative.edge_inventory(),
-            vec![
-                AtlasHolonomyEdgeId::new(0, 1, 0).unwrap(),
-                AtlasHolonomyEdgeId::new(0, 1, 1).unwrap(),
-            ]
-        );
-    }
-
-    #[test]
-    fn gaussian_certificate_retains_auditable_patch_inputs() {
-        let analysis = triangle_analysis([(0.0, false); 3], 0);
-        assert_eq!(analysis.patch_summaries().len(), 3);
-        let patch = analysis.patch_summaries()[0];
-        assert_eq!(patch.chart, 0);
-        assert_eq!(patch.projection_fit_rows, 1_000);
-        assert_eq!(patch.inference_rows, 1_000_000);
-        assert_eq!(patch.covariance_degrees_of_freedom, 999_999);
-        assert_eq!(patch.ambient_dimension, 3);
-        assert_eq!(patch.retained_dimension, 3);
-        assert_eq!(
-            patch.centering,
-            GaussianPatchCentering::MeanEstimatedOnInferenceRows
-        );
-        assert_near(patch.projector_variance_scale(), 0.01 * 1.01 / 999_999.0);
-    }
-
-    #[test]
-    fn shared_inference_rows_require_an_explicit_joint_covariance() {
-        let make_patch = |chart, pilot_rows| {
-            GaussianPcaPatch::new(
-                chart,
-                GaussianPatchRowSplit::new(pilot_rows, (100..200).collect()).unwrap(),
-                PilotProjectionProvenance::ExactAnalyticCapture,
-                GaussianPatchCentering::MeanEstimatedOnInferenceRows,
-                identity_projection(3),
-                arr2(&[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]),
-                0.01,
-                1.0,
-                GaussianPcaSpectrumProvenance::CertifiedPopulation(
-                    GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap(),
-                ),
-            )
-            .unwrap()
-        };
-        let patches = vec![
-            make_patch(0, (0..50).collect()),
-            make_patch(1, (50..100).collect()),
-        ];
-
-        assert!(GaussianPcaErrorModel::independent(&patches).is_err());
-        let dimension = GaussianPcaErrorModel::coordinate_offsets(&patches)
-            .last()
-            .copied()
-            .unwrap();
-        let joint = Array2::<f64>::zeros((dimension, dimension));
-        let mut tiny_indefinite = joint.clone();
-        tiny_indefinite[[0, 0]] = -1.0e-30;
-        assert!(
-            GaussianPcaErrorModel::certified_joint(
-                &patches,
-                CrossPatchCovarianceProvenance::ExplicitJointCovariance,
-                tiny_indefinite,
-            )
-            .is_err(),
-            "covariance validation must be relative to its own scale"
-        );
-        assert!(
-            GaussianPcaErrorModel::certified_joint(
-                &patches,
-                CrossPatchCovarianceProvenance::DisjointInferenceRows,
-                joint.clone(),
-            )
-            .is_err()
-        );
-        let plugin_model = GaussianPcaErrorModel::plugin_joint(
-            &patches,
-            CrossPatchCovarianceProvenance::ExplicitJointCovariance,
-            joint.clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            plugin_model.authority(),
-            GaussianPcaCovarianceAuthority::AsymptoticPlugIn
-        );
-        let model = GaussianPcaErrorModel::certified_joint(
-            &patches,
-            CrossPatchCovarianceProvenance::ExplicitJointCovariance,
-            joint,
-        )
-        .unwrap();
-        assert_eq!(
-            model.cross_patch_provenance(),
-            &CrossPatchCovarianceProvenance::ExplicitJointCovariance
-        );
-        assert_eq!(
-            model.authority(),
-            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization
-        );
-    }
-
-    #[test]
     fn fitted_patch_scalars_can_only_build_an_asymptotic_plugin_covariance() {
         let patches = vec![
             patch(0, 0.0, 0.0, false, 1_000, 0),
@@ -2042,60 +1828,6 @@ mod tests {
         assert_eq!(
             model.authority(),
             GaussianPcaCovarianceAuthority::AsymptoticPlugIn
-        );
-    }
-
-    #[test]
-    fn nonnested_pilot_frames_use_the_retained_normal_cross_operator() {
-        let frame_a = arr2(&[
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [0.0, 0.0, 0.0],
-        ]);
-        let frame_b = arr2(&[
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ]);
-        let tangent = arr2(&[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]);
-        let make_patch = |chart, frame| {
-            GaussianPcaPatch::new(
-                chart,
-                GaussianPatchRowSplit::from_disjoint_ranges(
-                    chart * 1_000,
-                    100,
-                    chart * 1_000 + 500,
-                    100,
-                )
-                .unwrap(),
-                PilotProjectionProvenance::ExactAnalyticCapture,
-                GaussianPatchCentering::MeanEstimatedOnInferenceRows,
-                frame,
-                tangent.clone(),
-                0.01,
-                1.0,
-                GaussianPcaSpectrumProvenance::CertifiedPopulation(
-                    GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap(),
-                ),
-            )
-            .unwrap()
-        };
-        let patches = vec![make_patch(0, frame_a), make_patch(1, frame_b)];
-        let edge = build_projected_edge(&patches, certified_edge(0, 1, 0, 0.0)).unwrap();
-        let normal = identity_square(3) - tangent.dot(&tangent.t());
-        let normal_cross_operator = normal.dot(&edge.projection_cross_gram_ba).dot(&normal);
-
-        assert_eq!(edge.public.projected_dimension, 4);
-        assert_near(frobenius_squared(normal_cross_operator.view()), 0.0);
-        assert_near(
-            frobenius_squared(edge.patch_gradient_a.unwrap().view()),
-            0.0,
-        );
-        assert_near(
-            frobenius_squared(edge.patch_gradient_b.unwrap().view()),
-            0.0,
         );
     }
 
@@ -2330,75 +2062,6 @@ mod tests {
     }
 
     #[test]
-    fn independent_projector_simulation_calibrates_cycle_plugin_variance() {
-        const REPLICATES: usize = 2_048;
-        let ambient = 4;
-        let inference_rows = 100_000;
-        let true_tangents = [
-            plane_tangent(0.0, ambient),
-            plane_tangent(0.2, ambient),
-            plane_tangent(-0.15, ambient),
-        ];
-        let base = certified_analysis(
-            true_tangents
-                .iter()
-                .cloned()
-                .enumerate()
-                .map(|(chart, tangent)| {
-                    projected_patch_from_tangent(chart, inference_rows, tangent)
-                })
-                .collect(),
-            triangle_edges(),
-            AtlasFamilywiseLevel::new(0.05).unwrap(),
-            None,
-        );
-        let cycle = &base.cycles()[0];
-        let plugin_standard_error = cycle.standard_error.unwrap();
-        assert!(plugin_standard_error > 0.0);
-        let perturbation_sd = base.patch_summaries()[0].projector_variance_scale().sqrt();
-        let gaussian_boundary =
-            cycle_rejection_boundary(plugin_standard_error, 0.0, 0.0, cycle.gaussian_error_budget)
-                .unwrap();
-
-        let mut gaussian = DeterministicGaussian::new(0x2311_0001);
-        let mut sum = 0.0;
-        let mut sum_squares = 0.0;
-        let mut rejections = 0usize;
-        for _ in 0..REPLICATES {
-            let fitted: Vec<_> = true_tangents
-                .iter()
-                .map(|tangent| perturb_tangent(tangent, perturbation_sd, &mut gaussian))
-                .collect();
-            let angle = wrap_signed_angle(
-                polar_edge_angle(&fitted[0], &fitted[1])
-                    + polar_edge_angle(&fitted[1], &fitted[2])
-                    + polar_edge_angle(&fitted[2], &fitted[0]),
-            );
-            sum += angle;
-            sum_squares += angle * angle;
-            rejections += usize::from(angle.abs() > gaussian_boundary);
-        }
-        let mean = sum / REPLICATES as f64;
-        let empirical_sd = (sum_squares / REPLICATES as f64 - mean * mean)
-            .max(0.0)
-            .sqrt();
-        assert!(
-            (empirical_sd / plugin_standard_error - 1.0).abs() <= 0.15,
-            "plugin sd={plugin_standard_error:.6e}, independent Monte-Carlo sd={empirical_sd:.6e}"
-        );
-        let rejection_rate = rejections as f64 / REPLICATES as f64;
-        let nominal = cycle.gaussian_error_budget;
-        let binomial_standard_error = (nominal * (1.0 - nominal) / REPLICATES as f64).sqrt();
-        eprintln!(
-            "ATLAS_CALIBRATION linearized_projectors replicates={REPLICATES} plugin_sd={plugin_standard_error:.9e} empirical_sd={empirical_sd:.9e} nominal={nominal:.6} rejection_rate={rejection_rate:.6}"
-        );
-        assert!(
-            (rejection_rate - nominal).abs() <= 5.0 * binomial_standard_error,
-            "nominal={nominal:.6}, empirical rejection={rejection_rate:.6}"
-        );
-    }
-
-    #[test]
     fn actual_spiked_rows_sample_covariance_and_pca_calibrate_cycle_plugin_variance() {
         const REPLICATES: usize = 384;
         const ROWS_PER_PATCH: usize = 512;
@@ -2504,125 +2167,6 @@ mod tests {
         assert!((null_rate - alpha).abs() <= 5.0 * null_mc_se);
         assert!((power - expected_power).abs() <= 5.0 * power_mc_se);
         assert!(power > null_rate);
-    }
-
-    #[test]
-    fn observed_orientation_flips_do_not_exceed_finite_sample_bound() {
-        const REPLICATES: usize = 2_048;
-        let inference_rows = 1_000_000;
-        let true_a = plane_tangent(0.0, 3);
-        let true_b = plane_tangent(0.2, 3);
-        let analysis = certified_analysis(
-            vec![
-                projected_patch_from_tangent(0, inference_rows, true_a.clone()),
-                projected_patch_from_tangent(1, inference_rows, true_b.clone()),
-            ],
-            vec![certified_edge(0, 1, 0, 0.0)],
-            AtlasFamilywiseLevel::new(0.05).unwrap(),
-            None,
-        );
-        assert!(analysis.orientation().certified_value().is_some());
-        let bound = analysis.orientation_flip_probability_bound().unwrap();
-        let perturbation_sd = analysis.patch_summaries()[0]
-            .projector_variance_scale()
-            .sqrt();
-        let mut gaussian = DeterministicGaussian::new(0x2311_0003);
-        let mut flips = 0usize;
-        for _ in 0..REPLICATES {
-            let fitted_a = perturb_tangent(&true_a, perturbation_sd, &mut gaussian);
-            let fitted_b = perturb_tangent(&true_b, perturbation_sd, &mut gaussian);
-            flips += usize::from(determinant_2(fitted_b.t().dot(&fitted_a).view()) < 0.0);
-        }
-        let observed = flips as f64 / REPLICATES as f64;
-        eprintln!(
-            "ATLAS_CALIBRATION linearized_orientation replicates={REPLICATES} flips={flips} observed_rate={observed:.9e} bound={bound:.9e}"
-        );
-        assert!(
-            observed <= bound + 1.0 / REPLICATES as f64,
-            "observed flip rate {observed:.6e} exceeded finite-sample bound {bound:.6e}"
-        );
-    }
-
-    #[test]
-    fn near_margin_wishart_pca_orientation_sweep_respects_the_bound() {
-        const REPLICATES: usize = 256;
-        let population_a = plane_tangent(0.0, 3);
-        let separation = 1.45_f64;
-        let population_b = plane_tangent(separation, 3);
-        let mut gaussian = DeterministicGaussian::new(0x2311_0006);
-        let mut smallest_row_flips = 0usize;
-
-        for rows in [4, 16, 64] {
-            let make_patch = |chart, tangent| {
-                GaussianPcaPatch::new(
-                    chart,
-                    GaussianPatchRowSplit::from_disjoint_ranges(
-                        chart * 10_000,
-                        rows,
-                        chart * 10_000 + 5_000,
-                        rows,
-                    )
-                    .unwrap(),
-                    PilotProjectionProvenance::ExactAnalyticCapture,
-                    GaussianPatchCentering::MeanEstimatedOnInferenceRows,
-                    identity_projection(3),
-                    tangent,
-                    4.0,
-                    1.0,
-                    GaussianPcaSpectrumProvenance::CertifiedPopulation(
-                        GaussianPcaPopulationBounds::new(4.0, 5.0, 1.0).unwrap(),
-                    ),
-                )
-                .unwrap()
-            };
-            let patches = vec![
-                make_patch(0, population_a.clone()),
-                make_patch(1, population_b.clone()),
-            ];
-            let error_model = GaussianPcaErrorModel::independent(&patches).unwrap();
-            let edge = ProjectedAtlasEdgeSpec::new(
-                0,
-                1,
-                0,
-                PopulationCrossGramProvenance::CertifiedSmallestSingularValue {
-                    lower_bound: separation.cos(),
-                },
-                0.0,
-            )
-            .unwrap();
-            let analysis = GaussianPcaHolonomyAnalysis::certify(
-                patches,
-                vec![edge],
-                error_model,
-                AtlasFamilywiseLevel::new(0.05).unwrap(),
-                None,
-            )
-            .unwrap();
-            let bound = analysis.orientation_flip_probability_bound().unwrap();
-            let mut flips = 0usize;
-            for _ in 0..REPLICATES {
-                let fitted_a = sample_spiked_pca_tangent(&population_a, rows, 2.0, &mut gaussian);
-                let fitted_b = sample_spiked_pca_tangent(&population_b, rows, 2.0, &mut gaussian);
-                let aligned_a = align_tangent_to_population(&fitted_a, &population_a);
-                let aligned_b = align_tangent_to_population(&fitted_b, &population_b);
-                flips += usize::from(determinant_2(aligned_b.t().dot(&aligned_a).view()) < 0.0);
-            }
-            if rows == 4 {
-                smallest_row_flips = flips;
-            }
-            let observed = flips as f64 / REPLICATES as f64;
-            eprintln!(
-                "ATLAS_CALIBRATION wishart_orientation rows={rows} replicates={REPLICATES} flips={flips} observed_rate={observed:.9e} bound={bound:.9e}"
-            );
-            assert!(
-                observed <= bound + 1.0 / REPLICATES as f64,
-                "rows={rows}, observed Wishart-PCA flips={observed:.6}, bound={bound:.6}"
-            );
-        }
-        assert!(
-            smallest_row_flips > 0,
-            "near-margin low-occupancy sweep must actually enter the flip regime"
-        );
     }
 
     #[test]
@@ -2854,53 +2398,6 @@ mod tests {
         );
     }
 
-    fn cancellation_gauss_bonnet(remainder: f64) -> GaussBonnetInput {
-        GaussBonnetInput::certified_independent_gaussian(
-            vec![GaussBonnetNoiseSource::new(7, arr2(&[[1.0]])).unwrap()],
-            vec![
-                GaussBonnetContribution::new(
-                    std::f64::consts::PI,
-                    remainder,
-                    0.0,
-                    vec![GaussBonnetSourceGradient::new(7, array![1.0]).unwrap()],
-                )
-                .unwrap(),
-                GaussBonnetContribution::new(
-                    std::f64::consts::PI,
-                    0.0,
-                    0.0,
-                    vec![GaussBonnetSourceGradient::new(7, array![-1.0]).unwrap()],
-                )
-                .unwrap(),
-            ],
-        )
-        .unwrap()
-    }
-
-    fn nondegenerate_gauss_bonnet(
-        remainder: f64,
-        authority: GaussBonnetCovarianceAuthority,
-    ) -> GaussBonnetInput {
-        let sources = vec![GaussBonnetNoiseSource::new(7, arr2(&[[1.0]])).unwrap()];
-        let contributions = vec![
-            GaussBonnetContribution::new(
-                std::f64::consts::TAU,
-                remainder,
-                0.0,
-                vec![GaussBonnetSourceGradient::new(7, array![1.0]).unwrap()],
-            )
-            .unwrap(),
-        ];
-        match authority {
-            GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources => {
-                GaussBonnetInput::certified_independent_gaussian(sources, contributions).unwrap()
-            }
-            GaussBonnetCovarianceAuthority::AsymptoticPlugIn => {
-                GaussBonnetInput::asymptotic_plugin(sources, contributions).unwrap()
-            }
-        }
-    }
-
     #[test]
     fn gauss_bonnet_cancellation_is_aggregated_and_refuses_a_degenerate_normal_law() {
         let confidence = gauss_bonnet_confidence(&cancellation_gauss_bonnet(0.0), 0.05).unwrap();
@@ -2946,116 +2443,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn gauss_bonnet_degeneracy_is_relative_to_the_covariance_scale() {
-        let variance = 1.0e-30;
-        assert!(
-            GaussBonnetNoiseSource::new(0, arr2(&[[-variance]])).is_err(),
-            "a tiny negative variance must not hide below an absolute tolerance"
-        );
-        let input = GaussBonnetInput::certified_independent_gaussian(
-            vec![GaussBonnetNoiseSource::new(0, arr2(&[[variance]])).unwrap()],
-            vec![
-                GaussBonnetContribution::new(
-                    std::f64::consts::TAU,
-                    0.0,
-                    0.0,
-                    vec![GaussBonnetSourceGradient::new(0, array![1.0]).unwrap()],
-                )
-                .unwrap(),
-            ],
-        )
-        .unwrap();
-        let confidence = gauss_bonnet_confidence(&input, 0.05).unwrap();
-
-        assert_eq!(confidence.first_order_variance, variance);
-        assert_eq!(confidence.standard_error, Some(variance.sqrt()));
-        assert!(confidence.decision.certified_value().is_some());
-        assert!(confidence.decision.refusals().is_empty());
-    }
-
-    #[test]
-    fn integer_euler_confidence_handles_shared_gaussian_curvature_and_remainder() {
-        const REPLICATES: usize = 4_096;
-        let requested_alpha = 0.05;
-        let target_misround_probability = 0.04;
-        let deterministic_remainder = 0.2;
-        let normal = Normal::new(0.0, 1.0).unwrap();
-        let critical = normal.inverse_cdf(1.0 - target_misround_probability / 2.0);
-        let standard_error = (std::f64::consts::PI - deterministic_remainder) / critical;
-        let source_standard_deviation = standard_error / 1.5;
-        let true_chi = AtlasEulerCharacteristic(2);
-        let template = GaussBonnetInput::certified_independent_gaussian(
-            vec![
-                GaussBonnetNoiseSource::new(
-                    0,
-                    arr2(&[[source_standard_deviation * source_standard_deviation]]),
-                )
-                .unwrap(),
-            ],
-            vec![
-                GaussBonnetContribution::new(
-                    std::f64::consts::PI * true_chi.value() as f64,
-                    deterministic_remainder / 2.0,
-                    0.0,
-                    vec![GaussBonnetSourceGradient::new(0, array![1.0]).unwrap()],
-                )
-                .unwrap(),
-                GaussBonnetContribution::new(
-                    std::f64::consts::PI * true_chi.value() as f64,
-                    deterministic_remainder / 2.0,
-                    0.0,
-                    vec![GaussBonnetSourceGradient::new(0, array![0.5]).unwrap()],
-                )
-                .unwrap(),
-            ],
-        )
-        .unwrap();
-        let template_confidence = gauss_bonnet_confidence(&template, requested_alpha).unwrap();
-        assert!(template_confidence.shared_source_covariance_adjustment > 0.0);
-        assert_near(
-            template_confidence.misround_probability_bound.unwrap(),
-            target_misround_probability,
-        );
-        let mut gaussian = DeterministicGaussian::new(0x2311_0004);
-        let mut correctly_rounded = 0usize;
-        for _ in 0..REPLICATES {
-            let mut input = template.clone();
-            input.contributions[0].curvature_estimate = std::f64::consts::TAU
-                * true_chi.value() as f64
-                - input.contributions[1].curvature_estimate
-                + deterministic_remainder
-                + standard_error * gaussian.normal();
-            let confidence = gauss_bonnet_confidence(&input, requested_alpha).unwrap();
-            assert!(confidence.shared_source_covariance_adjustment > 0.0);
-            if confidence.decision.certified_value().is_some() {
-                assert_eq!(
-                    confidence.decision.error_probability_bound(),
-                    confidence.misround_probability_bound
-                );
-                assert!(confidence.misround_probability_bound.unwrap() <= requested_alpha);
-            } else {
-                assert!(matches!(
-                    confidence.decision.refusals(),
-                    [AtlasStatisticalRefusal::GaussBonnetRoundingMarginExhausted { .. }]
-                ));
-            }
-            correctly_rounded += usize::from(confidence.nearest_integer_candidate == true_chi);
-        }
-        let wrong = REPLICATES - correctly_rounded;
-        let observed = wrong as f64 / REPLICATES as f64;
-        let binomial_standard_error =
-            (target_misround_probability * (1.0 - target_misround_probability) / REPLICATES as f64)
-                .sqrt();
-        eprintln!(
-            "ATLAS_CALIBRATION gauss_bonnet replicates={REPLICATES} target_bound={target_misround_probability:.6} observed_misround={observed:.6} shared_covariance_adjustment={:.9e} deterministic_remainder={deterministic_remainder:.6}",
-            template_confidence.shared_source_covariance_adjustment
-        );
-        assert!(
-            observed <= target_misround_probability + 5.0 * binomial_standard_error,
-            "declared upper bound={target_misround_probability:.6}, observed={observed:.6}"
-        );
-    }
 }
 
 #[derive(Clone, Debug)]

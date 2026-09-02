@@ -959,39 +959,6 @@ mod tests {
         }
     }
 
-    fn assert_transform_close(
-        lhs: &ScaleDeviationTransform,
-        rhs: &ScaleDeviationTransform,
-        tol: f64,
-    ) {
-        assert_eq!(lhs.non_intercept_start, rhs.non_intercept_start);
-        assert_matrix_close(
-            &lhs.projection_coef,
-            &rhs.projection_coef,
-            tol,
-            "projection coefficients",
-        );
-        assert_eq!(
-            lhs.weighted_column_mean.len(),
-            rhs.weighted_column_mean.len()
-        );
-        assert_eq!(lhs.rescale.len(), rhs.rescale.len());
-        for j in 0..lhs.weighted_column_mean.len() {
-            assert!(
-                (lhs.weighted_column_mean[j] - rhs.weighted_column_mean[j]).abs() <= tol,
-                "weighted column mean mismatch at {j}: {} vs {}",
-                lhs.weighted_column_mean[j],
-                rhs.weighted_column_mean[j]
-            );
-            assert!(
-                (lhs.rescale[j] - rhs.rescale[j]).abs() <= tol,
-                "rescale mismatch at {j}: {} vs {}",
-                lhs.rescale[j],
-                rhs.rescale[j]
-            );
-        }
-    }
-
     #[test]
     fn scale_deviation_operator_gram_preserves_signed_weights() {
         let primary = array![[1.0], [2.0], [-1.0], [0.5]];

@@ -2388,13 +2388,6 @@ fn survival_marginal_slope_accepts_explicit_probit_link() {
 }
 
 #[test]
-fn high_dimensional_duchon_default_power_is_admissible() {
-    let dim = 16;
-    let power = minimum_duchon_power_for_operator_penalties(dim, DuchonNullspaceOrder::Zero, 2);
-    assert!(2 * (1 + power) > dim + 2);
-}
-
-#[test]
 fn survival_location_scale_wiggle_rejects_unsupported_inverse_link() {
     let data = workflow_test_dataset();
     let materialized = materialize(

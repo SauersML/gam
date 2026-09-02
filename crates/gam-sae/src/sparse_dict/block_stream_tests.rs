@@ -65,51 +65,6 @@ fn planted_data(
     x
 }
 
-/// EV of a block model (frames + γ) over `x` via the public block encode/decode.
-fn model_ev(
-    x: ArrayView2<'_, f32>,
-    decoder: &Array2<f32>,
-    gamma: f32,
-    g: usize,
-    b: usize,
-    k: usize,
-) -> f64 {
-    let n = x.nrows();
-    let p = x.ncols();
-    let mut means = vec![0.0f64; p];
-    for i in 0..n {
-        for c in 0..p {
-            means[c] += x[[i, c]] as f64;
-        }
-    }
-    for m in means.iter_mut() {
-        *m /= n as f64;
-    }
-    let mut rss = 0.0f64;
-    let mut tss = 0.0f64;
-    for i in 0..n {
-        let row = x.row(i);
-        let w = block_projections_row(row, decoder.view(), g, b);
-        let gates = block_gates(w.view());
-        let sel: Vec<u32> = route_row_blocks(&gates, k)
-            .iter()
-            .map(|&(gg, _)| gg)
-            .collect();
-        let recon = reconstruct_row(row, decoder.view(), &sel, gamma, b);
-        for c in 0..p {
-            let r = x[[i, c]] as f64 - recon[c] as f64;
-            rss += r * r;
-            let t = x[[i, c]] as f64 - means[c];
-            tss += t * t;
-        }
-    }
-    if tss <= 1.0e-24 {
-        if rss <= 1.0e-24 { 1.0 } else { 0.0 }
-    } else {
-        1.0 - rss / tss
-    }
-}
-
 fn config(g: usize, b: usize, k: usize) -> BlockSparseConfig {
     BlockSparseConfig {
         n_blocks: g,

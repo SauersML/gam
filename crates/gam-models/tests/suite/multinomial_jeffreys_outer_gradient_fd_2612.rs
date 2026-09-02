@@ -95,35 +95,6 @@ struct Reading {
     hessian: Option<Array2<f64>>,
 }
 
-fn evaluate(armed: bool, rho: &Array1<f64>, mode: EvalMode) -> Reading {
-    let (design, response) = fixture();
-    let n = design.nrows();
-    let family = MultinomialFamily::new(
-        response,
-        Array1::<f64>::ones(n),
-        K,
-        Arc::new(design),
-        Arc::new(vec![penalty()]),
-    )
-    .expect("multinomial fixture is valid")
-    .with_joint_jeffreys_term(armed)
-    .with_joint_initial_log_lambdas(rho.to_vec());
-    let blocks = family.build_block_specs();
-    let diagnostics =
-        evaluate_labeled_outer_criterion_for_diagnostics(&family, &blocks, &options(), rho, mode)
-            .expect("the outer criterion evaluates at this rho");
-    assert!(
-        diagnostics.inner_converged,
-        "the inner solve must converge for the finite difference to price one criterion \
-         (armed={armed}, rho={rho:?})"
-    );
-    Reading {
-        value: diagnostics.objective,
-        gradient: diagnostics.gradient,
-        hessian: diagnostics.outer_hessian,
-    }
-}
-
 /// The rho this is taken at. Term-major over `K` per-class copies of the single
 /// smooth component; a moderate value so both the wiggliness and the null space
 /// are live and the inner solve converges from the default seed.

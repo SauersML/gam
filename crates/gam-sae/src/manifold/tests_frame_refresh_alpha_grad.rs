@@ -10,7 +10,6 @@
 //!   keeps the full-`B` border (frame activation is a no-op).
 
 use super::*;
-use approx::assert_abs_diff_eq;
 
 #[test]
 pub(crate) fn small_p_zero_decoder_stays_full_b() {

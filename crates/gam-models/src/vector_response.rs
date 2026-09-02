@@ -804,7 +804,7 @@ impl VectorLikelihood for MultinomialLogitLikelihood {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array1, Array2};
+    use ndarray::Array2;
 
     // Macro (not fn) so the assertion / panic tokens are inlined into each
     // caller's test body, satisfying the build.rs scanner that looks for

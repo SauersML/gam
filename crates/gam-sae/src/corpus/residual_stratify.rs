@@ -345,35 +345,10 @@ impl StratifiedCorpusTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::super::shard_reader::MmapShardSource;
     use super::*;
-    use gam_solve::row_sampling_measure::RowSamplingMeasure;
     use ndarray::{Array2, s};
     use std::io::Write;
     use std::path::PathBuf;
-
-    fn temp_shard_dir(name: &str, rows: &Array2<f64>, split_at: usize) -> PathBuf {
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "gam-residual-stratify-test-{}-{}",
-            std::process::id(),
-            name
-        ));
-        std::fs::create_dir_all(&dir).expect("create dir");
-        let n = rows.nrows();
-        let split = split_at.min(n);
-        let parts = [
-            ("a.shard", rows.slice(s![..split, ..])),
-            ("b.shard", rows.slice(s![split.., ..])),
-        ];
-        for (key, part) in parts {
-            let bytes = encode_shard_bytes(part);
-            let mut f = std::fs::File::create(dir.join(key)).expect("create shard");
-            f.write_all(&bytes).expect("write shard");
-            f.sync_all().expect("sync");
-        }
-        dir
-    }
 
     /// Orthonormal basis for the dominant span (first `k_dom` canonical axes).
     fn dominant_basis(p: usize, k_dom: usize) -> Array2<f64> {
