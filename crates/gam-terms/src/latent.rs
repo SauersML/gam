@@ -738,44 +738,6 @@ impl LatentManifold {
         out
     }
 
-    /// Project every column of an ambient matrix into `T_t M`.
-    pub fn project_matrix_columns_to_tangent(
-        &self,
-        t: ArrayView1<'_, f64>,
-        matrix: ArrayView2<'_, f64>,
-    ) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros(matrix.dim());
-        self.project_matrix_columns_to_tangent_into(t, matrix, out.view_mut());
-        out
-    }
-
-    /// In-place column-wise tangent projection: writes the projection of every
-    /// column of `matrix` into the matching column of `out`. Both `matrix` and
-    /// `out` must have shape `(ambient_dim × ncols)`. Callers that project the
-    /// same `(q × p)` scratch every row hoist `out` outside the loop to avoid
-    /// reallocating an `Array2` per row; the projection itself reuses the
-    /// allocation-free [`Self::project_to_tangent`] per column.
-    pub fn project_matrix_columns_to_tangent_into(
-        &self,
-        t: ArrayView1<'_, f64>,
-        matrix: ArrayView2<'_, f64>,
-        mut out: ndarray::ArrayViewMut2<'_, f64>,
-    ) {
-        assert_eq!(
-            matrix.dim(),
-            out.dim(),
-            "project_matrix_columns_to_tangent_into: matrix {:?} != out {:?}",
-            matrix.dim(),
-            out.dim(),
-        );
-        for col_idx in 0..matrix.ncols() {
-            let col = self.project_to_tangent(t, matrix.column(col_idx));
-            for row_idx in 0..matrix.nrows() {
-                out[[row_idx, col_idx]] = col[row_idx];
-            }
-        }
-    }
-
     fn add_normal_pinning(&self, t: ArrayView1<'_, f64>, matrix: &mut Array2<f64>) {
         match self {
             Self::Sphere { dim } => {
@@ -953,41 +915,6 @@ impl LatentCoordValues {
         };
         out.project_all_rows_to_manifold();
         out
-    }
-
-    /// Construct directly from a flat (`n_obs * latent_dim`) array.
-    pub fn from_flat(
-        values: Array1<f64>,
-        n_obs: usize,
-        latent_dim: usize,
-        id_mode: LatentIdMode,
-    ) -> Self {
-        Self::from_flat_with_manifold(
-            values,
-            n_obs,
-            latent_dim,
-            id_mode,
-            LatentManifold::Euclidean,
-        )
-    }
-
-    /// Construct directly from a flat array and explicit latent manifold.
-    pub fn from_flat_with_manifold(
-        values: Array1<f64>,
-        n_obs: usize,
-        latent_dim: usize,
-        id_mode: LatentIdMode,
-        manifold: LatentManifold,
-    ) -> Self {
-        Self::from_flat_with_manifold_and_retraction_and_id(
-            values,
-            n_obs,
-            latent_dim,
-            id_mode,
-            manifold,
-            LatentRetractionRegistry::all_euclidean(),
-            next_latent_coord_id(),
-        )
     }
 
     pub fn from_flat_with_manifold_and_retraction_and_id(
@@ -1215,19 +1142,6 @@ impl LatentCoordValues {
         }
     }
 
-    /// Apply this latent block back to a `TermCollectionSpec`-style covariate
-    /// table: returns the `(N, d)` materialized matrix that downstream basis
-    /// evaluators (Duchon, Matérn, ...) take as their feature input.
-    ///
-    /// This mirrors [`crate::smooth::SpatialLogKappaCoords::apply_tospec`],
-    /// but the carrier on the spec side is the data-row covariate block rather
-    /// than the per-term `length_scale`. The spec-mutation is handled at the
-    /// call site (the consuming term needs to know which columns of its
-    /// feature view to overwrite).
-    pub fn apply_tospec(&self) -> Array2<f64> {
-        self.as_matrix()
-    }
-
     /// Compute `∂Φ/∂t` for a radial-kernel design Φ — the original
     /// Duchon/Matérn path. See [`Self::design_gradient_wrt_t_dispatch`] for
     /// the basis-agnostic dispatch entry point.
@@ -1319,7 +1233,6 @@ impl LatentCoordValues {
         }
     }
 }
-
 
 fn wrap_to_period(x: f64, period: f64) -> f64 {
     assert!(

@@ -10,11 +10,6 @@ use super::*;
 pub(crate) static DUCHON_DESIGN_BUILD_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Current value of the Duchon design-build counter (test-support).
-pub fn duchon_design_build_count() -> usize {
-    DUCHON_DESIGN_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 pub(crate) fn duchon_coeff_exponents(p_order: usize, s_order: usize, m_or_n: usize) -> f64 {
     // In the partial fractions
     //   1 / (z^p (z + kappa^2)^s)
@@ -1471,72 +1466,10 @@ pub(crate) fn build_duchon_design_psi_derivativeswithworkspace(
     )
 }
 
-pub fn build_duchon_basis_log_kappa_derivative(
-    data: ArrayView2<'_, f64>,
-    spec: &DuchonBasisSpec,
-) -> Result<BasisPsiDerivativeResult, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    build_duchon_basis_log_kappa_derivativewithworkspace(data, spec, &mut workspace)
-}
-
-pub fn build_duchon_basis_log_kappa_derivativewithworkspace(
-    data: ArrayView2<'_, f64>,
-    spec: &DuchonBasisSpec,
-    workspace: &mut BasisWorkspace,
-) -> Result<BasisPsiDerivativeResult, BasisError> {
-    let mut bundle = build_duchon_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
-    bundle.first.implicit_operator = bundle.implicit_operator;
-    Ok(bundle.first)
-}
-
-pub fn build_duchon_basis_log_kappa_derivatives(
-    data: ArrayView2<'_, f64>,
-    spec: &DuchonBasisSpec,
-) -> Result<BasisPsiDerivativeBundle, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    build_duchon_basis_log_kappa_derivativeswithworkspace(data, spec, &mut workspace)
-}
-
 pub(crate) fn duchon_operator_penalties_requested(spec: &DuchonOperatorPenaltySpec) -> bool {
     matches!(spec.mass, OperatorPenaltySpec::Active { .. })
         || matches!(spec.tension, OperatorPenaltySpec::Active { .. })
         || matches!(spec.stiffness, OperatorPenaltySpec::Active { .. })
-}
-
-pub fn build_duchon_basis_log_kappa_derivativeswithworkspace(
-    data: ArrayView2<'_, f64>,
-    spec: &DuchonBasisSpec,
-    workspace: &mut BasisWorkspace,
-) -> Result<BasisPsiDerivativeBundle, BasisError> {
-    if spec.periodic.is_some() {
-        return build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
-            data, spec, workspace,
-        );
-    }
-    // #2638: resolve the chart the forward would build — realized centers,
-    // effective null-space order, seeded anisotropy, adopted data-metric
-    // reparam `V`, and the identifiability transform read off the `V`-rotated
-    // design — and hand the RESOLVED spec to every sub-builder below. Passing
-    // the caller's `spec` here is what let the ψ-jet assemble in the raw `Z`
-    // frame while `build_duchon_basis(data, spec)` shipped `Z·V`.
-    let chart = prepare_duchon_derivative_contextwithworkspace(data, spec, workspace)?;
-    let operator_collocation_points =
-        if duchon_operator_penalties_requested(&chart.spec.operator_penalties) {
-            let m = (DUCHON_COLLOCATION_OVERSAMPLE * chart.centers.nrows()).min(data.nrows());
-            Some(select_thin_plate_knots(data, m)?)
-        } else {
-            None
-        };
-    build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
-        data,
-        &chart.spec,
-        chart.centers.view(),
-        chart.identifiability_transform.as_ref(),
-        operator_collocation_points
-            .as_ref()
-            .map(|points| points.view()),
-        workspace,
-    )
 }
 
 /// Per-axis ψ derivatives of a hybrid Duchon basis — the anisotropic sibling of
@@ -1771,24 +1704,6 @@ pub fn build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
         },
         implicit_operator: design_derivatives.implicit_operator,
     })
-}
-
-pub fn build_duchon_basis_log_kappasecond_derivative(
-    data: ArrayView2<'_, f64>,
-    spec: &DuchonBasisSpec,
-) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    build_duchon_basis_log_kappasecond_derivativewithworkspace(data, spec, &mut workspace)
-}
-
-pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
-    data: ArrayView2<'_, f64>,
-    spec: &DuchonBasisSpec,
-    workspace: &mut BasisWorkspace,
-) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    let mut bundle = build_duchon_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
-    bundle.second.implicit_operator = bundle.implicit_operator;
-    Ok(bundle.second)
 }
 
 /// Multiplicative amplification factor that lifts an underflowing Duchon

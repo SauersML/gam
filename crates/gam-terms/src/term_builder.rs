@@ -4597,10 +4597,6 @@ fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset) -> Vec<usize> {
     k_list
 }
 
-pub fn heuristic_centers(n: usize, d: usize) -> usize {
-    default_num_centers(n, d)
-}
-
 // ---------------------------------------------------------------------------
 // Smooth option parsers
 // ---------------------------------------------------------------------------
@@ -5789,18 +5785,6 @@ pub fn parse_duchon_power_policy(
             Ok(DuchonPowerPolicy::Explicit(value))
         }
         None => Ok(DuchonPowerPolicy::CubicStructuralDefault),
-    }
-}
-
-pub fn parse_duchon_power(options: &BTreeMap<String, String>) -> Result<f64, String> {
-    match parse_duchon_power_policy(options)? {
-        DuchonPowerPolicy::Explicit(power) => Ok(power),
-        // Context-free placeholder: the bare option parser has no column count,
-        // so it cannot compute the dimension-aware cubic power `s = (d − 1)/2`.
-        // The dimension-aware resolution happens later in `build_smooth_basis`;
-        // this 1.5 is only a stand-in for callers that need a concrete number
-        // without data context (e.g. round-trip parser tests).
-        DuchonPowerPolicy::CubicStructuralDefault => Ok(1.5),
     }
 }
 

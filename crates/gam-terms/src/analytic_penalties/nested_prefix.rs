@@ -314,17 +314,4 @@ impl AnalyticPenalty for NestedPrefixPenalty {
         "nested_prefix"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        if let Some(schedule) = self.weight_schedule.as_mut() {
-            let prev = schedule.current_weight(schedule.iter_count);
-            let next = schedule.current_weight(iter);
-            if prev > 0.0 {
-                let ratio = next / prev;
-                for w in &mut self.shell_weights {
-                    *w *= ratio;
-                }
-            }
-            schedule.iter_count = iter + 1;
-        }
-    }
 }

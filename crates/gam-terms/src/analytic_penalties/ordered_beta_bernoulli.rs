@@ -657,13 +657,6 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
         "ordered_beta_bernoulli"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        if let Some(schedule) = self.temperature_schedule.as_mut() {
-            self.tau = schedule.current_tau(iter);
-            schedule.iter_count = iter + 1;
-        }
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
 }
 
 // `ψ₁` and `ψ₂` come from the workspace's single polygamma implementation. The
