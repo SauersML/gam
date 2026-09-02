@@ -46,7 +46,7 @@
 //! (`γ` pinned at 0 with collapsed effective range ⇒ a "not a smooth 1-D
 //! topology" diagnostic handed to the mixture rung).
 
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array2, ArrayView1};
 use wide::f64x4;
 
 /// The continuous closure family on the window `[0, window]`.
@@ -250,15 +250,6 @@ pub struct ClosureProfileCi {
     pub ci_includes_interval: bool,
     /// γ̂ pinned at the singular cluster boundary — hand to the mixture rung.
     pub singular_boundary: bool,
-}
-
-/// χ²₁ quantile at the requested two-sided coverage `level` (e.g. 0.95).
-///
-/// `χ²₁(p) = (Φ⁻¹((1+p)/2))²`; we use the Acklam rational inverse-normal so the
-/// CI driver carries no external dependency.
-fn chi2_1_quantile(level: f64) -> f64 {
-    let z = inv_std_normal(0.5 * (1.0 + level));
-    z * z
 }
 
 /// Acklam's rational approximation to the inverse standard-normal CDF, refined

@@ -27,10 +27,6 @@
 //! tests declined to run, so "37 passed" can no longer hide "37 verified
 //! nothing".
 use crate::device_runtime::GpuRuntime;
-use crate::{GpuPolicy, global_policy};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static SKIPPED_FOR_ABSENT_DEVICE: AtomicU64 = AtomicU64::new(0);
 
 /// The one line a skipped GPU test prints, and the one string a CI ledger step
 /// has to grep for.

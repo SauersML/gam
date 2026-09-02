@@ -1,5 +1,4 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use opt::{BacktrackConfig, armijo_roundoff_cushion, backtracking_line_search};
 
 use crate::manifold::{
     GeometryError, GeometryResult, RiemannianManifold, check_len, cholesky_spd, dot, flatten,
