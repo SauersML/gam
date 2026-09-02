@@ -15,6 +15,7 @@
 
 pub mod base;
 pub mod construction;
+pub use construction::*;
 pub mod latent;
 pub mod location_scale;
 pub mod lognormal_kernel;
@@ -26,7 +27,6 @@ pub mod surface;
 pub(crate) mod time_constraints;
 
 pub use base::*;
-pub use construction::*;
 pub use latent::*;
 pub use location_scale::*;
 pub use lognormal_kernel::*;

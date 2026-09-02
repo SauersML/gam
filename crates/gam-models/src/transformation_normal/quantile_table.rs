@@ -180,13 +180,6 @@ impl CtnTransformTable {
         self.h.view()
     }
 
-    /// `(h'(y_lo | x_i), h'(y_hi | x_i))` — the slopes of row `i`'s two affine
-    /// tails, which are just the end columns of the derivative table.
-    pub fn tail_slopes(&self, row: usize) -> (f64, f64) {
-        let last = self.grid_y.len() - 1;
-        (self.h_prime[[row, 0]], self.h_prime[[row, last]])
-    }
-
     /// `h(y | x_row)` — the tabulated transform itself, by the same rule
     /// [`CtnTransformTable::invert`] inverts.
     ///

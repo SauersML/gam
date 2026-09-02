@@ -2124,23 +2124,6 @@ impl BinomialLocationScaleFamily {
         Ok(out)
     }
 
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
-    ///
-    /// The two-output map is (η_threshold, η_log_sigma):
-    /// - block 0 (threshold):  output 0 = design rows, output 1 = zeros
-    /// - block 1 (log_sigma):  output 0 = zeros, output 1 = design rows
-    pub fn block_effective_jacobian(
-        specs: &[ParameterBlockSpec],
-        block_idx: usize,
-    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-        crate::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
-            family: "BinomialLocationScaleFamily",
-            n_outputs: 2,
-            additive_blocks: &[Self::BLOCK_T, Self::BLOCK_LOG_SIGMA],
-            wiggle_block: None,
-        }
-        .block_effective_jacobian(specs, block_idx)
-    }
 }
 
 impl CustomFamily for BinomialLocationScaleFamily {

@@ -340,9 +340,6 @@ pub struct SurvivalLocationScaleFitResult {
 }
 
 impl SurvivalLocationScaleFitResult {
-    pub fn inverse_link_outer(&self) -> Option<&gam_solve::rho_optimizer::CertifiedOuterResult> {
-        self.inverse_link_outer.as_ref()
-    }
 }
 
 pub struct SurvivalTransformationFitResult {

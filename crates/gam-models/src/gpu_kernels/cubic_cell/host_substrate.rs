@@ -21,16 +21,6 @@ use crate::gpu_kernels::cubic_cell::{
     CubicCellDerivativeMomentHostView, MAX_SUPPORTED_DEGREE,
 };
 
-fn validate_host_view(view: &CubicCellDerivativeMomentHostView<'_>) -> Result<(), String> {
-    if view.max_degree > MAX_SUPPORTED_DEGREE {
-        return Err(format!(
-            "host cubic-cell oracle: max_degree={} exceeds MAX_SUPPORTED_DEGREE={}",
-            view.max_degree, MAX_SUPPORTED_DEGREE
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::validate_host_view;

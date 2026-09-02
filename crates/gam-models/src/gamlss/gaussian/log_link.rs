@@ -228,26 +228,11 @@ impl CustomFamily for PoissonLogFamily {
     // Preserve the pre-gam#1395 behavior: the trait default flipped to OFF (the
     // flat-prior exact-Newton objective carries no Jeffreys term), so families
     // that historically armed the term by default opt back in explicitly.
-    fn joint_jeffreys_term_required(&self) -> bool {
-        true
-    }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         evaluate_log_link_diagonal_irls(self, block_states)
     }
 
-    fn exact_newton_joint_gradient_evaluation(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        // Assemble the exact score from the IRLS working set (X_bᵀ(w⊙(z−η))),
-        // the same source of truth the inner joint-Newton RHS uses. For the
-        // canonical Poisson log link observed = Fisher, so this is the exact
-        // observed gradient (matches FD of the log-likelihood).
-        let eval = self.evaluate(block_states)?;
-        gamlss_joint_gradient_from_working_sets(&eval, specs, block_states).map(Some)
-    }
 }
 
 impl CustomFamilyGenerative for PoissonLogFamily {
@@ -405,98 +390,11 @@ impl CustomFamily for GammaLogFamily {
     // Preserve the pre-gam#1395 behavior: the trait default flipped to OFF (the
     // flat-prior exact-Newton objective carries no Jeffreys term), so families
     // that historically armed the term by default opt back in explicitly.
-    fn joint_jeffreys_term_required(&self) -> bool {
-        true
-    }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         evaluate_log_link_diagonal_irls(self, block_states)
     }
 
-    fn exact_newton_joint_gradient_evaluation(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        // Assemble the exact score from the IRLS working set (X_bᵀ(w⊙(z−η))).
-        // The Gamma log link is non-canonical, but the working step z is defined
-        // relative to the row weight so w(z−η) is the exact observed ∂ℓ/∂η
-        // regardless — the assembled gradient matches FD of the log-likelihood.
-        let eval = self.evaluate(block_states)?;
-        gamlss_joint_gradient_from_working_sets(&eval, specs, block_states).map(Some)
-    }
-
-    fn diagonalworking_weights_directional_derivative(
-        &self,
-        block_states: &[ParameterBlockState],
-        block_idx: usize,
-        d_eta: &Array1<f64>,
-    ) -> Result<Option<Array1<f64>>, String> {
-        if block_idx != Self::BLOCK_ETA {
-            return Ok(None);
-        }
-        let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
-        let n = self.y.len();
-        if eta.len() != n || self.weights.len() != n || d_eta.len() != n {
-            return Err(GamlssError::DimensionMismatch {
-                reason: "GammaLogFamily input size mismatch".to_string(),
-            }
-            .into());
-        }
-        if !self.shape.is_finite() || self.shape <= 0.0 {
-            return Err(GamlssError::NonFinite {
-                reason: "GammaLogFamily shape must be finite and > 0".to_string(),
-            }
-            .into());
-        }
-
-        let mut values = Vec::with_capacity(n);
-        for i in 0..n {
-            let yi = self.y[i];
-            if !yi.is_finite() || yi <= 0.0 {
-                return Err(GamlssError::InvalidInput {
-                    reason: format!("GammaLogFamily requires positive finite y; found y[{i}]={yi}"),
-                }
-                .into());
-            }
-            let e = eta[i];
-            if !e.is_finite() || !d_eta[i].is_finite() {
-                return Err(GamlssError::NonFinite {
-                    reason: format!(
-                        "GammaLogFamily directional geometry requires finite eta and direction at row {i}"
-                    ),
-                }
-                .into());
-            }
-            let prior_w = self.weights[i];
-            if !prior_w.is_finite() || prior_w < 0.0 {
-                return Err(GamlssError::InvalidInput {
-                    reason: format!(
-                        "GammaLogFamily requires finite non-negative prior weights; found weight[{i}]={prior_w}"
-                    ),
-                }
-                .into());
-            }
-            if prior_w == 0.0 {
-                values.push(0.0);
-                continue;
-            }
-            let row = self.row_kernel(i, yi, e, prior_w)?;
-            let observed_weight = row.observed_weight;
-            // d/dη [prior_weight * shape * y / exp(η)] = -W_obs.
-            let derivative = -observed_weight * d_eta[i];
-            if !derivative.is_finite() {
-                return Err(row_geometry_error(
-                    i,
-                    "Gamma observed-information directional derivative",
-                    e,
-                    derivative,
-                ));
-            }
-            values.push(derivative);
-        }
-        Ok(Some(Array1::from_vec(values)))
-    }
 }
 
 impl CustomFamilyGenerative for GammaLogFamily {
