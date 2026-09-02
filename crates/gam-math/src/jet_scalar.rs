@@ -1556,13 +1556,6 @@ impl DynamicOrder2<'_> {
         self.h
     }
 
-    /// Hessian entry `(row, col)`.
-    #[inline]
-    #[must_use]
-    pub fn h_at(&self, row: usize, col: usize) -> f64 {
-        self.h[row * self.dimension() + col]
-    }
-
     #[inline(always)]
     fn assert_compatible(&self, o: &Self) {
         assert_eq!(
@@ -3134,23 +3127,6 @@ pub trait HessianPattern<const K: usize, const H: usize> {
     const PAIR_BITS: [[u128; K]; K];
 }
 
-/// Build the symmetric axis-pair → patterned-slot lookup used by dependency
-/// propagation in [`PatternedOrder2`].
-pub const fn hessian_pair_bits<const K: usize, const H: usize>(
-    pairs: [(usize, usize); H],
-) -> [[u128; K]; K] {
-    let mut table = [[0u128; K]; K];
-    let mut slot = 0;
-    while slot < H {
-        let (i, j) = pairs[slot];
-        let bit = 1u128 << slot;
-        table[i][j] = bit;
-        table[j][i] = bit;
-        slot += 1;
-    }
-    table
-}
-
 /// Exact order-two jet with a dense gradient and a compile-time patterned
 /// upper-triangle Hessian.
 ///
@@ -3721,11 +3697,6 @@ impl<const K: usize> crate::nested_dual::JetField for Order2<K> {
         // every gradient/Hessian channel by an exact zero; skip the K + K²
         // multiply-adds and construct the constant. (#932)
         <Self as JetScalar<K>>::constant(v)
-    }
-    fn with_value(&self, v: f64) -> Self {
-        let mut out = *self;
-        out.0.v = v;
-        out
     }
 }
 
@@ -4718,14 +4689,6 @@ impl<const K: usize> crate::nested_dual::JetField for OneSeed<K> {
             eps: self.eps.constant_like(0.0),
         }
     }
-    fn with_value(&self, v: f64) -> Self {
-        // The real value channel is the base part's; the ε part carries no
-        // value of its own.
-        OneSeed {
-            base: self.base.with_value(v),
-            eps: self.eps,
-        }
-    }
 }
 
 // ── OneSeedLane<L, K>: lane-batched one-seed directional (doc §A.2) ──────
@@ -4968,16 +4931,6 @@ impl<L: Lane, const K: usize> OneSeedLane<L, K> {
         self.compose_unary(d)
     }
 
-    /// `ψ(self)` digamma; caller guarantees positivity (matches
-    /// [`JetScalar::digamma`], same hand-certified stack).
-    #[inline]
-    pub fn digamma(&self) -> Self {
-        let d = self
-            .base
-            .v
-            .unary5(crate::jet_tower::digamma_derivative_stack);
-        self.compose_unary(d)
-    }
 }
 
 impl<const K: usize> OneSeedBatch<K> {
@@ -5384,16 +5337,6 @@ impl<L: Lane, const K: usize> TwoSeedLane<L, K> {
         self.compose_unary(d)
     }
 
-    /// `ψ(self)` digamma; caller guarantees positivity (matches
-    /// [`JetScalar::digamma`]).
-    #[inline]
-    pub fn digamma(&self) -> Self {
-        let d = self
-            .base
-            .v
-            .unary5(crate::jet_tower::digamma_derivative_stack);
-        self.compose_unary(d)
-    }
 }
 
 impl<const K: usize> TwoSeedBatch<K> {

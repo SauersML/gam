@@ -201,11 +201,6 @@ impl ContractFeasibleStep {
         blocking_scaled_drift: 0.0,
     };
 
-    /// True when a row drove the fraction to exactly zero — the direction is
-    /// blocked by an active face and needs a projection, not a shorter step.
-    pub fn is_blocked_by_active_face(&self) -> bool {
-        self.fraction == 0.0
-    }
 }
 
 /// Why the contract-feasible ratio test could not answer.
@@ -678,52 +673,6 @@ impl ConstraintSet {
         }
     }
 
-    /// The coefficient (β) columns that constraint row `row` acts on, ascending
-    /// and in the JOINT column space of this set — the one and only sanctioned
-    /// route from constraint-row space to coefficient space.
-    ///
-    /// Needed because the two spaces are genuinely different (see
-    /// [`ConstraintRowId`]): a consumer building a free/pinned β mask from a
-    /// reduced face has row ids in hand and coefficient positions to fill, and
-    /// the identity map between them is valid only for a square box carrier.
-    /// The block-diagonal arm is where it visibly fails — row ids advance by
-    /// each member's `nrows()` while columns advance by its `ncols()`, so the
-    /// two run at different rates the moment any member constrains fewer rows
-    /// than it has coefficients.
-    pub fn row_column_support(&self, row: ConstraintRowId) -> Result<Vec<usize>, String> {
-        let row = row.index();
-        match self {
-            ConstraintSet::Dense(dense) => {
-                if row >= dense.a.nrows() {
-                    return Err(format!(
-                        "ConstraintSet: row {row} out of range ({} rows)",
-                        dense.a.nrows()
-                    ));
-                }
-                Ok(dense
-                    .a
-                    .row(row)
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, value)| **value != 0.0)
-                    .map(|(col, _)| col)
-                    .collect())
-            }
-            ConstraintSet::KhatriRaoCone(cone) => cone.row_column_support(row),
-            ConstraintSet::BlockDiagonal { blocks, .. } => {
-                let (block, local) = Self::block_for_row(blocks, row)?;
-                // The member reports support in ITS OWN column space; the joint
-                // offset is the block's `col_start`, which is independent of the
-                // row offset used to reach `local`.
-                let mut cols = block.set.row_column_support(ConstraintRowId(local))?;
-                for col in &mut cols {
-                    *col += block.col_start;
-                }
-                Ok(cols)
-            }
-        }
-    }
-
     /// The same constraint system expressed in delta coordinates around
     /// `beta`: `A(β + δ) ≥ b  ⇔  Aδ ≥ b − Aβ`. The matrix carrier is shared;
     /// only the `O(nrows)` bounds change.
@@ -890,63 +839,6 @@ impl ConstraintSet {
             }
         }
         Ok((step, blocking))
-    }
-
-    /// Fraction-to-boundary limit denominated in the SAME metric and at the
-    /// SAME tolerance as the primal-feasibility contract
-    /// ([`PRIMAL_FEASIBILITY_TOL`]) — the globalization ratio test.
-    ///
-    /// The rule, per non-vacuous row, on scaled slack `s = (a·β − b)/‖a‖` and
-    /// scaled drift `d = (a·δ)/‖a‖`:
-    ///
-    /// * `s < −tol` — the current iterate is infeasible. There is no feasible
-    ///   origin to step from; report it
-    ///   ([`ContractFeasibleStepError::InfeasibleIterate`]) rather than
-    ///   returning a meaningless fraction.
-    /// * `d ≥ 0` — the row cannot block; a step along `δ` only increases slack.
-    /// * `s + d ≥ −tol` — the WHOLE step lands inside the feasibility band.
-    ///   The row does not limit it. This is the clause that
-    ///   [`max_feasible_step`](Self::max_feasible_step) lacks, and its absence
-    ///   is gam#2719: with `s == 0` the exact rule returns `0` for a drift of
-    ///   `−1e-15`, refusing a step whose endpoint the very same carrier calls
-    ///   feasible.
-    /// * otherwise — the row genuinely blocks. Limit at the TRUE boundary,
-    ///   `max(s, 0) / (−d)`, not at the band edge: aiming at `−tol` every step
-    ///   would walk the iterate to the edge of the contract and leave it there.
-    ///
-    /// The returned fraction is therefore never larger than the exact ratio
-    /// test's answer EXCEPT on steps whose whole excursion is sub-tolerance,
-    /// and the worst violation any accepted step can introduce is `tol` — the
-    /// contract, exactly.
-    ///
-    /// A fraction of `0.0` is an answer, not a failure: see
-    /// [`ContractFeasibleStep::is_blocked_by_active_face`].
-    pub fn max_contract_feasible_step(
-        &self,
-        beta: ArrayView1<'_, f64>,
-        direction: ArrayView1<'_, f64>,
-    ) -> Result<ContractFeasibleStep, ContractFeasibleStepError> {
-        if beta.len() != self.ncols() || direction.len() != self.ncols() {
-            return Err(ContractFeasibleStepError::Dimension {
-                beta: beta.len(),
-                direction: direction.len(),
-                expected: self.ncols(),
-            });
-        }
-        let values = self
-            .values(beta)
-            .map_err(ContractFeasibleStepError::Carrier)?;
-        // The constraint functional is linear, so its value at `δ` IS the
-        // directional derivative `Aδ`; the bounds do not enter.
-        let directional = self
-            .values(direction)
-            .map_err(ContractFeasibleStepError::Carrier)?;
-        contract_feasible_step_over_rows(
-            &values,
-            &directional,
-            |row| self.bound(row),
-            |row| self.row_norm(row),
-        )
     }
 
     /// Materialize the requested rows densely (KKT systems on the active set).

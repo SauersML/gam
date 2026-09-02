@@ -647,69 +647,6 @@ impl ProjectedFactorCache {
         self.len() == 0
     }
 
-    /// Test/diagnostic affordance: block until a consumer has subscribed to the
-    /// in-progress slot for `key` (i.e. is waiting on the producer), or until
-    /// `timeout` elapses. Returns `true` if a subscriber arrived, `false` if the
-    /// key has no in-progress slot or the wait timed out.
-    ///
-    /// This lives on the cache because it reaches into the per-key subscriber
-    /// condvar and waiter counter, which are private synchronization internals;
-    /// exposing it as a method keeps those fields encapsulated while still
-    /// letting downstream tests deterministically order producer/consumer
-    /// interleavings.
-    pub fn wait_for_subscriber(
-        &self,
-        key: ProjectedFactorKey,
-        timeout: std::time::Duration,
-    ) -> bool {
-        let marker = {
-            let inner = self
-                .inner
-                .lock()
-                .expect("projected factor cache lock poisoned");
-            let Some(m) = inner.in_progress.get(&key) else {
-                return false;
-            };
-            Arc::clone(m)
-        };
-        if marker
-            .waiter_count
-            .load(std::sync::atomic::Ordering::Acquire)
-            > 0
-        {
-            return true;
-        }
-        let (lock, cv) = &marker.subscriber_arrived;
-        let mut guard = lock
-            .lock()
-            .expect("subscriber-arrived notification lock poisoned");
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if marker
-                .waiter_count
-                .load(std::sync::atomic::Ordering::Acquire)
-                > 0
-            {
-                return true;
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let (next_guard, result) = cv
-                .wait_timeout(guard, deadline - now)
-                .expect("subscriber-arrived wait poisoned");
-            guard = next_guard;
-            if result.timed_out()
-                && marker
-                    .waiter_count
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    == 0
-            {
-                return false;
-            }
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -920,10 +857,6 @@ impl HyperCoordDrift {
             }),
             operator,
         }
-    }
-
-    pub fn has_operator(&self) -> bool {
-        self.operator.is_some()
     }
 
     pub fn uses_operator_fast_path(&self) -> bool {

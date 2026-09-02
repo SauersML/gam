@@ -261,7 +261,6 @@ pub trait CustomFamily {
         self.log_likelihood_only(block_states)
     }
 
-
     /// Selects the outer objective semantics for exact-Newton families.
     ///
     /// `RidgedQuadraticReml` is the explicit ridged surrogate REML surface:

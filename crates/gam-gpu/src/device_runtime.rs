@@ -352,45 +352,6 @@ impl GpuRuntime {
         })
     }
 
-    /// Number of times [`Self::availability`] has been entered process-wide.
-    ///
-    /// Test-facing instrumentation for the laziness contract: a size-gated
-    /// caller that returns before resolving availability leaves this unchanged, so
-    /// a test can assert a CPU-sized decision path created no CUDA context. This
-    /// is a monotone call counter, NOT a probe-success flag.
-    #[must_use]
-    pub fn resolution_call_count() -> u64 {
-        RESOLUTION_CALLS.load(Ordering::Relaxed)
-    }
-
-    /// Size-gated [`Self::resolve`]: resolve the process-wide runtime only when the
-    /// estimated dense arithmetic `work_flops` clears the GPU-dispatch flop floor.
-    ///
-    /// This is the ordering fix for the CUDA startup tax. For a CPU-sized problem
-    /// (`work_flops` below the floor) it returns `Ok(None)` without calling
-    /// [`Self::resolve`], so the device probe — and the `cuDevicePrimaryCtxRetain`
-    /// primary-context creation it performs on every GPU — never runs. The
-    /// problem-size decision therefore strictly precedes any driver contact, and
-    /// a CPU-sized fit pays ZERO CUDA cost.
-    ///
-    /// The floor is [`GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS`] — the
-    /// smallest `gemm_min_flops` ANY reachable policy (default seed or
-    /// device-calibrated) can carry, known WITHOUT a device — so the gate never
-    /// needs a probe to decide it should not probe, and refusing below it can
-    /// never block work that any policy would have dispatched. Work at or above
-    /// the floor falls through to the identical lossless resolution path (where
-    /// the real, possibly calibrated policy still gates each op), so device
-    /// behaviour for genuinely GPU-sized problems is unchanged.
-    pub fn resolve_if_dense_work_exceeds_floor(
-        policy: super::GpuPolicy,
-        work_flops: u128,
-    ) -> Result<Option<&'static Self>, GpuError> {
-        if work_flops < GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS {
-            return Ok(None);
-        }
-        Self::resolve(policy)
-    }
-
     /// Size-gated [`Self::resolve`] for independent fused row kernels.
     ///
     /// Batches below

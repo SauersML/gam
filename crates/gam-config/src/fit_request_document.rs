@@ -47,12 +47,6 @@ impl FitRequestDocument {
         Ok(document)
     }
 
-    pub fn to_canonical_json(&self) -> Result<String, String> {
-        self.validate()?;
-        serde_json::to_string(self)
-            .map_err(|error| format!("failed to serialize fit request document: {error}"))
-    }
-
     fn validate(&self) -> Result<(), String> {
         if self.schema != FIT_REQUEST_SCHEMA {
             return Err(format!(

@@ -14,10 +14,6 @@
 //! `super::linalg` falls back to the CPU fast path without disturbing
 //! numerics.
 
-pub fn blas_backend_status() -> Result<super::CudaBackendStatus, super::GpuError> {
-    super::cuda_backend_status()
-}
-
 #[cfg(target_os = "linux")]
 mod cuda_impl {
     use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};

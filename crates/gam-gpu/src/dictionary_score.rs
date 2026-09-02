@@ -100,11 +100,6 @@ impl DictionaryScoreRoutePlan {
         )
     }
 
-    /// True when the plan covers no route work.
-    #[must_use]
-    pub const fn is_degenerate(self) -> bool {
-        self.n_rows == 0 || self.n_items == 0 || self.feature_dim == 0
-    }
 }
 
 #[cfg(test)]

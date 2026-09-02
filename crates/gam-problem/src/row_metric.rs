@@ -404,31 +404,6 @@ impl RowMetric {
         )
     }
 
-    /// Like [`Self::output_fisher`] but with a **solver-only** Tikhonov floor
-    /// `δ ≥ 0`. The floor is recorded for solver helpers only; every
-    /// criterion-facing method (`quad_form`, `whiten_residual`, `fisher_mass`)
-    /// ignores it (#747 discipline), so the evidence criterion is `δ`-free.
-    pub fn output_fisher_with_solver_floor(
-        u: Arc<Array2<f64>>,
-        p: usize,
-        rank: usize,
-        solver_delta: f64,
-    ) -> Result<Self, String> {
-        if !(solver_delta.is_finite() && solver_delta >= 0.0) {
-            return Err(format!(
-                "RowMetric::output_fisher_with_solver_floor: solver_delta must be finite and \
-                 non-negative; got {solver_delta}"
-            ));
-        }
-        Self::from_factors(
-            MetricProvenance::OutputFisher { rank },
-            u,
-            p,
-            rank,
-            solver_delta,
-        )
-    }
-
     /// Structured-residual whitening from supplied per-row precision factors.
     ///
     /// `u` carries the per-row factor stack `U_n ∈ ℝ^{p × rank}` (row-major flat)
@@ -682,22 +657,6 @@ impl RowMetric {
         !matches!(self.provenance, MetricProvenance::Euclidean)
     }
 
-    /// Whether this metric is an **output-Fisher gauge** — either the
-    /// same-position [`MetricProvenance::OutputFisher`] or the downstream
-    /// [`MetricProvenance::OutputFisherDownstream`] (#980). The two share every
-    /// consumer behavior (Sym(F) separation under the gauge, two-lens coupling,
-    /// steering geometry, enrichment); they differ only in the *scientific*
-    /// reading of what behavioral coupling means (same-position vs
-    /// forward-looking). Consumers that gate on "is this an output-Fisher
-    /// pullback" should use this predicate rather than matching one variant, so
-    /// the downstream metric rides the identical path.
-    pub fn is_output_fisher_like(&self) -> bool {
-        matches!(
-            self.provenance,
-            MetricProvenance::OutputFisher { .. } | MetricProvenance::OutputFisherDownstream { .. }
-        )
-    }
-
     /// Number of rows the metric is defined over.
     pub fn n_rows(&self) -> usize {
         self.n_rows
@@ -893,53 +852,12 @@ impl RowMetric {
         }
     }
 
-    /// Whiten a per-row Jacobian `J_n ∈ ℝ^{p × d}` (row-major flat,
-    /// `J_n[i, a] = j_row[i * d + a]`) into `M_n = U_nᵀ J_n ∈ ℝ^{rank × d}` so
-    /// that `M_nᵀ M_n = J_nᵀ (U_n U_nᵀ) J_n = J_nᵀ W_n J_n` is the pullback
-    /// **without** any `p × p` intermediate. Euclidean returns `J_n` reshaped to
-    /// `(p, d)` (the identity whitening). Solver `δ` is not applied (criterion
-    /// face).
-    pub fn whiten_jacobian(&self, row: usize, j_row: &[f64], d: usize) -> Array2<f64> {
-        match &self.factors {
-            None => {
-                let mut out = Array2::<f64>::zeros((self.p, d));
-                for i in 0..self.p {
-                    for a in 0..d {
-                        out[[i, a]] = j_row[i * d + a];
-                    }
-                }
-                out
-            }
-            Some(u) => {
-                let mut m = Array2::<f64>::zeros((self.rank, d));
-                for k in 0..self.rank {
-                    for a in 0..d {
-                        let mut acc = 0.0;
-                        for i in 0..self.p {
-                            acc += u[[row, i * self.rank + k]] * j_row[i * d + a];
-                        }
-                        m[[k, a]] = acc;
-                    }
-                }
-                m
-            }
-        }
-    }
-
     /// Fisher mass of a per-row output vector `x_n ∈ ℝ^p`: the scalar
     /// `x_nᵀ M_n x_n` (alias of [`Self::quad_form`] read as an information mass
     /// rather than a residual square). Factored, never `p × p`, `δ`-free.
     #[inline]
     pub fn fisher_mass(&self, row: usize, x: ArrayView1<'_, f64>) -> f64 {
         self.quad_form(row, x)
-    }
-
-    /// The **solver-only** Tikhonov floor `δ` (#747). Returned for internal
-    /// solver helpers that need `U_n U_nᵀ + δ I` to be invertible; by contract
-    /// no caller may fold this into a criterion-facing quantity. Always `0` for
-    /// Euclidean and for factored metrics built without an explicit floor.
-    pub fn solver_floor(&self) -> f64 {
-        self.solver_delta
     }
 
     /// The gauge view of this metric: the
@@ -960,39 +878,6 @@ impl RowMetric {
             },
         }
     }
-}
-
-/// Pack a harvest-emitted probe stack into the row-major factor layout
-/// [`RowMetric::behavioral_fisher`] expects.
-///
-/// The harvest boundary (the model-interaction side) emits, per token, `s`
-/// probe vectors `vₖ = J_nᵀ F_n^{1/2} uₖ ∈ ℝ^p` — the natural shape is
-/// `probes[n, i, k] = (vₖ)ᵢ`, an `(n_rows, p, probes)` stack. This assembles the
-/// `(n_rows, p · probes)` row-major matrix `u[n, i·probes + k] = probes[n, i, k]`
-/// that the constructor consumes so that column `k` of the per-row factor `U_n`
-/// is exactly probe `vₖ` and `M_n = U_n U_nᵀ = Σₖ vₖ vₖᵀ ≈ G_n`.
-///
-/// This is a pure repack of the standard C-order flattening; it exists so the
-/// harvest → metric seam is a single named, validated Rust surface rather than
-/// an ad-hoc reshape at each call site. Errors on non-finite entries so the
-/// failure is caught here rather than deep in [`normalize_fisher_rao_blocks`].
-pub fn pack_probe_factors(probes: ndarray::ArrayView3<'_, f64>) -> Result<Array2<f64>, String> {
-    let (n_rows, p, s) = probes.dim();
-    if s == 0 {
-        return Err("pack_probe_factors: need at least one probe (s == 0)".to_string());
-    }
-    if !probes.iter().all(|v| v.is_finite()) {
-        return Err("pack_probe_factors: probe entries must be finite".to_string());
-    }
-    let mut u = Array2::<f64>::zeros((n_rows, p * s));
-    for n in 0..n_rows {
-        for i in 0..p {
-            for k in 0..s {
-                u[[n, i * s + k]] = probes[[n, i, k]];
-            }
-        }
-    }
-    Ok(u)
 }
 
 #[cfg(test)]

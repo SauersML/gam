@@ -65,11 +65,6 @@ impl ScopeProgress {
         self.inner.total.store(total, Ordering::Relaxed);
     }
 
-    /// Advance the current count by one, leaving the total unchanged.
-    pub fn inc(&self) {
-        self.inner.current.fetch_add(1, Ordering::Relaxed);
-    }
-
     fn snapshot(&self) -> (u64, u64) {
         (
             self.inner.current.load(Ordering::Relaxed),
@@ -291,25 +286,6 @@ pub fn start() {
 
 pub fn track_scope(label: impl Into<String>) -> ProcessScopeGuard {
     push_scope(label.into(), None)
-}
-
-/// Open a tracked scope that also exposes a live progress counter to the
-/// heartbeat. The returned [`ScopeProgress`] is cheap to clone into worker
-/// closures; bump it as the loop advances and the heartbeat will surface
-/// `progress=a/b (X%)` on the active-scope line. The scope closes when the
-/// returned guard is dropped, exactly like [`track_scope`].
-pub fn track_scope_with_progress(
-    label: impl Into<String>,
-    total: u64,
-) -> (ProcessScopeGuard, ScopeProgress) {
-    let progress = ScopeProgress {
-        inner: Arc::new(ProgressCounter {
-            current: AtomicU64::new(0),
-            total: AtomicU64::new(total),
-        }),
-    };
-    let guard = push_scope(label.into(), Some(progress.clone()));
-    (guard, progress)
 }
 
 fn push_scope(label: String, progress: Option<ScopeProgress>) -> ProcessScopeGuard {
