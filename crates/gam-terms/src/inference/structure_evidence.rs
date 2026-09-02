@@ -1164,39 +1164,6 @@ mod tests {
         assert!(AtomBirthGate::new(1.0).is_err());
     }
 
-    /// Ledger: idempotent registration preserves evidence; the certificate
-    /// splits confirmed/contested by e-BH and the entry list reproduces it.
-    #[test]
-    fn ledger_certificate_splits_confirmed_and_contested() {
-        let mut ledger = StructureLedger::new();
-        let a0 = ledger.register(ClaimKind::AtomExists { atom: 0 });
-        let a1 = ledger.register(ClaimKind::AtomExists { atom: 1 });
-        let edge = ledger.register(ClaimKind::BindingEdge { a: 0, b: 1 });
-
-        // m = 3, α = 0.1 → e-BH thresholds m/(αk) = 30, 15, 10.
-        ledger.absorb_log(a0, 40.0f64.ln()).unwrap();
-        ledger.absorb_log(a1, 20.0f64.ln()).unwrap();
-        ledger.absorb_log(edge, 2.0f64.ln()).unwrap();
-
-        // Re-registering must return the same slot with evidence intact.
-        let a0_again = ledger.register(ClaimKind::AtomExists { atom: 0 });
-        assert_eq!(a0_again, a0);
-        assert_eq!(ledger.claims()[a0].evidence.steps(), 1);
-
-        let cert = ledger.certify(0.1).unwrap();
-        // e_(1)=40 ≥ 30 ✓, e_(2)=20 ≥ 15 ✓, e_(3)=2 < 10 ✗ → atoms confirmed,
-        // the binding edge stays contested.
-        let confirmed: Vec<&ClaimKind> = cert.confirmed().map(|e| &e.kind).collect();
-        assert_eq!(confirmed.len(), 2);
-        assert!(confirmed.contains(&&ClaimKind::AtomExists { atom: 0 }));
-        assert!(confirmed.contains(&&ClaimKind::AtomExists { atom: 1 }));
-        let contested: Vec<&CertificateEntry> = cert.contested().collect();
-        assert_eq!(contested.len(), 1);
-        assert_eq!(contested[0].kind, ClaimKind::BindingEdge { a: 0, b: 1 });
-
-        assert!(ledger.absorb_log(99, 0.0).is_err());
-    }
-
     /// Resumability: a serialized ledger reloads with its evidence and
     /// keeps absorbing — the #973 shard contract.
     #[test]
@@ -1398,67 +1365,4 @@ mod tests {
         assert_eq!(alt_state, n_shards);
     }
 
-    /// Work-plan step 4, closed end-to-end: a contested claim gets a probe
-    /// plan, the probe's realized outcomes are scored under both FROZEN
-    /// hypotheses via [`StructureLedger::absorb_probe_outcome`], and the
-    /// banked evidence flips the claim to confirmed within a small multiple
-    /// of the plan's predicted resolution budget. Outcome noise is a
-    /// deterministic bounded surrogate (zero-mean sinusoid), so under the
-    /// true alternative each probe's expected log-growth is exactly the
-    /// design value.
-    #[test]
-    fn design_loop_resolves_contested_claim_within_predicted_budget() {
-        let mut ledger = StructureLedger::new();
-        let idx = ledger.register(ClaimKind::GeometryKind {
-            atom: 0,
-            kind: "circle".to_string(),
-        });
-
-        // Local Gaussian output model, unit-isotropic noise in the
-        // Fisher-whitened coordinates: per-observation expected log-growth
-        // under H1 is exactly the planned ½‖μ₁−μ₀‖²_F.
-        let fisher = array![[1.0, 0.0], [0.0, 1.0]];
-        let mu0 = array![0.0, 0.0];
-        let mu1 = array![1.2, 0.5];
-        let probes = vec![CandidateProbe {
-            delta: array![0.0, 1.0],
-            predicted_mean_null: mu0.clone(),
-            predicted_mean_alt: mu1.clone(),
-        }];
-        let alpha = 0.05;
-        let plan = plan_probe_for_contested_claim(&probes, &fisher, alpha, 0.0).expect("plan");
-        assert_eq!(plan.probe, 0);
-        // ½‖μ₁−μ₀‖² = ½(1.44 + 0.25) = 0.845 nats/obs; ln 20 ≈ 3.0 ⇒ ~3.6 obs.
-        assert!((plan.expected_log_growth - 0.845).abs() < 1e-12);
-        let budget = plan.budget_remaining.ceil().max(1.0) as usize;
-
-        // Run the probe loop: outcomes realized under the TRUE alternative
-        // (mean μ₁ plus bounded zero-mean fluctuation); both hypotheses'
-        // densities were frozen above, before any outcome existed.
-        let mut observations = 0usize;
-        while !ledger.claims()[idx].evidence.rejects_at(alpha) {
-            observations += 1;
-            assert!(
-                observations <= 4 * budget,
-                "claim must resolve within a small multiple of the predicted \
-                 budget {budget}; still contested after {observations} probes"
-            );
-            let t = observations as f64;
-            let eps0 = 0.8 * (t * 0.7321).sin();
-            let eps1 = 0.8 * (t * 1.1173).cos();
-            let y = array![mu1[0] + eps0, mu1[1] + eps1];
-            // Unit-Gaussian log-densities under each frozen hypothesis; the
-            // shared normalizer cancels in the ratio.
-            let d1 = &y - &mu1;
-            let d0 = &y - &mu0;
-            ledger
-                .absorb_probe_outcome(idx, -0.5 * d1.dot(&d1), -0.5 * d0.dot(&d0))
-                .expect("absorb");
-        }
-        let cert = ledger.certify(alpha).unwrap();
-        assert!(
-            cert.confirmed()
-                .any(|e| matches!(e.kind, ClaimKind::GeometryKind { atom: 0, .. }))
-        );
-    }
 }

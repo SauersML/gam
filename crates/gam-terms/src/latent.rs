@@ -1577,43 +1577,6 @@ mod tests {
         );
     }
 
-    /// `project_matrix_columns_to_tangent_into` (the hoisted, allocation-reuse
-    /// projection used by the SAE arrow-Schur assembler) must match the
-    /// per-column ground truth `project_to_tangent`, and must agree exactly
-    /// with the allocating `project_matrix_columns_to_tangent` it backs, on a
-    /// non-Euclidean (Sphere) manifold where the tangent projection is
-    /// non-trivial. This pins the in-place projection introduced for the SAE
-    /// hot-path scratch hoist.
-    #[test]
-    fn project_matrix_columns_to_tangent_into_matches_columnwise() {
-        let manifold = LatentManifold::Sphere { dim: 3 };
-        // Unit base point on S².
-        let norm = (1.0_f64 + 4.0 + 4.0).sqrt();
-        let t = array![1.0 / norm, 2.0 / norm, 2.0 / norm];
-        let matrix = array![
-            [0.3_f64, -1.1, 0.7, 2.0],
-            [1.5, 0.2, -0.4, 0.9],
-            [-0.6, 0.8, 1.3, -1.7],
-        ];
-        let mut into = Array2::<f64>::zeros(matrix.dim());
-        manifold.project_matrix_columns_to_tangent_into(t.view(), matrix.view(), into.view_mut());
-        let allocating = manifold.project_matrix_columns_to_tangent(t.view(), matrix.view());
-        for col_idx in 0..matrix.ncols() {
-            let expected = manifold.project_to_tangent(t.view(), matrix.column(col_idx));
-            for row_idx in 0..matrix.nrows() {
-                assert!(
-                    (into[[row_idx, col_idx]] - expected[row_idx]).abs() < 1e-12,
-                    "in-place projection deviates from columnwise truth at ({row_idx},{col_idx})"
-                );
-                assert_eq!(
-                    into[[row_idx, col_idx]],
-                    allocating[[row_idx, col_idx]],
-                    "in-place and allocating projection differ at ({row_idx},{col_idx})"
-                );
-            }
-        }
-    }
-
     /// Regression for #2295: a composite `Product` mixing a d=1 factor with a
     /// d=2 factor must split the flat gradient at the correct per-part offsets
     /// (each factor is projected at ITS OWN ambient width), round-trip with

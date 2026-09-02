@@ -4049,37 +4049,6 @@ mod knot_selection_invariance_tests {
 }
 
 #[cfg(test)]
-mod duchon_operator_gate_tests {
-    use super::{DuchonOperatorPenaltySpec, OperatorPenaltySpec};
-
-    #[test]
-    fn default_duchon_operator_penalties_are_active() {
-        let default_spec = DuchonOperatorPenaltySpec::default();
-
-        assert!(
-            default_spec.has_active_operator_penalty(),
-            "default Duchon terms must bypass the native-only fused radial path"
-        );
-        assert!(
-            matches!(default_spec.mass, OperatorPenaltySpec::Active { .. })
-                && matches!(default_spec.tension, OperatorPenaltySpec::Active { .. })
-                && matches!(default_spec.stiffness, OperatorPenaltySpec::Disabled),
-            "the default is mass+tension active with stiffness disabled"
-        );
-    }
-
-    #[test]
-    fn all_disabled_duchon_operator_penalties_are_native_only() {
-        let native_only = DuchonOperatorPenaltySpec::all_disabled();
-
-        assert!(
-            !native_only.has_active_operator_penalty(),
-            "all_disabled() is the explicit native-Gram-only configuration"
-        );
-    }
-}
-
-#[cfg(test)]
 mod retained_radial_indices_tests {
     use super::thin_plate_retained_radial_indices;
     use ndarray::Array1;

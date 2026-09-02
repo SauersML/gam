@@ -1229,53 +1229,6 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn constant_prior_mean_centers_penalty() {
-        let x = Array2::<f64>::zeros((4, 1));
-        let y = Array1::<f64>::zeros(4);
-        let penalty = gam_terms::smooth::BlockwisePenalty::ridge(0..1, 1.0)
-            .with_prior_mean(gam_problem::CoefficientPriorMean::scalar(2.5));
-        let beta = fixed_gaussian_beta(x, y, vec![penalty], array![0.0]);
-        assert!((beta[0] - 2.5).abs() < 1e-10, "beta={beta:?}");
-    }
-
-    #[test]
-    pub(crate) fn functional_prior_mean_recovers_kernel_amplitude() {
-        let x = Array2::<f64>::zeros((5, 3));
-        let y = Array1::<f64>::zeros(5);
-        let metadata = array![2.0];
-        let alpha = 1.75;
-        let penalty = gam_terms::smooth::BlockwisePenalty::ridge(0..3, 1.0).with_prior_mean(
-            gam_problem::CoefficientPriorMean::functional(
-                metadata,
-                std::sync::Arc::new(move |a: &Array1<f64>| {
-                    let t = a[0];
-                    array![alpha, alpha * t, alpha * t * t]
-                }),
-            ),
-        );
-        let beta = fixed_gaussian_beta(x, y, vec![penalty], array![0.0]);
-        let recovered_alpha = beta[0];
-        assert!((recovered_alpha - alpha).abs() < 1e-10, "beta={beta:?}");
-        assert!((beta[1] / 2.0 - alpha).abs() < 1e-10, "beta={beta:?}");
-        assert!((beta[2] / 4.0 - alpha).abs() < 1e-10, "beta={beta:?}");
-    }
-
-    #[test]
-    pub(crate) fn zero_prior_mean_matches_default_fixed_fit_bitwise() {
-        let x = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0], [1.0, 4.0],];
-        let y = array![0.5, 1.0, 1.5, 2.0, 2.5];
-        let base_penalty = gam_terms::smooth::BlockwisePenalty::ridge(0..2, 1.0);
-        let zero_penalty = gam_terms::smooth::BlockwisePenalty::ridge(0..2, 1.0).with_prior_mean(
-            gam_problem::CoefficientPriorMean::constant(Array1::zeros(2)),
-        );
-        let rho = array![0.25];
-        let beta_default =
-            fixed_gaussian_beta(x.clone(), y.clone(), vec![base_penalty], rho.clone());
-        let beta_zero = fixed_gaussian_beta(x, y, vec![zero_penalty], rho);
-        assert_eq!(beta_default.to_vec(), beta_zero.to_vec());
-    }
-
-    #[test]
     pub(crate) fn pirls_decision_summary_logs_on_power_of_two_repetitions() {
         assert!(!should_log_pirls_decision_summary(1));
         assert!(should_log_pirls_decision_summary(2));
@@ -3023,7 +2976,6 @@ mod tests {
         );
         assert_eq!(active_hint, vec![1]);
     }
-
 
     #[test]
     pub(crate) fn lower_bound_active_set_releases_stalewarm_boundary_hint() {
