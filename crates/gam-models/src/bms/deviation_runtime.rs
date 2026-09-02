@@ -970,10 +970,6 @@ impl DeviationRuntime {
         self.degree
     }
 
-    pub fn value_span_degree(&self) -> usize {
-        self.value_span_degree
-    }
-
     pub fn basis_dim(&self) -> usize {
         self.basis_dim
     }
@@ -1095,14 +1091,6 @@ impl DeviationRuntime {
 
     pub fn first_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
         self.evaluate_span_polynomial_design_raw(values, 1)
-    }
-
-    pub fn second_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.evaluate_span_polynomial_design_raw(values, 2)
-    }
-
-    pub fn third_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.evaluate_span_polynomial_design_raw(values, 3)
     }
 
     pub(crate) fn integrated_derivative_penalty_with_nullity(

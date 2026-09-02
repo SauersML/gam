@@ -927,34 +927,6 @@ impl SurvivalLocationScaleFamily {
         Ok((ll, block_gradients))
     }
 
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx` given the
-    /// realised block specs.
-    ///
-    /// Survival location-scale has three linear outputs per row:
-    ///   - output 0: η_time       ← time_transform block (block 0)
-    ///   - output 1: η_threshold  ← threshold block (block 1)
-    ///   - output 2: η_log_sigma  ← log_sigma block (block 2)
-    ///
-    /// The optional linkwiggle block (block 3) modulates the inverse link
-    /// nonlinearly and has an all-zero effective linear Jacobian.
-    ///
-    /// The stacked Jacobian for block k has shape `(3 * n, p_k)`.
-    pub fn block_effective_jacobian(
-        specs: &[ParameterBlockSpec],
-        block_idx: usize,
-    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-        crate::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
-            family: "SurvivalLocationScaleFamily",
-            n_outputs: 3,
-            additive_blocks: &[
-                Self::BLOCK_TIME,
-                Self::BLOCK_THRESHOLD,
-                Self::BLOCK_LOG_SIGMA,
-            ],
-            wiggle_block: Some(Self::BLOCK_LINK_WIGGLE),
-        }
-        .block_effective_jacobian(specs, block_idx)
-    }
 }
 
 /// Per-subject 3×3 channel Hessian W_i for survival location-scale.
@@ -987,7 +959,6 @@ pub struct SurvivalLocationScaleChannelHessian {
 impl SurvivalLocationScaleChannelHessian {
     /// Number of output channels for SLS (always 3).
     pub const K: usize = 3;
-
 
     /// Structural identity metric: W_i = I₃ for every subject.
     ///
@@ -1025,25 +996,6 @@ impl FamilyChannelHessian for SurvivalLocationScaleChannelHessian {
         }
     }
 
-    fn evaluate_full(&self) -> ndarray::Array3<f64> {
-        self.h.clone()
-    }
-}
-
-/// Public entry point for building a [`BlockEffectiveJacobian`] for one block of
-/// the survival location-scale model.
-///
-/// This thin wrapper exposes the otherwise-private `SurvivalLocationScaleFamily`
-/// associated function so integration tests and downstream crates can verify the
-/// block Jacobian contract without depending on the internal struct.
-///
-/// See `SurvivalLocationScaleFamily::block_effective_jacobian` for the full
-/// contract.
-pub fn survival_location_scale_block_effective_jacobian(
-    specs: &[ParameterBlockSpec],
-    block_idx: usize,
-) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-    SurvivalLocationScaleFamily::block_effective_jacobian(specs, block_idx)
 }
 
 /// Observed vs expected information: The survival location-scale family uses

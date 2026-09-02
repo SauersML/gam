@@ -32,20 +32,7 @@
 
 use gam_terms::basis::{ActivePenaltyInfo, BasisOptions, PenaltySource};
 
-use crate::custom_family::{
-    AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
-    ConstraintSet, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel,
-    CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
-    CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyPsiSecondDesignAction,
-    CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
-    ExactNewtonJointPsiDirectCache, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, PsiDesignMap, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, evaluate_custom_family_joint_hyper_efs_owned,
-    evaluate_custom_family_joint_hyper_owned, fit_custom_family,
-    fit_custom_family_fixed_log_lambdas_from_owned_mode,
-    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map,
-    second_psi_linear_map, shared_dense_arc, weighted_crossprod_psi_maps,
-};
+use crate::custom_family::{AdditiveBlockJacobian, BlockWorkingSet, BlockwiseFitOptions, ConstraintSet, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiDirectCache, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap, evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, evaluate_custom_family_joint_hyper_efs_owned, evaluate_custom_family_joint_hyper_owned, fit_custom_family, fit_custom_family_fixed_log_lambdas_from_owned_mode, resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map, shared_dense_arc, weighted_crossprod_psi_maps};
 use gam_problem::{ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace};
 
 use crate::model_types::UnifiedFitResult;
@@ -75,12 +62,7 @@ use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 // `split_wiggle_penalty_orders`) are imported inside that block instead, so they
 // are not flagged unused in a non-test `--lib` build; downstream consumers import
 // from `families::wiggle` directly.
-use crate::wiggle::{
-    SelectedWiggleBasis, WiggleBlockConfig, buildwiggle_block_input_from_knots,
-    monotone_wiggle_basis_with_derivative_order,
-    monotone_wiggle_nonnegative_constraints, project_monotone_wiggle_beta_nonnegative,
-    select_wiggle_basis_from_seed, validate_monotone_wiggle_beta_nonnegative,
-};
+use crate::wiggle::{SelectedWiggleBasis, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order, monotone_wiggle_nonnegative_constraints, project_monotone_wiggle_beta_nonnegative, select_wiggle_basis_from_seed, validate_monotone_wiggle_beta_nonnegative};
 
 use crate::inference::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 

@@ -35,7 +35,7 @@ pub(crate) use crate::bms::{
     CrossBlockIdentifiabilityWarning, DeviationBlockConfig, DeviationRuntime, LatentZNormalization,
     LatentZPolicy, MarginalSlopeCovariance, MarginalSlopeCovarianceRef, ParametricAnchorBlock,
     ScoreCovarianceField, marginal_slope_covariance_from_scores,
-    marginal_slope_preserving_scale, marginal_slope_probit_eta, padded_deviation_seed,
+    padded_deviation_seed,
 };
 
 pub(crate) use crate::bms::{
