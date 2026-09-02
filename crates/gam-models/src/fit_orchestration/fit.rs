@@ -172,12 +172,6 @@ mod profiled_outer_payload_tests {
     }
 }
 
-/// Lower floor applied before taking `ln(λ)` when mapping a smoothing parameter
-/// into the log-λ optimization coordinate. `λ` is non-negative by construction;
-/// flooring at the smallest positive normal `f64` keeps `ln` finite for an
-/// exactly-zero (fully-relaxed) penalty without perturbing any λ above the
-/// denormal range.
-
 /// Inner-PIRLS controls shared by the survival-transformation baseline and
 /// smoothing-coordinate eval closures. The baseline geometry is mildly
 /// nonlinear, so the iteration budget is generous. The convergence target is

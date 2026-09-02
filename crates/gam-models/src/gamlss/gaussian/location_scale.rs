@@ -888,24 +888,6 @@ impl GaussianLocationScaleFamily {
         )
     }
 
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx` given the
-    /// realised block specs.  Returns an [`AdditiveBlockJacobian`] encoding the
-    /// linear map η_r\[i\] = X_r\[i,:\] · β_r:
-    ///
-    /// - block 0 (mu):       output 0 = design rows, output 1 = zeros
-    /// - block 1 (log_sigma): output 0 = zeros, output 1 = design rows
-    pub fn block_effective_jacobian(
-        specs: &[ParameterBlockSpec],
-        block_idx: usize,
-    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-        crate::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
-            family: "GaussianLocationScaleFamily",
-            n_outputs: 2,
-            additive_blocks: &[Self::BLOCK_MU, Self::BLOCK_LOG_SIGMA],
-            wiggle_block: None,
-        }
-        .block_effective_jacobian(specs, block_idx)
-    }
 }
 
 /// Weighted residual sum of squares `Σ wᵢ (yᵢ − μᵢ)²` at the fitted means —
@@ -1221,7 +1203,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
     fn has_explicit_joint_hessian(&self) -> bool {
         true
     }
-
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,

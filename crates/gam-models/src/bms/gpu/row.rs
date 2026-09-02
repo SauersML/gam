@@ -2384,7 +2384,6 @@ pub(crate) fn launch_bms_flex_row_joint_gradient(
 #[derive(Clone, Copy)]
 pub(crate) enum BmsFlexRowLaunchMode {
     /// `bms_flex_row_hvp_partial`, `H · v` per row, result left on-stream.
-    HvpDeviceOut,
     /// `bms_flex_row_diag_partial`, `diag(H)` per row, downloaded to host.
     DiagonalHostOut,
 }
@@ -2394,7 +2393,6 @@ impl BmsFlexRowLaunchMode {
     /// Name of the partial kernel this mode loads from the HVP module.
     pub(crate) fn partial_kernel_name(self) -> &'static str {
         match self {
-            BmsFlexRowLaunchMode::HvpDeviceOut => "bms_flex_row_hvp_partial",
             BmsFlexRowLaunchMode::DiagonalHostOut => "bms_flex_row_diag_partial",
         }
     }
@@ -3093,53 +3091,6 @@ fn materialize_dense_from_hvp_batches(
     Ok(dense)
 }
 
-/// Device-output HVP. Runs `bms_flex_row_hvp_partial` +
-/// `bms_flex_row_hvp_reduce` on the storage's stream against caller-supplied
-/// device-resident `d_v` (length `p_total` doubles), writing the result into
-/// caller-supplied `d_out` (also `p_total` doubles). **No** `synchronize()`
-/// or DtoH is performed — the caller is responsible for stream ordering
-/// against any consumer that reads `d_out`.
-///
-/// This is the device-resident PCG hot path (Block 9 Phase 5): keeping the
-/// HVP output on the stream lets the outer PCG loop chain axpy / dot /
-/// preconditioner kernels back-to-back without a per-iter device sync.
-#[cfg(target_os = "linux")]
-pub(crate) fn launch_bms_flex_row_hvp_into_device(
-    storage: &DeviceResidentRowHess,
-    d_v: &CudaSlice<f64>,
-    d_out: &mut CudaSlice<f64>,
-) -> Result<(), GpuError> {
-    let p_total = storage.block.p_total;
-    if d_v.len() != p_total {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
-                "bms_flex_row hvp_into_device: d_v.len()={} != p_total={}",
-                d_v.len(),
-                p_total
-            ),
-        });
-    }
-    if d_out.len() != p_total {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
-                "bms_flex_row hvp_into_device: d_out.len()={} != p_total={}",
-                d_out.len(),
-                p_total
-            ),
-        });
-    }
-    // On-stream output: the shared engine launches partial+reduce into the
-    // caller's `d_out` and returns without sync/DtoH, so the outer PCG loop can
-    // chain device kernels against the result.
-    run_bms_flex_row_partial_reduce(
-        storage,
-        BmsFlexRowLaunchMode::HvpDeviceOut,
-        Some(d_v),
-        d_out,
-        "hvp_into_device",
-    )
-}
-
 /// Launch the device-resident HVP kernel. Returns the host-side joint β image
 /// of length `block.p_total`.
 #[cfg(target_os = "linux")]
@@ -3683,129 +3634,6 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
-    /// Assert the dispatch-worthiness claim and record the timings without
-    /// asserting on them (#2487, SPEC rule 19).
-    ///
-    /// These gates asserted `cpu_median / gpu_median >= 2.0` (walked down from
-    /// 5× and 10× calibration-box ratios). A ratio of two wall-clock medians is
-    /// a property of whoever else is on the box, not of the kernel: under
-    /// co-tenancy the device arm degrades harder than the host arm, so the
-    /// ratio collapses toward 1 exactly when the fleet is busiest, and the red
-    /// gets read as a code regression. The claim these gates exist to make —
-    /// "this shape belongs on the device" — is decided instead by the
-    /// calibrated policy, whose row crossover is a per-device *measurement*.
-    ///
-    /// The medians stay in the log as the hill-climbing perf record, which is
-    /// what a timing is good for.
-    #[cfg(target_os = "linux")]
-    fn assert_row_batch_dispatch_worthy(
-        label: &str,
-        policy: &gam_gpu::policy::GpuDispatchPolicy,
-        n: usize,
-    ) {
-        assert!(
-            policy.row_batch_target_is_gpu(n),
-            "{label}: n={n} rows is below this device's calibrated row-kernel \
-             crossover ({}), so the fixture no longer exercises a shape the \
-             dispatch policy would send to the device — grow the fixture rather \
-             than lowering the crossover",
-            policy.row_kernel_min_n
-        );
-        assert!(
-            !policy.row_batch_target_is_gpu(0),
-            "{label}: the dispatch predicate admitted an empty batch, so the \
-             assertion above proves nothing about n={n}"
-        );
-    }
-
-    /// #2422 device-free half, run by [`cuda_runtime_for_test`] on every host
-    /// that has no CUDA device.
-    ///
-    /// Every CUDA-gated test in this module early-returns when the runtime is
-    /// absent, and that return happens before the test's first assertion — so
-    /// the test reports `passed` having executed nothing. Because every CI
-    /// runner is device-free, that is the state this entire module has been in.
-    ///
-    /// The contract that IS checkable without a device is the production
-    /// entry's refusal. `launch_bms_flex_row_kernel` validates its inputs and
-    /// then reaches `launch_linux`, which opens with `RowKernelBackend::probe()?`;
-    /// with no device that probe fails, so the entry must return `Err` carrying
-    /// the device-absence reason. An entry that returns `Ok` on a device-free
-    /// host has fabricated device state — the #1551 silent-fallback class, and
-    /// exactly what a `return` before the first assertion could never see.
-    fn assert_row_kernel_seam_declines_without_cuda() {
-        let buffers = make_buffers(1, 4, 1, 1);
-        // The fixture must be one the entry ACCEPTS. `launch_bms_flex_row_kernel`
-        // rejects malformed inputs with `Err` as well, so an invalid fixture
-        // would satisfy the refusal check below without the device seam ever
-        // being reached — the assertion would hold for the wrong reason.
-        minimal_inputs(&buffers)
-            .validate()
-            .expect("the device-free half must present inputs the row-kernel entry accepts");
-
-        match launch_bms_flex_row_kernel(minimal_inputs(&buffers)) {
-            Ok(_) => panic!(
-                "no CUDA runtime on this host, yet the BMS FLEX row-kernel entry returned Ok \
-                 — the seam fabricated device state (#1551 class)"
-            ),
-            Err(GpuError::DriverCallFailed { reason }) if reason.contains("s_f") => panic!(
-                "the row-kernel entry refused over its INPUTS rather than the absent device, \
-                 so this proves nothing about the device seam: {reason}"
-            ),
-            Err(_) => {}
-        }
-    }
-
-    /// Resolve the CUDA runtime for a device-gated test.
-    ///
-    /// `Err` is a real driver fault and fails loudly — it must never be
-    /// confused with device absence. `None` means the host genuinely has no
-    /// device, and before handing that back this asserts the device-free half
-    /// of the caller's contract, so a caller that early-returns on `None` still
-    /// proves something real instead of reporting `passed` with zero assertions
-    /// executed (#2422). Curing it here rather than at each call site is
-    /// deliberate: every CUDA-gated test in this module routes through this one
-    /// function, and a fix applied per-site is a fix that misses the next site
-    /// the moment one is written.
-    ///
-    /// The availability question goes through `gam_gpu::test_gate::gpu_for_test`,
-    /// which probes with an EXPLICIT `GpuPolicy::Auto` and never writes the
-    /// process-wide policy — that policy is a first-writer-wins `OnceLock`
-    /// shared with every other test in this binary. Routing through the shared
-    /// gate adds two things this helper did not have: the skip is COUNTED, so a
-    /// suite can assert how many gated tests declined, and a
-    /// `GpuPolicy::Required` lane turns an absent device into a failure without
-    /// any per-test opt-in. The seam assertion below is this module's own and is
-    /// stronger than the gate's; it is kept.
-    fn cuda_runtime_for_test(
-        test_name: &str,
-    ) -> Option<&'static gam_gpu::device_runtime::GpuRuntime> {
-        let skips_before = gam_gpu::test_gate::skipped_for_absent_device();
-        match gam_gpu::test_gate::gpu_for_test(test_name) {
-            gam_gpu::test_gate::GpuTestGate::Ready(runtime) => Some(runtime),
-            gam_gpu::test_gate::GpuTestGate::AbsentDevice => {
-                gam_gpu::test_gate::assert_absent_device_was_counted(skips_before);
-                eprintln!(
-                    "[{test_name}] no CUDA device — asserting the device-free seam contract \
-                     instead of skipping"
-                );
-                assert_row_kernel_seam_declines_without_cuda();
-                None
-            }
-        }
-    }
-
-    fn assert_array1_close_932(label: &str, expected: &Array1<f64>, actual: &Array1<f64>) {
-        assert_eq!(expected.len(), actual.len(), "{label}: length mismatch");
-        for (index, (&want, &got)) in expected.iter().zip(actual).enumerate() {
-            let tolerance = 2.0e-8 * (1.0 + want.abs());
-            assert!(
-                want.is_finite() && got.is_finite() && (want - got).abs() <= tolerance,
-                "{label}[{index}]: expected={want:.17e} actual={got:.17e} tolerance={tolerance:.3e}"
-            );
-        }
-    }
-
     /// Mandatory A100 acceptance hook: once a device is present, every probe,
     /// upload, launch, synchronization, status, or download failure aborts the
     /// test instead of turning into a skip. The device arm is entered through
@@ -4255,42 +4083,6 @@ mod tests {
         );
     }
 
-    pub(crate) fn minimal_inputs<'a>(buffers: &'a TestBuffers) -> BmsFlexRowKernelInputs<'a> {
-        BmsFlexRowKernelInputs {
-            n_rows: 1,
-            r: 4,
-            p_h: 1,
-            p_w: 1,
-            q: &buffers.q,
-            b: &buffers.b,
-            mu_1: &buffers.mu_1,
-            mu_2: &buffers.mu_2,
-            z_obs: &buffers.z_obs,
-            y: &buffers.y,
-            w: &buffers.w,
-            e_obs: &buffers.e_obs,
-            s_f: 1.0,
-            cell_offsets: &buffers.cell_offsets,
-            cell_c0: &buffers.cell_c0,
-            cell_c1: &buffers.cell_c1,
-            cell_c2: &buffers.cell_c2,
-            cell_c3: &buffers.cell_c3,
-            cell_a: &buffers.cell_a,
-            cell_aa: &buffers.cell_aa,
-            cell_r: &buffers.cell_r,
-            cell_ar: &buffers.cell_ar,
-            cell_sbb: &buffers.cell_sbb,
-            cell_sbh: &buffers.cell_sbh,
-            cell_sbw: &buffers.cell_sbw,
-            cell_moments: CellMomentsSource::Host(&buffers.cell_moments),
-            chi_obs: &buffers.chi_obs,
-            xi_obs: &buffers.xi_obs,
-            rho_u: &buffers.rho_u,
-            tau_u: &buffers.tau_u,
-            r_uv: &buffers.r_uv,
-        }
-    }
-
     pub(crate) struct TestBuffers {
         pub(crate) q: Vec<f64>,
         pub(crate) b: Vec<f64>,
@@ -4318,38 +4110,6 @@ mod tests {
         pub(crate) rho_u: Vec<f64>,
         pub(crate) tau_u: Vec<f64>,
         pub(crate) r_uv: Vec<f64>,
-    }
-
-    pub(crate) fn make_buffers(n_cells: u32, r: usize, p_h: usize, p_w: usize) -> TestBuffers {
-        let cells = n_cells as usize;
-        TestBuffers {
-            q: vec![0.1; 1],
-            b: vec![0.5; 1],
-            mu_1: vec![0.3; 1],
-            mu_2: vec![0.07; 1],
-            z_obs: vec![0.0; 1],
-            y: vec![1.0; 1],
-            w: vec![1.0; 1],
-            e_obs: vec![0.15; 1],
-            cell_offsets: vec![0, n_cells],
-            cell_c0: vec![0.2; cells],
-            cell_c1: vec![-0.1; cells],
-            cell_c2: vec![0.05; cells],
-            cell_c3: vec![-0.02; cells],
-            cell_a: vec![0.1; cells * 4],
-            cell_aa: vec![0.0; cells * 4],
-            cell_r: vec![0.05; cells * (r - 1) * 4],
-            cell_ar: vec![0.0; cells * (r - 1) * 4],
-            cell_sbb: vec![0.0; cells * 4],
-            cell_sbh: vec![0.0; cells * p_h * 4],
-            cell_sbw: vec![0.0; cells * p_w * 4],
-            cell_moments: vec![1.0; cells * MOMENT_STRIDE],
-            chi_obs: vec![1.0; 1],
-            xi_obs: vec![0.0; 1],
-            rho_u: vec![0.0; r],
-            tau_u: vec![0.0; r],
-            r_uv: vec![0.0; r * r],
-        }
     }
 
     #[test]
@@ -4659,157 +4419,6 @@ mod tests {
     }
 
     // ── Phase-3 HVP / diagonal CPU oracles + GPU parity tests ────────────────
-
-    /// CPU oracle for [`launch_bms_flex_row_hvp`]. Mirrors the device kernel
-    /// element-for-element so the GPU parity test runs against the same algebra.
-    pub(crate) fn cpu_oracle_bms_flex_row_hvp(
-        row_hessians: &[f64],
-        marginal_design: &[f64],
-        slope_design: &[f64],
-        block: &BmsFlexBlockLayout,
-        primary: &BmsFlexPrimaryLayout,
-        n: usize,
-        v: &[f64],
-    ) -> Vec<f64> {
-        let r = primary.r;
-        let p_m = block.p_m;
-        let p_g = block.p_g;
-        assert_eq!(v.len(), block.p_total);
-        assert_eq!(row_hessians.len(), n * r * r);
-        assert_eq!(marginal_design.len(), n * p_m);
-        assert_eq!(slope_design.len(), n * p_g);
-        let mut out = vec![0.0_f64; block.p_total];
-        let mut row_dir = vec![0.0_f64; r];
-        let mut action = vec![0.0_f64; r];
-        for row in 0..n {
-            let mrow = &marginal_design[row * p_m..(row + 1) * p_m];
-            let grow = &slope_design[row * p_g..(row + 1) * p_g];
-            let mut acc_q = 0.0_f64;
-            for j in 0..p_m {
-                acc_q += mrow[j] * v[j];
-            }
-            let mut acc_g = 0.0_f64;
-            for j in 0..p_g {
-                acc_g += grow[j] * v[p_m + j];
-            }
-            row_dir[0] = acc_q;
-            row_dir[1] = acc_g;
-            if let (Some(prange), Some(brange)) = (primary.h.as_ref(), block.h.as_ref()) {
-                for (k, ii) in prange.clone().enumerate() {
-                    row_dir[ii] = v[brange.start + k];
-                }
-            }
-            if let (Some(prange), Some(brange)) = (primary.w.as_ref(), block.w.as_ref()) {
-                for (k, ii) in prange.clone().enumerate() {
-                    row_dir[ii] = v[brange.start + k];
-                }
-            }
-            let h_slice = &row_hessians[row * r * r..(row + 1) * r * r];
-            for u in 0..r {
-                let mut acc = 0.0_f64;
-                for v_idx in 0..r {
-                    acc += h_slice[u * r + v_idx] * row_dir[v_idx];
-                }
-                action[u] = acc;
-            }
-            let a0 = action[0];
-            for j in 0..p_m {
-                out[j] += a0 * mrow[j];
-            }
-            let a1 = action[1];
-            for j in 0..p_g {
-                out[p_m + j] += a1 * grow[j];
-            }
-            if let (Some(prange), Some(brange)) = (primary.h.as_ref(), block.h.as_ref()) {
-                for (k, ii) in prange.clone().enumerate() {
-                    out[brange.start + k] += action[ii];
-                }
-            }
-            if let (Some(prange), Some(brange)) = (primary.w.as_ref(), block.w.as_ref()) {
-                for (k, ii) in prange.clone().enumerate() {
-                    out[brange.start + k] += action[ii];
-                }
-            }
-        }
-        out
-    }
-
-    pub(crate) fn cpu_oracle_bms_flex_row_diagonal(
-        row_hessians: &[f64],
-        marginal_design: &[f64],
-        slope_design: &[f64],
-        block: &BmsFlexBlockLayout,
-        primary: &BmsFlexPrimaryLayout,
-        n: usize,
-    ) -> Vec<f64> {
-        let r = primary.r;
-        let p_m = block.p_m;
-        let p_g = block.p_g;
-        let mut out = vec![0.0_f64; block.p_total];
-        for row in 0..n {
-            let h_slice = &row_hessians[row * r * r..(row + 1) * r * r];
-            let h00 = h_slice[0];
-            let h11 = h_slice[r + 1];
-            let mrow = &marginal_design[row * p_m..(row + 1) * p_m];
-            let grow = &slope_design[row * p_g..(row + 1) * p_g];
-            for j in 0..p_m {
-                out[j] += h00 * mrow[j] * mrow[j];
-            }
-            for j in 0..p_g {
-                out[p_m + j] += h11 * grow[j] * grow[j];
-            }
-            if let (Some(prange), Some(brange)) = (primary.h.as_ref(), block.h.as_ref()) {
-                for (k, ii) in prange.clone().enumerate() {
-                    out[brange.start + k] += h_slice[ii * r + ii];
-                }
-            }
-            if let (Some(prange), Some(brange)) = (primary.w.as_ref(), block.w.as_ref()) {
-                for (k, ii) in prange.clone().enumerate() {
-                    out[brange.start + k] += h_slice[ii * r + ii];
-                }
-            }
-        }
-        out
-    }
-
-    pub(crate) fn cpu_oracle_bms_flex_row_joint_gradient(
-        row_neglog: &[f64],
-        row_grad: &[f64],
-        marginal_design: &[f64],
-        slope_design: &[f64],
-        block: &BmsFlexBlockLayout,
-        primary: &BmsFlexPrimaryLayout,
-        n: usize,
-    ) -> (f64, Vec<f64>) {
-        let r = primary.r;
-        assert_eq!(row_neglog.len(), n);
-        assert_eq!(row_grad.len(), n * r);
-        assert_eq!(marginal_design.len(), n * block.p_m);
-        assert_eq!(slope_design.len(), n * block.p_g);
-        let mut log_likelihood = 0.0_f64;
-        let mut gradient = vec![0.0_f64; block.p_total];
-        for row in 0..n {
-            log_likelihood -= row_neglog[row];
-            let grow = &row_grad[row * r..(row + 1) * r];
-            for j in 0..block.p_m {
-                gradient[j] -= grow[0] * marginal_design[row * block.p_m + j];
-            }
-            for j in 0..block.p_g {
-                gradient[block.p_m + j] -= grow[1] * slope_design[row * block.p_g + j];
-            }
-            if let (Some(primary_h), Some(block_h)) = (primary.h.as_ref(), block.h.as_ref()) {
-                for (offset, primary_idx) in primary_h.clone().enumerate() {
-                    gradient[block_h.start + offset] -= grow[primary_idx];
-                }
-            }
-            if let (Some(primary_w), Some(block_w)) = (primary.w.as_ref(), block.w.as_ref()) {
-                for (offset, primary_idx) in primary_w.clone().enumerate() {
-                    gradient[block_w.start + offset] -= grow[primary_idx];
-                }
-            }
-        }
-        (log_likelihood, gradient)
-    }
 
     #[test]
     fn cpu_joint_gradient_oracle_pins_score_sign_and_active_hw_pullback() {

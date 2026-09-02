@@ -505,35 +505,6 @@ pub(crate) struct NonRigidPilot {
     pub(crate) slope_beta: Array1<f64>,
 }
 
-pub fn survival_marginal_slope_vector_scale(
-    slopes: &[f64],
-    covariance: &MarginalSlopeCovariance,
-    probit_scale: f64,
-) -> Result<f64, String> {
-    marginal_slope_preserving_scale(slopes, covariance, probit_scale)
-}
-
-pub fn survival_marginal_slope_vector_eta(
-    q: f64,
-    z: &[f64],
-    slopes: &[f64],
-    covariance: &MarginalSlopeCovariance,
-    probit_scale: f64,
-) -> Result<f64, String> {
-    if z.len() != covariance.dim() {
-        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: format!(
-                "survival marginal-slope vector eta: score/covariance dimension mismatch: z={}, covariance={}",
-                z.len(),
-                covariance.dim()
-            ),
-        }
-        .into());
-    }
-    marginal_slope_probit_eta(q, z, slopes, covariance, probit_scale)
-        .map_err(|err| format!("survival marginal-slope vector eta: {err}"))
-}
-
 /// Allocation-free value-only workspace bound to one score-covariance FIELD
 /// whose shape, finiteness, symmetry, and positive-semidefinite contract were
 /// validated at covariance admission. Per-row evaluation uses that row's cached

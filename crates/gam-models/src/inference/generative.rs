@@ -862,47 +862,6 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
     }
 }
 
-/// Draw replicate chunks in deterministic draw order without materializing the
-/// full `n_draws × nobs` matrix.
-///
-/// The same RNG is advanced exactly once per observation draw regardless of
-/// `chunk_draws`, so changing the chunk size changes only memory and sink call
-/// boundaries, never the generated values. Frontends that write a file or
-/// yield an iterator should use this API; collecting the full matrix is an
-/// explicit convenience operation implemented below.
-pub fn sampleobservation_replicate_chunks<R, F>(
-    spec: &GenerativeSpec,
-    n_draws: usize,
-    chunk_draws: usize,
-    rng: &mut R,
-    mut consume: F,
-) -> Result<(), EstimationError>
-where
-    R: rand::Rng + ?Sized,
-    F: for<'a> FnMut(usize, ndarray::ArrayView2<'a, f64>) -> Result<(), EstimationError>,
-{
-    if chunk_draws == 0 {
-        crate::bail_invalid_estim!("replicate chunk size must be strictly positive");
-    }
-    if n_draws == 0 {
-        return Ok(());
-    }
-    let n = spec.nobs();
-    let capacity = chunk_draws.min(n_draws);
-    let mut chunk = Array2::<f64>::zeros((capacity, n));
-    let mut start = 0usize;
-    while start < n_draws {
-        let len = (n_draws - start).min(capacity);
-        for local_draw in 0..len {
-            let draw = sampleobservations(spec, rng)?;
-            chunk.row_mut(local_draw).assign(&draw);
-        }
-        consume(start, chunk.slice(ndarray::s![..len, ..]))?;
-        start += len;
-    }
-    Ok(())
-}
-
 /// Derive the independent RNG seed for one globally indexed replicate.
 ///
 /// SplitMix64's published integer mixer gives every `(seed, draw_index)` pair
@@ -995,25 +954,6 @@ pub fn sampleobservation_seeded_replicates(
             Ok(())
         },
     )?;
-    Ok(out)
-}
-
-/// Collect multiple synthetic replicates into an `n_draws × nobs` matrix.
-///
-/// This is intentionally the allocating convenience surface. Streaming
-/// consumers should call [`sampleobservation_replicate_chunks`] directly.
-pub fn sampleobservation_replicates<R: rand::Rng + ?Sized>(
-    spec: &GenerativeSpec,
-    n_draws: usize,
-    rng: &mut R,
-) -> Result<Array2<f64>, EstimationError> {
-    let n = spec.nobs();
-    let mut out = Array2::<f64>::zeros((n_draws, n));
-    sampleobservation_replicate_chunks(spec, n_draws, n_draws.max(1), rng, |start, chunk| {
-        let end = start + chunk.nrows();
-        out.slice_mut(ndarray::s![start..end, ..]).assign(&chunk);
-        Ok(())
-    })?;
     Ok(out)
 }
 
