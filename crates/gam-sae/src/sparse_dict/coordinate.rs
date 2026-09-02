@@ -131,7 +131,7 @@
 use super::block::BlockSparseFit;
 use crate::dual_certificate::harmonic_dual_birth_eta;
 use crate::super_resolution::{recover_spikes, separation_limit};
-use ndarray::{Array2, ArrayView2, ArrayView3};
+use ndarray::{ArrayView2, ArrayView3};
 use std::f64::consts::TAU;
 
 /// The phase and amplitude of one firing on a coordinate (circle/harmonic)
@@ -540,28 +540,6 @@ pub fn recover_measure_from_code(
     maybe_super_resolve(z, sigma)
 }
 
-/// Per-firing coordinate readout for a `b = 2` circle block: phase `t̂`,
-/// amplitude `‖z‖`, and their closed-form SEs, with `σ̂` estimated from the
-/// block's radial scatter. See the module doc for the derivation.
-pub fn block_firing_coordinates(
-    fit: &BlockSparseFit,
-    block: usize,
-) -> Result<BlockCoordinateReport, String> {
-    let block_size = fit.block_size;
-    if block_size == 0 || fit.decoder.nrows() % block_size != 0 {
-        return Err(format!(
-            "block_firing_coordinates: decoder rows {} not divisible by block_size {block_size}",
-            fit.decoder.nrows()
-        ));
-    }
-    block_route_firing_coordinates(
-        fit.blocks.view(),
-        fit.codes.view(),
-        fit.decoder.nrows() / block_size,
-        block,
-    )
-}
-
 /// Per-firing circle-coordinate readout directly from sparse block routing.
 ///
 /// `blocks` is `N×s` and `codes` is `N×s×2`; implicit dictionary zeros are
@@ -885,30 +863,6 @@ fn harmonic_argmax(rho: &[f64]) -> (f64, f64) {
     (best_t, harmonic_fpp(rho, best_t))
 }
 
-/// Per-firing coordinate readout for a harmonic block (`b = 2H`, `H ≥ 1`): the
-/// phase `t̂` maximising the trig matched filter `Σ_h ρ_h·u_h(t)` over all
-/// analytically isolated stationary roots, with the delta-method SE
-/// `√(σ̂² Σ_h ω_h²)/|f''(t̂)|`. Amplitude is `‖z‖` with SE `≈ σ̂`. See the module
-/// doc for the derivation; `H = 1` reproduces [`block_firing_coordinates`].
-pub fn harmonic_firing_coordinates(
-    fit: &BlockSparseFit,
-    block: usize,
-) -> Result<BlockCoordinateReport, String> {
-    let block_size = fit.block_size;
-    if block_size == 0 || fit.decoder.nrows() % block_size != 0 {
-        return Err(format!(
-            "harmonic_firing_coordinates: decoder rows {} not divisible by block_size {block_size}",
-            fit.decoder.nrows()
-        ));
-    }
-    harmonic_route_firing_coordinates(
-        fit.blocks.view(),
-        fit.codes.view(),
-        fit.decoder.nrows() / block_size,
-        block,
-    )
-}
-
 /// Harmonic coordinate readout directly from `blocks[N,s]` /
 /// `codes[N,s,b]` sparse routing, without constructing a fit result.
 pub fn harmonic_route_firing_coordinates(
@@ -1011,146 +965,6 @@ pub fn harmonic_measure_coordinates(
         n_firings: firings.len(),
         firings: measures,
     })
-}
-
-/// Measure-valued readout for every fired harmonic block in a fit.
-pub fn block_measure_valued_codes(fit: &BlockSparseFit) -> Result<Vec<MeasureValuedCode>, String> {
-    let b = fit.block_size;
-    if b < 2 || b % 2 != 0 {
-        return Err(format!(
-            "block_measure_valued_codes: harmonic readout requires block_size b = 2H (even, \
-             >= 2), got b = {b}"
-        ));
-    }
-    let g_total = fit.decoder.nrows() / b;
-    let mut all = Vec::new();
-    for block in 0..g_total {
-        let mut report = harmonic_measure_coordinates(fit, block)?;
-        all.append(&mut report.firings);
-    }
-    all.sort_by(|a, b| a.row.cmp(&b.row).then(a.block.cmp(&b.block)));
-    Ok(all)
-}
-
-/// Reconstruct dense rows by integrating the decoder against variable-length
-/// harmonic measures. This is the measure-valued analogue of
-/// [`crate::sparse_dict::reconstruct_block_sparse_rows`].
-pub fn reconstruct_measure_valued_rows(
-    decoder: ArrayView2<'_, f32>,
-    measures: &[MeasureValuedCode],
-    n_rows: usize,
-    block_size: usize,
-) -> Result<Array2<f32>, String> {
-    let b = block_size;
-    if b < 2 || b % 2 != 0 {
-        return Err(format!(
-            "reconstruct_measure_valued_rows: block_size must be even and >= 2, got {b}"
-        ));
-    }
-    if decoder.nrows() % b != 0 {
-        return Err(format!(
-            "reconstruct_measure_valued_rows: decoder rows {} not divisible by block_size {b}",
-            decoder.nrows()
-        ));
-    }
-    let g_total = decoder.nrows() / b;
-    let h_count = b / 2;
-    let p = decoder.ncols();
-    let mut out = Array2::<f32>::zeros((n_rows, p));
-    for measure in measures {
-        if measure.row >= n_rows {
-            return Err(format!(
-                "reconstruct_measure_valued_rows: row {} out of range 0..{n_rows}",
-                measure.row
-            ));
-        }
-        if measure.block >= g_total {
-            return Err(format!(
-                "reconstruct_measure_valued_rows: block {} out of range 0..{g_total}",
-                measure.block
-            ));
-        }
-        let code = code_from_spikes(&measure.spikes, h_count);
-        for r in 0..b {
-            let coeff = code[r] as f32;
-            if coeff == 0.0 {
-                continue;
-            }
-            let atom = decoder.row(measure.block * b + r);
-            for c in 0..p {
-                out[[measure.row, c]] += coeff * atom[c];
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Reconstruct dense rows from the single-coordinate harmonic readout, retaining
-/// exactly one spike per fired block. This is useful as the explicit baseline
-/// the measure-valued readout must dominate.
-pub fn reconstruct_single_coordinate_rows(fit: &BlockSparseFit) -> Result<Array2<f32>, String> {
-    let b = fit.block_size;
-    if b < 2 || b % 2 != 0 {
-        return Err(format!(
-            "reconstruct_single_coordinate_rows: harmonic readout requires block_size b = 2H \
-             (even, >= 2), got b = {b}"
-        ));
-    }
-    let mut measures = Vec::new();
-    for block in 0..fit.decoder.nrows() / b {
-        for (row, z) in collect_firings(fit, block, b)? {
-            let (spike, residual, residual_norm) = single_harmonic_spike(&z, 0.0);
-            assert_eq!(residual.len(), b);
-            assert!(residual_norm.is_finite());
-            measures.push(MeasureValuedCode {
-                block,
-                row,
-                spikes: vec![spike],
-                dual_eta: harmonic_dual_birth_eta(&coeffs_from_code(&residual), spike.amplitude),
-                used_super_resolution: false,
-            });
-        }
-    }
-    reconstruct_measure_valued_rows(fit.decoder.view(), &measures, fit.blocks.nrows(), b)
-}
-
-/// Held-in explained variance of a dense reconstruction against `x`.
-pub fn explained_variance_from_reconstruction(
-    x: ArrayView2<'_, f32>,
-    reconstruction: ArrayView2<'_, f32>,
-) -> Result<f64, String> {
-    if x.dim() != reconstruction.dim() {
-        return Err(format!(
-            "explained_variance_from_reconstruction: X shape {:?} != reconstruction shape {:?}",
-            x.dim(),
-            reconstruction.dim()
-        ));
-    }
-    let (n, p) = x.dim();
-    let mut means = vec![0.0; p];
-    for i in 0..n {
-        for c in 0..p {
-            means[c] += x[[i, c]] as f64;
-        }
-    }
-    for mean in &mut means {
-        *mean /= n.max(1) as f64;
-    }
-    let mut rss = 0.0;
-    let mut tss = 0.0;
-    for i in 0..n {
-        for c in 0..p {
-            let r = x[[i, c]] as f64 - reconstruction[[i, c]] as f64;
-            rss += r * r;
-            let centered = x[[i, c]] as f64 - means[c];
-            tss += centered * centered;
-        }
-    }
-    if tss <= f64::MIN_POSITIVE {
-        Ok(if rss <= f64::MIN_POSITIVE { 1.0 } else { 0.0 })
-    } else {
-        Ok(1.0 - rss / tss)
-    }
 }
 
 #[cfg(test)]

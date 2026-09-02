@@ -185,13 +185,6 @@ impl BirthRecord {
             .any(|candidate| matches!(&candidate.decision, BirthCandidateDecision::Accepted))
     }
 
-    /// Number of disjoint candidates installed by this round.
-    pub fn accepted_count(&self) -> usize {
-        self.candidates
-            .iter()
-            .filter(|candidate| matches!(&candidate.decision, BirthCandidateDecision::Accepted))
-            .count()
-    }
 }
 
 /// Lossless evidence and disposition for one attempted birth candidate.
@@ -587,10 +580,6 @@ fn current_residual(
     let fitted = term.try_fitted()?;
     Ok(&target.to_owned() - &fitted)
 }
-
-/// Frozen (`inner_max_iter == 0`, the #850 freeze) joint penalized quasi-Laplace criterion of a term
-/// at its current `(t, β)` — evaluate-don't-optimize. This is the joint-Laplace
-/// evidence at a fixed converged state (`loss.total() + extra penalties + ½
 
 /// Refresh the structured per-row metric on the FINAL residual before a
 /// terminal frozen joint evidence: the birth loop installs Σ⁻¹ fitted BEFORE

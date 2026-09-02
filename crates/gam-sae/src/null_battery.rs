@@ -521,83 +521,6 @@ const fn is_primary_structure_destroying_null(kind: NullKind) -> bool {
     )
 }
 
-/// Run an arbitrary scalar audit on the observed matrix and each requested null.
-///
-/// If [`NullKind::ArchitectureMatchedRandomWeight`] is requested,
-/// `random_weight` must be a real activation matrix harvested from a random-
-/// weight model with the same architecture family. The harness only resamples
-/// and moment-matches it; it does not fabricate an architecture null.
-pub fn run_null_battery<F>(
-    data: ArrayView2<'_, f64>,
-    random_weight: Option<ArrayView2<'_, f64>>,
-    config: &NullBatteryConfig,
-    mut audit: F,
-) -> Result<NullBatteryReport, String>
-where
-    F: FnMut(ArrayView2<'_, f64>) -> Result<f64, String>,
-{
-    validate_matrix(data, "observed")?;
-    if config.replicates == 0 {
-        return Err("null battery requires at least one replicate".to_string());
-    }
-    if config.kinds.is_empty() {
-        return Err("null battery requires at least one null kind".to_string());
-    }
-    for index in 0..config.kinds.len() {
-        if config.kinds[..index].contains(&config.kinds[index]) {
-            return Err(format!(
-                "null battery contains duplicate {} control",
-                config.kinds[index].as_str()
-            ));
-        }
-    }
-    let observed = audit(data)?;
-    require_finite(observed, "observed statistic")?;
-    let mut summaries = Vec::with_capacity(config.kinds.len());
-
-    for &kind in &config.kinds {
-        let mut samples = Vec::with_capacity(config.replicates);
-        for rep in 0..config.replicates {
-            let rep_seed = mix_seed(config.seed, kind_seed(kind), rep as u64);
-            let null = match kind {
-                NullKind::PhaseRandomized => phase_randomized_surrogate(data, rep_seed)?,
-                NullKind::RandomRotation => random_rotation_null(data, rep_seed)?,
-                NullKind::TokenShuffle => token_shuffle_null(data, rep_seed)?,
-                NullKind::PerDimensionShuffle => per_dimension_shuffle_null(data, rep_seed)?,
-                NullKind::MatchedSpectrumGaussian => {
-                    matched_spectrum_gaussian_null(data, rep_seed)?
-                }
-                NullKind::CovarianceExactHadamard => {
-                    covariance_exact_hadamard_null(data, rep_seed)?
-                }
-                NullKind::ArchitectureMatchedRandomWeight => {
-                    let Some(rw) = random_weight else {
-                        return Err(
-                            "architecture-matched random-weight null requested without random_weight activations"
-                                .to_string(),
-                        );
-                    };
-                    architecture_matched_random_weight_null(data, rw, rep_seed)?
-                }
-            };
-            let stat = audit(null.view())?;
-            require_finite(stat, "null statistic")?;
-            samples.push(stat);
-        }
-        summaries.push(summarize_null_distribution(
-            kind,
-            observed,
-            samples,
-            config.tail,
-        )?);
-    }
-
-    Ok(NullBatteryReport {
-        observed,
-        summaries,
-    })
-}
-
 /// Fourier phase-randomized surrogate, independently per activation channel.
 pub fn phase_randomized_surrogate(
     data: ArrayView2<'_, f64>,
@@ -661,29 +584,6 @@ pub fn phase_randomized_surrogate(
         }
     }
     validate_matrix(out.view(), "phase-randomized output")?;
-    Ok(out)
-}
-
-/// Multiply the activation matrix by a seeded random orthogonal matrix.
-pub fn random_rotation_null(data: ArrayView2<'_, f64>, seed: u64) -> Result<Array2<f64>, String> {
-    validate_matrix(data, "random-rotation input")?;
-    let p = data.ncols();
-    let q = random_orthogonal(p, seed)?;
-    let rotated = data.dot(&q);
-    validate_matrix(rotated.view(), "random-rotation output")?;
-    Ok(rotated)
-}
-
-/// Deterministically seeded token-row shuffle.
-pub fn token_shuffle_null(data: ArrayView2<'_, f64>, seed: u64) -> Result<Array2<f64>, String> {
-    validate_matrix(data, "token-shuffle input")?;
-    let mut order: Vec<usize> = (0..data.nrows()).collect();
-    let mut rng = StdRng::seed_from_u64(seed);
-    order.shuffle(&mut rng);
-    let mut out = Array2::<f64>::zeros(data.raw_dim());
-    for (dst, &src) in order.iter().enumerate() {
-        out.row_mut(dst).assign(&data.row(src));
-    }
     Ok(out)
 }
 
@@ -1471,39 +1371,6 @@ pub fn covariance_exact_hadamard_null_f32(
     covariance_exact_hadamard_null_impl(data, seed)
 }
 
-/// Gaussian matched-spectrum null for a matrix already expressed in principal-
-/// component coordinates.
-///
-/// Each output PC column is an independent normal draw with the observed
-/// column's mean and population standard deviation. Consequently the generated
-/// population matches the per-PC variance targets while a finite draw has the
-/// corresponding Monte Carlo fluctuation; cyclic ordering, higher moments, and
-/// cross-row manifold structure are destroyed. The explicit PC-coordinate
-/// contract avoids a hidden eigen-decomposition or a Python-side reimplementation.
-pub fn matched_spectrum_gaussian_null(
-    pc_scores: ArrayView2<'_, f64>,
-    seed: u64,
-) -> Result<Array2<f64>, String> {
-    validate_matrix(pc_scores, "matched-spectrum PC scores")?;
-    let location = stable_column_location(pc_scores)?;
-    let sd = stable_column_sd(pc_scores, &location)?;
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut out = Array2::<f64>::zeros(pc_scores.raw_dim());
-    for row in 0..out.nrows() {
-        for pc in 0..out.ncols() {
-            let centered_draw = sd[pc] * standard_normal(&mut rng);
-            out[[row, pc]] = location
-                .compose_centered(centered_draw, pc)
-                .map_err(|error| {
-                    format!(
-                        "matched-spectrum Gaussian draw failed at row {row}, column {pc}: {error}"
-                    )
-                })?;
-        }
-    }
-    Ok(out)
-}
-
 struct StableColumnLocation {
     mean: Array1<f64>,
     origin: Array1<f64>,
@@ -1811,60 +1678,6 @@ pub fn covariance_matched_gaussian_null(
                     )
                 })?;
             out[[row, col]] = draw;
-        }
-    }
-    Ok(out)
-}
-
-/// Resample real random-weight activations after mapping donor columns to the
-/// observed mean/scale parameters. Finite resampling still has ordinary Monte
-/// Carlo fluctuation around those targets.
-pub fn architecture_matched_random_weight_null(
-    observed: ArrayView2<'_, f64>,
-    random_weight: ArrayView2<'_, f64>,
-    seed: u64,
-) -> Result<Array2<f64>, String> {
-    validate_matrix(observed, "observed")?;
-    validate_matrix(random_weight, "random_weight")?;
-    if random_weight.ncols() != observed.ncols() {
-        return Err(format!(
-            "random_weight ncols {} != observed ncols {}",
-            random_weight.ncols(),
-            observed.ncols()
-        ));
-    }
-    let n = observed.nrows();
-    let p = observed.ncols();
-    let mut rng = StdRng::seed_from_u64(seed);
-    let observed_location = stable_column_location(observed)?;
-    let obs_sd = stable_column_sd(observed, &observed_location)?;
-    let random_weight_location = stable_column_location(random_weight)?;
-    let rw_sd = stable_column_sd(random_weight, &random_weight_location)?;
-    for axis in 0..p {
-        if rw_sd[axis] == 0.0 && obs_sd[axis] > 0.0 {
-            return Err(format!(
-                "architecture-matched donor column {axis} has zero scale but observed scale is {}",
-                obs_sd[axis]
-            ));
-        }
-    }
-    let mut out = Array2::<f64>::zeros((n, p));
-    for i in 0..n {
-        let src = rng.random_range(0..random_weight.nrows());
-        for j in 0..p {
-            let centered = random_weight_location.centered_value(random_weight[[src, j]], j)?;
-            let scaled = if rw_sd[j] > 0.0 {
-                (centered / rw_sd[j]) * obs_sd[j]
-            } else {
-                // Both target and donor are structurally constant on this
-                // axis, as certified above.
-                0.0
-            };
-            out[[i, j]] = observed_location
-                .compose_centered(scaled, j)
-                .map_err(|error| {
-                    format!("architecture-matched draw failed at row {i}, column {j}: {error}")
-                })?;
         }
     }
     Ok(out)
@@ -2314,110 +2127,6 @@ pub fn calibrated_roc_claim_report(
     })
 }
 
-/// Coordinate-dependent ordered-circle statistic on columns 0 and 1.
-pub fn first_two_ordered_circle_stat(data: ArrayView2<'_, f64>) -> Result<f64, String> {
-    validate_matrix(data, "first-two circle input")?;
-    if data.ncols() < 2 {
-        return Err("first-two circle statistic requires at least two columns".to_string());
-    }
-    let n = data.nrows();
-    if n < 4 {
-        return Err("first-two circle statistic requires at least four rows".to_string());
-    }
-    let centered = centered_unit_chart(data.slice(ndarray::s![.., 0..2]))?;
-    let x = centered.column(0);
-    let y = centered.column(1);
-    let mut pos_re = 0.0_f64;
-    let mut pos_im = 0.0_f64;
-    let mut neg_re = 0.0_f64;
-    let mut neg_im = 0.0_f64;
-    let mut energy = 0.0_f64;
-    let mut signed_area = 0.0_f64;
-    for i in 0..n {
-        let theta = 2.0 * PI * i as f64 / n as f64;
-        let c = theta.cos();
-        let s = theta.sin();
-        // Frequency-1 coefficient of z = x + i y. A coherent ordered circle puts
-        // its energy in one winding direction; independent per-channel phase
-        // randomization leaks comparable energy into the opposite winding.
-        pos_re += x[i] * c + y[i] * s;
-        pos_im += y[i] * c - x[i] * s;
-        neg_re += x[i] * c - y[i] * s;
-        neg_im += y[i] * c + x[i] * s;
-        energy += x[i] * x[i] + y[i] * y[i];
-        let j = (i + 1) % n;
-        signed_area += x[i] * y[j] - y[i] * x[j];
-    }
-    if energy == 0.0 {
-        return Ok(0.0);
-    }
-    let pos = pos_re * pos_re + pos_im * pos_im;
-    let neg = neg_re * neg_re + neg_im * neg_im;
-    let harmonic_energy = pos + neg;
-    let winding_balance = if harmonic_energy > 0.0 {
-        (pos - neg).max(0.0) / harmonic_energy
-    } else {
-        0.0
-    };
-    // Parseval-normalized energy in the ordered frequency-1 mode. A coherent
-    // circle attains one; unstructured architecture-matched activations put only
-    // O(1/n) of their energy in this single Fourier mode. The previous statistic
-    // computed these coefficients but omitted their concentration, allowing a
-    // chance high-area noise polygon to outrank the planted circle.
-    let harmonic_concentration = certify_unit_interval(
-        harmonic_energy / (n as f64 * energy),
-        n.saturating_mul(16),
-        "ordered-circle harmonic concentration",
-    )?;
-    let area_scale = certify_unit_interval(
-        signed_area.abs() / energy,
-        n.saturating_mul(8),
-        "ordered-circle signed-area scale",
-    )?;
-    Ok(winding_balance * harmonic_concentration * area_scale)
-}
-
-/// Basis-dependent energy in the first two coordinates.
-pub fn first_two_energy_fraction(data: ArrayView2<'_, f64>) -> Result<f64, String> {
-    validate_matrix(data, "first-two energy input")?;
-    if data.ncols() < 2 {
-        return Err("first-two energy requires at least two columns".to_string());
-    }
-    let centered = centered_unit_chart(data)?;
-    let mut total = ScaledSumSquares::default();
-    let mut first_two = ScaledSumSquares::default();
-    for i in 0..centered.nrows() {
-        for j in 0..centered.ncols() {
-            total.add(centered[[i, j]])?;
-            if j < 2 {
-                first_two.add(centered[[i, j]])?;
-            }
-        }
-    }
-    if total.scale == 0.0 {
-        return Ok(0.0);
-    }
-    certify_unit_interval(
-        scaled_square_ratio(first_two, total)?,
-        data.len(),
-        "first-two energy fraction",
-    )
-}
-
-/// Basis-invariant rank-two covariance energy fraction.
-pub fn top_two_energy_fraction(data: ArrayView2<'_, f64>) -> Result<f64, String> {
-    validate_matrix(data, "top-two energy input")?;
-    let (eigenvalues, total) = centered_covariance_spectrum(data, 2)?;
-    if total == 0.0 {
-        return Ok(0.0);
-    }
-    certify_unit_interval(
-        eigenvalues.iter().sum::<f64>() / total,
-        data.ncols().saturating_mul(128),
-        "top-two covariance energy fraction",
-    )
-}
-
 /// Frequency-1 circle detector calibrated by the phase-randomized null.
 ///
 /// The statistic finds the ambient two-plane carrying the strongest ordered
@@ -2814,29 +2523,6 @@ fn nonnegative_ratio(numerator: f64, denominator: f64) -> f64 {
     }
 }
 
-fn scaled_square_ratio(
-    numerator: ScaledSumSquares,
-    denominator: ScaledSumSquares,
-) -> Result<f64, String> {
-    if denominator.scale == 0.0 {
-        return if numerator.scale == 0.0 {
-            Ok(0.0)
-        } else {
-            Err("square ratio has a zero denominator and positive numerator".to_string())
-        };
-    }
-    if numerator.scale == 0.0 {
-        return Ok(0.0);
-    }
-    let scale_ratio = numerator.scale / denominator.scale;
-    let ratio = scale_ratio * scale_ratio * numerator.scaled_sum / denominator.scaled_sum;
-    if ratio.is_finite() {
-        Ok(ratio)
-    } else {
-        Err("square ratio is not representable in float64".to_string())
-    }
-}
-
 /// Project a theoretically unit-interval quantity only inside a forward-error
 /// envelope derived from the number of accumulated floating-point terms.
 /// Values outside that envelope are a broken invariant, not something a clamp
@@ -2889,18 +2575,6 @@ fn require_finite(value: f64, name: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("{name} is not finite: {value}"))
-    }
-}
-
-fn kind_seed(kind: NullKind) -> u64 {
-    match kind {
-        NullKind::PhaseRandomized => 0x91E4_11CE,
-        NullKind::RandomRotation => 0x807A_7100,
-        NullKind::TokenShuffle => 0x70CE_514F,
-        NullKind::PerDimensionShuffle => 0xD1AE_510F,
-        NullKind::MatchedSpectrumGaussian => 0x5EEC_7A11,
-        NullKind::CovarianceExactHadamard => 0x4841_DA4D,
-        NullKind::ArchitectureMatchedRandomWeight => 0xA2C4_177E,
     }
 }
 
@@ -3022,29 +2696,6 @@ fn standard_normal(rng: &mut StdRng) -> f64 {
     let u1: f64 = rng.random_range(f64::MIN_POSITIVE..1.0);
     let u2: f64 = rng.random_range(0.0..1.0);
     (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
-}
-
-fn stable_column_sd(
-    data: ArrayView2<'_, f64>,
-    location: &StableColumnLocation,
-) -> Result<Array1<f64>, String> {
-    if location.mean.len() != data.ncols() {
-        return Err("column-scale location dimension mismatch".to_string());
-    }
-    let mut accumulators = vec![ScaledSumSquares::default(); data.ncols()];
-    for row in data.rows() {
-        for j in 0..data.ncols() {
-            accumulators[j].add(location.centered_value(row[j], j)?)?;
-        }
-    }
-    let mut sd = Array1::<f64>::zeros(data.ncols());
-    for axis in 0..data.ncols() {
-        sd[axis] = accumulators[axis].rms(data.nrows())?;
-    }
-    if sd.iter().any(|value| !value.is_finite()) {
-        return Err("stable column-scale accumulation overflowed".to_string());
-    }
-    Ok(sd)
 }
 
 /// LAPACK-LASSQ-style sum of squares represented as

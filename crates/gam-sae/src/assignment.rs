@@ -4,12 +4,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::manifold::SaeManifoldRho;
-use gam_solve::evidence::{HybridAtomCandidate, HybridAtomChoice, select_hybrid_atom};
-use gam_terms::analytic_penalties::{
-    AnalyticPenalty, OrderedBetaBernoulliHessianDiagThirdChannels,
-    OrderedBetaBernoulliLogitAdjointData, OrderedBetaBernoulliPenalty,
-    SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight,
-};
+use gam_terms::analytic_penalties::{AnalyticPenalty, OrderedBetaBernoulliHessianDiagThirdChannels, OrderedBetaBernoulliLogitAdjointData, OrderedBetaBernoulliPenalty, SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight};
 use gam_terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 
 /// Shared per-atom row support measure.
@@ -53,31 +48,6 @@ impl SupportMeasure {
             ));
         }
         let weights = assignments.column(atom_idx).to_owned();
-        Self::from_weights(atom_idx, weights)
-    }
-
-    #[must_use = "support construction error must be handled"]
-    pub fn from_argmax_owners(
-        owners: &[usize],
-        atom_idx: usize,
-        k_atoms: usize,
-    ) -> Result<Self, String> {
-        if atom_idx >= k_atoms {
-            return Err(format!(
-                "SupportMeasure::from_argmax_owners: atom {atom_idx} out of range K={k_atoms}"
-            ));
-        }
-        let mut weights = Array1::<f64>::zeros(owners.len());
-        for (row, &owner) in owners.iter().enumerate() {
-            if owner >= k_atoms {
-                return Err(format!(
-                    "SupportMeasure::from_argmax_owners: row {row} owner {owner} out of range K={k_atoms}"
-                ));
-            }
-            if owner == atom_idx {
-                weights[row] = 1.0;
-            }
-        }
         Self::from_weights(atom_idx, weights)
     }
 
@@ -523,41 +493,6 @@ impl SaeAssignment {
         })
     }
 
-    /// #1033 — install a ρ-INVARIANT FROZEN routing (the amortized predicted
-    /// logits; see [`SaeAssignment::frozen_logits`]). `predicted` must be
-    /// `(n, K)`. With routing frozen, the gates are computed from `predicted` and
-    /// the logits are excluded from the inner Newton (their gradient/curvature are
-    /// inert, like an ungated atom's). Passing `None` restores the free-logit
-    /// path.
-    #[must_use = "build error must be handled"]
-    pub fn with_frozen_routing(mut self, predicted: Option<Array2<f64>>) -> Result<Self, String> {
-        if let Some(ref p) = predicted {
-            if p.dim() != (self.n_obs(), self.k_atoms()) {
-                return Err(format!(
-                    "SaeAssignment::with_frozen_routing: predicted shape {:?} must be ({}, {})",
-                    p.dim(),
-                    self.n_obs(),
-                    self.k_atoms()
-                ));
-            }
-            if matches!(self.mode, AssignmentMode::Softmax { .. }) {
-                return Err(
-                    "SaeAssignment::with_frozen_routing: frozen routing under Softmax is rejected \
-                     — the coupled simplex's entropy majorizer is assembled over the logits, which \
-                     a frozen (non-optimized) routing would leave inconsistent; this separable-mode \
-                     contract supports ordered Beta--Bernoulli and threshold gate, whose per-atom gates have no \
-                     simplex-coupled curvature to skip"
-                        .to_string(),
-                );
-            }
-            for row in 0..p.nrows() {
-                validate_finite_logits(p.row(row), row)?;
-            }
-        }
-        self.frozen_logits = predicted;
-        Ok(self)
-    }
-
     /// Whether the per-row routing is FROZEN (amortized) rather than free-logit.
     pub fn routing_is_frozen(&self) -> bool {
         self.frozen_logits.is_some()
@@ -600,110 +535,6 @@ impl SaeAssignment {
         } else {
             self.ungated.clone()
         }
-    }
-
-    /// #1033 — install the simplest faithful AMORTIZED routing predictor: a
-    /// fixed-form DISTILL of the current dictionary's routing, namely the current
-    /// (converged) logits SNAPSHOTTED as the ρ-invariant frozen routing. This is
-    /// the `x → logits` map "evaluated once at the frozen dictionary" — the
-    /// routing the dictionary already expresses — held fixed so the outer ρ-search
-    /// reuses it instead of re-optimizing the gates at every ρ. (A richer
-    /// predictor that recomputes logits from `x` via the encode-atlas chart
-    /// geometry is a later refinement; snapshotting the converged routing is the
-    /// exact fixed-point it would target at the frozen dictionary.) Rejected for
-    /// Softmax for the same simplex-coupling reason as [`Self::with_frozen_routing`].
-    #[must_use = "build error must be handled"]
-    pub fn freeze_routing_from_current_logits(self) -> Result<Self, String> {
-        let snapshot = self.logits.clone();
-        self.with_frozen_routing(Some(snapshot))
-    }
-
-    /// #1033 — in-place variant of [`Self::freeze_routing_from_current_logits`]
-    /// for callers holding `&mut SaeAssignment` (e.g. inside a `SaeManifoldTerm`),
-    /// where moving the assignment out is awkward. Same contract: snapshot the
-    /// current logits as the ρ-invariant frozen routing; reject Softmax.
-    pub fn freeze_routing_in_place(&mut self) -> Result<(), String> {
-        if matches!(self.mode, AssignmentMode::Softmax { .. }) {
-            return Err(
-                "SaeAssignment::freeze_routing_in_place: frozen routing under Softmax is rejected \
-                 (coupled-simplex entropy-majorizer); use ordered Beta--Bernoulli or threshold gate"
-                    .to_string(),
-            );
-        }
-        let snapshot = self.logits.clone();
-        for row in 0..snapshot.nrows() {
-            validate_finite_logits(snapshot.row(row), row)?;
-        }
-        self.frozen_logits = Some(snapshot);
-        Ok(())
-    }
-
-    /// #1033 — install an explicit predicted routing in place (the
-    /// [`RoutingPredictor::ChartGeometry`] output), `&mut self` variant of
-    /// [`Self::with_frozen_routing`]. `predicted` must be `(n, K)`; rejects Softmax
-    /// (separable-mode contract) and non-finite predictions.
-    pub fn set_frozen_routing_in_place(&mut self, predicted: Array2<f64>) -> Result<(), String> {
-        if predicted.dim() != (self.n_obs(), self.k_atoms()) {
-            return Err(format!(
-                "SaeAssignment::set_frozen_routing_in_place: predicted shape {:?} must be ({}, {})",
-                predicted.dim(),
-                self.n_obs(),
-                self.k_atoms()
-            ));
-        }
-        if matches!(self.mode, AssignmentMode::Softmax { .. }) {
-            return Err(
-                "SaeAssignment::set_frozen_routing_in_place: frozen routing under Softmax is \
-                 rejected (coupled-simplex entropy-majorizer); use ordered Beta--Bernoulli or threshold gate"
-                    .to_string(),
-            );
-        }
-        for row in 0..predicted.nrows() {
-            validate_finite_logits(predicted.row(row), row)?;
-        }
-        self.frozen_logits = Some(predicted);
-        Ok(())
-    }
-
-    /// #1033 — lift the frozen routing, restoring the free-logit search path.
-    pub fn thaw_routing(&mut self) {
-        self.frozen_logits = None;
-    }
-
-    /// #1026 — designate which atoms are UNGATED (the dense linear/background
-    /// tier; see [`SaeAssignment::ungated`]). `flags` must have length `K`.
-    ///
-    /// Ungating is defined for the COLUMN-SEPARABLE gate modes (ordered Beta--Bernoulli and
-    /// threshold gate): each atom's gate is an independent per-atom function of its own
-    /// logit, so pinning one atom to `a_k ≡ 1` leaves every other atom's gate
-    /// exactly as computed. Softmax is a coupled simplex (`Σ_k a_k = 1` over all
-    /// `K`), so a unit gate for one atom is only well defined relative to a
-    /// gated-subset renormalization that must also be reflected in the logit-JVP
-    /// and the entropy majorizer; this constructor's contract is restricted to
-    /// the separable modes, and an ungated atom under Softmax is REJECTED here so
-    /// the inner solve never runs on a value/gradient-mismatched gate. Callers
-    /// wanting a dense background tier under Softmax route it as an ordered Beta--Bernoulli or
-    /// threshold gate atom.
-    #[must_use = "build error must be handled"]
-    pub fn with_ungated(mut self, flags: Vec<bool>) -> Result<Self, String> {
-        if flags.len() != self.k_atoms() {
-            return Err(format!(
-                "SaeAssignment::with_ungated: flags length {} must equal K={}",
-                flags.len(),
-                self.k_atoms()
-            ));
-        }
-        if matches!(self.mode, AssignmentMode::Softmax { .. }) && flags.iter().any(|&u| u) {
-            return Err(
-                "SaeAssignment::with_ungated: an ungated atom under Softmax routing is \
-                 rejected — the coupled simplex requires a gated-subset renormalization \
-                 reflected in the logit-JVP and entropy majorizer, which this separable-mode \
-                 contract does not perform; route a dense background tier as ordered Beta--Bernoulli or threshold gate"
-                    .to_string(),
-            );
-        }
-        self.ungated = flags;
-        Ok(self)
     }
 
     /// Whether any atom is ungated (the #1026 background tier is engaged).
@@ -1036,19 +867,6 @@ impl SaeAssignment {
             })
             .collect();
         Self::with_mode(logits, coords, mode)
-    }
-}
-
-pub(crate) fn neutral_gate_weights(mode: AssignmentMode, k_atoms: usize) -> Array1<f64> {
-    match mode {
-        AssignmentMode::Softmax { .. } => Array1::from_elem(k_atoms, 1.0 / (k_atoms.max(1) as f64)),
-        AssignmentMode::OrderedBetaBernoulli { temperature, .. } => {
-            ordered_beta_bernoulli_row(Array1::<f64>::zeros(k_atoms).view(), temperature)
-        }
-        AssignmentMode::ThresholdGate { .. } => Array1::from_elem(k_atoms, 0.5),
-        // At all-equal (zero) logits the deterministic tie-break admits the
-        // FIRST k atoms — the neutral support under index-stable ordering.
-        AssignmentMode::TopK { k } => topk_row(Array1::<f64>::zeros(k_atoms).view(), k),
     }
 }
 
@@ -1615,13 +1433,6 @@ mod ordered_beta_bernoulli_exact_hessian_tests {
     }
 }
 
-pub fn assignment_prior_value(
-    assignment: &SaeAssignment,
-    rho: &SaeManifoldRho,
-) -> Result<f64, String> {
-    assignment_prior_value_weighted(assignment, rho, None)
-}
-
 /// As [`assignment_prior_value`], but with #991 design-honesty per-row weights:
 /// row `i`'s per-row prior contribution is scaled by `w_i` (mean-1). This is the
 /// per-row latent prior's analog of the `√w_i`-weighted data likelihood and the
@@ -1699,13 +1510,6 @@ pub(crate) fn assignment_prior_value_weighted(
     })
 }
 
-pub fn assignment_prior_log_strength_derivative(
-    assignment: &SaeAssignment,
-    rho: &SaeManifoldRho,
-) -> Result<f64, String> {
-    assignment_prior_log_strength_derivative_weighted(assignment, rho, None)
-}
-
 /// #991-weighted [`assignment_prior_log_strength_derivative`]. Every assignment
 /// mode differentiates the same weighted scalar used by its value path.
 pub(crate) fn assignment_prior_log_strength_derivative_weighted(
@@ -1750,12 +1554,6 @@ pub(crate) fn assignment_prior_log_strength_derivative_weighted(
         // No prior term ⇒ no ρ-derivative (sparsity lives in the fixed support).
         AssignmentMode::TopK { .. } => 0.0,
     })
-}
-pub fn assignment_prior_log_strength_hdiag(
-    assignment: &SaeAssignment,
-    rho: &SaeManifoldRho,
-) -> Result<Array1<f64>, String> {
-    assignment_prior_log_strength_hdiag_weighted(assignment, rho, None)
 }
 
 /// #991-weighted [`assignment_prior_log_strength_hdiag`]. Every assignment mode
@@ -1986,13 +1784,6 @@ fn mask_fixed_logit_entries(assignment: &SaeAssignment, arr: &mut Array1<f64>) {
     }
 }
 
-pub fn assignment_prior_log_strength_target_mixed(
-    assignment: &SaeAssignment,
-    rho: &SaeManifoldRho,
-) -> Result<Array1<f64>, String> {
-    assignment_prior_log_strength_target_mixed_weighted(assignment, rho, None)
-}
-
 /// #991-weighted [`assignment_prior_log_strength_target_mixed`]. The fixed-α
 /// fall-through reuses the `w_i`-weighted gradient; the learnable-α ordered Beta--Bernoulli branch
 /// uses the same weighted active mass as the value, gradient, and Hessian.
@@ -2035,13 +1826,6 @@ pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
         }
         _ => Ok(assignment_prior_grad_hdiag_weighted(assignment, rho, row_weights)?.0),
     }
-}
-
-pub fn assignment_prior_grad_hdiag(
-    assignment: &SaeAssignment,
-    rho: &SaeManifoldRho,
-) -> Result<(Array1<f64>, Array1<f64>), String> {
-    assignment_prior_grad_hdiag_weighted(assignment, rho, None)
 }
 
 /// #991-weighted [`assignment_prior_grad_hdiag`] — the per-(row, atom) logit
@@ -2215,18 +1999,6 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
     Ok((grad, diag))
 }
 
-/// Build exact derivatives of the ordered Beta--Bernoulli PSD curvature
-/// majorizer for the SAE log-det adjoint Γ, using the same penalty configuration —
-/// `alpha`/`tau`/`learnable_alpha` and the `lambda_sparse` weight convention —
-/// that [`assignment_prior_grad_hdiag`] assembles into `htt`. Returns `None`
-/// for other assignment modes.
-pub fn ordered_beta_bernoulli_psd_majorizer_third_channels(
-    assignment: &SaeAssignment,
-    rho: &SaeManifoldRho,
-) -> Result<Option<OrderedBetaBernoulliHessianDiagThirdChannels>, String> {
-    ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(assignment, rho, None)
-}
-
 /// As [`ordered_beta_bernoulli_psd_majorizer_third_channels`], with the #991 design-honesty per-row
 /// weights the assembled `htt` carried (the channels must differentiate the
 /// same weighted operator; `z_jac` carries the weighted active-mass derivative
@@ -2277,67 +2049,6 @@ pub(crate) fn ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
         }
     }
     Ok(Some(channels))
-}
-
-/// #1026 hybrid curved + linear-tail adjudication for one SAE atom slot.
-///
-/// A hybrid dictionary lets each atom slot be either a CURVED atom (its fitted
-/// `latent_dim ≥ 1` manifold chart, whose decoded image may turn) or its LINEAR
-/// special case (the euclidean-d=1-linear atom — one straight decoder direction,
-/// `γ(t) = t·b`, zero turning). The two are nested: the linear atom is exactly
-/// the curved family restricted to its straight sub-model, so a hybrid slot
-/// cannot lose to pure-linear at matched actives — it strictly generalizes it.
-///
-/// This is the single call the SAE fitter makes per atom to choose the split by
-/// EVIDENCE rather than fiat. It packages the atom's two already-fitted
-/// candidates — each scored on the COMMON rank-aware Laplace scale (`−V = NLE`,
-/// lower wins, identical to the union/mixture rungs) on the same rows — and
-/// routes them through [`select_hybrid_atom`]. The curved candidate's fitted
-/// turning `Θ` (from
-/// [`crate::chart_canonicalization::d1_atom_fitted_turning`]) enters
-/// as the decision feature: a `Θ → 0` atom yields to the cheaper linear tail by
-/// construction (the dominance floor — a curved atom buys nothing on a straight
-/// feature), a high-`Θ` atom takes the curved parameterization when its
-/// curvature lowers the NLE by more than its extra-parameter price (the `Θ/√ε`
-/// crossover).
-///
-/// `manifold` is the atom's fitted chart manifold; a non-curveable (already
-/// Euclidean-flat) chart can only present the linear candidate, which this
-/// helper enforces by ignoring any curved candidate offered for a flat chart —
-/// a flat chart has no curvature to price, so the linear special case is its
-/// only honest parameterization. Curveable charts present both candidates.
-///
-/// # Wiring into the fitter (the one call into `sae_manifold.rs`)
-///
-/// The post-fit pass in `sae_manifold.rs` already computes each d=1 atom's
-/// fitted turning `Θ` (the read-only EV-vs-Θ diagnostic). To make the split
-/// load-bearing, that pass supplies, per atom, the curved-candidate NLE +
-/// parameter count + `Θ` and the linear-candidate NLE + parameter count (both
-/// fitted on the atom's rows), and calls this helper; the returned
-/// [`HybridAtomChoice`] tells the fitter which parameterization to keep for that
-/// slot. The fitting of the two candidates lives in `sae_manifold.rs` (the
-/// manifold-chart fitter); the SELECTION/scoring lives here.
-pub fn select_hybrid_atom_parameterization(
-    manifold: &LatentManifold,
-    curved: Option<HybridAtomCandidate>,
-    linear: HybridAtomCandidate,
-) -> HybridAtomChoice {
-    // A flat (Euclidean) chart has no curvature to price: its only honest
-    // parameterization is the linear special case, so any curved candidate
-    // offered for it is dropped before the evidence comparison. Curveable charts
-    // (Circle / Sphere / Torus / curved products) present both candidates.
-    let curved = if manifold.is_euclidean() {
-        None
-    } else {
-        curved
-    };
-    let candidates: Vec<HybridAtomCandidate> = match curved {
-        Some(c) => vec![linear, c],
-        None => vec![linear],
-    };
-    // `candidates` is never empty (it always contains the linear candidate), so
-    // the selector always returns a choice.
-    select_hybrid_atom(&candidates).expect("hybrid atom slot always has the linear candidate")
 }
 
 #[cfg(test)]

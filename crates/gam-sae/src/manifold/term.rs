@@ -25,37 +25,6 @@ pub(crate) const SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR: f64 = 1.0e-8;
 /// Matches the `1e-9` relative rank cutoff used across the codebase.
 pub(crate) const SAE_DECODER_BETA_NULL_RELATIVE_FLOOR: f64 = 1.0e-9;
 
-/// Nominal curvature-homotopy `η` step (#1007): the tracker covers `η ∈ [0, 1]`
-/// in this many equal predictor-corrector waypoints when the branch is clean.
-/// Five waypoints is a few corrector solves — far cheaper than the multi-seed
-/// cascade it replaces — and the step is halved adaptively when the arrow-factor
-/// min pivot shrinks, so a near-bifurcation stretch is resolved at finer
-/// granularity without a separate knob.
-pub(crate) const CURVATURE_WALK_INITIAL_ETA_STEP: f64 = 0.2;
-
-/// Smallest curvature-homotopy `η` step (#1007). A pivot collapse (or corrector
-/// failure) that persists at this step is a DETECTED branch bifurcation, not a
-/// step-size artifact: the walk records it and defers to the seed cascade.
-pub(crate) const CURVATURE_WALK_MIN_ETA_STEP: f64 = 1.0 / 256.0;
-
-/// Hard ceiling on accepted corrector solves in one curvature-homotopy walk
-/// (#1007). Bounds the walk's cost under repeated halving; reaching it is a
-/// structural-termination signal (the branch is not cleanly trackable) that
-/// defers to the cascade, never a spin.
-pub(crate) const CURVATURE_WALK_MAX_CORRECTORS: usize = 32;
-
-/// Joint Newton iteration budget for the curvature-walk degenerate-basin
-/// recovery (#1117). When the walk lands on a sub-arrival-floor (see the
-/// `arrival_floor` in `run_curvature_homotopy_entry_at_rho`: the achievable
-/// linear ceiling `anchor_ev` minus one atom's share) reconstruction, the
-/// recovery runs a REAL joint fit from the pristine
-/// (circle-aware) seed with at least this many inner iterations, independent of
-/// the outer objective's possibly-frozen `inner_max_iter = 0` — otherwise the
-/// recovery (and the fallback cascade) would re-freeze at the cold seed and
-/// never escape the linear basin. Matches the cold-start budget that recovers
-/// EV ≈ 0.94 on the K = 1 periodic circle.
-pub(crate) const CURVATURE_WALK_RECOVERY_INNER_ITERS: usize = 25;
-
 /// Relative floor on the Newton directional decrease, expressed as a tiny
 /// multiple of `‖g‖·‖Δ‖`. A predicted decrease below this is at the level of
 /// f64 round-off in the quadratic model and is treated as no progress (the step
@@ -249,19 +218,6 @@ impl SaeBetaPenaltyAssembly {
         }
     }
 }
-
-/// ABSOLUTE "worse than a constant predictor" explained-variance floor (#1023),
-/// used by the curved-ARRIVAL quality gate and the inner-fit incumbent-restore
-/// gate as the point below which a CONVERGED fit is degenerate whatever the data's
-/// achievable ceiling. `0.10` is a deliberately conservative "must explain at least
-/// a tenth of the variance or it is structurally degenerate" floor for those
-/// post-convergence quality checks; it is NOT a tuned operating point.
-///
-/// This is not used by the collapse detector. That detector requires actual
-/// same-state decoder disappearance or #2362 structural evidence. This constant
-/// survives only where a fixed "worse than the mean" reference is genuinely
-/// wanted (arrival / incumbent gates).
-pub(crate) const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.10;
 
 /// #1026 — reconstruction EV-improvement / EV-degradation tolerance for the
 /// inner-fit reconstruction INCUMBENT. A new inner iterate is recorded as the

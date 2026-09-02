@@ -26,9 +26,6 @@
 //!    loop of charts, with a trivial/nontrivial verdict whose tolerance is
 //!    DERIVED from the loop's own defects (never a magic constant).
 
-use crate::inference::layer_transport::{ChartTopology, FittedTransport};
-use crate::inference::transport_class::CircleTransportReport;
-use ndarray::Array1;
 use std::f64::consts::{PI, TAU};
 
 /// One component map of a chart-coordinate pipeline, abstracted to exactly the
@@ -59,69 +56,7 @@ pub struct Contract {
 }
 
 impl Contract {
-    /// Validate the three certificate numbers: all finite, none negative.
-    fn validate(&self, stage: usize) -> Result<(), String> {
-        for (label, v) in [
-            ("domain_radius", self.domain_radius),
-            ("defect", self.defect),
-            ("lipschitz", self.lipschitz),
-        ] {
-            if !v.is_finite() {
-                return Err(format!(
-                    "contract stage {stage} ({}): {label} = {v} is not finite",
-                    self.name
-                ));
-            }
-            if v < 0.0 {
-                return Err(format!(
-                    "contract stage {stage} ({}): {label} = {v} is negative",
-                    self.name
-                ));
-            }
-        }
-        Ok(())
-    }
 
-    /// Build a component contract from a fitted inter-layer transport `h`, the
-    /// bridge from the crate's real transport artifacts ([`FittedTransport`],
-    /// produced by [`fit_transport_map`](crate::inference::layer_transport::fit_transport_map))
-    /// into the composer. The three certificate numbers are read directly off
-    /// the fit:
-    ///
-    /// - `domain_radius` = the source chart's coordinate span (a full turn `2π`
-    ///   on a circle, `hi − lo` on an interval): the ball on which `h`'s smooth
-    ///   is defined.
-    /// - `defect` = the target-space approximation error of the fitted map,
-    ///   estimated by its [`residual_rms`](FittedTransport::residual_rms) — how
-    ///   far `h` sits from the observed continuation coordinates. This is the
-    ///   sup-norm-style gap the shadowing bound propagates.
-    /// - `lipschitz` = the metric expansion bound `sup_t |h′(t)|` measured over
-    ///   a dense grid of the source domain — the largest local stretch the map
-    ///   applies. For a near-isometric TRANSPORT layer this is `≈ 1`; a COMPUTE
-    ///   layer that reshapes the chart metric reads `> 1` and amplifies earlier
-    ///   stages' error more (see [`compose_contracts`]).
-    pub fn from_transport(
-        t: &FittedTransport,
-        name: impl Into<String>,
-        grid: usize,
-    ) -> Result<Contract, String> {
-        let (lo, hi) = match t.topology_from {
-            ChartTopology::Circle => (0.0, TAU),
-            ChartTopology::Interval { lo, hi } => (lo, hi),
-        };
-        let g = grid.max(2);
-        let pts: Vec<f64> = (0..g)
-            .map(|k| lo + (hi - lo) * (k as f64) / ((g - 1) as f64))
-            .collect();
-        let deriv = t.derivative(Array1::from_vec(pts).view())?;
-        let lipschitz = deriv.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-        Ok(Contract {
-            name: name.into(),
-            domain_radius: hi - lo,
-            defect: t.residual_rms,
-            lipschitz,
-        })
-    }
 }
 
 /// The end-to-end certificate produced by composing a [`Contract`] chain.
@@ -213,86 +148,6 @@ pub fn compose_contracts(chain: &[Contract]) -> ComposedContract {
         per_stage_contribution,
         domain_ok,
     }
-}
-
-/// Compose a contract chain and check domain feasibility against the nominal
-/// input spread at each stage entry.
-///
-/// `entry_radii[j]` is the radius of the coordinate ball the pipeline actually
-/// feeds to stage `j` (the nominal spread of inputs, before approximation
-/// error). The realized inputs to stage `j` sit within `entry_radii[j] + E_{j-1}`
-/// of the certified center, where `E_{j-1}` is the error accumulated before
-/// stage `j` (propagated exactly as in [`compose_contracts`]). Feasibility
-/// requires that displacement to fit the stage's certified domain:
-///
-/// ```text
-/// entry_radii[j] + E_{j-1} ≤ domain_radius_j    for every stage j.
-/// ```
-///
-/// Per the measure-don't-latch doctrine, a violation is **reported, never folded
-/// into the bound**: [`total_defect`](ComposedContract::total_defect) is always
-/// the honest shadowing bound of the chain (it is never shrunk to make a stage
-/// fit), and any stage whose certified domain is overrun is surfaced as an
-/// `Err` naming the stage and the exact overflow. A feasible chain returns
-/// `Ok` with [`domain_ok`](ComposedContract::domain_ok)` = true`.
-///
-/// `Err` is also returned for structural problems (length mismatch, non-finite
-/// or negative certificate numbers or entry radii).
-pub fn compose_with_trace(
-    chain: &[Contract],
-    entry_radii: &[f64],
-) -> Result<ComposedContract, String> {
-    if chain.len() != entry_radii.len() {
-        return Err(format!(
-            "compose_with_trace: {} contracts but {} entry radii",
-            chain.len(),
-            entry_radii.len()
-        ));
-    }
-    for (j, c) in chain.iter().enumerate() {
-        c.validate(j)?;
-    }
-    for (j, &r) in entry_radii.iter().enumerate() {
-        if !r.is_finite() || r < 0.0 {
-            return Err(format!(
-                "compose_with_trace: entry_radii[{j}] = {r} invalid"
-            ));
-        }
-    }
-
-    let composed = compose_contracts(chain);
-
-    // Feasibility trace: displacement entering stage j is entry_radii[j] + E_{j-1}.
-    // Collect every violation rather than bailing on the first — a full report
-    // is more actionable than the first offender.
-    let mut violations: Vec<String> = Vec::new();
-    let mut accumulated = 0.0_f64;
-    for (j, stage) in chain.iter().enumerate() {
-        let required = entry_radii[j] + accumulated;
-        if required > stage.domain_radius {
-            let overflow = required - stage.domain_radius;
-            violations.push(format!(
-                "stage {j} ({}): entry radius {} + accumulated error {} = {} exceeds \
-                 domain_radius {} by {}",
-                stage.name, entry_radii[j], accumulated, required, stage.domain_radius, overflow
-            ));
-        }
-        accumulated = stage.defect + stage.lipschitz * accumulated;
-    }
-
-    if !violations.is_empty() {
-        return Err(format!(
-            "compose_with_trace: {} domain violation(s) (bound total_defect = {} is unchanged): {}",
-            violations.len(),
-            composed.total_defect,
-            violations.join("; ")
-        ));
-    }
-
-    Ok(ComposedContract {
-        domain_ok: true,
-        ..composed
-    })
 }
 
 /// The net `O(2)` element obtained by composing the transports around a closed
@@ -401,22 +256,6 @@ pub fn loop_holonomy(edges: &[(i8, f64)], defects: &[f64]) -> HolonomyReport {
         is_trivial,
         angle_tolerance,
     }
-}
-
-/// Adapter: compute loop holonomy directly from a loop of fitted circle
-/// transport classifications.
-///
-/// [`CircleTransportReport`] already carries the `O(2)` element as
-/// [`winding`](CircleTransportReport::winding) (the sign) and
-/// [`phase`](CircleTransportReport::phase) (the angle), plus its
-/// [`defect`](CircleTransportReport::defect) (the `O(2)` departure that bounds
-/// the angle uncertainty). This lifts them straight into [`loop_holonomy`]
-/// without the caller restating the `(sign, angle)` interface. The reports must
-/// be given in loop order.
-pub fn holonomy_from_transports(loop_edges: &[CircleTransportReport]) -> HolonomyReport {
-    let edges: Vec<(i8, f64)> = loop_edges.iter().map(|r| (r.winding, r.phase)).collect();
-    let defects: Vec<f64> = loop_edges.iter().map(|r| r.defect).collect();
-    loop_holonomy(&edges, &defects)
 }
 
 #[cfg(test)]

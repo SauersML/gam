@@ -39,10 +39,7 @@
 use ndarray::{Array1, Array2, ArrayView2};
 
 use super::weight_frame_catalog::{WeightFrameCatalog, WeightFrameSource};
-use crate::frames::{
-    GrassmannCrossMoment, GrassmannFrame, SAE_FRAME_ACTIVATION_MARGIN,
-    SAE_FRAME_MIN_AUTO_OUTPUT_DIM, SAE_FRAME_RANK_CUTOFF,
-};
+use crate::frames::{GrassmannFrame, SAE_FRAME_ACTIVATION_MARGIN, SAE_FRAME_MIN_AUTO_OUTPUT_DIM, SAE_FRAME_RANK_CUTOFF};
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd, fast_ab, fast_abt};
 
@@ -227,29 +224,6 @@ impl InFrameCurvedRegionPrediction {
         self.frame_source.as_ref()
     }
 
-    pub fn inframe_entries(&self) -> usize {
-        self.fitted_coords.len()
-    }
-
-    pub fn ambient_entries_if_materialized(&self) -> usize {
-        self.rows.len().saturating_mul(self.frame.output_dim())
-    }
-
-    pub fn materialize_ambient(&self) -> Array2<f64> {
-        fast_abt(&self.fitted_coords, &self.frame.frame().to_owned())
-    }
-
-    fn fill_row_into(&self, local_row: usize, out: &mut [f64]) {
-        let u = self.frame.frame();
-        let r = self.frame.rank();
-        for c in 0..self.frame.output_dim() {
-            let mut acc = 0.0;
-            for axis in 0..r {
-                acc += self.fitted_coords[[local_row, axis]] * u[[c, axis]];
-            }
-            out[c] = acc;
-        }
-    }
 }
 
 /// Lazy curved prediction over the full corpus. The hot fit path stores only
@@ -287,143 +261,6 @@ impl InFrameCurvedPrediction {
         &self.regions
     }
 
-    pub fn inframe_entries(&self) -> usize {
-        self.regions
-            .iter()
-            .map(InFrameCurvedRegionPrediction::inframe_entries)
-            .sum()
-    }
-
-    pub fn ambient_entries_if_materialized(&self) -> usize {
-        self.n_rows.saturating_mul(self.output_dim)
-    }
-
-    pub fn accepted_ambient_entries_if_eager(&self) -> usize {
-        self.regions
-            .iter()
-            .map(InFrameCurvedRegionPrediction::ambient_entries_if_materialized)
-            .sum()
-    }
-
-    pub fn materialize_rows(&self, rows: &[usize]) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros((rows.len(), self.output_dim));
-        let mut row_buf = vec![0.0_f64; self.output_dim];
-        for (out_row, &global_row) in rows.iter().enumerate() {
-            for region in &self.regions {
-                if let Some(local_row) = region.rows.iter().position(|&row| row == global_row) {
-                    region.fill_row_into(local_row, &mut row_buf);
-                    for c in 0..self.output_dim {
-                        out[[out_row, c]] = row_buf[c];
-                    }
-                    break;
-                }
-            }
-        }
-        out
-    }
-
-    pub fn materialize_ambient(&self) -> Array2<f64> {
-        let rows: Vec<usize> = (0..self.n_rows).collect();
-        self.materialize_rows(&rows)
-    }
-}
-
-/// Fit the curved stage in learned low-rank ambient frames.
-///
-/// `residual` is the Stage-1 residual `R = X − X̂_linear` (`N × p`), `regions`
-/// the curved candidates, `n_tokens_total` the corpus token count `N` used to
-/// amortize the global frame charge.
-pub fn fit_inframe_curved_regions(
-    residual: ArrayView2<'_, f64>,
-    regions: &[CurvedRegion],
-    n_tokens_total: usize,
-    config: &InFrameCurvedConfig,
-) -> Result<InFrameCurvedResult, String> {
-    let p = residual.ncols();
-    if p == 0 {
-        return Err("fit_inframe_curved_regions: residual must have p >= 1".to_string());
-    }
-    if config.frame_rank_min == 0 || config.frame_rank_max < config.frame_rank_min {
-        return Err(
-            "fit_inframe_curved_regions: require 1 <= frame_rank_min <= frame_rank_max".to_string(),
-        );
-    }
-
-    let mut fits: Vec<Option<RegionFit>> = Vec::with_capacity(regions.len());
-    for region in regions {
-        fits.push(fit_one_region(residual, region, config)?);
-    }
-
-    // Assemble lazy prediction records and the measured memory ledger. No `N × p`
-    // curved image is formed here; accepted atom images remain `N_g × r_g`.
-    let mut prediction_regions = Vec::new();
-    let mut records = Vec::with_capacity(regions.len());
-    let mut selected_regions = Vec::new();
-    let mut dense_border = 0usize;
-    let mut inframe_border = 0usize;
-    let mut dense_cov = 0usize;
-    let mut inframe_cov = 0usize;
-    let mut frame_charge = 0.0f64;
-    let ln_n = (n_tokens_total.max(2) as f64).ln();
-
-    for (i, (region, fit)) in regions.iter().zip(fits.iter()).enumerate() {
-        let Some(fit) = fit else {
-            continue;
-        };
-        let m = region.basis_size;
-        let r = fit.frame_rank;
-        let inframe_border_coeffs = m.saturating_mul(r);
-        let dense_border_coeffs = m.saturating_mul(p);
-        let manifold_dim = r.saturating_mul(p.saturating_sub(r));
-        records.push(RegionRecord {
-            region: i,
-            frame_source: None,
-            frame_catalog_index: None,
-            occupancy_status: ChartOccupancyStatus::Occupied,
-            basis_size: m,
-            frame_rank: r,
-            frame_manifold_dim: manifold_dim,
-            evidence: fit.evidence.clone(),
-            inframe_border_coeffs,
-            dense_border_coeffs,
-        });
-        if !fit.evidence.selected_by_bic {
-            continue;
-        }
-        selected_regions.push(i);
-        dense_border += dense_border_coeffs;
-        inframe_border += inframe_border_coeffs;
-        dense_cov += dense_border_coeffs
-            .saturating_mul(dense_border_coeffs)
-            .saturating_mul(BYTES_PER_F64);
-        inframe_cov += inframe_border_coeffs
-            .saturating_mul(inframe_border_coeffs)
-            .saturating_mul(BYTES_PER_F64);
-        frame_charge += 0.5 * manifold_dim as f64 * ln_n;
-        prediction_regions.push(InFrameCurvedRegionPrediction {
-            rows: region.rows.clone(),
-            frame: fit.frame.clone(),
-            frame_source: None,
-            fitted_coords: fit.fitted_coords.clone(),
-        });
-    }
-
-    let ledger = CascadeMemoryLedger {
-        p,
-        n_regions_selected: selected_regions.len(),
-        dense_border_coeffs: dense_border,
-        inframe_border_coeffs: inframe_border,
-        dense_cov_bytes: dense_cov,
-        inframe_cov_bytes: inframe_cov,
-        global_frame_charge: frame_charge,
-    };
-
-    Ok(InFrameCurvedResult {
-        curved_prediction: InFrameCurvedPrediction::new(residual.nrows(), p, prediction_regions),
-        records,
-        selected_regions,
-        ledger,
-    })
 }
 
 /// Fit curved charts inside a weight-sourced frame catalog.
@@ -556,36 +393,6 @@ pub fn fit_inframe_curved_weight_frame_catalog(
     })
 }
 
-/// Fit ONE region's curved chart purely in its learned ambient frame and return
-/// the learned frame rank together with the ambient curved prediction
-/// (`n_g × p`, the in-frame chart lifted through the frame). This is the
-/// gate-free single-region path — the arithmetic is `r`-dimensional throughout
-/// and `p` only reappears in the final lift `Ẑ Uᵀ`. Returns `None` when the
-/// region admits no beneficial low-rank frame (it belongs on the certified
-/// full-`p` path). Exposed for drivers and parity checks; the gated
-/// [`fit_inframe_curved_regions`] shares the same internals.
-pub fn inframe_curved_region_prediction(
-    residual: ArrayView2<'_, f64>,
-    rows: &[usize],
-    config: &InFrameCurvedConfig,
-) -> Result<Option<InFrameCurvedRegionPrediction>, String> {
-    if rows.len() < 2 {
-        return Ok(None);
-    }
-    let r_g = take_rows(residual, rows);
-    let Some(frame) = learn_frame(&r_g, config)? else {
-        return Ok(None);
-    };
-    let z = fast_ab(&r_g, &frame.frame().to_owned());
-    let fitted = fit_radial_all(&z, config.whitening_ridge)?;
-    Ok(Some(InFrameCurvedRegionPrediction {
-        rows: rows.to_vec(),
-        frame,
-        frame_source: None,
-        fitted_coords: fitted,
-    }))
-}
-
 /// PRODUCTION SEAM. Learn the low-rank ambient frame of a curved region's
 /// residual span *before* any dense fit, returned as the exact
 /// [`GrassmannFrame`] the arrow-Schur assembly consumes through
@@ -680,63 +487,10 @@ pub fn activate_residual_frame(
 
 struct RegionFit {
     frame: GrassmannFrame,
-    frame_rank: usize,
     /// Fitted in-frame coordinate prediction (`n_g × r`) — the radial chart
     /// evaluated on the region's rows, ready to lift through the frame.
     fitted_coords: Array2<f64>,
     evidence: RegionEvidence,
-}
-
-fn fit_one_region(
-    residual: ArrayView2<'_, f64>,
-    region: &CurvedRegion,
-    config: &InFrameCurvedConfig,
-) -> Result<Option<RegionFit>, String> {
-    let n_g = region.rows.len();
-    if n_g < config.min_rows || n_g < 2 * config.crossfit_folds.max(2) {
-        return Ok(None);
-    }
-    let r_g = take_rows(residual, &region.rows);
-
-    let frame = match learn_frame(&r_g, config)? {
-        Some(f) => f,
-        None => return Ok(None),
-    };
-    let r = frame.rank();
-    // In-frame coordinates Z = R_g · U  (n_g × r). The curved engine only ever
-    // sees these r columns; p never reappears until the ambient lift.
-    let mut z = fast_ab(&r_g, &frame.frame().to_owned());
-
-    let evidence = crossfit_evidence(&z, config, n_g)?;
-
-    // Optional slow-timescale frame refresh: re-polar from the fitted
-    // cross-moment and keep it ONLY if held-out in-frame EV improves.
-    let mut frame = frame;
-    if config.frame_refresh {
-        if let Some((refreshed, refreshed_z, refreshed_ev)) =
-            try_frame_refresh(&r_g, &z, &frame, config, n_g)?
-        {
-            if refreshed_ev.deviance_gain > evidence.deviance_gain {
-                frame = refreshed;
-                z = refreshed_z;
-                let fitted_coords = fit_radial_all(&z, config.whitening_ridge)?;
-                return Ok(Some(RegionFit {
-                    frame,
-                    frame_rank: r,
-                    fitted_coords,
-                    evidence: refreshed_ev,
-                }));
-            }
-        }
-    }
-
-    let fitted_coords = fit_radial_all(&z, config.whitening_ridge)?;
-    Ok(Some(RegionFit {
-        frame,
-        frame_rank: r,
-        fitted_coords,
-        evidence,
-    }))
 }
 
 fn fit_one_region_in_frame(
@@ -762,7 +516,6 @@ fn fit_one_region_in_frame(
     let fitted_coords = fit_radial_all(&z, config.whitening_ridge)?;
     Ok(Some(RegionFit {
         frame: frame.clone(),
-        frame_rank: frame.rank(),
         fitted_coords,
         evidence,
     }))
@@ -828,25 +581,6 @@ fn learn_frame(
         gauge[i] = sv.get(i).copied().unwrap_or(0.0);
     }
     Ok(Some(GrassmannFrame::from_oriented(frame, gauge)))
-}
-
-/// One closed-form polar refresh: accumulate the decoder-target cross-moment of
-/// the region's residual against its current in-frame coordinates and re-polar.
-/// Returns the refreshed frame, refreshed coordinates, and re-scored evidence.
-fn try_frame_refresh(
-    r_g: &Array2<f64>,
-    z: &Array2<f64>,
-    frame: &GrassmannFrame,
-    config: &InFrameCurvedConfig,
-    n_g: usize,
-) -> Result<Option<(GrassmannFrame, Array2<f64>, RegionEvidence)>, String> {
-    let (p, r) = (frame.output_dim(), frame.rank());
-    let mut cross = GrassmannCrossMoment::new(p, r);
-    cross.accumulate(r_g.view(), z.view())?;
-    let refreshed = cross.polar_frame()?;
-    let z_new = fast_ab(r_g, &refreshed.frame().to_owned());
-    let ev = crossfit_evidence(&z_new, config, n_g)?;
-    Ok(Some((refreshed, z_new, ev)))
 }
 
 /// Cross-fit held-out deviance of the in-frame radial curved chart over the
@@ -940,18 +674,6 @@ fn fit_radial_all(z: &Array2<f64>, ridge: f64) -> Result<Array2<f64>, String> {
     let w = whitening.transform(z);
     let pred_w = radial_predict(&w, &w);
     Ok(whitening.inverse(&pred_w))
-}
-
-/// Dense full-`p` radial-chart reference: the SAME curved chart fit in the full
-/// ambient width with NO frame. Used by the parity test (must agree with the
-/// in-frame fit when the residual lies in `range(U)`) and to demonstrate the
-/// `O(p³)` whitening the in-frame path avoids.
-pub fn dense_ambient_radial_reference(
-    r_g: ArrayView2<'_, f64>,
-    ridge: f64,
-) -> Result<Array2<f64>, String> {
-    let owned = r_g.to_owned();
-    fit_radial_all(&owned, ridge)
 }
 
 // ----- compact numeric helpers (r-dimensional; self-contained) -----

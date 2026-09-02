@@ -67,7 +67,6 @@
 //! pieces in on its side of the seam.
 
 pub mod designed_target;
-pub mod kernels;
 pub mod ledger_store;
 pub mod object_store;
 pub mod residual_stratify;
@@ -81,10 +80,7 @@ pub mod warm_state;
 // ---------------------------------------------------------------------------
 
 /// Deterministic, restartable source of activation row batches (seam half 1).
-pub use shard_reader::{
-    CorpusRowSource, DTYPE_F32, HEADER_LEN, MmapShardSource, RowBatch, SHARD_MAGIC, ShardError,
-    encode_shard_bytes,
-};
+pub use shard_reader::{CorpusRowSource, DTYPE_F32, HEADER_LEN, MmapShardSource, RowBatch, SHARD_MAGIC, ShardError};
 
 /// Per-row inner-solve warm-state cache (seam half 2).
 pub use warm_state::{DiskRowWarmCache, RowWarmCache, RowWarmState};
@@ -95,25 +91,14 @@ pub use rho_cascade::{RhoCascadeSchedule, RhoStepPlan, row_in_fraction};
 /// Residual-energy-stratified birth screen: make the dictionary tail reachable
 /// by guaranteeing rare high-residual rows representation in the discovery
 /// subsample, with Horvitz–Thompson weights that keep every criterion unbiased.
-pub use residual_stratify::{
-    RowResidualEnergy, RowStratum, SpanResidualEnergy, StratifiedCorpusTarget, Stratum,
-    StratumDesign, collect_stratified_target, design_stratified_subsample, stratify_row_energies,
-};
+pub use residual_stratify::{RowResidualEnergy, RowStratum, SpanResidualEnergy, StratifiedCorpusTarget, Stratum, StratumDesign, stratify_row_energies};
 
 /// ISA post-fit torus-merge audit: flag pairs of accepted atoms that are really
 /// one curved structure, by the fourth-moment `(κ − 2)²` contrast on their
 /// co-assigned rows.
-pub use torus_merge_audit::{MergeCandidate, audit_torus_merges};
+pub use torus_merge_audit::MergeCandidate;
 
 /// Designed corpus target collection (#991): stream → designed sample +
 /// honesty weights, the row set the term actually fits.
-pub use designed_target::{
-    DESIGNED_SAMPLE_DEFAULT_BUDGET_ROWS, DesignedCorpusTarget, auto_designed_budget,
-    collect_designed_target, collect_designed_target_auto, collect_designed_target_from_harvest,
-};
+pub use designed_target::{DESIGNED_SAMPLE_DEFAULT_BUDGET_ROWS, DesignedCorpusTarget};
 
-/// Mixed-precision fused kernels (read `f32`, accumulate `f64`).
-pub use kernels::{
-    axpy_f32_into_f64, cross_f32_rows_f64, dot_f32_f64, gemv_f32_rows_f64, gemv_t_f32_rows_f64,
-    gram_f32_rows_f64, norm_sq_f32_f64,
-};
