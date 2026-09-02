@@ -1391,9 +1391,6 @@ pub fn gaussian_weighted_ridge_batch(
 #[derive(Debug)]
 pub struct RankCertifiedPsdPseudoinverse {
     rank: usize,
-    relative_cutoff: f64,
-    absolute_cutoff: f64,
-    max_eigenvalue: f64,
     pseudoinverse: Array2<f64>,
 }
 
@@ -1465,9 +1462,6 @@ pub fn rank_certified_psd_pseudoinverse(
     }
     Ok(RankCertifiedPsdPseudoinverse {
         rank,
-        relative_cutoff,
-        absolute_cutoff,
-        max_eigenvalue,
         pseudoinverse,
     })
 }
