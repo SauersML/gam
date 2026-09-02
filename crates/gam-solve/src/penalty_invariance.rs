@@ -273,11 +273,6 @@ impl PenaltyMapInvariance {
         self.resolution
     }
 
-    /// Orthonormal basis of `null({A_i})` in `lambda` coordinates, `k x d`.
-    pub fn lambda_basis(&self) -> &Array2<f64> {
-        &self.basis
-    }
-
     /// Build from the canonical penalty bundle.
     ///
     /// The Gram is taken over the AUGMENTED operators
