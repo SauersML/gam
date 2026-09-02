@@ -120,40 +120,6 @@ impl FixedDesignGramCache {
         self.ywy
     }
 
-    /// Assemble `X'WX + S` for the inner solver without revisiting design rows.
-    pub fn penalized_normal_matrix(
-        &self,
-        penalty: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        if penalty.nrows() != self.p || penalty.ncols() != self.p {
-            return Err(format!(
-                "penalty shape {}x{} must match {}x{}",
-                penalty.nrows(),
-                penalty.ncols(),
-                self.p,
-                self.p
-            ));
-        }
-        let mut normal = self.xtwx.clone();
-        normal += &penalty;
-        Ok(normal)
-    }
-
-    /// Compute penalty-free weighted RSS from sufficient statistics.
-    pub fn penalized_rss(&self, beta: ArrayView1<'_, f64>) -> Result<f64, String> {
-        if beta.len() != self.p {
-            return Err(format!(
-                "beta length {} must match design column count {}",
-                beta.len(),
-                self.p
-            ));
-        }
-        // Expanding (r - Xb)'W(r - Xb) gives ywy - 2 b'X'Wr + b'X'WXb.
-        let gram_beta = self.xtwx.dot(&beta);
-        let linear = beta.dot(&self.xtwy);
-        let quadratic = beta.dot(&gram_beta);
-        Ok(self.ywy - 2.0 * linear + quadratic)
-    }
 }
 
 /// Cached fixed design rows for GLM / changing-`W` PIRLS trials.
@@ -208,26 +174,6 @@ impl FixedDesignRowCache {
     pub fn xtwx(&self, weights: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
         self.validate_changing_weights(weights)?;
         Ok(fast_xt_diag_x(&self.x, &weights))
-    }
-
-    /// Recompute `X' diag(weights) z` over cached rows for a PIRLS response.
-    pub fn xtwz(
-        &self,
-        weights: ArrayView1<'_, f64>,
-        z: ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, String> {
-        self.validate_changing_weights(weights)?;
-        if z.len() != self.n {
-            return Err(format!(
-                "z length {} must match design row count {}",
-                z.len(),
-                self.n
-            ));
-        }
-        validate_finite_vector("z", z)?;
-        let z2 = z.insert_axis(ndarray::Axis(1));
-        let xtwz_mat = fast_xt_diag_y(&self.x, &weights, &z2);
-        Ok(xtwz_mat.column(0).to_owned())
     }
 
     fn validate_changing_weights(&self, weights: ArrayView1<'_, f64>) -> Result<(), String> {

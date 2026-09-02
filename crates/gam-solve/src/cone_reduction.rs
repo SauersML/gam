@@ -492,14 +492,6 @@ fn symmetric_solve(a: &Array2<f64>, b: &Array1<f64>, floor: f64) -> Option<Array
     Some(solution)
 }
 
-/// Is `A` positive semidefinite, to the given relative floor?
-fn is_positive_semidefinite(a: &Array2<f64>, tolerance: f64) -> bool {
-    match symmetric_inertia(a.view(), tolerance) {
-        Ok(inertia) => inertia.negative == 0,
-        Err(_) => false,
-    }
-}
-
 /// Exact minimum of `wᵀMw` over the unit simplex `{w ≥ 0, 1ᵀw = 1}`.
 ///
 /// Strictly positive iff `M` is strictly copositive, which is exactly the
@@ -574,114 +566,6 @@ pub fn copositive_simplex_minimum(
         return Err("copositivity enumeration produced no finite face value".to_string());
     }
     Ok((best, best_point))
-}
-
-/// Exact constrained mode of `φ(x) = ½xᵀMx + cᵀx` over `x ≥ 0`.
-///
-/// Requires `M` strictly copositive, which makes `φ` coercive on the orthant
-/// (`xᵀMx ≥ μ|x|²` there with `μ > 0`) and therefore guarantees the minimum is
-/// attained. Refuses otherwise, because without copositivity there is no
-/// minimum to report and the cone-truncated law is improper.
-pub fn constrained_cone_mode(
-    matrix: ArrayView2<'_, f64>,
-    linear: &Array1<f64>,
-) -> Result<ConeMode, String> {
-    let n = matrix.nrows();
-    if matrix.ncols() != n {
-        return Err(format!(
-            "cone mode needs a square matrix, got {}x{}",
-            matrix.nrows(),
-            matrix.ncols()
-        ));
-    }
-    if linear.len() != n {
-        return Err(format!(
-            "cone mode: matrix is {n}x{n} but the linear term has length {}",
-            linear.len()
-        ));
-    }
-    if n > 20 {
-        return Err(format!(
-            "exact cone mode enumerates 2^n faces and is meant for a retained \
-             constraint face; n = {n} is out of range"
-        ));
-    }
-    let (copositive_minimum, _) = copositive_simplex_minimum(matrix)?;
-    if copositive_minimum <= 0.0 {
-        return Err(format!(
-            "the reduced precision is not strictly copositive (min wᵀMw over the simplex \
-             = {copositive_minimum:.9e}); the cone-truncated posterior is improper and has \
-             no mode"
-        ));
-    }
-    let owned = matrix.to_owned();
-    let scale = owned
-        .iter()
-        .fold(0.0f64, |worst, value| worst.max(value.abs()))
-        .max(1.0);
-    let floor = 1e-12 * scale;
-    let feasibility = 1e-9 * scale.sqrt().max(1.0);
-    let gradient_floor = 1e-7
-        * linear
-            .iter()
-            .fold(0.0f64, |worst, value| worst.max(value.abs()))
-            .max(1.0);
-
-    let mut best: Option<ConeMode> = None;
-    for mask in 0u32..(1u32 << n) {
-        let free: Vec<usize> = (0..n).filter(|j| mask & (1 << j) != 0).collect();
-        let mut point = Array1::<f64>::zeros(n);
-        if !free.is_empty() {
-            let size = free.len();
-            let mut block = Array2::<f64>::zeros((size, size));
-            for (i, &row) in free.iter().enumerate() {
-                for (j, &column) in free.iter().enumerate() {
-                    block[[i, j]] = owned[[row, column]];
-                }
-            }
-            // Second-order necessary condition on the face. A face whose block
-            // has a negative direction carries no minimiser, and admitting it
-            // would let a saddle win the enumeration.
-            if !is_positive_semidefinite(&block, 1e-12) {
-                continue;
-            }
-            let mut rhs = Array1::<f64>::zeros(size);
-            for (i, &row) in free.iter().enumerate() {
-                rhs[i] = -linear[row];
-            }
-            let Some(solution) = symmetric_solve(&block, &rhs, floor) else {
-                continue;
-            };
-            if solution.iter().any(|value| *value < -feasibility) {
-                continue;
-            }
-            for (i, &row) in free.iter().enumerate() {
-                point[row] = solution[i].max(0.0);
-            }
-        }
-        let gradient = owned.dot(&point) + linear;
-        if (0..n)
-            .filter(|j| mask & (1 << j) == 0)
-            .any(|j| gradient[j] < -gradient_floor)
-        {
-            continue;
-        }
-        let value = 0.5 * point.dot(&owned.dot(&point)) + linear.dot(&point);
-        if !value.is_finite() {
-            continue;
-        }
-        if best.as_ref().is_none_or(|current| value < current.value) {
-            best = Some(ConeMode {
-                point,
-                value,
-                gradient,
-                free: free.clone(),
-            });
-        }
-    }
-    best.ok_or_else(|| {
-        "no feasible KKT point on any face; the cone mode enumeration found nothing".to_string()
-    })
 }
 
 #[cfg(test)]

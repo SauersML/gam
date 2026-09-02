@@ -156,13 +156,6 @@ pub fn parse_level_directive(raw: &str) -> Option<LevelFilter> {
     parse_log_level(raw)
 }
 
-/// The quiet out-of-the-box verbosity, exposed so callers that want the
-/// documented default after an explicit-level path can name it instead of
-/// hardcoding `Warn`.
-pub const fn default_log_level() -> LevelFilter {
-    DEFAULT_LOG_LEVEL
-}
-
 /// Explicitly set the active log verbosity from a level spelling
 /// (`off|error|warn|info|debug|trace`, case-insensitive). This is the supported
 /// way to raise verbosity above the default — callers pass the level they want

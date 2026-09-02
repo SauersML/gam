@@ -34,8 +34,7 @@
 //! makes the n-free-across-trials guarantee a first-class, testable property by
 //! fingerprinting the stored design and proving it is never mutated by a query.
 
-use gam_linalg::faer_ndarray::{fast_xt_diag_x, fast_xt_diag_y};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array2, ArrayView2};
 
 /// GLM fixed-design sufficient-statistic provider.
 ///
@@ -46,10 +45,6 @@ pub struct GlmFixedDesignSufficient {
     x: Array2<f64>,
     n: usize,
     p: usize,
-    /// Order-insensitive fingerprint of the stored design bytes, captured at
-    /// construction. A query that respects the n-free-across-trials invariant
-    /// must leave this fingerprint unchanged.
-    design_fingerprint: u64,
 }
 
 impl GlmFixedDesignSufficient {
@@ -69,12 +64,10 @@ impl GlmFixedDesignSufficient {
         let n = x.nrows();
         let p = x.ncols();
         let x_owned = x.to_owned();
-        let design_fingerprint = fingerprint_matrix(x_owned.view());
         Ok(Self {
             x: x_owned,
             n,
             p,
-            design_fingerprint,
         })
     }
 
@@ -93,68 +86,6 @@ impl GlmFixedDesignSufficient {
         self.x.view()
     }
 
-    /// Weighted Gram `X' diag(w) X` over the stored rows.
-    ///
-    /// This is the GLM IRLS Hessian block. It is recomputed each iteration
-    /// because `w` moves, but it reuses the cached design: the O(n p^2)
-    /// contraction runs, while the n-row design construction does not repeat.
-    /// Routed through `fast_xt_diag_x` to match the runtime PIRLS recompute path
-    /// exactly.
-    pub fn weighted_gram(&self, w: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
-        self.validate_weights(w)?;
-        Ok(fast_xt_diag_x(&self.x, &w))
-    }
-
-    /// Weighted cross product `X' diag(w) z` over the stored rows.
-    ///
-    /// This is the GLM IRLS working right-hand side for working response `z`.
-    /// Recomputed each iteration (`w` and `z` move) but over the cached design.
-    /// Routed through `fast_xt_diag_y` to match the runtime PIRLS recompute path.
-    pub fn weighted_xty(
-        &self,
-        w: ArrayView1<'_, f64>,
-        z: ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, String> {
-        self.validate_weights(w)?;
-        if z.len() != self.n {
-            return Err(format!(
-                "z length {} must match design row count {}",
-                z.len(),
-                self.n
-            ));
-        }
-        validate_finite_vector("z", z)?;
-        let z2 = z.insert_axis(ndarray::Axis(1));
-        let xtwz_mat = fast_xt_diag_y(&self.x, &w, &z2);
-        Ok(xtwz_mat.column(0).to_owned())
-    }
-
-    /// Confirm the stored design bytes are unchanged since construction.
-    ///
-    /// This is the n-free-across-trials invariant: a `weighted_gram` /
-    /// `weighted_xty` query must never touch the n-row design. Returns an error
-    /// if the recomputed fingerprint differs from the one captured at build.
-    pub fn assert_design_unchanged(&self) -> Result<(), String> {
-        let current = fingerprint_matrix(self.x.view());
-        if current != self.design_fingerprint {
-            return Err(format!(
-                "stored design fingerprint changed: built {} now {}",
-                self.design_fingerprint, current
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_weights(&self, weights: ArrayView1<'_, f64>) -> Result<(), String> {
-        if weights.len() != self.n {
-            return Err(format!(
-                "weights length {} must match design row count {}",
-                weights.len(),
-                self.n
-            ));
-        }
-        validate_finite_vector("weights", weights)
-    }
 }
 
 fn validate_finite_matrix(name: &str, matrix: ArrayView2<'_, f64>) -> Result<(), String> {
@@ -164,40 +95,6 @@ fn validate_finite_matrix(name: &str, matrix: ArrayView2<'_, f64>) -> Result<(),
         }
     }
     Ok(())
-}
-
-fn validate_finite_vector(name: &str, vector: ArrayView1<'_, f64>) -> Result<(), String> {
-    for (index, value) in vector.iter().enumerate() {
-        if !(*value).is_finite() {
-            return Err(format!("{name}[{index}] must be finite"));
-        }
-    }
-    Ok(())
-}
-
-/// Order-sensitive bit fingerprint of a dense matrix.
-///
-/// Mixes each entry's raw IEEE-754 bits with its position so a permutation or
-/// any single-bit change of the stored design is detected. Used to prove the
-/// cache never mutates the n-row design on a query.
-fn fingerprint_matrix(matrix: ArrayView2<'_, f64>) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    let (nrows, ncols) = matrix.dim();
-    hash = mix(hash, nrows as u64);
-    hash = mix(hash, ncols as u64);
-    for ((row, col), value) in matrix.indexed_iter() {
-        hash = mix(hash, row as u64);
-        hash = mix(hash, col as u64);
-        hash = mix(hash, value.to_bits());
-    }
-    hash
-}
-
-/// FNV-1a style 64-bit mixing step.
-fn mix(mut hash: u64, value: u64) -> u64 {
-    hash ^= value;
-    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    hash
 }
 
 #[cfg(test)]
