@@ -26,7 +26,6 @@
 //! terms to bits so a test can assert the surface reconciles with the criterion
 //! exactly (no parallel accounting drift).
 
-
 use crate::atom_codes::SparseAtomCodes;
 
 /// Bits to code one Gaussian scalar of variance `signal_var` to per-sample MSE

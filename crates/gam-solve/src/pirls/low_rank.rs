@@ -13,7 +13,6 @@ use super::*;
 //   path), then solve the small `r × r` capacitance system.
 // ---------------------------------------------------------------------------
 
-
 /// Dense multi-output block Fisher assembly for latent / coupled GLM fits.
 ///
 /// Given `X` with shape `(N, K)` and per-row output Fisher blocks `W_i`

@@ -34,8 +34,6 @@
 //! `D` is the refinement step when the gap is too wide. `ρ ≥ 1` is an
 //! explicit refusal (`Err`), never a silent fallback.
 
-
-
 /// A certified enclosure of `log|S|` for a block-partitioned SPD matrix.
 #[derive(Debug, Clone)]
 pub struct LogdetEnclosure {

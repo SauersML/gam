@@ -56,7 +56,6 @@
 //! bounding box the boundary cell's cubic polynomial extends naturally (the
 //! cell index clamps, the local coordinate does not).
 
-
 /// Dimension of the penalty null space: span{1, x1, x2}. The mixed
 /// `2·a1·a2·f_{x1x2}²` term excludes `x1·x2` (its cross derivative is 1).
 const PENALTY_NULLITY: usize = 3;

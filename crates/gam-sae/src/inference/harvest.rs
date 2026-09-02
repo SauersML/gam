@@ -44,7 +44,6 @@
 //! from the tier — the same #973 honesty discipline, applied to the metric's
 //! estimation roles instead of the likelihood.
 
-
 /// The Fisher-bearing tier: which corpus rows carry factors, and the metric
 /// over exactly those rows.
 struct FisherTier {

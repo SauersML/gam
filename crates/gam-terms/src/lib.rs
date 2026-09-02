@@ -57,10 +57,6 @@ pub mod term_builder;
 #[path = "smooth/torch_dispatch.rs"]
 pub mod torch_dispatch;
 
-pub mod terms {
-    pub use crate::*;
-}
-
 /// Re-export of the neutral estimation error so crate-local macros
 /// (`bail_invalid_estim!`) and call sites can reference `crate::EstimationError`.
 pub use gam_problem::EstimationError;
