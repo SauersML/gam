@@ -12,9 +12,7 @@ pub(crate) use gam_linalg::triangular::{
     cholesky_solve_matrix, cholesky_solve_vector, forward_substitution_lower_matrix,
 };
 pub(crate) use gam_runtime::warm_start::Fingerprinter;
-pub(crate) use gam_terms::analytic_penalties::{
-    AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier,
-};
+pub(crate) use gam_terms::analytic_penalties::AnalyticPenaltyKind;
 pub(crate) use gam_terms::latent::{LatentCoordValues, LatentManifold};
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 pub(crate) use std::ops::Range;

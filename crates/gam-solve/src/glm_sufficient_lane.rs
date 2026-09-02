@@ -252,12 +252,6 @@ impl FrozenWeightGramTensor {
         self.inner.gram_at(psi)
     }
 
-    /// `XᵀW z(ψ)` at the frozen `W`, n-free in O(Dk) — the GLM working RHS for
-    /// the first Fisher step at `ψ`.
-    pub fn rhs_at(&self, psi: f64) -> Array1<f64> {
-        self.inner.rhs_at(psi)
-    }
-
     /// Exact `∂/∂ψ (XᵀW X)` at the frozen `W`, n-free, from the SAME
     /// representation as the value — the cure for the objective↔gradient
     /// desync class on this channel.
@@ -268,27 +262,6 @@ impl FrozenWeightGramTensor {
     /// Exact `∂/∂ψ (XᵀW z)` at the frozen `W`, n-free.
     pub fn drhs_dpsi(&self, psi: f64) -> Array1<f64> {
         self.inner.drhs_dpsi(psi)
-    }
-
-    /// Exact `∂²/∂ψ² (XᵀW X)` at the frozen `W`, n-free in O(D²k²) — the
-    /// frozen-W Fisher curvature block for the single-ψ Hessian channel. The
-    /// GLM outer Hessian `B_j` carries an additional irreducibly-n-dependent
-    /// third-derivative term (`Xᵀdiag(c⊙X_τβ̂)X`) that this tensor does not
-    /// hold, so `B_j` stays on the exact slab (see the module header); this
-    /// accessor exposes ONLY the n-free frozen-W Fisher second-ψ-derivative, in
-    /// the same source-of-truth representation as the value and gradient.
-    pub fn d2gram_dpsi2(&self, psi: f64) -> Array2<f64> {
-        self.inner.d2gram_dpsi2(psi)
-    }
-
-    /// Exact `∂²/∂ψ² (XᵀW z)` at the frozen `W`, n-free.
-    pub fn d2rhs_dpsi2(&self, psi: f64) -> Array1<f64> {
-        self.inner.d2rhs_dpsi2(psi)
-    }
-
-    /// The frozen working weight the tensor was built at.
-    pub fn frozen_weights(&self) -> ArrayView1<'_, f64> {
-        self.frozen_w.view()
     }
 
     /// The n-free conditioned-frame ψ-gradient pair `(∂(XᵀWX)/∂ψ, ∂(XᵀWz)/∂ψ)`
@@ -374,64 +347,6 @@ impl FrozenWeightGramTensor {
         true
     }
 
-    /// #1033 GLM endgame (value channel, n-free): the coefficient vector of ONE
-    /// frozen-`W` Fisher-scoring step at `psi`, solving the penalized normal
-    /// equations
-    ///
-    /// ```text
-    ///   (XᵀW X(ψ) + S) β = XᵀW z̃(ψ)
-    /// ```
-    ///
-    /// entirely in k-space — `XᵀW X(ψ)` from [`Self::gram_at`] and `XᵀW z̃(ψ)`
-    /// from [`Self::rhs_at`], both assembled n-free from the certified tensor —
-    /// so NO design row is touched. `penalty` is the (already ψ-keyed, k×k) total
-    /// penalty `S` the caller supplies in the SAME coefficient basis the tensor
-    /// was built in (the conditioned `x_fit` frame); it must be symmetric PSD so
-    /// `XᵀW X(ψ) + S` is SPD for the Cholesky solve.
-    ///
-    /// This is the LOAD-BEARING math for serving a GLM κ-trial's inner solve
-    /// without re-realizing the design: in the warm-β outer-loop regime the first
-    /// Fisher step is already at (or near) the trial's converged β, so — gated by
-    /// [`Self::weight_drift_within`] — this single k-space step IS the trial's
-    /// inner solve. It is a PURE function (no `&mut`, no I/O): the wiring that
-    /// routes the GLM lane through it (the design-revision skip) is a separate,
-    /// independently-verified increment. The frozen-`W` Gram is bit-tight against
-    /// the streamed weighted rebuild (see `frozen_w_gram_matches_exact_weighted_
-    /// rebuild`), so β here equals the streamed first-Fisher-step β to the solve's
-    /// conditioning.
-    ///
-    /// Returns `None` when `psi` is off-window, the penalty shape mismatches
-    /// `k×k`, or the Cholesky factorization fails (non-SPD assembled system) —
-    /// the caller then falls back to the exact per-trial PIRLS rebuild.
-    pub fn frozen_w_single_step_beta(
-        &self,
-        psi: f64,
-        penalty: ndarray::ArrayView2<'_, f64>,
-    ) -> Option<Array1<f64>> {
-        if !self.contains(psi) {
-            return None;
-        }
-        let mut system = self.gram_at(psi);
-        let k = system.nrows();
-        if penalty.dim() != (k, k) {
-            return None;
-        }
-        system += &penalty;
-        if system.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-        let rhs = self.rhs_at(psi);
-        if rhs.len() != k || rhs.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-        use gam_linalg::faer_ndarray::FaerCholesky;
-        let factor = system.cholesky(faer::Side::Lower).ok()?;
-        let beta = factor.solvevec(&rhs);
-        if beta.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-        Some(beta)
-    }
 }
 
 #[cfg(test)]

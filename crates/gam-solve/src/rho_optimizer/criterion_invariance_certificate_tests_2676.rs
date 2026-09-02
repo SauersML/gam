@@ -29,45 +29,6 @@
 use super::*;
 use ndarray::{Array1, Array2, array};
 
-/// Build the exact #2676 configuration: a criterion depending on `lambda` only
-/// through `Lambda = lambda_0 + c*lambda_2` and `lambda_1`, at a
-/// nearly-stationary point with a negative reduced gradient.
-///
-/// Returns `(H_rho, g_rho, t)` where `t` is the normalised lift of the exact
-/// null direction `w = (c, 0, -1)`.
-fn redundant_rho_system(scale: f64) -> (Array2<f64>, Array1<f64>, Array2<f64>) {
-    let lambdas = array![1.5_f64, 4.0, 1.5 / scale];
-    // Strictly positive definite in the IDENTIFIED coordinates: there is no
-    // negative curvature anywhere in this construction.
-    let reduced = array![[0.8_f64, -0.2], [-0.2, 0.5]];
-    let jacobian = array![[1.0_f64, 0.0], [0.0, 1.0], [scale, 0.0]];
-    let h_lambda = jacobian.dot(&reduced).dot(&jacobian.t());
-    // A genuine differential of the same reduced criterion, with a NEGATIVE
-    // component on the redundant pair — which is what makes the floored test's
-    // Rayleigh quotient exactly zero on the lift.
-    let g_reduced = array![-3.0e-5_f64, 7.0e-6];
-    let g_lambda = jacobian.dot(&g_reduced);
-    let mut g_rho = Array1::<f64>::zeros(3);
-    let mut h_rho = Array2::<f64>::zeros((3, 3));
-    for i in 0..3 {
-        g_rho[i] = lambdas[i] * g_lambda[i];
-    }
-    for i in 0..3 {
-        for j in 0..3 {
-            h_rho[[i, j]] = lambdas[i] * h_lambda[[i, j]] * lambdas[j];
-        }
-        h_rho[[i, i]] += g_rho[i];
-    }
-    // t proportional to diag(lambda)^-1 (c, 0, -1).
-    let raw = array![scale / lambdas[0], 0.0, -1.0 / lambdas[2]];
-    let norm = raw.dot(&raw).sqrt();
-    let mut basis = Array2::<f64>::zeros((3, 1));
-    for row in 0..3 {
-        basis[[row, 0]] = raw[row] / norm;
-    }
-    (h_rho, g_rho, basis)
-}
-
 /// THE IDENTITY the certificate's floor is supposed to protect against, and
 /// the one direction where it protects by exactly ZERO.
 ///
@@ -397,35 +358,6 @@ fn two_negative_directions_still_refuse_with_one_direction_deflated_2676() {
         Some(false),
         "deflating one direction cannot certify a matrix carrying two negative ones"
     );
-}
-
-/// The #2748 fixture for the OUTER certificate, built from the identity:
-/// `H = a·u₁u₁ᵀ − s·u₂u₂ᵀ + η·t tᵀ` with `g = 0`, so that
-///
-/// * the judged complement `span{u₁, u₂}` carries curvature `−s`;
-/// * the deflated direction carries `tᵀHt − Σ_k g_k t_k² = η`, which is
-///   **exactly zero in exact arithmetic** — a measured `‖δH‖₂`.
-///
-/// `g = 0` keeps the two effects separable: the gradient floor adds nothing, so
-/// the verdict is `−s` against the resolution and nothing else.
-fn outer_resolution_fixture(
-    negative_curvature: f64,
-    assembly_error: f64,
-) -> (Array2<f64>, Array1<f64>, Array2<f64>) {
-    let root_half = 0.5_f64.sqrt();
-    let t = array![root_half, 0.0, -root_half];
-    let u1 = array![root_half, 0.0, root_half];
-    let u2 = array![0.0_f64, 1.0, 0.0];
-    let mut hessian = Array2::<f64>::zeros((3, 3));
-    for r in 0..3 {
-        for c in 0..3 {
-            hessian[[r, c]] = u1[r] * u1[c] - negative_curvature * u2[r] * u2[c]
-                + assembly_error * t[r] * t[c];
-        }
-    }
-    let mut invariance = Array2::<f64>::zeros((3, 1));
-    invariance.column_mut(0).assign(&t);
-    (hessian, Array1::<f64>::zeros(3), invariance)
 }
 
 /// The instrument itself: with the pair consistent the measurement is zero, and

@@ -295,21 +295,6 @@ fn reserve_factorized_inference_state(
     }
 }
 
-/// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
-pub fn optimize_external_design<X>(
-    y: ArrayView1<'_, f64>,
-    w: ArrayView1<'_, f64>,
-    x: X,
-    offset: ArrayView1<'_, f64>,
-    s_list: Vec<BlockwisePenalty>,
-    opts: &ExternalOptimOptions,
-) -> Result<ExternalOptimResult, EstimationError>
-where
-    X: Into<DesignMatrix>,
-{
-    optimize_external_designwith_heuristic_lambdas(y, w, x, offset, s_list, None, opts)
-}
-
 /// Same as `optimize_external_design`, but allows heuristic λ warm-start seeds
 /// for the outer smoothing search.
 pub fn optimize_external_designwith_heuristic_lambdas<X>(

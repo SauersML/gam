@@ -992,37 +992,6 @@ impl ConstrainedProjectionLaw {
     }
 }
 
-/// Build [`ConstrainedProjectionLaw`] for `cᵀβ` from the persisted geometry and
-/// the ambient covariance, using the SAME cubature the module's moments and
-/// intervals use.
-pub fn constrained_projection_law(
-    ambient_covariance: &Array2<f64>,
-    geometry: &ConstrainedPosteriorGeometry,
-    contrast: &Array1<f64>,
-) -> Result<ConstrainedProjectionLaw, String> {
-    let decomposition = decompose_projection(ambient_covariance, geometry, contrast)?;
-    let Some(truncated) = decomposition.truncated else {
-        return Ok(ConstrainedProjectionLaw {
-            nodes: vec![(decomposition.ambient_mean, 1.0)],
-            residual_variance: decomposition.ambient_variance,
-        });
-    };
-    let nodes = converged_projection_nodes(
-        &truncated.normal_center,
-        &truncated.normal_covariance,
-        &truncated.upper_limits,
-        &truncated.projection_lift,
-        decomposition.ambient_mean,
-    )?;
-    Ok(ConstrainedProjectionLaw {
-        nodes: nodes
-            .into_iter()
-            .map(|node| (node.conditional_mean, node.weight))
-            .collect(),
-        residual_variance: truncated.residual_variance,
-    })
-}
-
 /// One point of the JOINT rule over an inequality-truncated Gaussian posterior:
 /// a feasible constraint-normal coordinate and the tangent coordinates drawn
 /// from the same low-discrepancy point.
@@ -3236,7 +3205,6 @@ fn is_prime(value: u64) -> bool {
 mod tests {
     use super::*;
     use ndarray::array;
-
 
     /// Independent reference: Simpson quadrature of `N(mean, variance)`
     /// restricted to `[0, ∞)`, with the density rescaled by its value at the
@@ -5623,7 +5591,6 @@ mod coverage_gate_tests {
 
 }
 
-
 #[cfg(test)]
 mod affine_ceiling_tests {
     use super::*;
@@ -5832,7 +5799,6 @@ mod affine_ceiling_tests {
         );
     }
 }
-
 
 #[cfg(test)]
 mod projection_law_2446_tests {

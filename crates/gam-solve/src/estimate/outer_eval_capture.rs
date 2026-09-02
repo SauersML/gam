@@ -301,26 +301,6 @@ fn buffer() -> &'static Mutex<Vec<OuterEvalRecord>> {
     BUFFER.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Start capturing outer evaluations, clearing any prior window.
-pub fn enable_outer_eval_capture() {
-    buffer().lock().expect("outer-eval capture buffer").clear();
-    ENABLED.store(true, Ordering::Relaxed);
-}
-
-/// Stop capturing and drain the recorded opening evaluations (in eval order).
-pub fn take_outer_eval_capture() -> Vec<OuterEvalRecord> {
-    ENABLED.store(false, Ordering::Relaxed);
-    std::mem::take(&mut *buffer().lock().expect("outer-eval capture buffer"))
-}
-
-/// Request one structured audit at the next outer seed with enough ψ axes.
-///
-/// Grades the ψ block only. Use [`enable_outer_gradient_fd_capture_over_theta`]
-/// to grade the ρ (log-smoothing) coordinates in the same record.
-pub fn enable_outer_gradient_fd_capture(min_psi_dim: usize) {
-    arm_outer_gradient_fd_capture(min_psi_dim, false);
-}
-
 /// Request one structured audit over the WHOLE θ vector — the ψ block and the
 /// ρ (log-smoothing) block — at the next outer seed with enough ψ axes.
 ///
@@ -419,23 +399,6 @@ pub(crate) fn begin_outer_criterion_component_capture() {
             state.selected_mode = None;
             state.curvature = None;
             state.tangent_basis = None;
-        }
-    });
-}
-
-/// Retain the tangent basis of the active inequality face this evaluation's
-/// criterion is projected onto (#2765).
-///
-/// Published by the tangent-projection entry BEFORE it recurses, so the
-/// recursion's curvature snapshot can state which subspace its determinant was
-/// taken on. Public because the projection lives in the outer-entry helpers
-/// rather than in the assembly that records the snapshot.
-pub fn record_outer_tangent_basis(z: Array2<f64>) {
-    FD_CAPTURE.with(|capture| {
-        if let Some(state) = capture.borrow_mut().as_mut()
-            && state.record.is_none()
-        {
-            state.tangent_basis = Some(z);
         }
     });
 }

@@ -1489,14 +1489,6 @@ where
     Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
     Fsp: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
 {
-    pub fn with_fixed_point_certificate<Fcert>(mut self, certificate_fn: Fcert) -> Self
-    where
-        Fcert: FnMut(&mut S, &Array1<f64>) -> Result<FixedPointCertificateEval, EstimationError>
-            + 'static,
-    {
-        self.fixed_point_certificate_fn = Some(Box::new(certificate_fn));
-        self
-    }
 
     pub fn with_seed_inner_state<Fseed>(
         self,
