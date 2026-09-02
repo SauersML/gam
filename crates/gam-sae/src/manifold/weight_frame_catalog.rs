@@ -5,10 +5,10 @@
 //! corpus rows are inspected. Data enters later only through occupancy and
 //! in-frame coordinates.
 
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2};
 
 use crate::frames::{GrassmannFrame, SAE_FRAME_RANK_CUTOFF};
-use gam_linalg::faer_ndarray::{FaerSvd, fast_ab};
+use gam_linalg::faer_ndarray::FaerSvd;
 
 /// Model component whose output image supplies a chart frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,40 +48,7 @@ pub struct WeightFrameMatrix {
 }
 
 impl WeightFrameMatrix {
-    /// Build the per-head OV component matrix `W_O W_V`.
-    ///
-    /// `w_o` is shaped `(d_model, d_head)` and `w_v` is shaped
-    /// `(d_head, d_model)`; the resulting square map has column image in the
-    /// residual stream.
-    pub fn attention_head_ov(
-        layer: usize,
-        head: usize,
-        w_o: ArrayView2<'_, f64>,
-        w_v: ArrayView2<'_, f64>,
-    ) -> Result<Self, String> {
-        if w_o.ncols() != w_v.nrows() {
-            return Err(format!(
-                "WeightFrameMatrix::attention_head_ov: W_O cols {} must equal W_V rows {}",
-                w_o.ncols(),
-                w_v.nrows()
-            ));
-        }
-        Ok(Self {
-            source: WeightFrameSource::AttentionHeadOv { layer, head },
-            matrix: fast_ab(&w_o.to_owned(), &w_v.to_owned()),
-        })
-    }
 
-    /// Build an MLP down-projection component matrix `W_down`.
-    ///
-    /// `w_down` is shaped `(d_model, d_mlp)` so its columns are residual-stream
-    /// output vectors.
-    pub fn mlp_down_projection(layer: usize, w_down: ArrayView2<'_, f64>) -> Self {
-        Self {
-            source: WeightFrameSource::MlpDownProjection { layer },
-            matrix: w_down.to_owned(),
-        }
-    }
 }
 
 /// One frame in the mechanism-support catalog.

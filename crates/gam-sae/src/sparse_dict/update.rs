@@ -1430,29 +1430,6 @@ fn reconstruction_rss_from_parts(
     rss
 }
 
-/// Pooled aggregates for the linear block's ONE shared REML variance component
-/// at ridge `rho` (design gam#2232, Increment 2, plug 4).
-///
-/// Reconstructs the shared-ρ code Gram `A = CᵀC` from the fit's
-/// stored routing and computes the matrix-free effective dof
-/// `γ = tr(A(A+ρI)⁻¹)` (`hutchinson_gram_edof`) together with the reconstruction
-/// `RSS` and the decoder penalty energy `‖D‖²_F` — exactly the aggregates
-/// [`linear_shared_rho_fs_step`] consumes. Matrix-free throughout (no dense
-/// `K×K`, no `K×P` right-hand side), so it holds at `K ≈ 32k`.
-pub fn linear_block_reml_stats(
-    x: ArrayView2<'_, f32>,
-    fit: &SparseDictFit,
-    rho: f64,
-) -> Result<LinearBlockRemlStats, SparseDictionaryError> {
-    linear_block_reml_stats_from_parts(
-        x,
-        fit.decoder.view(),
-        fit.indices.view(),
-        fit.codes.view(),
-        rho,
-    )
-}
-
 fn linear_block_reml_stats_from_parts(
     x: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,

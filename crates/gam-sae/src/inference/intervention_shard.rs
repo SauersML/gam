@@ -541,65 +541,6 @@ impl InterventionShard {
         self.row_id.len()
     }
 
-    /// The G2 eval-forever split: each distinct group id goes to eval iff
-    /// `splitmix64(group_id ^ splitmix64(seed))` is odd. A pure per-group
-    /// function — record order, shard composition, and refit history cannot
-    /// move a group across the fence, which is what makes "eval forever" a
-    /// property of the *function* rather than of bookkeeping.
-    pub fn eval_forever_split(&self, seed: u64) -> EvalForeverSplit {
-        let mut train: Vec<i64> = Vec::new();
-        let mut eval: Vec<i64> = Vec::new();
-        let mut groups: Vec<i64> = self.group.clone();
-        groups.sort_unstable();
-        groups.dedup();
-        let seed_mix = splitmix64(seed);
-        for g in groups {
-            if group_is_eval_forever(g, seed_mix) {
-                eval.push(g);
-            } else {
-                train.push(g);
-            }
-        }
-        EvalForeverSplit {
-            train_groups: train,
-            eval_groups: eval,
-        }
-    }
-
-    /// Guard G3's measurement floor: the `q`-quantile (0 < q < 1, caller
-    /// supplies the same one-sided evidence quantile the certificates use) of
-    /// `nu_measured` over the Δt = 0 control records. Errors when the shard
-    /// carries no controls — a floor from zero controls would be a fabricated
-    /// number, and the design requires the null to be *estimated*.
-    pub fn control_floor_nats(&self, q: f64) -> Result<f64, String> {
-        if !(q > 0.0 && q < 1.0) {
-            return Err(format!(
-                "control_floor_nats: quantile must be in (0, 1); got {q}"
-            ));
-        }
-        let nulls: Vec<f64> = self
-            .nu_measured
-            .iter()
-            .zip(self.is_control.iter())
-            .filter_map(|(&v, &c)| c.then_some(v))
-            .collect();
-        if nulls.is_empty() {
-            return Err(
-                "control_floor_nats: shard has no Δt = 0 control records; the G3 floor \
-                 must be estimated from controls, never assumed"
-                    .to_string(),
-            );
-        }
-        if nulls.iter().any(|value| !value.is_finite()) {
-            return Err(
-                "control_floor_nats: control measurements must be finite before taking a quantile"
-                    .to_string(),
-            );
-        }
-        // Inclusive linear-interpolation quantile (the same convention as
-        // numpy's default), on the validated finite sample.
-        Ok(inclusive_quantile(nulls, q))
-    }
 }
 
 #[cfg(test)]

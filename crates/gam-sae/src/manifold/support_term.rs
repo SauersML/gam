@@ -1312,10 +1312,6 @@ impl SaeSupportSparseTerm {
         self.output_dim
     }
 
-    pub fn active_pair_count(&self) -> usize {
-        self.atom_rows.iter().map(Vec::len).sum()
-    }
-
     /// #2502 occupancy-earned topology. A periodic atom whose routed tokens
     /// occupy a small contiguous arc is a bounded curve wearing a circle: the
     /// empty arc's shape is pure penalty extrapolation, and the closed basis

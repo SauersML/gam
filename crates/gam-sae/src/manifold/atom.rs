@@ -138,16 +138,6 @@ pub enum SaeAtomBasisKind {
     Precomputed(String),
 }
 
-/// The rank charge (effective latent dimension) of a finite-set atom with
-/// `anchors` anchors: `anchors − 1`. A categorical coordinate over `k` anchors has
-/// `k − 1` independent contrasts (one anchor is the reference level), so that — not
-/// `k`, and not a continuous manifold's intrinsic `d` — is what the race must
-/// charge the finite-set alternative. Returns `0` for the degenerate `anchors ≤ 1`
-/// (a single anchor is the constant, no contrasts).
-pub fn finite_set_rank_charge(anchors: usize) -> usize {
-    anchors.saturating_sub(1)
-}
-
 impl SaeAtomBasisKind {
     pub(crate) fn latent_manifold(&self, latent_dim: usize) -> LatentManifold {
         match self {
@@ -686,10 +676,6 @@ impl SaeManifoldAtom {
     /// κ, so the design does not move and only the penalty does.
     pub fn smooth_penalty_kappa_derivative(&self) -> Option<&Array2<f64>> {
         self.smooth_penalty_kappa_derivative.as_ref()
-    }
-
-    pub fn reference_roughness_kind(&self) -> SaeReferenceRoughnessKind {
-        self.reference_roughness_kind
     }
 
     pub fn geometry_plan(&self) -> Option<&SaeAtomGeometryPlan> {
@@ -1783,37 +1769,6 @@ impl SaeManifoldAtom {
         }
     }
 
-    /// Reconstruct the full decoder `B_k = C_k · Uᵀ` from a border coordinate
-    /// matrix `C_k` (`M_k × r`) and the active frame (issue #972). Used when the
-    /// border solver returns updated coordinates and the authoritative
-    /// `decoder_coefficients` must be refreshed for the full-`B` consumers.
-    pub fn reconstruct_decoder_coefficients(
-        &self,
-        coords: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        let frame = self.decoder_frame.as_ref().ok_or_else(|| {
-            "SaeManifoldAtom::reconstruct_decoder_coefficients: no active frame".to_string()
-        })?;
-        frame.reconstruct_decoder(coords)
-    }
-
-    /// Install border coordinates `C_k` (`M_k × r`) returned by the factored
-    /// border solve, refreshing `decoder_coefficients = C_k · Uᵀ` so all
-    /// full-`B` consumers stay consistent with the profiled frame (issue #972).
-    pub fn set_factored_coordinates(&mut self, coords: ArrayView2<'_, f64>) -> Result<(), String> {
-        let reconstructed = self.reconstruct_decoder_coefficients(coords)?;
-        if reconstructed.dim() != self.decoder_coefficients.dim() {
-            return Err(format!(
-                "SaeManifoldAtom::set_factored_coordinates: reconstructed decoder {:?} \
-                 must match {:?}",
-                reconstructed.dim(),
-                self.decoder_coefficients.dim()
-            ));
-        }
-        self.decoder_coefficients = reconstructed;
-        Ok(())
-    }
-
     /// Closed-form streaming polar refresh of the active frame from an
     /// accumulated `p × r` cross-moment (issue #972): `U ← polar(Mcm)`, then
     /// re-project the coordinates so `B_k` is unchanged in span. The frame
@@ -1896,40 +1851,6 @@ impl SaeManifoldAtom {
             *slot = 0.0;
         }
         for basis_col in 0..m {
-            let dphi = self.basis_jacobian[[row, basis_col, latent_axis]];
-            if dphi == 0.0 {
-                continue;
-            }
-            let dec = self.decoder_coefficients.row(basis_col);
-            for (o, &d) in out.iter_mut().zip(dec.iter()) {
-                *o += dphi * d;
-            }
-        }
-    }
-
-    /// #1026 — `∂²g_k/∂t_{ik,axis}∂η` for one row/axis, restricted to the curved
-    /// basis columns. Because the η-dial scales exactly the curved columns
-    /// (`∂Φ^η/∂η = Φ_curved`), the η-derivative of the coordinate Jacobian
-    /// `∂(∂Φ/∂t·B)/∂η` is the SAME coordinate-Jacobian contraction summed over
-    /// only the curved columns. This is the coordinate-channel analog of the
-    /// β-predictor's `curvature_basis_eta_derivatives`, and supplies the missing
-    /// `w_t = ∂g_t/∂η` forcing that lets the homotopy walk track onto the curved
-    /// branch instead of riding the base-topology shadow. `curved_cols` are the
-    /// atom's `phi_eta_split` curved column indices; a base-only atom (no dialed
-    /// columns) writes zeros.
-    pub fn fill_decoded_curved_derivative_row(
-        &self,
-        row: usize,
-        latent_axis: usize,
-        curved_cols: &[usize],
-        out: &mut [f64],
-    ) {
-        let p = self.output_dim();
-        assert_eq!(out.len(), p);
-        for slot in out.iter_mut() {
-            *slot = 0.0;
-        }
-        for &basis_col in curved_cols {
             let dphi = self.basis_jacobian[[row, basis_col, latent_axis]];
             if dphi == 0.0 {
                 continue;

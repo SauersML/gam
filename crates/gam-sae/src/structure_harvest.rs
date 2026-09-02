@@ -84,18 +84,7 @@ use crate::atom_codes::SparseAtomCodes;
 use crate::basis::{AmbientSphereHarmonicEvaluator, SaeBasisEvaluator, SaeBasisSecondJet};
 use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
 use crate::frames::GrassmannFrame;
-use crate::manifold::{
-    AssignmentMode, AtlasSeamKind, AtlasTopologyReadout, GraphCompressionKind,
-    GraphStructureSelection, LearnedGraphAtom, OccupancyLaw, SAE_AMBIENT_SPHERE_DEFAULT_DEGREE,
-    SAE_EUCLIDEAN_PATCH_MAX_DEGREE,
-    SAE_MAX_PERIODIC_HARMONICS,
-    SaeAtomBasisKind, SaeAtomGeometryPlan, SaeBasisResolution, SaeManifoldAtom, SaeManifoldRho,
-    SaeManifoldTerm, SaeReferenceMetricPlan, SphereChartTransition, UnitSpeedChartTransition,
-    amplitude_concentration_certificate, anisotropic_flat_product_torus_penalty,
-    anisotropic_flat_product_torus_penalty_aspect_derivative, classify_occupancy_interval,
-    embedded_donut_torus_reference_penalty,
-    embedded_donut_torus_reference_penalty_aspect_derivative,
-};
+use crate::manifold::{AssignmentMode, AtlasSeamKind, AtlasTopologyReadout, GraphCompressionKind, GraphStructureSelection, LearnedGraphAtom, SAE_AMBIENT_SPHERE_DEFAULT_DEGREE, SAE_EUCLIDEAN_PATCH_MAX_DEGREE, SAE_MAX_PERIODIC_HARMONICS, SaeAtomBasisKind, SaeAtomGeometryPlan, SaeBasisResolution, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SaeReferenceMetricPlan, SphereChartTransition, UnitSpeedChartTransition, amplitude_concentration_certificate, anisotropic_flat_product_torus_penalty, anisotropic_flat_product_torus_penalty_aspect_derivative, embedded_donut_torus_reference_penalty, embedded_donut_torus_reference_penalty_aspect_derivative};
 use crate::migration_ledger::SaeMigrationLedger;
 use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
 use gam_linalg::faer_ndarray::FaerSvd;
@@ -119,7 +108,6 @@ use gam_terms::structure::anova_atom::{
     CarveReport, FissionDecision, carve, carve_input_from_fitted_atom, fission_decision,
 };
 use opt::{BracketedRootConfig, FirstOrderSample, ObjectiveEvalError, find_root_bracketed};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Per-row soft-assignment mass below which an atom is treated as INACTIVE on
 /// that row when deriving the discrete co-activation support. A soft softmax /
@@ -4372,91 +4360,6 @@ fn radial_promoted_specs(
     Ok(Some(promoted))
 }
 
-/// F2 finite-set-atom opt-in. Default `false`: the birth race does NOT enrol a
-/// finite-set (discrete anchor) candidate, so the [`SaeAtomBasisKind::FiniteSet`]
-/// variant + [`AnchorIndicatorEvaluator`] land as inert scaffolding that cannot
-/// affect any birth. The switch flips to `true` only AFTER the finite-set atom is
-/// verified — full `gam-sae` suite green plus the real-data weekday adjudication
-/// (is weekday seven cyclic points or an occupied circle?). Enrolling the
-/// candidate in the actual race additionally needs an `AutoTopologyKind::FiniteSet`
-/// in `gam-solve`'s selector (the cross-crate follow-up); until then the flag +
-/// [`finite_set_candidate_for_birth`] are the staged, unit-tested substrate.
-static FINITE_SET_RACE_ENROLLED: AtomicBool = AtomicBool::new(false);
-
-/// Whether the birth race enrols the finite-set (discrete anchor) candidate.
-/// Default `false` — see `FINITE_SET_RACE_ENROLLED`.
-pub fn finite_set_race_enrolled() -> bool {
-    FINITE_SET_RACE_ENROLLED.load(Ordering::Relaxed)
-}
-
-/// Flip the finite-set-atom enrolment opt-in. Intended for the post-verification
-/// enablement (and for tests exercising the enrolled path); default is `false`.
-pub fn set_finite_set_race_enrolled(enrolled: bool) {
-    FINITE_SET_RACE_ENROLLED.store(enrolled, Ordering::Relaxed);
-}
-
-/// Build the finite-set (discrete anchor) candidate inputs for a `d = 1` birth
-/// whose occupancy is DISCRETE — the honest "seven cyclic points, not an occupied
-/// circle" alternative. Returns `(anchors, index_coords)` where `index_coords`
-/// (`n × 1`) assigns each row to its nearest of `anchors` anchors (the integer
-/// index the `AnchorIndicatorEvaluator` reads), and `anchors − 1` is the rank
-/// charge (`finite_set_rank_charge`). Returns `None` when the birth is not a
-/// discrete finite set (uniform / continuous occupancy, wrong dimension, or a
-/// degenerate coordinate) — so it never fabricates a cluster structure.
-///
-/// This is the pure, unit-tested substrate the race enrolment consumes once
-/// [`finite_set_race_enrolled`] flips; it does not itself touch any birth.
-pub fn finite_set_candidate_for_birth(coords: ArrayView2<'_, f64>) -> Option<(usize, Array2<f64>)> {
-    if coords.ncols() != 1 {
-        return None;
-    }
-    let n = coords.nrows();
-    if n < 4 {
-        return None;
-    }
-    let col = coords.column(0);
-    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for &t in col.iter() {
-        if !t.is_finite() {
-            return None;
-        }
-        lo = lo.min(t);
-        hi = hi.max(t);
-    }
-    let span = hi - lo;
-    if !(span > 0.0) {
-        return None;
-    }
-    // Range-normalize the single coordinate column to [0, 1] and classify on the
-    // INTERVAL (non-wrapping) occupancy law: a birth coordinate is
-    // interval-topology (linear, from the PCA seed), so its extreme values must
-    // NOT wrap onto each other — the circular classifier would fold `0` and `1`
-    // together and merge a linear set's first and last anchors (7 weekday points
-    // → 6), and its full-circle uniform model would misread a range-filling
-    // uniform coordinate as non-uniform. The interval classifier keeps linear
-    // ends distinct and range-uniform data uniform.
-    let r: Vec<f64> = col
-        .iter()
-        .map(|&t| ((t - lo) / span).clamp(0.0, 1.0))
-        .collect();
-    match classify_occupancy_interval(&r) {
-        OccupancyLaw::Discrete { anchors } if anchors >= 2 => {
-            // Assign each row to its nearest anchor bin from the normalization
-            // `r ∈ [0, 1]`: the `anchors` evenly spaced bins give the categorical
-            // index the indicator basis reads. A fitted-anchor-position
-            // assignment is the cross-crate refinement (it needs the classifier's
-            // centers exposed).
-            let mut idx = Array2::<f64>::zeros((n, 1));
-            for i in 0..n {
-                let bin = (r[i] * anchors as f64).floor();
-                idx[[i, 0]] = bin.clamp(0.0, (anchors - 1) as f64);
-            }
-            Some((anchors, idx))
-        }
-        _ => None,
-    }
-}
-
 /// A graph birth candidate enrolled in structure search.
 ///
 /// The candidate edge set is the derived anchor-kNN graph; REML per-edge losses
@@ -4466,28 +4369,6 @@ pub fn finite_set_candidate_for_birth(coords: ArrayView2<'_, f64>) -> Option<(us
 pub struct GraphBirthCandidate {
     pub atom: LearnedGraphAtom,
     pub selection: GraphStructureSelection,
-}
-
-/// Build the graph-atom birth candidate that the structure search scores. This
-/// is the graph counterpart to the fixed topology menu: the caller supplies
-/// REML per-edge deletion losses for the kNN edge set, and selection is paid in
-/// summed edge charge rather than by promoting to a circle/line first.
-pub fn graph_birth_candidate_for_structure_search(
-    anchor_embeddings: ArrayView2<'_, f64>,
-    row_coordinates: &[f64],
-    n_eff: f64,
-    edge_precisions: &[f64],
-    edge_delta_loss: &[f64],
-) -> Result<GraphBirthCandidate, String> {
-    let atom = LearnedGraphAtom::from_reml_knn_edges(
-        anchor_embeddings,
-        row_coordinates,
-        n_eff,
-        edge_precisions,
-        edge_delta_loss,
-    )?;
-    let selection = atom.structure_selection();
-    Ok(GraphBirthCandidate { atom, selection })
 }
 
 /// #2280 — build the local-chart atlas on a birth's ambient residual image and read
@@ -6661,17 +6542,6 @@ pub struct StructureSearchResult {
 }
 
 impl StructureSearchResult {
-    /// Assemble a result from the fitted term/ρ and the per-round e-process
-    /// ledgers, folding those rounds into the unified [`SaeMigrationLedger`]
-    /// currency ([`Self::migration`]) in one place so producers cannot drift.
-    #[must_use]
-    pub fn from_rounds(
-        term: SaeManifoldTerm,
-        rho: SaeManifoldRho,
-        rounds: Vec<SearchLedger>,
-    ) -> Self {
-        Self::from_rounds_with_predictions(term, rho, rounds, &[])
-    }
 
     /// Assemble a result AND thread the #2233 closed-form birth pre-screen
     /// predictions into the unified ledger. `birth_predictions[i]` maps a birth
