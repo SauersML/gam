@@ -265,7 +265,6 @@ pub fn enclosure_margin_verdict(enclosure: &LogdetEnclosure, decision_margin: f6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_problem::topology_certificates::CertificateLedger;
 
     #[test]
     fn criterion_stationarity_and_curvature_control_verdict() {

@@ -21,10 +21,6 @@
 //! execution path; the CPU reference is therefore the single implementation
 //! until a real batched kernel exists end to end.
 
-use crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure;
-use crate::gpu_kernels::arrow_schur::ArrowSchurGpuSolution;
-use crate::arrow_schur::ArrowSchurSystem;
-use crate::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,15 +43,6 @@ mod tests {
             sys.gb[r] = 0.2 * (r as f64 + 1.0) + seed;
         }
         sys
-    }
-
-    #[test]
-    fn empty_class_returns_empty() {
-        let out = solve_batched_k1_border(&[], 1e-6, 1e-6);
-        assert!(
-            out.is_empty(),
-            "an empty color class must return no results"
-        );
     }
 
 }

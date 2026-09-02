@@ -2141,38 +2141,9 @@ mod tests {
         );
     }
 
-    /// `K=4` dense row Hessian: per-row PSD matrix supplied directly.
-    struct DenseRowHessian {
-        h: Array3<f64>,
-    }
-
-    impl RowHessian for DenseRowHessian {
-        fn k(&self) -> usize {
-            self.h.shape()[1]
-        }
-        fn nrows(&self) -> usize {
-            self.h.shape()[0]
-        }
-        fn fill_row(&self, row: usize, out: &mut [f64]) {
-            let k = self.k();
-            assert_eq!(out.len(), k * k);
-            for c in 0..k {
-                for d in 0..k {
-                    out[c * k + d] = self.h[[row, c, d]];
-                }
-            }
-        }
-        fn evaluate_full(&self) -> Array3<f64> {
-            self.h.clone()
-        }
-    }
-
     // Per-row Hessian (K=1) sourced from an arbitrary positive vector —
     // used by the dual-metric sanity test to drive both structural and
     // curvature passes with the *same* non-identity weights.
-    fn diag_hess(w: Array1<f64>) -> DiagonalScalarRowHessian {
-        DiagonalScalarRowHessian::new(w)
-    }
 
     // ---- compile_from_raw_grams tests ----
 

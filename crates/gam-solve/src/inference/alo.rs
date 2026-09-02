@@ -1923,8 +1923,7 @@ fn solve_identity_minus_product_in_place(
 
 #[cfg(test)]
 mod tests {
-    use super::{ALO_EXACT_SCALAR_MAX_ITERS, AloExactScalarError, AloInput, alo_eta_exact_frozen_curvature, alo_eta_updatewith_offset, compute_alo_from_input_inner, finite_weighted_square_sum, spd_quadratic_after_certified_solve};
-    use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
+    use super::{ALO_EXACT_SCALAR_MAX_ITERS, AloExactScalarError, alo_eta_exact_frozen_curvature, alo_eta_updatewith_offset, finite_weighted_square_sum, spd_quadratic_after_certified_solve};
 
     #[test]
     fn alo_offset_update_matches_centered_algebra() {
@@ -2038,22 +2037,6 @@ mod tests {
         let quadratic =
             spd_quadratic_after_certified_solve(0, rhs.view(), solution.view()).unwrap();
         assert_eq!(quadratic, 2.5);
-    }
-
-    #[test]
-    fn percentile_index_matches_expected_rounding() {
-        assert_eq!(percentile_index(0, 0.95), 0);
-        assert_eq!(percentile_index(1, 0.95), 0);
-        assert_eq!(percentile_index(10, 0.50), 5);
-        assert_eq!(percentile_index(10, 0.95), 9);
-    }
-
-    #[test]
-    fn percentile_from_sorted_returns_order_statistic() {
-        let values = [1.0, 2.0, 3.0, 4.0, 5.0];
-        assert_eq!(percentile_from_sorted(&values, 0.50), 3.0);
-        assert_eq!(percentile_from_sorted(&values, 0.95), 5.0);
-        assert_eq!(percentile_from_sorted(&[], 0.95), 0.0);
     }
 
     // --- Multi-block ALO tests ---

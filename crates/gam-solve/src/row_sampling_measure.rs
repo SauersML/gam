@@ -58,7 +58,6 @@
 
 use gam_linalg::utils::splitmix64_hash;
 use gam_problem::{MetricProvenance, RowMetric};
-use faer::Side;
 
 /// Where a [`RowSamplingMeasure`] came from — the honest record of whether the
 /// enrichment is real (Fisher-mass driven) or the graceful uniform fallback.
@@ -435,7 +434,6 @@ pub fn per_row_fisher_mass(metric: &RowMetric) -> Vec<f64> {
 mod tests {
     use super::*;
     use ndarray::Array2;
-    use ndarray::array;
     use std::sync::Arc;
 
     fn factors_from_rows(rows: &[Vec<f64>], p: usize, rank: usize) -> Arc<Array2<f64>> {

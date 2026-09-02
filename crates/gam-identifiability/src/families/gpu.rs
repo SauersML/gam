@@ -22,19 +22,3 @@
 //! execution faults are preserved as [`gam_gpu::gpu_error::GpuError`] instead
 //! of being collapsed into an apparent absence.
 
-#[cfg(test)]
-mod tests {
-    use ndarray::Array2;
-
-    fn symmetrise_for_test(out: &mut Array2<f64>) {
-        let n = out.nrows();
-        for row in 0..n {
-            for col in (row + 1)..n {
-                let avg = 0.5 * (out[[row, col]] + out[[col, row]]);
-                out[[row, col]] = avg;
-                out[[col, row]] = avg;
-            }
-        }
-    }
-
-}

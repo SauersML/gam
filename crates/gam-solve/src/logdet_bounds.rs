@@ -34,7 +34,6 @@
 //! `D` is the refinement step when the gap is too wide. `ρ ≥ 1` is an
 //! explicit refusal (`Err`), never a silent fallback.
 
-use faer::Side;
 /// A certified enclosure of `log|S|` for a block-partitioned SPD matrix.
 #[derive(Debug, Clone)]
 pub struct LogdetEnclosure {
@@ -126,7 +125,6 @@ impl MarginVerdict {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ndarray::Array2;
 
     /// Deterministic block-SPD fixture: strong SPD diagonal blocks, weak

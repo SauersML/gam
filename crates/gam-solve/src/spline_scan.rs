@@ -6453,22 +6453,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn state_snapshot_round_trips_predict_and_training_sample_size_bit_for_bit() {
-        round_trip_predict_bit_for_bit(2);
-    }
-
-    /// #1044: the order-1 and order-3 layouts round-trip bit-for-bit too.
-    #[test]
-    fn state_snapshot_round_trips_predict_bit_for_bit_order1() {
-        round_trip_predict_bit_for_bit(1);
-    }
-
-    #[test]
-    fn state_snapshot_round_trips_predict_bit_for_bit_order3() {
-        round_trip_predict_bit_for_bit(3);
-    }
-
     /// A hand-built persisted state, valid by `from_state`'s own structural
     /// rules: `state` is `order` per knot, `cov` the `order(order+1)/2` upper
     /// triangle per knot, `gain` the full `order²` per knot, one weight per

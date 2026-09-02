@@ -386,7 +386,6 @@ impl CrossNodeGramReduction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::s;
 
     /// Deterministic pseudo-random row matrix keyed purely by index (same
     /// recipe as the streaming_border tests, so cross-file comparisons hold).

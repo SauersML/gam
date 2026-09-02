@@ -26,8 +26,7 @@
 // residues of that size cannot be called a saddle — flips the undeflated
 // verdict, and does not flip the deflated one.
 
-use super::*;
-use ndarray::{Array1, Array2, array};
+use ndarray::Array2;
 
 /// THE GUARANTEE, not an instance of it: **Cauchy interlacing bounds what
 /// deflation can hide.**

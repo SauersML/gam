@@ -1,7 +1,7 @@
 use super::*;
 use ndarray::{Array1, array};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn run_fixture(continuation_is_stationary: bool) -> (OuterResult, usize) {
     let mut seed_config = gam_problem::SeedConfig::default();

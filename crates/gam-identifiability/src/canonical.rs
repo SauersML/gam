@@ -2066,14 +2066,6 @@ mod tests {
 
     use ndarray::Array2;
 
-    /// Every block's coefficient coordinate is a plain basis of its column
-    /// space, which is the assumption these fixtures are about. A fixture that
-    /// exercises the structural veto instead declares `Structural` at its own
-    /// call site, so no test inherits the freedom by default (#2748).
-    fn spanning_coordinates(specs: &[ParameterBlockSpec]) -> Vec<CoefficientCoordinate> {
-        vec![CoefficientCoordinate::Spanning; specs.len()]
-    }
-
     fn linspace(n: usize) -> ndarray::Array1<f64> {
         if n <= 1 {
             return ndarray::Array1::<f64>::zeros(n.max(1));
@@ -2353,39 +2345,6 @@ mod tests {
     }
 
     use gam_problem::test_support::spec_from_dense_with_priority;
-
-    /// The geometry gam#2748 broke on, at the shape it broke at: a monotone
-    /// link-wiggle warp residualized against a higher-priority mean block.
-    ///
-    /// `B⊥ = B − X A` is rank-deficient BY CONSTRUCTION — de-aliasing
-    /// annihilates exactly `range(B) ∩ range(X)` — so the warp block arrives
-    /// with `w` columns carrying an exact null direction. Built here in closed
-    /// form so the fixture is a statement rather than a recorded run:
-    /// `warp[.., 0] = mean[.., 1]` makes column 0 of the warp lie exactly in the
-    /// mean block's span, which is the one direction the orthogonaliser absorbs.
-    fn dealiased_warp_against_mean_block_specs(
-        mean_priority: u8,
-        warp_priority: u8,
-    ) -> [ParameterBlockSpec; 2] {
-        let n = 240;
-        let t = linspace(n);
-        let mut mean = Array2::<f64>::zeros((n, 3));
-        let mut warp = Array2::<f64>::zeros((n, 4));
-        for i in 0..n {
-            mean[[i, 0]] = 1.0;
-            mean[[i, 1]] = t[i];
-            mean[[i, 2]] = (2.0 * t[i]).sin();
-            // Exactly in the mean block's span: the de-aliasing null direction.
-            warp[[i, 0]] = t[i];
-            warp[[i, 1]] = t[i] * t[i];
-            warp[[i, 2]] = t[i] * t[i] * t[i];
-            warp[[i, 3]] = (3.0 * t[i]).cos();
-        }
-        [
-            spec_from_dense_with_priority("eta", mean, mean_priority),
-            spec_from_dense_with_priority("wiggle", warp, warp_priority),
-        ]
-    }
 
     /// Direct unit test of the compiler primitive: a block whose columns are
     /// fully spanned by a higher-priority anchor must shed all overlapping

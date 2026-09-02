@@ -12,7 +12,6 @@
 //! SAS/binomial one) so the synthetic ladders sit exactly where the real ones do.
 
 use super::*;
-use ndarray::Array1;
 
 /// #2450's measured face constant, on the Matérn/Gaussian fixture.
 const FACE_C_POSITIVE: f64 = 87.512;

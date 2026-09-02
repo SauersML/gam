@@ -102,7 +102,7 @@ mod tests {
     use super::GlmFixedDesignSufficient;
     use ndarray::{Array1, Array2};
     use rand::rngs::StdRng;
-    use rand::{RngExt, SeedableRng};
+    use rand::RngExt;
 
     fn deterministic_design(n: usize, p: usize) -> Array2<f64> {
         Array2::from_shape_fn((n, p), |(i, j)| {

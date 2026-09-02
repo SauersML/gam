@@ -47,6 +47,7 @@
 //! gates).
 
 use ndarray::Array2;
+use super::MeasureJetBand;
 
 /// A single requested derivative direction in `L`-space: the lower-triangular
 /// entry `(i, j)` with `i >= j`. The zeroth-order "direction" (the value

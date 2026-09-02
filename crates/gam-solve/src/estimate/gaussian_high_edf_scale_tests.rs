@@ -28,8 +28,6 @@
 //! and so catches either regression in one shot.
 
 use super::*;
-use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
-use gam_terms::smooth::BlockwisePenalty;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

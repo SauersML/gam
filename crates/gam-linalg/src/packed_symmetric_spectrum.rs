@@ -513,8 +513,6 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::splitmix64;
-    use ndarray::{Array1, Array2};
 
     #[test]
     fn a_non_finite_input_is_refused_rather_than_decomposed() {

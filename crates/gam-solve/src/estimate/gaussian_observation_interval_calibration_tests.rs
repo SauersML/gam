@@ -28,12 +28,9 @@
 //! small PIT KS, and separately demonstrates that both ingredients are
 //! load-bearing (the MLE scale and the mean-term-dropped band both undercover).
 
-use super::*;
-use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
-use gam_terms::smooth::BlockwisePenalty;
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use rand::RngExt;
 
 const N: usize = 300;
 const P: usize = 160;

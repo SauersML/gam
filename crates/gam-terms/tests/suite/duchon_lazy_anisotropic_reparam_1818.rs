@@ -6,10 +6,3 @@
 //! builds stayed in the raw constrained-kernel frame, so their penalty spectrum
 //! and REML geometry depended on which memory route happened to be selected.
 
-use gam_runtime::resource::ResourcePolicy;
-use gam_terms::basis::{
-    BasisMetadata, BasisWorkspace, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
-    DuchonOperatorPenaltySpec, build_duchon_basiswithworkspace,
-};
-use ndarray::{Array1, Array2, Axis, s};
-

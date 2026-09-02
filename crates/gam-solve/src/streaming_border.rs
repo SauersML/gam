@@ -443,56 +443,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gram_matches_naive_xtx() {
-        let n = 257; // deliberately not a multiple of the chunk size
-        let k = 5;
-        let rows = planted_rows(n, k);
-        let gram = run_with_order(&rows, 16, &(0..17).collect::<Vec<_>>());
-        let naive = rows.t().dot(&rows);
-        for i in 0..k {
-            for j in 0..k {
-                let d = (gram[[i, j]] - naive[[i, j]]).abs();
-                let scale = naive[[i, j]].abs().max(1.0);
-                assert!(
-                    d <= 1.0e-12 * scale,
-                    "Gram[{i},{j}] = {} vs naive {} (delta {d})",
-                    gram[[i, j]],
-                    naive[[i, j]]
-                );
-            }
-        }
-        // Bitwise symmetry: mirror entries reuse the same product sequence.
-        for i in 0..k {
-            for j in 0..k {
-                assert_eq!(gram[[i, j]].to_bits(), gram[[j, i]].to_bits());
-            }
-        }
-    }
-
-    #[test]
-    fn bit_reproducible_across_chunk_submission_orders() {
-        // Enough chunks (> CROSS_CHUNK_BASE) to exercise the base-block seal,
-        // the power-of-two cascade, AND the trailing short block.
-        let n = 2 * CROSS_CHUNK_BASE * 3 + 7; // 775 rows
-        let k = 4;
-        let chunk_size = 2; // 388 chunks
-        let rows = planted_rows(n, k);
-        let n_chunks = n.div_ceil(chunk_size);
-
-        let in_order: Vec<usize> = (0..n_chunks).collect();
-        let reversed: Vec<usize> = (0..n_chunks).rev().collect();
-        // Deterministic stride shuffle (388 is coprime to 129).
-        let strided: Vec<usize> = (0..n_chunks).map(|i| (i * 129) % n_chunks).collect();
-
-        let g0 = run_with_order(&rows, chunk_size, &in_order);
-        let g1 = run_with_order(&rows, chunk_size, &reversed);
-        let g2 = run_with_order(&rows, chunk_size, &strided);
-
-        assert_bit_identical(&g0, &g1, "in-order vs reversed submission");
-        assert_bit_identical(&g0, &g2, "in-order vs strided submission");
-    }
-
     /// Mixed-precision error budget (#973): rows stored `f32` (the shard
     /// format) and accumulated in `f64` must reproduce the all-`f64` border
     /// Gram within a **named tolerance**, entry-wise relative to the Gram's

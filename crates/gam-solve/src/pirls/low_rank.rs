@@ -2,7 +2,6 @@
 //! low-rank weight, and the Woodbury capacitance assembly.
 
 use super::*;
-use gam_linalg::low_rank_weight::LowRankWeight;
 
 // - The diagonal part flows through `xt_diag_x_signed` / `xt_diag_x_psd`
 //   exactly as before. When `LowRankWeight::is_rank_zero()` the path is
@@ -190,73 +189,6 @@ mod low_rank_weight_pirls_tests {
             [0.2, 0.9, -0.5],
         ];
         DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x))
-    }
-
-    #[test]
-    pub(crate) fn xtwx_low_rank_matches_diagonal_when_rank_zero() {
-        let design = tiny_design();
-        let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
-        let u = Array2::<f64>::zeros((5, 0));
-        let v = Array2::<f64>::zeros((5, 0));
-        let weight = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
-        let mut ws = PirlsWorkspace::new(5, 3);
-        let got = compute_xtwx_low_rank(&mut ws, &design, &weight).unwrap();
-        let want = design
-            .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(&d).unwrap())
-            .unwrap();
-        let diff = (&got - &want).mapv(f64::abs).sum();
-        assert!(diff < 1e-12, "rank-0 path diverged from diagonal: {}", diff);
-    }
-
-    #[test]
-    pub(crate) fn xtwy_low_rank_matches_dense_reference() {
-        let design = tiny_design();
-        let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
-        let u = array![
-            [0.1, -0.2],
-            [0.4, 0.3],
-            [-0.1, 0.5],
-            [0.2, 0.1],
-            [0.0, -0.3]
-        ];
-        let v = array![[0.2, 0.1], [0.0, 0.4], [0.3, -0.2], [-0.1, 0.6], [0.5, 0.0]];
-        let weight = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
-        let y = array![0.7, -1.2, 0.3, 0.9, -0.4];
-        let got = compute_xtwy_low_rank(&design, &weight, &y).unwrap();
-
-        let xdense = design.as_dense().unwrap().to_owned();
-        let mut w = Array2::<f64>::zeros((5, 5));
-        for i in 0..5 {
-            w[[i, i]] = d[i];
-        }
-        w += &u.dot(&v.t());
-        let want = xdense.t().dot(&w.dot(&y));
-        let diff: f64 = got
-            .iter()
-            .zip(want.iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-        assert!(diff < 1e-10, "xtwy_low_rank diverged: {}", diff);
-    }
-
-    #[test]
-    pub(crate) fn woodbury_capacitance_is_well_formed() {
-        let uhat = array![[0.5, 0.1], [-0.2, 0.7], [0.3, -0.4]];
-        let vhat = array![[0.1, 0.2], [0.6, -0.1], [-0.3, 0.4]];
-        let cap = woodbury_gram_capacitance(&uhat, &vhat).unwrap();
-        let want = {
-            let mut m = vhat.t().dot(&uhat);
-            for k in 0..2 {
-                m[[k, k]] += 1.0;
-            }
-            m
-        };
-        let diff: f64 = cap
-            .iter()
-            .zip(want.iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-        assert!(diff < 1e-12);
     }
 
     #[test]

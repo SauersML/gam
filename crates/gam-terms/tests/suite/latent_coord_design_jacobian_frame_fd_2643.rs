@@ -22,12 +22,7 @@
 //! `input_scale == 1` arm below is kept precisely so a future reader can see
 //! that the sensitivity is to σ and to nothing else.
 
-use gam_terms::basis::BasisMetadata;
-use gam_terms::basis::{
-    CenterStrategy, LatentCoordDesignDerivative, LocalDesignJacobianProvider, MaternBasisSpec,
-    MaternIdentifiability, MaternLengthScale, MaternNu,
-};
-use gam_terms::latent::{LatentCoordValues, LatentIdMode};
+use gam_terms::basis::{CenterStrategy, LocalDesignJacobianProvider, MaternBasisSpec, MaternIdentifiability, MaternLengthScale, MaternNu};
 use gam_terms::smooth::input_standardization::estimate_isotropic_scale;
 use gam_terms::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
@@ -133,56 +128,6 @@ fn finite_difference_row(
     let forward = design_row(&plus, spec, row);
     let backward = design_row(&minus, spec, row);
     (forward - backward) / (2.0 * step)
-}
-
-/// Worst relative disagreement between the analytic Jacobian and the central
-/// difference, over a spread of (row, axis) pairs.
-fn worst_relative_error(target_sigma: f64) -> (f64, f64) {
-    let data = latent_data(target_sigma);
-    let sigma = estimate_isotropic_scale(data.view())
-        .expect("isotropic scale")
-        .get();
-
-    // Fit-time build, then freeze — this is the state the optimizer starts from.
-    let fresh = fresh_spec();
-    let built = build_term_collection_design(data.view(), &fresh).expect("fresh design");
-    let frozen = freeze_term_collection_from_design(&fresh, &built).expect("freeze");
-    let metadata = built.smooth.terms[0].metadata.clone();
-
-    let derivative = operator_under_test(&data, &metadata);
-
-    // Step chosen relative to the coordinate spread so the central difference
-    // sits near its own optimum (h ~ cbrt(eps) · scale) rather than in
-    // cancellation or truncation.
-    let step = f64::EPSILON.cbrt() * target_sigma.max(1e-3);
-
-    let mut worst = 0.0_f64;
-    for row in [0usize, 3, 7] {
-        for axis in 0..2 {
-            let analytic = derivative
-                .local_design_jacobian_row(row, axis)
-                .expect("analytic local design jacobian");
-            let numeric = finite_difference_row(&data, &frozen, row, axis, step);
-            assert_eq!(
-                analytic.len(),
-                numeric.len(),
-                "analytic and FD Jacobian rows must span the same design columns"
-            );
-            // Scale the denominator on the LARGER of the two magnitudes so a
-            // near-zero analytic value cannot make a large disagreement look
-            // small, and add an absolute floor so exact zeros are comparable.
-            let magnitude = analytic
-                .iter()
-                .chain(numeric.iter())
-                .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-            let denominator = magnitude.max(1e-8);
-            for (a, n) in analytic.iter().zip(numeric.iter()) {
-                worst = worst.max((a - n).abs() / denominator);
-            }
-        }
-    }
-    eprintln!("[2643] sigma={sigma:.6} worst_relative_error={worst:.6e} step={step:.3e}");
-    (sigma, worst)
 }
 
 /// The frame-agnostic control: at `input_scale == 1` the standardized and

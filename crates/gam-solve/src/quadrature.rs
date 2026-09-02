@@ -4513,7 +4513,6 @@ pub(crate) fn cloglog_point_jet5(t: f64) -> (f64, f64, f64, f64, f64, f64) {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
-    use gam_problem::LikelihoodScaleMetadata;
     use gam_spec::LikelihoodSpec;
 
     /// Pins `log_half_erfc_stable` (both the `u > 0` erfcx branch and the

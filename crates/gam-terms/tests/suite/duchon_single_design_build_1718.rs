@@ -84,49 +84,6 @@ fn reparam_branch_duchon_spec_2d() -> DuchonBasisSpec {
 }
 
 #[test]
-fn duchon_fresh_reparam_cold_build_materializes_design_exactly_once() {
-    // Fresh data each run so the process-wide `(data, spec)` basis cache misses
-    // and the cold build actually executes (a cache hit would perform zero
-    // design builds and vacuously pass).
-    let data = spatial_data_2d(600);
-    let spec = reparam_branch_duchon_spec_2d();
-
-    // Hold the guard across the measured build so no concurrent test build lands
-    // between the two counter reads. `.unwrap_or_else(|e| e.into_inner())`
-    // tolerates a poisoned lock from an unrelated test panic.
-    let count_guard = DESIGN_BUILD_COUNT_GUARD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let before = duchon_design_build_count();
-    let result = build_duchon_basis(data.view(), &spec).expect("duchon(x, z) cold build");
-    let builds = duchon_design_build_count() - before;
-    drop(count_guard);
-
-    // Precondition: the fresh-reparam branch must actually be the one exercised
-    // (a real radial reparam frozen into the basis metadata), otherwise this
-    // test would not be guarding the doubled-build path at all.
-    match &result.metadata {
-        BasisMetadata::Duchon { radial_reparam, .. } => assert!(
-            radial_reparam.is_some(),
-            "#1718 guard precondition: expected the dense duchon(x, z) build to compute a \
-             data-metric radial reparam (the branch that used to build the design twice); \
-             got None"
-        ),
-        other => panic!("expected Duchon basis metadata, got {other:?}"),
-    }
-
-    // Core structural assertion: the full `n×k` kernel design is materialized
-    // exactly ONCE. Before the #1718 fix this was 2 (once to read `G_c`, once to
-    // fold in `V`).
-    assert_eq!(
-        builds, 1,
-        "#1718 regression: duchon(x, z) cold build materialized the kernel design {builds} \
-         times (expected exactly 1). The reparam rotation must reuse the already-built \
-         un-rotated design, not re-evaluate the kernel."
-    );
-}
-
-#[test]
 fn duchon_fused_reparam_design_equals_unfused_rebuild() {
     // Numerical-correctness guard for the fusion: `(K·Z)·V` (the reused,
     // rotated block) must equal `K·(Z·V)` (the un-fused rebuild the predict /

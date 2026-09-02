@@ -7232,11 +7232,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         //! seam, which the ban-scanner forbids). A bare `#[cfg(test)] mod tests`
         //! is the one form the scanner permits.
         use super::*;
-        use crate::arrow_schur::{
-            ArrowSchurSystem, BetaPenaltyOp, DeviceSaeFrameData, DeviceSaePcgData,
-            DeviceSaeSmoothBlock, FactoredFrameGBlock, SparseBlockKroneckerPenaltyOp,
-            SparseGBlock,
-        };
+        use crate::arrow_schur::{ArrowSchurSystem, DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock};
         use ndarray::Array2;
 
         /// Build the tiny hand-verifiable framed SAE fixture (2 atoms, 2 rows).
