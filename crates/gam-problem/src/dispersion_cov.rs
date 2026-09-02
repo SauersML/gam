@@ -124,11 +124,6 @@ impl PhiScaledCovariance {
         &self.0
     }
 
-    /// Consume the wrapper and return the raw `φ · H⁻¹` matrix.
-    #[inline]
-    pub fn into_array(self) -> Array2<f64> {
-        self.0
-    }
 }
 
 impl From<Array2<f64>> for PhiScaledCovariance {
@@ -183,11 +178,6 @@ impl UnscaledPrecision {
         &self.0
     }
 
-    /// Consume the wrapper and return the raw `H` matrix.
-    #[inline]
-    pub fn into_array(self) -> Array2<f64> {
-        self.0
-    }
 }
 
 impl From<Array2<f64>> for UnscaledPrecision {

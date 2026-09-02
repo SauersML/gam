@@ -1473,20 +1473,6 @@ impl FamilySpecKind {
         matches!(self, Self::BinomialBetaLogistic(_))
     }
 
-    /// Coarse kind-level Firth eligibility: every binomial inverse link this
-    /// enum can represent (Logit/Probit/CLogLog and the stateful
-    /// LatentCLogLog/SAS/Beta-Logistic/Mixture links) carries a Fisher-weight
-    /// jet, so kind-level Firth support is exactly binomial membership.
-    ///
-    /// The authoritative, link-resolved gate is
-    /// [`LikelihoodSpec::supports_firth`], which routes through
-    /// [`InverseLink::has_fisher_weight_jet`]. Keep this in agreement with that
-    /// predicate: a future binomial link without a Fisher-weight jet would make
-    /// this approximation diverge and must be handled at both sites.
-    #[inline]
-    pub const fn supports_firth(&self) -> bool {
-        self.is_binomial()
-    }
 }
 
 impl LikelihoodSpec {
@@ -1573,39 +1559,12 @@ impl LikelihoodSpec {
     }
 
     #[inline]
-    pub const fn binomial_logit() -> Self {
-        Self::new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::Logit),
-        )
-    }
-
-    #[inline]
     pub const fn binomial_probit() -> Self {
         Self::new(
             ResponseFamily::Binomial,
             InverseLink::Standard(StandardLink::Probit),
         )
     }
-
-    #[inline]
-    pub const fn binomial_cloglog() -> Self {
-        Self::new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::CLogLog),
-        )
-    }
-
-    #[inline]
-    pub const fn binomial_latent_cloglog(state: LatentCLogLogState) -> Self {
-        Self::new(ResponseFamily::Binomial, InverseLink::LatentCLogLog(state))
-    }
-
-    #[inline]
-    pub const fn binomial_sas(state: SasLinkState) -> Self {
-        Self::new(ResponseFamily::Binomial, InverseLink::Sas(state))
-    }
-
 
     #[inline]
     pub fn binomial_mixture(state: MixtureLinkState) -> Self {
@@ -1617,48 +1576,6 @@ impl LikelihoodSpec {
         Self::new(
             ResponseFamily::Poisson,
             InverseLink::Standard(StandardLink::Log),
-        )
-    }
-
-    #[inline]
-    pub const fn tweedie_log(p: f64) -> Self {
-        Self::new(
-            ResponseFamily::Tweedie { p },
-            InverseLink::Standard(StandardLink::Log),
-        )
-    }
-
-    /// Estimated-theta NB spec: `theta` is the seed, refined by the inner
-    /// solver (#802 default).
-    #[inline]
-    pub const fn negative_binomial_log(theta: f64) -> Self {
-        Self::new(
-            ResponseFamily::NegativeBinomial {
-                theta,
-                theta_fixed: false,
-            },
-            InverseLink::Standard(StandardLink::Log),
-        )
-    }
-
-    /// Fixed-theta NB spec: the fit holds `theta` at exactly this value
-    /// (`--negative-binomial-theta`, issue #983).
-    #[inline]
-    pub const fn negative_binomial_log_fixed(theta: f64) -> Self {
-        Self::new(
-            ResponseFamily::NegativeBinomial {
-                theta,
-                theta_fixed: true,
-            },
-            InverseLink::Standard(StandardLink::Log),
-        )
-    }
-
-    #[inline]
-    pub const fn beta_logit(phi: f64) -> Self {
-        Self::new(
-            ResponseFamily::Beta { phi },
-            InverseLink::Standard(StandardLink::Logit),
         )
     }
 
@@ -2085,13 +2002,6 @@ impl LikelihoodScaleMetadata {
         }
     }
 
-    /// Whether the Negative-Binomial overdispersion `theta` is estimated from
-    /// data (the default for NB families, issue #802).
-    #[inline]
-    pub const fn negbin_theta_is_estimated(self) -> bool {
-        matches!(self, Self::EstimatedNegBinTheta { .. })
-    }
-
     /// The Negative-Binomial `theta` carried in the scale metadata (estimated
     /// or user-fixed), or `None` for non-NB families.
     #[inline]
@@ -2351,14 +2261,12 @@ impl ResolvedLikelihoodScale {
         }
     }
 
-
     pub fn negative_binomial_theta(self) -> Result<f64, InvalidLikelihoodScale> {
         match self {
             Self::NegativeBinomial { theta, .. } => Ok(theta.value()),
             other => Err(other.wrong_family("a negative-binomial theta")),
         }
     }
-
 
     pub fn beta_precision(self) -> Result<f64, InvalidLikelihoodScale> {
         match self {
@@ -2616,23 +2524,8 @@ impl GlmLikelihoodSpec {
     }
 
     #[inline]
-    pub fn resolved_gamma_log_shape(&self) -> Result<f64, InvalidLikelihoodScale> {
-        self.resolved_scale()?.gamma_log_shape()
-    }
-
-    #[inline]
-    pub fn resolved_gamma_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
-        self.resolved_scale()?.gamma_phi()
-    }
-
-    #[inline]
     pub fn resolved_tweedie_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
         self.resolved_scale()?.tweedie_phi()
-    }
-
-    #[inline]
-    pub fn resolved_tweedie_log_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
-        self.resolved_scale()?.tweedie_log_phi()
     }
 
     #[inline]
@@ -2645,21 +2538,14 @@ impl GlmLikelihoodSpec {
         self.resolved_scale()?.beta_precision()
     }
 
-
     #[inline]
     pub fn resolved_gaussian_log_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
         self.resolved_scale()?.gaussian_log_phi()
     }
 
-
     #[inline]
     pub fn link_function(&self) -> LinkFunction {
         self.spec.link_function()
-    }
-
-    #[inline]
-    pub fn fixed_phi(&self) -> Option<f64> {
-        self.scale.fixed_phi()
     }
 
     /// Multiplier converting the stored unscaled inverse penalized Hessian
@@ -2767,12 +2653,6 @@ impl GlmLikelihoodSpec {
         self
     }
 
-    /// Whether the Beta-regression precision `phi` is estimated from data.
-    #[inline]
-    pub fn beta_phi_is_estimated(&self) -> bool {
-        self.scale.beta_phi_is_estimated()
-    }
-
     /// Mutate the Beta precision `phi` in place, on BOTH the family variant
     /// (where every PIRLS weight / deviance / log-likelihood expression reads it
     /// via `ResponseFamily::Beta { phi }`) and the scale metadata (the
@@ -2789,12 +2669,6 @@ impl GlmLikelihoodSpec {
         self
     }
 
-    /// Whether the Tweedie exponential-dispersion `phi` is estimated from data.
-    #[inline]
-    pub fn tweedie_phi_is_estimated(&self) -> bool {
-        self.scale.tweedie_phi_is_estimated()
-    }
-
     /// Mutate the Tweedie dispersion `phi` in place. Unlike Beta, the Tweedie
     /// power `p` (not `phi`) is what is carried on the `ResponseFamily::Tweedie`
     /// variant; the dispersion lives purely in the scale metadata and is read by
@@ -2808,13 +2682,6 @@ impl GlmLikelihoodSpec {
             self.scale = LikelihoodScaleMetadata::EstimatedTweediePhi { phi };
         }
         self
-    }
-
-    /// Whether the Negative-Binomial overdispersion `theta` is estimated from
-    /// data (issue #802).
-    #[inline]
-    pub fn negbin_theta_is_estimated(&self) -> bool {
-        self.scale.negbin_theta_is_estimated()
     }
 
     /// Mutate the Negative-Binomial overdispersion `theta` in place, on BOTH the
@@ -2844,16 +2711,6 @@ impl GlmLikelihoodSpec {
             self.scale = LikelihoodScaleMetadata::EstimatedNegBinTheta { theta };
         }
         self
-    }
-
-    /// The estimated Negative-Binomial `theta`, read from the family variant
-    /// (the canonical store), or `None` for non-NB families.
-    #[inline]
-    pub fn negbin_theta(&self) -> Option<f64> {
-        match self.spec.response {
-            ResponseFamily::NegativeBinomial { theta, .. } => Some(theta),
-            _ => None,
-        }
     }
 
     /// Produce a copy of this spec with the Tweedie exponential-dispersion

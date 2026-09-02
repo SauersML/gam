@@ -149,10 +149,6 @@ impl CustomFamilyHyperLayout {
         &self.design_derivative_blocks
     }
 
-    pub fn family_axes(&self) -> &[usize] {
-        &self.family_axes
-    }
-
     /// Exact non-rho coordinate values used to realize this manifest.
     ///
     /// The vector is aligned one-to-one with [`Self::axis`] and is part of the

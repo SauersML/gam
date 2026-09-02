@@ -105,14 +105,6 @@ impl RidgePassport {
         }
     }
 
-    #[inline]
-    pub const fn laplace_hessian_ridge(self) -> f64 {
-        if self.policy.accounts_for_objective() {
-            self.delta
-        } else {
-            0.0
-        }
-    }
 }
 
 impl TryFrom<RidgePassportWire> for RidgePassport {
@@ -322,99 +314,6 @@ impl StabilizationLedger {
         }
     }
 
-    /// LM/TR damping. δ is invisible to the objective, gradient, and any
-    /// saved artifact. Asserting this invariant at every read site is the
-    /// whole reason the ledger exists.
-    pub fn solver_damping(
-        delta: f64,
-        chosen_by: StabilizationRule,
-    ) -> Result<Self, InvalidStabilization> {
-        Self::try_new(StabilizationKind::SolverDampingOnly, delta, chosen_by, None)
-    }
-
-    /// Solver-only perturbation that leaves the objective unchanged. The
-    /// caller may attach a backward-error bound when one is available
-    /// (e.g. from iterative refinement / Wilkinson-style analysis).
-    pub fn numerical_perturbation(
-        delta: f64,
-        chosen_by: StabilizationRule,
-        backward_error_bound: Option<f64>,
-    ) -> Result<Self, InvalidStabilization> {
-        Self::try_new(
-            StabilizationKind::NumericalPerturbation,
-            delta,
-            chosen_by,
-            backward_error_bound,
-        )
-    }
-
-    /// Ridge declared as part of a downstream approximation (for example the
-    /// regularized rho covariance used to place sigma points).
-    pub fn approximation_only(
-        delta: f64,
-        chosen_by: StabilizationRule,
-    ) -> Result<Self, InvalidStabilization> {
-        Self::try_new(StabilizationKind::ApproximationOnly, delta, chosen_by, None)
-    }
-
-    /// Model-level explicit prior. δ enters every accounting pass: the
-    /// quadratic penalty, the Laplace Hessian, the penalty log-determinant,
-    /// and serialization.
-    pub fn explicit_prior(
-        delta: f64,
-        matrix_form: RidgeMatrixForm,
-        policy: RidgePolicy,
-    ) -> Result<Self, InvalidStabilization> {
-        if !policy.accounts_for_objective() {
-            return Err(InvalidStabilization::new(
-                "an explicit prior requires an objective-accounted ridge policy",
-            ));
-        }
-        let mut ledger = Self::try_new(
-            StabilizationKind::ExplicitPrior,
-            delta,
-            StabilizationRule::UserSpecified,
-            None,
-        )?;
-        ledger.matrix_form = matrix_form;
-        ledger.objective_policy = Some(policy);
-        Ok(ledger)
-    }
-
-    /// Bridge from the existing `RidgePassport` so PIRLS-side code (which
-    /// already passes a `RidgePassport` through every call) can hand a
-    /// ledger to anything that wants the new uniform view.
-    ///
-    /// `RidgePolicy` is homogeneous-by-construction: every constructor sets
-    /// the three inclusion flags identically. A passport whose policy
-    /// excludes every accounting term is morally a numerical perturbation
-    /// (the ridge is there to make the solve work but the objective ignores
-    /// it); a passport whose policy includes every accounting term is an
-    /// objective-accounted stabilization. Heterogeneous flag combinations cannot be produced
-    /// by the public `RidgePolicy` API and have no inhabitants downstream.
-    pub const fn from_passport(passport: RidgePassport) -> Self {
-        let objective_policy = if passport.policy.accounts_for_objective() {
-            Some(passport.policy)
-        } else {
-            None
-        };
-        let kind = if objective_policy.is_some() {
-            StabilizationKind::ObjectiveStabilization
-        } else {
-            StabilizationKind::NumericalPerturbation
-        };
-        Self {
-            kind,
-            delta: passport.delta,
-            matrix_form: passport.matrix_form,
-            chosen_by: StabilizationRule::FixedConstant,
-            objective_policy,
-            backward_error_bound: None,
-            inertia_before: None,
-            inertia_after: None,
-        }
-    }
-
     fn try_new(
         kind: StabilizationKind,
         delta: f64,
@@ -547,51 +446,6 @@ impl StabilizationLedger {
         self.inertia_after
     }
 
-    /// δ value to fold into the quadratic penalty term, or 0.0 if this
-    /// ledger entry is not part of the model. Derived from `kind`: only
-    /// objective-accounted stabilization contributes.
-    #[inline]
-    pub const fn quadratic_delta(&self) -> f64 {
-        match self.kind {
-            StabilizationKind::ExplicitPrior | StabilizationKind::ObjectiveStabilization => {
-                self.delta
-            }
-            StabilizationKind::None
-            | StabilizationKind::SolverDampingOnly
-            | StabilizationKind::NumericalPerturbation
-            | StabilizationKind::ApproximationOnly => 0.0,
-        }
-    }
-
-    /// δ value to add to the Laplace Hessian, or 0.0 if not included.
-    /// Derived from `kind`: only objective-accounted stabilization contributes.
-    #[inline]
-    pub const fn laplace_hessian_delta(&self) -> f64 {
-        match self.kind {
-            StabilizationKind::ExplicitPrior | StabilizationKind::ObjectiveStabilization => {
-                self.delta
-            }
-            StabilizationKind::None
-            | StabilizationKind::SolverDampingOnly
-            | StabilizationKind::NumericalPerturbation
-            | StabilizationKind::ApproximationOnly => 0.0,
-        }
-    }
-
-    /// δ value to add inside log|S + δ I|, or 0.0 if not included.
-    /// Derived from `kind`: only objective-accounted stabilization contributes.
-    #[inline]
-    pub const fn penalty_logdet_delta(&self) -> f64 {
-        match self.kind {
-            StabilizationKind::ExplicitPrior | StabilizationKind::ObjectiveStabilization => {
-                self.delta
-            }
-            StabilizationKind::None
-            | StabilizationKind::SolverDampingOnly
-            | StabilizationKind::NumericalPerturbation
-            | StabilizationKind::ApproximationOnly => 0.0,
-        }
-    }
 }
 
 impl TryFrom<StabilizationLedgerWire> for StabilizationLedger {
@@ -756,10 +610,6 @@ impl SmoothTermIdx {
         self.0
     }
 
-    #[inline]
-    pub const fn is_placeholder(self) -> bool {
-        self.0 == usize::MAX
-    }
 }
 
 impl std::fmt::Display for SmoothTermIdx {

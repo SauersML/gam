@@ -247,33 +247,6 @@ fn wps_correction_term(
     }
 }
 
-/// ALO elpd from ALO-corrected leave-one-out predictions.
-///
-/// `loglik_fitted` and `loglik_loo` are the per-observation log predictive
-/// densities at the *fitted* (`η̂`) and *ALO leave-one-out* (`η̃₋ᵢ`) linear
-/// predictors respectively. The returned elpd is the honest ALO estimand
-/// `Σᵢ loglik_loo[i]`; each pointwise contribution is exactly `loglik_loo[i]`.
-///
-/// The raw fitted-vs-ALO ratio for observation `i` is
-/// `r_i = exp(ℓ(yᵢ|η̂ᵢ) − ℓ(yᵢ|η̃₋ᵢ))` — large where dropping `i` would have
-/// moved the fit a lot. We fit a GPD tail to this cross-observation ratio vector
-/// only to report an influence diagnostic: `k_hat_max` is the fitted tail shape
-/// and `n_k_bad` is the tail count when `k̂ > 0.7`. This is not draw-wise
-/// PSIS-LOO: there is no posterior-draw dimension, the Pareto fit is across
-/// observations, and the diagnostic never changes elpd.
-///
-/// Invalid or unrepresentable inputs are rejected explicitly. If the optional
-/// influence-tail fit is unavailable, `k_hat_max` is `None` and `n_k_bad` is
-/// zero; that diagnostic absence does not alter the certified elpd.
-pub fn alo_elpd(
-    loglik_fitted: ArrayView1<'_, f64>,
-    loglik_loo: ArrayView1<'_, f64>,
-) -> Result<AloElpd, EstimationError> {
-    let reduction_values: Vec<f64> = loglik_loo.iter().copied().collect();
-    let elpd = gam_solve::pirls::stable_finite_signed_sum(&reduction_values, "ALO elpd reduction")?;
-    alo_elpd_with_total(loglik_fitted, loglik_loo, elpd)
-}
-
 fn alo_elpd_with_total(
     loglik_fitted: ArrayView1<'_, f64>,
     loglik_loo: ArrayView1<'_, f64>,

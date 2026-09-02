@@ -149,7 +149,6 @@ impl GpuDispatchPolicy {
         }
     }
 
-
     pub const fn xtwx_target_is_gpu(&self, n: usize, p: usize, materialized: bool) -> bool {
         materialized && n > 0 && p > 0 && self.xtwx_flops(n, p) >= self.dense_reduction_flops_min()
     }
@@ -168,10 +167,6 @@ impl GpuDispatchPolicy {
             && self.xtwy_flops(n, px, q) >= self.dense_reduction_flops_min()
     }
 
-    pub const fn potrf_target_is_gpu(&self, p: usize, h_resident: bool) -> bool {
-        h_resident && p >= self.potrf_min_p
-    }
-
     /// Whether a batched Pólya-Gamma draw of `n` rows is worth dispatching to
     /// the device.
     ///
@@ -187,20 +182,6 @@ impl GpuDispatchPolicy {
     #[inline]
     pub const fn polya_gamma_batch_target_is_gpu(&self, n: usize) -> bool {
         n >= self.fused_kernel_min_n
-    }
-
-    /// Whether a batched per-row BMS kernel over `n` design rows is worth
-    /// dispatching to the device.
-    ///
-    /// The flex-row HVP and dense-block builders are batched over rows with the
-    /// per-row frames staged once, which is the same shape `row_kernel_min_n`
-    /// is calibrated for (it is set directly from the measured XtWX crossover
-    /// row count). Keyed on rows rather than a wall-clock ratio so the decision
-    /// is a property of the workload and the device, not of whoever else is on
-    /// the box.
-    #[inline]
-    pub const fn row_batch_target_is_gpu(&self, n: usize) -> bool {
-        n >= self.row_kernel_min_n
     }
 
     pub const fn dense_hessian_work_target_is_gpu(&self, n: usize, p: usize) -> bool {
@@ -464,126 +445,7 @@ pub struct ArrowBorderSolvePlan {
 }
 
 impl GpuDispatchPolicy {
-    /// Assembly flops for the dense reduced Schur: per row a rank-`d` update to
-    /// the `k × k` border (`≈ 2·d·k²`), summed over `n` rows.
-    const fn dense_schur_assembly_flops(n: usize, k: usize, d: usize) -> u128 {
-        2u128
-            .saturating_mul(n as u128)
-            .saturating_mul(d as u128)
-            .saturating_mul((k as u128).saturating_mul(k as u128))
-    }
 
-    /// Cholesky flops for the dense `k × k` reduced Schur: `≈ k³/3`.
-    const fn dense_border_cholesky_flops(k: usize) -> u128 {
-        let k = k as u128;
-        k.saturating_mul(k).saturating_mul(k) / 3
-    }
-
-    /// Total matrix-free PCG flops: `cg_iters · n·(4·d·k + d²)`.
-    const fn reduced_iterative_flops(n: usize, k: usize, d: usize, cg_iters: usize) -> u128 {
-        let n = n as u128;
-        let k = k as u128;
-        let d = d as u128;
-        let per_apply = n.saturating_mul(
-            4u128
-                .saturating_mul(d)
-                .saturating_mul(k)
-                .saturating_add(d.saturating_mul(d)),
-        );
-        per_apply.saturating_mul(cg_iters as u128)
-    }
-
-    /// Build the shape-driven [`ArrowBorderSolvePlan`] for a joint arrow-Schur
-    /// system with `n` row blocks, border width `k`, per-row depth `d`, and an
-    /// assumed CG budget `cg_iters` (pass
-    /// [`Self::MATVEC_OFFLOAD_MIN_CG_ITERS`] when none is measured; a smaller
-    /// value only biases the recommendation toward `DenseDirect`, never the
-    /// reverse).
-    ///
-    /// Degenerate shapes (`n`, `k`, or `d` zero) return an all-zero plan
-    /// recommending `DenseDirect` (the trivial/empty solve stays on the simple
-    /// path) with `device_favorable = false`.
-    pub fn arrow_border_solve_plan(
-        &self,
-        n: usize,
-        k: usize,
-        d: usize,
-        cg_iters: usize,
-    ) -> ArrowBorderSolvePlan {
-        if n == 0 || k == 0 || d == 0 {
-            return ArrowBorderSolvePlan {
-                n,
-                k,
-                d,
-                cg_iters,
-                data_fit_rank: 0,
-                dense_border_rank_deficient: false,
-                dense_direct_flops: 0,
-                reduced_iterative_flops: 0,
-                recommended: ArrowBorderStrategy::DenseDirect,
-                device_favorable: false,
-            };
-        }
-
-        let assembly = Self::dense_schur_assembly_flops(n, k, d);
-        let border_chol = Self::dense_border_cholesky_flops(k);
-        let dense_direct_flops = assembly.saturating_add(border_chol);
-        let iters = if cg_iters == 0 { 1 } else { cg_iters };
-        let reduced_iterative_flops = Self::reduced_iterative_flops(n, k, d, iters);
-
-        let data_fit_rank = (n.saturating_mul(d)).min(k);
-        let dense_border_rank_deficient = n.saturating_mul(d) < k;
-
-        // Recommend the exact dense factorization only when it is both VALID and
-        // not the bottleneck:
-        //   * Validity — a rank-deficient border (`n·d < k`) has a singular
-        //     `k × k` reduced Schur, so its Cholesky does not exist. DenseDirect
-        //     is inadmissible there and we must solve matrix-free. (The pure
-        //     assembly+Cholesky-vs-iterative flop rule this replaced ignored
-        //     rank and could recommend factorizing a provably-singular border
-        //     whenever the small-`k` dense flops happened to be the cheaper
-        //     count — e.g. `n=1, d=1, k=2`.)
-        //   * Cost — the reduced-Schur reduction is an embarrassingly-parallel
-        //     batched GEMM whichever path runs; the term that scales badly with
-        //     border width is the `k³/3` Cholesky. Prefer the exact,
-        //     RHS-reusable, convergence-free dense solve while that Cholesky is
-        //     no costlier than the full matrix-free CG solve, and fall to
-        //     ReducedIterative once the `k³` factorization overtakes it.
-        let recommended =
-            if !dense_border_rank_deficient && border_chol <= reduced_iterative_flops {
-                ArrowBorderStrategy::DenseDirect
-            } else {
-                ArrowBorderStrategy::ReducedIterative
-            };
-
-        let device_favorable = match recommended {
-            ArrowBorderStrategy::ReducedIterative => {
-                self.reduced_schur_matvec_should_offload(n, k, d, iters)
-            }
-            ArrowBorderStrategy::DenseDirect => {
-                // Dense Direct wins on device only when the batched per-row
-                // assembly work dominates the (poorly GPU-scaling, and here
-                // rank-deficient) border Cholesky, and the total clears the
-                // dense reduction floor. This is the honest encoding of the
-                // measured 0.94× on-device dense-Direct slowdown: when the k³
-                // Cholesky dominates, stay on the CPU.
-                assembly >= border_chol && dense_direct_flops >= self.dense_reduction_flops_min()
-            }
-        };
-
-        ArrowBorderSolvePlan {
-            n,
-            k,
-            d,
-            cg_iters: iters,
-            data_fit_rank,
-            dense_border_rank_deficient,
-            dense_direct_flops,
-            reduced_iterative_flops,
-            recommended,
-            device_favorable,
-        }
-    }
 }
 
 /// The aspirational single-GPU design-row throughput the #1412 decision gate is
@@ -614,31 +476,7 @@ pub struct GpuThroughputVerdict {
 }
 
 impl GpuThroughputVerdict {
-    /// Build a verdict from a measured throughput against
-    /// [`GPU_THROUGHPUT_TARGET_ROWS_PER_SEC`]. A non-finite or non-positive
-    /// measurement can never meet the target (it is not a usable measurement).
-    #[inline]
-    pub fn from_measurement(measured_rows_per_sec: f64) -> Self {
-        Self::from_measurement_against(measured_rows_per_sec, GPU_THROUGHPUT_TARGET_ROWS_PER_SEC)
-    }
 
-    /// Build a verdict against an explicit target (used by tests that probe the
-    /// comparison logic without depending on the global target constant).
-    #[inline]
-    pub fn from_measurement_against(measured_rows_per_sec: f64, target_rows_per_sec: f64) -> Self {
-        let usable = measured_rows_per_sec.is_finite() && measured_rows_per_sec > 0.0;
-        let fraction_of_target = if usable && target_rows_per_sec > 0.0 {
-            measured_rows_per_sec / target_rows_per_sec
-        } else {
-            0.0
-        };
-        Self {
-            measured_rows_per_sec,
-            target_rows_per_sec,
-            fraction_of_target,
-            meets_target: usable && measured_rows_per_sec >= target_rows_per_sec,
-        }
-    }
 }
 
 /// Why a Stage-3 encode deployment decision could not be made from a real device
@@ -706,45 +544,6 @@ pub enum EncodeDeploymentDecision {
 }
 
 impl EncodeDeploymentDecision {
-    /// The ONLY path to a `Met`/`Unmet` decision: a device measurement that
-    /// actually engaged the device and produced a usable rate. `engaged == false`
-    /// (false routing / CPU decline) or a non-finite / non-positive rate yields
-    /// [`Self::Undetermined`] — never a fabricated pass or fail.
-    #[must_use]
-    pub fn from_device_measurement(engaged: bool, measured_rows_per_sec: f64) -> Self {
-        Self::from_device_measurement_against(
-            engaged,
-            measured_rows_per_sec,
-            GPU_THROUGHPUT_TARGET_ROWS_PER_SEC,
-        )
-    }
-
-    /// [`Self::from_device_measurement`] against an explicit target (for tests
-    /// that probe the decision logic without the global target constant).
-    #[must_use]
-    pub fn from_device_measurement_against(
-        engaged: bool,
-        measured_rows_per_sec: f64,
-        target_rows_per_sec: f64,
-    ) -> Self {
-        let usable = measured_rows_per_sec.is_finite() && measured_rows_per_sec > 0.0;
-        if !engaged || !usable {
-            return Self::Undetermined {
-                reason: EncodeDecisionBlocked::DeviceNotEngaged,
-            };
-        }
-        if measured_rows_per_sec >= target_rows_per_sec {
-            Self::Met {
-                measured_rows_per_sec,
-                target_rows_per_sec,
-            }
-        } else {
-            Self::Unmet {
-                measured_rows_per_sec,
-                target_rows_per_sec,
-            }
-        }
-    }
 
     /// Construct the blocked decision for a host that cannot measure the exact
     /// encode on a device. This is the honest CPU-only / no-device-kernel outcome
@@ -754,27 +553,6 @@ impl EncodeDeploymentDecision {
         Self::Undetermined { reason }
     }
 
-    /// True ONLY when a device measurement cleared the target: the exact encode
-    /// ships and no surrogate is built. Never true from a CPU proxy.
-    #[must_use]
-    pub fn surrogate_unneeded(&self) -> bool {
-        matches!(self, Self::Met { .. })
-    }
-
-    /// True ONLY when a device measurement missed the target: the certified
-    /// amortized surrogate becomes justified. Never true without a measurement.
-    #[must_use]
-    pub fn surrogate_justified(&self) -> bool {
-        matches!(self, Self::Unmet { .. })
-    }
-
-    /// True when no device measurement is available and the decision is blocked
-    /// on hardware (neither [`Self::surrogate_unneeded`] nor
-    /// [`Self::surrogate_justified`]).
-    #[must_use]
-    pub fn is_undetermined(&self) -> bool {
-        matches!(self, Self::Undetermined { .. })
-    }
 }
 
 /// Which `(response, link)` family the Stage 3.3 device-resident PIRLS loop
@@ -883,34 +661,6 @@ impl GpuDispatchPolicy {
         }
     }
 
-    /// Admission predicate for routing the outer REML BFGS-over-ρ loop onto
-    /// a device-resident driver that keeps the BFGS state (ρ, gradient,
-    /// Hessian approx) on-device and only downloads the per-step scalar
-    /// metrics (objective value, gradient norm, convergence flag).
-    ///
-    /// The dense-work threshold piggybacks on the existing inner-PIRLS admission
-    /// predicate because the device-resident outer loop calls
-    /// `pirls_loop_on_stream` per step and must not pay the host hop for small
-    /// fits the inner loop would have rejected anyway. The
-    /// `num_rho ≥ 2` floor rules out the trivial single-smoother case where
-    /// host orchestration is already negligible and the device BFGS state
-    /// (one length-`num_rho` gradient + a `num_rho × num_rho` Hessian
-    /// approx) collapses to a couple of scalars not worth keeping on device.
-    pub const fn should_run_reml_outer_on_device(&self, adm: RemlOuterAdmission) -> bool {
-        if !adm.gpu_available {
-            return false;
-        }
-        if !self.dense_hessian_work_target_is_gpu(adm.n, adm.p) {
-            return false;
-        }
-        if adm.num_rho < 2 {
-            return false;
-        }
-        match adm.family {
-            Some(_) => true,
-            None => false,
-        }
-    }
 }
 
 #[cfg(test)]

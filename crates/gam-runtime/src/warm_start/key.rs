@@ -109,9 +109,6 @@ mod type_code {
     pub const BYTES: u8 = 1;
     pub const STR: u8 = 2;
     pub const U64: u8 = 3;
-    pub const F64: u8 = 4;
-    pub const F64_SLICE: u8 = 5;
-    pub const F64_2D: u8 = 6;
 }
 
 impl Fingerprinter {
@@ -146,24 +143,6 @@ impl Fingerprinter {
     pub fn absorb_u64(&mut self, tag: &[u8], v: u64) {
         self.frame(type_code::U64, tag);
         self.h.update(v.to_le_bytes());
-    }
-
-    pub fn absorb_f64(&mut self, tag: &[u8], v: f64) {
-        self.frame(type_code::F64, tag);
-        self.h.update(v.to_bits().to_le_bytes());
-    }
-
-    pub fn absorb_f64_slice(&mut self, tag: &[u8], xs: &[f64]) {
-        self.frame(type_code::F64_SLICE, tag);
-        self.h.update((xs.len() as u64).to_le_bytes());
-        absorb_f64_bytes(&mut self.h, xs);
-    }
-
-    pub fn absorb_f64_2d(&mut self, tag: &[u8], rows: usize, cols: usize, xs: &[f64]) {
-        self.frame(type_code::F64_2D, tag);
-        self.h.update((rows as u64).to_le_bytes());
-        self.h.update((cols as u64).to_le_bytes());
-        absorb_f64_bytes(&mut self.h, xs);
     }
 
     pub fn finalize(self) -> Fingerprint {
@@ -310,30 +289,6 @@ impl Fingerprinter {
     /// in cache-key strings.
     pub fn finish_hex(self) -> String {
         format!("{:016x}", self.finish_u64())
-    }
-}
-
-/// Feed `xs` to the hasher in one bulk `update` instead of one 8-byte
-/// `to_le_bytes` call per element. On little-endian hosts we reinterpret the
-/// `&[f64]` storage directly as `&[u8]`; on big-endian hosts we fall back to
-/// a per-element loop so the fingerprint stays endian-stable across machines.
-#[inline]
-fn absorb_f64_bytes(h: &mut Sha256, xs: &[f64]) {
-    #[cfg(target_endian = "little")]
-    {
-        // SAFETY: xs.as_ptr() is non-null/aligned (slice invariant); f64
-        // has no padding and any bit pattern is a valid u8; size_of_val
-        // covers exactly xs's bytes and the borrow lives within this call.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(xs.as_ptr() as *const u8, std::mem::size_of_val(xs))
-        };
-        h.update(bytes);
-    }
-    #[cfg(not(target_endian = "little"))]
-    {
-        for &x in xs {
-            h.update(x.to_bits().to_le_bytes());
-        }
     }
 }
 

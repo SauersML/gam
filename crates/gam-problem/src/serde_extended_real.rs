@@ -73,25 +73,6 @@ pub mod vec_f64 {
                 formatter.write_str("a sequence of numbers, with null for +infinity")
             }
 
-            fn visit_seq<A>(self, mut seq: A) -> Result<Vec<f64>, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-                while let Some(entry) = seq.next_element::<Option<f64>>()? {
-                    out.push(entry.unwrap_or(f64::INFINITY));
-                }
-                Ok(out)
-            }
-
-            fn visit_unit<E>(self) -> Result<Vec<f64>, E>
-            where
-                E: DeError,
-            {
-                // A `null` in place of the whole sequence is the absent-field
-                // encoding; `#[serde(default)]` semantics apply.
-                Ok(Vec::new())
-            }
         }
 
         deserializer.deserialize_seq(ExtendedRealVecVisitor)
