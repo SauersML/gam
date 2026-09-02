@@ -29,17 +29,6 @@ fn cdf(x: f64) -> f64 {
     gam_math::probability::normal_cdf(x)
 }
 
-/// Probit IRLS row weight `w_i · φ(η)² / (Φ(η) · Φ(−η))`. Clamped strictly
-/// positive: the residualised Gram must remain PSD even at extreme η pilots
-/// (probit saturation collapses both `Φ(η)` and `Φ(−η)` toward zero).
-fn probit_irls_weight(eta: f64, sample_weight: f64) -> f64 {
-    let p = cdf(eta).clamp(f64::MIN_POSITIVE, 1.0 - f64::MIN_POSITIVE);
-    let one_m = (1.0 - p).max(f64::MIN_POSITIVE);
-    let phi_eta = phi(eta);
-    let denom = (p * one_m).max(f64::MIN_POSITIVE);
-    sample_weight * phi_eta * phi_eta / denom
-}
-
 /// Row Hessian for Bernoulli's K=1 row primary state. The "Hessian" is the
 /// scalar IRLS weight per row at the pilot η.
 pub struct BernoulliRowHessian {
@@ -47,22 +36,6 @@ pub struct BernoulliRowHessian {
 }
 
 impl BernoulliRowHessian {
-    pub fn from_eta_pilot(eta_pilot: &Array1<f64>, sample_weights: &Array1<f64>) -> Self {
-        assert_eq!(
-            eta_pilot.len(),
-            sample_weights.len(),
-            "BernoulliRowHessian: eta_pilot length {} must match sample_weights length {}",
-            eta_pilot.len(),
-            sample_weights.len(),
-        );
-        let w = Array1::from_iter(
-            eta_pilot
-                .iter()
-                .zip(sample_weights.iter())
-                .map(|(&eta, &w)| probit_irls_weight(eta, w)),
-        );
-        Self { w }
-    }
 
     /// Construct directly from a pre-computed row-weight vector (e.g. the
     /// existing `pilot_irls_hessian_row_metric_at_eta` output).
@@ -113,19 +86,6 @@ impl RowHessian for BernoulliRowHessian {
 impl FamilyChannelHessian for BernoulliRowHessian {
     fn n_outputs(&self) -> usize {
         1
-    }
-
-    fn n_subjects(&self) -> usize {
-        self.w.len()
-    }
-
-    fn fill_subject(&self, i: usize, out: &mut [f64]) {
-        assert_eq!(
-            out.len(),
-            1,
-            "BernoulliRowHessian::fill_subject expects K=1"
-        );
-        out[0] = self.w[i];
     }
 
     fn evaluate_full(&self) -> ndarray::Array3<f64> {

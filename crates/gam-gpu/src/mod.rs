@@ -75,15 +75,6 @@ pub enum CudaBackendStatus {
     CudaReady,
 }
 
-#[inline]
-pub(crate) fn cuda_backend_status() -> Result<CudaBackendStatus, GpuError> {
-    Ok(if device_runtime::GpuRuntime::resolve(global_policy())?.is_some() {
-        CudaBackendStatus::CudaReady
-    } else {
-        CudaBackendStatus::CudaUnavailable
-    })
-}
-
 /// User-facing GPU backend policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

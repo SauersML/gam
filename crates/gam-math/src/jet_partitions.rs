@@ -142,16 +142,6 @@ impl MultiDirJet {
         out
     }
 
-    pub fn with_coeffs(n_dirs: usize, coeffs: &[(usize, f64)]) -> Self {
-        let mut out = Self::zero(n_dirs);
-        for &(mask, value) in coeffs {
-            if mask < out.coeffs.len() {
-                out.coeffs[mask] = value;
-            }
-        }
-        out
-    }
-
     #[inline]
     pub fn coeff(&self, mask: usize) -> f64 {
         self.coeffs[mask]
@@ -521,11 +511,6 @@ fn mask_of(slots: &[usize]) -> usize {
 // carry no dead-code cost because `pub` items are part of the crate's public API.
 // Bodies are byte-identical to their former gated form.
 impl MultiDirJet {
-    pub fn bilinear(base: f64, d1: f64, d2: f64, d12: f64) -> Self {
-        Self {
-            coeffs: vec![base, d1, d2, d12],
-        }
-    }
 
     pub fn sub(&self, other: &Self) -> Self {
         Self {

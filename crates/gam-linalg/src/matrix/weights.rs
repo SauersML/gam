@@ -91,12 +91,6 @@ impl<'a> SignedWeightsView<'a> {
         Self(view)
     }
 
-    /// Borrow an `&Array1<f64>` as a sign-honest weight view.
-    #[inline]
-    pub fn from_array(array: &'a Array1<f64>) -> Self {
-        Self(array.view())
-    }
-
     /// Borrow a contiguous slice as a sign-honest weight view.
     #[inline]
     pub fn from_slice(slice: &'a [f64]) -> Self {
@@ -127,14 +121,6 @@ impl<'a> SignedWeightsView<'a> {
         self.0.as_slice()
     }
 
-    /// Attempt to promote a signed view to a PSD view. Performs one linear
-    /// sign-scan; consolidates the runtime check at the few sites that still
-    /// need to ask the question (e.g. PIRLS step acceptance, where the same
-    /// scan was previously inlined as `weights.iter().any(|&w| w < 0.0)`).
-    #[inline]
-    pub fn as_psd(self) -> Option<PsdWeightsView<'a>> {
-        PsdWeightsView::try_new(self.0).ok()
-    }
 }
 
 #[derive(Copy, Clone)]
@@ -246,13 +232,6 @@ impl SignedWeightsArc {
     #[inline]
     pub fn from_array(array: Array1<f64>) -> Self {
         Self(Arc::new(array))
-    }
-
-    /// Borrow as an unvalidated function-boundary [`SignedWeightsView`] for
-    /// row-geometry consumers that perform their own joint certificate.
-    #[inline]
-    pub fn view_signed(&self) -> SignedWeightsView<'_> {
-        SignedWeightsView::from_array(self.0.as_ref())
     }
 
     /// Inner `Arc<Array1<f64>>` for sites that genuinely need the shared

@@ -403,46 +403,6 @@ impl Gauge {
         Ok(composed)
     }
 
-    /// Build from a compiled identifiability reparametrisation
-    /// (see [`CompiledBlockMap`], implemented for the `CompiledMap` emitted by
-    /// the identifiability compiler): `map.raw_from_compiled()` IS the global
-    /// triangular `T`, and the block ranges give both partitions. `ordering`
-    /// is accepted purely as a length sanity check.
-    pub fn from_compiled_map<M: CompiledBlockMap, O>(map: &M, ordering: &[O]) -> Self {
-        assert_eq!(
-            map.raw_block_ranges().len(),
-            map.compiled_block_ranges().len(),
-            "Gauge::from_compiled_map: CompiledMap raw_block_ranges len {} != \
-             compiled_block_ranges len {}",
-            map.raw_block_ranges().len(),
-            map.compiled_block_ranges().len(),
-        );
-        assert_eq!(
-            map.raw_block_ranges().len(),
-            ordering.len(),
-            "Gauge::from_compiled_map: ordering len {} != block count {}",
-            ordering.len(),
-            map.raw_block_ranges().len(),
-        );
-        let mut block_starts_raw = Vec::with_capacity(map.raw_block_ranges().len() + 1);
-        block_starts_raw.push(0);
-        for r in map.raw_block_ranges() {
-            block_starts_raw.push(r.end);
-        }
-        let mut block_starts_reduced = Vec::with_capacity(map.compiled_block_ranges().len() + 1);
-        block_starts_reduced.push(0);
-        for r in map.compiled_block_ranges() {
-            block_starts_reduced.push(r.end);
-        }
-        let total_raw = block_starts_raw.last().copied().unwrap_or(0);
-        Self {
-            t_full: map.raw_from_compiled().clone(),
-            affine_shift: Array1::zeros(total_raw),
-            block_starts_raw,
-            block_starts_reduced,
-        }
-    }
-
     /// Number of blocks in the partition.
     pub fn n_blocks(&self) -> usize {
         self.block_starts_raw.len().saturating_sub(1)
@@ -461,14 +421,6 @@ impl Gauge {
     /// Per-block raw widths.
     pub fn raw_widths(&self) -> Vec<usize> {
         self.block_starts_raw
-            .windows(2)
-            .map(|w| w[1] - w[0])
-            .collect()
-    }
-
-    /// Per-block reduced widths.
-    pub fn reduced_widths(&self) -> Vec<usize> {
-        self.block_starts_reduced
             .windows(2)
             .map(|w| w[1] - w[0])
             .collect()
@@ -653,50 +605,6 @@ impl Gauge {
             return raw_factor.to_owned();
         }
         fast_ab(raw_factor, &self.t_full)
-    }
-
-    /// Append blocks that were never reduced (raw == reduced, identity
-    /// lift). Used to lift joint objects that span both gauged blocks
-    /// and untouched ones (e.g. the survival flex blocks alongside the
-    /// compiled parametric blocks).
-    pub fn extend_with_identity(&self, extra_raw_widths: &[usize]) -> Self {
-        let extra_total: usize = extra_raw_widths.iter().sum();
-        let raw_total = self.raw_total();
-        let reduced_total = self.reduced_total();
-        let mut t = Array2::<f64>::zeros((raw_total + extra_total, reduced_total + extra_total));
-        t.slice_mut(ndarray::s![0..raw_total, 0..reduced_total])
-            .assign(&self.t_full);
-        for k in 0..extra_total {
-            t[[raw_total + k, reduced_total + k]] = 1.0;
-        }
-        let mut block_starts_raw = self.block_starts_raw.clone();
-        let mut block_starts_reduced = self.block_starts_reduced.clone();
-        // Both partitions are documented as length `n_blocks + 1` starting at
-        // 0, so each already ends at its own total; read that total once and
-        // carry it rather than re-deriving it (and re-asserting non-emptiness)
-        // on every extra width.
-        let mut raw_cursor = block_starts_raw.last().copied().expect(
-            "block_starts_raw is a length n_blocks+1 partition, so it always holds its leading 0",
-        );
-        let mut reduced_cursor = block_starts_reduced.last().copied().expect(
-            "block_starts_reduced is a length n_blocks+1 partition, so it always holds its leading 0",
-        );
-        for &w in extra_raw_widths {
-            raw_cursor += w;
-            reduced_cursor += w;
-            block_starts_raw.push(raw_cursor);
-            block_starts_reduced.push(reduced_cursor);
-        }
-        let mut affine_shift = Array1::<f64>::zeros(raw_total + extra_total);
-        affine_shift
-            .slice_mut(ndarray::s![0..raw_total])
-            .assign(&self.affine_shift);
-        Self {
-            t_full: t,
-            affine_shift,
-            block_starts_raw,
-            block_starts_reduced,
-        }
     }
 
     /// Grow an EXISTING block by one free coordinate, appended at the end of

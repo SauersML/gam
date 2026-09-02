@@ -349,50 +349,6 @@ fn subset_split_table(m: usize) -> &'static [SubsetSplit] {
     })
 }
 
-/// The cached set-partition list for `m` slots, in the former recursive
-/// "assign each element to an existing or new block" emission order.
-#[inline]
-fn partition_table(m: usize) -> &'static [PackedPartition] {
-    PARTITION_TABLES[m].get_or_init(|| {
-        let mut out = Vec::new();
-        let mut blocks = [0u8; MAX_SLOTS];
-        build_partitions(0, m, &mut blocks, 0, &mut out);
-        out
-    })
-}
-
-/// Enumerate the set-partitions of `0..m` exactly as the former `recurse` did:
-/// element `elem` is placed into each existing block (in block order) before a
-/// fresh block is opened with it alone. Records each completed partition's
-/// block bitmasks in first-appearance order. Runs once per `m`.
-fn build_partitions(
-    elem: usize,
-    m: usize,
-    blocks: &mut [u8; MAX_SLOTS],
-    n_blocks: usize,
-    out: &mut Vec<PackedPartition>,
-) {
-    if elem == m {
-        let mut packed = PackedPartition {
-            blocks: [0u8; MAX_SLOTS],
-            n_blocks: n_blocks as u8,
-        };
-        packed.blocks[..n_blocks].copy_from_slice(&blocks[..n_blocks]);
-        out.push(packed);
-        return;
-    }
-    let bit = 1u8 << elem;
-    // Place `elem` into each existing block.
-    for b in 0..n_blocks {
-        blocks[b] |= bit;
-        build_partitions(elem + 1, m, blocks, n_blocks, out);
-        blocks[b] &= !bit;
-    }
-    // Or open a new block with `elem` alone.
-    blocks[n_blocks] = bit;
-    build_partitions(elem + 1, m, blocks, n_blocks + 1, out);
-}
-
 #[cfg(test)]
 mod tests {
     use crate::jet_partitions::MultiDirJet;

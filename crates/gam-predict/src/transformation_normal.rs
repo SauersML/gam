@@ -154,29 +154,10 @@ impl PredictionTransform for TransformationNormalPredictor {
         Ok(eta.clone())
     }
 
-    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
-        match pass {
-            // `response` is the identity here (the offset already carries the
-            // response-scale conditional mean), so there is no link to
-            // transform or delta-propagate through in either pass: an η
-            // interval already IS the response interval.
-            PredictPass::FullUncertainty | PredictPass::PosteriorMean => {
-                ResponseInterval::IdentityEta
-            }
-        }
-    }
-
     fn bounds(&self) -> ResponseBounds {
         ResponseBounds::UNBOUNDED
     }
 
-    fn response_family(&self) -> ResponseFamily {
-        // Only the *latent* `h(y)` is Gaussian. The generic family observation
-        // band must never be built from this (its σ lives in latent units);
-        // the predictor supplies its own response-scale band from the
-        // quantile ladder in `predict_posterior_mean`.
-        ResponseFamily::Gaussian
-    }
 }
 
 impl PredictableModel for TransformationNormalPredictor {
