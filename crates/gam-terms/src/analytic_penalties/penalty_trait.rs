@@ -384,17 +384,6 @@ pub trait AnalyticPenalty: Send + Sync {
     }
 }
 
-pub(crate) fn advance_scalar_weight(
-    weight: &mut f64,
-    schedule: &mut Option<ScalarWeightSchedule>,
-    iter: usize,
-) {
-    if let Some(schedule) = schedule.as_mut() {
-        *weight = schedule.current_weight(iter);
-        schedule.iter_count = iter + 1;
-    }
-}
-
 /// Emit the standard scalar-weight-schedule builder for a penalty struct whose
 /// scalar weight lives in `$field` and whose schedule lives in
 /// `weight_schedule: Option<ScalarWeightSchedule>`. The builder seeds the
@@ -418,9 +407,6 @@ macro_rules! impl_with_weight_schedule {
 /// AnalyticPenalty for …` block.
 macro_rules! impl_scalar_apply_schedule {
     ($field:ident) => {
-        fn apply_schedule(&mut self, iter: usize) {
-            advance_scalar_weight(&mut self.$field, &mut self.weight_schedule, iter);
-        }
     };
 }
 

@@ -528,18 +528,6 @@ pub fn constant_curvature_kernel_psi_jets(
     Ok(jets)
 }
 
-/// `(k, ∂k/∂κ, ∂²k/∂κ²)` — the κ slice of [`constant_curvature_kernel_psi_jets`],
-/// kept as its own entry point for callers that hold `ℓ` fixed.
-pub fn constant_curvature_kernel_kappa_jets(
-    data: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    kappa: f64,
-    length_scale: f64,
-) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), BasisError> {
-    let jets = constant_curvature_kernel_psi_jets(data, centers, kappa, length_scale)?;
-    Ok((jets.value, jets.d_kappa, jets.d_kappa2))
-}
-
 /// Resolve the realized kernel range ℓ. An explicit positive `spec_length_scale`
 /// is used verbatim; the `0.0` sentinel auto-initializes from the median
 /// pairwise CHART distance among the centers, doubled to match the κ = 0

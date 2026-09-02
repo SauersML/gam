@@ -75,12 +75,6 @@ macro_rules! define_analytic_penalty_kind {
                 }
             }
 
-            pub fn is_row_block_diagonal(&self) -> bool {
-                match self {
-                    $(AnalyticPenaltyKind::$variant(_) => <$ty as PenaltyManifest>::ROW_BLOCK_DIAGONAL,)*
-                }
-            }
-
             pub fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
                 // UFCS forces dispatch through the AnalyticPenalty trait so a
                 // wrapper type (e.g. SheafConsistencyPenalty) carrying both an

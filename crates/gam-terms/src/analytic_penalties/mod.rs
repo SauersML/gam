@@ -127,7 +127,6 @@ pub use self::sheaf::{EdgeRestriction, SheafConsistencyPenalty};
 pub(crate) use crate::basis::{
     BasisError, DuchonNullspaceOrder, radial_basis_cartesian_derivative,
 };
-pub(crate) use crate::smooth::BlockwisePenalty;
 pub(crate) use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 pub(crate) use gam_linalg::lanczos::{
     SymmetricLanczosOptions, symmetric_lanczos_eigenpairs, symmetric_lanczos_log_quadrature,
