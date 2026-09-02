@@ -9,7 +9,6 @@
 
 pub mod atlas_holonomy;
 pub mod atlas_nerve;
-pub mod atom_geometry;
 pub mod atom_lens;
 pub mod checkpoint_dynamics;
 pub mod contracts;

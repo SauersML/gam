@@ -31,9 +31,6 @@ impl SaeAtomBuildPlan {
         self.geometry.basis_size()
     }
 
-    pub fn duchon_centers(&self) -> Option<&Array2<f64>> {
-        self.geometry.duchon_centers()
-    }
 }
 
 /// Deterministically pick Duchon centers from the PCA-seeded coordinates.

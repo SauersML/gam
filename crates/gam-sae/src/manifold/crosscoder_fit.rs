@@ -76,69 +76,6 @@ pub struct SaeCrosscoderFitRequest {
     pub cancel: Option<Arc<AtomicBool>>,
 }
 
-/// Column-equilibrate an augmented crosscoder target in place (#2015): scale
-/// every column to unit root-mean-square, and return the per-column scale.
-///
-/// # Why
-///
-/// The joint arrow-Schur Newton solve's contraction rate is set by the output
-/// Hessian's conditioning. With no column equilibration, a real activation +
-/// behavior augmentation measured column-norm spreads of ~1.3e4 (leading
-/// activation PCA channels vs. the small end of the `√λ_y`-scaled behavior
-/// tangent columns), joint Hessian condition number ≈ 1e8 — the diagnosed root
-/// cause of the "~1e3 inner iterations then honest KKT refusal" wall on real
-/// Qwen data (gam#2015). Scaling each column to unit RMS (`D = diag(‖col‖)`,
-/// fit against `Z̃D⁻¹`) makes every output channel contribute at unit curvature
-/// to the shared latent coordinate, so the globalized Newton solve takes full
-/// steps instead of crawling.
-///
-/// # Why this does not fight the `λ_ℓ` block-weighting machinery
-///
-/// This runs on the RAW stacked target BEFORE any `√λ_ℓ` block scaling is
-/// materialized (`with_crosscoder_blocks` captures its `pristine_blocks` from
-/// the target AFTER this call, so the pristine baseline already carries
-/// `column_scale` and every subsequent `√λ_ℓ` rewrite layers on top of it,
-/// never replacing it). `λ_ℓ` is a single scalar per block — it does not
-/// vary the RELATIVE scale of that block's own columns — so equilibrating
-/// columns first and letting REML select `λ_ℓ` second leaves the model
-/// `λ_ℓ = φ_x/φ_ℓ` identification untouched; only the inner solve's
-/// conditioning changes.
-///
-/// A column whose RMS is at or below `√ε` of the largest column's RMS is
-/// numerically empty (an all-(near)zero output channel); scaling it would
-/// amplify representation noise, so it keeps unit scale (a scalar-type-derived
-/// floor, not a tuning knob) — mirrors the single-block Tier-0 standardization
-/// gate ([`SaeManifoldTerm::set_tier0_scale`]).
-pub fn equilibrate_crosscoder_columns(target: &mut Array2<f64>) -> Array1<f64> {
-    let (n_rows, p) = target.dim();
-    let mut scale = Array1::<f64>::zeros(p);
-    if n_rows == 0 {
-        scale.fill(1.0);
-        return scale;
-    }
-    let n = n_rows as f64;
-    for (col_idx, col) in target.columns().into_iter().enumerate() {
-        scale[col_idx] = (col.iter().map(|v| v * v).sum::<f64>() / n).sqrt();
-    }
-    let scale_max = scale.iter().cloned().fold(0.0_f64, f64::max);
-    if scale_max.is_finite() && scale_max > 0.0 {
-        let floor = scale_max * f64::EPSILON.sqrt();
-        for s in scale.iter_mut() {
-            if !(*s > floor) {
-                *s = 1.0;
-            }
-        }
-        for mut row in target.rows_mut() {
-            row /= &scale;
-        }
-    } else {
-        // Every column is exactly zero: nothing to equilibrate; unit scale is
-        // the honest no-op (dividing by it changes nothing).
-        scale.fill(1.0);
-    }
-    scale
-}
-
 /// Single source of truth for the automatic circle-crosscoder fit controls used
 /// by the Python and CLI front doors. Callers may replace any field, but neither
 /// binding owns a second set of defaults.

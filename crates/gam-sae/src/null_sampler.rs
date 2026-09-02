@@ -61,7 +61,6 @@ pub const NULL_REPLICATES: usize = 200;
 /// every row sum and every column sum under [`Self::trade`].
 pub struct CurveballSampler {
     rows: Vec<Vec<usize>>,
-    n_atoms: usize,
     rng: StdRng,
 }
 
@@ -86,7 +85,6 @@ impl CurveballSampler {
         }
         Self {
             rows,
-            n_atoms,
             rng: StdRng::seed_from_u64(seed),
         }
     }
@@ -181,22 +179,6 @@ impl CurveballSampler {
         }
     }
 
-    /// Accumulate the current matrix's pairwise joint counts into the flat upper-
-    /// triangle buffer `joint[u*g + v]` (`u < v`), and the marginal counts into
-    /// `marg`.
-    fn accumulate(&self, joint: &mut [f64], marg: &mut [f64]) {
-        let g = self.n_atoms;
-        for row in &self.rows {
-            for (idx, &u) in row.iter().enumerate() {
-                marg[u] += 1.0;
-                for &v in &row[idx + 1..] {
-                    let (lo, hi) = if u < v { (u, v) } else { (v, u) };
-                    joint[lo * g + hi] += 1.0;
-                }
-            }
-        }
-    }
-
     /// Accumulate joint counts only for the requested unordered pairs. This is
     /// the sparse structure-search path: once proposal candidates are restricted
     /// to observed co-firing pairs, the fixed-margin null must not reintroduce a
@@ -227,27 +209,10 @@ impl CurveballSampler {
 /// a large positive `z` is genuine above-margin co-firing.
 #[derive(Clone, Debug)]
 pub struct CoactivationExceedance {
-    g: usize,
     n_obs: usize,
-    z: Vec<f64>,
 }
 
 impl CoactivationExceedance {
-    fn idx(&self, a: usize, b: usize) -> usize {
-        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-        lo * self.g + hi
-    }
-
-    /// Standardized excess `z = (observed − null_mean) / null_sd` of the pair's
-    /// joint activation over the fixed-margin null. `0` on the diagonal.
-    pub fn excess_z(&self, a: usize, b: usize) -> f64 {
-        if a == b || a >= self.g || b >= self.g {
-            return 0.0;
-        }
-        self.z[self.idx(a, b)]
-    }
-
-
 
     pub fn n_obs(&self) -> usize {
         self.n_obs
@@ -264,93 +229,6 @@ impl CoactivationExceedance {
 /// (observed at the boundary of the fixed-margin polytope, tiny but non-zero
 /// spread) still reports a large exceedance rather than being clamped to noise.
 const NULL_SD_FLOOR: f64 = 1e-9;
-
-/// Estimate the per-pair co-activation exceedance of `codes` over the fixed-margin
-/// null, using `replicates` curveball replicates. The curveball mixing length is
-/// derived from the matrix (one sweep ≈ its number of ones) so there are no tuned
-/// constants; the sampler seed is a content hash of `codes` (deterministic).
-///
-/// Between replicates the chain is advanced by one mixing sweep and thinned, and a
-/// burn-in sweep is run before the first sample, so the replicates are near-
-/// independent draws from the fixed-margin class.
-pub fn coactivation_exceedance(
-    codes: &SparseAtomCodes,
-    replicates: usize,
-) -> CoactivationExceedance {
-    let g = codes.k_atoms();
-    let n_obs = codes.n_obs();
-    let size = g * g;
-
-    // Observed joint + marginal counts.
-    let mut obs = vec![0.0_f64; size];
-    let mut obs_marg = vec![0.0_f64; g];
-    {
-        let sampler = CurveballSampler::from_codes(codes);
-        sampler.accumulate(&mut obs, &mut obs_marg);
-    }
-
-    let mut z = vec![0.0_f64; size];
-    if g < 2 || n_obs < 2 || replicates == 0 {
-        return CoactivationExceedance {
-            g,
-            n_obs,
-            z,
-        };
-    }
-
-    let mut sampler = CurveballSampler::from_codes(codes);
-    // Mixing sweep length: one chance per active entry to move (the canonical
-    // curveball budget), at least the row count so even a very sparse matrix mixes.
-    let sweep = sampler.n_ones().max(sampler.n_rows());
-    sampler.mix(sweep); // burn-in
-
-    // Welford accumulation of each pair's null joint count across replicates.
-    let mut mean = vec![0.0_f64; size];
-    let mut m2 = vec![0.0_f64; size];
-    let mut scratch = vec![0.0_f64; size];
-    let mut scratch_marg = vec![0.0_f64; g];
-    for r in 0..replicates {
-        sampler.mix(sweep); // thin between draws
-        for v in scratch.iter_mut() {
-            *v = 0.0;
-        }
-        for v in scratch_marg.iter_mut() {
-            *v = 0.0;
-        }
-        sampler.accumulate(&mut scratch, &mut scratch_marg);
-        let count = (r + 1) as f64;
-        for u in 0..g {
-            for w in (u + 1)..g {
-                let idx = u * g + w;
-                let x = scratch[idx];
-                let delta = x - mean[idx];
-                mean[idx] += delta / count;
-                m2[idx] += delta * (x - mean[idx]);
-            }
-        }
-    }
-
-    let denom = (replicates.saturating_sub(1)).max(1) as f64;
-    for u in 0..g {
-        for w in (u + 1)..g {
-            let idx = u * g + w;
-            let var = m2[idx] / denom;
-            let sd = var.max(0.0).sqrt();
-            z[idx] = if sd > NULL_SD_FLOOR {
-                (obs[idx] - mean[idx]) / sd
-            } else {
-                // Deterministic (pinned) null: no resolvable spread ⇒ no exceedance.
-                0.0
-            };
-        }
-    }
-
-    CoactivationExceedance {
-        g,
-        n_obs,
-        z,
-    }
-}
 
 /// Sparse fixed-margin exceedance for a pre-indexed candidate pair set.
 ///

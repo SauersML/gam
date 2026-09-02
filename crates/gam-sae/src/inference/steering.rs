@@ -67,7 +67,6 @@
 
 use ndarray::{Array1, Array2, ArrayView1};
 
-use crate::encode::EncodeAtlas;
 use crate::manifold::{SaeManifoldAtom, SaeManifoldTerm};
 use gam_problem::{FisherFactorKind, MetricProvenance, RowMetric};
 
@@ -176,65 +175,6 @@ pub struct CoordinateSetResult {
     pub steer: SteerPlan,
 }
 
-/// Write atom `atom_k`'s chart coordinate in row `x` to `t_to` by delta
-/// steering, preserving the row's off-atom/off-subspace residual exactly.
-///
-/// `amplitude` is the assignment/intensity with which the row expresses this
-/// atom; callers that have already separated existence/intensity/position should
-/// pass the intensity and only swap the position coordinate. The certified read
-/// uses [`EncodeAtlas::certified_encode_row`]; the write uses [`steer_delta`].
-pub fn set_coordinate(
-    model: &SaeManifoldTerm,
-    metric: &RowMetric,
-    atlas: &EncodeAtlas,
-    x: ArrayView1<'_, f64>,
-    atom_k: usize,
-    metric_row: usize,
-    amplitude: f64,
-    t_to: &[f64],
-) -> Result<CoordinateSetResult, String> {
-    let atom = model.atoms.get(atom_k).ok_or_else(|| {
-        format!(
-            "set_coordinate: atom index {atom_k} out of range (term has {} atoms)",
-            model.k_atoms()
-        )
-    })?;
-    if x.len() != atom.output_dim() {
-        return Err(format!(
-            "set_coordinate: input row has length {} but atom {atom_k} output_dim is {}",
-            x.len(),
-            atom.output_dim()
-        ));
-    }
-    let (t_from, cert) = atlas.certified_encode_row(atom, atom_k, x, amplitude)?;
-    let steer = steer_delta(
-        model,
-        metric,
-        atom_k,
-        metric_row,
-        amplitude,
-        t_from.as_slice().unwrap_or(&[]),
-        t_to,
-    )?;
-    let mut edited = x.to_owned();
-    if edited.len() != steer.delta.len() {
-        return Err(format!(
-            "set_coordinate: steering delta length {} does not match row length {}",
-            steer.delta.len(),
-            edited.len()
-        ));
-    }
-    for i in 0..edited.len() {
-        edited[i] += steer.delta[i];
-    }
-    Ok(CoordinateSetResult {
-        edited,
-        t_from_certified: t_from,
-        encode_certificate: cert,
-        steer,
-    })
-}
-
 /// Result of a coordinate interchange: donor position read from `x_source`, then
 /// written into `x_target` while preserving the target residual and intensity.
 #[derive(Clone, Debug)]
@@ -259,63 +199,6 @@ pub struct InterchangeResult {
     pub landing_error: f64,
     /// Underlying coordinate-write plan.
     pub set_result: CoordinateSetResult,
-}
-
-/// Interchange atom `atom_k`'s chart coordinate from `x_source` into `x_target`.
-///
-/// The source coordinate is certified with `source_amplitude`; the target write
-/// is performed with `target_amplitude`, so swapping a position coordinate cannot
-/// silently smuggle donor intensity into the target. The returned landing error
-/// is descriptive; statistical evidence requires an externally specified null
-/// experiment and is deliberately not fabricated from the error magnitude.
-pub fn interchange(
-    model: &SaeManifoldTerm,
-    metric: &RowMetric,
-    atlas: &EncodeAtlas,
-    x_target: ArrayView1<'_, f64>,
-    target_amplitude: f64,
-    x_source: ArrayView1<'_, f64>,
-    source_amplitude: f64,
-    atom_k: usize,
-    target_metric_row: usize,
-) -> Result<InterchangeResult, String> {
-    let atom = model.atoms.get(atom_k).ok_or_else(|| {
-        format!(
-            "interchange: atom index {atom_k} out of range (term has {} atoms)",
-            model.k_atoms()
-        )
-    })?;
-    let (donor_t, _donor_cert) =
-        atlas.certified_encode_row(atom, atom_k, x_source, source_amplitude)?;
-    let set = set_coordinate(
-        model,
-        metric,
-        atlas,
-        x_target,
-        atom_k,
-        target_metric_row,
-        target_amplitude,
-        donor_t.as_slice().unwrap_or(&[]),
-    )?;
-    let (target_t_after, _after_cert) =
-        atlas.certified_encode_row(atom, atom_k, set.edited.view(), target_amplitude)?;
-    let periods = model.assignment.coords[atom_k].effective_axis_periods();
-    let landing_error = coordinate_l2_distance(
-        donor_t.as_slice().unwrap_or(&[]),
-        target_t_after.as_slice().unwrap_or(&[]),
-        &periods,
-    )?;
-    Ok(InterchangeResult {
-        edited_target: set.edited.clone(),
-        donor_t,
-        target_t_before: set.t_from_certified.clone(),
-        target_t_after,
-        predicted_nats: set.steer.predicted_nats,
-        off_manifold_norm: set.steer.off_manifold_norm,
-        validity_radius: set.steer.validity_radius,
-        landing_error,
-        set_result: set,
-    })
 }
 
 fn shortest_coordinate_delta(
@@ -345,14 +228,6 @@ fn shortest_coordinate_delta(
         delta.push(d);
     }
     Ok(delta)
-}
-
-fn coordinate_l2_distance(a: &[f64], b: &[f64], periods: &[Option<f64>]) -> Result<f64, String> {
-    Ok(shortest_coordinate_delta(a, b, periods)?
-        .iter()
-        .map(|d| d * d)
-        .sum::<f64>()
-        .sqrt())
 }
 
 fn path_coordinate(
@@ -532,57 +407,6 @@ pub fn steer_delta(
         off_manifold_norm,
         metric_provenance: provenance,
     })
-}
-
-/// The model's predicted output-mean response to an applied activation push
-/// `δ`, under the LOCAL-LINEAR reading of its fitted surface: the projection
-/// of `δ` onto the span of atom `atom_k`'s decoder tangents `∂g_k/∂t` at the
-/// operating point `t_at`. A dictionary "predicts" exactly the component of a
-/// push it can carry along its learned surface; the transverse component is
-/// off-manifold and predicted to die (this is the same local model the
-/// off-manifold guard and the dosimetry chord trust, used in the same radius).
-///
-/// This is `μ(δ)` for the design loop of
-/// [`gam_terms::inference::structure_evidence`]: two structural hypotheses about
-/// the same activations (e.g. "one curved atom" vs "two flat atoms") are two
-/// fitted terms whose tangent spans differ, so they predict DIFFERENT
-/// responses to the same probe — and that disagreement, in the output-Fisher
-/// metric, is what `select_probe_by_expected_evidence` maximizes.
-pub fn predicted_response(
-    model: &SaeManifoldTerm,
-    atom_k: usize,
-    t_at: &[f64],
-    delta: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, String> {
-    let k = model.k_atoms();
-    if atom_k >= k {
-        return Err(format!(
-            "predicted_response: atom index {atom_k} out of range (term has {k} atoms)"
-        ));
-    }
-    let atom = &model.atoms[atom_k];
-    let d = atom.latent_dim();
-    let p = atom.output_dim();
-    if t_at.len() != d {
-        return Err(format!(
-            "predicted_response: t_at must have length latent_dim={d}; got {}",
-            t_at.len()
-        ));
-    }
-    if delta.len() != p {
-        return Err(format!(
-            "predicted_response: delta must have length output_dim={p}; got {}",
-            delta.len()
-        ));
-    }
-    atom.basis_evaluator.as_ref().ok_or_else(|| {
-        format!(
-            "predicted_response: atom {atom_k} ('{}') has no installed basis evaluator",
-            atom.name
-        )
-    })?;
-    let tangents = decode_tangents_at(atom, t_at, model.tier0_scale())?;
-    Ok(project_onto_tangent_span(&tangents, delta))
 }
 
 /// One model-in-the-loop observation of the exact [`SteerPlan`] supplied to an

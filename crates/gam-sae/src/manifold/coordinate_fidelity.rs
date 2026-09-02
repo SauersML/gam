@@ -254,18 +254,6 @@ pub fn watson_u2_uniform(u: &[f64]) -> WatsonUniformity {
     }
 }
 
-/// Watson's `U²` uniformity of the fitted coordinates against the atom's
-/// invariant (uniform) measure, per `d = 1` topology: a circle wraps modulo its
-/// period; an interval is normalized by its fitted coordinate range. Returns
-/// `None` (statistic undefined) for fewer than two coordinates, a non-finite
-/// coordinate, a non-positive period, or a collapsed interval range.
-pub fn coordinate_uniformity(
-    coords: ArrayView1<'_, f64>,
-    topology: &CanonicalChartTopology,
-) -> Option<WatsonUniformity> {
-    coordinate_uniformity_impl(coords, None, topology)
-}
-
 pub fn coordinate_uniformity_weighted(
     coords: ArrayView1<'_, f64>,
     support: &SupportMeasure,
@@ -477,34 +465,11 @@ impl OccupancyLaw {
     }
 }
 
-/// Classify the occupancy law of coordinates already folded onto the unit circle
-/// `u ∈ [0, 1)` (a circle wraps modulo its period; an interval is range
-/// normalized — both handled by [`coordinate_uniformity`]'s mapping) by a BIC
-/// comparison across the fixed model-class enumeration `{uniform, one wrapped
-/// Gaussian, k-anchor wrapped-Gaussian mixture for k on the anchor ladder}`. The
-/// class with the lowest BIC (= highest rank-aware quasi-Laplace score) is the law:
-/// a `k ≥ 2` anchor model ⟹ [`OccupancyLaw::Discrete`], a single wrapped Gaussian
-/// ⟹ [`OccupancyLaw::Continuous`], the uniform density ⟹ [`OccupancyLaw::Uniform`].
-pub fn classify_occupancy(u: &[f64]) -> OccupancyLaw {
-    classify_occupancy_impl(u, true)
-}
-
 /// Weighted circular occupancy law. `weights` must be the same atom support
 /// masses used by coordinate fidelity and persistence; zero-mass rows are absent.
 /// Hard 0/1 support reproduces [`classify_occupancy`].
 pub fn classify_occupancy_weighted(u: &[f64], weights: ArrayView1<'_, f64>) -> OccupancyLaw {
     classify_occupancy_weighted_impl(u, weights, true)
-}
-
-/// Occupancy law for an INTERVAL (non-wrapping) coordinate `u ∈ [0, 1]`: the same
-/// evidence race, but on the LINE rather than the circle, so the extreme values
-/// `0` and `1` are NOT cyclically adjacent. Use this for interval-topology
-/// coordinates (a birth PCA seed, a bounded latent) where a circular fold would
-/// wrongly merge a linear finite set's first and last anchors and misread a
-/// range-filling uniform coordinate as non-uniform. `classify_occupancy` is the
-/// circular counterpart for genuinely cyclic (circle-chart) coordinates.
-pub fn classify_occupancy_interval(u: &[f64]) -> OccupancyLaw {
-    classify_occupancy_impl(u, false)
 }
 
 /// Weighted interval counterpart of [`classify_occupancy_interval`].
@@ -540,74 +505,6 @@ fn occupied_extent(pts: &[f64], circular: bool) -> f64 {
         }
         _ => 0.0,
     }
-}
-
-fn classify_occupancy_impl(u: &[f64], circular: bool) -> OccupancyLaw {
-    let n = u.len();
-    if n < 4 {
-        return OccupancyLaw::Indeterminate;
-    }
-    // On the circle, fold into [0, 1) defensively; on the line, clamp into [0, 1].
-    let mut pts: Vec<f64> = u
-        .iter()
-        .map(|&x| {
-            if circular {
-                let f = x - x.floor();
-                if f >= 1.0 { 0.0 } else { f }
-            } else {
-                x.clamp(0.0, 1.0)
-            }
-        })
-        .collect();
-    if pts.iter().any(|p| !p.is_finite()) {
-        return OccupancyLaw::Indeterminate;
-    }
-    pts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let nf = n as f64;
-    let ln_n = nf.ln();
-
-    // Uniform density on the unit interval / circle is `1`, so its per-point
-    // log-density is `0` and its total loglik is `0`; no free location parameters.
-    let bic_uniform = -2.0 * 0.0 + 0.0 * ln_n;
-
-    // Resolution floor: with `n` points you cannot resolve a cluster tighter than
-    // the mean spacing `1/n`, so the Gaussian width is floored at half that (a
-    // Nyquist-like, data-derived floor — not a knob).
-    let sigma_floor = 1.0 / (2.0 * nf);
-
-    // #2691 — collapse guard, BEFORE the BIC race. A coordinate whose every row
-    // fits inside less than one resolution width is not a narrow density, it is
-    // one value: the race below would hand it to the single-Gaussian rung at the
-    // floor width and report `Continuous`. Denominated in `sigma_floor`, the
-    // module's OWN data-derived floor, so this introduces no new constant and
-    // scales with `n` exactly as the rung it protects.
-    if occupied_extent(&pts, circular) < sigma_floor {
-        return OccupancyLaw::Collapsed;
-    }
-
-    // Single Gaussian: the continuous unimodal alternative. Two free params.
-    let single = wrapped_gaussian_mixture_bic(&pts, 1, sigma_floor, ln_n, circular);
-
-    let mut best_law = OccupancyLaw::Uniform;
-    let mut best_bic = bic_uniform;
-    if let Some(bic) = single {
-        if bic < best_bic {
-            best_bic = bic;
-            best_law = OccupancyLaw::Continuous;
-        }
-    }
-    for &k in OCCUPANCY_ANCHOR_LADDER {
-        if k >= n {
-            break;
-        }
-        if let Some(bic) = wrapped_gaussian_mixture_bic(&pts, k, sigma_floor, ln_n, circular) {
-            if bic < best_bic {
-                best_bic = bic;
-                best_law = OccupancyLaw::Discrete { anchors: k };
-            }
-        }
-    }
-    best_law
 }
 
 fn classify_occupancy_weighted_impl(
@@ -686,156 +583,6 @@ fn classify_occupancy_weighted_impl(
         }
     }
     best_law
-}
-
-/// BIC of a `k`-anchor wrapped-Gaussian mixture fitted to sorted circle
-/// coordinates `pts ∈ [0, 1)` by deterministic circular `k`-means (evenly spaced
-/// init) plus a SHARED (pooled) wrapped-Gaussian width. Returns `None` when the
-/// fit is degenerate. `BIC = −2·loglik + p·ln n`, `p = 2k` (`k` means, `k − 1`
-/// weights, `1` shared width); lower is better.
-fn wrapped_gaussian_mixture_bic(
-    pts: &[f64],
-    k: usize,
-    sigma_floor: f64,
-    ln_n: f64,
-    circular: bool,
-) -> Option<f64> {
-    let n = pts.len();
-    if k == 0 || k > n {
-        return None;
-    }
-    // Deterministic k-means. On the circle the distance wraps modulo 1; on the
-    // line it is the ordinary absolute difference.
-    let circ_dist = |a: f64, b: f64| -> f64 {
-        if circular {
-            let d = (a - b).rem_euclid(1.0);
-            d.min(1.0 - d)
-        } else {
-            (a - b).abs()
-        }
-    };
-    // QUANTILE init: seed the centers on actual data (the `j/k` quantiles of the
-    // sorted coordinates), NOT at evenly-spaced angles `(j+0.5)/k`. Evenly-spaced
-    // angles land the centers on the GAPS between clusters for the true `k` (a
-    // discrete measure at `j/anchors` seeds a boundary center at `(j+0.5)/anchors`),
-    // the worst-case k-means init, so the true `k` converges to a split-boundary
-    // local optimum and loses to a larger `k` that happens to seed onto data.
-    // Quantile init always seeds inside occupied regions, so the true `k` finds
-    // its anchors.
-    let mut means: Vec<f64> = (0..k).map(|j| pts[(j * n) / k.max(1)]).collect();
-    let mut assign = vec![0usize; n];
-    for _ in 0..100 {
-        let mut changed = false;
-        for (i, &p) in pts.iter().enumerate() {
-            let mut best_j = 0usize;
-            let mut best_d = f64::INFINITY;
-            for (j, &m) in means.iter().enumerate() {
-                let d = circ_dist(p, m);
-                if d < best_d {
-                    best_d = d;
-                    best_j = j;
-                }
-            }
-            if assign[i] != best_j {
-                assign[i] = best_j;
-                changed = true;
-            }
-        }
-        // Cluster-mean update: circular resultant-vector angle on the circle, or
-        // the ordinary arithmetic mean on the line.
-        for (j, m) in means.iter_mut().enumerate() {
-            if circular {
-                let (mut sx, mut sy, mut cnt) = (0.0_f64, 0.0_f64, 0usize);
-                for (i, &p) in pts.iter().enumerate() {
-                    if assign[i] == j {
-                        let ang = std::f64::consts::TAU * p;
-                        sx += ang.cos();
-                        sy += ang.sin();
-                        cnt += 1;
-                    }
-                }
-                if cnt > 0 && (sx * sx + sy * sy) > 0.0 {
-                    *m = (sy.atan2(sx) / std::f64::consts::TAU).rem_euclid(1.0);
-                }
-            } else {
-                let (mut sum, mut cnt) = (0.0_f64, 0usize);
-                for (i, &p) in pts.iter().enumerate() {
-                    if assign[i] == j {
-                        sum += p;
-                        cnt += 1;
-                    }
-                }
-                if cnt > 0 {
-                    *m = sum / cnt as f64;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    // Per-cluster weight + a SHARED (pooled) wrapped-Gaussian width. A shared
-    // width is essential: with a free PER-cluster variance, adding anchors beyond
-    // the true count cheats — a spurious extra center splits a real cluster and
-    // drives that sub-cluster's variance toward zero, buying unbounded likelihood
-    // that the parameter penalty cannot claw back, so over-clustered `k` always
-    // wins. Pooling the variance over ALL points means an extra anchor only
-    // shaves the shared width slightly, so BIC stops at the `k` where genuine
-    // gaps (not jitter) separate the anchors. Width floored at the resolution.
-    let mut weights = vec![0.0_f64; k];
-    let mut counts = vec![0usize; k];
-    let mut total_ss = 0.0_f64;
-    for (i, &p) in pts.iter().enumerate() {
-        let j = assign[i];
-        counts[j] += 1;
-        let d = if circular {
-            let raw = (p - means[j]).rem_euclid(1.0);
-            if raw > 0.5 { raw - 1.0 } else { raw }
-        } else {
-            p - means[j]
-        };
-        total_ss += d * d;
-    }
-    for j in 0..k {
-        weights[j] = counts[j] as f64 / n as f64;
-    }
-    let shared_sigma = (total_ss / n as f64).sqrt().max(sigma_floor);
-    let sigmas = vec![shared_sigma; k];
-
-    // Mixture loglik with a wrapped Gaussian per component (±1 wrap images are
-    // ample for σ well below 0.5). Density is per unit circumference so it is
-    // directly commensurable with the uniform density `1`.
-    let inv_sqrt_2pi = 1.0 / (std::f64::consts::TAU).sqrt();
-    let mut loglik = 0.0_f64;
-    for &p in pts {
-        let mut dens = 0.0_f64;
-        for j in 0..k {
-            if weights[j] <= 0.0 {
-                continue;
-            }
-            let s = sigmas[j];
-            let mut g = 0.0_f64;
-            // On the circle, sum the ±1 wrap images so the density is periodic; on
-            // the line, only the central image.
-            let (lo_img, hi_img) = if circular { (-1_i32, 1_i32) } else { (0, 0) };
-            for m in lo_img..=hi_img {
-                let d = p - means[j] + m as f64;
-                g += (-0.5 * (d / s) * (d / s)).exp();
-            }
-            dens += weights[j] * inv_sqrt_2pi / s * g;
-        }
-        if !(dens > 0.0) {
-            return None;
-        }
-        loglik += dens.ln();
-    }
-    if !loglik.is_finite() {
-        return None;
-    }
-    // Free parameters: k means + (k−1) mixture weights + 1 shared variance = 2k.
-    let p_free = (2 * k) as f64;
-    Some(-2.0 * loglik + p_free * ln_n)
 }
 
 fn wrapped_gaussian_mixture_bic_weighted(

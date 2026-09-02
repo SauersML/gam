@@ -127,16 +127,6 @@ impl From<OuterGradientError> for String {
 /// paths on identical data.
 pub(crate) type ForcedRowLayout = Option<Option<SaeRowLayout>>;
 
-/// #1154 — base co-training weight for the amortized-encoder reconstruction
-/// consistency penalty, as a fraction of the penalized quasi-Laplace criterion magnitude. The
-/// effective weight is `COTRAIN_RECON_WEIGHT · max(|REML|, 1)`, so the penalty
-/// is a bounded, scale-free share of the objective and needs no caller knob.
-pub(crate) const COTRAIN_RECON_WEIGHT: f64 = 0.1;
-
-/// #1154 — base co-training weight for joint-solver non-convergence. Scaled like
-/// [`COTRAIN_RECON_WEIGHT`].
-pub(crate) const COTRAIN_CONVERGENCE_WEIGHT: f64 = 0.05;
-
 /// #1154 — amortized-encoder consistency of a fitted dictionary against its own
 /// fit-time target. The co-training signal of the joint amortized-encoder +
 /// REML loop: how faithfully the cheap initializer plus joint refinement invert
