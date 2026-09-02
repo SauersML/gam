@@ -51,9 +51,6 @@ impl SharedTangentPenalty {
         }
     }
 
-    pub fn column_end(&self) -> usize {
-        self.column_start + self.matrix.ncols()
-    }
 }
 
 /// Owned request for a shared-tangent REML fit.
@@ -89,27 +86,6 @@ impl SharedTangentRemlRequest {
         }
     }
 
-    /// Convenience constructor for an owned dense design.
-    pub fn from_dense(
-        design: Array2<f64>,
-        response: Array2<f64>,
-        weights: Array1<f64>,
-        fisher_metric: Option<Array3<f64>>,
-        penalties: Vec<SharedTangentPenalty>,
-    ) -> Self {
-        Self::new(
-            DesignMatrix::from(design),
-            response,
-            weights,
-            fisher_metric,
-            penalties,
-        )
-    }
-
-    pub fn with_initial_log_lambdas(mut self, initial: Array1<f64>) -> Self {
-        self.initial_log_lambdas = Some(initial);
-        self
-    }
 }
 
 /// A converged, serializable shared-tangent model.
@@ -144,10 +120,6 @@ impl SharedTangentRemlFit {
         predict_from_coefficients(design, &self.coefficients)
     }
 
-    /// Convenience prediction entry point for an owned dense design.
-    pub fn predict_dense(&self, design: Array2<f64>) -> Result<Array2<f64>, EstimationError> {
-        self.predict(&DesignMatrix::from(design))
-    }
 }
 
 /// Typed curvature-as-estimand record carried by a response-geometry archive.
@@ -346,21 +318,6 @@ impl ResponseGeometryModel {
         Ok(())
     }
 
-    /// Serialize the complete typed archive as UTF-8 JSON bytes.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ResponseGeometryModelError> {
-        self.validate()?;
-        serde_json::to_vec(self)
-            .map_err(|error| ResponseGeometryModelError::Serialization(error.to_string()))
-    }
-
-    /// Restore and validate a complete typed archive from UTF-8 JSON bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ResponseGeometryModelError> {
-        let model: Self = serde_json::from_slice(bytes)
-            .map_err(|error| ResponseGeometryModelError::Serialization(error.to_string()))?;
-        model.validate()?;
-        Ok(model)
-    }
-
     pub fn metadata(&self) -> ResponseGeometryMetadata {
         self.metadata.clone()
     }
@@ -382,12 +339,6 @@ impl ResponseGeometryModel {
         }
     }
 
-    /// Predict tangent coordinates from the supplied already-materialized
-    /// template design. Geometry exp-map dispatch intentionally remains in the
-    /// geometry/FFI layer.
-    pub fn predict_tangent(&self, design: &DesignMatrix) -> Result<Array2<f64>, EstimationError> {
-        self.shared_tangent_fit.predict(design)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -836,7 +787,6 @@ impl PreparedSharedTangent {
             penalty_beta.push(z);
         }
 
-
         // REML profiles the scale out as `φ̂ = D_p/rdf` with `D_p` the PENALIZED
         // deviance, so the criterion's data term is `rdf·ln(D_p)` and its
         // ρ-derivative is `rdf·(β̂ᵗλⱼSⱼβ̂)/D_p` — exactly `deviance_first[j]/D_p`.
@@ -954,7 +904,6 @@ impl PreparedSharedTangent {
             deviance_first[index] = beta.dot(&z);
             penalty_beta.push(z);
         }
-
 
         // REML profiles the scale out as `φ̂ = D_p/rdf` with `D_p` the PENALIZED
         // deviance, so the criterion's data term is `rdf·ln(D_p)` and its

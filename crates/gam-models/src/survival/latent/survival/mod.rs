@@ -7100,10 +7100,7 @@ mod custom_family;
 /// rather than this whole file, which is the fit math and must stay covered.
 mod log_sigma_curvature_certificate;
 
-pub use log_sigma_curvature_certificate::{
-    CertifiedLogSigmaCurvature, latent_survival_log_sigma_curvature_certified,
-};
-
+pub use log_sigma_curvature_certificate::CertifiedLogSigmaCurvature;
 
 #[cfg(test)]
 mod tests;

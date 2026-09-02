@@ -376,16 +376,6 @@ fn buildwiggle_block_input_from_canonical_penalties(
     })
 }
 
-pub fn buildwiggle_block_input_from_knots(
-    seed: ArrayView1<'_, f64>,
-    knots: &Array1<f64>,
-    degree: usize,
-    penalty_order: usize,
-    double_penalty: bool,
-) -> Result<ParameterBlockInput, String> {
-    buildwiggle_block_input_from_orders(seed, knots, degree, &[penalty_order], double_penalty)
-}
-
 /// Build a monotone I-spline block carrying the COMPLETE requested penalty set.
 ///
 /// Callers that want several derivative orders must come through here rather
@@ -409,21 +399,6 @@ pub fn buildwiggle_block_input_from_orders(
     let canonical =
         canonical_wiggle_function_penalties(knots, degree, derivative_orders, double_penalty)?;
     buildwiggle_block_input_from_canonical_penalties(seed, knots, degree, &canonical)
-}
-
-pub fn buildwiggle_block_input_from_seed(
-    seed: ArrayView1<'_, f64>,
-    cfg: &WiggleBlockConfig,
-) -> Result<(ParameterBlockInput, Array1<f64>), String> {
-    let knots = monotone_warp_knots_from_seed(seed, cfg.degree, cfg.num_internal_knots)?;
-    let block = buildwiggle_block_input_from_knots(
-        seed,
-        &knots,
-        cfg.degree,
-        cfg.penalty_order,
-        cfg.double_penalty,
-    )?;
-    Ok((block, knots))
 }
 
 pub(crate) fn monotone_wiggle_basis_from_knots(

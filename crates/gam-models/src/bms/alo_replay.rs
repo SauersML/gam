@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use super::deviation_runtime::{AnchorComponentTag, InstalledFlexBlock};
-use super::family::{BernoulliMarginalSlopeFamily, bernoulli_marginal_link_map};
-use super::gradient_paths::rigid_standard_normal_row_kernel;
+use super::family::BernoulliMarginalSlopeFamily;
 use super::hessian_paths::{
     block_slices, new_cell_moment_cache_stats, new_cell_moment_lru_cache, primary_slices,
 };
@@ -31,31 +30,6 @@ pub struct BernoulliMarginalSlopeAloRowGeometry {
     pub negative_log_likelihood: f64,
     pub nll_score: [f64; 2],
     pub observed_hessian: [[f64; 2]; 2],
-}
-
-/// Replay the exact rigid standard-normal row program used by fitting.
-///
-/// The latent score supplied here must already be in the fitted normalized and
-/// calibrated coordinate system. Gaussian-shift frailty is represented by the
-/// persisted probit scale, so no prediction-time approximation enters the
-/// score or observed Hessian.
-pub fn bernoulli_marginal_slope_alo_row_geometry(
-    input: BernoulliMarginalSlopeAloRowInput<'_>,
-) -> Result<BernoulliMarginalSlopeAloRowGeometry, String> {
-    let marginal = bernoulli_marginal_link_map(input.base_link, input.marginal_eta)?;
-    let (negative_log_likelihood, nll_score, observed_hessian) = rigid_standard_normal_row_kernel(
-        marginal,
-        input.slope,
-        input.latent_z,
-        input.response,
-        input.prior_weight,
-        input.probit_frailty_scale,
-    )?;
-    Ok(BernoulliMarginalSlopeAloRowGeometry {
-        negative_log_likelihood,
-        nll_score,
-        observed_hessian,
-    })
 }
 
 /// Exact saved-row geometry in the full local primary frame

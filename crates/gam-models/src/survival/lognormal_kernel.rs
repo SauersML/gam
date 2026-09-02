@@ -270,48 +270,6 @@ fn validate_kernel_inputs(m: f64, mu: f64, sigma: f64) -> Result<(), EstimationE
     Ok::<(), _>(())
 }
 
-#[inline]
-pub fn log_kernel_term(
-    quadctx: &QuadratureContext,
-    k: usize,
-    m: f64,
-    mu: f64,
-    sigma: f64,
-) -> Result<(f64, IntegratedExpectationMode), EstimationError> {
-    validate_kernel_inputs(m, mu, sigma)?;
-    let kf = k as f64;
-    let sigma2 = sigma * sigma;
-    if !sigma2.is_finite() {
-        crate::bail_invalid_estim!(
-            "lognormal kernel sigma is outside the finite exact-derivative range: sigma={sigma}"
-        );
-    }
-    let prefix_bound = kf * mu.abs() + 0.5 * kf * kf * sigma2;
-    if !prefix_bound.is_finite() {
-        crate::bail_invalid_estim!(
-            "lognormal kernel prefix is outside the finite exact-derivative range: k={k}, mu={mu}, sigma={sigma}"
-        );
-    }
-    let prefix = kf * mu + 0.5 * kf * kf * sigma2;
-    if m == 0.0 {
-        return Ok((prefix, IntegratedExpectationMode::ExactClosedForm));
-    }
-    let log_m = m.ln();
-    let shifted_bound = mu.abs() + kf * sigma2 + log_m.abs();
-    if !shifted_bound.is_finite() {
-        crate::bail_invalid_estim!(
-            "lognormal kernel shifted location is outside the finite exact-derivative range: k={k}, m={m}, mu={mu}, sigma={sigma}"
-        );
-    }
-    let shifted_mu = mu + kf * sigma2 + log_m;
-    // Survival carried in log space: prefix + ln S(shifted_mu, σ). This keeps the
-    // kernel's true magnitude when S underflows in value space at large σ — the
-    // old `laplace <= 0.0 → −∞` collapse discarded a large-but-finite log-value
-    // (#798) and the value-space asymptotic was biased low at σ ≥ 8 (#799).
-    let (log_laplace, mode) = lognormal_laplace_unit_log_term_shared(quadctx, shifted_mu, sigma);
-    Ok((prefix + log_laplace, mode))
-}
-
 /// Kernel bundle storing `log K_{k,m}` values instead of `K_{k,m}`.
 #[derive(Clone, Debug)]
 pub struct LogLognormalKernelBundle {

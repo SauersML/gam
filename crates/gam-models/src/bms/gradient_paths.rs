@@ -1141,44 +1141,6 @@ impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
         }
     }
 
-    fn visit_upper_triangle(
-        &self,
-        direction: &mut [f64],
-        projected: &mut [f64],
-        mut visit: impl FnMut(usize, usize, f64),
-    ) {
-        let dimension = self.dim();
-        assert_eq!(direction.len(), dimension);
-        assert_eq!(projected.len(), dimension);
-        match self.representation() {
-            MarginalSlopeCovarianceRef::Diagonal(diagonal) => {
-                for column in 0..dimension {
-                    for row in 0..=column {
-                        visit(row, column, if row == column { diagonal[row] } else { 0.0 });
-                    }
-                }
-            }
-            MarginalSlopeCovarianceRef::Full(matrix) => {
-                for column in 0..dimension {
-                    for row in 0..=column {
-                        visit(row, column, matrix[[row, column]]);
-                    }
-                }
-            }
-            MarginalSlopeCovarianceRef::LowRank(factor) => {
-                for column in 0..dimension {
-                    for row in 0..=column {
-                        let mut value = 0.0;
-                        for rank in 0..factor.ncols() {
-                            value += factor[[row, rank]] * factor[[column, rank]];
-                        }
-                        visit(row, column, value);
-                    }
-                }
-            }
-        }
-    }
-
     fn quadratic_value<T, F>(&self, input: &[T], value: F) -> f64
     where
         F: Fn(&T) -> f64,
@@ -1311,56 +1273,6 @@ pub fn marginal_slope_covariance_from_scores(
     } else {
         MarginalSlopeCovariance::full(cov)
     }
-}
-
-pub fn marginal_slope_preserving_scale(
-    slopes: &[f64],
-    covariance: &MarginalSlopeCovariance,
-    probit_scale: f64,
-) -> Result<f64, String> {
-    if !probit_scale.is_finite() {
-        return Err(format!(
-            "marginal-slope probit scale must be finite, got {probit_scale}"
-        ));
-    }
-    let variance = probit_scale * probit_scale * covariance.quadratic_form(slopes)?;
-    if !variance.is_finite() {
-        return Err("marginal-slope preserving variance is non-finite".to_string());
-    }
-    Ok((1.0 + variance).sqrt())
-}
-
-pub fn marginal_slope_probit_eta(
-    q: f64,
-    z: &[f64],
-    slopes: &[f64],
-    covariance: &MarginalSlopeCovariance,
-    probit_scale: f64,
-) -> Result<f64, String> {
-    if z.len() != slopes.len() {
-        return Err(format!(
-            "marginal-slope score/slope dimension mismatch: z={}, slopes={}",
-            z.len(),
-            slopes.len()
-        ));
-    }
-    if slopes.len() != covariance.dim() {
-        return Err(format!(
-            "marginal-slope covariance dimension mismatch: slopes={}, covariance={}",
-            slopes.len(),
-            covariance.dim()
-        ));
-    }
-    if !q.is_finite() || z.iter().any(|value| !value.is_finite()) {
-        return Err("marginal-slope probit eta inputs must be finite".to_string());
-    }
-    let scale = marginal_slope_preserving_scale(slopes, covariance, probit_scale)?;
-    let linear = z
-        .iter()
-        .zip(slopes.iter())
-        .map(|(&score, &slope)| probit_scale * slope * score)
-        .sum::<f64>();
-    Ok(q * scale + linear)
 }
 
 /// Log-space residual evaluator for the empirical-frailty intercept calibration.

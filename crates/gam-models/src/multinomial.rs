@@ -72,10 +72,7 @@ use crate::fit_orchestration::{
     FitConfig, build_termspec_with_geometry_and_overrides, resolved_resource_policy,
 };
 use crate::model_types::EstimationError;
-use crate::multinomial_posterior::{
-    MultinomialPosteriorIntegrationControl, integrate_multinomial_design_moments,
-    softmax_with_reference,
-};
+use crate::multinomial_posterior::softmax_with_reference;
 use crate::multinomial_reml::MultinomialFamily;
 use crate::penalized_vector_glm::{
     PenalizedVectorGlmInputs, VectorGlmResume, VectorGlmSolve, fit_penalized_vector_glm,
@@ -951,64 +948,7 @@ pub struct MultinomialFitOutputs {
 }
 
 impl MultinomialFitOutputs {
-    /// Number of active classes `M = K − 1` (columns of
-    /// [`Self::coefficients_active`]).
-    pub fn n_active_classes(&self) -> usize {
-        self.coefficients_active.ncols()
-    }
 
-    /// Per-class coefficient dimension `P` (rows of
-    /// [`Self::coefficients_active`]).
-    pub fn p_per_class(&self) -> usize {
-        self.coefficients_active.nrows()
-    }
-
-    /// Integrate the logistic-normal coefficient posterior at fresh design rows:
-    /// `E[softmax(η)]` and its marginal standard deviations with
-    /// `η ~ N(x'β̂, x'Σx)`, the full joint covariance (cross-class blocks
-    /// included) contracted into each row's active-logit covariance before
-    /// deterministic adaptive integration.
-    ///
-    /// # This is NOT the posterior mean, and the name says so on purpose (#2612)
-    ///
-    /// The quantity a caller usually wants — the posterior mean probability —
-    /// is not this. Integrating a nonlinear functional over the Laplace Gaussian
-    /// keeps the curvature half of the `O(n⁻¹)` correction to a posterior mean
-    /// and drops the skewness half; on a (quasi-)separated softmax the two are
-    /// neither small nor same-signed, and the result is under-confident by up to
-    /// tens of percentage points at unchanged argmax. The posterior mean is
-    /// computed by [`crate::multinomial_predictive`] as a ratio of normalising
-    /// constants, and [`MultinomialSavedModel::predict_probabilities`] is the
-    /// entry point that publishes it.
-    ///
-    /// What this function IS, and why it stays: the exact moments of `softmax`
-    /// under a STATED Gaussian. That is a well-defined object with its own uses
-    /// (propagating a declared coefficient uncertainty through the link, and
-    /// pinning the integrator itself), and naming it for the Gaussian rather
-    /// than for the posterior is what keeps the two from being confused again.
-    pub fn logistic_normal_softmax_moments(
-        &self,
-        x_new: ArrayView2<'_, f64>,
-    ) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
-        self.logistic_normal_softmax_moments_with_control(
-            x_new,
-            &MultinomialPosteriorIntegrationControl::default(),
-        )
-    }
-
-    pub fn logistic_normal_softmax_moments_with_control(
-        &self,
-        x_new: ArrayView2<'_, f64>,
-        control: &MultinomialPosteriorIntegrationControl,
-    ) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
-        let moments = integrate_multinomial_design_moments(
-            self.coefficients_active.view(),
-            self.coefficient_covariance.view(),
-            x_new,
-            control,
-        )?;
-        Ok((moments.class_mean, moments.class_standard_deviation))
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -2441,23 +2381,6 @@ impl MultinomialSavedModel {
         let d = self.p_per_class.checked_mul(self.n_active_classes)?;
         let flat = self.smoothing_correction_flat.as_ref()?;
         Array2::from_shape_vec((d, d), flat.clone()).ok()
-    }
-
-    /// The smoothing-CORRECTED joint posterior covariance `V_c = V_cond + C`,
-    /// the multinomial's `InferenceCovarianceMode::SmoothingCorrected` matrix.
-    ///
-    /// `None` exactly when [`Self::smoothing_correction`] is `None`. This never
-    /// falls back to the conditional matrix: a caller that asks for the
-    /// unconditional covariance and is handed the conditional one cannot tell
-    /// that its interval is narrower than it asked for, which is the whole
-    /// defect the mode axis exists to make visible.
-    pub fn coefficient_covariance_corrected(&self) -> Option<Array2<f64>> {
-        let correction = self.smoothing_correction()?;
-        let conditional = self.coefficient_covariance().ok()?;
-        if conditional.dim() != correction.dim() {
-            return None;
-        }
-        Some(conditional + correction)
     }
 
     /// Reconstruct the joint influence matrix `F = H⁻¹ X'WX` as a
@@ -4648,23 +4571,6 @@ pub fn predict_multinomial_formula_with_se(
     model.validate()?;
     let x_dense = build_multinomial_predict_design(model, data)?;
     model.predict_probabilities_with_se(x_dense.view())
-}
-
-/// The same pair under an EXPLICITLY named covariance definition.
-///
-/// The conditional arm is reachable by name rather than only as a fallback,
-/// which is what lets the two modes be audited against each other: the
-/// difference between the two bands on one fit IS the smoothing-parameter
-/// uncertainty, and a gate that can only see the default cannot tell a
-/// correction that is present from one that is zero.
-pub fn predict_multinomial_formula_with_se_in_mode(
-    model: &MultinomialSavedModel,
-    data: &EncodedDataset,
-    mode: InferenceCovarianceMode,
-) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
-    model.validate()?;
-    let x_dense = build_multinomial_predict_design(model, data)?;
-    model.predict_probabilities_with_se_in_mode(x_dense.view(), mode)
 }
 
 #[derive(Debug, Clone)]

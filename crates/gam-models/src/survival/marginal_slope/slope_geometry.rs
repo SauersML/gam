@@ -356,7 +356,6 @@ impl SlopeRowGeometry<DYNAMIC_SLOPE_PRIMARIES> for DynamicSlopeGeometry {
     }
 }
 
-
 /// Run a block in whichever primary frame the family's slope layout selects.
 ///
 /// The two frames have different primary counts, so a value that still carries
