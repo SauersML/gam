@@ -5766,22 +5766,12 @@ impl From<&DesignMatrix> for DesignBlock {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BlockDesignOperator, CoefficientTransformOperator, ConditionedDesign, DenseDesignMatrix,
-        DenseDesignOperator, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
-        FiniteSignedWeightsView, MultiChannelOperator, PsdWeightsView, RandomEffectOperator,
-        ReparamOperator, RowwiseKroneckerOperator, SparseDesignMatrix,
-        dense_operator_to_dense_by_chunks, dense_transpose_weighted_response, fast_atv, fast_av,
-        streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view, xt_diag_x_symmetric,
-    };
+    use super::{BlockDesignOperator, CoefficientTransformOperator, ConditionedDesign, DenseDesignMatrix, DenseDesignOperator, DesignBlock, DesignMatrix, EmbeddedColumnBlock, FiniteSignedWeightsView, MultiChannelOperator, PsdWeightsView, RandomEffectOperator, ReparamOperator, RowwiseKroneckerOperator, SparseDesignMatrix, dense_operator_to_dense_by_chunks, dense_transpose_weighted_response, fast_atv, fast_av, streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view};
     use crate::matrix::LinearOperator;
     use crate::test_support::no_densify_design;
-    use crate::types::RidgePolicy;
-    use crate::utils::{PcgSolveInfo, StableSolver};
+    use crate::utils::StableSolver;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
-    use gam_runtime::resource::{
-        MaterializationPolicy, MatrixMaterializationError, MemoryGovernor, ResourcePolicy,
-    };
+    use gam_runtime::resource::{MaterializationPolicy, MatrixMaterializationError, ResourcePolicy};
     use ndarray::{Array1, Array2, ArrayViewMut2, Axis, array, s};
     use std::ops::Range;
     use std::sync::Arc;

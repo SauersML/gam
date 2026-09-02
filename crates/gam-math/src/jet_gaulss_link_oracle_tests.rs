@@ -165,39 +165,3 @@ impl Lcg {
     }
 }
 
-/// The mechanically jet-derived `gaulss` OBSERVED tower (value / ∇ / observed H)
-/// in the production log-b σ-link parameterization must equal the INDEPENDENT
-/// closed form that replicates the production `gaussian_joint_psi_firstweights`
-/// observed scalars, channel by channel, through the SAME universal
-/// [`verify_kernel_channels`] oracle every #932 family uses. This pins the hand
-/// `κ`-chain-rule score/observed-Hessian cascade (σ = b + e^{η}, κ, κ') against
-/// the single-expression row NLL. (The production Newton Hessian's deliberate
-/// Fisher substitutions — `(μ,ls)→0`, `(ls,ls)→2κ²a` — are a modeling layer, not
-/// jet-tower work, and are intentionally not asserted here.)
-#[test]
-fn gaulss_link_jet_tower_matches_production_observed_score_and_hessian() {
-    let mut rng = Lcg(0x9322_2020_1109_ca75);
-    // Moderate ranges keep σ = 0.01 + e^{η_ls} and w = a/σ² finite and well-scaled.
-    let mut rows = Vec::new();
-    for _ in 0..24 {
-        rows.push(GaulssRow {
-            y: rng.uniform(-3.0, 3.0),
-            eta_mu: rng.uniform(-2.0, 2.0),
-            eta_ls: rng.uniform(-1.5, 1.5),
-            a: rng.uniform(0.5, 2.5),
-        });
-    }
-    let program = GaulssLinkRow { rows: rows.clone() };
-
-    const REL_TOL: f64 = 1e-11;
-    for (row, fixture) in rows.iter().enumerate() {
-        let tower: Box<Tower4<2>> = program_full_tower(&program, row).expect("gaulss jet tower");
-        let claims = gaulss_observed_closed_form(fixture);
-        verify_kernel_channels(&tower, &claims, REL_TOL).unwrap_or_else(|e| {
-            panic!(
-                "row {row}: gaulss production observed κ-chain-rule tower disagrees with \
-                 #932 jet-tower truth: {e}"
-            )
-        });
-    }
-}

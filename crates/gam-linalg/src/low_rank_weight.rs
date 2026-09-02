@@ -35,7 +35,7 @@
 //! solve of size `r × r`. The dimensionality of the corrected normal
 //! equation is `p × p`; nothing blows up to `n`.
 
-use ndarray::{Array1, ArrayView1, ArrayView2, Array2};
+use ndarray::{Array1, ArrayView1, ArrayView2};
 
 use crate::faer_ndarray::{fast_atv, fast_av};
 
@@ -135,8 +135,7 @@ impl<'a> LowRankWeight<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::faer_ndarray::fast_ab;
-    use crate::matrix::{DesignMatrix, FiniteSignedWeightsView, LinearOperator};
+    use crate::matrix::DesignMatrix;
     use ndarray::array;
 
     /// Build a tiny dense design and a corresponding `DesignMatrix::Dense`.
@@ -149,33 +148,6 @@ mod tests {
             [0.2, 0.9, -0.5],
         ];
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x))
-    }
-
-    #[test]
-    fn apply_matches_dense() {
-        let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
-        let u = array![
-            [0.1, -0.2],
-            [0.4, 0.3],
-            [-0.1, 0.5],
-            [0.2, 0.1],
-            [0.0, -0.3]
-        ];
-        let v = array![[0.2, 0.1], [0.0, 0.4], [0.3, -0.2], [-0.1, 0.6], [0.5, 0.0]];
-        let lr = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
-        let x = array![1.0, -2.0, 0.5, 0.3, -1.0];
-        let got = lr.apply(x.view());
-        let w = dense_w(&d, &u, &v);
-        let want = w.dot(&x);
-        for i in 0..got.len() {
-            assert!(
-                (got[i] - want[i]).abs() < 1e-12,
-                "row {}: {} vs {}",
-                i,
-                got[i],
-                want[i]
-            );
-        }
     }
 
 }

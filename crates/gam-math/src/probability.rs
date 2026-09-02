@@ -1556,7 +1556,6 @@ pub fn standard_normal_quantile_from_log_cdf(log_p: f64) -> Result<f64, String> 
 
 #[cfg(test)]
 mod cone_boundary_factor_tests {
-    use super::*;
 
     /// Adaptive-free Simpson quadrature of the exact 1-D boundary integral
     /// `∫_{−s}^{U} exp(−μu − ½hu²) du` on a truncation `U` chosen so the

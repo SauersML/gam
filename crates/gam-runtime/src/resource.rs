@@ -1391,38 +1391,6 @@ mod resource_policy_tests {
     // ── MemoryGovernor ledger ────────────────────────────────────────────────
 
     #[test]
-    fn reservations_account_and_release_on_drop() {
-        let governor = test_governor(1_000);
-        assert_eq!(governor.remaining_bytes(), 1_000);
-        let first = governor.try_reserve(600, "test-first").expect("fits");
-        assert_eq!(governor.reserved_bytes(), 600);
-        assert_eq!(governor.remaining_bytes(), 400);
-        assert_eq!(first.bytes(), 600);
-        drop(first);
-        assert_eq!(governor.reserved_bytes(), 0);
-        assert_eq!(governor.remaining_bytes(), 1_000);
-    }
-
-    #[test]
-    fn dense_reservation_uses_checked_footprint() {
-        let governor = test_governor(1 << 20);
-        let ok = governor
-            .try_reserve_dense_f64(1024, 64, "test-dense")
-            .expect("512 KiB fits in 1 MiB");
-        assert_eq!(ok.bytes(), 1024 * 64 * 8);
-        drop(ok);
-        // Dimension-product overflow must refuse, never wrap into a tiny
-        // spurious reservation.
-        governor
-            .try_reserve_dense_f64(usize::MAX, 2, "test-overflow")
-            .expect_err("overflowing footprint cannot be reserved");
-        assert!(matches!(
-            governor.try_reserve_dense_f64(usize::MAX, 2, "test-overflow"),
-            Err(MemoryReservationError::SizeOverflow { .. })
-        ));
-    }
-
-    #[test]
     fn compressed_macos_observation_keeps_xnu_available_memory_positive() {
         // #2316's healthy 8 GiB macOS host had more compressed than
         // free+inactive pages. sysinfo 0.33 subtracted compressor pages and

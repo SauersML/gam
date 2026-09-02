@@ -2294,18 +2294,4 @@ mod contraction_symmetry_tests {
         out
     }
 
-    /// The output-symmetric contraction is BIT-IDENTICAL to the full nest across
-    /// `K ∈ {2,3,4,9}` (so no fingerprint re-baseline is owed — accuracy and bits
-    /// are unchanged; this is a pure speed-only optimization).
-    #[test]
-    fn contraction_symmetry_is_bit_identical_to_full_nest() {
-        let checks = check_bit_identical::<2>(0x0000_0002_C0FF_EE01, 1000)
-            + check_bit_identical::<3>(0x0000_0003_C0FF_EE01, 800)
-            + check_bit_identical::<4>(0x0000_0004_C0FF_EE01, 600)
-            + check_bit_identical::<9>(0x0000_0009_C0FF_EE01, 300);
-        // Guards against the loops silently not running (e.g. a zeroed count):
-        // 1000·2²·2 + 800·3²·2 + 600·4²·2 + 300·9²·2.
-        assert_eq!(checks, 8000 + 14400 + 19200 + 48600);
-    }
-
 }

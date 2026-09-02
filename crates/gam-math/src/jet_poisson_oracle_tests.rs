@@ -50,12 +50,8 @@
 //!   ℓ(p) = μ − y·η + ln Γ(y + 1) = e^{η} − y·η + ln Γ(y + 1).
 //! ```
 
-use crate::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
-use crate::jet_tower::{
-    RowProgram, Tower4, program_fourth_contracted, program_full_tower, program_row_kernel,
-    program_third_contracted,
-};
-use crate::nested_dual::JetField;
+use crate::jet_scalar::JetScalar;
+use crate::jet_tower::{RowProgram, Tower4};
 
 /// One Poisson-log row fixture: the response `y` (a count, as `f64`) and the
 /// three bilinear-predictor coefficients `(a, b, d)` defining

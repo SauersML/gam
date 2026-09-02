@@ -1270,7 +1270,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jet_scalar::{DynamicJetArena, DynamicOrder2, FixedRuntimeJet, JetScalar};
+    use crate::jet_scalar::{FixedRuntimeJet, JetScalar};
     use crate::nested_dual::JetField;
     use std::cell::Cell;
 

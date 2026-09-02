@@ -1,5 +1,4 @@
 use gam_row_macros::row_atom;
-use gam_math::paired_timing::SpeedGate;
 
 row_atom! {
     fn generated_cause_specific [order2, third, fourth](

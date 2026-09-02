@@ -582,11 +582,7 @@ pub fn no_densify_design(dense: Array2<f64>) -> DesignMatrix {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PairedFoldComparison, RESOLUTION_TAIL, assert_paired_match_or_beat, no_densify_design,
-        paired_holdout_partition, student_t_cdf, student_t_upper_quantile,
-    };
-    use ndarray::array;
+    use super::{PairedFoldComparison, RESOLUTION_TAIL, assert_paired_match_or_beat, paired_holdout_partition, student_t_cdf, student_t_upper_quantile};
 
     #[test]
     fn paired_holdout_is_exact_reproducible_and_partitioned() {

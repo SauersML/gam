@@ -1913,10 +1913,7 @@ mod tests {
 
 #[cfg(test)]
 mod pure_fn_tests {
-    use super::{
-        addridge, inf_norm, max_abs_diag, predict_gam_dimension_mismatch_message,
-        row_mismatch_message, stable_logistic, stable_softplus,
-    };
+    use super::{inf_norm, predict_gam_dimension_mismatch_message, row_mismatch_message, stable_logistic, stable_softplus};
     use ndarray::array;
 
     // -----------------------------------------------------------------------

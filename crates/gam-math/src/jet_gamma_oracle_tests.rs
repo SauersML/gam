@@ -61,10 +61,7 @@
 //! tensor order.
 
 use crate::jet_scalar::JetScalar;
-use crate::jet_tower::{
-    Tower4, digamma_derivative_stack, ln_gamma_derivative_stack, program_fourth_contracted,
-    program_full_tower, program_row_kernel, program_third_contracted,
-};
+use crate::jet_tower::{Tower4, digamma_derivative_stack, ln_gamma_derivative_stack, program_full_tower};
 
 /// A tiny deterministic LCG so the test points are pseudo-random yet fixed
 /// across runs (NO `rand`, NO clock seeding — per the #932 rules).
