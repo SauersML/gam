@@ -126,9 +126,6 @@ impl AtlasChart {
         &self.support_rows
     }
 
-    pub fn support_weights(&self) -> &[f64] {
-        &self.support_weights
-    }
 }
 
 /// Existing transfer evidence for one connected chart-overlap component,
@@ -159,7 +156,6 @@ impl AtlasTransferGate {
             equivariance_defect: certificate.equivariance_defect,
         }
     }
-
 
     #[must_use]
     pub fn edge(&self) -> AtlasHolonomyEdgeId {

@@ -40,29 +40,18 @@
 //! `sparse_topk_state_memory_shape_matches_budget_formula`.
 
 use gam_problem::LatentRetractionRegistry;
-use gam_terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
-use ndarray::{Array1, Array2};
+use gam_terms::latent::{LatentIdMode, LatentManifold};
+use ndarray::Array1;
 
 use crate::assignment::{AssignmentMode, SaeAssignment};
-
-/// Byte width of one budgeted state cell, matching
-/// `streaming_plan::SAE_BYTES_PER_F64`. Kept as a local constant so this module
-/// does not reach into the private streaming-plan module for a single integer;
-/// the layout-contract test pins it against the real budget arithmetic.
-const STATE_CELL_BYTES: usize = 8;
 
 /// Per-atom coordinate metadata needed to reconstruct the dense
 /// [`LatentCoordValues`] block bit-for-bit on materialization.
 #[derive(Debug, Clone)]
 struct AtomCoordMeta {
     latent_dim: usize,
-    id_mode: LatentIdMode,
     manifold: LatentManifold,
     retraction: LatentRetractionRegistry,
-    /// Process-local stable identity of the source block. Preserved so a
-    /// dense → state → dense round-trip is identity-stable, not merely
-    /// value-stable.
-    latent_id: u64,
 }
 
 /// Coordinate geometry for one atom in a support-sparse assignment.
@@ -114,85 +103,9 @@ pub struct SaeAssignmentState {
     /// Per-atom coordinate metadata (length `K`) for dense reconstruction.
     atom_coord_meta: Vec<AtomCoordMeta>,
     mode: AssignmentMode,
-    /// #1026 per-atom ungated flag (length `K`).
-    ungated: Vec<bool>,
-    /// #1033 frozen/amortized routing, dense `(N, K)` when engaged (a
-    /// full-support-only field; the sparse TopK lane never freezes routing).
-    frozen_logits: Option<Array2<f64>>,
-    /// #1777 per-fit ordered Beta--Bernoulli-α override.
-    ordered_beta_bernoulli_alpha_override: Option<f64>,
 }
 
 impl SaeAssignmentState {
-    /// Skeleton full-support state: `N` rows, `K` atoms, `S_i = [0, K)`, zero
-    /// routing scalars, zero-dimensional Euclidean coordinates, softmax mode, no
-    /// ungated atoms, free (non-frozen) routing. The minimal coherent
-    /// full-support state; callers fill in routing scalars / coordinates through
-    /// the mutable accessors or (more commonly) obtain a populated state via
-    /// [`SaeAssignment::as_state`].
-    #[must_use]
-    pub fn full_support(n_obs: usize, k_atoms: usize) -> Self {
-        let indices: Vec<Vec<u32>> = (0..n_obs).map(|_| (0..k_atoms as u32).collect()).collect();
-        let gate_params = vec![vec![0.0_f64; k_atoms]; n_obs];
-        // d_k = 0 for every atom ⇒ empty per-row coord blocks.
-        let coords = vec![Vec::new(); n_obs];
-        let atom_coord_meta = (0..k_atoms)
-            .map(|_| AtomCoordMeta {
-                latent_dim: 0,
-                id_mode: LatentIdMode::None,
-                manifold: LatentManifold::Euclidean,
-                retraction: LatentRetractionRegistry::all_euclidean(),
-                latent_id: 0,
-            })
-            .collect();
-        Self {
-            n_obs,
-            k_atoms,
-            indices,
-            gate_params,
-            coords,
-            atom_coord_meta,
-            mode: AssignmentMode::softmax(1.0),
-            ungated: vec![false; k_atoms],
-            frozen_logits: None,
-            ordered_beta_bernoulli_alpha_override: None,
-        }
-    }
-
-    /// Support-sparse hard-TopK state (the honest `O(N · k_active)` lane, design
-    /// Increment 1). Every row carries exactly `support_k` active atoms whose
-    /// coordinates are `d_max`-dimensional Euclidean, so the state occupies
-    /// exactly the [`SaeTopKCurvedBudget`] `active_state_bytes`.
-    ///
-    /// * `indices[i]`     — length `support_k`, each `< k_atoms`;
-    /// * `gate_params[i]` — length `support_k` (routing scalars);
-    /// * `coords[i]`      — length `support_k · d_max`, active-atom coords in the
-    ///   same order as `indices[i]`.
-    ///
-    /// [`SaeTopKCurvedBudget`]: crate::manifold::SaeTopKCurvedBudget
-    #[must_use = "state build error must be handled"]
-    pub fn from_topk_support(
-        n_obs: usize,
-        k_atoms: usize,
-        support_k: usize,
-        d_max: usize,
-        indices: Vec<Vec<u32>>,
-        gate_params: Vec<Vec<f64>>,
-        coords: Vec<Vec<f64>>,
-    ) -> Result<Self, String> {
-        let atom_specs = (0..k_atoms)
-            .map(|_| SaeAssignmentAtomSpec::euclidean(d_max))
-            .collect();
-        Self::from_topk_support_heterogeneous(
-            n_obs,
-            k_atoms,
-            support_k,
-            atom_specs,
-            indices,
-            gate_params,
-            coords,
-        )
-    }
 
     /// Construct the canonical hard-TopK state for heterogeneous atoms.
     ///
@@ -315,10 +228,8 @@ impl SaeAssignmentState {
             .into_iter()
             .map(|spec| AtomCoordMeta {
                 latent_dim: spec.latent_dim,
-                id_mode: spec.id_mode,
                 manifold: spec.manifold,
                 retraction: spec.retraction,
-                latent_id: spec.latent_id,
             })
             .collect();
         Ok(Self {
@@ -329,9 +240,6 @@ impl SaeAssignmentState {
             coords,
             atom_coord_meta,
             mode: AssignmentMode::top_k_support(support_k),
-            ungated: vec![false; k_atoms],
-            frozen_logits: None,
-            ordered_beta_bernoulli_alpha_override: None,
         })
     }
 
@@ -368,11 +276,6 @@ impl SaeAssignmentState {
         self.atom_coord_meta[atom].latent_dim
     }
 
-    /// Per-atom coordinate manifold/topology.
-    pub fn atom_manifold(&self, atom: usize) -> &LatentManifold {
-        &self.atom_coord_meta[atom].manifold
-    }
-
     /// Effective per-axis periodicity for one atom, including a retraction
     /// override attached to an otherwise Euclidean coordinate block.
     ///
@@ -405,37 +308,6 @@ impl SaeAssignmentState {
             .sum();
         let atom = self.indices[row][slot] as usize;
         &self.coords[row][start..start + self.atom_coord_meta[atom].latent_dim]
-    }
-
-    /// Apply one compact coordinate update and retract each active atom through
-    /// its own manifold. `delta` uses the same heterogeneous support order as
-    /// [`Self::coords_row`].
-    pub fn apply_row_coord_step(&mut self, row: usize, delta: &[f64]) -> Result<(), String> {
-        if delta.len() != self.coords[row].len() {
-            return Err(format!(
-                "SaeAssignmentState::apply_row_coord_step: row {row} delta width {} != compact coordinate width {}",
-                delta.len(),
-                self.coords[row].len()
-            ));
-        }
-        let mut cursor = 0usize;
-        for slot in 0..self.indices[row].len() {
-            let atom = self.indices[row][slot] as usize;
-            let meta = &self.atom_coord_meta[atom];
-            let end = cursor + meta.latent_dim;
-            let mut current = Array1::from_vec(self.coords[row][cursor..end].to_vec());
-            let step = Array1::from_vec(delta[cursor..end].to_vec());
-            if meta.retraction.is_all_euclidean() {
-                current = meta.manifold.retract(current.view(), step.view());
-            } else {
-                meta.retraction
-                    .retract(&mut current.view_mut(), step.view());
-            }
-            self.coords[row][cursor..end]
-                .copy_from_slice(current.as_slice().expect("retraction is contiguous"));
-            cursor = end;
-        }
-        Ok(())
     }
 
     /// Replace one compact coordinate row and project every heterogeneous atom
@@ -679,185 +551,12 @@ impl SaeAssignmentState {
         Ok(())
     }
 
-    /// Whether every row's support is the full `[0, K)` in ascending order (the
-    /// dense-materialization precondition).
-    pub fn is_full_support(&self) -> bool {
-        if self.n_obs == 0 {
-            return true;
-        }
-        self.indices.iter().all(|row| {
-            row.len() == self.k_atoms && row.iter().enumerate().all(|(k, &a)| a as usize == k)
-        })
-    }
-
     // -- Layout-contract cell accounting (see module docs) -------------------
 
-    /// Total `indices` cells `Σ_i |S_i|`.
-    pub fn index_cells(&self) -> usize {
-        self.indices.iter().map(Vec::len).sum()
-    }
-
-    /// Total `gate_params` cells `Σ_i |S_i|`.
-    pub fn gate_cells(&self) -> usize {
-        self.gate_params.iter().map(Vec::len).sum()
-    }
-
-    /// Total coordinate cells `Σ_i Σ_{k∈S_i} d_k`.
-    pub fn coord_cells(&self) -> usize {
-        self.coords.iter().map(Vec::len).sum()
-    }
-
-    /// Total support-sparse state cells `indices + gate_params + coords`.
-    pub fn active_state_cells(&self) -> usize {
-        self.index_cells() + self.gate_cells() + self.coord_cells()
-    }
-
-    /// Support-sparse state footprint in bytes, one 8-byte word per cell —
-    /// equal to the [`SaeTopKCurvedBudget`] `active_state_bytes` for a uniform
-    /// TopK shape (see the module layout contract).
-    ///
-    /// [`SaeTopKCurvedBudget`]: crate::manifold::SaeTopKCurvedBudget
-    pub fn active_state_bytes(&self) -> usize {
-        self.active_state_cells().saturating_mul(STATE_CELL_BYTES)
-    }
-
-    /// Materialize the exact dense [`SaeAssignment`] layout this state
-    /// represents. Requires [`Self::is_full_support`]: the dense engine only
-    /// exists for the `S_i = [0, K)` specialization, and a proper-sparse state
-    /// has no dense `N×K` image.
-    #[must_use = "materialization error must be handled"]
-    pub fn materialize_dense(&self) -> Result<SaeAssignment, String> {
-        if !self.is_full_support() {
-            return Err(
-                "SaeAssignmentState::materialize_dense: requires a full-support state (S_i = [0, K) \
-                 for every row); a proper support-sparse state has no dense N×K materialization"
-                    .to_string(),
-            );
-        }
-        let n = self.n_obs;
-        let k = self.k_atoms;
-
-        // logits[i, k] = gate_params[i][k] (full support ⇒ index j == atom k).
-        let mut logits = Array2::<f64>::zeros((n, k));
-        for i in 0..n {
-            for (col, &g) in self.gate_params[i].iter().enumerate() {
-                logits[[i, col]] = g;
-            }
-        }
-
-        // Rebuild each atom's LatentCoordValues from the per-row support blocks.
-        // In full-support order the coord offset of atom k in a row is the prefix
-        // sum of the atoms' latent dims.
-        let mut coord_offsets = Vec::with_capacity(k);
-        let mut cursor = 0usize;
-        for meta in &self.atom_coord_meta {
-            coord_offsets.push(cursor);
-            cursor += meta.latent_dim;
-        }
-        let mut coords = Vec::with_capacity(k);
-        for (atom, meta) in self.atom_coord_meta.iter().enumerate() {
-            let d = meta.latent_dim;
-            let mut flat = Array1::<f64>::zeros(n * d);
-            if d > 0 {
-                let off = coord_offsets[atom];
-                for i in 0..n {
-                    let row = &self.coords[i];
-                    for axis in 0..d {
-                        flat[i * d + axis] = row[off + axis];
-                    }
-                }
-            }
-            coords.push(
-                LatentCoordValues::from_flat_with_manifold_and_retraction_and_id(
-                    flat,
-                    n,
-                    d,
-                    meta.id_mode.clone(),
-                    meta.manifold.clone(),
-                    meta.retraction.clone(),
-                    meta.latent_id,
-                ),
-            );
-        }
-
-        // Direct field construction (all fields are `pub`, in-crate): the logits
-        // were captured already canonicalized by `as_state`, so re-routing them
-        // through the validating/canonicalizing `with_mode` is unnecessary and
-        // would only risk a non-identity round-trip. This reverses `as_state`
-        // exactly.
-        Ok(SaeAssignment {
-            logits,
-            coords,
-            mode: self.mode,
-            ungated: self.ungated.clone(),
-            frozen_logits: self.frozen_logits.clone(),
-            ordered_beta_bernoulli_alpha_override: self.ordered_beta_bernoulli_alpha_override,
-        })
-    }
 }
 
 impl SaeAssignment {
-    /// View this dense assignment as its full-support [`SaeAssignmentState`]
-    /// (design Increment 1). The inverse of
-    /// [`SaeAssignmentState::materialize_dense`]: for every row the support is
-    /// `[0, K)`, `gate_params` is the dense `logits` row, and the coordinate
-    /// block is the per-atom `LatentCoordValues` rows gathered in atom order.
-    #[must_use]
-    pub fn as_state(&self) -> SaeAssignmentState {
-        let n = self.n_obs();
-        let k = self.k_atoms();
 
-        let per_atom_dim: Vec<usize> = self
-            .coords
-            .iter()
-            .map(LatentCoordValues::latent_dim)
-            .collect();
-
-        let indices: Vec<Vec<u32>> = (0..n).map(|_| (0..k as u32).collect()).collect();
-        let mut gate_params = Vec::with_capacity(n);
-        let mut coords = Vec::with_capacity(n);
-        for i in 0..n {
-            gate_params.push(self.logits.row(i).to_vec());
-            let row_len: usize = per_atom_dim.iter().sum();
-            let mut row_coords = Vec::with_capacity(row_len);
-            for atom in 0..k {
-                row_coords.extend_from_slice(self.coords[atom].row(i));
-            }
-            coords.push(row_coords);
-        }
-
-        let atom_coord_meta = self
-            .coords
-            .iter()
-            .map(|c| AtomCoordMeta {
-                latent_dim: c.latent_dim(),
-                id_mode: c.id_mode().clone(),
-                manifold: c.manifold().clone(),
-                retraction: c.retraction_registry().clone(),
-                latent_id: c.latent_id(),
-            })
-            .collect();
-
-        SaeAssignmentState {
-            n_obs: n,
-            k_atoms: k,
-            indices,
-            gate_params,
-            coords,
-            atom_coord_meta,
-            mode: self.mode,
-            ungated: self.ungated.clone(),
-            frozen_logits: self.frozen_logits.clone(),
-            ordered_beta_bernoulli_alpha_override: self.ordered_beta_bernoulli_alpha_override,
-        }
-    }
-
-    /// Construct the dense assignment that a full-support [`SaeAssignmentState`]
-    /// materializes (design Increment 1). Errors if `state` is not full-support.
-    #[must_use = "build error must be handled"]
-    pub fn from_full_support_state(state: &SaeAssignmentState) -> Result<Self, String> {
-        state.materialize_dense()
-    }
 }
 
 #[cfg(test)]

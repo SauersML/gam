@@ -504,18 +504,6 @@ impl RawPeriodicCircleEvaluator {
 }
 
 impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
-    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
-        if n_basis != 2 {
-            return Err(format!(
-                "RawPeriodicCircleEvaluator::phi_eta_split: n_basis {n_basis} != 2"
-            ));
-        }
-        // Both raw circle columns `[cos, sin]` are base (η-invariant) columns:
-        // the homotopy has nothing to dial because the base topology IS the full
-        // basis. These columns embed a curved unit circle, so this is a
-        // base-topology relaxation, not a linear one.
-        Ok(PhiEtaSplit::all_base(n_basis))
-    }
 
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         if coords.ncols() != self.latent_dim {
@@ -560,8 +548,6 @@ impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
         Ok((phi, jet))
     }
 }
-
-
 
 /// One real spherical-harmonic column `Y_l^m`, fixed at construction.
 ///
@@ -1289,87 +1275,6 @@ impl SaeBasisThirdJet for AmbientSphereHarmonicEvaluator {
         }
         Ok(t3)
     }
-}
-
-/// Select the working spherical-harmonic degree by the spectral-noise-floor
-/// bandwidth doctrine: fit the full `max_degree` basis on the chart, form the
-/// per-degree mean coefficient energy `E_l = ‖coefficients at degree l‖² /
-/// (2l+1)`, and cut at the largest cliff in that spectrum — the degree above
-/// which the energy collapses to the noise floor. This is the sphere analogue
-/// of the torus/circle bandwidth selection and the Duchon-sheet resolution
-/// ladder: no tuned resolution constant, the data's own spectrum sets the band.
-///
-/// Returns the smallest sufficient degree in `0..=max_degree`. If the spectrum
-/// has no pronounced floor (every degree carries signal), the full `max_degree`
-/// is kept.
-pub fn select_spherical_harmonic_degree(
-    coords: ArrayView2<'_, f64>,
-    target: ArrayView2<'_, f64>,
-    max_degree: usize,
-) -> Result<usize, String> {
-    use faer::Side;
-    use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
-
-    if coords.nrows() != target.nrows() {
-        return Err(format!(
-            "select_spherical_harmonic_degree: coords rows {} != target rows {}",
-            coords.nrows(),
-            target.nrows()
-        ));
-    }
-    if max_degree == 0 {
-        return Ok(0);
-    }
-    let evaluator = SphericalHarmonicEvaluator::new(max_degree)?;
-    let (phi, _) = evaluator.evaluate(coords)?;
-    // Ridge-stabilized normal-equations fit of the full basis to the target.
-    let mut gram = fast_ata(&phi);
-    let scale = gram.diag().iter().copied().fold(0.0_f64, f64::max);
-    let ridge = if scale > 0.0 { scale } else { 1.0 } * 1e-9;
-    for d in gram.diag_mut().iter_mut() {
-        *d += ridge;
-    }
-    let rhs = fast_atb(&phi, &target.to_owned());
-    let decoder = gram
-        .cholesky(Side::Lower)
-        .map_err(|err| {
-            format!("select_spherical_harmonic_degree: gram factorization failed: {err:?}")
-        })?
-        .solve_mat(&rhs);
-
-    // Per-degree mean coefficient energy over the (2l+1) orders and all outputs.
-    let mut energy = vec![0.0_f64; max_degree + 1];
-    let mut col = 0usize;
-    for (l, e) in energy.iter_mut().enumerate() {
-        let width = 2 * l + 1;
-        let mut acc = 0.0_f64;
-        for _ in 0..width {
-            for out in 0..decoder.ncols() {
-                acc += decoder[[col, out]] * decoder[[col, out]];
-            }
-            col += 1;
-        }
-        *e = acc / width as f64;
-    }
-
-    // Largest downward cliff `E_l / E_{l+1}`: the boundary between signal and
-    // the noise floor. Require a decisive factor (100×) before trusting it as a
-    // floor; otherwise keep the full band.
-    let mut cut = max_degree;
-    let mut best_ratio = 1.0_f64;
-    for l in 0..max_degree {
-        let hi = energy[l];
-        let lo = energy[l + 1].max(f64::MIN_POSITIVE);
-        let ratio = hi / lo;
-        if ratio > best_ratio {
-            best_ratio = ratio;
-            cut = l;
-        }
-    }
-    if best_ratio < 100.0 {
-        cut = max_degree;
-    }
-    Ok(cut)
 }
 
 /// Tensor-product periodic harmonic evaluator for a `d`-dimensional torus
@@ -2208,37 +2113,8 @@ impl QuotientSpectralEvaluator {
         Ok(evaluator)
     }
 
-    pub fn quotient_name(&self) -> &str {
-        &self.quotient_name
-    }
-
     pub fn basis_size(&self) -> usize {
         self.cover_columns.len()
-    }
-
-    pub fn cover_width(&self) -> usize {
-        self.cover_width
-    }
-
-    pub fn cover_columns(&self) -> &[usize] {
-        &self.cover_columns
-    }
-
-    pub fn laplace_eigenvalues(&self) -> &[f64] {
-        &self.laplace_eigenvalues
-    }
-
-    pub fn l2_gram_weights(&self) -> &[f64] {
-        &self.l2_gram_weights
-    }
-
-    /// Exact diagonal `L²` function-space Gram inherited from the cover.
-    pub fn function_space_gram(&self) -> Array2<f64> {
-        let mut gram = Array2::<f64>::zeros((self.basis_size(), self.basis_size()));
-        for (column, &weight) in self.l2_gram_weights.iter().enumerate() {
-            gram[[column, column]] = weight;
-        }
-        gram
     }
 
     /// Exact spectral penalty `G · diag(lambda_laplace^power)`.
@@ -2272,13 +2148,6 @@ impl QuotientSpectralEvaluator {
             penalty[[column, column]] = value;
         }
         Ok(penalty)
-    }
-
-    pub fn nullspace_dimension(&self) -> usize {
-        self.laplace_eigenvalues
-            .iter()
-            .filter(|&&eigenvalue| eigenvalue == 0.0)
-            .count()
     }
 
     fn validate_cover_value_jet(
@@ -2457,18 +2326,6 @@ impl AffineCoordinateEvaluator {
 }
 
 impl SaeBasisEvaluator for AffineCoordinateEvaluator {
-    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
-        let expected = self.latent_dim + 1;
-        if n_basis != expected {
-            return Err(format!(
-                "AffineCoordinateEvaluator::phi_eta_split: n_basis {n_basis} != {expected}"
-            ));
-        }
-        // The affine `[1, x, y, z]` basis is genuinely linear, so every column is
-        // a base column and the base-topology relaxation coincides with a true
-        // linear model here (the one basis where the two notions agree).
-        Ok(PhiEtaSplit::all_base(n_basis))
-    }
 
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
@@ -3713,16 +3570,6 @@ impl SubspaceReducedEvaluator {
             ));
         }
         Ok(Self { inner, q })
-    }
-
-    /// Inner basis width `M` (the wrapped evaluator's column count).
-    pub fn inner_width(&self) -> usize {
-        self.q.nrows()
-    }
-
-    /// Retained (data-supported) width `r`.
-    pub fn reduced_width(&self) -> usize {
-        self.q.ncols()
     }
 
     fn check_inner_width(&self, got: usize, what: &str) -> Result<(), String> {

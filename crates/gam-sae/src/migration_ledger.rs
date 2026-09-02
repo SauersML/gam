@@ -358,28 +358,6 @@ impl SaeMigrationLedger {
         });
     }
 
-    /// `true` iff the log records zero principal-component reseeds — the global
-    /// invariant every sanctioned fit path must hold.
-    #[must_use]
-    pub fn is_pc_reseed_free(&self) -> bool {
-        self.pc_reseed_events == 0
-    }
-
-    /// Assert the `pc_reseed_events == 0` invariant, returning a diagnostic
-    /// `Err` (never a panic) so callers can surface the breach honestly.
-    pub fn assert_no_pc_reseed(&self) -> Result<(), String> {
-        if self.is_pc_reseed_free() {
-            Ok(())
-        } else {
-            Err(format!(
-                "SaeMigrationLedger invariant breached: {} principal-component \
-                 reseed event(s) recorded (births must draw from the \
-                 residual-factor pool only)",
-                self.pc_reseed_events
-            ))
-        }
-    }
-
     /// Fold one structure-search round's [`SearchLedger`] into the unified
     /// currency, mapping each adjudicated move + verdict onto a birth / death /
     /// refusal priced by the banked e-process evidence (`bits_from_nats(log_e)`).

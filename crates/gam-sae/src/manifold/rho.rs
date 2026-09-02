@@ -2,12 +2,6 @@ use super::*;
 pub(crate) use gam_problem::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
 use gam_problem::{checked_exp_log_strength, checked_exp_log_strengths, validate_log_strength};
 
-/// Closed numerical domain of every active flat log-strength coordinate.
-///
-/// These are real parameter-domain endpoints, not saturation points: callers
-/// reject values outside the interval instead of clipping them onto a constant
-/// objective plateau.
-
 /// #1026 — how the per-atom ARD precisions are exposed to the OUTER PENALIZED QUASI-LAPLACE
 /// optimizer.
 ///
@@ -315,17 +309,6 @@ impl SaeManifoldRho {
         }
     }
 
-    /// Return a copy of this ρ carrying the crosscoder per-block relevance weights
-    /// `log(λ_ℓ)` (#2231 §2a). The block sub-vector is APPENDED to the flat
-    /// layout after ARD; an empty `log_lambda_block` restores the plain-SAE
-    /// byte-identical layout. The block order must match a term's
-    /// [`crate::manifold::CrosscoderLayout::block_dims`].
-    #[must_use]
-    pub fn with_log_lambda_block(mut self, log_lambda_block: Vec<f64>) -> Self {
-        self.log_lambda_block = log_lambda_block;
-        self
-    }
-
     /// Attach sectional curvatures as `(atom_index, kappa)` pairs. Empty
     /// restores the curvature-free layout. Atom indices must be strictly
     /// increasing so the mapping is canonical and flat-index lookup is exact.
@@ -411,12 +394,6 @@ impl SaeManifoldRho {
             }
         };
         self
-    }
-
-    /// Assignment-strength layout bound to this rho.
-    #[must_use]
-    pub fn assignment_strength_layout(&self) -> AssignmentStrengthLayout {
-        self.assignment_strength_layout
     }
 
     /// Flat index of `log_lambda_sparse`, or `None` when assignment strength is
@@ -509,7 +486,6 @@ impl SaeManifoldRho {
         Some(prefix + k + ard_len + self.log_lambda_block.len() + curvature_index)
     }
 
-
     pub fn ard_flat_index(&self, atom: usize, axis: usize) -> usize {
         let k = self.log_lambda_smooth.len();
         let prefix = self.smooth_flat_start();
@@ -520,15 +496,6 @@ impl SaeManifoldRho {
             }
             ArdSharing::Shared => prefix + k + axis,
         }
-    }
-
-    /// Shift every scale-coupled penalty seed by the profiled reconstruction
-    /// dispersion scale. SAE's Gaussian data-fit term is in squared output
-    /// units, while `lambda_sparse`, `lambda_smooth`, and ARD precisions are
-    /// absolute penalty weights; adding `log(phi_seed)` makes the seeded
-    /// effective stiffness `lambda / phi_seed` dimensionless.
-    pub fn seed_scaled_by_dispersion(&self, dispersion: f64) -> Result<Self, String> {
-        self.seed_scaled_by_dispersion_with_sparse_policy(dispersion, true)
     }
 
     /// Assignment-aware seed scaling.
@@ -1029,7 +996,6 @@ impl SaeManifoldRho {
         rebuilt.validate_log_strength_domain()?;
         Ok(rebuilt)
     }
-
 
 }
 

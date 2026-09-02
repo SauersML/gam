@@ -81,13 +81,6 @@ pub const PREFETCH_SHARDS_AHEAD: usize = 2;
 /// and become the only affordable unbiased estimator.
 pub const DESIGNED_SAMPLE_MANDATORY_MIN_ROWS: u64 = 100_000_000;
 
-/// Auto-switch predicate (#987): must this corpus be fit through a designed,
-/// honesty-weighted subsample? Pure function of the row count; no flag.
-#[inline]
-pub fn designed_sampling_mandatory(total_rows: u64) -> bool {
-    total_rows >= DESIGNED_SAMPLE_MANDATORY_MIN_ROWS
-}
-
 /// Minimal object-store abstraction: list shard keys, fetch object bytes.
 ///
 /// Implementors must be deterministic in *content* (the same key always yields

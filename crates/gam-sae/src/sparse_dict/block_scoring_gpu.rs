@@ -112,24 +112,6 @@ pub fn block_gate_row_cpu(
     block_gates(w.view())
 }
 
-/// CPU reference for a whole minibatch's gate block: `gates[r*n_blocks + g] =
-/// ‖x_r D_gᵀ‖₂`, row-major. The bit-exact oracle for the device gate block.
-#[must_use]
-pub fn block_gate_block_cpu(
-    rows: ArrayView2<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
-    n_blocks: usize,
-    b: usize,
-) -> Vec<f32> {
-    let n_rows = rows.nrows();
-    let mut gates = vec![0.0f32; n_rows * n_blocks];
-    for r in 0..n_rows {
-        let g = block_gate_row_cpu(rows.row(r), decoder, n_blocks, b);
-        gates[r * n_blocks..(r + 1) * n_blocks].copy_from_slice(&g);
-    }
-    gates
-}
-
 /// CPU oracle for the block route: each row's top-`k` `(block, gate)` shortlist,
 /// selected by `(gate desc, block asc)`. Bit-identical to
 /// `super::block::route_block_minibatch` up to f32 ties (that path forms `z`
