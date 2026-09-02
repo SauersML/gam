@@ -26,7 +26,6 @@
 //! options dict, calls [`run_sparse_sae_audit`], and turns
 //! [`SparseSaeAuditReport`] into Python objects.
 
-
 pub struct AbsorptionPairReport {
     pub a: usize,
     pub b: usize,

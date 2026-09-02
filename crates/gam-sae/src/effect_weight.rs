@@ -7,7 +7,6 @@
 //! effect decision is added beside it. Realized intervention KL is retained as
 //! an empirical validation ledger, not as the derived Fisher effect weight.
 
-
 /// Per-atom evidence in the existing reconstruction currency.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VarianceChargeEvidence {

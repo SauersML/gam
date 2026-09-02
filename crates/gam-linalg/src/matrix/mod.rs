@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
+use crate::faer_ndarray::fast_xt_diag_x;
 
 const MATRIX_FREE_PCG_MIN_P: usize = 2048;
 const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;

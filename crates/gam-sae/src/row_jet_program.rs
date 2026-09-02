@@ -38,7 +38,6 @@
 //! lowerings with a historical explicit cross-term reference, so a dropped or
 //! sign-flipped block is named independently rather than shared silently.
 
-
 /// Sentinel in [`SaeReconstructionRowProgram::coord_slot`] for an atom
 /// coordinate that is fixed in this row's local chart (compact active-set rows
 /// omit inactive atom coordinates, but softmax logit derivatives can still see

@@ -3,7 +3,6 @@
 //! Widths are derived only from constructor-validated [`SaeAtomGeometryPlan`]s.
 //! There is intentionally no evaluator reconstruction from realized widths.
 
-
 use super::SaeAtomBasisKind;
 
 /// Default per-axis harmonic order for a torus atom (Φ has `(2H+1)^d`

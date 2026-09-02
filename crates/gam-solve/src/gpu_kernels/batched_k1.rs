@@ -21,7 +21,6 @@
 //! execution path; the CPU reference is therefore the single implementation
 //! until a real batched kernel exists end to end.
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

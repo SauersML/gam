@@ -122,7 +122,6 @@ pub use gam_terms::analytic_penalties::resolve_learnable_weight;
 pub use gam_terms::latent::LatentManifold;
 pub(crate) use gam_terms::latent::{LatentCoordValues, LatentIdMode};
 
-
 pub(crate) use gam_linalg::faer_ndarray::{FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_atb, with_nested_parallel};
 
 pub(crate) use gam_linalg::triangular::cholesky_solve_vector;
@@ -145,7 +144,6 @@ pub(crate) use gam_solve::arrow_schur::{
 };
 
 pub(crate) use gam_solve::estimate::EstimationError;
-
 
 pub(crate) use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, HessianValue, OuterEval};
 pub(crate) use gam_solve::rho_optimizer::{

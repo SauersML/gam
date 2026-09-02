@@ -53,7 +53,6 @@
 //! **untouched** — it is called through its existing public surface with an
 //! adjusted target.
 
-
 use ndarray::{Array2, Array3};
 
 use super::block_chart::{BlockChartComposeConfig, BlockChartComposeResult};

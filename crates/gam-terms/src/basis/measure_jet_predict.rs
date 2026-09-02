@@ -72,8 +72,6 @@
 //! fitted Frobenius-normalized precision first (`λ_phys = λ_tilde / c`). Family
 //! dispersion scaling remains outside this pure spectrum-side kernel.
 
-
-
 #[derive(Clone, Copy)]
 pub enum MeasureJetExtrapolationSpectrum<'a> {
     /// One physical precision per band level.
