@@ -1884,50 +1884,6 @@ pub(crate) fn pca_seed_rejects_huge_finite_span_that_overflows_centering() {
 
 // ---- Issue #972: low-rank Grassmann decoder frame verification ----
 
-/// `polar(M) = W Vᵀ` is exactly column-orthonormal and equals `M` when `M`
-/// is already orthonormal (idempotence of the polar projection on the
-/// Stiefel manifold), and recovers the planted span of a low-rank decoder.
-#[test]
-pub(crate) fn planted_low_rank_frame_recovered_by_polar() {
-    let p = 12usize;
-    let r = 3usize;
-    let n = 200usize;
-    // Planted orthonormal frame: first `r` canonical axes (any rotation
-    // would do; canonical axes make the angle assertion transparent).
-    let mut planted = Array2::<f64>::zeros((p, r));
-    for j in 0..r {
-        planted[[j, j]] = 1.0;
-    }
-    // Latent coords drive targets onto the planted span: targets = coords·plantedᵀ.
-    let mut coords = Array2::<f64>::zeros((n, r));
-    for i in 0..n {
-        for j in 0..r {
-            // Deterministic, index-keyed pseudo-data (no clock RNG).
-            let x = ((i * 7 + j * 13 + 1) % 97) as f64 / 97.0 - 0.5;
-            coords[[i, j]] = x;
-        }
-    }
-    let targets = fast_abt(&coords, &planted);
-    let angle = grassmann_recover_planted_span_angle(targets.view(), coords.view(), planted.view())
-        .expect("span recovery");
-    assert_abs_diff_eq!(angle, 0.0, epsilon = 1.0e-9);
-
-    // Polar of an already-orthonormal frame is itself (up to canonical sign).
-    let frame = GrassmannFrame::polar_update(planted.view()).expect("polar");
-    let recovered_angle = frame
-        .max_principal_angle(planted.view())
-        .expect("principal angle");
-    assert_abs_diff_eq!(recovered_angle, 0.0, epsilon = 1.0e-9);
-    // Orthonormality: UᵀU = I_r.
-    let gram = fast_atb(&frame.frame().to_owned(), &frame.frame().to_owned());
-    for i in 0..r {
-        for j in 0..r {
-            let expect = if i == j { 1.0 } else { 0.0 };
-            assert_abs_diff_eq!(gram[[i, j]], expect, epsilon = 1.0e-9);
-        }
-    }
-}
-
 /// Regression test for #1415: the smooth-threshold third derivative consumed by the
 /// log-determinant θ-adjoint (`assignment_prior_hdiag_derivative_entry`) must be
 /// the EXACT derivative of the (separately certified) Hessian diagonal

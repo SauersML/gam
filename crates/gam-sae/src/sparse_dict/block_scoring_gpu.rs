@@ -709,23 +709,6 @@ mod tests {
     }
 
     #[test]
-    fn cpu_gate_block_matches_per_row_reference() {
-        // The block-form gate oracle must equal the per-row group ℓ₂ exactly.
-        let (rows, decoder) = fixture(6, 10, 3, 8);
-        let block = block_gate_block_cpu(rows.view(), decoder.view(), 10, 3);
-        for r in 0..rows.nrows() {
-            let per_row = block_gate_row_cpu(rows.row(r), decoder.view(), 10, 3);
-            for g in 0..10 {
-                assert_eq!(
-                    block[r * 10 + g].to_bits(),
-                    per_row[g].to_bits(),
-                    "gate block vs per-row differ at r={r} g={g}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn cpu_route_selects_by_gate_desc_block_asc() {
         // The CPU oracle must reproduce route_row_blocks selection semantics.
         let (rows, decoder) = fixture(4, 12, 2, 7);

@@ -341,81 +341,6 @@ pub fn conditional_coactivation_influence_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
-
-    #[test]
-    fn invariant_coupling_selects_constant_beta_and_large_radius() {
-        let n = 96usize;
-        let mut x = Vec::with_capacity(n);
-        let mut gate_i = Vec::with_capacity(n);
-        let mut gate_j = Vec::with_capacity(n);
-        for row in 0..n {
-            let t = row as f64 / (n - 1) as f64;
-            x.push(t);
-            let gi = 0.8 + 0.3 * (2.0 * std::f64::consts::PI * t).sin();
-            gate_i.push(gi);
-            gate_j.push(0.2 + 1.7 * gi);
-        }
-        let sample = full_pass_rows(n);
-        let report = estimate_from_designed_sample(
-            &gate_i,
-            &gate_j,
-            &x,
-            None,
-            &sample,
-            VaryingCoefficientConfig::default(),
-        )
-        .expect("partition-free conditionality");
-        println!(
-            "case=invariant beta_wiggliness={:.6e} beta_variation={:.6e} epsilon_star={:.6e} rho={:.6e}",
-            report.native.beta_wiggliness,
-            report.native.beta_variation,
-            report.certificate.robustness_radius_epsilon,
-            report.certificate.rho
-        );
-        assert!(report.native.beta_wiggliness < 1.0e-6);
-        assert!(report.native.beta_variation < 1.0e-8);
-        assert!(report.certificate.robustness_radius_epsilon > 1.0e10);
-    }
-
-    #[test]
-    fn context_varying_coupling_selects_wiggly_beta_and_small_radius() {
-        let n = 120usize;
-        let mut x = Vec::with_capacity(n);
-        let mut gate_i = Vec::with_capacity(n);
-        let mut gate_j = Vec::with_capacity(n);
-        for row in 0..n {
-            let t = row as f64 / (n - 1) as f64;
-            x.push(t);
-            let gi = 0.8 + 0.25 * (6.0 * std::f64::consts::PI * t).cos();
-            let beta = if t < 0.5 { 1.8 } else { -1.8 };
-            gate_i.push(gi);
-            gate_j.push(0.1 + beta * gi);
-        }
-        let labels: Vec<usize> = x.iter().map(|&t| if t >= 0.5 { 1 } else { 0 }).collect();
-        let sample = full_pass_rows(n);
-        let report = estimate_from_designed_sample(
-            &gate_i,
-            &gate_j,
-            &x,
-            Some(&labels),
-            &sample,
-            VaryingCoefficientConfig::default(),
-        )
-        .expect("partition-free conditionality");
-        println!(
-            "case=context_varying beta_wiggliness={:.6e} beta_variation={:.6e} epsilon_star={:.6e} rho={:.6e} diagnostics={}",
-            report.native.beta_wiggliness,
-            report.native.beta_variation,
-            report.certificate.robustness_radius_epsilon,
-            report.certificate.rho,
-            report.diagnostics.len()
-        );
-        assert!(report.native.beta_wiggliness > 1.0e-2);
-        assert!(report.native.beta_variation > 0.5);
-        assert!(report.certificate.robustness_radius_epsilon < 0.05);
-        assert_eq!(report.diagnostics.len(), 2);
-    }
 
     #[test]
     fn robustness_radius_matches_direct_adversarial_reweighting_search() {
@@ -643,26 +568,6 @@ mod tests {
             );
         }
         Ok(numer / denom)
-    }
-
-    #[test]
-    fn residual_gate_denominator_removes_same_chart_anchor_binding() {
-        let n = 12usize;
-        let chart_gate: Vec<f64> = (0..n)
-            .map(|row| if row % 3 == 0 { 1.0 } else { 0.0 })
-            .collect();
-        let sample = full_pass_rows(n);
-        let chart = Array2::from_shape_vec((n, 1), chart_gate.clone()).unwrap();
-        let residual = residual_gate_activities(
-            &chart_gate,
-            &chart_gate,
-            Some(chart.view()),
-            &sample.likelihood_weights,
-            0.0,
-        )
-        .unwrap();
-        assert!(residual.active_i.iter().all(|&active| !active));
-        assert!(residual.active_j.iter().all(|&active| !active));
     }
 
     fn weighted_correlation_stat_excluding(

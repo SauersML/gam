@@ -43,7 +43,6 @@
 
 use std::collections::BTreeMap;
 
-
 /// Minimal bit-vector. Backing storage is `Vec<u64>` words.
 ///
 /// We expose only the operations the atom-selection layer needs: construction,

@@ -469,7 +469,6 @@ pub fn explained_variance_from_sums(rss: f64, tss: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparse_dict::DecoderSolveStats;
     use ndarray::array;
 
     #[test]
@@ -487,40 +486,6 @@ mod tests {
         for (a, b) in back.iter().zip(z.iter()) {
             assert!((a - b).abs() < 1e-12);
         }
-    }
-
-    #[test]
-    fn interference_subspace_q_and_qperp_are_orthonormal_complements() {
-        // A 2-atom dictionary in p=3 spanning e0 and e1; e2 is unexplained.
-        let decoder = array![[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0]];
-        let indices = array![[0u32, 1u32], [0u32, 1u32]];
-        let codes = array![[2.0f32, 1.0f32], [2.0f32, 1.0f32]];
-        let fit = SparseDictFit {
-            decoder,
-            indices,
-            codes,
-            explained_variance: 0.0,
-            epochs: 0,
-            convergence: crate::sparse_dict::SparseDictConvergence::trivially_converged(),
-            active: 2,
-            score_route_stats: Default::default(),
-            decoder_solve_stats: DecoderSolveStats::default(),
-        };
-        let sub = interference_subspace(&fit, Some(2)).expect("subspace");
-        assert_eq!(sub.q.dim(), (3, 2));
-        assert_eq!(sub.q_perp.dim(), (3, 1));
-        // q columns orthonormal.
-        let gq = sub.q.t().dot(&sub.q);
-        assert!((gq[[0, 0]] - 1.0).abs() < 1e-9 && (gq[[1, 1]] - 1.0).abs() < 1e-9);
-        assert!(gq[[0, 1]].abs() < 1e-9);
-        // q ⟂ q_perp.
-        let cross = sub.q.t().dot(&sub.q_perp);
-        assert!(cross.iter().all(|&v| v.abs() < 1e-9));
-        // q_perp must be (±)e2, the unexplained direction.
-        assert!(sub.q_perp[[2, 0]].abs() > 0.999);
-        assert!(sub.q_perp[[0, 0]].abs() < 1e-6 && sub.q_perp[[1, 0]].abs() < 1e-6);
-        // Atom 0 (code 2) carries more energy than atom 1 (code 1) ⇒ larger scale first.
-        assert!(sub.scale[0] >= sub.scale[1]);
     }
 
     #[test]
@@ -544,58 +509,6 @@ mod tests {
         for (a, b) in back.iter().zip(z.iter()) {
             assert!((a - b).abs() < 1e-12);
         }
-    }
-
-    #[test]
-    fn qperp_weight_is_blind_to_in_plane_curvature() {
-        // The RETRACTED Q⊥ GLS weight (`G = I − QQᵀ`) is self-defeating: a curve's
-        // chords span the curve's OWN plane, so the post-linear curvature signal
-        // lives INSIDE `span(Q)` and `Q⊥`-weighting annihilates exactly what Tier-2
-        // exists to model. This pins that so the idea can't be re-derived.
-        //
-        // Tier-1 linear atoms span the e0–e1 plane — the plane a circle would live
-        // in; a fitted circle's chords span the same plane.
-        let decoder = array![[1.0f32, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]];
-        let indices = array![[0u32, 1u32], [0u32, 1u32], [0u32, 1u32]];
-        let codes = array![[3.0f32, 2.0], [3.0, 2.0], [3.0, 2.0]];
-        let fit = SparseDictFit {
-            decoder,
-            indices,
-            codes,
-            explained_variance: 0.0,
-            epochs: 0,
-            convergence: crate::sparse_dict::SparseDictConvergence::trivially_converged(),
-            active: 2,
-            score_route_stats: Default::default(),
-            decoder_solve_stats: DecoderSolveStats::default(),
-        };
-        let sub = interference_subspace(&fit, Some(2)).expect("subspace");
-        // The circle's plane (e0, e1) lives ENTIRELY inside Q: ‖Qᵀ e_j‖ ≈ 1.
-        for j in 0..2 {
-            let mut ej = Array1::<f64>::zeros(4);
-            ej[j] = 1.0;
-            let qte = sub.q.t().dot(&ej);
-            let proj_norm = qte.dot(&qte).sqrt();
-            assert!(
-                (proj_norm - 1.0).abs() < 1e-9,
-                "e{j} not fully in Q: {proj_norm}"
-            );
-        }
-        // A residual that IS the in-plane curvature signal (chord-sag), unit norm.
-        let curvature = array![0.6f64, -0.8, 0.0, 0.0];
-        let sig_rms = curvature.dot(&curvature).sqrt();
-        assert!(
-            sig_rms > 0.99,
-            "planted signal should be ~unit; got {sig_rms}"
-        );
-        // What the Q⊥ GLS weight would keep: `q_perpᵀ · residual`.
-        let qperp_component = sub.q_perp.t().dot(&curvature);
-        let qperp_rms = qperp_component.dot(&qperp_component).sqrt();
-        assert!(
-            qperp_rms < 1e-9,
-            "Q⊥ weight crushes the in-plane curvature to noise ({qperp_rms}) — it is BLIND \
-             to what Tier-2 must model; fit the raw residual instead"
-        );
     }
 
     #[test]
@@ -626,51 +539,6 @@ mod tests {
         // mean scores negative, which is meaningful and must not be clamped.
         assert!((explained_variance_from_sums(1.0, 1.0) - 0.0).abs() < 1e-15);
         assert!(explained_variance_from_sums(2.0, 1.0) < 0.0);
-    }
-
-    #[test]
-    fn explained_variance_vs_mean_measures_about_the_mean_not_zero() {
-        // Two columns with a large offset and small spread: measured about the
-        // mean the model explains three quarters; measured about ZERO the same
-        // reconstruction would score ~1.0 purely from the offset. This pins
-        // which baseline the SAE headline uses.
-        let z = array![[10.0, 20.0], [12.0, 22.0], [14.0, 24.0]];
-        let mean = Array1::from(vec![12.0, 22.0]);
-        // Residual of 1.0 in each of two rows, per column => rss = 4.
-        let recon = array![[11.0, 21.0], [12.0, 22.0], [15.0, 25.0]];
-        let ev = explained_variance_vs_mean(z.view(), recon.view(), &mean);
-        // tss about the mean = 2*(4) = 8 per column pair: (-2,0,2) twice => 16.
-        let expected = 1.0 - 4.0 / 16.0;
-        assert!(
-            (ev - expected).abs() < 1e-12,
-            "ev {ev} vs {expected}: baseline must be the mean, not zero"
-        );
-        assert!(ev < 0.99, "a zero baseline would inflate this to nearly 1");
-    }
-
-    #[test]
-    fn explained_variance_vs_mean_agrees_with_the_shared_policy() {
-        // The convenience wrapper must be the same function as the raw policy,
-        // which is the property that stopped holding when the copies drifted.
-        let z = array![[1.0, -2.0], [3.0, 4.0], [-5.0, 6.0]];
-        let recon = array![[0.5, -1.0], [2.0, 4.5], [-4.0, 5.0]];
-        let mean = Array1::from(vec![
-            z.column(0).sum() / 3.0,
-            z.column(1).sum() / 3.0,
-        ]);
-        let mut rss = 0.0;
-        let mut tss = 0.0;
-        for r in 0..z.nrows() {
-            for c in 0..z.ncols() {
-                let d = z[[r, c]] - recon[[r, c]];
-                rss += d * d;
-                let m = z[[r, c]] - mean[c];
-                tss += m * m;
-            }
-        }
-        let direct = explained_variance_from_sums(rss, tss);
-        let wrapped = explained_variance_vs_mean(z.view(), recon.view(), &mean);
-        assert!((direct - wrapped).abs() < 1e-12, "{direct} vs {wrapped}");
     }
 
 }

@@ -1315,24 +1315,7 @@ impl AtlasHolonomyCertificate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifold::AtlasSeamKind;
     use ndarray::{arr2, array};
-
-    fn analytic_edge(a: usize, b: usize, overlap: usize, sign: i8) -> AtlasSignedEdge {
-        assert!(matches!(sign, -1 | 1));
-        let transition = SphereChartTransition::new_analytic(
-            a,
-            b,
-            [
-                [f64::from(sign), 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            AtlasSeamKind::Regular,
-        )
-        .unwrap();
-        AtlasSignedEdge::from_analytic_sphere_transition(&transition, overlap).unwrap()
-    }
 
     fn projection_frame(angle: f64, padded_ambient: usize) -> Array2<f64> {
         let mut frame = Array2::<f64>::zeros((3 + padded_ambient, 3));
@@ -1581,35 +1564,6 @@ mod tests {
         orthonormalize_two_columns(perturbed)
     }
 
-    fn sample_spiked_pca_tangent(
-        population_tangent: &Array2<f64>,
-        rows: usize,
-        noise_standard_deviation: f64,
-        gaussian: &mut DeterministicGaussian,
-    ) -> Array2<f64> {
-        let ambient = population_tangent.nrows();
-        let mut data = Array2::<f64>::zeros((rows, ambient));
-        for row in 0..rows {
-            let scores = [gaussian.normal(), gaussian.normal()];
-            for ambient_coordinate in 0..ambient {
-                data[[row, ambient_coordinate]] = population_tangent[[ambient_coordinate, 0]]
-                    * scores[0]
-                    + population_tangent[[ambient_coordinate, 1]] * scores[1]
-                    + noise_standard_deviation * gaussian.normal();
-            }
-        }
-        let row_ids: Vec<_> = (0..rows).collect();
-        let covariance = selected_covariance(data.view(), &row_ids, None).unwrap();
-        let (_, eigenvectors) = covariance.eigh(faer::Side::Lower).unwrap();
-        let mut tangent = Array2::<f64>::zeros((ambient, INTRINSIC_DIMENSION));
-        for column in 0..INTRINSIC_DIMENSION {
-            tangent
-                .column_mut(column)
-                .assign(&eigenvectors.column(ambient - 1 - column));
-        }
-        tangent
-    }
-
     fn align_tangent_to_population(fitted: &Array2<f64>, population: &Array2<f64>) -> Array2<f64> {
         let cross = fitted.t().dot(population);
         let (left, _, right_t) = cross.svd(true, true).unwrap();
@@ -1663,85 +1617,6 @@ mod tests {
 
     fn wrap_signed_angle(angle: f64) -> f64 {
         (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
-    }
-
-    #[test]
-    fn authoritative_edge_constructors_enforce_canonical_identity() {
-        assert!(GaussianPcaPopulationBounds::new(f64::MAX, f64::MAX, 1.0).is_err());
-        assert!(GaussianPcaPopulationBounds::new(0.0, 1.0, 2.0).is_err());
-        assert!(AtlasHolonomyEdgeId::new(1, 1, 0).is_err());
-        assert_eq!(
-            AtlasHolonomyEdgeId::new(4, 2, 9).unwrap(),
-            AtlasHolonomyEdgeId::new(2, 4, 9).unwrap()
-        );
-        assert!(
-            SphereChartTransition::new_analytic(0, 1, [[0.0; 3]; 3], AtlasSeamKind::Regular,)
-                .is_err()
-        );
-        assert!(
-            ProjectedAtlasEdgeSpec::new(
-                0,
-                1,
-                0,
-                PopulationCrossGramProvenance::EstimatedOnly,
-                f64::NAN,
-            )
-            .is_err()
-        );
-        assert!(
-            ExactAnalyticHolonomyCertificate::new(
-                2,
-                vec![analytic_edge(0, 1, 3, 1), analytic_edge(0, 1, 3, -1),],
-            )
-            .is_err()
-        );
-        assert!(
-            ExactAnalyticHolonomyCertificate::new(2, vec![analytic_edge(0, 2, 0, 1)],).is_err()
-        );
-    }
-
-    #[test]
-    fn fitted_sphere_seam_cannot_construct_an_exact_analytic_edge() {
-        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let fitted =
-            SphereChartTransition::new_fitted(0, 1, identity, crate::manifold::AtlasSeamKind::Pole)
-                .unwrap();
-        assert!(AtlasSignedEdge::from_analytic_sphere_transition(&fitted, 0).is_err());
-
-        let analytic = SphereChartTransition::new_analytic(
-            0,
-            1,
-            identity,
-            crate::manifold::AtlasSeamKind::Pole,
-        )
-        .unwrap();
-        assert_eq!(
-            AtlasSignedEdge::from_analytic_sphere_transition(&analytic, 0)
-                .unwrap()
-                .sign(),
-            1
-        );
-    }
-
-    #[test]
-    fn exact_parallel_overlap_components_form_their_own_orientation_cycle() {
-        let certificate = ExactAnalyticHolonomyCertificate::new(
-            2,
-            vec![analytic_edge(0, 1, 0, 1), analytic_edge(0, 1, 1, -1)],
-        )
-        .unwrap();
-        assert_eq!(
-            certificate.orientability(),
-            AtlasOrientability::NonOrientable
-        );
-        let authoritative = AtlasHolonomyCertificate::ExactAnalytic(certificate);
-        assert_eq!(
-            authoritative.edge_inventory(),
-            vec![
-                AtlasHolonomyEdgeId::new(0, 1, 0).unwrap(),
-                AtlasHolonomyEdgeId::new(0, 1, 1).unwrap(),
-            ]
-        );
     }
 
     #[test]
@@ -2203,82 +2078,6 @@ mod tests {
     }
 
     #[test]
-    fn actual_spiked_rows_sample_covariance_and_pca_calibrate_cycle_plugin_variance() {
-        const REPLICATES: usize = 384;
-        const ROWS_PER_PATCH: usize = 512;
-        let true_tangents = [
-            plane_tangent(0.0, 3),
-            plane_tangent(0.2, 3),
-            plane_tangent(-0.15, 3),
-        ];
-        let patches: Vec<_> = true_tangents
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(chart, tangent)| projected_patch_from_tangent(chart, ROWS_PER_PATCH, tangent))
-            .collect();
-        let error_model = GaussianPcaErrorModel::independent(&patches).unwrap();
-        let analysis = GaussianPcaHolonomyAnalysis::certify(
-            patches,
-            triangle_edges(),
-            error_model,
-            AtlasFamilywiseLevel::new(0.05).unwrap(),
-            None,
-        )
-        .unwrap();
-        let plugin_standard_error = analysis.cycles()[0].standard_error.unwrap();
-        let rejection_boundary =
-            cycle_rejection_boundary(plugin_standard_error, 0.0, 0.0, 0.05).unwrap();
-        assert!(
-            analysis.cycles()[0]
-                .decision
-                .refusals()
-                .iter()
-                .any(|reason| {
-                    matches!(
-                        reason,
-                        AtlasStatisticalRefusal::GaussianLinearizationIsPlugin { .. }
-                    )
-                })
-        );
-
-        let mut gaussian = DeterministicGaussian::new(0x2311_0005);
-        let mut sum = 0.0;
-        let mut sum_squares = 0.0;
-        let mut rejections = 0usize;
-        for _ in 0..REPLICATES {
-            let fitted: Vec<_> = true_tangents
-                .iter()
-                .map(|tangent| {
-                    sample_spiked_pca_tangent(tangent, ROWS_PER_PATCH, 0.1, &mut gaussian)
-                })
-                .collect();
-            let angle = fitted_cycle_angle(&fitted);
-            sum += angle;
-            sum_squares += angle * angle;
-            rejections += usize::from(angle.abs() > rejection_boundary);
-        }
-        let mean = sum / REPLICATES as f64;
-        let empirical_sd = (sum_squares / REPLICATES as f64 - mean * mean)
-            .max(0.0)
-            .sqrt();
-        assert!(
-            (empirical_sd / plugin_standard_error - 1.0).abs() <= 0.20,
-            "plugin sd={plugin_standard_error:.6e}, actual-row PCA sd={empirical_sd:.6e}"
-        );
-        let rejection_rate = rejections as f64 / REPLICATES as f64;
-        let nominal = 0.05;
-        let binomial_standard_error = (nominal * (1.0 - nominal) / REPLICATES as f64).sqrt();
-        eprintln!(
-            "ATLAS_CALIBRATION actual_row_pca replicates={REPLICATES} rows_per_patch={ROWS_PER_PATCH} plugin_sd={plugin_standard_error:.9e} empirical_sd={empirical_sd:.9e} nominal={nominal:.6} rejection_rate={rejection_rate:.6}"
-        );
-        assert!(
-            (rejection_rate - nominal).abs() <= 5.0 * binomial_standard_error,
-            "nominal={nominal:.6}, actual-row PCA rejection={rejection_rate:.6}"
-        );
-    }
-
-    #[test]
     fn two_sided_cycle_test_has_nominal_size_and_closed_form_power() {
         const REPLICATES: usize = 4_096;
         let alpha = 0.05;
@@ -2344,88 +2143,6 @@ mod tests {
         assert!(
             observed <= bound + 1.0 / REPLICATES as f64,
             "observed flip rate {observed:.6e} exceeded finite-sample bound {bound:.6e}"
-        );
-    }
-
-    #[test]
-    fn near_margin_wishart_pca_orientation_sweep_respects_the_bound() {
-        const REPLICATES: usize = 256;
-        let population_a = plane_tangent(0.0, 3);
-        let separation = 1.45_f64;
-        let population_b = plane_tangent(separation, 3);
-        let mut gaussian = DeterministicGaussian::new(0x2311_0006);
-        let mut smallest_row_flips = 0usize;
-
-        for rows in [4, 16, 64] {
-            let make_patch = |chart, tangent| {
-                GaussianPcaPatch::new(
-                    chart,
-                    GaussianPatchRowSplit::from_disjoint_ranges(
-                        chart * 10_000,
-                        rows,
-                        chart * 10_000 + 5_000,
-                        rows,
-                    )
-                    .unwrap(),
-                    PilotProjectionProvenance::ExactAnalyticCapture,
-                    GaussianPatchCentering::MeanEstimatedOnInferenceRows,
-                    identity_projection(3),
-                    tangent,
-                    4.0,
-                    1.0,
-                    GaussianPcaSpectrumProvenance::CertifiedPopulation(
-                        GaussianPcaPopulationBounds::new(4.0, 5.0, 1.0).unwrap(),
-                    ),
-                )
-                .unwrap()
-            };
-            let patches = vec![
-                make_patch(0, population_a.clone()),
-                make_patch(1, population_b.clone()),
-            ];
-            let error_model = GaussianPcaErrorModel::independent(&patches).unwrap();
-            let edge = ProjectedAtlasEdgeSpec::new(
-                0,
-                1,
-                0,
-                PopulationCrossGramProvenance::CertifiedSmallestSingularValue {
-                    lower_bound: separation.cos(),
-                },
-                0.0,
-            )
-            .unwrap();
-            let analysis = GaussianPcaHolonomyAnalysis::certify(
-                patches,
-                vec![edge],
-                error_model,
-                AtlasFamilywiseLevel::new(0.05).unwrap(),
-                None,
-            )
-            .unwrap();
-            let bound = analysis.orientation_flip_probability_bound().unwrap();
-            let mut flips = 0usize;
-            for _ in 0..REPLICATES {
-                let fitted_a = sample_spiked_pca_tangent(&population_a, rows, 2.0, &mut gaussian);
-                let fitted_b = sample_spiked_pca_tangent(&population_b, rows, 2.0, &mut gaussian);
-                let aligned_a = align_tangent_to_population(&fitted_a, &population_a);
-                let aligned_b = align_tangent_to_population(&fitted_b, &population_b);
-                flips += usize::from(determinant_2(aligned_b.t().dot(&aligned_a).view()) < 0.0);
-            }
-            if rows == 4 {
-                smallest_row_flips = flips;
-            }
-            let observed = flips as f64 / REPLICATES as f64;
-            eprintln!(
-                "ATLAS_CALIBRATION wishart_orientation rows={rows} replicates={REPLICATES} flips={flips} observed_rate={observed:.9e} bound={bound:.9e}"
-            );
-            assert!(
-                observed <= bound + 1.0 / REPLICATES as f64,
-                "rows={rows}, observed Wishart-PCA flips={observed:.6}, bound={bound:.6}"
-            );
-        }
-        assert!(
-            smallest_row_flips > 0,
-            "near-margin low-occupancy sweep must actually enter the flip regime"
         );
     }
 

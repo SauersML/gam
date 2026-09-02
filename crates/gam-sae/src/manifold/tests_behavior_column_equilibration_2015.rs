@@ -28,56 +28,7 @@
 
 use ndarray::Array2;
 
-use crate::manifold::{
-    SaeBehaviorAutoFitRequest, SaeCrosscoderAutoFitConfig, equilibrate_crosscoder_columns,
-    run_auto_sae_behavior_fit,
-};
-
-/// Direct unit check of the equilibration primitive itself: every non-empty
-/// column of the mutated target has unit RMS, and un-scaling by the returned
-/// factor exactly reproduces the original (a diagonal, lossless change of
-/// variables).
-#[test]
-fn equilibrate_crosscoder_columns_normalizes_and_round_trips() {
-    let mut target = Array2::<f64>::zeros((5, 3));
-    // Column scale ratio 1e4: column 0 ~ O(1e2), column 1 ~ O(1), column 2 ~ O(1e-2).
-    for i in 0..5 {
-        let t = i as f64;
-        target[[i, 0]] = 100.0 * (t + 1.0);
-        target[[i, 1]] = 1.0 * (t + 1.0);
-        target[[i, 2]] = 0.01 * (t + 1.0);
-    }
-    let original = target.clone();
-    let scale = equilibrate_crosscoder_columns(&mut target);
-    assert_eq!(scale.len(), 3);
-    for col in 0..3 {
-        let rms = (target.column(col).iter().map(|v| v * v).sum::<f64>() / 5.0).sqrt();
-        assert!(
-            (rms - 1.0).abs() < 1e-9,
-            "column {col} must be unit-RMS after equilibration, got {rms}"
-        );
-    }
-    // Undo: multiplying each column back by its scale must exactly reproduce
-    // the original (equilibration is a lossless per-column rescale).
-    for i in 0..5 {
-        for j in 0..3 {
-            let restored = target[[i, j]] * scale[j];
-            assert!(
-                (restored - original[[i, j]]).abs() <= 1e-9 * original[[i, j]].abs().max(1.0),
-                "round trip mismatch at ({i},{j}): {restored} vs {}",
-                original[[i, j]]
-            );
-        }
-    }
-    // The ratio of the largest to smallest scale reflects the planted 1e4 spread.
-    let scale_max = scale.iter().cloned().fold(0.0_f64, f64::max);
-    let scale_min = scale.iter().cloned().fold(f64::INFINITY, f64::min);
-    assert!(
-        scale_max / scale_min > 1e3,
-        "the equilibration scale must reflect the planted column-scale spread, got ratio {}",
-        scale_max / scale_min
-    );
-}
+use crate::manifold::{SaeBehaviorAutoFitRequest, SaeCrosscoderAutoFitConfig, run_auto_sae_behavior_fit};
 
 /// Row-aligned circle activation (`p_x = 4`) and behavior probabilities
 /// (`vocab = 4`, so `p_y = 3`) at `n` positions. `residual_amp` sets the

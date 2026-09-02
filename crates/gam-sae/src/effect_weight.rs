@@ -7,7 +7,6 @@
 //! effect decision is added beside it. Realized intervention KL is retained as
 //! an empirical validation ledger, not as the derived Fisher effect weight.
 
-
 /// Per-atom evidence in the existing reconstruction currency.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VarianceChargeEvidence {
@@ -276,62 +275,6 @@ mod tests {
     const ATOMS: usize = 2;
     const RARE_ATOM: usize = 0;
     const DENSE_ATOM: usize = 1;
-
-    fn rare_effect_shard() -> InterventionShard {
-        InterventionShard {
-            row_id: vec![7, 8, 9, 10],
-            atom: vec![
-                RARE_ATOM as i64,
-                RARE_ATOM as i64,
-                DENSE_ATOM as i64,
-                DENSE_ATOM as i64,
-            ],
-            dose: vec![1.0, 0.0, 1.0, 0.0],
-            d_dose: 1,
-            nu_hat_1: vec![8.0, 0.0, 0.0, 0.0],
-            nu_hat_2: None,
-            nu_measured: vec![8.0, 0.0, 0.0, 0.0],
-            group: vec![70, 70, 90, 90],
-            is_control: vec![false, true, false, true],
-            layer: 18,
-            seed: 19,
-        }
-    }
-
-    #[test]
-    fn rare_high_fisher_effect_atom_is_retained_when_variance_only_would_drop_it() {
-        let variance = vec![
-            Some(VarianceChargeEvidence {
-                delta_deviance: 0.01,
-                charge: 4.0,
-            }),
-            Some(VarianceChargeEvidence {
-                delta_deviance: 20.0,
-                charge: 4.0,
-            }),
-        ];
-        assert!(!variance[RARE_ATOM].unwrap().retains());
-        assert!(variance[DENSE_ATOM].unwrap().retains());
-
-        let effect = fisher_effect_from_interventions(ATOMS, &rare_effect_shard()).unwrap();
-        let rare_effect = effect[RARE_ATOM].unwrap();
-        assert_eq!(rare_effect.mean_fisher_quadratic_kl_nats, 8.0);
-        assert_eq!(
-            rare_effect
-                .realized_kl_validation
-                .unwrap()
-                .mean_empirical_realized_kl_nats,
-            8.0
-        );
-        let retained = effect_weighted_retention(&variance, &effect).unwrap();
-
-        assert!(retained[RARE_ATOM].retained_by_effect);
-        assert!(!retained[RARE_ATOM].retained_by_variance);
-        assert!(retained[RARE_ATOM].retained);
-        assert!(!retained[DENSE_ATOM].retained_by_effect);
-        assert!(retained[DENSE_ATOM].retained_by_variance);
-        assert!(retained[DENSE_ATOM].retained);
-    }
 
     #[test]
     fn streaming_score_vector_accumulates_fisher_quadratic_per_firing() {

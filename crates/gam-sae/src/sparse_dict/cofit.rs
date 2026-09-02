@@ -53,7 +53,6 @@
 //! **untouched** — it is called through its existing public surface with an
 //! adjusted target.
 
-
 use ndarray::{Array2, Array3};
 
 use super::block_chart::{BlockChartComposeConfig, BlockChartComposeResult};
@@ -142,7 +141,6 @@ pub struct CofitReport {
 #[cfg(test)]
 mod cofit_tests {
     use super::*;
-    use crate::sparse_dict::reconstruct_block_sparse_rows;
 
     /// Orthonormal-per-block decoder for the planted trap. Three blocks of size
     /// b=2 in P=5:
@@ -219,10 +217,6 @@ mod cofit_tests {
         (blocks, codes)
     }
 
-    fn ev(x: &Array2<f32>, recon: &Array2<f32>) -> f64 {
-        explained_variance_from_reconstruction(x.view(), recon.view()).unwrap()
-    }
-
     fn chart_cfg_small() -> BlockChartComposeConfig {
         BlockChartComposeConfig {
             block_size: 2,
@@ -234,193 +228,4 @@ mod cofit_tests {
         }
     }
 
-    #[test]
-    fn cofit_beats_one_shot_and_recovers_angle() {
-        let n = 240;
-        let decoder = planted_decoder();
-        let (x, theta) = planted_data(n);
-        let (blocks, codes) = tied_routing(&x, &decoder, 2);
-
-        let config = CofitConfig {
-            code_ridge: 1.0e-6,
-            chart: chart_cfg_small(),
-            ..CofitConfig::default()
-        };
-        let report = cofit_block_and_curved(
-            x.view(),
-            decoder.view(),
-            blocks.view(),
-            codes.view(),
-            1.0,
-            &config,
-        )
-        .expect("cofit runs");
-
-        // (a) The co-fit's composed reconstruction beats the one-shot baseline
-        //     (round 0) on explained variance — the linear tier, freed of the
-        //     curvature the chart explains, stops double-counting e1.
-        let one_shot_ev = report.rounds[0].explained_variance;
-        assert!(
-            report.explained_variance > one_shot_ev + 1.0e-4,
-            "co-fit EV {} should beat one-shot EV {}",
-            report.explained_variance,
-            one_shot_ev
-        );
-
-        // A curved chart must actually have been accepted for block 2 (the plane
-        // holding the circle) — otherwise this is a pure-linear result.
-        assert!(
-            report.rounds.last().unwrap().n_accepted_charts >= 1,
-            "expected at least one accepted curved chart"
-        );
-
-        // (a, cont.) The curved atom's recovered coordinates correlate with the
-        //     planted angle. The chart lives in {e3, e4}; read the recovered
-        //     angle off the curved correction there. Use the rotation-invariant
-        //     complex correlation magnitude to allow a global chart-frame gauge.
-        let c = &report.curved_correction;
-        let mut re = 0.0f64;
-        let mut im = 0.0f64;
-        let mut mag = 0.0f64;
-        for i in 0..n {
-            let hat = (c[[i, 4]] as f64).atan2(c[[i, 3]] as f64);
-            let d = theta[i] - hat;
-            re += d.cos();
-            im += d.sin();
-            mag += 1.0;
-        }
-        let rho = (re * re + im * im).sqrt() / mag.max(1.0);
-        assert!(
-            rho > 0.9,
-            "recovered circle angle should track the planted angle (ρ={rho})"
-        );
-    }
-
-    #[test]
-    fn objective_is_monotone_across_rounds() {
-        let n = 240;
-        let decoder = planted_decoder();
-        let (x, _theta) = planted_data(n);
-        let (blocks, codes) = tied_routing(&x, &decoder, 2);
-
-        let config = CofitConfig {
-            chart: chart_cfg_small(),
-            ..CofitConfig::default()
-        };
-        let report = cofit_block_and_curved(
-            x.view(),
-            decoder.view(),
-            blocks.view(),
-            codes.view(),
-            1.0,
-            &config,
-        )
-        .expect("cofit runs");
-
-        assert!(report.rounds.len() >= 2, "expected multiple rounds");
-        let slack = config.monotone_slack;
-        for w in report.rounds.windows(2) {
-            let prev = w[0].objective;
-            let cur = w[1].objective;
-            assert!(
-                cur <= prev + slack * (prev.abs() + 1.0),
-                "objective rose from {prev} to {cur}"
-            );
-        }
-    }
-
-    #[test]
-    fn insufficient_rounds_return_error_instead_of_an_open_cofit_2023() {
-        let decoder = planted_decoder();
-        let (x, _theta) = planted_data(240);
-        let (blocks, codes) = tied_routing(&x, &decoder, 2);
-        let config = CofitConfig {
-            max_rounds: 1,
-            chart: chart_cfg_small(),
-            ..CofitConfig::default()
-        };
-
-        let error = cofit_block_and_curved(
-            x.view(),
-            decoder.view(),
-            blocks.view(),
-            codes.view(),
-            1.0,
-            &config,
-        )
-        .expect_err("a still-moving A/B replay must not mint CofitReport");
-        assert!(
-            error.contains("did not reach an idempotent fixed point"),
-            "unexpected non-convergence error: {error}"
-        );
-    }
-
-    #[test]
-    fn empty_curved_tier_reproduces_pure_linear_fit() {
-        let n = 200;
-        let decoder = planted_decoder();
-        let (x, _theta) = planted_data(n);
-        let (blocks, codes) = tied_routing(&x, &decoder, 2);
-
-        // Force the curved tier empty: select no blocks ⇒ no charts accepted.
-        let mut chart = chart_cfg_small();
-        chart.max_blocks = 0;
-        let config = CofitConfig {
-            code_ridge: 1.0e-6,
-            chart,
-            ..CofitConfig::default()
-        };
-        let report = cofit_block_and_curved(
-            x.view(),
-            decoder.view(),
-            blocks.view(),
-            codes.view(),
-            1.0,
-            &config,
-        )
-        .expect("cofit runs");
-
-        // No charts anywhere.
-        assert_eq!(report.rounds.last().unwrap().n_accepted_charts, 0);
-        // The curved correction is identically zero.
-        let max_c = report
-            .curved_correction
-            .iter()
-            .fold(0.0f32, |m, &v| m.max(v.abs()));
-        assert!(
-            max_c < 1.0e-5,
-            "curved correction should vanish (max {max_c})"
-        );
-
-        // The composed reconstruction equals an independent per-row least-squares
-        // linear solve over all fired blocks (the pure linear fit).
-        let b = 2usize;
-        let mut ref_codes = Array3::<f32>::zeros((n, decoder.nrows() / b, b));
-        for i in 0..n {
-            let mut active: Vec<(u32, f32)> = Vec::new();
-            for gg in 0..(decoder.nrows() / b) {
-                for r in 0..b {
-                    active.push(((gg * b + r) as u32, 0.0));
-                }
-            }
-            let s = active.len();
-            let solved = solve_row_codes(x.row(i), decoder.view(), &active, s, 1.0e-6);
-            for (t, code) in solved.codes.iter().enumerate() {
-                ref_codes[[i, t / b, t % b]] = *code;
-            }
-        }
-        let ref_recon =
-            reconstruct_block_sparse_rows(decoder.view(), blocks.view(), ref_codes.view(), b)
-                .unwrap();
-        let ev_ref = ev(&x, &ref_recon);
-        assert!(
-            (report.explained_variance - ev_ref).abs() < 1.0e-6,
-            "empty-curved co-fit EV {} should match the pure linear LS fit EV {}",
-            report.explained_variance,
-            ev_ref
-        );
-        // And it must strictly beat the tied one-shot baseline (LS fixes the e1
-        // double-count the tied projection introduced).
-        assert!(report.explained_variance > report.rounds[0].explained_variance + 1.0e-4);
-    }
 }

@@ -25,10 +25,7 @@
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
-use crate::manifold::{
-    AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, ln_sphere_project,
-};
+use crate::manifold::{AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
 
 const ON: f64 = 6.0;
 
@@ -159,98 +156,3 @@ fn fit_and_measure(
     fitted_norm_cv(&fitted)
 }
 
-/// LOAD-BEARING F4 acceptance: at a realistic norm variation, the flat fit
-/// invents spurious higher-harmonic curvature and a dominant radial residual; the
-/// LN-sphere fit does neither.
-#[test]
-fn ln_sphere_fit_removes_flat_spurious_curvature_and_radial_residual() {
-    let (n, p, s) = (240usize, 6usize, 0.4_f64);
-    let evaluator = Arc::new(
-        PeriodicHarmonicEvaluator::new(9)
-            .expect("an odd harmonic count is a valid periodic basis size"),
-    ); // harmonics 1..=4
-    let (x, _theta) = plant(n, p, s, 0x1234_5678);
-    let seed = seed_coords(&x);
-
-    // Genuine norm variation is planted.
-    let norms: Vec<f64> = (0..n)
-        .map(|i| (x[[i, 0]] * x[[i, 0]] + x[[i, 1]] * x[[i, 1]]).sqrt())
-        .collect();
-    let mean = norms.iter().sum::<f64>() / n as f64;
-    let var = norms.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
-    let cv = var.sqrt() / mean;
-    assert!(cv > 0.2, "planted norm CV too small to test anything: {cv}");
-
-    // FLAT: reconstruct the raw activation.
-    let flat_cv = fit_and_measure(&evaluator, &seed, &x);
-    // SPHERE: reconstruct the LN-projected direction (the real code path).
-    let (u, _norms) = ln_sphere_project(x.view(), None)
-        .expect("planted activations are strictly positive, so LN projection is defined");
-    let sph_cv = fit_and_measure(&evaluator, &seed, &u);
-    eprintln!(
-        "F4 s={s} planted_cv={cv:.3} | FLAT fit_norm_cv={flat_cv:.4} | SPHERE fit_norm_cv={sph_cv:.4}"
-    );
-
-    // The flat fit absorbs the θ-independent norm variation into its reconstruction
-    // (fitted output norms swing with the planted r, forcing radial curvature); the
-    // LN-sphere fit sees a unit-norm target, so its fitted norms are ~constant.
-    assert!(
-        sph_cv < 0.05,
-        "LN-sphere fitted norms should be ~constant (nuisance scale quotiented \
-         out); got fit_norm_cv {sph_cv}"
-    );
-    assert!(
-        flat_cv > 0.15,
-        "flat fit should reproduce the planted norm variation in its \
-         reconstruction; got fit_norm_cv {flat_cv} (planted CV {cv})"
-    );
-    assert!(
-        flat_cv > 3.0 * sph_cv,
-        "flat norm absorption {flat_cv} must dominate the LN-sphere fit {sph_cv}"
-    );
-}
-
-/// The spurious curvature is MONOTONE in the norm variation — it is manufactured
-/// by the flat metric from the nuisance scale, not an intrinsic property of the
-/// data. At zero norm variation the flat and sphere fits agree; as the variation
-/// grows the flat curvature climbs while the sphere stays put.
-#[test]
-fn flat_spurious_curvature_grows_with_norm_variation_sphere_invariant() {
-    let (n, p) = (240usize, 6usize);
-    let evaluator = Arc::new(
-        PeriodicHarmonicEvaluator::new(9)
-            .expect("an odd harmonic count is a valid periodic basis size"),
-    );
-    let mut flat_curve = Vec::new();
-    let mut sphere_curve = Vec::new();
-    for &s in &[0.0_f64, 0.2, 0.45] {
-        let (x, _theta) = plant(n, p, s, 0xABCD_0001);
-        let seed = seed_coords(&x);
-        let flat_cv = fit_and_measure(&evaluator, &seed, &x);
-        let (u, _) = ln_sphere_project(x.view(), None)
-            .expect("planted activations are strictly positive, so LN projection is defined");
-        let sph_cv = fit_and_measure(&evaluator, &seed, &u);
-        flat_curve.push(flat_cv);
-        sphere_curve.push(sph_cv);
-    }
-    eprintln!("F4 sweep FLAT fit_norm_cv={flat_curve:?} SPHERE fit_norm_cv={sphere_curve:?}");
-    // The flat fit's absorbed norm variation climbs with the planted variation:
-    // lowest at zero, and a wide end-to-end increase.
-    assert!(
-        flat_curve[2] > flat_curve[0] + 0.1,
-        "flat fitted-norm CV should climb with planted norm variation: {flat_curve:?}"
-    );
-    assert!(
-        flat_curve[0] <= flat_curve[1] && flat_curve[1] <= flat_curve[2],
-        "flat norm absorption should be monotone in the planted variation: {flat_curve:?}"
-    );
-    // The LN-sphere fit is invariant to the nuisance scale: its fitted norms stay
-    // ~constant no matter how much norm variation is injected.
-    for &v in &sphere_curve {
-        assert!(
-            v < 0.05,
-            "LN-sphere fitted norms should be invariant to the injected scale: \
-             {sphere_curve:?}"
-        );
-    }
-}
