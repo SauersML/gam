@@ -100,9 +100,6 @@ pub enum TopologyKind {
     Torus,
 }
 
-impl TopologyKind {
-}
-
 /// One topology candidate together with the evidence ingredients it
 /// produced at its own fitted optimum.
 #[derive(Debug, Clone)]

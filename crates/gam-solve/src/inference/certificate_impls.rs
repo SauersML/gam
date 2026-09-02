@@ -22,6 +22,8 @@ use crate::model_types::OuterCriterionCertificate;
 use crate::row_sampling_measure::CoresetCertificate;
 use crate::structure_search::{CollapseAction, CollapseEvent};
 use gam_problem::topology_certificates::{Certificate, Claim, Evidence, Verdict};
+use crate::row_sampling_measure::CoresetMarginVerdict;
+use crate::logdet_bounds::MarginVerdict;
 
 /// Helper: insert a scalar only when finite, else record it as text "n/a" so the
 /// evidence is explicit about a missing quantity (never a silent 0.0).
@@ -235,6 +237,28 @@ impl Certificate for CollapseEvent {
             CollapseAction::Reseeded => Verdict::Insufficient,
             CollapseAction::Terminal => Verdict::Unavailable,
         }
+    }
+}
+
+/// Map a coreset race outcome (the certificate's own
+/// [`CoresetCertificate::certify_margin`](crate::row_sampling_measure::CoresetCertificate::certify_margin)
+/// rule, evaluated against a consumer's
+/// `decision_margin`) onto the shared [`Verdict`] ladder. This is the
+/// margin-resolved entry point a race consumer uses to obtain a unified verdict
+/// without re-deriving the mapping.
+pub fn coreset_race_verdict(verdict: CoresetMarginVerdict) -> Verdict {
+    match verdict {
+        CoresetMarginVerdict::Certified { .. } => Verdict::Certified,
+        CoresetMarginVerdict::InsufficientMargin { .. } => Verdict::Insufficient,
+    }
+}
+
+/// Verdict for an enclosure resolved against a concrete consumer
+/// `decision_margin`, reusing [`LogdetEnclosure::decide_within_margin`].
+pub fn enclosure_margin_verdict(enclosure: &LogdetEnclosure, decision_margin: f64) -> Verdict {
+    match enclosure.decide_within_margin(decision_margin) {
+        MarginVerdict::Decided { .. } => Verdict::Certified,
+        MarginVerdict::InsufficientMargin { .. } => Verdict::Insufficient,
     }
 }
 

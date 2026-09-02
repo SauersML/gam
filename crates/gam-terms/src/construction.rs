@@ -1874,9 +1874,6 @@ pub struct ReparamInvariant {
     max_balanced_eigenvalue: f64,
 }
 
-impl ReparamInvariant {
-}
-
 /// Precompute the lambda-invariant reparameterization structure from canonical penalties.
 ///
 /// Uses block-local roots directly instead of requiring rank x p global roots.

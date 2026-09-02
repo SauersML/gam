@@ -581,9 +581,6 @@ pub struct Governed<T> {
     value: T,
 }
 
-impl<T> Governed<T> {
-}
-
 impl<T> std::ops::Deref for Governed<T> {
     type Target = T;
 

@@ -58,9 +58,6 @@ pub struct CrossFitConfig {
     pub seed: u64,
 }
 
-impl CrossFitConfig {
-}
-
 /// Deterministic partition of `0..n` into `k` folds by a seeded permutation.
 ///
 /// Uses a splitmix64 hash of `(seed, row)` to assign each row a fold, giving a

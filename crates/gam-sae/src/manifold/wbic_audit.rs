@@ -243,9 +243,6 @@ pub struct AuditRow {
     pub production_delta_fraction: f64,
 }
 
-impl AuditRow {
-}
-
 /// Directly price a WBIC learning-coefficient contribution for ONE scalar
 /// reconstruction direction with per-observation energy `mu` against noise edge
 /// `edge` at effective sample size `n_eff`: `λ̂_k = ½·μ/(μ + e·log n_eff)`

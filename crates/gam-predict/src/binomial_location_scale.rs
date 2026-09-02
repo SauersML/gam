@@ -93,6 +93,24 @@ impl BinomialLocationScalePredictor {
 }
 
 impl BinomialLocationScalePredictor {
+
+    /// Plug-in probability point + (covariance-derived) response-scale SE via
+    /// the threshold/scale/wiggle chain rule. The η SE is reported equal to the
+    /// response SE because the threshold-scale η interval is not meaningful on
+    /// the probability scale and is collapsed onto the point predictor.
+    fn plugin_state_from_covariance(
+        &self,
+        input: &PredictInput,
+    ) -> Result<LinearState, EstimationError> {
+        let with_se = self.predict_with_uncertainty_inner(input)?;
+        Ok(LinearState {
+            eta: with_se.eta,
+            mean: with_se.mean,
+            eta_se: with_se.mean_se.clone(),
+            mean_se: with_se.mean_se,
+            covariance_source: InferenceCovarianceMode::Conditional,
+        })
+    }
     fn response_se_from_backend(
         &self,
         input: &PredictInput,
@@ -416,6 +434,10 @@ impl BinomialLocationScalePredictor {
 }
 
 impl PredictionTransform for BinomialLocationScalePredictor {
+
+    fn point_state(&self, input: &PredictInput) -> Result<LinearState, EstimationError> {
+        self.plugin_state_from_covariance(input)
+    }
 
     fn linear_state(
         &self,

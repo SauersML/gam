@@ -3454,6 +3454,32 @@ mod weighted_chi_square_tests {
 
 /// The SIGNED, multiplicity-carrying form — the generalization the estimated-
 /// scale references need (gam#2672).
+/// Standard normal survival probability `P(Z > x)`.
+///
+/// This is evaluated as `½·erfc(x/√2)`, not as `1 − Φ(x)`. The latter loses
+/// relative accuracy as soon as `Φ(x)` approaches one and becomes identically
+/// zero for every representable `x` above roughly `8.3`, while the direct
+/// complementary form retains the full representable tail.
+#[inline]
+pub fn normal_sf(x: f64) -> f64 {
+    0.5 * erfc(x / std::f64::consts::SQRT_2)
+}
+
+/// Student-t survival probability `P(T_ν > t)`.
+///
+/// The small tail is always obtained from
+/// [`student_t_two_sided_probability`]. For negative `t`, subtracting its
+/// half-tail from one constructs the large probability, where subtraction is
+/// well conditioned.
+pub fn student_t_sf(t: f64, degrees_of_freedom: f64) -> f64 {
+    let two_sided = student_t_two_sided_probability(t, degrees_of_freedom);
+    if t < 0.0 {
+        1.0 - 0.5 * two_sided
+    } else {
+        0.5 * two_sided
+    }
+}
+
 #[cfg(test)]
 mod signed_weighted_chi_square_tests {
     use super::*;

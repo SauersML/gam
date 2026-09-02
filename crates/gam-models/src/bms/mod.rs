@@ -91,9 +91,6 @@ impl Default for DeviationBlockConfig {
     }
 }
 
-impl DeviationBlockConfig {
-}
-
 impl From<WigglePenaltyConfig> for DeviationBlockConfig {
     fn from(cfg: WigglePenaltyConfig) -> Self {
         let penalty_order = *cfg.penalty_orders.iter().max().unwrap_or(&2);

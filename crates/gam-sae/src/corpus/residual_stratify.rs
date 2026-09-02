@@ -215,9 +215,19 @@ pub struct RowStratum {
     pub std_energy: f64,
 }
 
+/// Biased base-2 exponent bin for a non-negative energy. Zero / subnormal /
+/// non-finite / negative energies fall in bin `0` (the low-energy floor).
+#[inline]
+fn energy_exponent_bin(energy: f64) -> usize {
+    if !energy.is_finite() || energy <= 0.0 {
+        return 0;
+    }
+    ((energy.to_bits() >> 52) & 0x7ff) as usize
+}
+
 /// Stratify a set of per-row residual energies into factor-of-two energy bands,
 /// returning the row-index groups ASCENDING in energy. Reuses the same IEEE-754
-/// binary-exponent bins (`EnergyExponentHistogram::bin_of`) and Sturges cap
+/// binary-exponent bins (`energy_exponent_bin`) and Sturges cap
 /// (`sturges_stratum_cap`) as the streaming design; adjacent lowest-energy bands
 /// are merged to the cap so the high-energy tail (where rare discoverable structure
 /// concentrates) keeps its resolution. Empty / non-finite / negative energies fall
@@ -237,7 +247,7 @@ pub fn stratify_row_energies(energies: &[f64]) -> Vec<RowStratum> {
         std::collections::BTreeMap::new();
     for (i, &e) in energies.iter().enumerate() {
         bin_rows
-            .entry(EnergyExponentHistogram::bin_of(e))
+            .entry(energy_exponent_bin(e))
             .or_default()
             .push(i);
     }
@@ -620,43 +630,5 @@ mod tests {
         assert_eq!(sturges_stratum_cap(255), 8);
         assert_eq!(sturges_stratum_cap(256), 9);
         assert_eq!(sturges_stratum_cap(100_000_000), 27);
-    }
-}
-
-/// Binary-exponent histogram bins for residual energies.
-struct EnergyExponentHistogram;
-
-impl EnergyExponentHistogram {
-    fn new() -> Self {
-        Self {
-            count: vec![0; N_EXPONENT_BINS],
-            sum: vec![0.0; N_EXPONENT_BINS],
-            sumsq: vec![0.0; N_EXPONENT_BINS],
-            total_rows: 0,
-        }
-    }
-
-    /// Biased base-2 exponent bin for a non-negative energy. Zero / subnormal /
-    /// non-finite / negative energies fall in bin `0` (the low-energy floor).
-    #[inline]
-    fn bin_of(energy: f64) -> usize {
-        if !energy.is_finite() || energy <= 0.0 {
-            return 0;
-        }
-        ((energy.to_bits() >> 52) & 0x7ff) as usize
-    }
-
-    #[inline]
-    fn observe(&mut self, energy: f64) {
-        let e = if energy.is_finite() && energy > 0.0 {
-            energy
-        } else {
-            0.0
-        };
-        let bin = Self::bin_of(e);
-        self.count[bin] += 1;
-        self.sum[bin] += e;
-        self.sumsq[bin] += e * e;
-        self.total_rows += 1;
     }
 }

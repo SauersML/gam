@@ -221,9 +221,6 @@ pub struct ChildDecoder {
     pub centered_coeffs: Array1<f64>,
 }
 
-impl ChildDecoder {
-}
-
 /// The lossless-on-the-additive-part split: child atoms inheriting the
 /// main-effect blocks. Gauge choice (documented, fixed): the grand mean
 /// `g₀` rides with child A; child B is centered. The interaction energy

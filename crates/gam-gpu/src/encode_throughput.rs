@@ -152,9 +152,6 @@ pub struct FullEncodeThroughput {
     pub device_encode_engaged: bool,
 }
 
-impl FullEncodeThroughput {
-}
-
 /// Correctness of an encode result, measured against the production CPU encode
 /// (a per-row reference) and the reconstruction it implies.
 ///

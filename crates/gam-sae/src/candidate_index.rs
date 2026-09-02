@@ -513,9 +513,6 @@ pub struct RecallReport {
     pub misses: Vec<RecallMiss>,
 }
 
-impl RecallReport {
-}
-
 /// Result of [`SaeCandidateIndex::proposal_recall_report`] — the two-stage
 /// routing license: how much of the EXACT top-`s` rescore the sublinear proposal
 /// recovered, plus every miss.
@@ -543,9 +540,6 @@ pub struct ProposalRecallReport {
     /// Every miss (true-top-s atom the proposal dropped), with row, atom,
     /// alignment, and reason. No silent drops — the license's honesty contract.
     pub misses: Vec<RecallMiss>,
-}
-
-impl ProposalRecallReport {
 }
 
 // ---------------------------------------------------------------------------

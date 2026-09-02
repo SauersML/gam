@@ -95,9 +95,6 @@ pub struct AffineDesign {
     pub eta_gradient: AffineEtaGradient,
 }
 
-impl AffineDesign {
-}
-
 fn fitted_covariances(fit: &gam_solve::estimate::UnifiedFitResult) -> AffineCovariances {
     AffineCovariances {
         conditional: fit.beta_covariance().cloned(),

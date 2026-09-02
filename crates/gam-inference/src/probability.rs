@@ -1,8 +1,4 @@
 use gam_math::probability::beta_quantile;
-use gam_problem::types::LikelihoodSpec;
-use gam_solve::estimate::EstimationError;
-use gam_solve::mixture_link::inverse_link_jet_for_family_public;
-use ndarray::{Array1, ArrayView1};
 use statrs::function::beta::beta_reg;
 
 /// Standard normal PDF φ(x).  Implementation lives in `gam-math`; re-exported
@@ -18,7 +14,6 @@ pub use gam_math::probability::normal_cdf;
 /// `1.0 - normal_cdf(x)` returns exactly zero for `x` above ~8.3 because Φ
 /// saturates; this keeps full relative accuracy down to the subnormal floor
 /// (#2562). Implementation lives in `gam-math`.
-pub use gam_math::probability::normal_sf;
 
 /// Two-sided standard-normal probability `P(|Z| ≥ |z|)`, evaluated directly
 /// without subtracting a CDF from one.
@@ -26,7 +21,6 @@ pub use gam_math::probability::normal_two_sided_probability;
 
 /// Student-t survival probability `P(T_ν > t)`, evaluated through the direct
 /// regularized-beta tail in `gam-math`.
-pub use gam_math::probability::student_t_sf;
 
 /// Two-sided Student-t probability `P(|T_ν| ≥ |t|)`, evaluated through the
 /// direct regularized-beta tail in `gam-math`.

@@ -140,9 +140,6 @@ pub struct LatentCoordinateStationarityEvidence {
     pub hessian_vector_evaluations: usize,
 }
 
-impl LatentCoordinateStationarityEvidence {
-}
-
 impl fmt::Display for LatentCoordinateStationarityEvidence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(

@@ -2988,9 +2988,6 @@ impl BinomialWiggleSecondDirectionalRows {
 }
 
 impl BinomialLocationScaleWiggleFamily {
-}
-
-impl BinomialLocationScaleWiggleFamily {
     /// Build a matrix-free `RowCoeffOperator` for the BLS Wiggle joint
     /// directional derivative `D_β H_L[u]`. Channels (in order):
     /// X_t, X_ls, B (b0), B' (d0), B'' (dd0). The operator acts on the

@@ -57,11 +57,7 @@ pub(crate) use gam::geometry::simplex::{closure as simplex_closure, simplex_frec
 
 pub(crate) use gam::sample::{NutsConfig, NutsResult};
 
-pub(crate) use gam::data::{
-    ColumnKindTag, DataSchema, EncodedDataset, SchemaColumn, UnseenCategoryPolicy,
-    encode_recordswith_schema, infer_and_encode_column_major,
-};
-
+pub(crate) use gam::data::{ColumnKindTag, DataSchema, EncodedDataset, SchemaColumn, UnseenCategoryPolicy, encode_recordswith_schema, infer_and_encode_column_major};
 
 pub(crate) use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, GroupMetadata, PredictModelClass,

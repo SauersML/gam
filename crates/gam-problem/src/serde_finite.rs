@@ -67,6 +67,29 @@ impl Display for NonFiniteFloat {
 
 impl std::error::Error for NonFiniteFloat {}
 
+/// Walk `value` through `serde`'s data model and fail on the FIRST non-finite
+/// `f32`/`f64` that a serializer would emit, reporting its path.
+///
+/// This is the write-side counterpart of the load-side type error: it converts
+/// "a `null` will silently appear in the output" into a typed refusal at the
+/// point of origin.
+pub fn ensure_serialized_floats_are_finite<T>(value: &T) -> Result<(), NonFiniteFloat>
+where
+    T: Serialize + ?Sized,
+{
+    let mut walker = FloatWalker { path: String::new() };
+    match value.serialize(&mut walker) {
+        Ok(()) => Ok(()),
+        Err(WalkError::NonFinite(found)) => Err(found),
+        // `Custom` can only arise from a `Serialize` impl that itself reports an
+        // error (e.g. a map with an unrepresentable key). Such a value cannot be
+        // serialized to JSON either, so there is no float verdict to give and
+        // the writer downstream will surface the same failure with its own
+        // message. Treat it as "nothing non-finite found here".
+        Err(WalkError::Custom(_)) => Ok(()),
+    }
+}
+
 /// Error channel of the walking serializer.
 #[derive(Debug)]
 enum WalkError {
@@ -97,6 +120,27 @@ struct FloatWalker {
 }
 
 impl FloatWalker {
+    /// Append `.name` (or `name` at the root) and return the previous length so
+    /// the caller can truncate back after descending.
+    fn push_field(&mut self, name: &str) -> usize {
+        let restore = self.path.len();
+        if !self.path.is_empty() {
+            self.path.push('.');
+        }
+        self.path.push_str(name);
+        restore
+    }
+
+    fn push_index(&mut self, index: usize) -> usize {
+        let restore = self.path.len();
+        // `fmt::Write` for `String` never returns `Err`, so this names an
+        // invariant of the sink rather than hiding a failure mode. Do not
+        // "remove the Result" by writing `push_str(&index.to_string())`: that
+        // allocates once per sequence element and breaks this module's
+        // no-allocation-per-scalar promise.
+        write!(self.path, "[{index}]").expect("`String`'s `fmt::Write` impl is infallible");
+        restore
+    }
 
     fn pop_to(&mut self, restore: usize) {
         self.path.truncate(restore);
@@ -120,7 +164,26 @@ impl FloatWalker {
 struct KeyRenderer;
 
 impl KeyRenderer {
+    /// A key serde offered as a compound value. JSON object keys are strings,
+    /// so there is no spelling for it; name the shape that was offered so the
+    /// `<key>` placeholder that lands in the path can be traced back to the type
+    /// that produced it.
+    fn not_a_scalar(shape: impl Display) -> WalkError {
+        WalkError::Custom(format!("map key is not a scalar: {shape}"))
+    }
 
+    /// Spelling of an enum variant used as a map key. `variant` is what the JSON
+    /// writer emits as the object key, so it is what the path segment must be —
+    /// but `derive` is not the only source of `Serialize` impls, and an empty
+    /// name would splice an invisible segment into the path. Fall back to the
+    /// enum and the variant index, which serde always supplies.
+    fn variant_key(name: &'static str, variant_index: u32, variant: &'static str) -> String {
+        if variant.is_empty() {
+            format!("{name}#{variant_index}")
+        } else {
+            variant.to_string()
+        }
+    }
 }
 
 impl Serializer for KeyRenderer {
@@ -639,6 +702,17 @@ impl SerializeSeq for SeqWalker<'_> {
     type Ok = ();
     type Error = WalkError;
 
+    fn serialize_element<T>(&mut self, value: &T) -> Result<(), WalkError>
+    where
+        T: Serialize + ?Sized,
+    {
+        let restore = self.walker.push_index(self.index);
+        let outcome = value.serialize(&mut *self.walker);
+        self.walker.pop_to(restore);
+        self.index += 1;
+        outcome
+    }
+
     fn end(self) -> Result<(), WalkError> {
         self.finish();
         Ok(())
@@ -649,6 +723,13 @@ impl SerializeTuple for SeqWalker<'_> {
     type Ok = ();
     type Error = WalkError;
 
+    fn serialize_element<T>(&mut self, value: &T) -> Result<(), WalkError>
+    where
+        T: Serialize + ?Sized,
+    {
+        SerializeSeq::serialize_element(self, value)
+    }
+
     fn end(self) -> Result<(), WalkError> {
         SerializeSeq::end(self)
     }
@@ -657,6 +738,13 @@ impl SerializeTuple for SeqWalker<'_> {
 impl SerializeTupleStruct for SeqWalker<'_> {
     type Ok = ();
     type Error = WalkError;
+
+    fn serialize_field<T>(&mut self, value: &T) -> Result<(), WalkError>
+    where
+        T: Serialize + ?Sized,
+    {
+        SerializeSeq::serialize_element(self, value)
+    }
 
     fn end(self) -> Result<(), WalkError> {
         SerializeSeq::end(self)
@@ -672,6 +760,13 @@ struct VariantSeqWalker<'a> {
 impl SerializeTupleVariant for VariantSeqWalker<'_> {
     type Ok = ();
     type Error = WalkError;
+
+    fn serialize_field<T>(&mut self, value: &T) -> Result<(), WalkError>
+    where
+        T: Serialize + ?Sized,
+    {
+        SerializeSeq::serialize_element(&mut self.seq, value)
+    }
 
     fn end(self) -> Result<(), WalkError> {
         self.seq.finish();
@@ -694,6 +789,32 @@ impl SerializeMap for MapWalker<'_> {
     type Ok = ();
     type Error = WalkError;
 
+    fn serialize_key<T>(&mut self, key: &T) -> Result<(), WalkError>
+    where
+        T: Serialize + ?Sized,
+    {
+        // A key that cannot be rendered as a scalar is not JSON-encodable at
+        // all; fall back to a positional marker so the walk (and its float
+        // verdict) still completes.
+        let rendered = key
+            .serialize(KeyRenderer)
+            .unwrap_or_else(|err| format!("<unrenderable key: {err}>"));
+        self.restore = Some(self.walker.push_field(&rendered));
+        self.entries += 1;
+        Ok(())
+    }
+
+    fn serialize_value<T>(&mut self, value: &T) -> Result<(), WalkError>
+    where
+        T: Serialize + ?Sized,
+    {
+        let outcome = value.serialize(&mut *self.walker);
+        if let Some(restore) = self.restore.take() {
+            self.walker.pop_to(restore);
+        }
+        outcome
+    }
+
     fn end(self) -> Result<(), WalkError> {
         assert_announced_len(&self.origin, self.announced, self.entries);
         Ok(())
@@ -715,6 +836,17 @@ impl SerializeStruct for StructWalker<'_> {
     type Ok = ();
     type Error = WalkError;
 
+    fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> Result<(), WalkError>
+    where
+        T: Serialize + ?Sized,
+    {
+        let restore = self.walker.push_field(key);
+        let outcome = value.serialize(&mut *self.walker);
+        self.walker.pop_to(restore);
+        self.fields += 1;
+        outcome
+    }
+
     fn end(self) -> Result<(), WalkError> {
         assert_announced_len(&self.origin, Some(self.announced), self.fields);
         if let Some(restore) = self.restore {
@@ -727,6 +859,13 @@ impl SerializeStruct for StructWalker<'_> {
 impl SerializeStructVariant for StructWalker<'_> {
     type Ok = ();
     type Error = WalkError;
+
+    fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> Result<(), WalkError>
+    where
+        T: Serialize + ?Sized,
+    {
+        SerializeStruct::serialize_field(self, key, value)
+    }
 
     fn end(self) -> Result<(), WalkError> {
         SerializeStruct::end(self)

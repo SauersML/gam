@@ -197,9 +197,6 @@ pub struct EfsEval {
     pub consecutive_restored_incumbents: Option<usize>,
 }
 
-impl EfsEval {
-}
-
 /// One coordinate of an objective-supplied final fixed-point certificate.
 ///
 /// `Covered` means the objective has an analytic update equation whose zero is

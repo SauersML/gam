@@ -18,10 +18,7 @@ use ndarray::{Array1, Array2, Array3, Axis, s};
 
 use faer::Side;
 use gam_linalg::decision::{RankDecision, certified_rank, equilibrate_gram};
-use gam_linalg::faer_ndarray::{
-    FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb, fast_xt_diag_y,
-    rrqr_with_permutation,
-};
+use gam_linalg::faer_ndarray::{FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_with_permutation};
 
 /// Slack factor (multiples of machine ε) for the rank-revealing eigenvalue
 /// threshold used when pseudo-inverting a Gram matrix or selecting the
@@ -1085,6 +1082,10 @@ pub struct CompiledMap {
 /// `CompiledMap` (which lives ABOVE `gam-problem`). This `impl` supplies
 /// the inverted dependency edge.
 impl gam_problem::gauge::CompiledBlockMap for CompiledMap {
+
+    fn compiled_block_ranges(&self) -> &[std::ops::Range<usize>] {
+        &self.compiled_block_ranges
+    }
     fn raw_from_compiled(&self) -> &Array2<f64> {
         &self.raw_from_compiled
     }
@@ -3244,4 +3245,14 @@ mod tests {
             );
         }
     }
+}
+
+/// Build `W_b = stack_i sqrt(H_i) · J_b,i` flattened to `(n*K, ncols)` from a
+/// materialised `(n, p, K)` tensor. Thin wrapper over
+/// [`scale_jacobian_by_sqrt_h_with`] that reads the tensor element-wise.
+fn scale_block_by_sqrt_h(jb: &Array3<f64>, h_full: &Array3<f64>) -> Array2<f64> {
+    let n = jb.shape()[0];
+    let p = jb.shape()[1];
+    let k = jb.shape()[2];
+    scale_jacobian_by_sqrt_h_with(n, p, k, h_full, |i, a, c| jb[[i, a, c]])
 }

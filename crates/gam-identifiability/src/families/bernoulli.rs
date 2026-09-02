@@ -17,18 +17,6 @@ use ndarray::{Array1, Array2, Array3};
 use crate::families::compiler::{RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with};
 use gam_problem::FamilyChannelHessian;
 
-/// Standard normal pdf.
-#[inline]
-fn phi(x: f64) -> f64 {
-    (-0.5 * x * x).exp() / (std::f64::consts::TAU).sqrt()
-}
-
-/// Standard normal cdf. Wrapper for the codebase's `normal_cdf`.
-#[inline]
-fn cdf(x: f64) -> f64 {
-    gam_math::probability::normal_cdf(x)
-}
-
 /// Row Hessian for Bernoulli's K=1 row primary state. The "Hessian" is the
 /// scalar IRLS weight per row at the pilot η.
 pub struct BernoulliRowHessian {
@@ -84,6 +72,19 @@ impl RowHessian for BernoulliRowHessian {
 /// is vacuous. Families that genuinely have a single output channel
 /// (Gaussian, Binomial, Poisson, etc.) all use this 1×1 identity path.
 impl FamilyChannelHessian for BernoulliRowHessian {
+
+    fn fill_subject(&self, i: usize, out: &mut [f64]) {
+        assert_eq!(
+            out.len(),
+            1,
+            "BernoulliRowHessian::fill_subject expects K=1"
+        );
+        out[0] = self.w[i];
+    }
+
+    fn n_subjects(&self) -> usize {
+        self.w.len()
+    }
     fn n_outputs(&self) -> usize {
         1
     }

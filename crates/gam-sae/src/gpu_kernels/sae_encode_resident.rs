@@ -111,9 +111,6 @@ pub struct EncodeChartDevice {
     pub recon_center: Vec<f64>,
 }
 
-impl EncodeAtomDevice {
-}
-
 /// A per-row Kantorovich certificate, the device/emulator mirror of
 /// [`crate::encode::RowCertificate`]. `certified()` uses the SAME `h ≤ ½` gate.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -574,9 +571,6 @@ pub struct DeviceEncodeThroughput {
     /// is `Undetermined { NoDeviceEncodeKernel-adjacent }` — a fast CPU number is
     /// never a device pass.
     pub decision: EncodeDeploymentDecision,
-}
-
-impl DeviceEncodeThroughput {
 }
 
 #[cfg(test)]

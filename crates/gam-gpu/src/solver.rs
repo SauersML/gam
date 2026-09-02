@@ -1002,3 +1002,15 @@ pub(crate) fn cholesky_lower_on_ordinal_gpu(
 ) -> Result<Array2<f64>, String> {
     cuda::cholesky_lower_on_ordinal(ordinal, hessian)
 }
+
+pub fn cholesky_solve_gpu(
+    hessian: ArrayView2<'_, f64>,
+    rhs: ArrayView2<'_, f64>,
+) -> Result<(Array2<f64>, f64), String> {
+    // Route through iterative refinement. The function falls back to fp64
+    // internally, so callers always get a valid result; the refinement
+    // outcome metadata is intentionally not surfaced by this thin wrapper.
+    // This wrapper returns the logdet, so it must request it (`need_logdet`).
+    let result = iterative_refinement_cholesky_solve(hessian, rhs, /*need_logdet=*/ true)?;
+    Ok((result.0, result.1))
+}

@@ -188,9 +188,6 @@ impl GaugeOrbitDescent {
     }
 }
 
-impl StateMoveSite {
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EvidenceFixedPointGap {
     /// No clause failed: the pass recurred its entry state exactly.
@@ -207,9 +204,6 @@ pub(crate) enum EvidenceFixedPointGap {
     /// re-entry, so the objective this pass settled on is not the objective the
     /// next one would see.
     TemperatureStillAnnealing,
-}
-
-impl EvidenceFixedPointGap {
 }
 
 /// Put one softmax-logit row in the reference-logit chart used by the joint

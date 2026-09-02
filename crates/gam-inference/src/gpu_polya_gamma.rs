@@ -52,10 +52,8 @@
 //! `(seed, row)`. Host sampling delegates to upstream, so CPU/GPU acceptance
 //! compares distributions rather than implementation-specific draw sequences.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, ArrayView1};
 use std::{convert::Infallible, sync::OnceLock};
-
-use gam_linalg::triangular::{back_substitution_lower_transpose, cholesky_solve_vector};
 
 use crate::polya_gamma::PolyaGamma;
 
@@ -220,6 +218,16 @@ impl XorwowState {
 /// caller. The CUDA kernel keeps its own device-side transforms; this bridge is
 /// only for the host distribution oracle.
 impl rand::TryRng for XorwowState {
+
+    #[inline]
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+        rand::rand_core::utils::fill_bytes_via_next_word(dest, || Ok(XorwowState::next_u32(self)))
+    }
+
+    #[inline]
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(XorwowState::next_u32(self))
+    }
     type Error = Infallible;
 
     #[inline]

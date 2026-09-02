@@ -7270,4 +7270,49 @@ impl SaeManifoldTerm {
     // (the contiguous trailing methods of this impl block) were split into the
     // sibling construction_reconstruction.rs (declared in mod.rs); callers reach
     // them bare via use super::*.
+
+    /// Fold the row's Daleckii–Krein deflation differential into the single
+    /// t–t weight consumed by `SaeRowJetContraction::Trace` (#2333).
+    ///
+    /// For every symmetric derivative block `D`, the returned `E` satisfies
+    /// `sum(E⊙D) = tr(inv_vv·D) - deflation_block_correction(inv_vv,D)`. In
+    /// the spectral case this is `U ((Uᵀ inv_vv U) ⊙ F) Uᵀ`, using the
+    /// exact same `F` and gap convention as the correction. Gauge-only rows fold
+    /// the structural-null subtraction directly; undeflated or malformed
+    /// spectral rows preserve the raw selected inverse, matching the correction's
+    /// zero branch.
+    fn deflation_folded_trace_weight(
+        inv_vv: &Array2<f64>,
+        dirs: &[Array1<f64>],
+        spectrum: Option<&RowDeflationSpectrum>,
+    ) -> Array2<f64> {
+        let q = inv_vv.nrows();
+        let Some(spec) = spectrum else {
+            let mut e = inv_vv.clone();
+            for v in dirs {
+                for a in 0..q {
+                    let va = v.get(a).copied().unwrap_or(0.0);
+                    if va == 0.0 {
+                        continue;
+                    }
+                    for b in 0..q {
+                        e[[a, b]] -= va * v.get(b).copied().unwrap_or(0.0);
+                    }
+                }
+            }
+            return e;
+        };
+        let u = &spec.evecs;
+        if u.nrows() != q || u.ncols() != q {
+            return inv_vv.clone();
+        }
+        let mut folded = u.t().dot(inv_vv).dot(u);
+        let f = Self::row_deflation_frechet_coefficients(spec, q);
+        for a in 0..q {
+            for b in 0..q {
+                folded[[a, b]] *= f[[a, b]];
+            }
+        }
+        u.dot(&folded).dot(&u.t())
+    }
 }

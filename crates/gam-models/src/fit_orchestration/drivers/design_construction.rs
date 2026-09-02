@@ -8483,3 +8483,41 @@ mod glm_eta_observation_fd_tests {
         }
     }
 }
+
+pub fn fit_term_collection_with_penalty_block_gamma_prior_callback<F>(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    callback: F,
+    family: LikelihoodSpec,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError>
+where
+    F: FnMut(&PenaltyBlockGammaPriorMetadata<'_>) -> Option<(f64, f64)>,
+{
+    let design = build_term_collection_design_with_policy(data, spec, &options.resource_policy)?;
+    let effective_offset = design
+        .compose_offset(offset, "penalty-prior callback fit")
+        .map_err(EstimationError::BasisError)?;
+    let mut fit_opts = adaptive_fit_options_base(options, &design);
+    fit_opts.rho_prior = realize_penalty_block_gamma_priors(&design, callback)
+        .map_err(EstimationError::BasisError)?;
+    let fitted = FittedTermCollection {
+        fit: fit_gamwith_heuristic_lambdas(
+            design.design.clone(),
+            y,
+            weights,
+            effective_offset.view(),
+            &design.penalties,
+            None,
+            family.clone(),
+            &fit_opts,
+        )?,
+        design,
+        adaptive_diagnostics: None,
+    };
+    enforce_term_constraint_feasibility(&fitted.design, &fitted.fit)?;
+    Ok(fitted)
+}

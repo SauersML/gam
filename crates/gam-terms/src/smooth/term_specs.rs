@@ -1,8 +1,9 @@
-use coefficient_transforms::{convex_derivative_control_transform_matrix, cumulative_sum_transform_matrix};
 
 pub use error::SmoothError;
 
 use input_standardization::estimate_isotropic_scale;
+use coefficient_transforms::convex_derivative_control_transform_matrix;
+use coefficient_transforms::cumulative_sum_transform_matrix;
 
 use shape_constraints::{
     bspline_first_derivative_control_spans, shape_lower_bounds_local, shape_order_and_sign,
@@ -3786,11 +3787,6 @@ pub fn spatial_identifiability_policy(
     }
 }
 
-/// Standard deviation of the wide, weakly-informative symmetric `Normal` prior
-/// placed on a relaxable double-penalty smooth's `DoublePenaltyNullspace`
-/// selection coordinate in every design regime.
-pub const NULLSPACE_DEGENERACY_RHO_SD: f64 = 15.0;
-
 /// Per-term data-derived ψ = log κ bounds.
 ///
 /// Uses the same safe operating range documented in
@@ -6546,9 +6542,6 @@ pub fn build_random_effect_block(
         num_groups: q,
         kept_levels,
     })
-}
-
-impl SmoothDesign {
 }
 
 pub struct LocalSmoothTermBuild {

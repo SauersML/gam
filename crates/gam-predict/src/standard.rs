@@ -187,6 +187,19 @@ impl StandardPredictor {
 /// the canonical standard engines, not duplicated boilerplate.
 impl PredictionTransform for StandardPredictor {
 
+    fn point_state(&self, input: &PredictInput) -> Result<LinearState, EstimationError> {
+        let with_se = self.predict_with_uncertainty(input)?;
+        Ok(LinearState {
+            eta: with_se.eta,
+            mean: with_se.mean,
+            eta_se: with_se.eta_se,
+            mean_se: with_se.mean_se,
+            // Point state is built from the predictor's stored conditional
+            // covariance.
+            covariance_source: InferenceCovarianceMode::Conditional,
+        })
+    }
+
     fn linear_state(
         &self,
         input: &PredictInput,

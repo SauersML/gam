@@ -1,4 +1,4 @@
-use ndarray::{Array2, ArrayView2};
+use ndarray::ArrayView2;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 

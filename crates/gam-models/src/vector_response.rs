@@ -41,9 +41,6 @@ pub enum VectorNoise {
     },
 }
 
-impl VectorNoise {
-}
-
 /// Vector-valued response target.
 ///
 /// `y` is `(N, M)`; `row_weights` (if present) is length `N` and scales the

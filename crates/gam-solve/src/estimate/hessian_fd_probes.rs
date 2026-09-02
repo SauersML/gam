@@ -9,7 +9,3 @@
 //! unconditionally (the workspace ban-scanner forbids feature gating); a `pub`
 //! debug helper the production path never calls is inert by construction.
 
-use super::joint_hyper::ExternalJointHyperEvaluator;
-
-impl<'a> ExternalJointHyperEvaluator<'a> {
-}

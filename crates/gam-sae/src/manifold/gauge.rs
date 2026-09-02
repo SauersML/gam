@@ -37,9 +37,6 @@ pub struct AffineChartTransition {
     pub geometric_residual: f64,
 }
 
-impl AffineChartTransition {
-}
-
 // ===========================================================================
 // F1 — amplitude-concentration certificate (the "intensity is presence vs a
 // hidden radial coordinate" law).

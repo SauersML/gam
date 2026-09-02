@@ -220,9 +220,6 @@ pub enum CapacityVerdict {
     NotConverged(NotConvergedReason),
 }
 
-impl CapacityVerdict {
-}
-
 /// The checkable certificate: the five conditions, their evidence, and the verdict.
 #[derive(Clone, Debug)]
 pub struct DormantCapacityCertificate {

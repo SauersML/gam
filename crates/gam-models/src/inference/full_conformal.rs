@@ -2094,9 +2094,6 @@ pub struct JackknifePlusInterval {
     pub n: usize,
 }
 
-impl JackknifePlusInterval {
-}
-
 /// The jackknife+ interval assembly of Barber et al. (2021), exact order
 /// statistics:
 ///

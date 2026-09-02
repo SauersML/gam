@@ -209,9 +209,6 @@ pub struct Sensitivity {
     pub stratum: StratumFingerprint,
 }
 
-impl Sensitivity {
-}
-
 /// Where the criterion is — and is not — differentiable.
 ///
 /// Pseudo-logdets, eigenframe channels (#784 Q_c), and gate splices are C¹

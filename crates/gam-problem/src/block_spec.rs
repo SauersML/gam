@@ -264,6 +264,40 @@ pub struct RowScaledJacobian {
 
 impl BlockEffectiveJacobian for RowScaledJacobian {
 
+    fn effective_jacobian_rows(
+        &self,
+        state: &FamilyLinearizationState<'_>,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.design.nrows();
+        let rows = clamp_jacobian_rows(rows, n);
+        if self.eta_scaling.len() != n {
+            return Err(format!(
+                "RowScaledJacobian: eta_scaling length {} != design nrows {}",
+                self.eta_scaling.len(),
+                n,
+            ));
+        }
+        // Row-scaled blocks are β-linear; verify the linearization point
+        // contains no NaN when β is provided (sanity check on caller state).
+        if !state.beta.is_empty() && state.beta.iter().any(|v| v.is_nan()) {
+            return Err(
+                "RowScaledJacobian::effective_jacobian_at: state.beta contains NaN".to_string(),
+            );
+        }
+        let mut scaled = self
+            .design
+            .slice(ndarray::s![rows.start..rows.end, ..])
+            .to_owned();
+        for local_i in 0..scaled.nrows() {
+            let s = self.eta_scaling[rows.start + local_i];
+            for j in 0..scaled.ncols() {
+                scaled[[local_i, j]] *= s;
+            }
+        }
+        Ok(scaled)
+    }
+
 }
 
 pub(crate) fn clamp_jacobian_rows(rows: Range<usize>, n: usize) -> Range<usize> {

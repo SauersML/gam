@@ -209,7 +209,6 @@ struct SurvivalLocationScaleProfile {
     inverse_link: InverseLink,
     wiggle_knots: Option<Array1<f64>>,
     wiggle_degree: Option<usize>,
-    inverse_link_outer: Option<gam_solve::rho_optimizer::CertifiedOuterResult>,
 }
 
 fn survival_inverse_link_profile_objective(
@@ -307,7 +306,6 @@ impl SurvivalLocationScaleProfile {
             inverse_link: self.inverse_link,
             wiggle_knots: self.wiggle_knots,
             wiggle_degree: self.wiggle_degree,
-            inverse_link_outer: self.inverse_link_outer,
         }
     }
 }
@@ -3751,7 +3749,6 @@ pub(crate) fn fit_survival_location_scale_model(
             inverse_link,
             wiggle_knots,
             wiggle_degree,
-            inverse_link_outer: None,
         })
     }
 
@@ -3916,9 +3913,7 @@ pub(crate) fn fit_survival_location_scale_model(
                     certified_outer.final_value(),
                 ));
             }
-            let mut profile = selected.value;
-            profile.inverse_link_outer = Some(certified_outer);
-            Ok(profile)
+            Ok(selected.value)
         }
 
         match spec.inverse_link.clone() {
