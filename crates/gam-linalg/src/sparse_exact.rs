@@ -1327,30 +1327,6 @@ mod tests {
 
     // ── trace_product_sparse (rayon parallel reduction, #759) ─────────────────
 
-    /// Dense reference tr(H^{-1} S) computed by a completely different code path:
-    /// an explicit dense Cholesky-based inverse and an elementwise double sum.
-    fn dense_trace_ref(h: &Array2<f64>, s: &Array2<f64>) -> f64 {
-        let n = h.nrows();
-        let chol = h.cholesky(Side::Lower).unwrap();
-        let mut h_inv = Array2::<f64>::zeros((n, n));
-        for j in 0..n {
-            let mut rhs = Array1::<f64>::zeros(n);
-            rhs[j] = 1.0;
-            let col = chol.solvevec(&rhs);
-            for i in 0..n {
-                h_inv[[i, j]] = col[i];
-            }
-        }
-        // tr(H^{-1} S) = sum_ij (H^{-1})_ij S_ij  (S symmetric here).
-        let mut trace = 0.0;
-        for i in 0..n {
-            for j in 0..n {
-                trace += h_inv[[i, j]] * s[[i, j]];
-            }
-        }
-        trace
-    }
-
     // ── solve_sparse_spdmulti / solve_sparse_spdmulti_rows ───────────────────
 
     #[test]
@@ -1448,34 +1424,6 @@ mod tests {
         let block = taka.block(0, 3);
         approx_eq(block[[0, 2]], h_inv[[0, 2]], 1e-10);
         approx_eq(block[[2, 0]], h_inv[[2, 0]], 1e-10);
-    }
-
-    /// Build the dense inverse of an SPD matrix via per-column Cholesky solves.
-    fn dense_inverse_spd(h: &Array2<f64>) -> Array2<f64> {
-        let n = h.nrows();
-        let chol = h.cholesky(Side::Lower).unwrap();
-        let mut inv = Array2::<f64>::zeros((n, n));
-        for j in 0..n {
-            let mut rhs = Array1::<f64>::zeros(n);
-            rhs[j] = 1.0;
-            let col = chol.solvevec(&rhs);
-            for i in 0..n {
-                inv[[i, j]] = col[i];
-            }
-        }
-        inv
-    }
-
-    /// Reference tr(Z·S) computed densely from full matrices.
-    fn dense_trace_product(z: &Array2<f64>, s_dense: &Array2<f64>) -> f64 {
-        let n = z.nrows();
-        let mut acc = 0.0;
-        for i in 0..n {
-            for j in 0..n {
-                acc += z[[i, j]] * s_dense[[j, i]];
-            }
-        }
-        acc
     }
 
 }

@@ -1264,8 +1264,7 @@ mod pre_probe_gate_tests {
     //! device probe and its per-GPU `cuDevicePrimaryCtxRetain` context
     //! creation. Observable on any host (CUDA or not) through the process-wide
     //! `resolution_call_count` counter; nextest gives each test its own process.
-    use super::{DispatchOp, GpuDispatchPolicy, route_through_gpu};
-    use crate::device_runtime::GpuRuntime;
+    use super::{DispatchOp, GpuDispatchPolicy};
 
     #[test]
     fn admissibility_bound_never_tightens_the_real_admission() {

@@ -825,10 +825,7 @@ mod newtype_tests {
 
 #[cfg(test)]
 mod ridge_policy_tests {
-    use super::{
-        Inertia, RidgeMatrixForm, RidgePassport, RidgePolicy, StabilizationKind,
-        StabilizationLedger, StabilizationRule,
-    };
+    use super::{RidgePassport, RidgePolicy, StabilizationLedger};
     use serde_json::json;
 
     #[test]

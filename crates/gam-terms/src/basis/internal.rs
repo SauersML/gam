@@ -455,7 +455,7 @@ pub(super) fn cumulative_bspline_offsets_into(
 #[cfg(test)]
 mod knot_scale_invariance_tests {
     use super::*;
-    use crate::basis::{create_difference_penalty_matrix, evaluate_bspline_derivative_scalar};
+    use crate::basis::create_difference_penalty_matrix;
     use ndarray::Array1;
 
     /// Clamped cubic knot vector with interior knots at `frac * scale` for

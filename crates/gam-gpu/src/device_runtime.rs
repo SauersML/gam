@@ -631,34 +631,6 @@ fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, 
 }
 
 #[cfg(test)]
-mod laziness_gate_tests {
-    //! Pins the CUDA startup-tax ordering fix: a CPU-sized problem must reach
-    //! its size decision WITHOUT ever resolving GPU availability (which is what
-    //! triggers the one-time device probe + `cuDevicePrimaryCtxRetain`
-    //! primary-context creation on every GPU). Runs on any host — on a CUDA-less
-    //! box the probe is a no-op, but the invariant under test is purely the
-    //! control-flow ordering (size check strictly before resolution), which is
-    //! observable through the process-wide `resolution_call_count` counter.
-    //!
-    //! nextest runs each test in its own process, so the counter starts at a
-    //! clean baseline per test; the assertions use a delta against `before` so
-    //! they are robust regardless of the absolute starting value.
-    use super::*;
-
-    /// The resolution counter is process-global and the test binary runs in
-    /// parallel: on a real GPU box dozens of concurrent tests legitimately
-    /// enter `availability()` between any two reads (this is exactly how the
-    /// exact `before + 1` form of these gates failed on hardware while
-    /// staying green on quiet CPU-only runners — #2313's hardware-only
-    /// coverage class). Calling the gate `N` times and bounding the delta
-    /// makes the control-flow property immune to that traffic: a gate that
-    /// probes contributes ≥ N calls; one that never probes contributes 0,
-    /// and unrelated concurrent traffic is orders of magnitude below N.
-    const COUNTER_PROBE_CALLS: u64 = 4096;
-
-}
-
-#[cfg(test)]
 mod policy_resolution_contract_tests {
     use super::*;
     use crate::GpuPolicy;

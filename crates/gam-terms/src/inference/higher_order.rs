@@ -87,7 +87,6 @@ impl CumulantArrays {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use statrs::function::gamma::digamma;
 
     #[test]
     fn bartlett_factor_recovers_mean_over_df() {

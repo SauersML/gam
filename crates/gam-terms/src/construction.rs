@@ -3144,9 +3144,7 @@ mod tests {
         subspace_split_is_consistent,
     };
     use crate::EstimationError;
-    use crate::construction::kronecker_product;
     use faer::Mat;
-    use gam_linalg::faer_ndarray::FaerEigh;
     use gam_linalg::utils::inf_norm;
     use ndarray::{Array1, Array2, array};
 

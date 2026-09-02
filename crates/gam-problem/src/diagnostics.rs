@@ -853,7 +853,6 @@ impl KktRefusalDiagnosis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::arr1;
 
     #[test]
     fn diagnostics_from_predictions_computes_residual_metrics() {

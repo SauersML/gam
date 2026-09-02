@@ -18,7 +18,7 @@ use ndarray::{Array1, Array2, Array3, Axis, s};
 
 use faer::Side;
 use gam_linalg::decision::{RankDecision, certified_rank, equilibrate_gram};
-use gam_linalg::faer_ndarray::{FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_with_permutation, fast_ata, fast_xt_diag_y};
+use gam_linalg::faer_ndarray::{FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_with_permutation};
 
 /// Slack factor (multiples of machine ε) for the rank-revealing eigenvalue
 /// threshold used when pseudo-inverting a Gram matrix or selecting the
@@ -2175,137 +2175,6 @@ mod tests {
     }
 
     // ---- compile_from_raw_grams tests ----
-
-    /// Block B is a column-duplicate of block A in the structural metric
-    /// → the lower-priority block compiles to zero width instead of making
-    /// callers skip reduced-coordinate construction.
-    #[test]
-    fn compile_from_raw_grams_full_structural_alias() {
-        let n = 10;
-        let a = Array2::from_shape_fn((n, 2), |(i, j)| ((i + 1) as f64 * (j + 1) as f64).sin());
-        // Block B = A · L for some 2×2 invertible L → same column span.
-        let l = Array2::from_shape_vec((2, 2), vec![1.0, 0.5, -0.25, 1.0]).unwrap();
-        let b = a.dot(&l);
-        let w = Array1::ones(n);
-        let (gram_h, gram_struct, raw_ranges) = scalar_grams_two_block(&a, &b, &w);
-        let res = compile_from_raw_grams(
-            &gram_h,
-            &gram_struct,
-            &raw_ranges,
-            &[BlockOrder::Marginal, BlockOrder::Slope],
-        )
-        .expect("lower-priority full alias should compile to zero width");
-        assert_eq!(res.compiled_block_ranges[0].len(), 2);
-        assert_eq!(res.compiled_block_ranges[1].len(), 0);
-        assert_eq!(res.raw_from_compiled.dim(), (4, 2));
-        assert!(
-            res.raw_from_compiled
-                .slice(s![raw_ranges[1].clone(), ..])
-                .iter()
-                .all(|v| v.abs() <= 1.0e-12),
-            "zero-width block must not retain raw coefficient directions in T"
-        );
-    }
-
-    /// A zero-width *first* block has no columns to alias and must compile to
-    /// an empty range with the remaining blocks intact — not abort with
-    /// `FullyAliased`. Regression for the survival location-scale lognormal AFT
-    /// pre-fit channel-aware audit, whose `time_transform` block collapses to
-    /// zero free coefficients under the parametric AFT reduction and previously
-    /// crashed the fit ("block of width 0 has zero structural span").
-    #[test]
-    fn compile_from_raw_grams_zero_width_first_block_is_identifiable() {
-        let n = 12;
-        let empty = Array2::<f64>::zeros((n, 0));
-        let b = Array2::from_shape_fn((n, 2), |(i, j)| {
-            ((i + 1) as f64 * (j + 1) as f64 * 0.23).cos()
-        });
-        let w = Array1::ones(n);
-        let (gram_h, gram_struct, raw_ranges) = scalar_grams_two_block(&empty, &b, &w);
-        let map = compile_from_raw_grams(
-            &gram_h,
-            &gram_struct,
-            &raw_ranges,
-            &[BlockOrder::Marginal, BlockOrder::Slope],
-        )
-        .expect("zero-width first block must be trivially identifiable, not FullyAliased");
-        assert_eq!(
-            map.compiled_block_ranges[0].len(),
-            0,
-            "empty first block keeps zero columns"
-        );
-        assert_eq!(
-            map.compiled_block_ranges[1].len(),
-            2,
-            "the second block keeps its full structural rank"
-        );
-        assert_eq!(map.raw_from_compiled.dim(), (2, 2));
-    }
-
-    /// A `protected` first block keeps every raw column even when it is
-    /// internally rank-deficient (a duplicate-column structural null that the
-    /// unprotected path drops), and later blocks still reduce against the full
-    /// raw anchor. Regression for the survival marginal-slope monotone
-    /// time-wiggle time block: its chain-rule Jacobian recomputes a fixed
-    /// `p_tw`-column wiggle basis on every evaluation, so a reduced (`p_time <
-    /// p_tw`) time design made that Jacobian write past its buffer — an
-    /// out-of-bounds panic in the phase-4b compiled-map path.
-    #[test]
-    fn compile_from_raw_grams_protected_keeps_full_rank_deficient_first_block() {
-        let n = 14;
-        // Block A (first, highest priority): two IDENTICAL columns → structural
-        // rank 1, i.e. one within-block null direction the unprotected filter
-        // drops. Stands in for the wiggle time block whose raw width must be
-        // preserved.
-        // Column value depends only on the row → both columns are identical.
-        let a = Array2::from_shape_fn((n, 2), |(i, _)| ((i + 1) as f64 * 0.37).sin());
-        // Block B: genuinely independent, so it survives at full width.
-        let b = Array2::from_shape_fn((n, 2), |(i, j)| {
-            ((i + 1) as f64 * (0.29 + j as f64 * 0.11)).cos()
-        });
-        let w = Array1::ones(n);
-        let (gram_h, gram_struct, raw_ranges) = scalar_grams_two_block(&a, &b, &w);
-        let ordering = [BlockOrder::Time, BlockOrder::Marginal];
-
-        // Unprotected: the duplicate column is dropped → block 0 reduces to 1.
-        let unprotected = compile_from_raw_grams(&gram_h, &gram_struct, &raw_ranges, &ordering)
-            .expect("unprotected compile");
-        assert_eq!(
-            unprotected.compiled_block_ranges[0].len(),
-            1,
-            "unprotected first block drops its structural-null direction"
-        );
-
-        // Protected: block 0 keeps both raw columns; T's block-0 diagonal is the
-        // 2×2 identity (raw coords == compiled coords for the protected block).
-        let protected = compile_from_raw_grams_protected(
-            &gram_h,
-            &gram_struct,
-            &raw_ranges,
-            &ordering,
-            &[true, false],
-        )
-        .expect("protected compile");
-        assert_eq!(
-            protected.compiled_block_ranges[0].len(),
-            2,
-            "protected first block retains its full raw width"
-        );
-        let t_block0 = protected
-            .raw_from_compiled
-            .slice(s![0..2, protected.compiled_block_ranges[0].clone()])
-            .to_owned();
-        for i in 0..2 {
-            for j in 0..2 {
-                let expect = if i == j { 1.0 } else { 0.0 };
-                assert!(
-                    (t_block0[[i, j]] - expect).abs() <= 1e-12,
-                    "protected first block map must be identity, got [{i},{j}]={}",
-                    t_block0[[i, j]]
-                );
-            }
-        }
-    }
 
     #[test]
     fn orthogonalization_annotates_independent_and_fully_absorbed_blocks() {

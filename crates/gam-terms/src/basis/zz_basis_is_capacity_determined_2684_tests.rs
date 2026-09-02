@@ -26,7 +26,7 @@
 
 use super::types::should_use_lazy_spatial_design;
 use super::*;
-use gam_runtime::resource::{DerivativeStorageMode, ResourcePolicy};
+use gam_runtime::resource::ResourcePolicy;
 use gam_runtime::test_support::simulated_cgroup_memory_environment;
 use ndarray::Array2;
 

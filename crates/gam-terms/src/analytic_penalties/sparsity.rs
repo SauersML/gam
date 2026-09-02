@@ -1430,7 +1430,6 @@ mod soft_abs_gershgorin_2339_tests {
     //! hand-derived closed forms.
     use super::*;
     use approx::assert_abs_diff_eq;
-    use gam_linalg::faer_ndarray::FaerEigh;
     use gam_linalg::utils::splitmix64;
     use ndarray::Array2;
 

@@ -431,12 +431,6 @@ mod tests {
         }
     }
 
-    /// Exact double-double argument `m·γ·u` (`m` a small integer).
-    fn dd_arg(m: usize, gamma: f64, u: f64) -> Dd {
-        let (p, e) = two_prod(gamma, u);
-        Dd { hi: p, lo: e }.mul_f(m as f64)
-    }
-
     /// The double-double reference itself matches libm to a few ULP at small
     /// and large arguments (a sanity check on the TRUTH used below).
     #[test]

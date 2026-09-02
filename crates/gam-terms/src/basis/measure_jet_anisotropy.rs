@@ -47,8 +47,6 @@
 //! gates).
 
 use ndarray::Array2;
-use ndarray::Array1;
-use super::MeasureJetBand;
 
 /// A single requested derivative direction in `L`-space: the lower-triangular
 /// entry `(i, j)` with `i >= j`. The zeroth-order "direction" (the value
@@ -110,8 +108,7 @@ impl MeasureJetAnisotropyJets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis::{measure_jet_band, measure_jet_energy_form};
-    use ndarray::array;
+    use crate::basis::measure_jet_band;
 
     pub(crate) fn band_for(centers: &Array2<f64>) -> MeasureJetBand {
         measure_jet_band(centers.view(), 0).expect("band")

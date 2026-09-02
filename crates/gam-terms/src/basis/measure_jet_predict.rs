@@ -72,8 +72,6 @@
 //! fitted Frobenius-normalized precision first (`λ_phys = λ_tilde / c`). Family
 //! dispersion scaling remains outside this pure spectrum-side kernel.
 
-use ndarray::ArrayView1;
-use ndarray::ArrayView2;
 #[derive(Clone, Copy)]
 pub enum MeasureJetExtrapolationSpectrum<'a> {
     /// One physical precision per band level.
@@ -85,8 +83,7 @@ pub enum MeasureJetExtrapolationSpectrum<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use ndarray::{Array1, arr1};
+    use ndarray::Array1;
 
     /// Shared deterministic fixture: a 5-level dyadic band with a
     /// non-constant fitted spectrum.

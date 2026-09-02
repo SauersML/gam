@@ -1914,7 +1914,6 @@ mod tests {
 #[cfg(test)]
 mod pure_fn_tests {
     use super::{inf_norm, predict_gam_dimension_mismatch_message, row_mismatch_message, stable_logistic, stable_softplus};
-    use ndarray::array;
 
     // -----------------------------------------------------------------------
     // stable_softplus: log(1 + exp(x))

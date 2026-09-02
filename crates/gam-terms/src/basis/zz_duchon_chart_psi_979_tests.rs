@@ -130,37 +130,6 @@ fn chart_amplification(data: ArrayView2<'_, f64>, spec: &DuchonBasisSpec) -> f64
     .amplification
 }
 
-/// Central differences of the SHIPPED design and of the analytic first
-/// derivative along ψ, at two steps (ratio 2) so a truncation-limited
-/// estimate is told apart from a formula defect. Returns the best relative
-/// Frobenius gaps `(first, second)`.
-fn chart_gaps(data: ArrayView2<'_, f64>, spec: &DuchonBasisSpec, label: &str) -> (f64, f64) {
-    let first_an = analytic_first(data, spec);
-    let second_an = analytic_second(data, spec);
-    let mut best_first = f64::INFINITY;
-    let mut best_second = f64::INFINITY;
-    for &h in &[2.0e-3_f64, 1.0e-3] {
-        let plus = spec_at_psi(spec, h);
-        let minus = spec_at_psi(spec, -h);
-        let first_fd = (forward_design(data, &plus) - forward_design(data, &minus)) / (2.0 * h);
-        let first_gap = frobenius(&(&first_an - &first_fd)) / frobenius(&first_fd).max(1e-300);
-        let second_fd = (analytic_first(data, &plus) - analytic_first(data, &minus)) / (2.0 * h);
-        let second_gap =
-            frobenius(&(&second_an - &second_fd)) / frobenius(&second_fd).max(1e-300);
-        eprintln!(
-            "[{label}] h={h:.1e} first |an|={:.6e} |fd|={:.6e} gap={first_gap:.3e}; \
-             second |an|={:.6e} |fd|={:.6e} gap={second_gap:.3e}",
-            frobenius(&first_an),
-            frobenius(&first_fd),
-            frobenius(&second_an),
-            frobenius(&second_fd),
-        );
-        best_first = best_first.min(first_gap);
-        best_second = best_second.min(second_gap);
-    }
-    (best_first, best_second)
-}
-
 /// The benchmark's chart: sixteen axes, constant-only null space, spectral
 /// power 9. The chart MUST be amplified here (the kernel underflows), and the
 /// operator's first and second ψ-derivatives must be those of the shipped,

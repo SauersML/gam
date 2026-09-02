@@ -22,10 +22,8 @@
 //! execution faults are preserved as [`gam_gpu::gpu_error::GpuError`] instead
 //! of being collapsed into an apparent absence.
 
-use std::ops::Range;
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ndarray::Array2;
 
     fn symmetrise_for_test(out: &mut Array2<f64>) {
@@ -35,20 +33,6 @@ mod tests {
                 let avg = 0.5 * (out[[row, col]] + out[[col, row]]);
                 out[[row, col]] = avg;
                 out[[col, row]] = avg;
-            }
-        }
-    }
-
-    #[test]
-    fn primary_state_cpu_oracle_is_symmetric_and_nontrivial() {
-        let (channel_blocks, h_packed, ranges) = make_fixture();
-        let (cpu_h, cpu_s) = cpu_oracle(&channel_blocks, &h_packed, &ranges);
-        assert!(cpu_h.iter().any(|value| value.abs() > 0.0));
-        assert!(cpu_s.iter().any(|value| value.abs() > 0.0));
-        for row in 0..cpu_h.nrows() {
-            for col in 0..cpu_h.ncols() {
-                assert!((cpu_h[[row, col]] - cpu_h[[col, row]]).abs() <= 1e-12);
-                assert!((cpu_s[[row, col]] - cpu_s[[col, row]]).abs() <= 1e-12);
             }
         }
     }

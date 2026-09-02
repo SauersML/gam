@@ -868,7 +868,6 @@ fn spherical_wahba_kernel_matrix_cpu_validated(
 #[cfg(test)]
 mod spherical_wahba_kernel_contract_2475_tests {
     use super::*;
-    use ndarray::array;
 
     fn assert_sobolev_m1_refusal(entry_point: &str, result: Result<Array2<f64>, BasisError>) {
         let error = result.expect_err("untruncated Sobolev m=1 has no Gram diagonal");

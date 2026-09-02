@@ -5928,32 +5928,6 @@ mod tests {
         }
     }
 
-    fn exact_weighted_penalized_solve(
-        design: &Array2<f64>,
-        weights: &Array1<f64>,
-        rhs: &Array1<f64>,
-        penalty: &Array2<f64>,
-        ridge: f64,
-    ) -> Array1<f64> {
-        let mut h = design
-            .t()
-            .dot(&(design * &weights.view().insert_axis(Axis(1))));
-        h += penalty;
-        if ridge > 0.0 {
-            for i in 0..h.nrows() {
-                h[[i, i]] += ridge;
-            }
-        }
-        let factor = StableSolver::new()
-            .factorize(&h)
-            .expect("exact reference factorization");
-        let mut solution = rhs.clone();
-        let mut solution_matrix = crate::faer_ndarray::array1_to_col_matmut(&mut solution);
-        factor.solve_in_place(solution_matrix.as_mut());
-        assert!(solution.iter().all(|value| value.is_finite()));
-        solution
-    }
-
     #[test]
     fn fast_av_matches_ndarray_dot() {
         let x = array![[1.0, 2.0, -1.0], [0.5, -3.0, 4.0], [2.0, 0.0, 1.5]];
@@ -6076,13 +6050,6 @@ mod tests {
     fn ledger_read_guard() -> std::sync::RwLockReadGuard<'static, ()> {
         LEDGER_PRESSURE
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Guard for a test that makes the ledger unavailable to everyone else.
-    fn ledger_write_guard() -> std::sync::RwLockWriteGuard<'static, ()> {
-        LEDGER_PRESSURE
-            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 

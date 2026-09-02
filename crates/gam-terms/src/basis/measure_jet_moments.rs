@@ -73,7 +73,6 @@
 //! same-center point loop without changing a single number.
 
 use ndarray::{Array1, Array2};
-use std::ops::Range;
 
 /// The local jet-fit sufficient statistics read off one table — exactly the
 /// per-block quantities `assemble_weighted_forms` (measure_jet_smooth.rs)
@@ -96,7 +95,6 @@ pub struct MeasureJetJetStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::s;
 
     /// Deterministic generic-float dataset (no RNG): low-discrepancy
     /// fractional parts, d = 3, with a unit channel and one value channel.

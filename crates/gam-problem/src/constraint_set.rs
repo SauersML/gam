@@ -1120,17 +1120,4 @@ mod tests {
         assert!((violation - 1.0 / 2.0_f64.sqrt()).abs() < 1e-14);
     }
 
-    /// `β ≥ 0` on two coordinates, expressed with a deliberately non-unit row
-    /// so the scaled/raw distinction is observable.
-    fn scaled_box() -> ConstraintSet {
-        // Row 0: 1e-3·β₀ ≥ 0 (‖a‖ = 1e-3). Row 1: β₁ ≥ 0 (‖a‖ = 1).
-        ConstraintSet::Dense(
-            LinearInequalityConstraints::new(
-                array![[1.0e-3_f64, 0.0], [0.0, 1.0]],
-                Array1::<f64>::zeros(2),
-            )
-            .expect("scaled box"),
-        )
-    }
-
 }

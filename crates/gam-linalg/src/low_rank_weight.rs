@@ -132,21 +132,3 @@ impl<'a> LowRankWeight<'a> {
 
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::matrix::DesignMatrix;
-    use ndarray::array;
-
-    /// Build a tiny dense design and a corresponding `DesignMatrix::Dense`.
-    fn small_design() -> DesignMatrix {
-        let x = array![
-            [1.0, 0.5, -0.2],
-            [0.3, 1.2, 0.4],
-            [-0.1, 0.7, 1.0],
-            [0.6, -0.3, 0.8],
-            [0.2, 0.9, -0.5],
-        ];
-        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x))
-    }
-
-}

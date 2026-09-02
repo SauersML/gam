@@ -57,7 +57,7 @@
 use ndarray::Array1;
 
 use crate::manifold::RiemannianManifold;
-use crate::manifolds::constant_curvature::{ConstantCurvature, distance_kappa_jet};
+use crate::manifolds::constant_curvature::ConstantCurvature;
 use crate::manifolds::poincare;
 
 struct Rng(u64);
@@ -112,21 +112,6 @@ const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
 fn seed_for(dim: usize, kappa: f64) -> u64 {
     SEED ^ ((dim as u64) << 32) ^ kappa.to_bits()
-}
-
-fn sup_diff(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f64::max)
-}
-
-/// Largest magnitude across two vectors, floored at 1 — the scale a residual
-/// between them is relative to.
-fn joint_scale(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
-    a.iter()
-        .chain(b.iter())
-        .fold(1.0_f64, |acc, v| acc.max(v.abs()))
 }
 
 #[test]
@@ -317,46 +302,6 @@ fn distance_is_a_metric_and_agrees_with_the_logarithm() {
         }
     }
     assert!(verified > 0, "no metric axiom was evaluated");
-}
-
-/// Relative tolerance for a jet component, plus an absolute floor set by what
-/// the finite-difference instrument can actually resolve.
-///
-/// The absolute term is the point of this function. These derivatives are
-/// *small*: `∂d/∂κ` spans `1e-7 … 0.17` over the fixtures below and `∂²d/∂κ²`
-/// reaches down to `6e-12` for near-coincident points, while the FD residual
-/// against a correct analytic derivative sits at `1e-9 … 2e-8` regardless.
-/// Below that floor the difference quotient carries no information, so no
-/// tolerance can be honest about the small cases — but the floor must be set
-/// from the *measured* noise and not, as this test first did, from a `max(…,
-/// 1.0)` guard. That guard made the bound `1e-6` absolute everywhere, which is
-/// fifty times looser than the instrument: a mutation perturbing `∂²d/∂κ²` by
-/// `1e-5` relative passed it. With the floor at the measured noise (5–10× over
-/// the worst residual observed across all 15 dim × κ fixtures) the same
-/// mutation fails, which is the property that makes this test worth running.
-fn jet_tolerance(analytic: f64, difference: f64, floor: f64) -> f64 {
-    1.0e-6 * analytic.abs().max(difference.abs()) + floor
-}
-
-/// Noise floor of the central first difference: worst residual measured 4.4e-9.
-const FIRST_FLOOR: f64 = 5.0e-8;
-/// Noise floor of the central second difference, which amplifies roundoff by
-/// `1/H²`: worst residual measured 1.9e-8.
-const SECOND_FLOOR: f64 = 1.0e-7;
-
-/// Largest componentwise gap between two vectors, against the same bound.
-fn assert_vector_close(
-    analytic: &Array1<f64>,
-    difference: &Array1<f64>,
-    floor: f64,
-    context: &str,
-) {
-    for (i, (a, d)) in analytic.iter().zip(difference.iter()).enumerate() {
-        assert!(
-            (a - d).abs() <= jet_tolerance(*a, *d, floor),
-            "{context}: component {i} analytic {a} vs finite difference {d}"
-        );
-    }
 }
 
 /// #2687: the κ > 0 branch is **not** unconstrained, and its singular locus sits

@@ -640,37 +640,6 @@ mod exp_map_vjp_tests {
 }
 
 #[cfg(test)]
-mod frechet_mean_tests {
-    use super::SpdManifold;
-    use crate::manifold::{GeometryError, RiemannianManifold, spectral_map_spd};
-    use ndarray::{Array1, Array2};
-
-    /// Row-major flat `n×n` diagonal matrix from its diagonal.
-    fn diag_flat(d: &[f64]) -> Array1<f64> {
-        let n = d.len();
-        let mut m = Array2::<f64>::zeros((n, n));
-        for i in 0..n {
-            m[[i, i]] = d[i];
-        }
-        Array1::from_iter(m.iter().copied())
-    }
-
-    /// Stack flat samples into the `M×n²` matrix the primitive consumes.
-    fn stack(rows: &[Array1<f64>]) -> Array2<f64> {
-        let m = rows.len();
-        let k = rows[0].len();
-        let mut s = Array2::<f64>::zeros((m, k));
-        for (i, r) in rows.iter().enumerate() {
-            for (j, &v) in r.iter().enumerate() {
-                s[[i, j]] = v;
-            }
-        }
-        s
-    }
-
-}
-
-#[cfg(test)]
 mod parallel_transport_tests {
     use super::SpdManifold;
     use crate::manifold::{RiemannianManifold, from_flat, sym};

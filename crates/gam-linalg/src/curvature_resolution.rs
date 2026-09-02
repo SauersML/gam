@@ -652,18 +652,6 @@ pub fn measure_symmetric_ladder(
 mod tests {
     use super::*;
 
-    /// A ladder of steps spanning the interesting decades, used to check the
-    /// closed forms against the error model they claim to optimise.
-    fn step_ladder() -> Vec<f64> {
-        let mut steps = Vec::new();
-        let mut step = 1.0e-8_f64;
-        while step <= 1.0e1 {
-            steps.push(step);
-            step *= 10.0_f64.powf(0.05);
-        }
-        steps
-    }
-
     /// The two laws applied to the same numeric input disagree, and the type
     /// records which was chosen. This is the confusion the module exists to
     /// prevent: `eps_f = 1e-8` read as a Weyl bound gives `1e-8`, whereas the

@@ -2063,8 +2063,6 @@ fn pull_back_penalty(penalty: &PenaltyMatrix, kept: &[usize]) -> PenaltyMatrix {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_linalg::matrix::DenseDesignMatrix;
-    use gam_problem::AdditiveBlockJacobian;
 
     use ndarray::Array2;
 
@@ -2354,7 +2352,7 @@ mod tests {
         );
     }
 
-    use gam_problem::test_support::{spec_from_dense, spec_from_dense_with_priority};
+    use gam_problem::test_support::spec_from_dense_with_priority;
 
     /// The geometry gam#2748 broke on, at the shape it broke at: a monotone
     /// link-wiggle warp residualized against a higher-priority mean block.
