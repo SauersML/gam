@@ -227,9 +227,6 @@ pub fn resolve_fit_request_config(
     if let Some(flag) = json_config.scale_dimensions {
         fit_config.scale_dimensions = flag;
     }
-    if let Some(flag) = json_config.adaptive_regularization {
-        fit_config.adaptive_regularization = Some(flag);
-    }
     if let Some(formula) = json_config.noise_formula {
         fit_config.noise_formula = Some(formula);
     }
@@ -895,14 +892,12 @@ mod tests {
                     input.firth = true;
                     input.transformation_normal = true;
                     input.outer_max_iter = Some(7);
-                    input.adaptive_regularization = Some(true);
                     input
                 },
                 json: json!({
                     "firth": true,
                     "transformation_normal": true,
-                    "outer_max_iter": 7,
-                    "adaptive_regularization": true
+                    "outer_max_iter": 7
                 }),
             },
             ParityCase {

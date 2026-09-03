@@ -380,7 +380,6 @@ fn fit_standard_base(
                 fit: fitted.fit,
                 design: fitted.design,
                 resolvedspec,
-                adaptive_diagnostics: fitted.adaptive_diagnostics,
                 kappa_timing: None,
             },
         )
@@ -929,7 +928,6 @@ pub(crate) fn fit_standard_model(
         basis_adequacy: Vec::new(),
         adaptive_spatial_terms: adaptive_spatial_terms.clone(),
         adaptive_spatial_center_counts: adaptive_spatial_center_counts.clone(),
-        adaptive_diagnostics: fitted.adaptive_diagnostics,
         kappa_timing: fitted.kappa_timing,
         wiggle_knots: None,
         wiggle_degree: None,
@@ -1040,7 +1038,6 @@ pub(crate) fn fit_standard_model(
         basis_adequacy: Vec::new(),
         adaptive_spatial_terms,
         adaptive_spatial_center_counts,
-        adaptive_diagnostics: result.adaptive_diagnostics,
         kappa_timing: result.kappa_timing,
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),

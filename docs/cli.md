@@ -43,7 +43,6 @@ Common options:
 | `--noise-offset-column COLUMN` | Additive offset for the scale / dispersion predictor; under the marginal-slope families, for the slope predictor (`--offset-column` then offsets the marginal predictor). |
 | `--firth` | Firth bias reduction for supported binomial-logit fits. |
 | `--scale-dimensions` | Enable per-axis anisotropy for eligible spatial smooths. |
-| `--adaptive-regularization true|false` | Opt into spatial adaptive regularization for compatible standard GAMs. |
 | `--transformation-normal` | Fit a conditional transformation-normal model. |
 
 CLI links are declared in the formula with `link(type=...)`; there is no

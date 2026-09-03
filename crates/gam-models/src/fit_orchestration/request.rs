@@ -229,7 +229,6 @@ pub struct StandardFitResult {
     /// whose row count can include periodic image expansion and is therefore
     /// not the next request size.
     pub adaptive_spatial_center_counts: Vec<Option<usize>>,
-    pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
     pub kappa_timing: Option<SpatialLengthScaleOptimizationTiming>,
     pub saved_link_state: FittedLinkState,
     pub wiggle_knots: Option<Array1<f64>>,
@@ -612,13 +611,6 @@ pub struct FitConfig {
     /// formula family. Front ends must set model-wide spatial knobs here rather
     /// than mutating a request after materialization.
     pub spatial_optimization: SpatialLengthScaleOptimizationOptions,
-    /// Enable exact spatial adaptive regularization for standard formula fits.
-    /// `None` uses the quality-first automatic policy. The current automatic
-    /// policy leaves LAREG off unless explicitly requested because the
-    /// optimizer's REML-selected local weights can over-regularize small
-    /// high-yield spatial signals.
-    pub adaptive_regularization: Option<bool>,
-
     /// Route the fit through the transformation-normal family.  When set, the
     /// formula terms are treated as the covariate side of the transformation
     /// model and the response basis is built internally.  Incompatible with
@@ -781,7 +773,6 @@ impl Default for FitConfig {
             ctn_stage1: None,
             scale_dimensions: false,
             spatial_optimization: SpatialLengthScaleOptimizationOptions::default(),
-            adaptive_regularization: None,
             transformation_normal: false,
             firth: false,
             outer_max_iter: None,

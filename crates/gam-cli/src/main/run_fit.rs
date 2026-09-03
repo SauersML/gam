@@ -93,7 +93,6 @@ fn fit_request_document_from_fit_args(
         HazardLoadingArg::LoadedVsUnloaded => "loaded-vs-unloaded".to_string(),
     });
     let config = crate::config_resolve::FitRequestConfigDocument {
-        adaptive_regularization: Some(args.adaptive_regularization),
         baseline_makeham: args.baseline_makeham,
         baseline_rate: args.baseline_rate,
         baseline_scale: args.baseline_scale,
@@ -1760,11 +1759,6 @@ pub(crate) fn validate_fit_args_preflight(
         if args.firth {
             return Err("--transformation-normal conflicts with --firth".to_string());
         }
-        if args.adaptive_regularization {
-            return Err(
-                "--adaptive-regularization is only supported for standard GAM fitting".to_string(),
-            );
-        }
         if args.frailty_kind.is_some() || args.frailty_sd.is_some() || args.hazard_loading.is_some()
         {
             return Err("--transformation-normal conflicts with frailty flags".to_string());
@@ -1784,22 +1778,12 @@ pub(crate) fn validate_fit_args_preflight(
                 "--firth is redundant for marginal-slope fitting: the robust Jeffreys/Firth stabilizer is installed by policy"
             );
         }
-        if args.adaptive_regularization {
-            return Err(
-                "--adaptive-regularization is only supported for standard GAM fitting".to_string(),
-            );
-        }
         if args.family != FamilyArg::Auto {
             return Err(
                 "--family is ignored by marginal-slope fitting; select its link in the formula"
                     .to_string(),
             );
         }
-    }
-    if args.predict_noise.is_some() && args.adaptive_regularization {
-        return Err(
-            "--adaptive-regularization is only supported for standard GAM fitting".to_string(),
-        );
     }
     if args.negative_binomial_theta.is_some() && args.family != FamilyArg::NegativeBinomial {
         return Err("--negative-binomial-theta requires --family negative-binomial".to_string());
@@ -1817,11 +1801,6 @@ pub(crate) fn validate_fit_args_preflight(
             return Err(
                 "--family is ignored by Surv(...) fitting; use survival formula/link options"
                     .to_string(),
-            );
-        }
-        if args.adaptive_regularization {
-            return Err(
-                "--adaptive-regularization is only supported for standard GAM fitting".to_string(),
             );
         }
     }

@@ -21,17 +21,16 @@ DEFAULT_GAM_BIN = REPO_ROOT / "target" / "release" / "gam"
 SMOOTH_RESOLUTION = 150
 
 
-CONFIGS: list[tuple[str, bool, str]] = [
-    ("adaptive order=0 power=2", True, "#d1495b"),
-    ("non-adaptive order=0 power=2", False, "#118ab2"),
+CONFIGS: list[tuple[str, str]] = [
+    ("order=0 power=2", "#118ab2"),
 ]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Fit a 2D Duchon surface with a sharp transition to a new plateau, "
-            "comparing adaptive vs non-adaptive regularization."
+            "Fit a 2D Duchon surface with a sharp transition to a new plateau "
+            "and compare it against mgcv."
         )
     )
     parser.add_argument("--gam-bin", type=Path, default=DEFAULT_GAM_BIN)
@@ -240,7 +239,6 @@ def fit_rust_surface(
     test_csv: Path,
     grid_csv: Path,
     label: str,
-    adaptive_regularization: bool,
     expected_rows: int,
     n_test_rows: int,
     grid_shape: tuple[int, int],
@@ -256,8 +254,6 @@ def fit_rust_surface(
             "fit",
             train_csv,
             formula,
-            "--adaptive-regularization",
-            "true" if adaptive_regularization else "false",
             "--out",
             model_path,
         ]
@@ -413,7 +409,7 @@ def main() -> int:
         true_rmse = rmse(y_test, y_test_true)
         true_mae = mae(y_test, y_test_true)
         metrics.append(("true surface", true_r2, true_rmse, true_mae))
-        for label, adaptive_regularization, color in CONFIGS:
+        for label, color in CONFIGS:
             y_hat, y_test_hat = fit_rust_surface(
                 args.gam_bin,
                 workdir,
@@ -421,7 +417,6 @@ def main() -> int:
                 test_csv,
                 grid_csv,
                 label,
-                adaptive_regularization,
                 expected_rows,
                 n_test_rows,
                 grid_shape,

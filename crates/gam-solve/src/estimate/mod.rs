@@ -74,7 +74,7 @@ mod summary;
 
 pub use crate::model_types::result_types::dispersion_from_likelihood;
 pub use crate::model_types::{
-    AdaptiveRegularizationOptions, BlockRole, CovarianceDeclined, FitArtifacts, FitGeometry,
+    BlockRole, CovarianceDeclined, FitArtifacts, FitGeometry,
     FitInference, FitOptions,
     FittedBlock, FittedLinkState, NO_CRITERION_AT_EXACT_FIT, OuterCriterionCertificate,
     OuterStationarityCertificate, UnifiedFitResult, UnifiedFitResultParts, WorkingGeometry,

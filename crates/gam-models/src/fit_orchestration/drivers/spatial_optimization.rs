@@ -2728,7 +2728,6 @@ fn try_exact_joint_spatial_length_scale_optimization(
         fit,
         design: optimized.design,
         resolvedspec: optimized_spec,
-        adaptive_diagnostics: optimized.adaptive_diagnostics,
         kappa_timing: Some(kappa_timing),
     };
 
@@ -8461,7 +8460,6 @@ fn try_exact_joint_latent_coord_optimization(
         fit,
         design: optimized.design,
         resolvedspec: resolvedspec.clone(),
-        adaptive_diagnostics: optimized.adaptive_diagnostics,
         kappa_timing: None,
     })
 }
@@ -8707,7 +8705,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             fit: out.fit,
             design: out.design,
             resolvedspec,
-            adaptive_diagnostics: out.adaptive_diagnostics,
             kappa_timing: None,
         });
     }
@@ -8934,7 +8931,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             fit: fitted.fit,
             design: fitted.design,
             resolvedspec,
-            adaptive_diagnostics: fitted.adaptive_diagnostics,
             kappa_timing: None,
         });
     }
@@ -8987,7 +8983,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
                 fit: fitted.fit,
                 design: fitted.design,
                 resolvedspec,
-                adaptive_diagnostics: fitted.adaptive_diagnostics,
                 kappa_timing: None,
             });
         }
@@ -9041,7 +9036,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         fit: fitted.fit,
         design: fitted.design,
         resolvedspec,
-        adaptive_diagnostics: fitted.adaptive_diagnostics,
         kappa_timing: None,
     })
 }

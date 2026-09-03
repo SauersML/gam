@@ -339,12 +339,3 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
     Ok(())
 }
 
-pub(super) fn standard_adaptive_regularization_options(
-    config: &FitConfig,
-) -> Option<AdaptiveRegularizationOptions> {
-    let enabled = config.adaptive_regularization.unwrap_or(false);
-    enabled.then(|| AdaptiveRegularizationOptions {
-        enabled: true,
-        ..AdaptiveRegularizationOptions::default()
-    })
-}

@@ -231,7 +231,6 @@ pub(crate) struct FitArgs {
             "sigma_time_degree",
             "slope_time_k",
             "slope_time_degree",
-            "adaptive_regularization",
             "scale_dimensions",
             "precompute_conformal",
             "inference",
@@ -391,13 +390,6 @@ pub(crate) struct FitArgs {
     /// B-spline degree for the time margin of the slope tensor product.
     #[arg(long = "slope-time-degree", default_value_t = 3, value_parser = parse_positive_usize_cli)]
     pub(crate) slope_time_degree: usize,
-    /// Enable MM-based spatial adaptive regularization (Charbonnier majorizer)
-    /// for compatible smooth terms. Off by default — pass
-    /// `--adaptive-regularization true` to opt in. Only consulted by the bare
-    /// `gam fit` (standard GAM) path; the marginal-slope and
-    /// transformation-normal paths do not use this flag.
-    #[arg(long = "adaptive-regularization", action = ArgAction::Set, default_value_t = false)]
-    pub(crate) adaptive_regularization: bool,
     /// Enable per-axis anisotropic spatial optimization for all eligible
     /// spatial terms (Matérn and Duchon). Hybrid Duchon jointly optimizes a
     /// scalar kappa plus per-axis contrasts; pure Duchon optimizes shape-only

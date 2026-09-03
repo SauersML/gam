@@ -270,7 +270,6 @@ def _build_fit_payload(
     frailty_sd: float | None,
     hazard_loading: str | None,
     scale_dimensions: bool | None,
-    adaptive_regularization: bool | None,
     firth: bool | None,
     noise_formula: str | None,
     noise_offset: str | None,
@@ -310,7 +309,6 @@ def _build_fit_payload(
             else str(persistent_warm_start_root)
         ),
         "scale_dimensions": scale_dimensions,
-        "adaptive_regularization": adaptive_regularization,
         "firth": firth,
         "noise_formula": noise_formula,
         "noise_offset": noise_offset,
@@ -733,7 +731,6 @@ def fit(
     frailty_sd: float | None = ...,
     hazard_loading: str | None = ...,
     scale_dimensions: bool | None = ...,
-    adaptive_regularization: bool | None = ...,
     firth: bool | None = ...,
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
@@ -777,7 +774,6 @@ def fit(
     frailty_sd: float | None = ...,
     hazard_loading: str | None = ...,
     scale_dimensions: bool | None = ...,
-    adaptive_regularization: bool | None = ...,
     firth: bool | None = ...,
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
@@ -820,7 +816,6 @@ def fit(
     frailty_sd: float | None = None,
     hazard_loading: str | None = None,
     scale_dimensions: bool | None = None,
-    adaptive_regularization: bool | None = None,
     firth: bool | None = None,
     noise_formula: str | None = None,
     noise_offset: str | None = None,
@@ -974,10 +969,6 @@ def fit(
         When ``True``, enables learned per-axis anisotropic length scales on
         spatial smooths (e.g. multi-dim Duchon / Matern / TPS). Per-axis
         scales are learned, not specified. Corresponds to ``--scale-dimensions``.
-    adaptive_regularization:
-        Enable exact local adaptive regularization for compatible spatial
-        smooths. Omit to use the quality-first automatic policy, which leaves
-        it off unless explicitly requested.
     firth:
         Enable Firth bias-reduced estimation. Corresponds to ``--firth``.
     noise_formula:
@@ -1176,7 +1167,6 @@ def fit(
             weights=weights,
             fisher_rao_w=fisher_rao_w,
             scale_dimensions=scale_dimensions,
-            adaptive_regularization=adaptive_regularization,
             firth=firth,
             precision_hyperpriors=precision_hyperpriors,
             latents=latents,
@@ -1221,7 +1211,6 @@ def fit(
         frailty_sd=frailty_sd,
         hazard_loading=hazard_loading,
         scale_dimensions=scale_dimensions,
-        adaptive_regularization=adaptive_regularization,
         firth=firth,
         noise_formula=noise_formula,
         noise_offset=noise_offset,
@@ -1315,7 +1304,6 @@ def fit_array(
     frailty_sd: float | None = None,
     hazard_loading: str | None = None,
     scale_dimensions: bool | None = None,
-    adaptive_regularization: bool | None = None,
     firth: bool | None = None,
     noise_formula: str | None = None,
     noise_offset: str | None = None,
@@ -1382,7 +1370,6 @@ def fit_array(
         frailty_sd=frailty_sd,
         hazard_loading=hazard_loading,
         scale_dimensions=scale_dimensions,
-        adaptive_regularization=adaptive_regularization,
         firth=firth,
         noise_formula=noise_formula,
         noise_offset=noise_offset,
@@ -1627,7 +1614,6 @@ def validate_formula(
     frailty_sd: float | None = None,
     hazard_loading: str | None = None,
     scale_dimensions: bool | None = None,
-    adaptive_regularization: bool | None = None,
     firth: bool | None = None,
     noise_formula: str | None = None,
     noise_offset: str | None = None,
@@ -1677,7 +1663,6 @@ def validate_formula(
         frailty_sd=frailty_sd,
         hazard_loading=hazard_loading,
         scale_dimensions=scale_dimensions,
-        adaptive_regularization=adaptive_regularization,
         firth=firth,
         noise_formula=noise_formula,
         noise_offset=noise_offset,

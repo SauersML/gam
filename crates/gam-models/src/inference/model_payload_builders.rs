@@ -493,7 +493,6 @@ pub fn assemble_standard_payload(
         design,
         resolvedspec,
         basis_adequacy,
-        adaptive_diagnostics,
         saved_link_state,
         wiggle_knots,
         wiggle_degree,
@@ -572,7 +571,6 @@ pub fn assemble_standard_payload(
     }
     payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
     payload.resolved_termspec = Some(resolved_termspec);
-    payload.adaptive_regularization_diagnostics = adaptive_diagnostics;
     payload.basis_adequacy = basis_adequacy;
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();

@@ -22,7 +22,6 @@ fn fit_options() -> FitOptions {
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: false,
-        adaptive_regularization: None,
         rho_prior: RhoPrior::Flat,
         kronecker_penalty_system: None,
         kronecker_factored: None,

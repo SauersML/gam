@@ -24,7 +24,7 @@ use gam_terms::inference::formula_dsl::{
     inverse_link_supports_joint_wiggle, joint_wiggle_unsupported_link_message, parse_formula,
     parse_surv_interval_response, parse_surv_response, parsed_term_column_names,
 };
-use gam_terms::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
+use gam_terms::smooth::TermCollectionSpec;
 // The data-schema value types live in the `gam-data` foundation crate; they
 // were previously authored here and are still named `gam::inference::model::{
 // ColumnKindTag, DataSchema, SchemaColumn}` by a broad set of integration tests
@@ -673,8 +673,6 @@ pub struct FittedModelPayload {
     pub resolved_slopespec: Option<TermCollectionSpec>,
     #[serde(default)]
     pub resolved_slopespecs: Option<Vec<TermCollectionSpec>>,
-    #[serde(default)]
-    pub adaptive_regularization_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
     /// Precomputed exact Gaussian-identity jackknife+ statistics (#942).
     ///
     /// Populated *only* for a standard Gaussian-identity model fit with unit
@@ -949,7 +947,6 @@ impl FittedModelPayload {
             resolved_termspec_noise: None,
             resolved_slopespec: None,
             resolved_slopespecs: None,
-            adaptive_regularization_diagnostics: None,
             gaussian_jackknife_plus: None,
             full_conformal: None,
         }

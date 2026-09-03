@@ -263,7 +263,6 @@ pub(crate) fn materialize_standard<'a>(
             sas_link,
             optimize_sas,
             firth_bias_reduction: config.firth,
-            adaptive_regularization: standard_adaptive_regularization_options(config),
             ..Default::default()
         },
     );

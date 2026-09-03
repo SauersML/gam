@@ -51,7 +51,6 @@ _BASE: dict[str, typing.Any] = {
     "frailty_sd": None,
     "hazard_loading": None,
     "scale_dimensions": None,
-    "adaptive_regularization": None,
     "firth": None,
     "noise_formula": None,
     "noise_offset": None,

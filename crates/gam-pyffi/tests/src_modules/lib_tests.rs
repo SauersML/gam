@@ -849,7 +849,6 @@ fn gaussian_reml_fit_blocks_forward_native(
         nullspace_dims: vec![0; s_list.len()],
         linear_constraints: None,
         firth_bias_reduction: false,
-        adaptive_regularization: None,
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,

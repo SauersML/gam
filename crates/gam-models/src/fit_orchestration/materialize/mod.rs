@@ -39,7 +39,6 @@ pub(crate) use validation::{
 
 use latent::*;
 use secondary::*;
-use terms::*;
 use validation::*;
 
 #[cfg(test)]

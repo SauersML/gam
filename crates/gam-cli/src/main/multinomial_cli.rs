@@ -152,11 +152,6 @@ pub(crate) fn run_fit_multinomial(
     if args.expectile_tau.is_some() {
         return Err("--expectile-tau requires --family expectile".to_string());
     }
-    if args.adaptive_regularization {
-        return Err(
-            "--adaptive-regularization is only supported for standard GAM fitting".to_string(),
-        );
-    }
     let Some(out) = args.out.as_ref() else {
         return Err(
             "fit requires --out; refusing to run a training job that writes no model".to_string(),

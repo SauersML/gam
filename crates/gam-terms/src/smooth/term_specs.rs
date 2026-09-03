@@ -2765,27 +2765,6 @@ pub struct StandardLatentCoordConfig {
     pub analytic_penalties: Option<std::sync::Arc<crate::AnalyticPenaltyRegistry>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AdaptiveSpatialMap {
-    pub termname: String,
-    pub feature_cols: Vec<usize>,
-    pub collocation_points: Array2<f64>,
-    pub inv_magweight: Array1<f64>,
-    pub invgradweight: Array1<f64>,
-    pub inv_lapweight: Array1<f64>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AdaptiveRegularizationDiagnostics {
-    pub epsilon_0: f64,
-    pub epsilon_g: f64,
-    pub epsilon_c: f64,
-    pub epsilon_outer_iterations: usize,
-    pub mm_iterations: usize,
-    pub converged: bool,
-    pub maps: Vec<AdaptiveSpatialMap>,
-}
-
 #[derive(Debug, Clone)]
 pub struct LinearColumnConditioning {
     col_idx: usize,

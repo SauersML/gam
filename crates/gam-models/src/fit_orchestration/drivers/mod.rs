@@ -9,27 +9,24 @@
 // `gam_solve::*`, basis/term machinery as `gam_terms::*`).
 use gam_terms::basis::{
     BasisError, BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult,
-    BasisWorkspace, CenterStrategy, FixedRowSpaceProjector, MaternIdentifiability, PenaltySource,
+    BasisWorkspace, CenterStrategy, FixedRowSpaceProjector, MaternIdentifiability,
     SpatialIdentifiability, build_constant_curvature_basis_kappa_derivatives,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
-    build_matern_collocation_operator_matrices, build_measure_jet_basis_psi_derivatives,
+    build_measure_jet_basis_psi_derivatives,
     build_thin_plate_basis_log_kappa_derivatives, estimate_penalty_nullity,
     initial_aniso_contrasts,
 };
 
 use gam_custom_family::{
     BlockEffectiveJacobian, BlockGeometryDirectionalDerivative, BlockWorkingSet,
-    BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyOwnedMode,
-    CustomFamilyWarmStart, ExactNewtonOuterObjective, FamilyEvaluation, FamilyLinearizationState,
-    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    evaluate_custom_family_joint_hyper_efs_owned, evaluate_custom_family_joint_hyper_owned,
-    fit_custom_family, fit_custom_family_fixed_log_lambdas_from_owned_mode,
+    BlockwiseFitOptions, CustomFamily, FamilyEvaluation, FamilyLinearizationState,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, fit_custom_family,
 };
 
 use gam_model_kernels::bernoulli_link::bernoulli_natural_observation;
 
 use gam_solve::estimate::{
-    EstimationError, ExternalOptimOptions, FitInference, FitOptions, FittedLinkState, PenaltySpec,
+    EstimationError, ExternalOptimOptions, FitInference, FitOptions, PenaltySpec,
     UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
 };
 
@@ -46,13 +43,11 @@ use gam_solve::mixture_link::{
     state_from_sasspec, state_fromspec,
 };
 
-use gam_math::quantile::quantile_from_sorted;
-
 use gam_linalg::faer_ndarray::{fast_ab, fast_atb, fast_atv};
 
 use gam_linalg::matrix::{DesignBlock, DesignMatrix, RandomEffectOperator, SymmetricMatrix};
 
-use gam_problem::{ConstraintSet, ExactNewtonJointPsiTerms, LinearInequalityConstraints};
+use gam_problem::LinearInequalityConstraints;
 
 use gam_spec::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily,
@@ -72,12 +67,11 @@ use gam_terms::smooth::shape_constraints::{
 // had while textually pasted inside `gam_terms::smooth`.
 use gam_terms::smooth::*;
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
-use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use gam_terms::smooth::penalty_priors::realize_penalty_block_gamma_priors;
 
 // Fit-result carriers relocated out of `gam_terms::smooth::term_specs` with the
@@ -87,7 +81,6 @@ use gam_terms::smooth::penalty_priors::realize_penalty_block_gamma_priors;
 pub struct FittedTermCollection {
     pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
-    pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -142,7 +135,6 @@ pub struct FittedTermCollectionWithSpec {
     pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
     pub resolvedspec: TermCollectionSpec,
-    pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
     pub kappa_timing: Option<SpatialLengthScaleOptimizationTiming>,
 }
 
@@ -231,13 +223,6 @@ include!("spatial_length_scale_monotone_tests.rs");
 // relocated, so both guards compiled into NO binary. Self-contained
 // `#[cfg(test)] mod`, so it adds nothing to the non-test build.
 include!("psi_gram_tensor_fast_path_tests.rs");
-// #901 re-home: the custom-family ADAPTIVE-ψ projected-logdet REML
-// hypergradient + outer-Hessian FD oracle on a real `SpatialAdaptiveExactFamily`
-// — the half of #901 the engine fix (joint_jeffreys_information_depends_on_psi)
-// directly targets, plus the #426 unified-dispatch parity pin. Same #1601
-// orphaning story as the two oracles above; driver deps live HERE post-carve.
-// Self-contained `#[cfg(test)] mod`, so it adds nothing to the non-test build.
-include!("spatial_adaptive_hyper_fd_tests.rs");
 // #1274 re-home: the Matérn n-free penalty re-key topology/byte-identity gates.
 // Authored in the pre-#1521 monolith under `tests/src_modules/smooths/`, they
 // were orphaned by #1601 (the `gam_terms::smooth::tests` `include!` was
@@ -254,8 +239,9 @@ include!("matern_nfree_rekey_topology_tests.rs");
 // `tests/src_modules/` tree was `mod`'d into no binary). Self-contained
 // `#[cfg(test)] mod`.
 include!("design_assembly_constraint_tests.rs");
-// #1601 relocation debt: the LAST of the three orphaned smooth test files — 48
-// adaptive / bounded / pure-Duchon / Charbonnier regression guards. Same story:
+// #1601 relocation debt: the LAST of the three orphaned smooth test files — the
+// bounded / pure-Duchon regression guards (the adaptive-regularization guards
+// left with the engine they tested, #2670). Same story:
 // commented out of `gam_terms::smooth::tests` by #1601 "for relocation" and
 // parked in the `tests/src_modules/` tree that compiled into no binary. Re-homed
 // here where its `build_term_collection_design` / freeze / SAS-link-state /

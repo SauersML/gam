@@ -1727,7 +1727,6 @@ pub struct FitOptions {
     /// evaluator so baseline fits, spatial hyperparameter evaluations, outer
     /// line searches, final refits, and inference all optimize the same target.
     pub firth_bias_reduction: bool,
-    pub adaptive_regularization: Option<AdaptiveRegularizationOptions>,
     /// Fixed prior on smoothing parameters for explicit joint HMC sampling
     /// flows.
     ///
@@ -1762,7 +1761,6 @@ impl Default for FitOptions {
             nullspace_dims: Vec::new(),
             linear_constraints: None,
             firth_bias_reduction: false,
-            adaptive_regularization: None,
             rho_prior: gam_problem::RhoPrior::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
@@ -2190,33 +2188,6 @@ mod shipped_criterion_identity_tests {
         assert!(!mixed.upper_tail_gradient_vanishes_everywhere(2));
         // Out of range is malformed, not flat.
         assert!(!mixed.upper_tail_gradient_vanishes(2));
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AdaptiveRegularizationOptions {
-    pub enabled: bool,
-    pub max_mm_iter: usize,
-    pub beta_rel_tol: f64,
-    pub max_epsilon_outer_iter: usize,
-    pub epsilon_log_step: f64,
-    pub min_epsilon: f64,
-    pub weight_floor: f64,
-    pub weight_ceiling: f64,
-}
-
-impl Default for AdaptiveRegularizationOptions {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_mm_iter: 10,
-            beta_rel_tol: 1e-3,
-            max_epsilon_outer_iter: 4,
-            epsilon_log_step: std::f64::consts::LN_2,
-            min_epsilon: 1e-8,
-            weight_floor: 1e-8,
-            weight_ceiling: 1e8,
-        }
     }
 }
 
