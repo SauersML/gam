@@ -9044,6 +9044,201 @@ mod tests_atlas_prior_2280 {
              {atlas_misnamed:?}. Its errors must be abstentions."
         );
     }
+    /// #2280 — the seed-degenerate zoo's ATLAS REFUSALS, decomposed to their
+    /// typed cause. The zoo above establishes the headline (atlas refuses where
+    /// the manifold is intact, menu-race confidently misnames); this probe
+    /// answers the question that headline begs: WHICH gate refuses, and is the
+    /// refusal a property of the embedding or of the readout's own bars?
+    ///
+    /// The folded embedding is an injective immersion of the planted manifold
+    /// (identity block + Veronese fold), so every local chart sees the same
+    /// geometry it saw unembedded: a refusal there is NOT a statement about the
+    /// data. The nuisance embedding adds off-manifold noise, so a refusal there
+    /// may be honest. Separating the two arms per refusal cause is the point.
+    #[test]
+    fn atlas_refusal_causes_on_the_seed_degenerate_zoo_2280() {
+        use crate::manifold::tests_topology_fixtures::{
+            circle, cylinder_strip, embedded_plane, mobius_strip, open_arc, sphere, swiss_roll,
+            torus, trefoil_knot,
+        };
+
+        let zoo: Vec<(&str, Array2<f64>, usize)> = vec![
+            ("circle", circle(400, 2.0), 1),
+            ("trefoil", trefoil_knot(600, 1.0), 1),
+            ("open_arc", open_arc(400, 2.0), 1),
+            ("plane", embedded_plane(20, 20), 2),
+            ("swiss_roll", swiss_roll(30, 12), 2),
+            ("cylinder", cylinder_strip(60, 5), 2),
+            ("mobius", mobius_strip(60, 5), 2),
+            ("torus", torus(30, 20, 3.0, 1.0), 2),
+            ("sphere", sphere(500), 2),
+        ];
+        const VARIANCE_RATIO: f64 = 16.0;
+
+        let mut table = String::from(
+            "\n#2280 atlas refusal decomposition (typed cause per fixture/arm)\n\
+             embedding fixture      d  build                     charts dropped  verdict\n",
+        );
+        let mut folded_build_failures = 0usize;
+        let mut named_or_refused: Vec<String> = Vec::new();
+
+        for (embedding, build) in [
+            (
+                "folded",
+                (|x: &Array2<f64>| folded_embedding(x, VARIANCE_RATIO))
+                    as fn(&Array2<f64>) -> Array2<f64>,
+            ),
+            (
+                "nuisance",
+                (|x: &Array2<f64>| nuisance_embedding(x, VARIANCE_RATIO, 0x2280))
+                    as fn(&Array2<f64>) -> Array2<f64>,
+            ),
+        ] {
+            for (name, target, d) in &zoo {
+                let y = build(target);
+                let config = crate::manifold::LocalAtlasConfig::balanced(y.nrows(), *d);
+                let outcome = match crate::manifold::LocalAtlas::build(y.view(), config) {
+                    Err(build_err) => {
+                        if embedding == "folded" {
+                            folded_build_failures += 1;
+                        }
+                        format!("BUILD-ERR {build_err}")
+                    }
+                    Ok(atlas) => {
+                        let charts = atlas.chart_count();
+                        let dropped = atlas.rejected_centers().len();
+                        let verdict = match crate::manifold::observe_atlas_topology(&atlas) {
+                            Err(e) => format!("OBSERVE-ERR {e}"),
+                            Ok(readout) => match readout.refusal() {
+                                None => format!(
+                                    "NAMED {:?}",
+                                    readout.observed_manifold().expect("no refusal means named")
+                                ),
+                                Some(refusal) => {
+                                    let inv = readout.invariants();
+                                    format!(
+                                        "REFUSED {refusal} [b0/b1={}/{} mean_mult={:.2}\
+                                         unsigned_tri={}]",
+                                        inv.betti.b0,
+                                        inv.betti.b1,
+                                        inv.mean_cover_multiplicity,
+                                        inv.unsigned_orientation_triangles
+                                    )
+                                }
+                            },
+                        };
+                        format!("{charts:3} charts {dropped:2} dropped  {verdict}")
+                    }
+                };
+                if embedding == "folded" {
+                    named_or_refused.push(format!("{name}: {outcome}"));
+                }
+                table.push_str(&format!("{embedding:<9} {name:<12} {d}  {outcome}\n"));
+            }
+        }
+        println!("{table}");
+
+        // The folded embedding is an injective immersion: the atlas's own design
+        // premise ("local charts are always injective — small neighborhoods
+        // cannot fold") says a build failure there is a gate calibration fact,
+        // not a data fact. Record which side of that line the measured refusals
+        // fall on, as an enforced count rather than a scrolling log line.
+        let folded_build_failures_on_manifold_intact_arm = folded_build_failures;
+        assert!(
+            !named_or_refused.is_empty(),
+            "{table}\nThe folded arm must produce one row per fixture to decompose."
+        );
+        assert_eq!(
+            named_or_refused.len(),
+            zoo.len(),
+            "{table}\nEvery folded row must carry a typed outcome."
+        );
+        // Not a verdict on the refusals themselves — the decomposition is the
+        // deliverable. Only the accounting is enforced: the counts add up.
+        println!(
+            "folded arm: {folded_build_failures_on_manifold_intact_arm}/{} build errors, {} readout-stage outcomes",
+            zoo.len(),
+            named_or_refused
+                .iter()
+                .filter(|row| !row.contains("BUILD-ERR"))
+                .count()
+        );
+
+        // Mechanism check for the dominant refusal. `sign_resolution_budget` is
+        // sin(φ_a + φ_b) with φ = arcsin(sqrt(off-plane energy fraction)) — a
+        // WORST-CASE TILT consistent with the residual. Off-plane energy has two
+        // sources: frame tilt (first order in displacement, the thing the budget
+        // means to bound) and extrinsic curvature (second order: a curved
+        // manifold leaves ‖II‖²·ρ⁴-scale energy off ANY plane). The Veronese
+        // fold is pure curvature at fixed intrinsic geometry, so if the sign
+        // subcomplex shatters monotonically in the fold amplitude, the budget is
+        // conflating the two; if it does not, the shattering is a tilt story and
+        // this hypothesis is dead.
+        let mut sweep = String::from(
+            "\n#2280 fold-amplitude sweep (signed-subcomplex b0 vs nerve b0; shatter = b0_signed - b0_nerve)\n\
+             ratio  torus: signed b0/b1 vs nerve   shatter  sphere: signed b0/b1 vs nerve  shatter\n",
+        );
+        for ratio in [0.25_f64, 1.0, 4.0, 16.0] {
+            for (name, build_target, d) in [
+                (
+                    "torus",
+                    (|| torus(30, 20, 3.0, 1.0)) as fn() -> Array2<f64>,
+                    2,
+                ),
+                ("sphere", || sphere(500), 2),
+            ] {
+                let target = build_target();
+                let y = folded_embedding(&target, ratio);
+                let config = crate::manifold::LocalAtlasConfig::balanced(y.nrows(), d);
+                let Ok(atlas) = crate::manifold::LocalAtlas::build(y.view(), config) else {
+                    sweep.push_str(&format!("{ratio:<6} {name}: BUILD-ERR\n"));
+                    continue;
+                };
+                let Ok(readout) = crate::manifold::observe_atlas_topology(&atlas) else {
+                    sweep.push_str(&format!("{ratio:<6} {name}: OBSERVE-ERR\n"));
+                    continue;
+                };
+                let inv = readout.invariants();
+                let shatter = inv.signed_subcomplex_betti.b0.saturating_sub(inv.betti.b0);
+                sweep.push_str(&format!(
+                    "{ratio:<6} {name}: ({}, {}) vs ({}, {})            {shatter}\n",
+                    inv.signed_subcomplex_betti.b0,
+                    inv.signed_subcomplex_betti.b1,
+                    inv.betti.b0,
+                    inv.betti.b1
+                ));
+
+                // Margin decomposition on the largest fold: for every transition,
+                // is the sign refused because the BUDGET is inflated (budget ≥ 1
+                // or budget ≫ σ_min while σ_min is healthy) or because the
+                // tangent planes are GENUINELY near-orthogonal (σ_min small)?
+                // This decides the fix: a budget derivation that separates
+                // curvature energy from tilt energy, vs a denser cover.
+                if ratio == 16.0 {
+                    let mut budgets_saturated = 0usize;
+                    let mut healthy_cosines = 0usize;
+                    let mut total = 0usize;
+                    let mut worst_cosine = f64::INFINITY;
+                    for t in atlas.transitions() {
+                        total += 1;
+                        if t.sign_resolution_budget >= 1.0 {
+                            budgets_saturated += 1;
+                        }
+                        if t.smallest_principal_cosine > 0.5 {
+                            healthy_cosines += 1;
+                        }
+                        worst_cosine = worst_cosine.min(t.smallest_principal_cosine);
+                    }
+                    sweep.push_str(&format!(
+                        "         {name}: {total} transitions, {budgets_saturated} saturated \
+                         budgets (≥1.0), {healthy_cosines} with σ_min > 0.5, min σ_min = \
+                         {worst_cosine:.3}\n"
+                    ));
+                }
+            }
+        }
+        println!("{sweep}");
+    }
 }
 
 #[cfg(test)]
