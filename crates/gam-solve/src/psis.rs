@@ -241,7 +241,9 @@ fn profile_shape(b: f64, x: &[f64]) -> Option<f64> {
 
 #[inline]
 fn gpd_quantile(p: f64, k: f64, sigma: f64) -> f64 {
-    let survival = (1.0 - p).clamp(1e-12, 1.0);
+    // Callers pass `p = (rank + ½) / tail_count`, strictly inside (0, 1), so the
+    // survival is strictly inside (0, 1) and needs no floor before its log.
+    let survival = 1.0 - p;
     if k.abs() < 1e-8 {
         -sigma * survival.ln()
     } else {

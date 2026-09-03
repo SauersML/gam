@@ -779,11 +779,12 @@ where
     };
     let dim = seed.len();
     let target = initial.target;
-    let lower = seed.mapv(|v| v - 6.0);
-    let upper = seed.mapv(|v| v + 6.0);
+    // The baseline shape search runs on the outer engine's own domain; the
+    // private `seed ± 6` box that used to be handed in here was a hand-supplied
+    // bound of exactly the kind that decided the survival time-block λ until
+    // a03438645 (#2670).
     let problem = contract
         .configure(OuterProblem::new(dim).with_prefer_gradient_only(true))
-        .with_bounds(lower, upper)
         .with_initial_rho(seed.clone())
         .with_seed_config(crate::seeding::SeedConfig {
             max_seeds: 1,

@@ -2554,7 +2554,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let absorber_slots = usize::from(influence_columns.is_some());
     let absorber_rho0 = influence_columns
         .as_ref()
-        .map(|_| influence_absorber_log_lambda(spec.z.len()).clamp(-12.0, 12.0));
+        // A seed for the outer REML search, which the engine bounds on its
+        // own domain; the `±12` clamp that used to sit here bound only past
+        // ~1.6e5 rows, where it silently capped `ln n` (#2469).
+        .map(|_| influence_absorber_log_lambda(spec.z.len()));
     let marginal_penalty_count = marginal_design.penalties.len() + absorber_slots;
     let setup = joint_setup(
         data_view,
