@@ -138,6 +138,9 @@ fn formula() -> String {
 #[test]
 fn grouped_binomial_sweep_every_fit_is_minted_2569() {
     init_parallelism();
+    // The phase clocks and the geometry decision are `log::info!` lines; a
+    // test binary without a logger prints none of them.
+    gam_runtime::test_support::install_diagnostic_logger();
     let config = FitConfig {
         family: Some("binomial-logit".to_string()),
         weight_column: Some("w".to_string()),

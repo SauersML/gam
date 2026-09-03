@@ -456,6 +456,9 @@ fn gaussian_identity_bias_corrected_mean_interval(
 
 #[test]
 fn large_scale_reml_stress_main() {
+    // The phase clocks and the geometry decision are `log::info!` lines; a
+    // test binary without a logger prints none of them.
+    gam_runtime::test_support::install_diagnostic_logger();
     let (x_train, y_train, _y_true_train) = simulate(N_TRAIN, PC_DIM, SEED_BASE);
     let (x_holdout, _y_holdout, y_true_holdout) =
         simulate(N_HOLDOUT, PC_DIM, SEED_BASE.wrapping_add(0xDEAD));
