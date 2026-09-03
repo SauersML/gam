@@ -153,7 +153,20 @@ pub(crate) fn survival_location_scale_response_from_predictors(
             .collect()
     };
     let survival_prob = Array1::from_vec(survival_values?);
-    Ok(SurvivalLocationScalePredictResult { eta, survival_prob })
+    let log_survival_prob = Array1::from_vec(
+        eta.as_slice()
+            .ok_or_else(|| SurvivalLocationScaleError::NumericalFailure {
+                reason: "predict_survival_location_scale: eta storage is not contiguous".to_string(),
+            })?
+            .iter()
+            .map(|&v| inverse_link_log_survival_checked(inverse_link, v))
+            .collect::<Result<Vec<f64>, SurvivalLocationScaleError>>()?,
+    );
+    Ok(SurvivalLocationScalePredictResult {
+        eta,
+        survival_prob,
+        log_survival_prob,
+    })
 }
 
 pub fn predict_survival_location_scalewith_uncertainty(
@@ -359,6 +372,29 @@ pub(crate) fn inverse_link_survival_prob_checked(
     eta: f64,
 ) -> Result<f64, SurvivalLocationScaleError> {
     inverse_link_failure_prob_checked(inverse_link, eta).map(|f| (1.0 - f).clamp(0.0, 1.0))
+}
+
+/// `ln S(η)` for a location-scale survival fit's residual distribution,
+/// evaluated in log space, so the cumulative hazard `−ln S` is finite wherever
+/// the linear predictor is — a survival probability that has underflowed to 0
+/// still has the cumulative hazard the model assigns it (#2469, #2816).
+pub(crate) fn inverse_link_log_survival_checked(
+    inverse_link: &InverseLink,
+    eta: f64,
+) -> Result<f64, SurvivalLocationScaleError> {
+    Ok(match inverse_link {
+        InverseLink::Standard(StandardLink::Probit) => {
+            probit_log_survival_and_ratio_derivatives(eta).0
+        }
+        InverseLink::Standard(StandardLink::Logit) => -gam_linalg::utils::stable_softplus(eta),
+        InverseLink::Standard(StandardLink::CLogLog) => -eta.exp(),
+        _ => {
+            // No closed log form for the remaining links: their survival value
+            // is evaluated as such and logged; an exact zero is `−∞`, the
+            // cumulative hazard the model assigns there.
+            inverse_link_survival_prob_checked(inverse_link, eta)?.ln()
+        }
+    })
 }
 
 pub(crate) fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 {

@@ -88,13 +88,6 @@ pub fn resolve_saved_survival_time_columns(
     })
 }
 
-/// Smallest positive survival probability we admit before taking
-/// `-ln(S)` for the cumulative hazard. Using `f64::MIN_POSITIVE` (≈ 2.2e-308)
-/// would let `-ln(S)` reach ~709 and risk downstream `exp(-cum)` underflow
-/// patterns that don't round-trip through `clamp(0,1)`. `1e-300` keeps
-/// `-ln(S) ≤ ~691` and matches the location-scale predict contract upstream.
-const SURVIVAL_PROB_MIN_FOR_LOG: f64 = 1e-300;
-
 /// Typed errors emitted by the survival prediction pipeline.
 ///
 /// Each variant carries a pre-formatted `reason` string so `Display` is
@@ -3907,9 +3900,10 @@ fn predict_survival_location_scale_batch(
 
     // Mean / SE computation.  The uncertainty path also computes the
     // survival mean and eta, so we use whichever output we have.
-    let (eta_full, survival_prob_full, response_se_full, eta_se_full): (
+    let (eta_full, survival_prob_full, log_survival_prob_full, response_se_full, eta_se_full): (
         Array1<f64>,
         Array1<f64>,
+        Option<Array1<f64>>,
         Option<Array1<f64>>,
         Option<Array1<f64>>,
     ) = if with_uncertainty {
@@ -3947,16 +3941,25 @@ fn predict_survival_location_scale_batch(
              missing despite include_response_sd=true"
                 .to_string()
         })?;
+        // The posterior-mean survival is a closed-form response moment with no
+        // log-space form; its cumulative hazard is `−ln` of the value it has.
         (
             unc.eta,
             unc.survival_prob,
+            None,
             Some(response_se),
             Some(unc.eta_standard_error),
         )
     } else {
         let pred = predict_survival_location_scale(&pred_input, &saved_fit)
             .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
-        (pred.eta, pred.survival_prob, None, None)
+        (
+            pred.eta,
+            pred.survival_prob,
+            Some(pred.log_survival_prob),
+            None,
+            None,
+        )
     };
 
     let beta_threshold = saved_fit.beta_threshold();
@@ -4070,9 +4073,22 @@ fn predict_survival_location_scale_batch(
                 return;
             }
             let k = if per_row_eval { i } else { i * eval_width + j };
-            let surv = survival_prob_full[k].clamp(SURVIVAL_PROB_MIN_FOR_LOG, 1.0);
-            *s = surv;
-            *ch = -surv.ln();
+            // The cumulative hazard is `−ln S` in log space where the fit
+            // provides it, so it stays finite wherever the linear predictor is;
+            // a posterior-mean survival that has underflowed to exactly 0 has
+            // the infinite cumulative hazard the model assigns it, not a floored
+            // one (#2469).
+            match log_survival_prob_full.as_ref() {
+                Some(log_s) => {
+                    *s = log_s[k].exp();
+                    *ch = -log_s[k];
+                }
+                None => {
+                    let surv = survival_prob_full[k];
+                    *s = surv;
+                    *ch = if surv > 0.0 { -surv.ln() } else { f64::INFINITY };
+                }
+            }
             *h = hazard_full[k];
         });
 

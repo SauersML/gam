@@ -897,6 +897,8 @@ pub struct SurvivalLocationScalePredictInput {
 pub struct SurvivalLocationScalePredictResult {
     pub eta: Array1<f64>,
     pub survival_prob: Array1<f64>,
+    /// `ln` of `survival_prob`, evaluated in log space (finite wherever `eta` is).
+    pub log_survival_prob: Array1<f64>,
 }
 
 #[derive(Clone)]
