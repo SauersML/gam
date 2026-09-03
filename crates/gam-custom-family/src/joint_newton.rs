@@ -2339,20 +2339,32 @@ pub(crate) struct ObjectiveAccumulation {
     /// the objective values themselves plus the penalty's own cancellation
     /// scale.
     pub(crate) magnitude: f64,
+    /// The rounding the evaluation's NON-summed terms carry, summed over both
+    /// endpoints of the comparison: today the Jeffreys log-determinant's
+    /// certified `value_roundoff_bound` (gam#2718). A log-determinant with a
+    /// direction at the `1e-10·λ_max` floor rounds by `ε·1e10` in that
+    /// direction — orders above what the same evaluation's likelihood sum can
+    /// carry, and invisible to a ceiling that counts only summed terms. On
+    /// the `bms_covariance_declined_2718` fixture the ladder measured
+    /// `6e-8..1e-7` five times and a summed-terms ceiling of `1e-11` refused
+    /// every one, so the controller kept its `ε|F|` floor and ratcheted the
+    /// radius to `1e-12`.
+    pub(crate) logdet_roundoff: f64,
 }
 
 impl ObjectiveAccumulation {
-    /// `m·ε·(1 + Σ|terms|)` — the largest rounding one evaluation can carry.
+    /// `m·ε·(1 + Σ|terms|) + logdet_roundoff` — the largest rounding one
+    /// evaluation can carry.
     ///
     /// Non-finite or absurd inputs yield `f64::INFINITY`, i.e. no ceiling: this
     /// guard exists to refuse an impossible measurement, never to suppress a
     /// legitimate one it cannot size.
     pub(crate) fn roundoff_ceiling(&self) -> f64 {
-        if !self.magnitude.is_finite() {
+        if !self.magnitude.is_finite() || !self.logdet_roundoff.is_finite() {
             return f64::INFINITY;
         }
         let terms = (self.summed_terms.max(1) as f64).max(1.0);
-        terms * f64::EPSILON * (1.0 + self.magnitude.abs())
+        terms * f64::EPSILON * (1.0 + self.magnitude.abs()) + self.logdet_roundoff.max(0.0)
     }
 }
 

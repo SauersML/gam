@@ -1437,6 +1437,75 @@ impl JointJeffreysPlan {
         self.reduced_dim != 0 && self.gate_weight != 0.0
     }
 
+    /// `Φ = G · ½ Σ_i g(λ_i; floor)` — the gated Jeffreys value this spectrum
+    /// carries, emitted through the same `JeffreysLogdetAtom` projection the
+    /// full value/gradient/curvature term uses, so a value-only evaluation of
+    /// a trial point and the triple at the incumbent cannot disagree.
+    pub fn value(&self) -> f64 {
+        if !self.is_active() {
+            return 0.0;
+        }
+        super::atoms::CriterionAtom::value(&self.value_atom())
+    }
+
+    fn value_atom(&self) -> super::atoms::JeffreysLogdetAtom {
+        super::atoms::JeffreysLogdetAtom {
+            eigvals: self.evals.clone(),
+            floor: self.floor,
+            gate_weight: self.gate_weight,
+            reduced_drift: HashMap::new(),
+            floor_drift: HashMap::new(),
+            stratum: super::atoms::StratumFingerprint {
+                kept_rank: self.reduced_dim,
+                min_relative_eigengap: 0.0,
+            },
+        }
+    }
+
+    /// The rounding ONE evaluation of [`Self::value`] carries (gam#2718).
+    ///
+    /// A symmetric eigensolve returns each `λ_i` exactly for some perturbed
+    /// `H_id + E` with `‖E‖ ≤ m·ε·‖H_id‖`, so every eigenvalue is known only to
+    /// `m·ε·λ_max`. The value maps that through `g'(λ) = floored_inverse(λ)`,
+    /// which is `1/λ` on an identified direction and saturates at `1/floor`
+    /// below it, and the gate moves with `λ_min`, `λ_max` carrying `U = ½Σg`
+    /// with it. To first order in the perturbation
+    ///
+    /// ```text
+    /// δΦ ≤ m·ε·λ_max · ( G·½ Σ_i |g'(λ_i)| + (|∂G/∂λ_min| + |∂G/∂λ_max|)·|U| ).
+    /// ```
+    ///
+    /// At the relative floor `1/floor = 1/(1e-10·λ_max)`, so ONE floored
+    /// direction contributes `½·m·ε·1e10 ≈ 1e-6·m`: orders above the `ε·|F|`
+    /// a likelihood sum carries, and the reason a trust-region ratio test on
+    /// an objective that folds `Φ` cannot read changes below it. This is what
+    /// the inner solve's objective-resolution ceiling has to admit before it
+    /// can believe its own backtracking ladder.
+    pub fn value_roundoff_bound(&self) -> f64 {
+        if !self.is_active() {
+            return 0.0;
+        }
+        let m = self.reduced_dim as f64;
+        let eigenvalue_perturbation = m * f64::EPSILON * self.lambda_max.abs().max(self.floor);
+        let value_sensitivity = 0.5
+            * self.gate_weight.abs()
+            * self
+                .evals
+                .iter()
+                .map(|&lam| floored_inverse(lam, self.floor).abs())
+                .sum::<f64>();
+        let ungated = 0.5
+            * self
+                .evals
+                .iter()
+                .map(|&lam| jeffreys_antiderivative(lam, self.floor))
+                .sum::<f64>();
+        let (gate_grad_min, gate_grad_max) =
+            conditioning_gate_weight_grad(self.lambda_min, self.lambda_max);
+        let gate_sensitivity = (gate_grad_min.abs() + gate_grad_max.abs()) * ungated.abs();
+        eigenvalue_perturbation * (value_sensitivity + gate_sensitivity)
+    }
+
     /// Whether the reduced information is UNDER-IDENTIFIED at the gate's own
     /// derived knots — the yes/no question, as distinct from
     /// [`Self::is_active`]'s "would the term contribute anything".
@@ -1935,6 +2004,10 @@ where
     if !plan.is_active() {
         return Ok((0.0, Array1::zeros(p), Array2::zeros((p, p))));
     }
+    // SINGLE-EMISSION (gam#931). The Jeffreys value is the plan's own
+    // projection of its spectrum through `JeffreysLogdetAtom`; the value-only
+    // trial evaluation reads the same method, so no inline branch can drift.
+    let phi = plan.value();
     let m = plan.reduced_dim;
     let z_j = plan.z_j;
     let evals = plan.evals;
@@ -2020,23 +2093,6 @@ where
     } else {
         None
     };
-    // SINGLE-EMISSION (gam#931). The Jeffreys value and first derivative are
-    // emitted by the atom below from one spectrum and one floor. The live call
-    // site supplies the same reduced drifts it already needs for curvature; the
-    // atom owns the scalar projection (`g`, `g'_λ`, and `g'_floor`) so no inline
-    // value/gradient branch can drift from it.
-    let value_atom = super::atoms::JeffreysLogdetAtom {
-        eigvals: evals.clone(),
-        floor,
-        gate_weight,
-        reduced_drift: HashMap::new(),
-        floor_drift: HashMap::new(),
-        stratum: super::atoms::StratumFingerprint {
-            kept_rank: m,
-            min_relative_eigengap: 0.0,
-        },
-    };
-    let phi = super::atoms::CriterionAtom::value(&value_atom);
     // Gradient: grad[k] = ½ tr(K · Z_Jᵀ Hdot[e_k] Z_J) = ½ Σ_i d_i (Ṽ_k)_ii with
     // Ṽ_k = Vᵀ D_k V the reduced derivative rotated into the eigenbasis. For the
     // inner-Newton dense path the Hessian is beta-dependent through the working
@@ -4238,6 +4294,41 @@ mod tests {
     /// the saturated (locally-constant `G`) regimes — staying inside each branch
     /// to avoid the C¹ knots (the `max`-tie and ramp endpoints) where FD straddles
     /// a kink.
+    #[test]
+    pub(crate) fn a_floored_direction_dominates_the_value_roundoff_bound_2718() {
+        let z = Array2::<f64>::eye(2);
+        let plan_of = |lam_min: f64, lam_max: f64| {
+            let h = Array2::from_diag(&Array1::from(vec![lam_max, lam_min]));
+            JointJeffreysPlan::prepare(h.view(), z.view()).unwrap()
+        };
+        // Both directions identified above the absolute gate's clear point and
+        // within a factor of two of each other: the term is off, so is its
+        // rounding.
+        let off = plan_of(32.0, 64.0);
+        assert!(!off.is_active());
+        assert_eq!(off.value_roundoff_bound(), 0.0);
+        // A direction parked below the relative floor (`4e-12 < 1e-10 · 4`):
+        // `g'` saturates at `1/floor = 2.5e9`, so one evaluation of the value
+        // can round by `2·ε·4 · ½·(1/4 + 2.5e9) ≈ 2.2e-6`.
+        let floored = plan_of(4.0e-12, 4.0).value_roundoff_bound();
+        assert!(floored > 1.0e-6 && floored < 1.0e-5, "{floored:.3e}");
+        // Four decades above the floor the same direction is read through
+        // `1/λ`, and the bound falls by those four decades — it tracks the
+        // conditioning of the log-determinant, not `ε·|Φ|`.
+        let identified = plan_of(4.0e-6, 4.0).value_roundoff_bound();
+        let ratio = floored / identified;
+        assert!(
+            ratio > 5.0e3 && ratio < 2.0e4,
+            "ratio={ratio:.3e} floored={floored:.3e} identified={identified:.3e}"
+        );
+        // The value the bound describes is the one the full term emits.
+        let h = Array2::from_diag(&Array1::from(vec![4.0, 4.0e-6]));
+        let (phi, _grad, _hphi) =
+            joint_jeffreys_term(h.view(), z.view(), |_: &Array1<f64>| Ok(None)).unwrap();
+        assert_eq!(plan_of(4.0e-6, 4.0).value(), phi);
+        assert!(phi.is_finite() && phi != 0.0);
+    }
+
     #[test]
     pub(crate) fn conditioning_gate_weight_grad_matches_finite_difference() {
         // Each config picks (λ_min, λ_max) comfortably inside one branch:

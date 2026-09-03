@@ -6167,6 +6167,66 @@ impl CustomFamily for BetaDependentJeffreysInformationFamily {
     }
 }
 
+/// A trial point where the family cannot form its Jeffreys information is a
+/// refusal of that point, not a Jeffreys value of zero: the #2765 replays fired
+/// the zero arm thousands of times per solve at rows whose transformed time
+/// derivative was not positive, and every such trial was scored on an objective
+/// off from the incumbent's by `|Φ|`.
+#[test]
+fn the_jeffreys_value_refuses_a_point_whose_information_is_unavailable_2765() {
+    #[derive(Clone)]
+    struct RefusingJeffreysInformationFamily;
+    impl CustomFamily for RefusingJeffreysInformationFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            BetaDependentJeffreysInformationFamily.evaluate(block_states)
+        }
+
+        fn joint_jeffreys_term_required(&self) -> bool {
+            true
+        }
+
+        fn joint_jeffreys_information_with_specs(
+            &self,
+            block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+        ) -> Result<Option<Array2<f64>>, String> {
+            let (b0, _) = BetaDependentJeffreysInformationFamily::beta_of(block_states);
+            if b0 < 0.0 {
+                return Err(format!(
+                    "transformed time derivative must be positive: beta[0]={b0}"
+                ));
+            }
+            BetaDependentJeffreysInformationFamily
+                .joint_jeffreys_information_with_specs(block_states, specs)
+        }
+    }
+
+    let family = RefusingJeffreysInformationFamily;
+    let specs = vec![jeffreys_seam_spec(2)];
+    let ranges = block_param_ranges(&specs);
+    let z_joint = Array2::<f64>::eye(2);
+
+    let feasible = vec![jeffreys_seam_state(array![0.7, -0.4])];
+    let value = custom_family_joint_jeffreys_value(&family, &feasible, &specs, &ranges, &z_joint)
+        .expect("a feasible point has a Jeffreys value");
+    assert!(value.phi.is_finite() && value.phi != 0.0, "phi={}", value.phi);
+    assert!(value.roundoff > 0.0, "roundoff={}", value.roundoff);
+
+    let infeasible = vec![jeffreys_seam_state(array![-0.7, -0.4])];
+    let error =
+        custom_family_joint_jeffreys_value(&family, &infeasible, &specs, &ranges, &z_joint)
+            .expect_err("an unavailable information is a refusal of the point, not Φ = 0");
+    assert!(
+        error
+            .to_string()
+            .contains("transformed time derivative must be positive"),
+        "{error}"
+    );
+}
+
 /// `D_β H_Φ[δ]` must match a Richardson-certified central difference of the
 /// `H_Φ` the same helper pair produces.
 #[test]

@@ -243,14 +243,35 @@ pub(crate) fn jeffreys_term_skippable_for_source(
         .map_err(CustomFamilyError::trial_point)
 }
 
+/// The Jeffreys objective contribution at one working point together with the
+/// rounding one evaluation of it carries (gam#2718). The trust-region ratio
+/// test compares two of these; the second field is what lets the solve's
+/// objective-resolution ceiling admit a discrepancy the log-determinant's own
+/// arithmetic produced instead of refusing it as model error.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct JointJeffreysValue {
+    /// `strength · Φ`, the value folded into the inner objective.
+    pub(crate) phi: f64,
+    /// `strength · ` the plan's `value_roundoff_bound`.
+    pub(crate) roundoff: f64,
+}
+
 /// Evaluate ONLY the Jeffreys objective value `Phi = 1/2 log|Z_J^T H Z_J|` at
-/// the current working point. Cheaper than the full term (no directional
-/// derivatives), used to keep the trust-region accept/reject objective
-/// consistent with the Jeffreys-modified Newton step. Returns `0.0` when there
-/// is no coefficient system, the family exposes no exact joint Hessian,
-/// or the reduced Fisher information is not yet SPD (the value contribution is
-/// then simply omitted for that trial point — the step machinery still bounds
-/// the coefficient, and the next accepted cycle re-folds a finite value).
+/// the current working point, with its round-off bound. Cheaper than the full
+/// term (no directional derivatives), used to keep the trust-region
+/// accept/reject objective consistent with the Jeffreys-modified Newton step.
+/// Returns a zero value when there is no coefficient system or the family
+/// exposes no exact joint Hessian (the term is inapplicable, exactly as
+/// [`custom_family_joint_jeffreys_term`] reports `None`).
+///
+/// A point where the family CANNOT form its information (an infeasible trial
+/// point — on the survival marginal-slope families a row whose transformed
+/// time derivative is not positive — or a reduced spectrum the eigensolver
+/// refuses) is an error, not a zero: the objective `−ℓ + ½βᵀSβ − Φ` does not
+/// exist there. Returning `0.0` instead evaluated a DIFFERENT objective at that
+/// trial point, off from the incumbent's by `|Φ|`, and the #2765 replays show
+/// that arm firing thousands of times per solve. The trial loop routes this
+/// error through the same refusal a likelihood failure takes.
 pub(crate) fn custom_family_joint_jeffreys_value<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
@@ -259,42 +280,33 @@ pub(crate) fn custom_family_joint_jeffreys_value<
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
     z_joint: &Array2<f64>,
-) -> f64 {
+) -> Result<JointJeffreysValue, CustomFamilyError> {
     let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     if total_p == 0 || z_joint.ncols() == 0 {
-        return 0.0;
+        return Ok(JointJeffreysValue::default());
     }
-    let h_joint = match family.joint_jeffreys_information_with_specs(states, specs) {
-        Ok(Some(h)) if h.nrows() == total_p && h.ncols() == total_p => h,
-        // TEMPORARY gam#2695 instrument. This arm turns a FAILURE into a
-        // different objective value: Φ silently becomes 0 at this trial point
-        // while the baseline carried a finite one, so `actual` jumps by |Φ|
-        // with the model and likelihood both accepting — exactly the
-        // `[0,0,2,0]` partition. Print it so the live-warp fixture can say
-        // whether that is what it is doing.
-        other => {
-            log::info!(
-                "[P2695-PHI0] information unavailable at trial point: {}",
-                match other {
-                    Ok(Some(h)) => format!("shape {:?} != ({total_p},{total_p})", h.dim()),
-                    Ok(None) => "family exposes no joint Hessian".to_string(),
-                    Err(error) => format!("error: {error}"),
-                }
-            );
-            return 0.0;
+    let h_joint = match family.joint_jeffreys_information_with_specs(states, specs)? {
+        None => return Ok(JointJeffreysValue::default()),
+        Some(h) if h.nrows() == total_p && h.ncols() == total_p => h,
+        Some(h) => {
+            return Err(CustomFamilyError::trial_point(format!(
+                "joint Jeffreys information has shape {:?}, expected ({total_p},{total_p})",
+                h.dim()
+            )));
         }
     };
-    match gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_term(
+    let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
         h_joint.view(),
         z_joint.view(),
-        |_: &Array1<f64>| Ok(None),
-    ) {
-        Ok((phi, _grad, _hphi)) => phi * family.joint_jeffreys_term_strength(),
-        Err(error) => {
-            log::info!("[P2695-PHI0] jeffreys term refused at trial point: {error}");
-            0.0
-        }
-    }
+    )
+    .map_err(|error| {
+        CustomFamilyError::trial_point(format!("Jeffreys value unavailable at this point: {error}"))
+    })?;
+    let strength = family.joint_jeffreys_term_strength();
+    Ok(JointJeffreysValue {
+        phi: plan.value() * strength,
+        roundoff: plan.value_roundoff_bound() * strength.abs(),
+    })
 }
 
 fn scale_jeffreys_triple(

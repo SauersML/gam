@@ -5395,6 +5395,7 @@ pub(crate) fn an_impossible_resolution_claim_is_refused_and_a_real_one_is_kept_2
     let banded = ObjectiveAccumulation {
         summed_terms: 344,
         magnitude: 2.0e8,
+        logdet_roundoff: 0.0,
     };
     let mut witness = ObjectiveResolutionWitness::default();
     witness.start_ladder();
@@ -5430,6 +5431,7 @@ pub(crate) fn an_impossible_resolution_claim_is_refused_and_a_real_one_is_kept_2
         // |old| + |trial| + max|S_λ|·(‖β_old‖₁² + ‖β_trial‖₁²), generously: an
         // O(1) penalty matrix at ‖β‖₁ ≈ 1e6 and an objective of 8.1e8.
         magnitude: 2.0e3 + 8.1e8 + 1.0e12,
+        logdet_roundoff: 0.0,
     };
     let mut runaway_witness = ObjectiveResolutionWitness::default();
     runaway_witness.start_ladder();
@@ -5536,10 +5538,58 @@ pub(crate) fn the_runaway_step_is_rejected_once_its_resolution_claim_is_refused_
 /// The ceiling is a bound and never a suppressor: a non-finite accumulation
 /// cannot be sized, so it must license everything rather than refuse everything.
 #[test]
+pub(crate) fn a_log_determinant_at_the_floor_admits_the_ladders_measurement_2718() {
+    // `bms_covariance_declined_2718`'s terminal solve, from its own log: 160
+    // rows, an objective of ~109 at both endpoints, and a backtracking ladder
+    // whose `actual − predicted` held at `6.0e-8` across three decades of
+    // `‖δ‖`. The summed-terms ceiling there was `9.9e-12`, and it refused the
+    // claim five times while the radius ratcheted to `1e-12`.
+    let summed_only = ObjectiveAccumulation {
+        summed_terms: 160,
+        magnitude: 2.2e2,
+        logdet_roundoff: 0.0,
+    };
+    assert!(summed_only.roundoff_ceiling() < 1.0e-10);
+    let mut refused = ObjectiveResolutionWitness::default();
+    refused.start_ladder();
+    refused.observe(1.0e-4, -3.0e-7, 1.0e-8, summed_only);
+    refused.observe(1.0e-7, -6.0e-8, 1.0e-14, summed_only);
+    assert_eq!(refused.measured(), 0.0);
+    assert!(refused.refused().is_some());
+    // The same ladder, with the Jeffreys value's certified rounding at both
+    // endpoints (one reduced direction at the `1e-10` floor across 60 centers:
+    // `½·60·ε·1e10 ≈ 6.7e-5` per evaluation), is a measurement: the
+    // log-determinant CAN round by that much, so what failed to decay is
+    // rounding and the shrinks the ladder took are undone.
+    let with_logdet = ObjectiveAccumulation {
+        logdet_roundoff: 2.0 * 6.7e-5,
+        ..summed_only
+    };
+    assert!(with_logdet.roundoff_ceiling() > 1.0e-4);
+    let mut measured = ObjectiveResolutionWitness::default();
+    measured.start_ladder();
+    measured.observe(1.0e-4, -3.0e-7, 1.0e-8, with_logdet);
+    measured.observe(1.0e-7, -6.0e-8, 1.0e-14, with_logdet);
+    let resolution = measured.measured();
+    assert!(
+        resolution > 5.9e-8 && resolution < 6.1e-8,
+        "resolution={resolution:.3e}"
+    );
+    assert!(measured.refused().is_none());
+    // An unsizable log-determinant bound refuses nothing, like an unsizable sum.
+    let unsizable = ObjectiveAccumulation {
+        logdet_roundoff: f64::NAN,
+        ..summed_only
+    };
+    assert!(unsizable.roundoff_ceiling().is_infinite());
+}
+
+#[test]
 pub(crate) fn an_unsizable_accumulation_refuses_nothing_2748() {
     let unsizable = ObjectiveAccumulation {
         summed_terms: 1,
         magnitude: f64::NAN,
+        logdet_roundoff: 0.0,
     };
     assert!(unsizable.roundoff_ceiling().is_infinite());
     let mut witness = ObjectiveResolutionWitness::default();

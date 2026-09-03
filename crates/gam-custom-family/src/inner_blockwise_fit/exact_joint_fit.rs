@@ -2037,16 +2037,18 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // old_objective − trialobjective` compares two points on one objective
         // `−ℓ + ½βᵀSβ − Φ` (gam#826/#872). `lastobjective` is the pure
         // quadratic-penalized objective; subtract the gated old-β Φ here.
-        let old_phi = if !jeffreys_skippable_this_cycle {
+        let old_jeffreys = if !jeffreys_skippable_this_cycle {
             joint_jeffreys_subspace
                 .as_ref()
                 .map(|z_joint| {
                     custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint)
                 })
-                .unwrap_or(0.0)
+                .transpose()?
+                .unwrap_or_default()
         } else {
-            0.0
+            JointJeffreysValue::default()
         };
+        let old_phi = old_jeffreys.phi;
         let old_objective = lastobjective - old_phi;
         // Row measure observed by the objective at β. `lastobjective` was
         // set on the previous cycle (or at function entry) under `options`;
@@ -3331,12 +3333,23 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // cycle the trial, the step (H_Φ=0/∇Φ=0), and the residual all sit
             // on the SAME Φ=0 objective (gam#729/#715 sign fix; the baseline and
             // post-accept folds carry the matching skippable gate).
-            if !jeffreys_skippable_this_cycle
-                && let Some(z_joint) = joint_jeffreys_subspace.as_ref()
-            {
-                trial_penalty -=
-                    custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
-            }
+            // A trial point where the family cannot form its Jeffreys
+            // information has no objective to compare; that is a refusal of
+            // the trial (folded into `trial_ll_or_refusal` below, ahead of the
+            // likelihood sweep it would only waste), never a different Φ.
+            let trial_jeffreys: Result<JointJeffreysValue, CustomFamilyError> =
+                if !jeffreys_skippable_this_cycle
+                    && let Some(z_joint) = joint_jeffreys_subspace.as_ref()
+                {
+                    custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint)
+                } else {
+                    Ok(JointJeffreysValue::default())
+                };
+            let (trial_jeffreys_phi, trial_jeffreys_roundoff) = match &trial_jeffreys {
+                Ok(value) => (value.phi, value.roundoff),
+                Err(_) => (0.0, 0.0),
+            };
+            trial_penalty -= trial_jeffreys_phi;
             // Cheap-LL line-search path: rejected backtracking attempts
             // discard the exact-Newton workspace they build, so we evaluate
             // just the scalar full-data log-likelihood for the accept/reject
@@ -3361,8 +3374,47 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // collapses, and the inner exits non-converged at cycle ~2 (seed
             // rejected pre-solver → hard raise, β pinned). Subtract the trial
             // penalty so the threshold is the NLL the trial must beat.
-            let line_search_options =
-                coefficient_line_search_options(options, old_objective + 1e-10 - trial_penalty);
+            // What ONE evaluation at the incumbent and at this trial sums over,
+            // and the rounding the Jeffreys log-determinant carries at each
+            // (gam#2748, gam#2718). Built once, before the line search, because
+            // TWO decisions read it: the early exit below and the resolution
+            // witness after the trial objective is known. The objective
+            // magnitudes cover the likelihood accumulation; the penalty's
+            // cancellation scale is carried separately because it is precisely
+            // the term whose accumulation exceeds its value; the log-determinant
+            // is not a sum at all and carries its own certified bound.
+            let trial_beta_l1_norm: f64 = states
+                .iter()
+                .flat_map(|state| state.beta.iter())
+                .map(|value| value.abs())
+                .sum();
+            let penalty_accumulation_scale = penalty_entry_magnitude
+                * (old_beta_l1_norm * old_beta_l1_norm + trial_beta_l1_norm * trial_beta_l1_norm);
+            let pre_trial_accumulation = ObjectiveAccumulation {
+                summed_terms: total_joint_n,
+                magnitude: 2.0 * old_objective.abs() + penalty_accumulation_scale,
+                logdet_roundoff: old_jeffreys.roundoff + trial_jeffreys_roundoff,
+            };
+            // The early exit is a CERTIFICATE that the accept test below would
+            // refuse this trial, so its slack must be one that no admissible
+            // reading of the objective's rounding could overturn: the larger of
+            // the accept test's own slack at the incumbent and the ceiling on
+            // what one evaluation can round by. A literal `1e-10` here sat three
+            // decades below what a Firth objective at the `1e-10·λ_max` floor
+            // carries; on the bms 2718 endgame it refused 23 of 24 attempts per
+            // cycle before the ratio test or the witness ever saw them, so the
+            // witness had no ladder to measure and the radius ratcheted to its
+            // floor (gam#2718).
+            let early_exit_slack = joint_objective_roundoff_slack(
+                old_objective,
+                old_objective,
+                objective_resolution_witness.measured(),
+            )
+            .max(pre_trial_accumulation.roundoff_ceiling());
+            let line_search_options = coefficient_line_search_options(
+                options,
+                old_objective + early_exit_slack - trial_penalty,
+            );
             // Accept-on-first-attempt fast path (gam#979 `gradient_reload`
             // cost). On the FIRST trust-region attempt of a cycle the step
             // is the undamped (radius-bumped) Newton proposal, which on the
@@ -3423,14 +3475,16 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             //
             // Route both evaluators into one `Result` so there is a single
             // rejection block. Byte-identical while no evaluator errs.
-            let trial_ll_or_refusal = match fused_first_attempt_log_likelihood(
-                family,
-                options,
-                specs,
-                &states,
-                trust_attempt,
-                joint_workspace_requested,
-            ) {
+            let trial_ll_or_refusal = match trial_jeffreys.and_then(|_| {
+                fused_first_attempt_log_likelihood(
+                    family,
+                    options,
+                    specs,
+                    &states,
+                    trust_attempt,
+                    joint_workspace_requested,
+                )
+            }) {
                 Ok(Some((value, workspace))) => {
                     accepted_joint_workspace = Some(workspace);
                     Ok(value)
@@ -3539,23 +3593,11 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // the ladder's shrink is rounding, not remainder — and the
             // controller must know that before it can tell a bad region from
             // an unreadable one.
-            let trial_beta_l1_norm: f64 = states
-                .iter()
-                .flat_map(|state| state.beta.iter())
-                .map(|value| value.abs())
-                .sum();
-            // What ONE evaluation at these two points actually SUMS OVER, which
-            // is what bounds the rounding it can carry (gam#2748). The objective
-            // magnitudes cover the likelihood accumulation; the penalty's
-            // cancellation scale is carried separately because it is precisely
-            // the term whose accumulation exceeds its value.
+            // The accumulation the early exit certified against, with the trial
+            // objective's own magnitude in place of the incumbent's stand-in.
             let accumulation = ObjectiveAccumulation {
-                summed_terms: total_joint_n,
-                magnitude: old_objective.abs()
-                    + trialobjective.abs()
-                    + penalty_entry_magnitude
-                        * (old_beta_l1_norm * old_beta_l1_norm
-                            + trial_beta_l1_norm * trial_beta_l1_norm),
+                magnitude: old_objective.abs() + trialobjective.abs() + penalty_accumulation_scale,
+                ..pre_trial_accumulation
             };
             objective_resolution_witness.observe(
                 step_norm,
@@ -4368,7 +4410,9 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .as_ref()
                 .map(|z_joint| {
                     custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint)
+                        .map(|value| value.phi)
                 })
+                .transpose()?
                 .unwrap_or(0.0)
         } else {
             0.0
