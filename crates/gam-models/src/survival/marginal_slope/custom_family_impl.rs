@@ -852,6 +852,52 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         }
     }
 
+    fn exact_newton_joint_psihessian_directional_derivatives_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_index: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "survival marginal-slope exact-Newton joint psi-Hessian all-axes derivative: specs/block_states length mismatch {} vs {}",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        // Design-derivative ψ axes on the rigid frame come from one row sweep;
+        // every other axis (log-sigma, baseline) and the flex frames keep the
+        // per-axis sweep the batched path declines with `None`.
+        if self.family_hyper_role(hyper_layout, psi_index)?.is_none()
+            && let Some(axes) = self.psi_hessian_directional_derivatives_all_beta_axes_with_options(
+                block_states,
+                hyper_layout.design_derivative_blocks(),
+                psi_index,
+                &BlockwiseFitOptions::default(),
+            )?
+        {
+            return Ok(Some(axes));
+        }
+        let total: usize = block_states.iter().map(|state| state.beta.len()).sum();
+        let mut axes = Vec::with_capacity(total);
+        for axis in 0..total {
+            let mut direction = Array1::<f64>::zeros(total);
+            direction[axis] = 1.0;
+            match self.exact_newton_joint_psihessian_directional_derivative(
+                block_states,
+                specs,
+                hyper_layout,
+                psi_index,
+                &direction,
+            )? {
+                Some(matrix) => axes.push(matrix),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(axes))
+    }
+
     fn exact_newton_joint_psihessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],

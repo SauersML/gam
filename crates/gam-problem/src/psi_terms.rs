@@ -150,6 +150,39 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<DriftDerivResult>, String>;
+
+    /// [`Self::hessian_directional_derivative`] along every one of the `total`
+    /// joint coefficient axes at `psi_index`, in axis order. The default is the
+    /// per-axis sweep; a workspace whose family can build the set from one row
+    /// pass overrides it (gam#979). `None` on any axis is `None` for the set.
+    fn hessian_directional_derivatives_all_beta_axes(
+        &self,
+        psi_index: usize,
+        total: usize,
+    ) -> Result<Option<Vec<DriftDerivResult>>, String> {
+        per_axis_psi_hessian_directional_derivatives(self, psi_index, total)
+    }
+}
+
+/// The per-axis sweep behind
+/// [`ExactNewtonJointPsiWorkspace::hessian_directional_derivatives_all_beta_axes`],
+/// shared by the default and by overrides that fall back to it for the ψ axes
+/// their batched sweep does not cover.
+pub fn per_axis_psi_hessian_directional_derivatives<W: ExactNewtonJointPsiWorkspace + ?Sized>(
+    workspace: &W,
+    psi_index: usize,
+    total: usize,
+) -> Result<Option<Vec<DriftDerivResult>>, String> {
+    let mut axes = Vec::with_capacity(total);
+    for axis in 0..total {
+        let mut direction = Array1::<f64>::zeros(total);
+        direction[axis] = 1.0;
+        match workspace.hessian_directional_derivative(psi_index, &direction)? {
+            Some(drift) => axes.push(drift),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(axes))
 }
 
 #[cfg(test)]

@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The ψ-hyper build takes the ψ-Hessian directional derivative along every coefficient axis from one row sweep where the family provides it (marginal-slope rigid frame), instead of one sweep per axis (#979).
+
 - The blockwise coefficient loop's early exit and accept test use the objective's round-off slack instead of an absolute `1e-10` (#2469).
 
 - Survival marginal-slope fits with a follow-up-varying slope score trust-region trials on the follow-up-varying frame's likelihood; the value-only path previously read the time-constant closed form, so the slope's variation was invisible to the accept test (#2765).

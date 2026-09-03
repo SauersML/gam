@@ -2463,6 +2463,42 @@ pub trait CustomFamily {
         Ok(None)
     }
 
+    /// [`Self::exact_newton_joint_psihessian_directional_derivative`] along
+    /// EVERY joint coefficient axis at one ψ axis, `p` matrices in axis order.
+    ///
+    /// The ψ-hyper build's Firth branch needs all of them, and materializing
+    /// each with its own row sweep cost `3p` sweeps per ψ axis (gam#979: 58 s
+    /// per gradient on the rigid marginal-slope arm at n=4800, p=89). A family
+    /// whose row kernels are linear in the direction can build the whole set
+    /// from one sweep; this default is the per-axis loop, so a family without
+    /// that sweep answers exactly what it answered before, and `None` on any
+    /// axis is `None` for the set.
+    fn exact_newton_joint_psihessian_directional_derivatives_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        psi_index: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        let total: usize = block_states.iter().map(|state| state.beta.len()).sum();
+        let mut axes = Vec::with_capacity(total);
+        for axis in 0..total {
+            let mut direction = Array1::<f64>::zeros(total);
+            direction[axis] = 1.0;
+            match self.exact_newton_joint_psihessian_directional_derivative(
+                block_states,
+                specs,
+                hyper_layout,
+                psi_index,
+                &direction,
+            )? {
+                Some(matrix) => axes.push(matrix),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(axes))
+    }
+
     /// How the penalized Hessian's log-determinant and its derivatives
     /// should handle eigenvalues below the numerical-stability floor.
     ///

@@ -69,6 +69,72 @@ fn materialize_authoritative_psi_hessian_directional_derivative<
     }
 }
 
+/// [`materialize_authoritative_psi_hessian_directional_derivative`] along every
+/// joint coefficient axis at one ψ axis, in axis order, from the workspace when
+/// one is present and from the family otherwise — each of which may build the
+/// whole set from one row sweep (gam#979). `None` means no axis is available,
+/// exactly as the per-axis materializer's `None` on the first axis would.
+fn materialize_authoritative_psi_hessian_directional_derivatives_all_beta_axes<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    synced_states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    hyper_layout: &CustomFamilyHyperLayout,
+    psi_workspace: Option<&dyn ExactNewtonJointPsiWorkspace>,
+    psi_index: usize,
+    total: usize,
+) -> Result<Option<Vec<Array2<f64>>>, CustomFamilyError> {
+    let drifts = if let Some(workspace) = psi_workspace {
+        workspace.hessian_directional_derivatives_all_beta_axes(psi_index, total)?
+    } else {
+        family
+            .exact_newton_joint_psihessian_directional_derivatives_all_beta_axes(
+                synced_states,
+                specs,
+                hyper_layout,
+                psi_index,
+            )?
+            .map(|axes| axes.into_iter().map(DriftDerivResult::Dense).collect::<Vec<_>>())
+    };
+    let Some(drifts) = drifts else {
+        return Ok(None);
+    };
+    if drifts.len() != total {
+        return Err(CustomFamilyError::trial_point(format!(
+            "authoritative psi Hessian all-axes derivative for axis {psi_index} produced {} \
+             axes, expected {total}",
+            drifts.len()
+        )));
+    }
+    let mut axes = Vec::with_capacity(total);
+    for drift in drifts {
+        axes.push(match drift {
+            DriftDerivResult::Dense(matrix) => {
+                if matrix.dim() != (total, total) {
+                    return Err(CustomFamilyError::trial_point(format!(
+                        "authoritative psi Hessian all-axes derivative for axis {psi_index} \
+                         has dense shape {:?}, expected ({total}, {total})",
+                        matrix.dim(),
+                    )));
+                }
+                matrix
+            }
+            DriftDerivResult::Operator(operator) => {
+                if operator.dim() != total {
+                    return Err(CustomFamilyError::trial_point(format!(
+                        "authoritative psi Hessian all-axes derivative for axis {psi_index} \
+                         has operator dimension {}, expected {total}",
+                        operator.dim(),
+                    )));
+                }
+                operator.mul_mat(&Array2::<f64>::eye(total))
+            }
+        });
+    }
+    Ok(Some(axes))
+}
+
 /// Build `HyperCoord` objects for ψ (custom family) hyperparameters.
 ///
 /// Converts family-provided (a^ℓ, q, L) objects and penalty derivatives
@@ -307,31 +373,20 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
         // former code called the row-streaming provider independently in each
         // location, doubling the genuinely ψ-dependent work as well as the base
         // work. Keep canonical axis order so every contraction is unchanged.
+        // One sweep for all `total` axes where the family or workspace can build
+        // it (gam#979: this loop used to materialize each axis with its own row
+        // sweep, 58 s per gradient on the rigid marginal-slope arm).
         let firth_pert_axis_derivatives: Option<Vec<Array2<f64>>> =
             if jeffreys_hphi_ctx.is_some() && firth_pert_info.is_some() {
-                let mut axes = Vec::with_capacity(total);
-                let mut complete = true;
-                for a_idx in 0..total {
-                    let mut e_a = Array1::<f64>::zeros(total);
-                    e_a[a_idx] = 1.0;
-                    match materialize_authoritative_psi_hessian_directional_derivative(
-                        family,
-                        synced_states,
-                        specs,
-                        hyper_layout,
-                        psi_workspace.as_deref(),
-                        psi_global,
-                        &e_a,
-                        total,
-                    )? {
-                        Some(matrix) => axes.push(matrix),
-                        None => {
-                            complete = false;
-                            break;
-                        }
-                    }
-                }
-                complete.then_some(axes)
+                materialize_authoritative_psi_hessian_directional_derivatives_all_beta_axes(
+                    family,
+                    synced_states,
+                    specs,
+                    hyper_layout,
+                    psi_workspace.as_deref(),
+                    psi_global,
+                    total,
+                )?
             } else {
                 None
             };
@@ -366,28 +421,66 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // Typed capability path for families without a build-once
                 // canonical batch. Exact and intentionally isolated from the
                 // authoritative batched path above.
-                for a_idx in 0..total {
-                    let mut e_a = Array1::<f64>::zeros(total);
-                    e_a[a_idx] = 1.0;
-                    let hdot_a =
-                        family.joint_jeffreys_information_directional_derivative_with_specs(
-                            synced_states,
-                            specs,
-                            &e_a,
-                        )?;
-                    let psi_hdot_a =
-                        materialize_authoritative_psi_hessian_directional_derivative(
-                            family,
-                            synced_states,
-                            specs,
-                            hyper_layout,
-                            psi_workspace.as_deref(),
-                            psi_global,
-                            &e_a,
-                            total,
-                        )?;
-                    if let (Some(hdot_a), Some(psi_hdot_a)) = (hdot_a, psi_hdot_a) {
+                // Both sets from one sweep each where the family can (gam#979);
+                // the per-axis sweep is the fallback for a family that answers
+                // one axis at a time.
+                let batched = match (
+                    family.joint_jeffreys_information_directional_derivative_all_axes_with_specs(
+                        synced_states,
+                        specs,
+                    )?,
+                    materialize_authoritative_psi_hessian_directional_derivatives_all_beta_axes(
+                        family,
+                        synced_states,
+                        specs,
+                        hyper_layout,
+                        psi_workspace.as_deref(),
+                        psi_global,
+                        total,
+                    )?,
+                ) {
+                    (Some(hdots), Some(psi_hdots))
+                        if hdots.len() == total && psi_hdots.len() == total =>
+                    {
+                        Some((hdots, psi_hdots))
+                    }
+                    _ => None,
+                };
+                if let Some((hdots, psi_hdots)) = batched {
+                    for a_idx in 0..total {
                         let phi_psi_beta_a =
+                                gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
+                                    h_joint.view(),
+                                    z_j.view(),
+                                    pert_info,
+                                    &hdots[a_idx],
+                                    &psi_hdots[a_idx],
+                                )?;
+                        g[a_idx] -= phi_psi_beta_a;
+                    }
+                } else {
+                    for a_idx in 0..total {
+                        let mut e_a = Array1::<f64>::zeros(total);
+                        e_a[a_idx] = 1.0;
+                        let hdot_a =
+                            family.joint_jeffreys_information_directional_derivative_with_specs(
+                                synced_states,
+                                specs,
+                                &e_a,
+                            )?;
+                        let psi_hdot_a =
+                            materialize_authoritative_psi_hessian_directional_derivative(
+                                family,
+                                synced_states,
+                                specs,
+                                hyper_layout,
+                                psi_workspace.as_deref(),
+                                psi_global,
+                                &e_a,
+                                total,
+                            )?;
+                        if let (Some(hdot_a), Some(psi_hdot_a)) = (hdot_a, psi_hdot_a) {
+                            let phi_psi_beta_a =
                                 gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
                                     h_joint.view(),
                                     z_j.view(),
@@ -395,7 +488,8 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                                     &hdot_a,
                                     &psi_hdot_a,
                                 )?;
-                        g[a_idx] -= phi_psi_beta_a;
+                            g[a_idx] -= phi_psi_beta_a;
+                        }
                     }
                 }
             }

@@ -1456,6 +1456,200 @@ impl SurvivalMarginalSlopeFamily {
     /// sampled rows are visited and the accumulator uses per-row
     /// Horvitz-Thompson inverse-inclusion weights before being wrapped in the
     /// `HyperOperator`.
+    /// [`Self::psi_hessian_directional_derivative_with_options`] along EVERY
+    /// joint coefficient axis of one design-derivative ψ axis, from ONE row
+    /// sweep.
+    ///
+    /// The per-axis accumulator evaluates each row's third- and fourth-order
+    /// kernels once per coefficient axis, so the ψ-hyper build's Firth branch,
+    /// which needs the derivative along all `p` axes, swept the rows `3p` times
+    /// per ψ axis (gam#979: 58 s per gradient at n=4800, p=89). Every per-axis
+    /// input is linear in the direction: the row's primary direction is
+    /// `L_row·e_a` for a fixed `P×p` loading (three time/marginal functionals
+    /// and the slope channels' design rows), and the ψ action is
+    /// `psi_row[a]` times a fixed placement. So each row's kernels are
+    /// evaluated once per primary basis vector (`P` third-order calls and `P`
+    /// fourth-order calls contracted with the ψ direction) and contracted per
+    /// axis with the sparse loading column; only the design pullbacks remain
+    /// per axis.
+    ///
+    /// Rigid frame only. The flex and time-wiggle kernels carry their own
+    /// primary layout and ψ lifts, and keep the per-axis path: this returns
+    /// `None` there, exactly as it does where the per-axis path has no ψ block,
+    /// so a caller falls back to the per-axis sweep with identical semantics.
+    pub(crate) fn psi_hessian_directional_derivatives_all_beta_axes_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if self.effective_flex_active(block_states)?
+            || self.flex_timewiggle_active()
+            || self.slope_is_follow_up_varying()
+        {
+            return Ok(None);
+        }
+        let slices = block_slices(self, block_states);
+        let Some((block_idx, local_idx, p_psi, psi_label)) =
+            self.psi_block_info(derivative_blocks, psi_index)?
+        else {
+            return Ok(None);
+        };
+        let deriv = &derivative_blocks[block_idx][local_idx];
+        let loading = spatial_block_primary_loading(self, block_idx)?;
+        let beta_psi = match block_idx {
+            1 => &block_states[1].beta,
+            _ => &block_states[2].beta,
+        };
+        let psi_block_range = match block_idx {
+            1 => slices.marginal.clone(),
+            _ => slices.slope.clone(),
+        };
+        let primary_dim = self.core_primary_dimension();
+        // The ψ action of the per-axis path is `psi_row · d_beta_block` placed
+        // in these primary slots (`primary_psi_action_from_psi_row`).
+        let mut placement = Array1::<f64>::zeros(primary_dim);
+        if block_idx == 1 {
+            placement[PRIMARY_Q0] = 1.0;
+            placement[PRIMARY_Q1] = 1.0;
+        } else {
+            placement[PRIMARY_SLOPE] = 1.0;
+        }
+        let basis: Vec<Array1<f64>> = (0..primary_dim)
+            .map(|k| {
+                let mut e = Array1::<f64>::zeros(primary_dim);
+                e[k] = 1.0;
+                e
+            })
+            .collect();
+
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.slope.len();
+        let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
+        let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
+        let p_total = slices.total;
+
+        let policy = gam_runtime::resource::ResourcePolicy::default_library();
+        let psi_map = crate::custom_family::resolve_custom_family_x_psi_map(
+            deriv,
+            self.n,
+            p_psi,
+            0..self.n,
+            psi_label,
+            &policy,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let row_weights = outer_row_weights_by_index(options, self.n);
+        let slope_channels = self.slope_layout.primary_channels();
+        let accs = chunked_row_reduction(
+            row_iter.as_slice(),
+            || {
+                (0..p_total)
+                    .map(|_| BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i))
+                    .collect::<Vec<_>>()
+            },
+            |row, accs| -> Result<(), String> {
+                let psi_row = psi_map
+                    .row_vector(row)
+                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
+                let psi_dir = primary_direction_from_psi_row(self, block_idx, &psi_row, beta_psi)?;
+                let w = row_weights[row];
+                // The row's kernels once per primary basis vector.
+                let mut third: Vec<Array2<f64>> = Vec::with_capacity(primary_dim);
+                let mut fourth: Vec<Array2<f64>> = Vec::with_capacity(primary_dim);
+                for e in &basis {
+                    let mut t = self.row_primary_third_contracted_general(row, block_states, e)?;
+                    let mut f =
+                        self.row_primary_fourth_contracted_general(row, block_states, e, &psi_dir)?;
+                    if w != 1.0 {
+                        t.mapv_inplace(|v| v * w);
+                        f.mapv_inplace(|v| v * w);
+                    }
+                    third.push(t);
+                    fourth.push(f);
+                }
+                // The third-order kernel contracted with the ψ placement: the
+                // per-axis `third_action` is this times `psi_row[a]`.
+                let mut action = Array2::<f64>::zeros((primary_dim, primary_dim));
+                for (k, t) in third.iter().enumerate() {
+                    if placement[k] != 0.0 {
+                        action.scaled_add(placement[k], t);
+                    }
+                }
+                // The row's loading `L_row`: each primary as a linear functional
+                // of β (`row_primary_direction_from_flat_dynamic_with_q_geometry`).
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                let slope_rows: Vec<(usize, Array1<f64>)> = slope_channels
+                    .as_slice()
+                    .iter()
+                    .map(|&(primary, design)| -> Result<(usize, Array1<f64>), String> {
+                        let chunk = design
+                            .try_row_chunk(row..row + 1)
+                            .map_err(|e| format!("survival slope channel design row: {e}"))?;
+                        Ok((primary, chunk.row(0).to_owned()))
+                    })
+                    .collect::<Result<_, _>>()?;
+                let mut row_dir = Array1::<f64>::zeros(primary_dim);
+                let mut third_beta = Array2::<f64>::zeros((primary_dim, primary_dim));
+                let mut fourth_a = Array2::<f64>::zeros((primary_dim, primary_dim));
+                for axis in 0..p_total {
+                    row_dir.fill(0.0);
+                    if slices.time.contains(&axis) {
+                        let j = axis - slices.time.start;
+                        row_dir[PRIMARY_Q0] = q_geom.dq0_time[j];
+                        row_dir[PRIMARY_Q1] = q_geom.dq1_time[j];
+                        row_dir[PRIMARY_QD1] = q_geom.dqd1_time[j];
+                    } else if slices.marginal.contains(&axis) {
+                        let j = axis - slices.marginal.start;
+                        row_dir[PRIMARY_Q0] = q_geom.dq0_marginal[j];
+                        row_dir[PRIMARY_Q1] = q_geom.dq1_marginal[j];
+                        row_dir[PRIMARY_QD1] = q_geom.dqd1_marginal[j];
+                    } else if slices.slope.contains(&axis) {
+                        let j = axis - slices.slope.start;
+                        for (primary, design_row) in &slope_rows {
+                            row_dir[*primary] = design_row[j];
+                        }
+                    }
+                    let in_psi_block = psi_block_range.contains(&axis);
+                    let direction_is_zero = row_dir.iter().all(|v| *v == 0.0);
+                    if direction_is_zero && !in_psi_block {
+                        continue;
+                    }
+                    third_beta.fill(0.0);
+                    fourth_a.fill(0.0);
+                    for k in 0..primary_dim {
+                        if row_dir[k] != 0.0 {
+                            third_beta.scaled_add(row_dir[k], &third[k]);
+                            fourth_a.scaled_add(row_dir[k], &fourth[k]);
+                        }
+                    }
+                    let right_primary = third_beta.t().dot(&loading);
+                    accs[axis].add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary)?;
+                    accs[axis].add_pullback(self, row, &fourth_a)?;
+                    if in_psi_block {
+                        let coefficient = psi_row[axis - psi_block_range.start];
+                        if coefficient != 0.0 {
+                            let third_action = action.mapv(|v| v * coefficient);
+                            accs[axis].add_pullback(self, row, &third_action)?;
+                        }
+                    }
+                }
+                Ok(())
+            },
+            |total, chunk| {
+                for (t, c) in total.iter_mut().zip(chunk.iter()) {
+                    t.add(c);
+                }
+            },
+        )?;
+        Ok(Some(accs.iter().map(|acc| acc.to_dense(&slices)).collect()))
+    }
+
     pub(crate) fn psi_hessian_directional_derivative_operator_with_options(
         &self,
         block_states: &[ParameterBlockState],

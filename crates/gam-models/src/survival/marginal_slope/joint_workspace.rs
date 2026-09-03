@@ -411,6 +411,39 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         }
     }
 
+    fn hessian_directional_derivatives_all_beta_axes(
+        &self,
+        psi_index: usize,
+        total: usize,
+    ) -> Result<Option<Vec<gam_problem::DriftDerivResult>>, String> {
+        if self
+            .family
+            .family_hyper_role(&self.hyper_layout, psi_index)?
+            .is_none()
+            && let Some(axes) = self
+                .family
+                .psi_hessian_directional_derivatives_all_beta_axes_with_options(
+                    &self.block_states,
+                    self.hyper_layout.design_derivative_blocks(),
+                    psi_index,
+                    &self.options,
+                )?
+        {
+            if axes.len() != total {
+                return Err(format!(
+                    "survival marginal-slope joint workspace: batched psi-Hessian sweep produced {} axes, expected {total}",
+                    axes.len()
+                ));
+            }
+            return Ok(Some(
+                axes.into_iter()
+                    .map(gam_problem::DriftDerivResult::Dense)
+                    .collect(),
+            ));
+        }
+        gam_problem::psi_terms::per_axis_psi_hessian_directional_derivatives(self, psi_index, total)
+    }
+
     fn hessian_directional_derivative(
         &self,
         psi_index: usize,
