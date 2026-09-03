@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The penalty pseudo-log-determinant treats a coordinate no penalty block covers as structurally null whether or not a ridge is present, so its rank agrees with the penalized subspace the Hessian carries (#2454, #2760).
+
 - The SAE exact stationarity Hessian is assembled from one arrow probe per coordinate slot plus one per border column instead of one apply per column (#2267, #2731).
 
 - The joint Newton certificate is deferred to a negative-curvature escape only when that escape could lower the objective by more than its resolution within the trust radius (#2765).

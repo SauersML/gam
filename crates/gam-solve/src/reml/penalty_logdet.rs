@@ -437,8 +437,13 @@ impl PenaltyPseudologdet {
 
         // Eigendecompose each block and collect results.
 
-        // For the unpenalized dimensions (not covered by any block), add ridge.
-        // Those dimensions have eigenvalue = ridge if ridge > 0, otherwise 0 (null).
+        // Coordinates no penalty block covers are in the structural null space
+        // of `Σ λ_k S_k`, ridge or no ridge. The ridge stabilises a factorization;
+        // it is not a penalty, and the hinted split INSIDE a block already
+        // treats a ridge-only direction as null (gam#2454: counting the
+        // uncovered intercept as a rank-1 "ridge block" reported `rank = 10`
+        // beside an `E` of 9 rows and a `log|S|₊` growing at exactly 9 per
+        // unit ρ, and put `1/ridge²` into the inverse spectrum).
         let mut covered = vec![false; p_total];
         for bd in &blocks {
             for i in bd.start..bd.end {
@@ -499,7 +504,7 @@ impl PenaltyPseudologdet {
                 nullity,
             })
         };
-        let mut block_results: Vec<BlockResult> = if rayon::current_thread_index().is_some() {
+        let block_results: Vec<BlockResult> = if rayon::current_thread_index().is_some() {
             blocks
                 .iter()
                 .map(process_block)
@@ -512,27 +517,6 @@ impl PenaltyPseudologdet {
         };
 
         // Also add uncovered dimensions as trivial "block results".
-        if ridge > 0.0 {
-            let inv_ridge_sq = 1.0 / (ridge * ridge);
-            let scale = 1.0 / ridge.sqrt();
-            for (idx, &c) in covered.iter().enumerate() {
-                if !c {
-                    let mut w_col = Array2::<f64>::zeros((1, 1));
-                    w_col[[0, 0]] = scale;
-                    block_results.push(BlockResult {
-                        start: idx,
-                        end: idx + 1,
-                        w_local: w_col,
-                        u_null_local: Array2::<f64>::zeros((1, 0)),
-                        inv_evals_sq: vec![inv_ridge_sq],
-                        value: ridge.ln(),
-                        rank: 1,
-                        nullity: 0,
-                    });
-                }
-            }
-        }
-
         // Assemble combined W-factor and other arrays.
         let total_rank: usize = block_results.iter().map(|br| br.rank).sum();
         let total_value: f64 = block_results.iter().map(|br| br.value).sum();
@@ -561,11 +545,7 @@ impl PenaltyPseudologdet {
 
         // Null space: the dimensions where eigenvalue == 0 (ridge == 0, no penalty).
         let block_nullity: usize = block_results.iter().map(|br| br.nullity).sum();
-        let uncovered_nullity = if ridge > 0.0 {
-            0
-        } else {
-            covered.iter().filter(|&&c| !c).count()
-        };
+        let uncovered_nullity = covered.iter().filter(|&&c| !c).count();
         let total_nullity = block_nullity + uncovered_nullity;
         let u_null = if total_nullity > 0 {
             let mut u0 = Array2::<f64>::zeros((p_total, total_nullity));
@@ -578,7 +558,7 @@ impl PenaltyPseudologdet {
                 }
             }
             for (idx, &c) in covered.iter().enumerate() {
-                if !c && ridge <= 0.0 {
+                if !c {
                     u0[[idx, null_col]] = 1.0;
                     null_col += 1;
                 }
@@ -1195,31 +1175,9 @@ impl PenaltyPseudologdet {
             });
         }
 
-        // Coordinates not covered by any penalty block carry only the ridge (or
-        // are structurally null when ridge == 0), mirroring the uncovered-column
-        // handling in `from_penalties_block_factored`.
-        if let Some(r) = ridge {
-            let inv_ridge_sq = 1.0 / (r * r);
-            let scale = 1.0 / r.sqrt();
-            for (idx, &c) in covered.iter().enumerate() {
-                if !c {
-                    let mut w_col = Array2::<f64>::zeros((1, 1));
-                    w_col[[0, 0]] = scale;
-                    block_results.push(BlockResult {
-                        start: idx,
-                        end: idx + 1,
-                        w_local: w_col,
-                        u_null_local: Array2::<f64>::zeros((1, 0)),
-                        inv_evals_sq: vec![inv_ridge_sq],
-                        value: r.ln(),
-                        rank: 1,
-                        nullity: 0,
-                    });
-                }
-            }
-        }
-
-        // Assemble the combined block-diagonal factorization.
+        // Coordinates no penalty block covers are structurally null, ridge or
+        // no ridge — the same rule as `from_penalties_block_factored` and as the
+        // hinted split inside a block (gam#2454).
         let total_rank: usize = block_results.iter().map(|br| br.rank).sum();
         let total_value: f64 = block_results.iter().map(|br| br.value).sum();
 
@@ -1246,11 +1204,7 @@ impl PenaltyPseudologdet {
         }
 
         let block_nullity: usize = block_results.iter().map(|br| br.nullity).sum();
-        let uncovered_nullity = if ridge.is_some() {
-            0
-        } else {
-            covered.iter().filter(|&&c| !c).count()
-        };
+        let uncovered_nullity = covered.iter().filter(|&&c| !c).count();
         let total_nullity = block_nullity + uncovered_nullity;
         let u_null = if total_nullity > 0 {
             let mut u0 = Array2::<f64>::zeros((p_total, total_nullity));
@@ -1262,12 +1216,10 @@ impl PenaltyPseudologdet {
                     null_col += br.nullity;
                 }
             }
-            if ridge.is_none() {
-                for (idx, &c) in covered.iter().enumerate() {
-                    if !c {
-                        u0[[idx, null_col]] = 1.0;
-                        null_col += 1;
-                    }
+            for (idx, &c) in covered.iter().enumerate() {
+                if !c {
+                    u0[[idx, null_col]] = 1.0;
+                    null_col += 1;
                 }
             }
             Some(u0)
