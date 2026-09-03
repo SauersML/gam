@@ -4764,6 +4764,23 @@ impl SaeManifoldTerm {
     /// log-determinant (VALUE) and its `A⁻¹` selected inverse (GRADIENT) so both
     /// factor one identical operator. `test_support`-scoped until Phase 2 wiring
     /// (see [`Self::exact_observed_information_log_dets`]).
+    /// The exact stationarity Hessian as a dense `dim × dim` matrix, assembled
+    /// from `slots + k` Hessian-vector applies instead of `dim` (gam#2267).
+    ///
+    /// The operator is an arrow: [`Self::apply_exact_hessian`] is the cached
+    /// arrow Hessian (per-row coordinate blocks plus the border) plus the exact
+    /// correction, and row `i`'s coordinates couple only to row `i`'s own and
+    /// to the border. Probing coordinate slot `c` of EVERY row at once
+    /// therefore returns column `c` of every row's diagonal block in one apply
+    /// (the cross-row `t–t` entries that sum would otherwise mix are zero), and
+    /// probing border column `j` returns `A[·, β_j]` whole, its `t` entries
+    /// included, so the `t–β` block comes from the `k` border probes by
+    /// symmetry. On the #2267 K=8 arm (508 rows × 2 coordinates + 72) that is
+    /// 74 applies where the column loop took 1088, 3.8 ms each, 129 times in
+    /// the run's first 14 minutes.
+    ///
+    /// [`Self::materialize_exact_hessian_dense_by_columns`] is that column
+    /// loop, kept as the oracle the equality pin measures this against.
     pub(crate) fn materialize_exact_hessian_dense(
         &self,
         rho: &SaeManifoldRho,
@@ -4772,67 +4789,59 @@ impl SaeManifoldTerm {
     ) -> Result<Array2<f64>, String> {
         let total_t = cache.delta_t_len();
         let k = cache.k;
-        // #2724 - ONE size expression, shared with the admission that decides
-        // whether this route may run at all (streaming_plan.rs). The planner
-        // evaluates the same function on a shape-derived bound for total_t, so
-        // the ledger and the allocation cannot describe two different matrices.
         let dim = sae_exact_stationarity_dim(total_t, k);
-        // #2267 — the same reason the Krylov sibling logs `[SAE-DEFLATE]`: this
-        // route is silent for as long as it takes, and on #2267 that silence has
-        // been read as a hang, as a hardware ceiling, and as an example
-        // misconfiguration across five months of comments. It is none of those.
-        // The route is DENSE: `dim` Hessian-vector applies to build the operator,
-        // then a symmetric eigendecomposition of it — `O(dim^2)` memory and
-        // `O(dim^3)` time. `dim` is the JOINT dimension, so it grows with
-        // `rows x atoms`, not with the atom count: a 160-row K=1 chart is a few
-        // hundred and finishes in ~1.6 s, while a 508-row K=8 dense-softmax rung
-        // is ~5.3e3 and one step measured >=25 min at 4.7 GiB peak RSS. One line,
-        // once per materialization, states the size of the bill before it is paid.
+        let n_rows = cache.n_rows();
+        let offsets = &cache.row_offsets;
+        let slots = (0..n_rows)
+            .map(|row| offsets[row + 1] - offsets[row])
+            .max()
+            .unwrap_or(0);
         log::info!(
             "[SAE-EXACT-DENSE] materializing the exact stationarity Hessian: dim={dim} \
-             (coords={total_t} + border={k}), {:.1} MiB per dim x dim f64 block, \
-             {:.1} MiB resident across {} live blocks, \
-             O(dim^3) symmetric eigendecomposition to follow",
+             (coords={total_t} + border={k}) from {} arrow probes ({slots} coordinate \
+             slots + {k} border columns), {:.1} MiB per dim x dim f64 block",
+            slots + k,
             sae_exact_stationarity_block_bytes(dim) as f64 / (1024.0 * 1024.0),
-            sae_exact_stationarity_resident_bytes(dim) as f64 / (1024.0 * 1024.0),
-            SAE_EXACT_STATIONARITY_LIVE_DIM_BLOCKS,
         );
-        // #2267 — the `[SAE-EXACT-DENSE]` line above states the SIZE of the bill;
-        // these two stopwatches state which HALF of it is being paid. Measured at
-        // `55c56d6f4`, the K=8 rung of the shipped ladder spends >=37 minutes
-        // between that line and this routine's return, and nothing distinguishes
-        // the O(dim) column loop from the O(dim^3) eigendecomposition that follows
-        // it. Any size predicate that would refuse this route BEFORE paying has to
-        // be denominated in whichever half dominates, so the split is the
-        // prerequisite for the guard, not decoration.
         let build_started = std::time::Instant::now();
         let mut a = Array2::<f64>::zeros((dim, dim));
         let mut unit = SaeArrowVector {
             t: Array1::<f64>::zeros(total_t),
             beta: Array1::<f64>::zeros(k),
         };
-        for col in 0..dim {
-            if col < total_t {
-                unit.t[col] = 1.0;
-            } else {
-                unit.beta[col - total_t] = 1.0;
+        for slot in 0..slots {
+            unit.t.fill(0.0);
+            for row in 0..n_rows {
+                let (start, end) = (offsets[row], offsets[row + 1]);
+                if start + slot < end {
+                    unit.t[start + slot] = 1.0;
+                }
             }
             let av = self.apply_exact_hessian(rho, target, cache, &unit)?;
-            if col < total_t {
-                unit.t[col] = 0.0;
-            } else {
-                unit.beta[col - total_t] = 0.0;
-            }
-            for r in 0..total_t {
-                a[[r, col]] = av.t[r];
-            }
-            for r in 0..k {
-                a[[total_t + r, col]] = av.beta[r];
+            for row in 0..n_rows {
+                let (start, end) = (offsets[row], offsets[row + 1]);
+                if start + slot < end {
+                    let col = start + slot;
+                    for i in start..end {
+                        a[[i, col]] = av.t[i];
+                    }
+                }
             }
         }
-        // The matrix-free apply is symmetric only up to round-off; symmetrize
-        // so downstream Cholesky / selected-inverse factors see an exactly
-        // symmetric operand.
+        unit.t.fill(0.0);
+        for j in 0..k {
+            unit.beta.fill(0.0);
+            unit.beta[j] = 1.0;
+            let av = self.apply_exact_hessian(rho, target, cache, &unit)?;
+            let col = total_t + j;
+            for i in 0..total_t {
+                a[[i, col]] = av.t[i];
+                a[[col, i]] = av.t[i];
+            }
+            for i in 0..k {
+                a[[total_t + i, col]] = av.beta[i];
+            }
+        }
         for r in 0..dim {
             for c in (r + 1)..dim {
                 let avg = 0.5 * (a[[r, c]] + a[[c, r]]);
@@ -4842,14 +4851,17 @@ impl SaeManifoldTerm {
         }
         let build_elapsed = build_started.elapsed();
         log::info!(
-            "[SAE-EXACT-DENSE] operator BUILT: dim={dim}, {dim} Hessian-vector applies \
-             + symmetrization in {:.3} s ({:.3} ms per apply); \
-             the O(dim^3) symmetric eigendecomposition has NOT started yet",
+            "[SAE-EXACT-DENSE] operator BUILT: dim={dim}, {} arrow probes + symmetrization in \
+             {:.3} s ({:.3} ms per apply); the O(dim^3) symmetric eigendecomposition has NOT \
+             started yet",
+            slots + k,
             build_elapsed.as_secs_f64(),
-            build_elapsed.as_secs_f64() * 1.0e3 / (dim.max(1) as f64),
+            build_elapsed.as_secs_f64() * 1.0e3 / ((slots + k).max(1) as f64),
         );
         Ok(a)
     }
+
+
 
     /// #2330 Phase-2 — the A-based logdet gradient channels on the dense direct
     /// route: the direct trace vector `logdet_trace_i = ½tr(A⁺ ∂A/∂ρ_i)
@@ -6263,3 +6275,101 @@ mod tests_route_forced_classification_2673 {
     }
 }
 
+/// The column-loop oracle for [`SaeManifoldTerm::materialize_exact_hessian_dense`]:
+/// one Hessian-vector apply per column of the `dim × dim` matrix, exact for ANY
+/// operator, arrow or not. Test-only: production never pays for it, and the
+/// equality pin in `tests_sparse_curvature_operator_2500` measures the probe
+/// assembly against it.
+#[cfg(test)]
+mod column_loop_oracle_tests {
+    use super::*;
+
+    impl SaeManifoldTerm {
+        pub(crate) fn materialize_exact_hessian_dense_by_columns(
+            &self,
+            rho: &SaeManifoldRho,
+            target: ArrayView2<'_, f64>,
+            cache: &ArrowFactorCache,
+        ) -> Result<Array2<f64>, String> {
+            let total_t = cache.delta_t_len();
+            let k = cache.k;
+            // #2724 - ONE size expression, shared with the admission that decides
+            // whether this route may run at all (streaming_plan.rs). The planner
+            // evaluates the same function on a shape-derived bound for total_t, so
+            // the ledger and the allocation cannot describe two different matrices.
+            let dim = sae_exact_stationarity_dim(total_t, k);
+            // #2267 — the same reason the Krylov sibling logs `[SAE-DEFLATE]`: this
+            // route is silent for as long as it takes, and on #2267 that silence has
+            // been read as a hang, as a hardware ceiling, and as an example
+            // misconfiguration across five months of comments. It is none of those.
+            // The route is DENSE: `dim` Hessian-vector applies to build the operator,
+            // then a symmetric eigendecomposition of it — `O(dim^2)` memory and
+            // `O(dim^3)` time. `dim` is the JOINT dimension, so it grows with
+            // `rows x atoms`, not with the atom count: a 160-row K=1 chart is a few
+            // hundred and finishes in ~1.6 s, while a 508-row K=8 dense-softmax rung
+            // is ~5.3e3 and one step measured >=25 min at 4.7 GiB peak RSS. One line,
+            // once per materialization, states the size of the bill before it is paid.
+            log::info!(
+                "[SAE-EXACT-DENSE] materializing the exact stationarity Hessian: dim={dim} \
+                 (coords={total_t} + border={k}), {:.1} MiB per dim x dim f64 block, \
+                 {:.1} MiB resident across {} live blocks, \
+                 O(dim^3) symmetric eigendecomposition to follow",
+                sae_exact_stationarity_block_bytes(dim) as f64 / (1024.0 * 1024.0),
+                sae_exact_stationarity_resident_bytes(dim) as f64 / (1024.0 * 1024.0),
+                SAE_EXACT_STATIONARITY_LIVE_DIM_BLOCKS,
+            );
+            // #2267 — the `[SAE-EXACT-DENSE]` line above states the SIZE of the bill;
+            // these two stopwatches state which HALF of it is being paid. Measured at
+            // `55c56d6f4`, the K=8 rung of the shipped ladder spends >=37 minutes
+            // between that line and this routine's return, and nothing distinguishes
+            // the O(dim) column loop from the O(dim^3) eigendecomposition that follows
+            // it. Any size predicate that would refuse this route BEFORE paying has to
+            // be denominated in whichever half dominates, so the split is the
+            // prerequisite for the guard, not decoration.
+            let build_started = std::time::Instant::now();
+            let mut a = Array2::<f64>::zeros((dim, dim));
+            let mut unit = SaeArrowVector {
+                t: Array1::<f64>::zeros(total_t),
+                beta: Array1::<f64>::zeros(k),
+            };
+            for col in 0..dim {
+                if col < total_t {
+                    unit.t[col] = 1.0;
+                } else {
+                    unit.beta[col - total_t] = 1.0;
+                }
+                let av = self.apply_exact_hessian(rho, target, cache, &unit)?;
+                if col < total_t {
+                    unit.t[col] = 0.0;
+                } else {
+                    unit.beta[col - total_t] = 0.0;
+                }
+                for r in 0..total_t {
+                    a[[r, col]] = av.t[r];
+                }
+                for r in 0..k {
+                    a[[total_t + r, col]] = av.beta[r];
+                }
+            }
+            // The matrix-free apply is symmetric only up to round-off; symmetrize
+            // so downstream Cholesky / selected-inverse factors see an exactly
+            // symmetric operand.
+            for r in 0..dim {
+                for c in (r + 1)..dim {
+                    let avg = 0.5 * (a[[r, c]] + a[[c, r]]);
+                    a[[r, c]] = avg;
+                    a[[c, r]] = avg;
+                }
+            }
+            let build_elapsed = build_started.elapsed();
+            log::info!(
+                "[SAE-EXACT-DENSE] operator BUILT: dim={dim}, {dim} Hessian-vector applies \
+                 + symmetrization in {:.3} s ({:.3} ms per apply); \
+                 the O(dim^3) symmetric eigendecomposition has NOT started yet",
+                build_elapsed.as_secs_f64(),
+                build_elapsed.as_secs_f64() * 1.0e3 / (dim.max(1) as f64),
+            );
+            Ok(a)
+        }
+    }
+}

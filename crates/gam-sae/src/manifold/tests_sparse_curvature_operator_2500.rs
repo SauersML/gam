@@ -194,6 +194,42 @@ fn logit_slots(term: &SaeManifoldTerm, cache: &ArrowFactorCache) -> Vec<(usize, 
 /// cache's CONDITIONED row factors, so on a deflated direction the installed
 /// curvature is ρ-independent unit stiffness while the raw diagonal claims
 /// `w·λ·s·(1−2a)/τ²`.
+/// The probe-assembled exact stationarity Hessian equals the column-loop one
+/// (gam#2267): the coordinate block is per-row block-diagonal, so `slots + k`
+/// applies build the matrix `dim` applies built. Both threshold-gate arms, so
+/// the exact correction's deflation stratum is covered as well.
+#[test]
+fn exact_hessian_probe_assembly_equals_the_column_loop_2267() {
+    for straddle in [false, true] {
+        let (term, target, rho) = threshold_gate_tiny_fixture(straddle);
+        let (_loss, cache) = frozen_cache(&term, &target, &rho);
+        assert!(
+            cache.n_rows() > 1,
+            "the fixture must carry more than one row, or cross-row coupling is untested"
+        );
+        let by_columns = term
+            .materialize_exact_hessian_dense_by_columns(&rho, target.view(), &cache)
+            .expect("column-loop exact A");
+        let by_probes = term
+            .materialize_exact_hessian_dense(&rho, target.view(), &cache)
+            .expect("probe-assembled exact A");
+        assert_eq!(by_columns.dim(), by_probes.dim());
+        let scale = by_columns
+            .iter()
+            .fold(0.0_f64, |acc, v| acc.max(v.abs()))
+            .max(1.0);
+        let max_diff = by_columns
+            .iter()
+            .zip(by_probes.iter())
+            .fold(0.0_f64, |acc, (x, y)| acc.max((x - y).abs()));
+        assert!(
+            max_diff <= 1.0e-12 * scale,
+            "straddle={straddle}: the probe assembly differs from the column loop by \
+             {max_diff:.3e} against a scale of {scale:.3e}"
+        );
+    }
+}
+
 #[test]
 fn threshold_gate_sparse_operator_is_the_installed_exact_a_derivative_2500() {
     for straddle in [false, true] {

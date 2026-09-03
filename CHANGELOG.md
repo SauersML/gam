@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The SAE exact stationarity Hessian is assembled from one arrow probe per coordinate slot plus one per border column instead of one apply per column (#2267, #2731).
+
 - The joint Newton certificate is deferred to a negative-curvature escape only when that escape could lower the objective by more than its resolution within the trust radius (#2765).
 - The joint Newton's slow-geometric-rate exit is a typed terminal reason (`SlowGeometricRate`) whose text distinguishes slow contraction from no contraction (#2695).
 - The two 2705 box-constrained regression tests no longer share one fixture csv path per process (#2705).
