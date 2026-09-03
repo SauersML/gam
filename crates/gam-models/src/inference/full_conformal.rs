@@ -202,6 +202,11 @@ use faer::Side;
 use ndarray::{Array1, Array2};
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_av};
+
+/// Newton steps allowed when polishing the REML strength from the outer
+/// engine's certified point to the arithmetic's stationarity. Quadratic
+/// convergence from inside the basin takes a handful; exhaustion is refused.
+const REML_STRENGTH_POLISH_BUDGET: usize = 32;
 use opt::{BacktrackConfig, backtracking_line_search};
 
 /// One maximal interval of candidate values retained in the prediction set.
@@ -842,6 +847,11 @@ struct RemlEval {
     value: f64,
     /// `G = ∂Ṽ/∂ρ`.
     grad: f64,
+    /// Rounding band of `grad`: Wilkinson's growth factor for the operations
+    /// the gradient accumulates (a `p×p` Cholesky, two solves and two traces)
+    /// times the magnitude sum of its three terms. A gradient inside this band
+    /// is zero to the arithmetic; that is what "stationary" means here.
+    grad_band: f64,
     /// `∂²Ṽ/∂ρ²`.
     hess: f64,
     /// `∂²Ṽ/∂ρ∂z` (0 when the test row is absent).
@@ -989,6 +999,8 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         let logdet: f64 = 2.0 * chol.diag().iter().map(|d| d.ln()).sum::<f64>();
         let value = coef * d.ln() + logdet - r * rho;
         let grad = coef * pen / d + lambda * tr_ainv_s - r;
+        let grad_band = gam_linalg::roundoff::accumulation_growth(2 * p * p * p + 8 * p * p + 8 * p)
+            * ((coef * pen / d).abs() + (lambda * tr_ainv_s).abs() + r.abs());
         let pen_prime = pen - 2.0 * lambda * lambda * quad;
         let hess = coef * (pen_prime * d - pen * pen) / (d * d) + lambda * tr_ainv_s
             - lambda * lambda * tr_ainv_s_sq;
@@ -1011,6 +1023,7 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         Ok(RemlEval {
             value,
             grad,
+            grad_band,
             hess,
             cross,
             mu_rho_train,
@@ -1032,32 +1045,90 @@ impl<'a> GaussianRemlRhoResponse<'a> {
     /// Select ρ̂ by REML: a coarse value scan over `ρ ∈ [−25, 25]` to seed,
     /// then safeguarded Newton on `G = 0`. Deterministic (no randomness, fixed
     /// grid), so it qualifies as the symmetric fitting map's smoothing choice.
+    /// The REML-selected log smoothing strength for the training response
+    /// with the test response set to `z` (or the training-only criterion for
+    /// `None`), found by the workspace's outer engine: one ρ coordinate with
+    /// the analytic gradient and Hessian `eval` already provides, the engine's
+    /// own domain, seed cascade and stationarity certificate. This replaced a
+    /// 61-point grid over a hand box `[−25, 25]` followed by an uncertified
+    /// Newton with a `±5` widening, a `1e-12` curvature floor and a `1e-13`
+    /// step tolerance that returned its last iterate after 100 steps (#2469,
+    /// #2670; SPEC forbids grid search and hand-supplied boxes outright).
     pub fn select_rho(&self, z: Option<f64>) -> Result<f64, String> {
-        let (lo, hi, m) = (-25.0_f64, 25.0_f64, 60usize);
-        let mut best = (f64::INFINITY, 0.0_f64);
-        for k in 0..=m {
-            let rho = lo + (hi - lo) * (k as f64) / (m as f64);
-            if let Ok(ev) = self.eval(rho, z)
-                && ev.value < best.0
-            {
-                best = (ev.value, rho);
+        use gam_problem::{Derivative, HessianValue, OuterEval};
+        use gam_solve::estimate::EstimationError;
+        use gam_solve::rho_optimizer::OuterProblem;
+        let context = match z {
+            Some(z) => format!("full conformal REML strength at z={z}"),
+            None => "full conformal REML strength".to_string(),
+        };
+        // A criterion that cannot be evaluated at a trial ρ (a Cholesky that
+        // fails at an extreme strength) is a property of that trial point, so
+        // the search retreats from it rather than abandoning the problem.
+        let refuse = |error: String| EstimationError::TrialPointRefused { reason: error };
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(gam_problem::DeclaredHessianForm::Dense);
+        let mut objective = problem.build_objective(
+            (),
+            |_: &mut (), rho: &Array1<f64>| self.eval(rho[0], z).map(|ev| ev.value).map_err(refuse),
+            |_: &mut (), rho: &Array1<f64>| {
+                let ev = self.eval(rho[0], z).map_err(refuse)?;
+                Ok(OuterEval {
+                    cost: ev.value,
+                    gradient: Array1::from_vec(vec![ev.grad]),
+                    hessian: HessianValue::Dense(Array2::from_elem((1, 1), ev.hess)),
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut objective, &context)
+            .map_err(|error| format!("{context}: {error}"))?;
+        // The engine certifies the basin; from there the criterion is smooth
+        // with a positive analytic Hessian, so Newton converges quadratically
+        // to the arithmetic's own stationarity — a gradient inside its own
+        // rounding band. The response ρ̂(z) is differentiated downstream,
+        // which needs exactly that resolution. (A step below ρ's representation
+        // is not reachable: the gradient's rounding floor is what bounds the
+        // step, so the band, not the step, is the statement.) The budget is a
+        // refusal budget, never a source of a returned iterate.
+        let mut rho = result.rho[0];
+        let mut ev = self.eval(rho, z)?;
+        for _ in 0..REML_STRENGTH_POLISH_BUDGET {
+            if ev.grad.abs() <= ev.grad_band {
+                return Ok(rho);
             }
+            if !(ev.hess.is_finite() && ev.hess > 0.0) {
+                return Err(format!(
+                    "{context}: the REML criterion's curvature is {} at ρ={rho}; the certified \
+                     point is not a minimum",
+                    ev.hess
+                ));
+            }
+            let candidate = rho - ev.grad / ev.hess;
+            let ev_candidate = self.eval(candidate, z)?;
+            if ev_candidate.grad.abs() >= ev.grad.abs() {
+                // The step no longer reduces the gradient: the iteration sits
+                // on the gradient's noise floor, above the band the terms
+                // predict — refused, with both numbers named.
+                return Err(format!(
+                    "{context}: Newton polish stalled at ρ={rho} with gradient {} above its \
+                     rounding band {} (next step gave {})",
+                    ev.grad, ev.grad_band, ev_candidate.grad
+                ));
+            }
+            rho = candidate;
+            ev = ev_candidate;
         }
-        let mut rho = best.1;
-        for _ in 0..100 {
-            let ev = self.eval(rho, z)?;
-            if !ev.hess.is_finite() || ev.hess <= 1e-12 {
-                break;
-            }
-            let step = ev.grad / ev.hess;
-            let new_rho = (rho - step).clamp(lo - 5.0, hi + 5.0);
-            let delta = new_rho - rho;
-            rho = new_rho;
-            if delta.abs() < 1e-13 {
-                break;
-            }
-        }
-        Ok(rho)
+        Err(format!(
+            "{context}: Newton polish from the certified ρ did not reach the gradient's \
+             rounding band within {REML_STRENGTH_POLISH_BUDGET} steps (ρ={rho}, gradient {}, \
+             band {})",
+            ev.grad, ev.grad_band
+        ))
     }
 
     /// Run the certificate-first procedure: build the frozen-ρ exact set, then
