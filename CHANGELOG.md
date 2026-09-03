@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The blockwise coefficient loop's early exit and accept test use the objective's round-off slack instead of an absolute `1e-10` (#2469).
+
 - Survival marginal-slope fits with a follow-up-varying slope score trust-region trials on the follow-up-varying frame's likelihood; the value-only path previously read the time-constant closed form, so the slope's variation was invisible to the accept test (#2765).
 
 - `perf_scale` gains `grouped_binomial_sweep_2569`, the #2569 grouped-binomial shape rebuilt from synthetic data with per-fit wall time printed (#2569).

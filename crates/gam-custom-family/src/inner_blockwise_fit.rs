@@ -3616,9 +3616,15 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 let trial_block_penalty =
                     block_quadratic_penalty(&states[b].beta, s_lambda, ridge, options.ridge_policy);
                 let trial_penalty = current_penalty - old_block_penalty + trial_block_penalty;
+                // The early exit certifies that the accept test below would
+                // refuse the trial, so its slack is the accept test's own
+                // round-off slack at the incumbent, not an absolute number
+                // (the joint loop made the same change in `e2b49a23f`).
+                let blockwise_slack =
+                    joint_objective_roundoff_slack(objective_cycle_prev, objective_cycle_prev, 0.0);
                 let line_search_options = coefficient_line_search_options(
                     options,
-                    objective_cycle_prev - trial_penalty + 1e-10,
+                    objective_cycle_prev - trial_penalty + blockwise_slack,
                 );
                 let trial_ll =
                     match family.log_likelihood_only_with_options(&states, &line_search_options) {
@@ -3642,9 +3648,17 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                     trial_penalty,
                     trialobjective,
                     objective_cycle_prev,
-                    objective_cycle_prev + 1e-10 - trialobjective,
+                    objective_cycle_prev + blockwise_slack - trialobjective,
                 );
-                if trialobjective.is_finite() && trialobjective <= objective_cycle_prev + 1e-10 {
+                if trialobjective.is_finite()
+                    && trialobjective
+                        <= objective_cycle_prev
+                            + joint_objective_roundoff_slack(
+                                objective_cycle_prev,
+                                trialobjective,
+                                0.0,
+                            )
+                {
                     objective_cycle_prev = trialobjective;
                     current_penalty = trial_penalty;
                     accepted = true;
@@ -3818,9 +3832,14 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                             );
                             let trial_penalty =
                                 current_penalty - old_block_penalty + trial_block_penalty;
+                            let blockwise_slack = joint_objective_roundoff_slack(
+                                objective_cycle_prev,
+                                objective_cycle_prev,
+                                0.0,
+                            );
                             let line_search_options = coefficient_line_search_options(
                                 options,
-                                objective_cycle_prev - trial_penalty + 1e-10,
+                                objective_cycle_prev - trial_penalty + blockwise_slack,
                             );
                             let trial_ll = match family
                                 .log_likelihood_only_with_options(&states, &line_search_options)
@@ -3834,7 +3853,13 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                             };
                             let trialobjective = -trial_ll + trial_penalty;
                             if trialobjective.is_finite()
-                                && trialobjective <= objective_cycle_prev + 1e-10
+                                && trialobjective
+                                    <= objective_cycle_prev
+                                        + joint_objective_roundoff_slack(
+                                            objective_cycle_prev,
+                                            trialobjective,
+                                            0.0,
+                                        )
                             {
                                 objective_cycle_prev = trialobjective;
                                 current_penalty = trial_penalty;
