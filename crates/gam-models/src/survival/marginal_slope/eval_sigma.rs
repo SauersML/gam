@@ -248,6 +248,34 @@ impl SurvivalMarginalSlopeFamily {
                 for idx in range {
                     let weighted = row_iter[idx];
                     let i = weighted.index;
+                    // The value the trust region scores a trial on must be the
+                    // value of the frame whose gradient and Hessian proposed
+                    // the step (`compute_row_primary_gradient_hessian_uncached`
+                    // dispatches on the same flag). The time-constant closed
+                    // form below reads ONE slope value and a zero rate; on the
+                    // follow-up-varying frame the row's `η′₁` carries
+                    // `q·c′ + b′ᵀz`, so that form is a different likelihood,
+                    // one in which the slope's variation is invisible — which
+                    // is what "the slope can't vary" looks like from outside
+                    // (gam#2765).
+                    if self.slope_is_follow_up_varying() {
+                        let inputs = rigid_row_inputs(
+                            self,
+                            block_states,
+                            i,
+                            "survival marginal-slope value-only row",
+                        )?;
+                        let primaries = rigid_row_kernel_primaries::<
+                            DYNAMIC_SLOPE_PRIMARIES,
+                            DynamicSlopeGeometry,
+                        >(self, block_states, i)?;
+                        let (nll, _, _) = rigid_row_order2::<
+                            DYNAMIC_SLOPE_PRIMARIES,
+                            DynamicSlopeGeometry,
+                        >(&primaries, &inputs)?;
+                        ll -= weighted.weight * nll;
+                        continue;
+                    }
                     let q_geom = self.row_dynamic_q_values(i, block_states)?;
                     if score_dim > 1 {
                         ll -= weighted.weight

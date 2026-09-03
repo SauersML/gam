@@ -222,6 +222,61 @@ fn margin_along(
 /// and the whole step is not. Asserted separately so a later edit that makes
 /// the fixture trivial fails HERE, naming the fixture, rather than making the
 /// gates below vacuously true.
+/// The likelihood the trust region scores a trial on (`log_likelihood_only`)
+/// must be the likelihood whose gradient and Hessian the step was built from.
+/// On the follow-up-varying frame the row kernel's `η′₁` carries `q·c′` and
+/// `b′ᵀz`; a value-only path that reads the time-constant closed form drops
+/// both, and then no step that varies the slope can be rewarded (#2765). The
+/// time-constant frame is the control: there the closed form IS the kernel.
+#[test]
+fn the_value_only_likelihood_is_the_frame_kernels_likelihood_2765() {
+    for frame_is_follow_up_varying in [false, true] {
+        let family = family(frame_is_follow_up_varying);
+        let base = states(&family, interior_slope_beta());
+        let direction = exiting_direction();
+        // The second probe moves the slope along the exiting direction but
+        // stays inside the follow-up domain: halve the step until the
+        // follow-up frame reports a positive margin (the time-constant frame
+        // has no margin to report and takes the same step).
+        let mut interior_t = 0.25_f64;
+        if frame_is_follow_up_varying {
+            let mut halvings = 0;
+            while margin_along(&family, &base, &direction, interior_t) <= 0.0 {
+                interior_t *= 0.5;
+                halvings += 1;
+                assert!(halvings < 20, "no interior probe found along the exiting direction");
+            }
+        }
+        for t in [0.0_f64, interior_t] {
+            let point = family
+                .displaced_block_states(&base, &direction, t)
+                .expect("width agreement");
+            if frame_is_follow_up_varying {
+                assert!(
+                    margin_along(&family, &base, &direction, t) > 0.0,
+                    "the probe must stay interior at t={t}"
+                );
+            }
+            let value_only = family
+                .log_likelihood_only(&point)
+                .expect("value-only likelihood");
+            let mut kernel = 0.0_f64;
+            for row in 0..N_ROWS {
+                let (nll, _, _) = family
+                    .compute_row_primary_gradient_hessian_uncached(row, &point)
+                    .expect("frame kernel row");
+                kernel -= nll;
+            }
+            let scale = value_only.abs().max(kernel.abs()).max(1.0);
+            assert!(
+                (value_only - kernel).abs() <= 1e-10 * scale,
+                "follow_up_varying={frame_is_follow_up_varying} t={t}: value-only likelihood \
+                 {value_only:.12e} differs from the frame kernel's {kernel:.12e}"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_fixture_step_really_leaves_the_domain_2765() {
     let family = family(true);
