@@ -59,11 +59,15 @@ use faer::Side;
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam_problem::RowMetric;
 
-/// Number of (scale | factor) ↔ (factor | scale) alternation sweeps. Fixed and
-/// deterministic: the alternation is a smooth descent on the structured-Gaussian
-/// objective and converges geometrically, so a small fixed budget is both
-/// sufficient and reproducible (no clock/RNG-driven stopping).
-const ALTERNATION_SWEEPS: usize = 8;
+/// Alternation sweeps the structured-Gaussian fit may take before it is
+/// refused. The alternation is a block-coordinate ascent on the penalized
+/// log-evidence (with smoothed, floored scale updates, so not an exact
+/// ascent), and it stops on its own at the first sweep that fails to improve
+/// the evidence by more than the evidence's rounding band, keeping the best
+/// state it saw. This budget bounds an ascent that keeps improving, and its
+/// exhaustion is a refusal, not a result (#2469 — it used to run exactly 8
+/// sweeps and return whatever state that left).
+const ALTERNATION_MAX_SWEEPS: usize = 256;
 
 /// Number of bins the activity coordinate `z` is partitioned into for the smooth
 /// activity-scale `c(z)`. The per-bin factor activity is estimated then linearly
@@ -246,7 +250,10 @@ impl StructuredResidualModel {
         let mut diagonal = raw_diag.mapv(|v| v.max(diag_floor));
         let mut lambda = Array2::<f64>::zeros((p, rank));
 
-        for _sweep in 0..ALTERNATION_SWEEPS {
+        // Best state seen, restored when a sweep stops improving the evidence.
+        let mut best: Option<(f64, Array2<f64>, Array1<f64>, Array1<f64>)> = None;
+        let mut converged = false;
+        for _sweep in 0..ALTERNATION_MAX_SWEEPS {
             // (Λ, D | scale): scale-deflated second moment
             //   S = (1/n) Σ_n (r_n r_nᵀ) / c(z_n).
             // Under the model E[r_n r_nᵀ] = c_n ΛΛᵀ + D, so S ≈ ΛΛᵀ + D̄ with
@@ -361,7 +368,38 @@ impl StructuredResidualModel {
                     row_scale[i] = bin_scale[row_bin[i]];
                 }
             }
+            // Stop at the first sweep that does not improve the penalized
+            // log-evidence by more than the evidence's own rounding band: the
+            // band is the accumulation of every term the evidence sums, so an
+            // improvement inside it is not one the arithmetic can attest to,
+            // and a decrease is the smoothed, floored scale update overshooting.
+            // The best state is kept either way.
+            let (evidence, band) =
+                penalized_log_evidence_with_band(r, &lambda, &diagonal, &row_scale, rank);
+            match &best {
+                Some((best_evidence, _, _, _)) if evidence <= best_evidence + band => {
+                    converged = true;
+                    break;
+                }
+                _ => {
+                    best = Some((evidence, lambda.clone(), diagonal.clone(), row_scale.clone()));
+                }
+            }
         }
+        let Some((_, best_lambda, best_diagonal, best_row_scale)) = best else {
+            return Err(format!(
+                "structured residual factor fit: no alternation sweep produced a state \
+                 (rank {rank}, p {p}, n {n})"
+            ));
+        };
+        if !converged {
+            return Err(format!(
+                "structured residual factor fit: the alternation was still improving the \
+                 penalized log-evidence beyond its rounding band after \
+                 {ALTERNATION_MAX_SWEEPS} sweeps (rank {rank}, p {p}, n {n})"
+            ));
+        }
+        let (lambda, diagonal, row_scale) = (best_lambda, best_diagonal, best_row_scale);
 
         let log_evidence = penalized_log_evidence(r, &lambda, &diagonal, &row_scale, rank);
         let mut model = Self {
@@ -1176,6 +1214,21 @@ fn penalized_log_evidence(
     row_scale: &Array1<f64>,
     rank: usize,
 ) -> f64 {
+    penalized_log_evidence_with_band(r, lambda, diagonal, row_scale, rank).0
+}
+
+/// The penalized log-evidence and its rounding band: Wilkinson's growth factor
+/// for the number of floating-point operations the evidence accumulates, times
+/// the sum of the magnitudes of every term it adds, so a difference between
+/// two evidence values inside the band is not attested by the arithmetic
+/// (#2469).
+fn penalized_log_evidence_with_band(
+    r: ArrayView2<'_, f64>,
+    lambda: &Array2<f64>,
+    diagonal: &Array1<f64>,
+    row_scale: &Array1<f64>,
+    rank: usize,
+) -> (f64, f64) {
     let n = r.nrows();
     let p = r.ncols();
     let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / diagonal[i]).collect();
@@ -1204,6 +1257,7 @@ fn penalized_log_evidence(
     }
 
     let mut log_lik = 0.0_f64;
+    let mut magnitude = 0.0_f64;
     for i in 0..n {
         let c = row_scale[i].max(f64::MIN_POSITIVE);
         // Quadratic r_nᵀ Σ_n^{-1} r_n via Woodbury:
@@ -1252,10 +1306,19 @@ fn penalized_log_evidence(
             }
         }
         log_lik += -0.5 * (log_det + quad + p as f64 * two_pi_ln);
+        magnitude += 0.5 * (log_det.abs() + quad.abs() + p as f64 * two_pi_ln);
     }
 
     let k_params = (p * rank + p + ACTIVITY_SCALE_BINS) as f64;
-    log_lik - 0.5 * k_params * (n.max(2) as f64).ln()
+    let penalty = 0.5 * k_params * (n.max(2) as f64).ln();
+    magnitude += penalty.abs();
+    // Operations accumulated per row: the quadratic form (`p`), the factor
+    // projections (`rank·p`), the capacitance solve (`rank²`) and the
+    // `rank`-term contraction; plus the `p` log-determinant terms and the
+    // `rank²·p` capacitance assembly once.
+    let operations = n * (p * (1 + rank) + rank * (rank + 1)) + p * (1 + rank * rank);
+    let band = gam_linalg::roundoff::accumulation_growth(operations) * magnitude;
+    (log_lik - penalty, band)
 }
 
 #[cfg(test)]
