@@ -834,7 +834,9 @@ impl PenaltyCoordinate {
         // differences in equivalent roots collapse to the same bucket, while
         // genuinely different roughness scales stay distinct.
         let quant = |v: f64| -> i64 {
-            if !v.is_finite() || v.abs() <= 1e-300 {
+            // Only an exact zero has no logarithm to quantise; any nonzero
+            // value, however small, is a distinct coordinate.
+            if !v.is_finite() || v == 0.0 {
                 return 0;
             }
             // ~1e-6 relative resolution: round log|v| to 6 decimals and keep sign.

@@ -709,21 +709,26 @@ fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
         // Modified-Lentz continued fraction for Q(a,x) = 1 − P(a,x); P = 1 − Q.
         // Evaluating the *upper* tail here keeps the directly-computed quantity
         // small wherever P is near 1, so `1 − Q` loses no significant digits.
-        const FPMIN: f64 = 1e-300;
+        // Lentz's modified continued-fraction algorithm substitutes a tiny value
+        // for an exact zero in its recurrence (Numerical Recipes §6.2). It is a
+        // component of the algorithm, not a floor on a result: any value below
+        // the smallest normal quotient works and the converged fraction does not
+        // depend on it.
+        const LENTZ_TINY: f64 = 1e-300;
         let mut b = x + 1.0 - a;
-        let mut c = 1.0 / FPMIN;
+        let mut c = 1.0 / LENTZ_TINY;
         let mut d = 1.0 / b;
         let mut h = d;
         for i in 1..1000 {
             let an = -(i as f64) * (i as f64 - a);
             b += 2.0;
             d = an * d + b;
-            if d.abs() < FPMIN {
-                d = FPMIN;
+            if d.abs() < LENTZ_TINY {
+                d = LENTZ_TINY;
             }
             c = b + an / c;
-            if c.abs() < FPMIN {
-                c = FPMIN;
+            if c.abs() < LENTZ_TINY {
+                c = LENTZ_TINY;
             }
             d = 1.0 / d;
             let del = d * c;

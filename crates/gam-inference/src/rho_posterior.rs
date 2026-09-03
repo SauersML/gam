@@ -162,7 +162,9 @@ impl DetNormal {
         (((z >> 11) as f64) + 0.5) / ((1u64 << 53) as f64)
     }
     fn normal(&mut self) -> f64 {
-        let u1 = self.uniform().max(1e-300);
+        // `uniform` returns `(k + ½)/2⁵³`, strictly inside (0, 1): `ln(u1)` is
+        // finite by construction.
+        let u1 = self.uniform();
         let u2 = self.uniform();
         (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
     }

@@ -1103,10 +1103,10 @@ pub(crate) fn build_periodic_duchon_basis_1d(
         // exact Fourier-series periodization of the spectral density, which is
         // PSD by construction. `kappa` is well defined here because this branch
         // runs iff `length_scale` is `Some`.
-        let kappa = 1.0
-            / len_scale
-                .expect("hybrid branch requires length_scale")
-                .max(1e-300);
+        let kappa = duchon_inverse_length_scale(
+            len_scale.expect("hybrid branch requires length_scale"),
+            "periodic hybrid Duchon basis",
+        )?;
         raw_kernel
             .axis_chunks_iter_mut(ndarray::Axis(0), 1024)
             .into_par_iter()
@@ -1151,11 +1151,10 @@ pub(crate) fn build_periodic_duchon_basis_1d(
         } else {
             // Same exact circular periodization the design uses, so
             // ``ω = z' K_centers z`` is the PSD Gram of the periodic smoother.
-            let kappa = 1.0
-                / spec
-                    .length_scale
-                    .expect("hybrid branch requires length_scale")
-                    .max(1e-300);
+            let kappa = duchon_inverse_length_scale(
+                spec.length_scale.expect("hybrid branch requires length_scale"),
+                "periodic hybrid Duchon center kernel",
+            )?;
             Ok(
                 periodic_hybrid_duchon_kernel_value(r, kappa, p_order, s_order, period)?
                     * kernel_amp,

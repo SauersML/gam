@@ -76,10 +76,6 @@ use gam_solve::pirls::LinearInequalityConstraints;
 /// `z(π/2) = v₀`, so consecutive draws decorrelate completely.
 const TRAVEL_TIME: f64 = std::f64::consts::FRAC_PI_2;
 
-/// A constraint whose amplitude `R = ‖(uᵢ, wᵢ)‖` is below this floor cannot
-/// reach its boundary along the current arc — treated as never-hit.
-const AMPLITUDE_FLOOR: f64 = 1e-300;
-
 /// Slack below which a constraint is considered "on the wall" at the current
 /// position (in whitened units). Used to launch active-face starts inward and
 /// to suppress spurious re-hits of a wall just reflected from.
@@ -352,7 +348,8 @@ fn first_wall_hit(u: f64, w: f64, g: f64, t_max: f64) -> Option<f64> {
         // returned as an immediate bounce; the bounce cap backstops the
         // degenerate tangent case at a feasible on-wall position.
         let r = (u * u + w * w).sqrt();
-        if r <= AMPLITUDE_FLOOR {
+        // A zero amplitude has no phase; any positive one does.
+        if !(r > 0.0) {
             return None;
         }
         let q = (-g / r).clamp(-1.0, 1.0);
@@ -361,7 +358,7 @@ fn first_wall_hit(u: f64, w: f64, g: f64, t_max: f64) -> Option<f64> {
     }
 
     let r = (u * u + w * w).sqrt();
-    if r <= AMPLITUDE_FLOOR {
+    if !(r > 0.0) {
         // c(t) ≈ g > 0 constant — never reaches the wall.
         return None;
     }

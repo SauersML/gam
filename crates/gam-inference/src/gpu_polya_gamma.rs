@@ -310,14 +310,16 @@ pub fn pg_normal_cpu_oracle(state: &mut XorwowState, b: u32, tilt: f64) -> f64 {
     let mean = pg_mean(b as f64, tilt);
     let var = pg_variance(b as f64, tilt);
     let sd = var.sqrt();
-    let mut draw = mean + sd * state.next_norm();
-    // Reflect into the positive half-line. At b > 170 the probability mass
-    // below zero is ~Φ(-mean/sd) ≈ 0 for any reasonable c; reflection is a
-    // negligibly biased truncation.
-    if draw <= 0.0 {
-        draw = -draw + 1e-300;
+    // A Pólya-Gamma variable is strictly positive; the Gaussian approximation
+    // is truncated to the positive half-line by rejection (its mean is
+    // positive, so acceptance is certain), not reflected and nudged off zero
+    // by `1e-300` (#2469).
+    loop {
+        let draw = mean + sd * state.next_norm();
+        if draw > 0.0 {
+            return draw;
+        }
     }
-    draw
 }
 
 // ────────────────────────────────────────────────────────────────────────

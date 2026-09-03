@@ -558,12 +558,16 @@ pub fn coalesce_antipodal(
         if used[i] || used[j] {
             continue;
         }
+        // A zero direction has no unit vector and cannot be merged.
+        let ni = dirs[i].dot(&dirs[i]).sqrt();
+        let nj = dirs[j].dot(&dirs[j]).sqrt();
+        if ni == 0.0 || nj == 0.0 {
+            continue;
+        }
         used[i] = true;
         used[j] = true;
         // Orient both halves to a common sign and average: e ∝ d̂_i − d̂_j (since
         // d_j ≈ −d_i, this is the mean signed axis, robust to unequal norms).
-        let ni = dirs[i].dot(&dirs[i]).sqrt().max(1e-300);
-        let nj = dirs[j].dot(&dirs[j]).sqrt().max(1e-300);
         let mut e: Array1<f64> = dirs[i].mapv(|x| x / ni);
         for (idx, val) in dirs[j].iter().enumerate() {
             e[idx] -= val / nj;
@@ -592,7 +596,10 @@ pub fn coalesce_antipodal(
         if used[i] {
             continue;
         }
-        let ni = dirs[i].dot(&dirs[i]).sqrt().max(1e-300);
+        let ni = dirs[i].dot(&dirs[i]).sqrt();
+        if ni == 0.0 {
+            continue;
+        }
         out.push(SignedDirection {
             dir: dirs[i].mapv(|x| x / ni),
             members: vec![atom_ids[i]],

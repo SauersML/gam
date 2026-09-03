@@ -1454,7 +1454,9 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                             )
                         })?;
                         // ∂S_k/∂ψ_j (unscaled): extract from local by dividing out λ_k.
-                        let ds_k_dpsi = if lambda_k.abs() > 1e-300 {
+                        // A strength is `exp(ρ)`, positive unless it has underflowed to
+                        // exactly zero; that is the one case with no `S_k/λ_k`.
+                        let ds_k_dpsi = if lambda_k != 0.0 {
                             Some(local.mapv(|v| v / lambda_k))
                         } else {
                             None
