@@ -18,6 +18,20 @@ pub enum JointNewtonTerminalReason {
         joint_trust_radius: f64,
         rejection_counts: [usize; 4],
     },
+    /// The residual was still contracting — every step accepted, the model
+    /// trusted — but at a geometric rate too slow to reach tolerance within
+    /// the projection cap. The solve was descending, not stuck: on the #2695
+    /// 1569 pair this is the scale coefficient walking the σ→0 ray, an
+    /// objective with no finite minimizer along that direction at that ρ, and
+    /// the outer needs to read it as under-penalization rather than as a
+    /// failed seed.
+    SlowGeometricRate {
+        rate_per_cycle: f64,
+        window_cycles: usize,
+        projected_cycles_to_tolerance: usize,
+        residual: f64,
+        residual_tol: f64,
+    },
 }
 
 impl std::fmt::Display for JointNewtonTerminalReason {
@@ -44,6 +58,32 @@ impl std::fmt::Display for JointNewtonTerminalReason {
                  trust-region floor {joint_trust_radius:.6e}; rejects \
                  [model,likelihood,objective,feasibility]={rejection_counts:?}"
             ),
+            Self::SlowGeometricRate {
+                rate_per_cycle,
+                window_cycles,
+                projected_cycles_to_tolerance,
+                residual,
+                residual_tol,
+            } => {
+                if *rate_per_cycle < 1.0 {
+                    write!(
+                        f,
+                        "residual {residual:.6e} still contracting at {rate_per_cycle:.4}x per \
+                         cycle over the last {window_cycles} cycles, projected more than \
+                         {projected_cycles_to_tolerance} further cycles to reach \
+                         {residual_tol:.6e}: the solve was descending along a direction with \
+                         no finite minimizer in reach, not stuck"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "residual {residual:.6e} is not contracting ({rate_per_cycle:.4}x per \
+                         cycle over the last {window_cycles} cycles, every step accepted) and \
+                         cannot reach {residual_tol:.6e}: the solve was descending along a \
+                         direction with no finite minimizer in reach, not stuck"
+                    )
+                }
+            }
         }
     }
 }

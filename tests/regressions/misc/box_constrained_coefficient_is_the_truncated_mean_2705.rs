@@ -96,8 +96,14 @@ fn dataset(x: &[f64], y: &[f64]) -> EncodedDataset {
     for i in 0..x.len() {
         csv.push_str(&format!("{:.17e},{:.17e}\n", x[i], y[i]));
     }
+    // Both tests in this file build a fixture in the same process, and each
+    // encodes a different slope sign, so the path must be unique per CALL, not
+    // per process: a shared name let one test read the other's csv (and the
+    // second remover find nothing), which flipped the recovered slope's sign.
+    static FIXTURE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = FIXTURE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = std::env::temp_dir();
-    tmp.push(format!("gam_2705_boxmean_{}.csv", std::process::id()));
+    tmp.push(format!("gam_2705_boxmean_{}_{serial}.csv", std::process::id()));
     {
         let mut file = std::fs::File::create(&tmp).expect("create fixture csv");
         file.write_all(csv.as_bytes()).expect("write fixture csv");

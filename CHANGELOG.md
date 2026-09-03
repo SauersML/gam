@@ -1,5 +1,9 @@
 ## Unreleased
 
+- The joint Newton certificate is deferred to a negative-curvature escape only when that escape could lower the objective by more than its resolution within the trust radius (#2765).
+- The joint Newton's slow-geometric-rate exit is a typed terminal reason (`SlowGeometricRate`) whose text distinguishes slow contraction from no contraction (#2695).
+- The two 2705 box-constrained regression tests no longer share one fixture csv path per process (#2705).
+
 - The ψ-hyper build takes the ψ-Hessian directional derivative along every coefficient axis from one row sweep where the family provides it (marginal-slope rigid frame), instead of one sweep per axis (#979).
 
 - The blockwise coefficient loop's early exit and accept test use the objective's round-off slack instead of an absolute `1e-10` (#2469).

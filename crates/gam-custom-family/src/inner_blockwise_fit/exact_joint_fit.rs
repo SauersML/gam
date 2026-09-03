@@ -2180,9 +2180,18 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // fit, where ∇ℓ vanishes by symmetry from cycle 0 and the
         // Newton step is identically zero so the trust-region search
         // can never produce a strictly negative actual reduction).
-        let has_resolvable_negative_curvature = joint_spectrum
-            .as_ref()
-            .is_some_and(|spectrum| spectrum.has_resolvable_negative_curvature());
+        // A negative direction blocks a certificate only when the escape it
+        // promises could lower the objective by more than the objective's own
+        // resolution within the current trust step (gam#2765): the spectral
+        // test alone deferred the constrained-stationarity certificate on 92%
+        // of the recovery fixture's cycles to escapes that changed nothing.
+        let has_resolvable_negative_curvature = joint_spectrum.as_ref().is_some_and(|spectrum| {
+            spectrum.has_resolvable_negative_curvature()
+                && spectrum.negative_curvature_escape_is_resolvable(
+                    joint_trust_radius,
+                    objective_tol.max(objective_resolution_witness.measured()),
+                )
+        });
         // Record THIS route's decision variables. The blockwise recorder
         // below is on a different loop: `55968a53c` instrumented only that
         // one, and the refusal then read `40 cycle(s) [no terminal
@@ -6041,6 +6050,21 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     effective_projection_cap,
                     inner_max_cycles,
                 );
+                // A typed outcome, so the outer's seed statistics can tell a
+                // descending ray from a stuck solve (gam#2695).
+                if let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
+                    termination_reason,
+                    ..
+                }) = terminal_convergence_state.as_mut()
+                {
+                    *termination_reason = gam_problem::JointNewtonTerminalReason::SlowGeometricRate {
+                        rate_per_cycle: (residual / oldest).powf(1.0 / (LINEAR_RATE_WINDOW as f64)),
+                        window_cycles: LINEAR_RATE_WINDOW,
+                        projected_cycles_to_tolerance: effective_projection_cap,
+                        residual,
+                        residual_tol,
+                    };
+                }
                 cycles_done = cycle + 1;
                 converged = false;
                 break;

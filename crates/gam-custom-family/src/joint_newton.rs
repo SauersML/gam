@@ -3542,6 +3542,35 @@ pub(crate) mod whitened_spectrum {
                 .any(|&value| value < -self.numerical_floor)
         }
 
+        /// Whether the hard-case escape along a negative direction could lower
+        /// the objective by more than `resolution` within a trust step of
+        /// `radius`, both in the D-metric this spectrum is whitened in.
+        ///
+        /// [`Self::has_resolvable_negative_curvature`] names a direction the
+        /// EIGENSOLVER resolves; this names one the OBJECTIVE resolves. The
+        /// quadratic model's decrease to the boundary along a whitened
+        /// eigen-direction with curvature `γ < 0` and gradient component `c` is
+        /// `½|γ|r² + |c|r`. When that is below the objective's resolution the
+        /// escape the certificate defers to cannot produce a change the accept
+        /// test can read, so deferring is not a decision but a loop: on the
+        /// #2765 recovery fixture 58,258 of 63,646 cycles were that deferral,
+        /// each followed by an accepted escape that changed nothing readable.
+        pub(crate) fn negative_curvature_escape_is_resolvable(
+            &self,
+            radius: f64,
+            resolution: f64,
+        ) -> bool {
+            if !(radius > 0.0) || !radius.is_finite() {
+                return false;
+            }
+            let floor = resolution.max(0.0);
+            self.gamma
+                .iter()
+                .zip(self.c.iter())
+                .filter(|(gamma, _)| **gamma < -self.numerical_floor)
+                .any(|(gamma, c)| 0.5 * (-*gamma) * radius * radius + c.abs() * radius > floor)
+        }
+
         /// Median `|γ_k|` over the identified modes — a spectrum scale that a
         /// single stiff mode cannot set.
         ///
@@ -4198,6 +4227,31 @@ mod trust_region_subproblem_tests {
     /// Moré–Sorensen solve must nevertheless take its hard-case boundary step
     /// along the negative eigenspace; otherwise a first-order convergence test
     /// can mint the saddle as a fitted Laplace mode.
+    #[test]
+    pub(crate) fn a_negative_direction_the_objective_cannot_read_is_not_an_escape_2765() {
+        // A strict saddle the eigensolver resolves cleanly (γ_min = -1e-3 against
+        // λ_max = 1e8, well above the numerical floor) whose escape within the
+        // trust radius is worth `½·1e-3·r²`.
+        let h = array![[-1.0e-3, 0.0, 0.0], [0.0, 2.0e-3, 0.0], [0.0, 0.0, 1.0e8]];
+        let rhs = array![0.0, 0.0, 0.0];
+        let d = array![1.0, 1.0, 1.0];
+        let spec = WhitenedHessianSpectrum::decompose(&h, &rhs, &d, KKT_REFUSAL_RANK_TOL).unwrap();
+        assert!(spec.has_resolvable_negative_curvature());
+        // At radius 1e-4 the escape lowers the model by 5e-12: below an
+        // objective resolution of 1e-9 it is not a decision the objective can
+        // referee; at radius 1 it is worth 5e-4 and is.
+        assert!(!spec.negative_curvature_escape_is_resolvable(1.0e-4, 1.0e-9));
+        assert!(spec.negative_curvature_escape_is_resolvable(1.0, 1.0e-9));
+        // A gradient component along the negative direction counts linearly.
+        let rhs_tilted = array![1.0e-3, 0.0, 0.0];
+        let tilted =
+            WhitenedHessianSpectrum::decompose(&h, &rhs_tilted, &d, KKT_REFUSAL_RANK_TOL).unwrap();
+        assert!(tilted.negative_curvature_escape_is_resolvable(1.0e-4, 1.0e-9));
+        // A collapsed or unusable radius resolves nothing.
+        assert!(!spec.negative_curvature_escape_is_resolvable(0.0, 1.0e-9));
+        assert!(!spec.negative_curvature_escape_is_resolvable(f64::NAN, 1.0e-9));
+    }
+
     #[test]
     pub(crate) fn zero_gradient_strict_saddle_takes_hard_case_boundary_step() {
         let h = array![[-2.0, 0.0], [0.0, 1.0]];
