@@ -365,11 +365,13 @@ fn sae_auto_k_recommendation(
 /// block-chart MDL scorer's `coordinate_spectrum` (same mean-centred covariance,
 /// same `jacobi_eigh`, zeros clamped, descending). One eigenvalue per coded
 /// coordinate axis.
-fn coordinate_variance_spectrum(coords: ndarray::ArrayView2<'_, f64>) -> Vec<f64> {
+fn coordinate_variance_spectrum(
+    coords: ndarray::ArrayView2<'_, f64>,
+) -> Result<Vec<f64>, String> {
     let n = coords.nrows();
     let d = coords.ncols();
     if d == 0 || n == 0 {
-        return vec![0.0; d];
+        return Ok(vec![0.0; d]);
     }
     let mut means = vec![0.0f64; d];
     for j in 0..d {
@@ -392,10 +394,17 @@ fn coordinate_variance_spectrum(coords: ndarray::ArrayView2<'_, f64>) -> Vec<f64
     }
     let mut vals = vec![0.0f64; d];
     let mut vecs = vec![0.0f64; d * d];
-    gam::terms::sae::gpu_kernels::sae_encode_resident::jacobi_eigh(&cov, d, &mut vals, &mut vecs);
+    if !gam::terms::sae::gpu_kernels::sae_encode_resident::jacobi_eigh(
+        &cov, d, &mut vals, &mut vecs,
+    ) {
+        return Err(format!(
+            "coordinate variance spectrum: the {d}×{d} covariance did not diagonalise within \
+             the Jacobi sweep budget (non-finite coordinates?)"
+        ));
+    }
     let mut spectrum: Vec<f64> = vals.into_iter().map(|v| v.max(0.0)).collect();
     spectrum.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    spectrum
+    Ok(spectrum)
 }
 
 pub(crate) fn manifold_description_length_from_arrays(
@@ -429,7 +438,7 @@ pub(crate) fn manifold_description_length_from_arrays(
             ));
         }
         atom_coord_dims.push(block.ncols() as f64);
-        coord_variances.extend(coordinate_variance_spectrum(*block));
+        coord_variances.extend(coordinate_variance_spectrum(*block)?);
     }
 
     let total_var: f64 = coord_variances.iter().sum();
