@@ -1294,7 +1294,7 @@ pub(crate) fn run_fitwith_predict_noise(
                 fit.covariance_corrected.clone(),
                 fit.geometry.clone(),
                 SavedFitSummary::from_blockwise_fit(&fit)?,
-            );
+            )?;
             let resolved_base_link = link_choice
                 .map(|choice| {
                     crate::config_resolve::effective_link_to_standard(
@@ -1419,7 +1419,7 @@ pub(crate) fn run_fitwith_predict_noise(
                 fit.covariance_corrected.clone(),
                 fit.geometry.clone(),
                 SavedFitSummary::from_blockwise_fit(&fit)?,
-            );
+            )?;
             let payload = assemble_location_scale_payload(
                 LocationScaleInputs {
                     formula: formula_text.to_string(),
@@ -1587,7 +1587,7 @@ pub(crate) fn run_fitwith_predict_noise(
             fit.covariance_corrected.clone(),
             fit.geometry.clone(),
             SavedFitSummary::from_blockwise_fit(&fit)?,
-        );
+        )?;
         let binomial_noise_transform = build_scale_deviation_transform_design(
             &solved.fit.mean_design.design,
             &solved.fit.noise_design.design,

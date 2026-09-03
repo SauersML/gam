@@ -196,12 +196,12 @@ pub(crate) fn core_saved_fit_result(
     beta_covariance: Option<Array2<f64>>,
     beta_covariance_corrected: Option<Array2<f64>>,
     summary: SavedFitSummary,
-) -> UnifiedFitResult {
+) -> Result<UnifiedFitResult, String> {
     // Saved models are part of the stable inference contract. Reject non-finite
     // values at construction time so JSON cannot silently encode them as null.
     let summary = summary
         .validated()
-        .expect("core_saved_fit_result called with non-finite summary metrics");
+        .map_err(|error| format!("saved fit summary metrics are invalid: {error}"))?;
     validate_all_finite("fit_result.beta", beta.iter().copied())
         .expect("core_saved_fit_result called with non-finite beta");
     validate_all_finite("fit_result.lambdas", lambdas.iter().copied())
@@ -239,7 +239,13 @@ pub(crate) fn core_saved_fit_result(
         // itself read back from a serialized decimal, and the alternative --
         // loosening the validator to a tolerance -- would drop the exactness
         // the rest of the pipeline relies on to round-trip rho.
-        let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+        if let Some(bad) = lambdas.iter().copied().find(|v| !(v.is_finite() && *v > 0.0)) {
+            return Err(format!(
+                "saved fit carries a smoothing strength {bad} that is not finite and positive; a \
+                 strength is exp(rho), so no rho reproduces it — refusing to floor it"
+            ));
+        }
+        let log_lambdas = lambdas.mapv(f64::ln);
         // `checked_exp_log_strength` is a domain check followed by plain
         // `rho.exp()`, so this is bit-identical to what the validator computes
         // -- and `gam-problem` is not a dependency of this crate.
@@ -315,7 +321,7 @@ pub(crate) fn core_saved_fit_result(
             },
             inner_cycles: 0,
         })
-        .expect("core_saved_fit_result called with invalid fit metrics")
+        .map_err(|error| format!("saved fit metrics are invalid: {error}"))
     }
 }
 
@@ -424,7 +430,7 @@ pub(crate) fn compact_saved_multiblock_fit_result(
     beta_covariance_corrected: Option<Array2<f64>>,
     geometry: Option<gam::estimate::FitGeometry>,
     summary: SavedFitSummary,
-) -> UnifiedFitResult {
+) -> Result<UnifiedFitResult, String> {
     let total: usize = blocks.iter().map(|block| block.beta.len()).sum();
     let mut beta = Array1::zeros(total);
     let mut offset = 0;
@@ -441,7 +447,7 @@ pub(crate) fn compact_saved_multiblock_fit_result(
         beta_covariance,
         beta_covariance_corrected,
         summary,
-    );
+    )?;
     fit_result.blocks = blocks;
     if let Some(geom) = geometry {
         if let Some(inf) = fit_result.inference.as_mut() {
@@ -452,7 +458,7 @@ pub(crate) fn compact_saved_multiblock_fit_result(
     fit_result
         .validate_numeric_finiteness()
         .expect("compact saved fit materialization violated fitted-result invariants");
-    fit_result
+    Ok(fit_result)
 }
 
 pub(crate) fn compact_saved_survival_location_scale_fit_result(
@@ -467,7 +473,7 @@ pub(crate) fn compact_saved_survival_location_scale_fit_result(
         fit.covariance_corrected.clone(),
         fit.geometry.clone(),
         SavedFitSummary::from_blockwise_fit(fit)?,
-    );
+    )?;
     apply_inverse_link_state_to_fit_result(&mut fit_result, inverse_link);
     fit_result.artifacts.survival_link_wiggle_knots =
         fit.artifacts.survival_link_wiggle_knots.clone();
@@ -610,7 +616,7 @@ mod tests {
             fit.covariance_corrected.clone(),
             fit.geometry.clone(),
             summary,
-        );
+        ).expect("saved fit reconstruction");
         assert_eq!(reconstructed.outer_iterations, 1);
         assert_eq!(
             reconstructed.training_sample_size(),

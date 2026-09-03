@@ -267,7 +267,7 @@ fn core_saved_fit_result_preserves_summary_metrics() {
     // survives `Array1::zeros(0)` asked the constructor to contradict itself,
     // and it cannot exercise "metrics survive the round-trip" on a path where
     // the metric is definitionally absent.
-    let fit = core_saved_fit_result(array![1.0], array![1.0], 1.0, None, None, summary);
+    let fit = core_saved_fit_result(array![1.0], array![1.0], 1.0, None, None, summary).expect("saved fit reconstruction");
 
     assert_eq!(fit.outer_iterations, 60);
     assert_eq!(fit.outer_gradient_norm, Some(42.0));
@@ -838,7 +838,7 @@ fn cli_sample_bounded_model_reaches_sampler_config_validation() {
             summary.training_sample_size = 3;
             summary
         },
-    );
+    ).expect("saved fit reconstruction");
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(bounded_cli_schema());
     payload.resolved_termspec = Some(bounded_cli_termspec());
@@ -1681,7 +1681,7 @@ fn saved_prediction_runtime_rejects_location_scale_survival_payload_drift() {
         None,
         None,
         saved_fit_summary_fixture(),
-    );
+    ).expect("saved fit reconstruction");
     let mut payload = test_payload(
         "Surv(entry, exit, event) ~ 1",
         ModelKind::Survival,
@@ -2072,7 +2072,7 @@ fn saved_bernoulli_marginal_slope_replays_main_and_slope_deviation_runtimes() {
             log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
             ..saved_fit_summary_fixture()
         },
-    );
+    ).expect("saved fit reconstruction");
     let mut payload = FittedModelPayload::new(
         MODEL_PAYLOAD_VERSION,
         "y ~ x + link(type=probit) + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")"
@@ -2930,7 +2930,7 @@ fn intercept_only_gaussian_location_scale_model(
         None,
         None,
         saved_fit_summary_fixture(),
-    );
+    ).expect("saved fit reconstruction");
     let mut payload = test_payload(
         "y ~ 1",
         ModelKind::LocationScale,
@@ -2991,7 +2991,7 @@ fn intercept_only_binomial_location_scale_model(
         Some(covariance),
         None,
         saved_fit_summary_fixture(),
-    );
+    ).expect("saved fit reconstruction");
     let mut payload = test_payload(
         "y ~ 1",
         ModelKind::LocationScale,
@@ -3327,7 +3327,7 @@ fn core_saved_fit_result_json_roundtripswith_finite_summary() {
                 curvature_floor: None,
             }),
         },
-    );
+    ).expect("saved fit reconstruction");
     let payload = serde_json::to_string(&fit)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize fit result", e));
     let parsed: gam::estimate::UnifiedFitResult = serde_json::from_str(&payload)
@@ -4126,7 +4126,7 @@ fn bernoulli_marginal_slope_saved_model_persists_exact_kernel_metadata_only() {
             None,
             None,
             saved_fit_summary_fixture(),
-        ),
+        ).expect("saved fit reconstruction"),
         // Single marginal coefficient, no influence absorber → truncation
         // is a no-op (p_marginal == block-0 width).
         1,
@@ -4199,7 +4199,7 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
             None,
             None,
             saved_fit_summary_fixture(),
-        ),
+        ).expect("saved fit reconstruction"),
         // Single marginal coefficient, no influence absorber ⇒ truncation
         // is a no-op (p_marginal == block-0 width).
         p_marginal: 1,
@@ -4334,7 +4334,7 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
             log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
             ..saved_fit_summary_fixture()
         },
-    );
+    ).expect("saved fit reconstruction");
     let model = super::build_bernoulli_marginal_slope_saved_model(
         "y ~ 1".to_string(),
         DataSchema {
@@ -4422,7 +4422,7 @@ fn saved_marginal_slope_models_require_latent_z_normalization() {
             None,
             None,
             saved_fit_summary_fixture(),
-        ),
+        ).expect("saved fit reconstruction"),
         // Single marginal coefficient, no influence absorber → truncation
         // is a no-op (p_marginal == block-0 width).
         1,
@@ -4472,7 +4472,7 @@ fn saved_marginal_slope_models_require_latent_z_normalization() {
         None,
         None,
         saved_fit_summary_fixture(),
-    ));
+    ).expect("saved fit reconstruction"));
     survival.data_schema = Some(DataSchema { columns: vec![] });
     survival.set_training_feature_metadata(vec![], vec![]);
     survival.resolved_termspec = Some(empty_termspec());
@@ -5635,7 +5635,7 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
         None,
         None,
         saved_fit_summary_fixture(),
-    );
+    ).expect("saved fit reconstruction");
 
     let mut payload = test_payload(
         "Surv(entry, exit, event) ~ x1 + x2",
@@ -5799,7 +5799,7 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
         None,
         None,
         saved_fit_summary_fixture(),
-    );
+    ).expect("saved fit reconstruction");
 
     let mut payload = test_payload(
         "Surv(entry, exit, event) ~ 1",
@@ -6025,12 +6025,14 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
     let p = fit_beta.len();
     let fit_result = core_saved_fit_result(
         fit_beta,
-        Array1::zeros(built.penalties.len()),
+        // A saved strength is `exp(rho)`, so the fixture carries a positive one;
+        // a zero strength is refused by the builder (#2469).
+        Array1::ones(built.penalties.len()),
         1.0,
         Some(Array2::<f64>::eye(p)),
         None,
         saved_fit_summary_fixture(),
-    );
+    ).expect("saved fit reconstruction");
     let mut payload = test_payload(
         "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)",
         ModelKind::Survival,
@@ -6205,7 +6207,7 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         None,
         None,
         saved_fit_summary_fixture(),
-    );
+    ).expect("saved fit reconstruction");
     let mut payload = test_payload(
         "Surv(entry, exit, event) ~ 1",
         ModelKind::Survival,
@@ -6414,13 +6416,13 @@ fn saved_baseline_timewiggle_reconstruction_keeps_requested_order_one_penalty() 
         "survival",
     );
     payload.fit_result = Some(core_saved_fit_result(
-        Array1::zeros(1),
+        Array1::ones(1),
         Array1::zeros(0),
         1.0,
         None,
         None,
         saved_fit_summary_fixture(),
-    ));
+    ).expect("saved fit reconstruction"));
     payload.baseline_timewiggle_knots = Some(built.knots.to_vec());
     payload.baseline_timewiggle_degree = Some(built.degree);
     payload.baseline_timewiggle_penalty_orders = Some(vec![1, 2, 3]);
