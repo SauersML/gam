@@ -68,12 +68,6 @@ pub struct SlqLogDet {
     pub std_err: f64,
 }
 
-/// Floor on Ritz eigenvalues before taking `ln`. The operator is SPD so the
-/// Ritz values `θ_i` are positive in exact arithmetic; this clamps any tiny
-/// negative/zero value produced by round-off so `ln` stays finite. Chosen far
-/// below any physically meaningful curvature scale.
-const RITZ_LN_FLOOR: f64 = 1e-300;
-
 /// Draw a deterministic Rademacher (±1) vector of length `dim` into `z`,
 /// seeded reproducibly by `probe_seed`. Two bits per draw are wasteful but the
 /// per-element top-bit read keeps this trivially correct and stream-stable.
@@ -297,7 +291,7 @@ impl SlqUnitDeflatedLogDet {
 ///
 /// so `tr(φ(A)) = Σ_{λ_i ≥ floor} ln λ_i` — every collapsed / near-null / (round-off
 /// or genuinely) negative-curvature direction contributes exactly `0` instead of
-/// the plain estimator's `ln(RITZ_LN_FLOOR) ≈ −690` per deflated direction. This
+/// the plain estimator's `ln(band) ≈ ln(γ_m·max|θ|)` per such direction. This
 /// matches the dense convention where a sub-floor eigenvalue is pinned to `λ̃ = 1`.
 ///
 /// The floor is RELATIVE, exactly as in the dense path:
@@ -599,16 +593,25 @@ pub(crate) fn exact_a_ritz_conditioning(
 }
 
 /// Gauss quadrature `e₁ᵀ ln(T) e₁ = Σ_i (τ_{i,0})² ln(θ_i)` over the Lanczos
-/// tridiagonal eigenpairs, with `θ_i` floored to [`RITZ_LN_FLOOR`] so a
+/// tridiagonal eigenpairs, with `θ_i` floored to the Lanczos rounding band `γ_m·max|θ|` so a
 /// round-off-negative Ritz value (the SPD operator forbids genuine ones) cannot
 /// produce a `NaN`. `eigenvectors` columns are the Ritz vectors `y_i`; `τ_{i,0}`
 /// is their first component.
 fn clamped_log_quadrature(eigenvalues: &Array1<f64>, eigenvectors: &Array2<f64>) -> f64 {
+    // The operator is SPD, so a Ritz value at or below zero is Lanczos
+    // round-off: the tridiagonal's eigenvalues carry an error of order
+    // `γ_m·max|θ|` for `m` Lanczos steps. A Ritz value inside that band is
+    // indistinguishable from the band itself, and is evaluated there — the
+    // arithmetic's own scale, not an absolute `1e-300` that contributed
+    // `ln(1e-300) ≈ −690` per such direction (#2469).
+    let steps = eigenvalues.len();
+    let theta_max = eigenvalues.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let ritz_band = gam_linalg::roundoff::accumulation_growth(steps) * theta_max;
     let mut quad = 0.0_f64;
     for i in 0..eigenvalues.len() {
         let tau0 = eigenvectors[[0, i]];
         let weight = tau0 * tau0;
-        let lambda = eigenvalues[i].max(RITZ_LN_FLOOR);
+        let lambda = eigenvalues[i].max(ritz_band);
         quad += weight * lambda.ln();
     }
     quad
@@ -634,9 +637,8 @@ fn deflated_log_quadrature(
         }
         let tau0 = eigenvectors[[0, i]];
         let weight = tau0 * tau0;
-        // `deflate_floor > 0`, so a kept Ritz value is strictly positive; the
-        // `RITZ_LN_FLOOR` guard only defends against a round-off boundary case.
-        quad += weight * lambda.max(RITZ_LN_FLOOR).ln();
+        // `deflate_floor > 0`, so a kept Ritz value is strictly positive.
+        quad += weight * lambda.ln();
     }
     quad
 }
@@ -681,7 +683,7 @@ mod tests {
     /// Exact `log det A` via the workspace symmetric eigensolver (`Σ ln λ_i`).
     fn exact_logdet(a: &Array2<f64>) -> f64 {
         let (evals, _) = a.eigh(Side::Lower).expect("SPD eigendecomposition");
-        evals.iter().map(|&l| l.max(RITZ_LN_FLOOR).ln()).sum()
+        evals.iter().map(|&l| l.ln()).sum()
     }
 
     fn condition_number(a: &Array2<f64>) -> f64 {
@@ -866,7 +868,7 @@ mod tests {
     /// #2308 — the matrix-free evidence log|S| MUST obey the same unit-deflation
     /// convention as the dense reduced-Schur factor: a collapsed / near-null /
     /// negative-curvature direction is pinned to unit stiffness and contributes
-    /// `ln 1 = 0`, NOT the plain estimator's `ln(RITZ_LN_FLOOR) ≈ −690`.
+    /// `ln 1 = 0`, NOT the plain estimator's `ln(γ_m·max|θ|)`.
     #[test]
     fn slq_unit_deflation_pins_collapsed_direction_to_unit_2308() {
         let dim = 48usize;
@@ -924,14 +926,25 @@ mod tests {
             reference
         );
 
-        // Plain SLQ (no deflation) is dragged HUNDREDS of units below by the
-        // collapsed direction's `ln(RITZ_LN_FLOOR)` contribution — the exact
-        // ρ-dependent-Occam-reward bug the matrix-free unit deflation removes.
+        // Plain SLQ (no deflation) is dragged below by the collapsed direction's
+        // `ln(γ_m·max|θ|)` contribution — the Lanczos arithmetic's own band, about
+        // −30 here (it was `ln(1e-300) ≈ −690` while the floor was a constant) —
+        // the ρ-dependent-Occam-reward bug the matrix-free unit deflation removes.
+        // The quadrature spreads one direction's weight over its nodes, so the
+        // realized drop is bounded below by half the band's log, not by all of it.
         let plain = slq_logdet(dim, |v| a.dot(&v), 48, dim, 0xD1F);
-        eprintln!("plain est={:.6}", plain.estimate);
+        let ritz_band =
+            gam_linalg::roundoff::accumulation_growth(48) * deflated.lambda_max_abs;
+        let collapsed_direction_drop = -ritz_band.ln();
+        eprintln!(
+            "plain est={:.6} collapsed-direction drop ln(band)={:.3}",
+            plain.estimate, -collapsed_direction_drop
+        );
         assert!(
-            deflated.estimate - plain.estimate > 100.0,
-            "plain SLQ ({}) must sit far below the unit-deflated estimate ({})",
+            collapsed_direction_drop > 0.0
+                && deflated.estimate - plain.estimate > 0.5 * collapsed_direction_drop,
+            "plain SLQ ({}) must sit below the unit-deflated estimate ({}) by the collapsed \
+             direction's ln(band) ≈ −{collapsed_direction_drop:.1}",
             plain.estimate,
             deflated.estimate
         );
