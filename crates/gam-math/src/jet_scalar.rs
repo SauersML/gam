@@ -1394,8 +1394,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder1<'arena> {
             axis < dimension,
             "dynamic first-order jet axis out of bounds"
         );
-        let g = arena.zeros(dimension);
-        g[axis] = 1.0;
+        let g = arena_vector(arena, dimension, |i| if i == axis { 1.0 } else { 0.0 });
         Self { arena, v: x, g }
     }
 
@@ -1426,10 +1425,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder1<'arena> {
 
     fn add(&self, o: &Self) -> Self {
         self.assert_compatible(o);
-        let g = self.arena.zeros(self.dimension());
-        for i in 0..g.len() {
-            g[i] = self.g[i] + o.g[i];
-        }
+        let g = arena_vector(self.arena, self.dimension(), |i| self.g[i] + o.g[i]);
         Self {
             arena: self.arena,
             v: self.v + o.v,
@@ -1439,10 +1435,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder1<'arena> {
 
     fn sub(&self, o: &Self) -> Self {
         self.assert_compatible(o);
-        let g = self.arena.zeros(self.dimension());
-        for i in 0..g.len() {
-            g[i] = self.g[i] - o.g[i];
-        }
+        let g = arena_vector(self.arena, self.dimension(), |i| self.g[i] - o.g[i]);
         Self {
             arena: self.arena,
             v: self.v - o.v,
@@ -1452,10 +1445,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder1<'arena> {
 
     fn mul(&self, o: &Self) -> Self {
         self.assert_compatible(o);
-        let g = self.arena.zeros(self.dimension());
-        for i in 0..g.len() {
-            g[i] = self.v * o.g[i] + self.g[i] * o.v;
-        }
+        let g = arena_vector(self.arena, self.dimension(), |i| self.v * o.g[i] + self.g[i] * o.v);
         Self {
             arena: self.arena,
             v: self.v * o.v,
@@ -1468,10 +1458,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder1<'arena> {
     }
 
     fn scale(&self, s: f64) -> Self {
-        let g = self.arena.zeros(self.dimension());
-        for i in 0..g.len() {
-            g[i] = self.g[i] * s;
-        }
+        let g = arena_vector(self.arena, self.dimension(), |i| self.g[i] * s);
         Self {
             arena: self.arena,
             v: self.v * s,
@@ -1480,10 +1467,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder1<'arena> {
     }
 
     fn compose_unary(&self, d: [f64; 5]) -> Self {
-        let g = self.arena.zeros(self.dimension());
-        for i in 0..g.len() {
-            g[i] = d[1] * self.g[i];
-        }
+        let g = arena_vector(self.arena, self.dimension(), |i| d[1] * self.g[i]);
         Self {
             arena: self.arena,
             v: d[0],
