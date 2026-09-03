@@ -247,93 +247,6 @@ impl std::fmt::Debug for ConstantCurvatureProfile<'_> {
     }
 }
 
-/// The criterion's own forward resolution in `η`.
-///
-/// A value-comparing line search cannot separate two `η` closer than this — the
-/// values differ below the rounding of `V` — so an iterate that stops moving at
-/// this scale HAS converged, and demanding a smaller gradient than the value can
-/// resolve would classify every successful solve as a stall. ONE expression,
-/// because the refinement's step test and the stationarity certificate below
-/// both need it and a certificate that disagrees with the loop that produced it
-/// is worse than no certificate.
-fn eta_resolution(eta: f64) -> f64 {
-    f64::EPSILON.sqrt() * (1.0 + eta.abs())
-}
-
-/// Is `η` a stationary point of `V(κ, ·)`, at the resolution the criterion's own
-/// VALUE can express?
-///
-/// Two tests, because a gradient bar alone is not achievable near a flat
-/// minimum: `|V_η|` below a relative floor, or an exact Newton step already
-/// shorter than [`eta_resolution`]. Shared by the refinement loop and by the
-/// terminal classification so the two cannot disagree about what "converged"
-/// means — the disagreement they used to carry was the defect: `converged` was a
-/// flag recording which `break` fired, so a line search that exhausted BECAUSE
-/// the incumbent was already the minimum left it unset.
-fn eta_is_stationary(gradient: f64, curvature: f64, eta: f64, value: f64) -> bool {
-    if gradient.abs() <= 1.0e-9 * (1.0 + value.abs()) {
-        return true;
-    }
-    curvature.is_finite()
-        && curvature > 0.0
-        && (gradient / curvature).abs() <= eta_resolution(eta)
-}
-
-/// Why [`ConstantCurvatureProfile::minimize_over_eta`]'s refinement stopped.
-///
-/// It exists because the terminal classification cannot recover this from the
-/// final state, and getting it wrong in EITHER direction has a cost. The
-/// previous shape of this code kept a `converged` flag set by two of the loop's
-/// several `break`s, so a search that stopped for a third reason was recorded as
-/// a failure; replacing the flag with a purely analytic re-test of the final jet
-/// then refused six fixtures that were converged — measured, `V_η` between
-/// `1.7e-6` and `1.9e-3` against `V_ηη` between `0.93` and `6.3e3`, i.e. Newton
-/// steps of `1.8e-6` down to `2.5e-8`.
-///
-/// Both mistakes have one cause: an analytic bar asks for a certificate in exact
-/// arithmetic, and this criterion is not evaluated in exact arithmetic. Every
-/// `V(κ, η)` runs its own inner ρ optimization, so the computed value carries
-/// that solve's noise, orders above `ε·|V|`. The instrument that knows the real
-/// floor is the LINE SEARCH — it is the thing that decides, empirically, whether
-/// a smaller value is reachable — so its verdict is a certificate rather than a
-/// failure to produce one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RefineExit {
-    /// [`eta_is_stationary`] fired: the analytic certificate, in the cases where
-    /// the criterion is smooth enough to issue it.
-    Stationary,
-    /// The backtracking search along an exact DESCENT direction found no smaller
-    /// value at any of its thirty geometric scales, down to the point where the
-    /// trial stops being distinguishable from the incumbent. No reachable point
-    /// near `η̂` has a smaller `V`, which is the strongest first-order statement
-    /// this criterion supports.
-    SearchExhausted,
-    /// A step was accepted and moved the iterate less than
-    /// [`eta_resolution`] — the scale at which a value-comparing search cannot
-    /// tell two η apart. Same content as [`Self::SearchExhausted`], reached from
-    /// the accepting side.
-    BelowResolution,
-    /// The iteration budget ran out while steps were still being accepted, i.e.
-    /// the refinement was still moving when it was stopped. The one exit that
-    /// is not a certificate of anything.
-    BudgetExhausted,
-}
-
-impl RefineExit {
-    /// Does this exit certify first-order optimality at the resolution the
-    /// criterion can express?
-    ///
-    /// A budget that ran out while the iterate was still moving does not; the
-    /// other three do, each for a stated reason. Deliberately NOT a wildcard, so
-    /// a new exit has to answer this question rather than inherit an answer.
-    fn certifies(self) -> bool {
-        match self {
-            Self::Stationary | Self::SearchExhausted | Self::BelowResolution => true,
-            Self::BudgetExhausted => false,
-        }
-    }
-}
-
 /// How the inner range solve at one κ terminated.
 ///
 /// The variants are not shades of one answer. Each is a different claim about
@@ -345,10 +258,9 @@ impl RefineExit {
 /// `0.68 → 34 000` across the κ box.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RangeSolveOutcome {
-    /// `V_ηη > 0` at an η strictly inside the box, with the refinement
-    /// certifying first-order optimality there — see [`RefineExit::certifies`],
-    /// which accepts either the analytic bar or a line search that could not
-    /// reach a smaller value. The envelope and Schur reductions of the profile
+    /// `V_ηη > 0` at an η strictly inside the box that the outer engine's
+    /// stationarity certificate accepted and did not report as railed.
+    /// The envelope and Schur reductions of the profile
     /// are both valid, and the residual `V_η` costs `V_η·η̂′` on the first
     /// derivative — a term that is present under every non-`InteriorMinimum`
     /// outcome too, because `V_p′` is reported as `V_κ` in all of them. What
@@ -662,214 +574,81 @@ impl<'a> ConstantCurvatureProfile<'a> {
         Ok(sample)
     }
 
-    /// `η̂(κ) = argmin_η V(κ, η)` on the evaluability box, and the jet there.
-    ///
-    /// A deterministic scan across the geometry's own scale span brackets the
-    /// basin before a safeguarded Newton refines it. The scan is an
-    /// INITIALIZATION, not a constraint: the measured criterion puts its minimum
-    /// above the largest evaluated separation on a third of the planted
-    /// fixtures, and the Newton is free to walk there — only the evaluability
-    /// box stops it. Making the bracket deterministic (rather than warm-starting
-    /// from the previous κ) is what makes `V_p` a function of κ alone, which the
-    /// CI walk and the LR test both require.
-    ///
-    /// # The narrow scan is not a defect, and that is measured (gam#2747)
-    ///
-    /// Recorded here because it looks like one and the next reader will suspect
-    /// it. The scan spans `[ln d_min⁺, ln d_max]` clamped into the box — a factor
-    /// of about 18 — while the chart is `ln(1/ε)/(4√ε) ≈ 6·10⁸` wide, and the
-    /// minimizer really does sit outside the scan on a third of the planted
-    /// cells (`ℓ̂ = 6.9` against a scan top of `2.3`, and `3.4·10⁴` at the
-    /// hyperbolic end of another). The obvious conclusion is that `V_p` is being
-    /// over-estimated wherever the Newton fails to escape, biasing κ̂.
-    ///
-    /// It was checked rather than assumed. Emulating this exact solve — same
-    /// thirteen points, same clamp, same seed as a fourteenth candidate, same
-    /// trust cap, same `value ≤ incumbent` backtrack — against a brute-force
-    /// `min_η` over the WHOLE chart, at fifteen κ across each of the nine cells
-    /// of the curvature × range grid: the gap is zero to double precision in
-    /// every cell, including the ones that require walking three e-folds out of
-    /// the bracket. The Newton escapes; the scan behaves like the initialization
-    /// it is documented as. Rewriting it would be churn.
-    ///
-    /// # What this costs, and why it is paid
-    ///
-    /// Roughly seventeen criterion evaluations per κ where the pinned-range
-    /// criterion needed one — thirteen bracket points and a handful of Newton
-    /// steps — of which only the accepted iterates pay for derivative blocks
-    /// (see [`Self::evaluate_value`]). That is the intrinsic price of profiling
-    /// a nuisance coordinate rather than guessing it, and the alternative is the
-    /// defect: a κ estimated against a heuristic range is an estimate of the
-    /// range error. Warm-starting from the previous κ would cut the bracket, but
-    /// it makes `V_p` depend on the ORDER the CI walk visits κ, and a profile
-    /// likelihood that is not a function of its own argument cannot support an
-    /// interval.
+    /// The profiled range `η̂(κ) = argmin_η V(κ, η)` on the evaluability domain,
+    /// found by the workspace's outer engine: one coordinate carrying the
+    /// analytic ψ-gradient and curvature the jet already provides, the engine's
+    /// seed cascade and stationarity certificate, and the domain `[lo, hi]`
+    /// derived at construction (the distance-kernel limit above, the
+    /// evaluability wall below). The certificate's railed coordinate names a
+    /// wall outcome; a certified interior point with positive curvature is an
+    /// interior minimum; a point the certificate cannot vouch for is
+    /// `Uncertified`, and a search the engine could not certify at all is an
+    /// error. This replaced a 13-point scan of the bracket seeding a Newton
+    /// with a `√ε` resolution, a `1e-9` relative stationarity test, a
+    /// quarter-width fallback step and two hand budgets that returned its last
+    /// iterate (#2469, #2670: SPEC forbids grid search and hand bounds).
     fn minimize_over_eta(
         &self,
         kappa: f64,
     ) -> Result<(f64, ProfiledRemlPsiJet, RangeSolveOutcome), EstimationError> {
         let Some((lo, hi)) = self.eta_bounds else {
-            // η is not a coordinate. `η̂(κ) ≡ η_pinned` by construction, which is
-            // the one case where `dη̂/dκ = 0` needs no argument at all.
             let jet = self.evaluate_psi(kappa, self.eta_seed)?;
             return Ok((self.eta_seed, jet, RangeSolveOutcome::Pinned));
         };
-        // Bracket over the evaluated scale span (clamped into the box), plus the
-        // seed, so a user-supplied or previously fitted range is always among
-        // the candidates.
-        const SCAN_POINTS: usize = 13;
-        let scan_lo = self.eta_bracket.0.clamp(lo, hi);
-        let scan_hi = self.eta_bracket.1.clamp(lo, hi);
-        // Two lists: points whose value the search may COMPARE (interior ρ̂),
-        // and every point that evaluated at all. The second exists only so a
-        // dataset whose ρ̂ rails everywhere still gets an answer — it is a
-        // fallback, and the outcome it produces is `Uncertified` because a
-        // comparison across truncated minima is not a minimization.
-        let mut comparable: Vec<(f64, f64)> = Vec::with_capacity(SCAN_POINTS + 1);
-        let mut any: Vec<(f64, f64)> = Vec::with_capacity(SCAN_POINTS + 1);
-        let consider = |eta: f64, ok: &mut Vec<(f64, f64)>, all: &mut Vec<(f64, f64)>| {
-            match self.evaluate_value(kappa, eta) {
-                Ok(value) => {
-                    ok.push((value, eta));
-                    all.push((value, eta));
-                }
-                Err(_) => {
-                    if let Some(&(value, _)) = self
-                        .value_cache
-                        .borrow()
-                        .get(&(kappa.to_bits(), eta.to_bits()))
-                    {
-                        all.push((value, eta));
-                    }
-                }
-            }
+        use gam_problem::{Derivative, HessianValue, OuterEval};
+        use gam_solve::rho_optimizer::OuterProblem;
+        let context = format!("constant-curvature range solve at κ = {kappa}");
+        // A kernel that cannot be evaluated at a trial η is a property of that
+        // trial, so the search retreats from it instead of abandoning the
+        // profile.
+        let refuse = |error: EstimationError| EstimationError::TrialPointRefused {
+            reason: error.to_string(),
         };
-        for i in 0..SCAN_POINTS {
-            consider(
-                scan_lo + (scan_hi - scan_lo) * (i as f64) / ((SCAN_POINTS - 1) as f64),
-                &mut comparable,
-                &mut any,
-            );
-        }
-        consider(self.eta_seed, &mut comparable, &mut any);
-        let fell_back = comparable.is_empty();
-        let mut candidates = if fell_back { any } else { comparable };
-        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        // The jet carries checks the value path does not (the ψ-fixed null-space
-        // premise, and the chart's reproduction of the forward score), so a point
-        // the value accepts can still be one the jet refuses. Walk the scan in
-        // value order and start from the best point that yields a jet, rather
-        // than failing the whole profile at that κ.
-        let started = candidates.iter().find_map(|&(_, eta)| {
-            self.evaluate_psi(kappa, eta).ok().map(|jet| (eta, jet))
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(gam_problem::DeclaredHessianForm::Dense)
+            .with_bounds(Array1::from_vec(vec![lo]), Array1::from_vec(vec![hi]))
+            .with_initial_rho(Array1::from_vec(vec![self.eta_seed.clamp(lo, hi)]));
+        let mut objective = problem.build_objective(
+            (),
+            |_: &mut (), rho: &Array1<f64>| self.evaluate_value(kappa, rho[0]).map_err(refuse),
+            |_: &mut (), rho: &Array1<f64>| {
+                let jet = self.evaluate_psi(kappa, rho[0]).map_err(refuse)?;
+                Ok(OuterEval {
+                    cost: jet.value,
+                    gradient: Array1::from_vec(vec![jet.gradient[1]]),
+                    hessian: HessianValue::Dense(Array2::from_elem((1, 1), jet.hessian[1][1])),
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError>>,
+        );
+        let result = problem.run(&mut objective, &context)?;
+        let eta = result.rho[0];
+        let jet = self.evaluate_psi(kappa, eta)?;
+        let certificate = result.criterion_certificate.as_ref();
+        // A railed coordinate sits on one of the two walls; which one is read
+        // off the fact's own box, not off a resolution constant.
+        let railed_at_upper = certificate.is_some_and(|c| {
+            c.railed_facts
+                .iter()
+                .any(|fact| fact.theta > 0.5 * (fact.lower + fact.upper))
         });
-        let Some((mut eta, mut jet)) = started else {
-            crate::bail_invalid_estim!(
-                "constant-curvature profile could not evaluate the range box at κ = {kappa}"
-            );
-        };
-        if fell_back {
-            // Every probed range railed ρ̂. There is no comparison to make — a
-            // constrained minimum over a truncated λ range is not comparable to
-            // an unconstrained one — so the best RAW value stands, and it is not
-            // a minimization of anything. `η̂` is then an artifact of which
-            // truncation happened to be shallowest, so the profile has no
-            // derivative here and `Uncertified` says so.
-            return Ok((eta, jet, RangeSolveOutcome::Uncertified));
-        }
-        // Safeguarded Newton on η at fixed κ. The trust step is capped at the
-        // BRACKET width rather than the (deliberately enormous) box width, so a
-        // flat or non-convex stretch cannot throw the iterate fifteen orders of
-        // magnitude away from the geometry.
-        const MAX_NEWTON: usize = 60;
-        let width = (scan_hi - scan_lo).max(1.0);
-        // WHY the refinement stopped, kept because the terminal classification
-        // needs it and cannot recover it from the state alone. See
-        // [`RefineExit`]: three of these four are certificates and one is a
-        // failure, and in exact arithmetic the difference would not exist.
-        let mut exit = RefineExit::BudgetExhausted;
-        for _ in 0..MAX_NEWTON {
-            let g = jet.gradient[1];
-            let h = jet.hessian[1][1];
-            let at_lo = eta <= lo + eta_resolution(lo);
-            let at_hi = eta >= hi - eta_resolution(hi);
-            if at_hi && g <= 0.0 {
-                return Ok((eta, jet, RangeSolveOutcome::DistanceKernelLimit));
-            }
-            if at_lo && g >= 0.0 {
-                return Ok((eta, jet, RangeSolveOutcome::EvaluabilityWall));
-            }
-            if eta_is_stationary(g, h, eta, jet.value) {
-                exit = RefineExit::Stationary;
-                break;
-            }
-            let raw = if h.is_finite() && h > 0.0 {
-                -g / h
-            } else {
-                -g.signum() * 0.25 * width
-            };
-            let mut step = raw.clamp(-width, width);
-            let mut accepted = None;
-            for _ in 0..30 {
-                let trial = (eta + step).clamp(lo, hi);
-                if (trial - eta).abs() <= 1.0e-14 * (1.0 + eta.abs()) {
-                    break;
-                }
-                // Screen the trial with the cheap value; only the ACCEPTED point
-                // pays for a jet. A trial the value accepts but the jet refuses
-                // is treated as a rejected trial and the step keeps shrinking.
-                if let Ok(value) = self.evaluate_value(kappa, trial)
-                    && value <= jet.value
-                    && let Ok(next) = self.evaluate_psi(kappa, trial)
-                {
-                    accepted = Some((trial, next));
-                    break;
-                }
-                step *= 0.5;
-            }
-            match accepted {
-                Some((next_eta, next_jet)) => {
-                    let moved = (next_eta - eta).abs();
-                    eta = next_eta;
-                    jet = next_jet;
-                    if moved <= eta_resolution(eta) {
-                        exit = RefineExit::BelowResolution;
-                        break;
-                    }
-                }
-                None => {
-                    exit = RefineExit::SearchExhausted;
-                    break;
-                }
-            }
-        }
-        let h = jet.hessian[1][1];
-        // ONE expression for "on the wall", and it is [`eta_resolution`] — the
-        // same scale the stationarity certificate uses, because a point the
-        // criterion cannot distinguish from the wall IS on it. This used to be
-        // two different literals, `1e-12` in the loop's early returns and `1e-9`
-        // here, so a band three orders wide was a wall to one test and interior
-        // to the other. Neither number was derived from anything.
-        let at_top = eta >= hi - eta_resolution(hi);
-        let at_bottom = eta <= lo + eta_resolution(lo);
-        // The chart's TOP is the geodesic-distance face and its bottom is an
-        // evaluability wall, so an iterate that stopped at one is not the same
-        // finding as an iterate that stopped at the other — see
-        // `RangeSolveOutcome::DistanceKernelLimit`. Both give the plain κ slice,
-        // because at an ACTIVE bound `η̂(κ)` is the bound; only one of them is an
-        // answer about the model.
-        //
-        // Away from both faces the question is whether this is a MINIMUM, and it
-        // is asked in two halves that both have to hold. `exit.certifies()` is
-        // the first-order half at the resolution the criterion can issue (see
-        // [`RefineExit`]); `V_ηη > 0` is the second-order half, and without it a
-        // stationary point is a maximum or a saddle in η and the profile's
-        // reduction divides by the wrong sign.
-        let outcome = if at_top {
+        let railed_at_lower = certificate.is_some_and(|c| {
+            c.railed_facts
+                .iter()
+                .any(|fact| fact.theta <= 0.5 * (fact.lower + fact.upper))
+        });
+        let curvature = jet.hessian[1][1];
+        let outcome = if railed_at_upper {
             RangeSolveOutcome::DistanceKernelLimit
-        } else if at_bottom {
+        } else if railed_at_lower {
             RangeSolveOutcome::EvaluabilityWall
-        } else if exit.certifies() && h.is_finite() && h > 0.0 {
+        } else if certificate.and_then(|c| c.hessian_psd()) != Some(false)
+            && curvature.is_finite()
+            && curvature > 0.0
+        {
             RangeSolveOutcome::InteriorMinimum
         } else {
             RangeSolveOutcome::Uncertified
