@@ -1,5 +1,7 @@
 ## Unreleased
 
+- `perf_scale` gains `grouped_binomial_sweep_2569`, the #2569 grouped-binomial shape rebuilt from synthetic data with per-fit wall time printed (#2569).
+
 - First-order dynamic jets fill each result once instead of zeroing and overwriting it, the same single-fill the second-order jets use (#979).
 
 - Custom-family inner solves on Firth-armed fits no longer ratchet the trust radius to its floor: the Jeffreys log-determinant's certified round-off (`JointJeffreysPlan::value_roundoff_bound`) is part of the objective-resolution ceiling, so the witness's measurement is admitted, and the row kernel's early exit uses the accept test's round-off slack instead of an absolute `1e-10` (#2695, #2718, #2748). A trial point where the Jeffreys information cannot be formed is refused instead of scored with `Φ = 0` (#2765).
