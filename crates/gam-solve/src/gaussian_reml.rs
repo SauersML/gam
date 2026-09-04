@@ -52,7 +52,6 @@ fn zero_backward_result(n: usize, p: usize, d: usize) -> GaussianRemlBackwardRes
 pub const RHO_LOWER: f64 = -30.0;
 pub const RHO_UPPER: f64 = 30.0;
 const EIGEN_REL_TOL: f64 = 1.0e-10;
-const MIN_DEVIANCE: f64 = 1.0e-300;
 /// Relative first-order convergence certificate for the block-orthogonal
 /// alternation: the largest per-block |dV/drho|, normalized by the score's
 /// natural magnitude `d * max(1, rank)`, must fall below this and the analytic
@@ -2813,7 +2812,20 @@ pub fn gaussian_reml_free_b_score(
         let beta_col = coefficients.column(output);
         let s_beta_col = s_beta.column(output);
         let penalty_quadratic = beta_col.dot(&s_beta_col);
-        let dp = (weighted_rss + lambda * penalty_quadratic).max(MIN_DEVIANCE);
+        let dp = weighted_rss + lambda * penalty_quadratic;
+        // A zero penalized deviance is an interpolating fit whose profiled scale
+        // `φ̂ = D_p/ν` is not identifiable: `log(2π·D_p/ν)` has no minimum there,
+        // so the criterion is refused rather than evaluated at a floor (#2469;
+        // the block profile in this file refuses the same case for the same
+        // reason). `D_p` is a sum of non-negative terms, so `!(dp > 0)` is exact
+        // zero or non-finite input, never cancellation.
+        if !(dp > 0.0) {
+            crate::bail_invalid_estim!(
+                "Gaussian REML output {output} has a non-positive penalized deviance {dp}: the \
+                 profiled scale is not identifiable (interpolating fit), so the REML criterion \
+                 is undefined there"
+            );
+        }
         sigma2[output] = dp / nu;
         reml_score += 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln());
         grad_log_lambda += 0.5 * nu * lambda * penalty_quadratic / dp;
@@ -3250,9 +3262,11 @@ fn validate_gaussian_reml_forward_fit(
         && fit.edf.is_finite())
         || fit.coefficients.iter().any(|value| !value.is_finite())
         || fit.fitted.iter().any(|value| !value.is_finite())
-        || fit.sigma2.iter().any(|value| !value.is_finite())
+        || fit.sigma2.iter().any(|value| !(value.is_finite() && *value > 0.0))
     {
-        crate::bail_invalid_estim!("Gaussian REML backward forward state must be finite");
+        crate::bail_invalid_estim!(
+            "Gaussian REML backward forward state must be finite with positive profiled scales"
+        );
     }
     let penalty_fingerprint = matrix_fingerprint(penalty);
     if fit.cache.penalty_fingerprint != penalty_fingerprint {
@@ -3531,7 +3545,7 @@ fn add_reml_score_vjp(
     }
 
     for j in 0..beta.ncols() {
-        let dp = (sigma2[j] * nu).max(MIN_DEVIANCE);
+        let dp = sigma2[j] * nu;
         let coef = scale * 0.5 * nu / dp;
         add_deviance_profile_vjp(
             coef,
@@ -3666,7 +3680,7 @@ fn add_reml_rho_gradient_vjp(
     let s_beta = dense_ab(penalty, beta.view());
     let mut upstream_beta = Array2::<f64>::zeros(beta.dim());
     for j in 0..beta.ncols() {
-        let dp = (sigma2[j] * nu).max(MIN_DEVIANCE);
+        let dp = sigma2[j] * nu;
         let q = lambda * beta.column(j).dot(&s_beta.column(j));
         let q_coef = scale * nu / dp;
         for row in 0..beta.nrows() {
