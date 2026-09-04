@@ -17,8 +17,7 @@
 //!     `aniso_log_scales = Some(zeros)`) with `K` farthest-point centers.
 //!   * REML/LAML outer loop must converge.
 //!   * Held-out-grid relative L2 reconstruction error must be < 0.10.
-//!   * Bias-corrected predictions must be available on `FitInference`
-//!     and finite.
+//!   * The held-out posterior-mean prediction must be finite.
 //!   * 95% prediction-interval coverage on held-out samples must
 //!     exceed 0.85 across `N_COVERAGE_SIMS` independent simulations.
 //!   * Each fit must terminate on convergence, strictly inside the outer
@@ -415,26 +414,12 @@ fn gaussian_identity_mean(
     mean
 }
 
-fn gaussian_identity_bias_corrected_mean(
-    design: ArrayView2<'_, f64>,
-    fit: &UnifiedFitResult,
-    offset: ArrayView1<'_, f64>,
-) -> Array1<f64> {
-    let bias_correction = fit
-        .inference
-        .as_ref()
-        .and_then(|inference| inference.bias_correction_beta.as_ref())
-        .expect("FitInference must carry bias_correction_beta");
-    let beta = &fit.beta + bias_correction;
-    gaussian_identity_mean(design, beta.view(), offset)
-}
-
-fn gaussian_identity_bias_corrected_mean_interval(
+fn gaussian_identity_mean_interval(
     design: ArrayView2<'_, f64>,
     fit: &UnifiedFitResult,
     offset: ArrayView1<'_, f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    let mean = gaussian_identity_bias_corrected_mean(design, fit, offset);
+    let mean = gaussian_identity_mean(design, fit.beta.view(), offset);
     let covariance = fit
         .beta_covariance_corrected()
         .expect("Gaussian identity coverage requires smoothing-corrected covariance");
@@ -605,29 +590,10 @@ fn large_scale_reml_stress_main() {
          which this bar is out of reach.",
     );
 
-    // (3) Bias-corrected predictions: FitInference must carry a finite
-    //     bias-correction vector after a successful REML fit, and the
-    //     bias-corrected Gaussian identity prediction must stay finite.
-    let inference = fitted
-        .fit
-        .inference
-        .as_ref()
-        .expect("compute_inference=true must populate FitInference");
-    let bc = inference
-        .bias_correction_beta
-        .as_ref()
-        .expect("FitInference must carry bias_correction_beta");
-    assert_eq!(bc.len(), fitted.fit.beta.len());
-    assert!(
-        bc.iter().all(|v| v.is_finite()),
-        "bias_correction_beta must be entirely finite",
-    );
-
-    let pred_unc_mean = gaussian_identity_bias_corrected_mean(
-        holdout_dense.view(),
-        &fitted.fit,
-        holdout_offset.view(),
-    );
+    // (3) The held-out Gaussian identity prediction must stay finite after a
+    //     successful REML fit.
+    let pred_unc_mean =
+        gaussian_identity_mean(holdout_dense.view(), fitted.fit.beta.view(), holdout_offset.view());
     assert!(pred_unc_mean.iter().all(|v| v.is_finite()));
 
     // (4) The outer loop converged inside its configured budget rather than
@@ -910,7 +876,7 @@ fn large_scale_reml_stress_coverage() {
             .expect("Gaussian identity coverage requires the conditional covariance")
             .clone();
         let offset_te = Array1::<f64>::zeros(N_COVERAGE_HOLDOUT);
-        let (pred_mean, pred_lower, pred_upper) = gaussian_identity_bias_corrected_mean_interval(
+        let (pred_mean, pred_lower, pred_upper) = gaussian_identity_mean_interval(
             holdout_dense.view(),
             &fitted.fit,
             offset_te.view(),

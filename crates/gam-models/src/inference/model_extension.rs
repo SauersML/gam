@@ -536,9 +536,6 @@ fn insert_coefficient_into_saved_fit(
         if let Some(qs) = inference.reparam_qs.as_mut() {
             *qs = insert_symmetric_array2(qs, index, 1.0)?;
         }
-        if let Some(bias) = inference.bias_correction_beta.as_mut() {
-            *bias = insert_array1(bias, index, 0.0);
-        }
     }
     if let Some(geometry) = fit.geometry.as_mut() {
         geometry.penalized_hessian = insert_symmetric_array2(

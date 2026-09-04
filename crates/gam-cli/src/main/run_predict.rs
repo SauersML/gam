@@ -2675,10 +2675,6 @@ pub(crate) fn run_predict_survival(
                 covariance_mode,
                 mean_interval_method: MeanIntervalMethod::TransformEta,
                 includeobservation_interval: false,
-                // One estimand policy for every front door: the band is centred
-                // on the posterior mean the point column reports, exactly as
-                // the library's `resolve_prediction_request` centres its bands.
-                apply_bias_correction: false,
                 ..PredictUncertaintyOptions::default()
             },
         )

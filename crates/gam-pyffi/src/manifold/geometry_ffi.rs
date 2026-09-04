@@ -7727,7 +7727,6 @@ fn predict_columns_conformal(
         covariance_mode,
         mean_interval_method: gam_predict::MeanIntervalMethod::TransformEta,
         includeobservation_interval: options.observation_interval.unwrap_or(false),
-        apply_bias_correction: false,
         conformal_level: Some(level),
         ..gam_predict::PredictUncertaintyOptions::default()
     };

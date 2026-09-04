@@ -2256,11 +2256,9 @@ where
     let mut beta_covariance_frequentist = None;
     let mut coefficient_influence = None;
     let mut weighted_gram = None;
-    let mut bias_correction_jacobian = None;
     // Factorization of stabilized Hessian in transformed basis, reused for
     // SE computation via solve-on-demand after dispersion is determined.
     let mut edf_factor: Option<Box<dyn FactorizedSystem>> = None;
-    let mut bias_correction_beta = None;
     let mut rho_posterior_certificate = None;
     let mut rho_posterior_escalation = None;
     // Hold the governor charge across every dense inference allocation in this
@@ -2469,43 +2467,6 @@ where
             }
         }
 
-        if opts.compute_inference {
-            // O(n⁻¹) frequentist bias correction vector b̂ =
-            // H⁻¹ S(λ̂)(β̂ - μ). This is an inference product, unlike the
-            // posterior-identity solves that constrained fits need regardless
-            // of whether standard errors were requested.
-            let beta_t = pirls_res.beta_transformed.as_ref();
-            let mut s_beta_t = Array1::<f64>::zeros(p_dim);
-            for (kk, cp) in pirls_res
-                .reparam_result
-                .canonical_transformed
-                .iter()
-                .enumerate()
-            {
-                let r = &cp.col_range;
-                let local = cp.local_ref();
-                let beta_block = beta_t.slice(ndarray::s![r.clone()]);
-                let centered = &beta_block - &cp.prior_mean;
-                let local_beta = local.dot(&centered);
-                let lam_k = lambdas[kk];
-                let mut acc = s_beta_t.slice_mut(ndarray::s![r.clone()]);
-                acc.scaled_add(lam_k, &local_beta);
-            }
-            let b_t = factor.solve(&s_beta_t).map_err(|reason| {
-                EstimationError::RemlOptimizationFailed(format!(
-                    "exact bias-correction solve failed: {reason}"
-                ))
-            })?;
-            certify_factorized_inference_vector_solve(h, &s_beta_t, &b_t, "bias correction")?;
-            let qs = &pirls_res.reparam_result.qs;
-            let b_orig = qs.dot(&b_t);
-            if b_orig.iter().any(|value| !value.is_finite()) {
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "bias-correction basis map produced non-finite coefficients".to_string(),
-                ));
-            }
-            bias_correction_beta = Some(b_orig);
-        }
         // Preserve the factorization for solve-on-demand SE and covariance
         // computation below, after dispersion has been determined.
         edf_factor = Some(factor);
@@ -2942,14 +2903,6 @@ where
             let mut s_mat = qs.dot(&s_t).dot(&qs.t());
             gam_linalg::matrix::symmetrize_in_place(&mut s_mat);
 
-            // The frequentist bias-corrected coefficient used by prediction is
-            // β_BC = β̂ + b̂ with b̂ = H⁻¹S(β̂ - μ) at fixed smoothing
-            // parameters. Its fixed-ρ linearization with respect to β̂ is
-            // A = I + H⁻¹S. Credible bands centered at β_BC must use the
-            // covariance of that same estimator, A V Aᵀ; otherwise the center is
-            // debiased but the reported uncertainty remains for the shrunken
-            // penalized mode β̂, producing severely over-narrow bands on heavily
-            // smoothed large-scale Duchon fits (#1870).
             // X'WX = H − S(λ) in the original basis — the genuine PSD weighted
             // Gram, reconstructed from the same `penalized_hessian` and `s_mat`
             // that define `F = H⁻¹X'WX` (issue #1027). Stored directly so the
@@ -3014,26 +2967,6 @@ where
                     "influence matrix solve H·F = X'WX did not certify: {error}"
                 ))
             })?;
-
-            // The frequentist bias-corrected coefficient used by prediction is
-            // β_BC = β̂ + b̂ with b̂ = H⁻¹S(β̂ - μ) at fixed smoothing
-            // parameters. Its fixed-ρ linearization with respect to β̂ is
-            // A = I + H⁻¹S. Credible bands centered at β_BC must use the
-            // covariance of that same estimator, A V Aᵀ; otherwise the center is
-            // debiased but the reported uncertainty remains for the shrunken
-            // penalized mode β̂, producing severely over-narrow bands on heavily
-            // smoothed large-scale Duchon fits (#1870).
-            //
-            // `A = I + H⁻¹S = 2I − F` exactly, since `F = I − H⁻¹S`. Deriving
-            // it from `F` rather than from a second product keeps the Jacobian
-            // and the influence matrix on the identical `H⁻¹S`, and inherits
-            // the solve's accuracy instead of the inverse's amplification.
-            let mut bc_jac = f_mat.clone();
-            bc_jac *= -1.0;
-            for diagonal in 0..p_cov {
-                bc_jac[[diagonal, diagonal]] += 2.0;
-            }
-            bias_correction_jacobian = Some(bc_jac);
 
             // Frequentist covariance Ve = H⁻¹·X'WX·H⁻¹·φ = φ·H⁻¹·Fᵀ (the
             // sandwich is symmetric, so `F·H⁻¹ = (H⁻¹·Fᵀ)`). Solving
@@ -3479,22 +3412,6 @@ where
                 };
                 match truncation {
                     Ok(()) => {
-                        if let Some(a_bc) = bias_correction_jacobian.as_ref() {
-                            if a_bc.dim() != corrected.dim() {
-                                return Err(EstimationError::RemlOptimizationFailed(format!(
-                                    "bias-correction Jacobian shape {:?} does not match corrected covariance {:?}",
-                                    a_bc.dim(),
-                                    corrected.dim()
-                                )));
-                            }
-                            // The truncation is a statement about the law of β;
-                            // `A_bc` then maps that law to the bias-corrected
-                            // estimator `β_BC = A_bc·β` (#1870). Truncating
-                            // first and mapping second is the only order in
-                            // which the feasible set is applied in the frame it
-                            // was declared in.
-                            corrected = a_bc.dot(&corrected).dot(&a_bc.t());
-                        }
                         gam_linalg::matrix::symmetrize_in_place(&mut corrected);
                         Some(corrected)
                     }
@@ -3552,13 +3469,12 @@ where
                             .as_ref()
                             .and_then(|c| c.diag().get(*index).copied());
                         format!(
-                            " [#2705 attribution: index={index} value={value:.17e} arithmetic_tolerance={tolerance:.6e} post_constrained_diag={} smoothing_correction_diag={} removed_variance_diag={} cubature_allowance={} inside_cubature_allowance={} congruence_applied={}]",
+                            " [#2705 attribution: index={index} value={value:.17e} arithmetic_tolerance={tolerance:.6e} post_constrained_diag={} smoothing_correction_diag={} removed_variance_diag={} cubature_allowance={} inside_cubature_allowance={}]",
                             base.map_or("n/a".to_string(), |v| format!("{v:.6e}")),
                             smoothing.map_or("n/a".to_string(), |v| format!("{v:.6e}")),
                             removed.map_or("n/a".to_string(), |v| format!("{v:.6e}")),
                             allowance.map_or("n/a".to_string(), |v| format!("{v:.6e}")),
                             allowance.map_or("unknown".to_string(), |a| (-value <= a).to_string()),
-                            bias_correction_jacobian.is_some(),
                         )
                     }
                     _ => String::new(),
@@ -3586,8 +3502,6 @@ where
         beta_covariance_frequentist,
         coefficient_influence,
         weighted_gram,
-        bias_correction_beta,
-        bias_correction_jacobian,
     });
 
     let pirls_status = pirls_res.status;

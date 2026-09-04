@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The O(n⁻¹) frequentist bias correction is deleted end to end (`apply_bias_correction`, the `bias_correction_beta` / `bias_correction_jacobian` fit fields and their optimizer producers, the `A·V·Aᵀ` map on the smoothing-corrected covariance): every credible band is the posterior band of the posterior mean it is centred on. On the Gaussian additive coverage gate the de-shrunk default band over-covered (0.917 / 0.975 / 0.992 at nominal 0.80 / 0.90 / 0.95) while the posterior band is calibrated (0.825 / 0.933 / 0.975) (#2670).
+
 - `gam predict` no longer takes `--mode` or `--no-bias-correction`: the posterior mean is the one point estimand every surface reports, the plug-in prediction is published beside it by name (`survival_prob_plugin` on survival CSVs, `mean_plugin` on latent event-probability CSVs, as `mean_plugin` already was on the standard surface), and every band is centred on the posterior mean as the library's policy already did (#2670).
 
 - The joint Newton's trust region (via `opt`) treats a step as numerically neutral only when both the realized change and the model's predicted reduction are inside the objective's round-off floor; a resolvable prediction that realizes nothing is rejected, not accepted with `ρ = 1` (#2765).

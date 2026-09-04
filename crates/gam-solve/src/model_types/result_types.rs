@@ -168,8 +168,6 @@ mod per_term_edf_tests {
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
-                bias_correction_beta: None,
-                bias_correction_jacobian: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -281,8 +279,6 @@ mod per_term_edf_tests {
                 beta_covariance_frequentist: None,
                 coefficient_influence: Some(influence),
                 weighted_gram: None,
-                bias_correction_beta: None,
-                bias_correction_jacobian: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -358,8 +354,6 @@ mod per_term_edf_tests {
                 // per-block-trace channel, where the `penalty_cursor` walk matters.
                 coefficient_influence: None,
                 weighted_gram: None,
-                bias_correction_beta: None,
-                bias_correction_jacobian: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -563,8 +557,6 @@ mod per_term_edf_tests {
                 // `penalty_cursor` keys into `penalty_block_trace`.
                 coefficient_influence: None,
                 weighted_gram: None,
-                bias_correction_beta: None,
-                bias_correction_jacobian: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -2729,21 +2721,6 @@ pub struct FitInference {
     /// correction indefinite and the corrected EDF drop below the conditional).
     #[serde(default)]
     pub weighted_gram: Option<Array2<f64>>,
-    /// O(n⁻¹) frequentist bias-correction vector b̂ = H⁻¹ S(λ̂) β̂ in the
-    /// original (untransformed) coefficient basis. Predictions apply
-    /// η̂_BC(x) = η̂(x) + s_*(x)^T b̂ to remove first-order shrinkage bias.
-    #[serde(default)]
-    pub bias_correction_beta: Option<Array1<f64>>,
-    /// O(n⁻¹) frequentist bias-correction Jacobian `A = I + H⁻¹ S(λ̂)` — the
-    /// fixed-ρ linearization `dβ_BC/dβ̂` of the bias-corrected coefficient
-    /// `β_BC = β̂ + b̂`. A credible band centred at `β_BC` must report the
-    /// covariance of that estimator, `A·V·Aᵀ`. The smoothing-corrected
-    /// covariance already folds `A` in (see the optimizer), but the *conditional*
-    /// covariance is stored raw, so prediction applies `A` to the conditional
-    /// band through this Jacobian to avoid the over-narrow band #1870 documents.
-    /// `None` when the full inverse (hence `A`) was unavailable.
-    #[serde(default)]
-    pub bias_correction_jacobian: Option<Array2<f64>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3185,8 +3162,6 @@ mod assembly_inner_status_gate_tests {
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
-                bias_correction_beta: None,
-                bias_correction_jacobian: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -3654,9 +3629,6 @@ impl FitInference {
                 "fit_result.weighted_gram",
                 v.iter().copied(),
             )?;
-        }
-        if let Some(v) = self.bias_correction_beta.as_ref() {
-            validate_all_finite_estimation("fit_result.bias_correction_beta", v.iter().copied())?;
         }
         if let Some(v) = self.beta_standard_errors_corrected.as_ref() {
             validate_all_finite_estimation(
@@ -4692,23 +4664,6 @@ impl UnifiedFitResult {
                 standard_errors,
                 covariance: self.beta_covariance(),
             })
-    }
-
-    /// Get the O(n⁻¹) bias-correction vector b̂ = H⁻¹ S(λ̂) β̂ in the
-    /// original coefficient basis, if available.
-    pub fn bias_correction_beta(&self) -> Option<&Array1<f64>> {
-        self.inference
-            .as_ref()
-            .and_then(|inf| inf.bias_correction_beta.as_ref())
-    }
-
-    /// Get the O(n⁻¹) bias-correction Jacobian `A = I + H⁻¹ S(λ̂)`, if available.
-    /// Prediction uses it to form the conditional bias-corrected band covariance
-    /// `A·V·Aᵀ` (#1870); `None` when the full inverse was unavailable.
-    pub fn bias_correction_jacobian(&self) -> Option<&Array2<f64>> {
-        self.inference
-            .as_ref()
-            .and_then(|inf| inf.bias_correction_jacobian.as_ref())
     }
 
     /// Get the penalized Hessian if available.

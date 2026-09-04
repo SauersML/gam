@@ -1642,15 +1642,6 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw(
         if let Some(influence) = inference.coefficient_influence.as_mut() {
             rescale_influence_coordinates(influence, &row_factors);
         }
-        if let Some(jacobian) = inference.bias_correction_jacobian.as_mut() {
-            rescale_influence_coordinates(jacobian, &row_factors);
-        }
-        // b̂ = H⁻¹S(λ̂)β̂ is a coefficient-space vector: b̂_raw = D·b̂.
-        if let Some(bias) = inference.bias_correction_beta.as_mut() {
-            for (value, &factor) in bias.iter_mut().zip(row_factors.iter()) {
-                *value *= factor;
-            }
-        }
         // `β_saved = Qs·θ` puts the rows of the stabilizing reparameterization
         // in the saved coefficient frame: Qs_raw = D·Qs.
         if let Some(qs) = inference.reparam_qs.as_mut() {
@@ -2518,8 +2509,6 @@ fn survival_unified_fit_result(
         beta_covariance_frequentist: None,
         coefficient_influence: None,
         weighted_gram: None,
-        bias_correction_beta: None,
-        bias_correction_jacobian: None,
     };
 
     UnifiedFitResult::try_from_parts(gam_solve::estimate::UnifiedFitResultParts {

@@ -210,7 +210,6 @@ fn predictive_interval(
         covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
         mean_interval_method: MeanIntervalMethod::TransformEta,
         includeobservation_interval: true,
-        apply_bias_correction: false,
         edgeworth_one_sided: false,
         boundary_correction: false,
         ..PredictUncertaintyOptions::default()

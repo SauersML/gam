@@ -1096,16 +1096,14 @@ pub fn resolve_prediction_request(
         }
         // Effectively-linear model + interval: the plug-in equals the posterior
         // mean, so the delta-method path reports the same point as the plain
-        // branch and only adds the band. `apply_bias_correction: false` is what
-        // keeps that true — recentring η by `X·H⁻¹S(λ̂)β̂` would shift the
-        // reported point the moment an interval was requested (#398, #2115).
+        // branch and only adds the band; the point never moves because an
+        // interval was requested (#398, #2115).
         (Some(level), false) => {
             let options = PredictUncertaintyOptions {
                 confidence_level: level,
                 covariance_mode: request.covariance_mode,
                 mean_interval_method: crate::MeanIntervalMethod::TransformEta,
                 includeobservation_interval: request.observation_interval,
-                apply_bias_correction: false,
                 observation_prior_weights: request.observation_prior_weights.clone(),
                 ..PredictUncertaintyOptions::default()
             };

@@ -128,7 +128,6 @@ fn fit_negbin_theta_and_se(x: &[f64], y: &[f64]) -> (f64, f64) {
             covariance_mode: InferenceCovarianceMode::Conditional,
             mean_interval_method: MeanIntervalMethod::Delta,
             includeobservation_interval: false,
-            apply_bias_correction: false,
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,

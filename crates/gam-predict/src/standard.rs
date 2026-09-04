@@ -102,7 +102,7 @@ impl StandardPredictor {
     /// The wiggle-path posterior-mean state: η-scale SE through the link-wiggle
     /// chain rule, then the per-row coefficient-uncertainty-integrated mean.
     /// Only reached when a link wiggle is active; the wiggle-free path is the
-    /// richer [`predict_gam_posterior_mean_from_backendwith_bc`] engine.
+    /// richer [`predict_gam_posterior_mean_from_backend`] engine.
     fn wiggle_posterior_mean_state(
         &self,
         input: &PredictInput,
@@ -157,7 +157,7 @@ impl StandardPredictor {
                 // f64 on a degenerate fit (near-singular Hessian, se in the
                 // thousands); +inf IS the correctly rounded value of that
                 // integral. Report it honestly, exactly like the non-wiggle
-                // engine (predict_gam_posterior_mean_from_backendwith_bc) —
+                // engine (predict_gam_posterior_mean_from_backend) —
                 // substituting the finite plug-in g⁻¹(η̂) silently reported an
                 // unbounded posterior mean as an innocuous finite number.
                 strategy.posterior_mean(&quadctx, e, se)
@@ -182,8 +182,8 @@ impl StandardPredictor {
 /// Link-wiggle full-uncertainty / posterior-mean policy for the standard
 /// predictor. Only the wiggle path routes through the generic drivers; the
 /// wiggle-free path keeps the richer [`predict_gamwith_uncertainty`] /
-/// `predict_gam_posterior_mean_from_backendwith_bc` engines (bias correction,
-/// boundary/OOD inflation, smoothing-corrected backend selection), which are
+/// `predict_gam_posterior_mean_from_backend` engines (boundary/OOD inflation,
+/// smoothing-corrected backend selection), which are
 /// the canonical standard engines, not duplicated boilerplate.
 impl PredictionTransform for StandardPredictor {
     fn point_state(&self, input: &PredictInput) -> Result<LinearState, EstimationError> {
@@ -403,21 +403,10 @@ impl PredictableModel for StandardPredictor {
             )?;
             let family = spec_from_family_link(self.family.clone(), self.link_kind.as_ref());
             let strategy = strategy_from_fit(&family, fit)?;
-            // #1602: report the UNCORRECTED linear predictor η̂ = Xβ̂ here. The
-            // exported coefficients (`summary().coefficients`) are the penalized
-            // MLE / posterior mode β̂, and `docs/predictions.md` ("Raw design
-            // matrix") promises `design_matrix(data) @ coef == linear_predictor`
-            // for every family (and the `posterior.samples @ X.T` recipe). Adding
-            // the O(1/n) frequentist bias-correction `b̂ = H⁻¹S(β̂−μ)` to η broke
-            // that identity by exactly `X@b̂` for curved links (1.5–4% of the lp
-            // range) while leaving identity-link Gaussian exact. It is also the
-            // lone outlier among the sibling paths: the plug-in/full-uncertainty
-            // arm sets `apply_bias_correction: false` (empirically worse against
-            // truth, #398/#1536) and the link-wiggle posterior-mean path reports
-            // the plug-in η. The Bayesian posterior mean `E[g⁻¹(η)]` should
-            // integrate the conditional posterior of η, which is centered at the
-            // mode Xβ̂ — not a frequentist-bias-shifted center — so dropping `b̂`
-            // here is both contract-restoring and more principled. Pass `None`.
+            // The posterior mean `E[g⁻¹(η)]` integrates the conditional
+            // posterior of η, which is centred at the mode Xβ̂ — the same β̂
+            // `summary().coefficients` exports, so `design_matrix(data) @ coef
+            // == linear_predictor` holds for every family (#1602, #398, #1536).
             let mut result = predict_gam_posterior_mean_from_backend(
                 input.design.clone(),
                 self.beta.view(),
@@ -445,14 +434,6 @@ impl PredictableModel for StandardPredictor {
                     // The observation band is recomputed below, centred on the
                     // posterior-mean point rather than the plug-in point.
                     includeobservation_interval: false,
-                    // #1602: the reported point is the UNCORRECTED η̂ = Xβ̂ (the
-                    // posterior-mean engine above is called without a bias-
-                    // correction vector), matching the exported coefficients
-                    // `summary().coefficients == β̂` so `design_matrix @ coef ==
-                    // linear_predictor` holds for every link. Mirror that here so
-                    // the borrowed SE / bounds are centred on the same η̂; we only
-                    // consume the engine's SE / bounds, never its point.
-                    apply_bias_correction: false,
                     ..PredictUncertaintyOptions::default()
                 };
                 let unc = predict_gamwith_uncertainty(
