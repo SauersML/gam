@@ -519,10 +519,11 @@ pub fn fit_transformation_normal(
     let exact_mode_candidates = |eval_mode: gam_problem::EvalMode,
                                  rho: &Array1<f64>|
      -> Vec<Option<CustomFamilyWarmStart>> {
-        let (froze, candidates) = exact_mode_branch.borrow_mut().candidates(eval_mode, rho);
-        if froze {
+        let (first_iterate, candidates) =
+            exact_mode_branch.borrow_mut().candidates(eval_mode, rho);
+        if first_iterate {
             log::info!(
-                "[transformation-normal] froze deterministic exact coefficient-mode branch at the first derivative-bearing outer seed evaluation"
+                "[transformation-normal] first derivative-bearing outer seed evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
             );
         }
         candidates
@@ -719,9 +720,11 @@ pub fn fit_transformation_normal(
             let objective = selection.result.objective;
             let gradient = selection.result.gradient.clone();
             let outer_hessian = selection.result.outer_hessian.clone();
-            exact_mode_branch
-                .borrow_mut()
-                .record_value(eval_mode, selection.result.warm_start.clone());
+            exact_mode_branch.borrow_mut().record_value(
+                eval_mode,
+                selection.result.warm_start.clone(),
+                selection.result.inner_converged,
+            );
 
             Ok(ExactJointEvaluation {
                 objective,

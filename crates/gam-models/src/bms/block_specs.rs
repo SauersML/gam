@@ -2939,7 +2939,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                     Ok(ws) => {
                         if !exact_mode_branch.borrow_mut().install_seed(ws) {
                             log::debug!(
-                                "[BMS] ignored a late outer-cache coefficient seed after the exact mode branch froze"
+                                "[BMS] ignored a late outer-cache coefficient seed: an accepted outer iterate already owns the coefficient-mode anchor"
                             );
                         }
                     }
@@ -2969,12 +2969,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 &tolerance_options,
                 row_set,
             );
-            let (froze, candidates) = exact_mode_branch
+            let (first_iterate, candidates) = exact_mode_branch
                 .borrow_mut()
                 .candidates(effective_mode, &rho);
-            if froze {
+            if first_iterate {
                 log::info!(
-                    "[BMS] froze deterministic exact coefficient-mode branch at the first derivative-bearing outer evaluation"
+                    "[BMS] first derivative-bearing outer evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
                 );
             }
             let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
@@ -2997,9 +2997,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 runaway_error.replace(Some(err.clone()));
                 return Err(err);
             }
-            exact_mode_branch
-                .borrow_mut()
-                .record_value(eval_mode, selection.result.warm_start.clone());
+            exact_mode_branch.borrow_mut().record_value(
+                eval_mode,
+                selection.result.warm_start.clone(),
+                selection.result.inner_converged,
+            );
             if !selection.result.inner_converged {
                 return Err(
                     "exact bernoulli marginal-slope inner solve did not converge".to_string(),

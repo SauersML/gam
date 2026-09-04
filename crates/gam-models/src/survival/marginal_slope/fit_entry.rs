@@ -1592,7 +1592,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     Ok(ws) => {
                         if !exact_mode_branch.borrow_mut().install_seed(ws) {
                             log::debug!(
-                                "[SMS] ignored a late outer-cache coefficient seed after the exact mode branch froze"
+                                "[SMS] ignored a late outer-cache coefficient seed: an accepted outer iterate already owns the coefficient-mode anchor"
                             );
                         }
                     }
@@ -1651,12 +1651,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 )
             };
             let selection = if let Some(value_selection) = owned_value_mode {
-                let froze = exact_mode_branch.borrow_mut().prepare(effective_mode);
-                if froze {
-                    log::info!(
-                        "[SMS] froze deterministic exact coefficient-mode branch at the first derivative-bearing outer evaluation"
-                    );
-                }
                 log::info!(
                     "[SMS] upgrading the exact owned ValueOnly coefficient mode at identical theta; skipping coefficient re-solve"
                 );
@@ -1671,12 +1665,12 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 )
                 .map_err(|error| format!("{error}; {}", cycle_budget_evidence()))?
             } else {
-                let (froze, candidates) = exact_mode_branch
+                let (first_iterate, candidates) = exact_mode_branch
                     .borrow_mut()
                     .candidates(effective_mode, &rho);
-                if froze {
+                if first_iterate {
                     log::info!(
-                        "[SMS] froze deterministic exact coefficient-mode branch at the first derivative-bearing outer evaluation"
+                        "[SMS] first derivative-bearing outer evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
                     );
                 }
                 evaluate_custom_family_joint_hyper_best_mode_shared(
@@ -1690,9 +1684,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 )
                 .map_err(|error| format!("{error}; {}", cycle_budget_evidence()))?
             };
-            exact_mode_branch
-                .borrow_mut()
-                .record_value(eval_mode, selection.result.warm_start.clone());
+            exact_mode_branch.borrow_mut().record_value(
+                eval_mode,
+                selection.result.warm_start.clone(),
+                selection.result.inner_converged,
+            );
             if !selection.result.inner_converged {
                 return Err(
                     "exact survival marginal-slope inner solve did not converge".to_string()

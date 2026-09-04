@@ -17,67 +17,77 @@ fn test_design_hyper_layout(
 }
 
 #[test]
-pub(crate) fn exact_ctn_mode_branch_freezes_derivative_input() {
+pub(crate) fn exact_ctn_mode_branch_anchors_on_the_accepted_iterate_2765() {
     let warm = |value: f64| {
         CustomFamilyWarmStart::from_cached_beta(&[1], &array![value])
             .expect("one-coefficient CTN mode seed")
     };
-    let carried_beta = |candidates: &[Option<CustomFamilyWarmStart>]| {
+    let anchor_beta = |candidates: &[Option<CustomFamilyWarmStart>]| {
         candidates
-            .get(1)
+            .first()
             .and_then(Option::as_ref)
-            .expect("compatible carried CTN mode seed")
+            .expect("a compatible anchor mode")
             .block_beta_view(0)
             .expect("one CTN coefficient")[0]
     };
+    let rho = Array1::zeros(0);
+    let value_only = gam_problem::EvalMode::ValueOnly;
+    let with_gradient = gam_problem::EvalMode::ValueAndGradient;
 
+    // No mode exists yet: the only candidate is a cold solve.
     let mut state = ExactCoefficientModeBranch::default();
-    let (froze, candidates) = state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
-    assert!(!froze);
+    let (first_iterate, candidates) = state.candidates(value_only, &rho);
+    assert!(!first_iterate);
     assert_eq!(candidates.len(), 1);
     assert!(candidates[0].is_none());
 
-    state.record_value(gam_problem::EvalMode::ValueOnly, warm(1.0));
-    let (_, candidates) = state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
-    assert_eq!(carried_beta(&candidates), 1.0);
-    state.record_value(gam_problem::EvalMode::ValueOnly, warm(2.0));
+    // Before any iterate is accepted, value-only seed probes carry their
+    // converged mode forward; a probe that did not converge leaves no trace.
+    state.record_value(value_only, warm(1.0), true);
+    state.record_value(value_only, warm(9.0), false);
+    let (_, candidates) = state.candidates(value_only, &rho);
+    assert_eq!(candidates.len(), 1, "one start per evaluation, never a cold solve beside it");
+    assert_eq!(anchor_beta(&candidates), 1.0);
+    state.record_value(value_only, warm(2.0), true);
 
-    let (froze, candidates) = state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
-    assert!(!froze);
-    assert_eq!(candidates.len(), 2);
-    assert!(candidates[0].is_none(), "cold candidate is evaluated first");
-    assert_eq!(carried_beta(&candidates), 2.0);
+    // The first derivative-bearing evaluation is an accepted iterate: it is
+    // solved from the carried mode and announces itself once.
+    let (first_iterate, candidates) = state.candidates(with_gradient, &rho);
+    assert!(first_iterate);
+    assert_eq!(anchor_beta(&candidates), 2.0);
+    state.record_value(with_gradient, warm(3.0), true);
+    let (first_iterate, _) = state.candidates(with_gradient, &rho);
+    assert!(!first_iterate, "the announcement is made exactly once");
 
-    let (froze, candidates) = state.candidates(
-        gam_problem::EvalMode::ValueGradientHessian,
-        &Array1::zeros(0),
+    // Line-search probes start from the accepted iterate's mode and cannot
+    // replace it, whether they converge or not, so the value at a trial θ is
+    // a function of θ and the iterate — not of the probe order.
+    state.record_value(value_only, warm(4.0), true);
+    state.record_value(value_only, warm(5.0), false);
+    let (_, candidates) = state.candidates(value_only, &rho);
+    assert_eq!(
+        anchor_beta(&candidates),
+        3.0,
+        "a value-only probe must not replace the accepted iterate's mode"
     );
-    assert!(froze);
-    assert_eq!(candidates.len(), 2);
-    assert!(candidates[0].is_none(), "cold remains first after freeze");
-    assert_eq!(carried_beta(&candidates), 2.0);
-
-    state.record_value(gam_problem::EvalMode::ValueOnly, warm(4.0));
-    state.record_value(gam_problem::EvalMode::ValueAndGradient, warm(5.0));
     assert!(
         !state.install_seed(warm(6.0)),
-        "an outer-cache seed must not mutate a frozen profile branch"
-    );
-    assert!(!state.prepare(gam_problem::EvalMode::ValueAndGradient));
-    let (froze, candidates) = state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
-    assert!(!froze);
-    assert_eq!(candidates.len(), 2);
-    assert!(candidates[0].is_none());
-    assert_eq!(
-        carried_beta(&candidates),
-        2.0,
-        "outer trial history must not replace the CTN branch anchor"
+        "an outer-cache seed must not displace the mode this walk certified"
     );
 
+    // The next accepted iterate moves the anchor with the walk; a
+    // derivative-bearing evaluation that did not converge does not.
+    state.record_value(with_gradient, warm(7.0), false);
+    let (_, candidates) = state.candidates(value_only, &rho);
+    assert_eq!(anchor_beta(&candidates), 3.0);
+    state.record_value(with_gradient, warm(8.0), true);
+    let (_, candidates) = state.candidates(value_only, &rho);
+    assert_eq!(anchor_beta(&candidates), 8.0);
+
+    // A branch that has never seen a mode solves cold at its first iterate.
     let mut cold = ExactCoefficientModeBranch::default();
-    let (froze, candidates) =
-        cold.candidates(gam_problem::EvalMode::ValueAndGradient, &Array1::zeros(0));
-    assert!(froze);
+    let (first_iterate, candidates) = cold.candidates(with_gradient, &rho);
+    assert!(first_iterate);
     assert_eq!(candidates.len(), 1);
     assert!(candidates[0].is_none());
 }
