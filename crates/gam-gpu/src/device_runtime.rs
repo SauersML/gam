@@ -675,9 +675,11 @@ mod policy_resolution_contract_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cudarc_loader_panic_diagnostics_follow_recovery_scope() {
-        const CHILD_MODE: &str = "GAM_TEST_CUDARC_RECOVERY_MODE";
+        const CHILD_MODE_PREFIX: &str = "__gam_cudarc_child_";
         const LOADER_PANIC: &str = "Unable to dynamically load synthetic CUDA library";
-        if let Ok(mode) = std::env::var(CHILD_MODE) {
+        if let Some(mode) = std::env::args()
+            .find_map(|argument| argument.strip_prefix(CHILD_MODE_PREFIX).map(str::to_owned))
+        {
             install_cudarc_panic_filter();
             match mode.as_str() {
                 "caught" => {
@@ -733,7 +735,9 @@ mod policy_resolution_contract_tests {
                     "device_runtime::policy_resolution_contract_tests::cudarc_loader_panic_diagnostics_follow_recovery_scope",
                     "--nocapture",
                 ])
-                .env(CHILD_MODE, mode)
+                // A skip filter that matches no test carries the child mode
+                // through libtest's argument parser without environment state.
+                .args(["--skip", &format!("{CHILD_MODE_PREFIX}{mode}")])
                 .output()
                 .expect("run hook regression subprocess");
             let stderr = String::from_utf8_lossy(&output.stderr);

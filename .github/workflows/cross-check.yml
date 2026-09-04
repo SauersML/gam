@@ -39,11 +39,9 @@ name: Compile gate (native Linux + non-Linux cross)
 # `cfg(target_os = "linux")` split with a toolchain that cross-installs on the
 # ubuntu runner in seconds. `cargo check` needs no linker for rlib targets, so
 # mingw is only needed for build scripts — installed anyway for safety.
-# gam-pyffi is excluded from BOTH jobs: checking pyo3 for a foreign target
-# needs a cross Python interpreter config, and its native surface is compiled
-# on every push by the rolling-wheel workflow, which builds the extension
-# module itself. Every `cfg(target_os)` neighbourhood that broke historically
-# lives in the engine crates these jobs do cover.
+# gam-pyffi is included in the native deny-warnings check. Only the foreign
+# target excludes it, because cross-checking PyO3 needs a target interpreter
+# configuration. Native Python compilation must gate every push (#2821/#2824).
 
 on:
   push:
@@ -78,6 +76,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Ban scanner (root build.rs, run standalone)
         run: |
           set +e
@@ -130,7 +131,7 @@ jobs:
           # single `--locked` proves the lock is complete, and putting it on both
           # would fail the cross-compile arm for a reason that has nothing to do
           # with the target it exists to check.
-          cargo check --locked --workspace --exclude gam-pyffi --all-targets
+          cargo check --locked --workspace --all-targets
 
   # Rustdoc had no CI job at all (#2711): nothing in `.github/` ran `cargo doc`
   # or `rustdoc`, so a surface that exits 101 was dark by omission while
