@@ -93,9 +93,11 @@
 //! large `K`, matching the tests) and **strict for high `d`** (a `d ≈ 33` manifold
 //! needs hundreds of tokens per atom, which is exactly where the real-data drift
 //! appears). The threshold depends on `d`, which is what we are estimating, so the
-//! window is found by a short deterministic fixed-point: seed with the full-ladder
-//! `d̂`, keep the rungs meeting the threshold, refit, repeat until the rung set
-//! stops changing.
+//! window grows from the four smallest widths (three fitted parameters and one
+//! residual degree of freedom). Each next rung must pass the sampling threshold
+//! both before and after its admission. Excluded tail losses never choose the
+//! threshold that excludes them. This matters because the threshold equation
+//! can have multiple fixed points, including one sustained by an overfit tail.
 //!
 //! The report exposes the drift rather than hiding it: it carries the full-ladder
 //! `d̂`, the stable-window `d̂` (the trustworthy default), and a drop-last `d̂`
@@ -250,8 +252,8 @@ pub fn dimension_spectrometer(
     // needs `nrung − 3 ≥ 1`. With only three rungs the three parameters interpolate
     // the data exactly (RSS ≈ 0) and the slope SE is undefined; the fit would report
     // a spurious near-zero uncertainty. `fit_scaling_law` still accepts three rungs
-    // (returning an infinite SE / floor-saturated verdict) so the drop-last probe and
-    // the stable-window fallback stay well-posed, but the primary entry demands four.
+    // (returning an infinite SE / floor-saturated verdict) for the drop-last
+    // diagnostic, but the primary entry and its stable window demand four.
     if cfg.n_doublings < 3 {
         return Err(
             "dimension_spectrometer requires n_doublings >= 3 (>= 4 rungs): the scaling law has \
@@ -300,88 +302,67 @@ fn threshold_points_per_atom(d_hat: f64) -> f64 {
     statistical.max(2.0)
 }
 
-/// Select the reliable rung window by a short deterministic fixed-point: keep the
-/// rungs whose points-per-atom `N/K` meets [`threshold_points_per_atom`] evaluated
-/// at the current `d̂`, refit to update `d̂`, and repeat until the retained set
-/// stops changing. Returns rung indices (ascending `K`). If the seed `d̂` is not a
-/// usable positive dimension (e.g. the fit is floor-saturated) the whole ladder is
-/// returned — windowing a non-resolved slope would be meaningless.
-fn select_stable_window(rungs: &[(usize, f64)], n_rows: usize, seed_d: f64) -> Vec<usize> {
-    let full: Vec<usize> = (0..rungs.len()).collect();
-    if !(seed_d.is_finite() && seed_d > 0.0) {
-        return full;
+/// Grow a sampling-admissible prefix from the least token-starved widths.
+/// Checking the next rung against the current prefix prevents that rung from
+/// lowering the dimension estimate enough to admit itself. Checking again after
+/// refitting ensures the returned window satisfies its own sampling criterion.
+/// The prefix grows strictly, so termination needs no iteration cap. A failed
+/// scaling-law fit propagates; an undersampled seed is not a reliable window.
+fn select_stable_window(
+    rungs: &[(usize, f64)],
+    n_rows: usize,
+) -> Result<(usize, ScalingLaw), String> {
+    // Floor, slope, intercept, plus one residual degree of freedom.
+    let mut count = 4;
+    if rungs.len() < count {
+        return Err("stable scaling window requires at least four rungs".to_string());
     }
-    let mut d = seed_d;
-    let mut prev: Vec<usize> = full.clone();
-    for _ in 0..8 {
-        let tau = threshold_points_per_atom(d);
-        let mut window: Vec<usize> = (0..rungs.len())
-            .filter(|&i| (n_rows as f64) / (rungs[i].0 as f64) >= tau)
-            .collect();
-        // A slope needs at least three rungs; if the threshold is stricter than the
-        // ladder can honour, fall back to the three least token-starved (smallest-K)
-        // rungs and let `small_nk_regime` carry the warning.
-        if window.len() < 3 {
-            window = (0..rungs.len().min(3)).collect();
-        }
-        let sub: Vec<(usize, f64)> = window.iter().map(|&i| rungs[i]).collect();
-        match fit_scaling_law(&sub) {
-            Ok(law) if law.d_hat.is_finite() && law.d_hat > 0.0 => {
-                if window == prev {
-                    return window;
-                }
-                d = law.d_hat;
-                prev = window;
-            }
-            _ => return window,
-        }
+    let mut law = fit_scaling_law(&rungs[..count])?;
+    let admissible = |law: &ScalingLaw, last: usize| {
+        law.d_hat.is_finite()
+            && law.d_hat > 0.0
+            && (n_rows as f64) / rungs[last].0 as f64 >= threshold_points_per_atom(law.d_hat)
+    };
+    if !admissible(&law, count - 1) {
+        return Err(format!(
+            "stable scaling window has no sampling-admissible four-rung seed: \
+             d={}, N/K={} at K={}",
+            law.d_hat,
+            n_rows as f64 / rungs[count - 1].0 as f64,
+            rungs[count - 1].0,
+        ));
     }
-    prev
+    while count < rungs.len() && admissible(&law, count) {
+        let next = fit_scaling_law(&rungs[..count + 1])?;
+        if !admissible(&next, count) {
+            break;
+        }
+        law = next;
+        count += 1;
+    }
+    Ok((count, law))
 }
 
 /// Fit the scaling law over the full ladder, the derived stable window, and the
 /// drop-last ladder, and assemble the report. `n_rows` is `N` (for points-per-atom).
 fn analyze_ladder(rungs: &[(usize, f64)], n_rows: usize) -> Result<SpectrometerReport, String> {
-    if rungs.len() < 3 {
-        return Err("analyze_ladder requires at least 3 rungs".to_string());
+    if rungs.len() < 4 {
+        return Err("analyze_ladder requires at least 4 rungs".to_string());
     }
     let full = fit_scaling_law(rungs)?;
-
-    // Stable window: seed the fixed-point with the full-ladder d̂ (unless the slope
-    // is not resolved, in which case windowing is meaningless and we keep it full).
-    let seed_d = if full.floor_saturated {
-        f64::NAN
-    } else {
-        full.d_hat
-    };
-    let window = select_stable_window(rungs, n_rows, seed_d);
-    let window_sub: Vec<(usize, f64)> = window.iter().map(|&i| rungs[i]).collect();
-    let stable = fit_scaling_law(&window_sub)?;
-
-    // Drop-last robustness probe (only meaningful with a rung to spare).
-    let d_hat_drop_last = if rungs.len() >= 4 {
-        fit_scaling_law(&rungs[..rungs.len() - 1])
-            .map(|law| law.d_hat)
-            .unwrap_or(full.d_hat)
-    } else {
-        full.d_hat
-    };
+    let (stable_rung_count, stable) = select_stable_window(rungs, n_rows)?;
+    let d_hat_drop_last = fit_scaling_law(&rungs[..rungs.len() - 1])?.d_hat;
 
     let points_per_atom: Vec<f64> = rungs
         .iter()
         .map(|&(k, _)| n_rows as f64 / k as f64)
         .collect();
-    let d_for_threshold = if stable.d_hat.is_finite() && stable.d_hat > 0.0 {
-        stable.d_hat
-    } else {
-        full.d_hat
-    };
-    let threshold = threshold_points_per_atom(d_for_threshold);
+    let threshold = threshold_points_per_atom(stable.d_hat);
     let small_nk_regime =
-        window.len() < rungs.len() || points_per_atom.iter().any(|&r| r < threshold);
+        stable_rung_count < rungs.len() || points_per_atom.iter().any(|&r| r < threshold);
 
-    let lo_k = rungs[window[0]].0;
-    let hi_k = rungs[window[window.len() - 1]].0;
+    let lo_k = rungs[0].0;
+    let hi_k = rungs[stable_rung_count - 1].0;
 
     Ok(SpectrometerReport {
         rungs: rungs.to_vec(),
@@ -396,7 +377,7 @@ fn analyze_ladder(rungs: &[(usize, f64)], n_rows: usize) -> Result<SpectrometerR
         d_hat_drop_last,
         stable_window_lo_k: lo_k,
         stable_window_hi_k: hi_k,
-        stable_rung_count: window.len(),
+        stable_rung_count,
         min_points_per_atom: threshold,
         floor_saturated: stable.floor_saturated,
         small_nk_regime,
@@ -936,6 +917,37 @@ mod tests {
         // Points-per-atom is exposed so the drift is inspectable, aligned to the ladder.
         assert_eq!(report.points_per_atom.len(), report.rungs.len());
         assert!((report.points_per_atom[0] - n_rows as f64 / rungs[0].0 as f64).abs() < 1.0e-9);
+
+        // Excluded losses cannot choose their own admission threshold. Make
+        // that tail arbitrarily more overfit while keeping every retained
+        // observation fixed: the selected estimate must remain identical.
+        let mut worse_tail = rungs.clone();
+        for (index, (_, loss)) in worse_tail
+            .iter_mut()
+            .skip(report.stable_rung_count)
+            .enumerate()
+        {
+            *loss *= 0.01_f64.powi(index as i32 + 1);
+        }
+        let (count, law) = select_stable_window(&worse_tail, n_rows).expect("same reliable prefix");
+        assert_eq!(count, report.stable_rung_count);
+        assert_eq!(law.d_hat, report.d_hat);
+        assert_eq!(law.sigma2, report.noise_floor);
+    }
+
+    #[test]
+    fn stable_window_refuses_undersampled_seed() {
+        let rungs: Vec<_> = [4_usize, 8, 16, 32, 64]
+            .into_iter()
+            .map(|k| (k, 0.02 + (k as f64).powf(-0.25)))
+            .collect();
+        let error = select_stable_window(&rungs, 100)
+            .err()
+            .expect("four reliable rungs are unavailable");
+        assert!(
+            error.contains("no sampling-admissible four-rung seed"),
+            "{error}"
+        );
     }
 
     #[test]
