@@ -38,7 +38,7 @@
 
 use crate::manifold::{
     GraphCompressionKind, LocalAtlas, LocalAtlasConfig, observe_atlas_topology,
-    tests_topology_fixtures::{circle, cylinder_strip, sphere, trefoil_knot},
+    tests_topology_fixtures::{circle, cylinder_strip, mobius_strip, sphere, trefoil_knot},
 };
 use ndarray::{Array2, ArrayView2};
 
@@ -87,8 +87,14 @@ fn structureless_cloud(n: usize, p: usize, seed: u64) -> Array2<f64> {
 /// outcome for this question — no manifold was asserted — so all three collapse to
 /// `None`. Distinguishing them would make the null arm sensitive to WHICH honest
 /// refusal fired, which is a property of the cover rather than of the claim being
-/// tested; the refusal string is printed instead, so a change of mechanism is
-/// visible without being asserted.
+/// tested.
+///
+/// The reported line is the readout's OWN `Display`, which already carries the
+/// verdict-or-refusal plus every invariant it rests on, and the cover multiplicity
+/// pair that `Display` omits. That matters most in the outcome this test would
+/// hate: if noise is ever NAMED, the line reporting it must already contain the
+/// invariants that produced the name, or the refutation needs a second run to be
+/// diagnosable.
 fn verdict(z: ArrayView2<'_, f64>, d: usize) -> (Option<GraphCompressionKind>, String) {
     let config = LocalAtlasConfig::balanced(z.nrows(), d);
     let atlas = match LocalAtlas::build(z, config) {
@@ -97,13 +103,12 @@ fn verdict(z: ArrayView2<'_, f64>, d: usize) -> (Option<GraphCompressionKind>, S
     };
     match observe_atlas_topology(&atlas) {
         Ok(readout) => {
-            let named = readout.observed_manifold();
-            let why = match (named, readout.refusal()) {
-                (Some(kind), _) => format!("named {kind:?}"),
-                (None, Some(refusal)) => format!("refused: {refusal}"),
-                (None, None) => "no verdict and no refusal".to_string(),
-            };
-            (named, why)
+            let inv = readout.invariants();
+            let line = format!(
+                "{readout} max_mult={} mean_mult={:.3}",
+                inv.max_cover_multiplicity, inv.mean_cover_multiplicity
+            );
+            (readout.observed_manifold(), line)
         }
         Err(error) => (None, format!("readout errored: {error}")),
     }
@@ -140,6 +145,20 @@ fn matched_pairs() -> Vec<(&'static str, Array2<f64>, GraphCompressionKind, Arra
             cylinder_strip(40, 10),
             GraphCompressionKind::Cylinder,
             structureless_cloud(400, 3, 0x2280_0004),
+            2,
+        ),
+        // The holonomy cell. `cylinder_and_mobius_differ_only_by_the_holonomy_class_2280`
+        // (`manifold/atlas_topology.rs`) already pins the Mobius band against its cylinder
+        // at identical `(b0, b1, b2, chi)`, which is what makes the orientation class the
+        // only thing separating them — that pair is not rebuilt here. What it does not
+        // have is a NULL: it is positive-only. This row supplies one, so the single
+        // measurement the readout makes most confidently is also the one whose matched
+        // noise arm has to refuse.
+        (
+            "mobius",
+            mobius_strip(40, 10),
+            GraphCompressionKind::MobiusStrip,
+            structureless_cloud(400, 3, 0x2280_0006),
             2,
         ),
     ]
@@ -187,7 +206,7 @@ fn structureless_noise_earns_no_topology_and_the_planted_shapes_still_do_2280() 
     // on a failure, so a changed refusal mechanism is legible either way.
     for row in &rows {
         eprintln!(
-            "[2280-null] {:>9} d={} n={} p={} | planted: {:<46} | noise: {}",
+            "[2280-null] {} d={} n={} p={}\n  planted: {}\n  noise:   {}",
             row.label, row.d, row.n, row.p, row.planted_why, row.noise_why
         );
     }
