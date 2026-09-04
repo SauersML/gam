@@ -945,7 +945,10 @@ pub fn parse_survival_time_basis_config(
             }
             if !time_smooth_lambda.is_finite() || time_smooth_lambda < 0.0 {
                 return Err(
-                    "time-basis smoothing lambda must be finite and >= 0 (CLI: --time-smooth-lambda; Python: time_smooth_lambda=)"
+                    "time-basis smoothing lambda must be finite and >= 0; it is \
+                     the REML seed for the time block (FitConfig::time_smooth_lambda, \
+                     default 1e-2), carried on a saved model as \
+                     survival_time_smooth_lambda -- no user surface sets it"
                         .to_string(),
                 );
             }

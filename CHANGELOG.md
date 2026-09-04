@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The survival time-basis smoothing-lambda refusal no longer points the user at `--time-smooth-lambda` / `time_smooth_lambda=`, neither of which exists; it names the seed's real provenance (`FitConfig::time_smooth_lambda`, saved as `survival_time_smooth_lambda`) (#2670).
+
 - `gam predict` on a survival model emits `std_error` / `mean_lower` / `mean_upper` only under `--uncertainty`: they used to ride along on every default prediction because the deleted `--mode posterior-mean` was itself the switch that built the uncertainty object (#2670, #2136).
 
 - The O(n⁻¹) frequentist bias correction is deleted end to end (`apply_bias_correction`, the `bias_correction_beta` / `bias_correction_jacobian` fit fields and their optimizer producers, the `A·V·Aᵀ` map on the smoothing-corrected covariance): every credible band is the posterior band of the posterior mean it is centred on. On the Gaussian additive coverage gate the de-shrunk default band over-covered (0.917 / 0.975 / 0.992 at nominal 0.80 / 0.90 / 0.95) while the posterior band is calibrated (0.825 / 0.933 / 0.975) (#2670).
