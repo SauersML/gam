@@ -2349,9 +2349,10 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                     cfg.deflation_subspace_iters,
                     cfg.deflation_target_std_err_rel,
                 )
-                .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
+                .map_err(|reason| ArrowSchurError::SchurFactorFailed {
                     reason: format!(
-                        "rational log-det surrogate plan build failed for reduced Schur dim {dim}"
+                        "rational log-det surrogate plan build failed for reduced Schur dim \
+                         {dim}: {reason}"
                     ),
                 })?;
                 state.plan = Some(derived.plan);
@@ -2677,13 +2678,17 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     deflation_max_rank: usize,
     deflation_subspace_iters: usize,
     deflation_target_std_err_rel: f64,
-) -> Option<DerivedRationalLogdetPlan> {
+) -> Result<DerivedRationalLogdetPlan, String> {
     let k = sys.k;
     if k == 0
         || !(cg_rel_tol.is_finite() && cg_rel_tol > 0.0 && cg_rel_tol < 1.0)
         || !(deflation_target_std_err_rel.is_finite() && deflation_target_std_err_rel >= 0.0)
     {
-        return None;
+        return Err(format!(
+            "inadmissible surrogate request: reduced Schur dim {k}, cg_rel_tol {cg_rel_tol:.3e} \
+             (needs 0 < tol < 1), deflation target {deflation_target_std_err_rel:.3e} (needs \
+             finite and non-negative)"
+        ));
     }
     let lambda_max = reduced_schur_lambda_max(
         sys,
@@ -2694,10 +2699,23 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
         gpu_matvec,
         power_iters,
         seed,
-    )?;
+    )
+    .ok_or_else(|| {
+        format!(
+            "spectral bracket unavailable: the power iteration produced no finite λ_max for \
+             reduced Schur dim {k} in {power_iters} iterations"
+        )
+    })?;
     let lambda_min = (SPECTRAL_DEFLATION_REL_FLOOR * lambda_max).max(f64::MIN_POSITIVE);
-    let base_plan =
-        RationalLogdetPlan::build(k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
+    let base_plan = RationalLogdetPlan::build(
+        k, num_probes, seed, lambda_min, lambda_max, rel_tol,
+    )
+    .ok_or_else(|| {
+        format!(
+            "quadrature plan unbuildable on bracket [{lambda_min:.6e}, {lambda_max:.6e}] at \
+             rel_tol {rel_tol:.3e} with {num_probes} probes (reduced Schur dim {k})"
+        )
+    })?;
     // One resident operator across the pilot, every deflation re-solve, and the
     // subspace-iteration `with_two_sided_deflation` applies — the whole rank-derivation
     // ladder (the two-sided deflation: block-power on S + inverse subspace
@@ -2712,20 +2730,31 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     let precond = reduced_schur_shifted_preconditioner(sys, ridge_beta);
     // Rank-0 pilot: fixes the |log|S|| scale and is the answer outright when no
     // deflation is requested or the bare bar already clears the target.
-    let pilot = base_plan.evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
+    let pilot = base_plan
+        .evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)
+        .ok_or_else(|| {
+            format!(
+                "rank-0 pilot solve broke down: the shifted-CG family did not return a finite \
+                 solution on the bracket [{lambda_min:.6e}, {lambda_max:.6e}] at cg_rel_tol \
+                 {cg_rel_tol:.3e}, cg_max_iters {cg_max_iters} (reduced Schur dim {k}). The \
+                 seed system's own budget is min(cg_max_iters, dim) = {} iterations.",
+                cg_max_iters.min(k.max(1))
+            )
+        })?;
     if deflation_max_rank == 0 {
-        return Some(DerivedRationalLogdetPlan {
+        return Ok(DerivedRationalLogdetPlan {
             plan: base_plan,
             entry_evaluation: pilot,
         });
     }
     let target = deflation_target_std_err_rel * (pilot.estimate.abs() + 1.0);
     if pilot.std_err <= target {
-        return Some(DerivedRationalLogdetPlan {
+        return Ok(DerivedRationalLogdetPlan {
             plan: base_plan,
             entry_evaluation: pilot,
         });
     }
+    let pilot_std_err = pilot.std_err;
     // Grow from the smallest nonzero peel rank (doubling ⇒ log-many re-solves)
     // until the bar clears. The caller's cap is a resource ceiling; reaching it
     // with an over-target bar refuses the surrogate rather than silently
@@ -2759,16 +2788,48 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
             deflation_subspace_iters,
             seed,
             (basis_cg_rel_tol, cg_max_iters),
-        )?;
-        let eval = plan.evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
+        )
+        .ok_or_else(|| {
+            format!(
+                "two-sided deflation basis unbuildable at rank {r} (top {}, bottom {}) after \
+                 {deflation_subspace_iters} subspace iterations on reduced Schur dim {k}",
+                r.div_ceil(2),
+                r / 2
+            )
+        })?;
+        let eval = plan
+            .evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)
+            .ok_or_else(|| {
+                format!(
+                    "deflated solve broke down at rank {r}: the shifted-CG family did not return \
+                     a finite solution at cg_rel_tol {cg_rel_tol:.3e} (reduced Schur dim {k})"
+                )
+            })?;
         if eval.std_err <= target {
-            return Some(DerivedRationalLogdetPlan {
+            return Ok(DerivedRationalLogdetPlan {
                 plan,
                 entry_evaluation: eval,
             });
         }
         if r >= cap {
-            return None;
+            // The resource ceiling, reached with an over-target bar. This is a
+            // deliberate refusal rather than a silent weakening of the accuracy
+            // contract — but a refusal that names only its dimension cannot be
+            // acted on, and this one aborts a fit that has already converged.
+            // Every number the caller needs to decide whether to raise the cap,
+            // relax the target, or take the estimate as it stands is here.
+            return Err(format!(
+                "deflation reached its rank ceiling {cap} (requested {deflation_max_rank}, \
+                 reduced Schur dim {k}) with the Hutchinson bar still over target: std_err \
+                 {:.6e} against target {target:.6e} (= {deflation_target_std_err_rel:.3e} × \
+                 (|estimate| + 1)), estimate {:.6e}; the rank-0 pilot's bar was \
+                 {pilot_std_err:.6e}, so deflation removed {:.1}% of the pilot variance and \
+                 needed {:.1}%",
+                eval.std_err,
+                eval.estimate,
+                100.0 * (1.0 - eval.std_err / pilot_std_err.max(f64::MIN_POSITIVE)),
+                100.0 * (1.0 - target / pilot_std_err.max(f64::MIN_POSITIVE)),
+            ));
         }
         rank = rank.saturating_mul(2);
     }

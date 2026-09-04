@@ -4718,10 +4718,34 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
         2,
         0.0,
     );
+    let refusal = match under_certified {
+        Ok(_) => panic!(
+            "derived surrogate must refuse when its rank ceiling is exhausted before \
+             the requested Hutchinson error bar is certified"
+        ),
+        Err(reason) => reason,
+    };
+    // A refusal that names only its dimension cannot be acted on, and this one
+    // aborts a fit that has already converged (gam#2731). It has to carry which
+    // of the builder's failure points fired and the numbers to decide on:
+    // whether to raise the ceiling, relax the target, or take the bar as it is.
+    for needle in [
+        "rank ceiling",
+        "std_err",
+        "target",
+        "estimate",
+        "pilot",
+    ] {
+        assert!(
+            refusal.contains(needle),
+            "the rank-ceiling refusal must name `{needle}`; got: {refusal}"
+        );
+    }
+    // And it must be THIS failure point, not one of the four breakdowns that
+    // share the call site's message.
     assert!(
-        under_certified.is_none(),
-        "derived surrogate must refuse when its rank ceiling is exhausted before \
-         the requested Hutchinson error bar is certified"
+        !refusal.contains("broke down") && !refusal.contains("unbuildable"),
+        "a ceiling refusal must not read as a numerical breakdown; got: {refusal}"
     );
 }
 
