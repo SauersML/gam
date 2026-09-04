@@ -1928,35 +1928,29 @@ fn survival_edf_from_dense_hessian(
 /// penalty blocks to select (e.g. the Weibull linear-time path), so the caller
 /// keeps the seed.
 ///
-/// # Left-truncation guard on the time baseline (issue #1790/#1791)
+/// # No left-truncation box on the time baseline (issues #1790/#1791, #2670)
 ///
 /// The transformation-survival LAML `−½·log|H|` term uses the **observed**
 /// information `H = X_exitᵀW_exit X_exit − X_entryᵀW_entry X_entry + (event/deriv)
-/// + S(λ)` (`WorkingState::hessian_curvature = Observed`), not the
-/// positive-definite **Fisher** curvature the standard GAM/location-scale REML
-/// path uses (`HessianCurvatureKind::Fisher`). Under right censoring
-/// (`entry == 0`) the `−X_entryᵀW_entry X_entry` term vanishes and `H` is PD, so
-/// the LAML surface is well-behaved. Under genuine **left truncation** the
-/// delayed-entry rows contribute a rank-heavy NEGATIVE `−X_entryᵀW_entry X_entry`
-/// block that can drive the time-block of `H` indefinite / near-singular. The
-/// spectral-regularized `log|H|` then keeps DECREASING as the time smoothing `λ`
-/// shrinks (the near-null time direction is rewarded), so the outer BFGS rails
-/// the time-block `λ` down to the lower bound. That under-smoothed, unpenalized
-/// I-spline linear-trend column then inflates the baseline log-cumulative-hazard
-/// into a huge, covariate-flat constant offset (`H ≈ const`, `S(t) ≡ 0`,
-/// covariate dependence erased) — exactly the degenerate fit #1790/#1791 report.
-/// The median-exit anchor (#1790) improves conditioning but does not remove the
-/// observed-information indefiniteness, so the selection still rails.
+/// + S(λ)`. Under genuine left truncation the delayed-entry rows contribute the
+/// negative `−X_entryᵀW_entry X_entry` block, and below some time smoothing `λ`
+/// the inner mode's `H` is indefinite. While the criterion turned such an `H`
+/// into a spectrally regularised `log|H|`, shrinking the time `λ` was rewarded
+/// (the near-null time direction lowered the cost), the outer search railed the
+/// time block to its lower bound, and the under-smoothed baseline inflated into a
+/// covariate-flat constant offset — the degenerate fit #1790/#1791 report. The
+/// time blocks' outer lower bound was then floored at the seed `ρ` under left
+/// truncation, a hand box that let the selector only hold or over-smooth.
 ///
-/// Fix: under left truncation, floor the outer lower bound of the **time**
-/// smoothing blocks at their seed `ρ` (`λ ≥ seed`, the documented CLI-equivalent
-/// known-good conditioning) so the selector can only ever HOLD or INCREASE the
-/// time penalty — never shrink it into the observed-information-driven degenerate
-/// under-smoothed region. Over-smoothing stays fully available, and the
-/// covariate smoothing blocks keep their full ±window so the covariate effect is
-/// unconstrained. Right-censored data (`entry == 0`) has a PD `H`, so its bounds
-/// are untouched and the fit is bit-for-bit preserved. Time blocks are those
-/// whose penalty range lies in the leading `[0, time_block_cols)` columns.
+/// That box guarded a criterion that no longer exists: an indefinite observed
+/// `H` at a trial ρ is not a Laplace mode and is REFUSED by
+/// `unified_lamlobjective_and_rhogradient` (a `TrialPointRefused` the outer
+/// engine retreats from), never converted into a positive-subspace
+/// pseudo-objective; and the inner loop no longer returns a saddle step on an
+/// indefinite curvature (`newton_solve::descent_curvature`). So the ρ domain is
+/// the outer engine's own for every block, left-truncated or not; the
+/// heterogeneous-entry cohort of #2814 selects `ρ̂ = 10.5` for its time block
+/// through this window with the same certificate as before.
 /// Outcome of the survival smoothing-parameter selection: the selected λ plus
 /// the OUTER convergence evidence (#2301 defect D). The analytic
 /// stationarity certificate that `OuterProblem::run` mints is threaded through
@@ -1984,8 +1978,6 @@ fn optimize_survival_transformation_smoothing(
     penalty_blocks: &[PenaltyBlock],
     beta0: &Array1<f64>,
     structural_lower_bounds: Option<&Array1<f64>>,
-    time_block_cols: usize,
-    left_truncated: bool,
 ) -> Result<Option<SurvivalSmoothingSelection>, String> {
     use gam_problem::{Derivative, HessianValue, OuterEval};
     use gam_solve::rho_optimizer::OuterProblem;
@@ -2195,29 +2187,8 @@ fn optimize_survival_transformation_smoothing(
     // optimum is `λ → ∞` (the block collapsing to its null space), which the
     // LAML gradient reaches on its own tolerance long before `e³⁰`.
     let bound = gam_solve::estimate::RHO_BOUND;
-    let mut lower = Array1::<f64>::from_elem(num_smoothing, -bound);
+    let lower = Array1::<f64>::from_elem(num_smoothing, -bound);
     let upper = Array1::<f64>::from_elem(num_smoothing, bound);
-    // Under left truncation the observed-information LAML `log|H|` is unreliable
-    // BELOW the seed for the baseline time block (see the doc header): the
-    // delayed-entry `−X_entryᵀW_entry X_entry` term can drive `H` indefinite so
-    // shrinking the time `λ` spuriously lowers the LAML cost and rails the
-    // selection into a degenerate, covariate-flat under-smoothed baseline
-    // (#1790/#1791). Floor the TIME smoothing blocks' lower bound at their seed
-    // `ρ` so the selector may only hold or over-smooth the baseline — never
-    // under-smooth it into that region. Covariate smoothing blocks (whose penalty
-    // ranges start at or beyond `time_block_cols`) keep their full window so the
-    // covariate effect stays unconstrained. Right-censored data has a PD `H`, so
-    // its bounds are left exactly as before.
-    if left_truncated {
-        for k in 0..num_smoothing {
-            let is_time_block = penalty_blocks
-                .get(k)
-                .is_some_and(|block| block.range.start < time_block_cols);
-            if is_time_block {
-                lower[k] = seed_rho[k];
-            }
-        }
-    }
     let context =
         format!("survival transformation smoothing-parameter selection (dim={num_smoothing})");
     // `OuterProblem::run` returns `Ok` only after its analytic projected-KKT
@@ -3493,16 +3464,6 @@ pub(crate) fn fit_survival_transformation_model(
     // candidate, so the constrained optimum stays valid. The selected λ is written
     // back into both the working model and `penalty_blocks` so the final fit,
     // edf, and warm-start cache all use the data-adaptive value.
-    // Left-truncation status drives the observed-information LAML guard on the
-    // baseline time smoothing block (#1790/#1791): genuine delayed entry
-    // (`entry > ENTRY_AT_ORIGIN_THRESHOLD`) makes the observed-information `H`
-    // indefinite below the seed λ, so the time block's outer lower bound is
-    // floored at its seed to prevent the degenerate under-smoothed baseline.
-    let is_left_truncated = spec
-        .age_entry
-        .iter()
-        .any(|&t| t > crate::survival::ENTRY_AT_ORIGIN_THRESHOLD);
-    let p_time_total = prepared.time_design_exit.ncols();
     let (survival_outer_iterations, survival_outer_certificate, selected_mode) = if let Some(
         selection,
     ) = optimize_survival_transformation_smoothing(
@@ -3510,8 +3471,6 @@ pub(crate) fn fit_survival_transformation_model(
         &penalty_blocks,
         &beta0,
         structural_lower_bounds.as_ref(),
-        p_time_total,
-        is_left_truncated,
     )? {
         model
             .set_penalty_lambdas(&selection.lambdas)
