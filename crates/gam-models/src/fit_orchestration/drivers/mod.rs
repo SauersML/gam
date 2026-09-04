@@ -215,6 +215,7 @@ include!("iso_kappa_reml_gradient_fd_tests.rs");
 // criterion — or the joint [ρ, ψ] search minimizes a different model than the
 // one it is graded against. Self-contained `#[cfg(test)] mod`.
 include!("spatial_realizer_chart_2760_tests.rs");
+include!("spatial_aniso_psi_layout_2760_tests.rs");
 // #901 re-home: the Matérn κ-optimizer convergence/monotone gates the issue
 // listed as stalling on the wrong projected-logdet gradient. Same #1601
 // orphaning story — driver deps live HERE post-carve. Self-contained

@@ -4104,6 +4104,27 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
     // design jet into the collection's fixed row-space complement (gam#2760).
     // The shared implicit operator covers first, diagonal-second, and cross-
     // second axes; dense fallbacks are projected here by the identical object.
+    // gam#2760 — the same stage-2 joint-null rotation the isotropic arm applies
+    // in `try_build_spatial_term_log_kappa_derivative`. The realized design this
+    // derivative is graded against is `X·Q`, so an unrotated per-axis block is a
+    // derivative of a different model. Before the row-space projector: `Q` acts
+    // on coefficients, the projector on rows.
+    if let Some(rotation) = smooth_term.joint_null_rotation.as_ref() {
+        let Some(rotated) = aniso_result
+            .rotated_by_joint_null(rotation)
+            .map_err(EstimationError::from)?
+        else {
+            log::warn!(
+                "[spatial-kappa] term {term_idx}: per-axis ψ declined -- the realized design \
+                 carries a joint-null rotation of {} coefficients that the per-axis derivative \
+                 blocks do not admit",
+                rotation.rotation.nrows()
+            );
+            return Ok(None);
+        };
+        aniso_result = rotated;
+    }
+
     if let Some(gauge) = smooth_term.collection_gauge.as_ref() {
         let projector = FixedRowSpaceProjector::from_constraint_block(
             gauge.constraint_block.view(),

@@ -3429,16 +3429,21 @@ pub fn spatial_term_uses_per_axis_psi(resolvedspec: &TermCollectionSpec, term_id
         return false;
     };
     match &term.basis {
+        // gam#2760 — enrollment is a property of the MODEL, so it must not read
+        // `joint_null_rotation`. That field records whether the spec at hand
+        // asks its local build to apply the stage-2 rotation `Q`, which is a
+        // property of the REALIZATION PATH: the collection clears it once it
+        // composes `Q·T0` into the gauge, and a ψ-replay spec carries it so the
+        // local build reproduces the collection's block. The θ layout is sized
+        // from the resolved spec and the hyper-directions are built from the
+        // realizer's, so a predicate that reads the field answers `d` on one and
+        // `1` on the other and the joint route refuses on the shape mismatch
+        // (`psi_dim=6, hyper_dirs=1` on every `--scale-dimensions` Duchon fit).
+        // `Q` is instead applied where it belongs, by the per-axis producer
+        // (`AnisoBasisPsiDerivatives::rotated_by_joint_null`), exactly as the
+        // isotropic arm has always applied it.
         SmoothBasisSpec::Duchon { spec, .. } => {
-            // A joint null rotation `Q` has to be applied to every ψ-derivative
-            // block — the isotropic arm does it explicitly in
-            // `try_build_spatial_term_log_kappa_derivative`. The per-axis
-            // consumer does not, so a rotated Duchon term stays isotropic
-            // rather than shipping an unrotated per-axis derivative against a
-            // rotated design. (The anisotropic Matérn has the same gap; it is
-            // pre-existing and not touched here.)
-            term.joint_null_rotation.is_none()
-                && crate::basis::duchon_spec_supports_axis_psi(spec, d)
+            crate::basis::duchon_spec_supports_axis_psi(spec, d)
         }
         _ => true,
     }
