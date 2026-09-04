@@ -721,10 +721,19 @@ impl<'a> RemlState<'a> {
         let n = x_dense.nrows();
         let active_blocks = Self::tk_active_blocks(c_array);
         use rayon::prelude::*;
+        // `z` is `H⁻¹Xᵀ` stored `p × n`, so its column `i` is a stride-`n`
+        // walk: a per-row dot against it is a cache miss per element and
+        // falls to ndarray's generic (non-unrolled) kernel. Measured on the
+        // Duchon 6-D fits (n = 50,000): 17 % (p = 100) and 31 % (p = 500) of
+        // the whole fit inside this and the `h′` loop below. One contiguous
+        // transpose costs `O(n·p)` memory traffic and makes every row dot a
+        // unit-stride kernel.
+        let z_transposed = z.t();
+        let z_rows = z_transposed.as_standard_layout();
         let h_diag_vec: Vec<f64> = (0..n)
             .into_par_iter()
             .map(|i| {
-                let val = x_dense.row(i).dot(&z.column(i));
+                let val = x_dense.row(i).dot(&z_rows.row(i));
                 if !val.is_finite() {
                     crate::bail_invalid_estim!(
                         "{context} produced non-finite leverage at row {i}: {val}"
@@ -1343,10 +1352,14 @@ impl<'a> RemlState<'a> {
         if let Some(x_theta) = x_fixed {
             let ch = c_array * &shared.h_diag;
             design_q_prime += &gam_linalg::faer_ndarray::fast_atv(x_theta, &ch);
+            // Contiguous rows of `Zᵀ` instead of stride-`n` columns of `Z`
+            // (see `tk_shared_intermediates` for the measurement).
+            let z_transposed = z.t();
+            let z_rows = z_transposed.as_standard_layout();
             ndarray::Zip::from(&mut h_prime)
                 .and(x_theta.rows())
-                .and(z.columns())
-                .par_for_each(|o, xr, zc| *o = 2.0 * xr.dot(&zc));
+                .and(z_rows.rows())
+                .par_for_each(|o, xr, zr| *o = 2.0 * xr.dot(&zr));
         }
 
         let q_weight_prime = &(&c_prime * &shared.h_diag) + &(c_array * &h_prime);
