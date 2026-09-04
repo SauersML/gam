@@ -266,6 +266,18 @@ pub struct SurvivalPredictResult {
     /// the requested mode. `None` iff the result carries no uncertainty
     /// surfaces.
     pub covariance_source: Option<SurvivalPredictionCovarianceMode>,
+    /// The plug-in surface `S(eta_hat)` when `survival` carries the posterior
+    /// mean `E[S(eta) | data]`; `None` when `survival` IS the plug-in (the
+    /// [`SurvivalPredictEstimand::Plugin`] request).
+    ///
+    /// The posterior-mean path builds the plug-in prediction first and then
+    /// replaces its surfaces with the quadrature means, so this costs one
+    /// clone per CALL and no extra prediction. Publishing it means a presenter
+    /// reports both estimands BY NAME rather than asking for one with a mode:
+    /// `gam predict` has published `survival_prob_plugin` beside
+    /// `survival_prob` since #2670, and the Python payload could not, because
+    /// the surface it integrated was discarded here.
+    pub survival_plugin: Option<Array2<f64>>,
 }
 
 /// Exact plug-in survival probability over each requested latent-hazard window.
@@ -1026,6 +1038,10 @@ fn predict_survival_posterior_mean(
         covariance_mode,
     )?;
     let (n_rows, n_times) = result.survival.dim();
+    // `result` is the plug-in prediction and the loop below overwrites its
+    // surfaces with the posterior means, so the plug-in survival is taken
+    // here: one clone per call, not one per quadrature node.
+    let survival_plugin = result.survival.clone();
     let mut survival_mean = Array2::<f64>::zeros((n_rows, n_times));
     let mut survival_second = Array2::<f64>::zeros((n_rows, n_times));
     let mut density_mean = Array2::<f64>::zeros((n_rows, n_times));
@@ -1119,6 +1135,7 @@ fn predict_survival_posterior_mean(
         })
     });
     result.covariance_source = req.with_uncertainty.then_some(covariance_mode);
+    result.survival_plugin = Some(survival_plugin);
     Ok(result)
 }
 
@@ -2346,6 +2363,8 @@ pub fn predict_survival(
         survival_se: None,
         eta_se: None,
         covariance_source: None,
+        // This IS the plug-in prediction; `survival` carries it.
+        survival_plugin: None,
     })
 }
 
@@ -4142,6 +4161,8 @@ fn predict_survival_location_scale_batch(
         survival_se,
         eta_se: eta_se_per_row,
         covariance_source: with_uncertainty.then_some(covariance_mode),
+        // This IS the plug-in prediction; `survival` carries it.
+        survival_plugin: None,
     })
 }
 
@@ -5819,6 +5840,7 @@ mod tests {
             survival_se: None,
             eta_se: None,
             covariance_source: None,
+            survival_plugin: None,
         }
     }
 

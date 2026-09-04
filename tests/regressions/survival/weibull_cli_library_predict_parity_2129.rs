@@ -250,4 +250,50 @@ fn weibull_cli_and_library_predict_surfaces_agree() {
          cli = {cli_eta:?}, lib = {lib_eta:?} (max |Δ| = {max_eta_diff:.3e}). \
          A ~2× ratio here is the #2129 double-count resurfacing on the CLI path.",
     );
+
+    // Path C — the same library surface asked for the POSTERIOR MEAN. Since
+    // #2670 the CLI publishes both estimands by name (`survival_prob_plugin`
+    // beside `survival_prob`) because there is no `--mode` to select one; the
+    // library route integrated the very same plug-in surface on its way to the
+    // posterior mean and used to discard it, so a Python caller could not see
+    // the column its CLI twin prints. It is published now, and this is the
+    // parity assertion: the plug-in a posterior-mean result carries IS the
+    // plug-in estimand's own answer, on the same model and the same grid.
+    let posterior = predict_survival(
+        SurvivalPredictRequest {
+            model: &model,
+            data: dataset.values.view(),
+            col_map: &col_map,
+            training_headers,
+            primary_offset: &primary_offset,
+            noise_offset: &noise_offset,
+            time_grid: Some(&GRID_TIMES),
+            with_uncertainty: false,
+            estimand: gam::families::survival::predict::SurvivalPredictEstimand::PosteriorMean,
+        },
+        SurvivalPredictionCovarianceMode::Conditional,
+    )
+    .expect("library Weibull posterior-mean survival predict");
+    let published_plugin = posterior.survival_plugin.as_ref().expect(
+        "a posterior-mean survival result publishes the plug-in surface it integrated (#2670)",
+    );
+    assert_eq!(
+        published_plugin.dim(),
+        lib.survival.dim(),
+        "the published plug-in surface must have the plug-in prediction's shape",
+    );
+    let mut max_plugin_diff = 0.0_f64;
+    for (published, plugin) in published_plugin.iter().zip(lib.survival.iter()) {
+        max_plugin_diff = max_plugin_diff.max((published - plugin).abs());
+    }
+    assert!(
+        max_plugin_diff <= 1e-12,
+        "the plug-in surface published beside the posterior mean is not the plug-in \
+         estimand's own answer (max |Δ| = {max_plugin_diff:.3e})",
+    );
+    // The plug-in request carries no second copy of itself: `survival` IS it.
+    assert!(
+        lib.survival_plugin.is_none(),
+        "a plug-in request must not publish a redundant plug-in surface",
+    );
 }

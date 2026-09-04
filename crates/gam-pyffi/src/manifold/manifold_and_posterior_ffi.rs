@@ -4623,6 +4623,16 @@ fn serialize_survival_prediction_payload(
         .collect();
     columns.insert("survival_prob".to_string(), survival_col);
     columns.insert("failure_prob".to_string(), failure_col);
+    // Both estimands by name, as `gam predict` publishes them (#2670). The
+    // engine integrated this surface to produce `survival_prob`; a presenter
+    // that wants the plug-in should read the column rather than re-request
+    // the prediction with a different estimand.
+    if let Some(plugin) = result.survival_plugin.as_ref() {
+        let plugin_col: Vec<f64> = (0..n)
+            .map(|i| plugin[[i, t.saturating_sub(1)]])
+            .collect();
+        columns.insert("survival_prob_plugin".to_string(), plugin_col);
+    }
 
     // Restricted mean survival time over the prediction horizon. The engine
     // owns both the integral and the choice of horizon; this layer only moves
