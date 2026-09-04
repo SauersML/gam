@@ -1,5 +1,13 @@
 ## Unreleased
 
+### Testing
+- Of the three specialised binomial closed-form derivative towers in
+  `gamlss::binomial_q_derivs`, only the logit one was cross-checked against the generic
+  mu-jet path; probit had tail-limit tests only and cloglog had none. Each closed form is
+  now walked from its own loss up through `m1..m4` by five-point central difference, and
+  cloglog additionally gets the jet-path agreement test logit already had. Both closed
+  forms pass as written -- this closes an unwatched surface rather than fixing a defect. (#932)
+
 ### Performance
 - The flex BMS row program's link-deviation basis sum is now one fused jet operation
   (`RuntimeJetScalar::weighted_compose_sum`) rather than a per-coefficient
