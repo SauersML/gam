@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Fixed
+- The `SLS-MACRO-CODEGEN-932` timing cell in `gam-row-macros` compared the generated
+  location-scale program against a hand schedule that gated its `u1`/`g` terms on
+  `plan.u1.is_some()` -- the row's weight -- while the generated program gates on the
+  term's own coefficient stack. On a censored far-tail row with a zero stack the hand
+  formed `0 * inf` and returned NaN where the program returns a finite zero, so its
+  saving was the guard it was missing. The opponent now carries the program's contract
+  and `the_hand_carries_the_generated_programs_activity_contract_932` pins it. (#932)
+
 - A coefficient-mode profile whose candidates all refused the trial point now reports a trial-point refusal instead of `UnsupportedConfiguration`, so the outer search steps away instead of aborting the fit. On the large-scale CTN preprocessor a single `h' has non-positive values` refusal killed a 25-minute fit that already had a certified incumbent; one structural rejection among the candidates still keeps the whole profile structural (#979, #2553, #2590).
 
 - `Cargo.lock` resolves `numpy` against the workspace's own `ndarray 0.17.2` again: a re-resolution had flipped that one edge to `ndarray 0.16.1`, which left `gam-pyffi` with 945 compile errors (every `into_pyarray` / `from_owned_array` at the Python boundary) because the two crates no longer shared an `ArrayBase` type. No gate job builds the FFI crate, so nothing caught it (#2670).

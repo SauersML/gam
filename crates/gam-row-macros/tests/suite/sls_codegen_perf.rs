@@ -695,14 +695,30 @@ fn hand(p: &[f64; K], kernel: &Kernel) -> Channels {
     let [u0_value, u0_first, u0_second, _, _] = plan.u0;
     let mut value = u0_value;
 
-    let u1_active = plan.u1.is_some();
-    let [u1_value, u1_first, u1_second, _, _] = plan.u1.unwrap_or([0.0; 5]);
-    value += u1_value;
+    // THE SAME CONTRACT AS THE GENERATED PROGRAM. `generated_sls_order2` gates
+    // each term on the term's own coefficient STACK — its emitted condition is
+    // `u1_value != 0.0 || u1_first != 0.0 || …` — while `plan.u1` is `Some`
+    // whenever the row's weight is nonzero. Those differ on a real row: a
+    // censored row whose residual channels are all zero carries a nonzero
+    // weight and an exactly zero stack, and applying the chain rule to that
+    // stack against a far-tail index jet forms `0 * inf`. Gating on `is_some`
+    // there returns NaN where the program returns a finite zero, so it is not a
+    // schedule the program could be replaced by, and its saving is the guard it
+    // is missing (`the_hand_carries_the_generated_programs_activity_contract_932`).
+    let u1_stack = plan.u1.unwrap_or([0.0; 5]);
+    let u1_active = u1_stack.iter().any(|entry| *entry != 0.0);
+    let [u1_value, u1_first, u1_second, _, _] = u1_stack;
+    if u1_active {
+        value += u1_value;
+    }
 
     let inner = p[3] * p[8] - p[5];
-    let g_active = plan.g.is_some();
-    let [g_value, g_first, g_second, _, _] = plan.g.unwrap_or([0.0; 5]);
-    value += g_value;
+    let g_stack = plan.g.unwrap_or([0.0; 5]);
+    let g_active = g_stack.iter().any(|entry| *entry != 0.0);
+    let [g_value, g_first, g_second, _, _] = g_stack;
+    if g_active {
+        value += g_value;
+    }
 
     let u0_g4 = -entry_exp;
     let u0_g7 = p[4] * entry_exp;
@@ -776,6 +792,60 @@ fn hand(p: &[f64; K], kernel: &Kernel) -> Channels {
     }
 
     (value, gradient, hessian)
+}
+
+/// A censored FAR-TAIL row whose `u1` coefficient stack is EXACTLY zero while
+/// its weight is not: `d = 0` with the censored residual channels zeroed, so
+/// `outer_plan_order2` returns `Some([0.0; 5])`, and an exit log-scale far
+/// enough out that `exp(-eta_ls_exit)` overflows.
+fn far_tail_zero_u1_stack_row() -> ([f64; K], Kernel) {
+    let (mut p, mut kernel) = fixture();
+    p[6] = -1000.0;
+    kernel.d = 0.0;
+    kernel.censored_u1 = [0.0; 5];
+    (p, kernel)
+}
+
+/// THE OPPONENT IS ON THE GENERATED PROGRAM'S CONTRACT, and this is the row
+/// that says so. The timed cell asserts the generated schedule beats the
+/// strongest hand *of the same contract*; a hand that asked `plan.u1.is_some()`
+/// where the program asks whether the stack is nonzero was not on it, and the
+/// difference shows up here as a `NaN` rather than as a rounding disagreement.
+#[test]
+fn the_hand_carries_the_generated_programs_activity_contract_932() {
+    let (p, kernel) = far_tail_zero_u1_stack_row();
+    let program = generated(&p, &kernel);
+    let opponent = hand(&p, &kernel);
+    let finite = |channels: &Channels| {
+        channels.0.is_finite()
+            && channels.1.iter().all(|channel| channel.is_finite())
+            && channels.2.iter().flatten().all(|channel| channel.is_finite())
+    };
+
+    // NON-VACUITY: the row must reach the regime the pin is about.
+    assert!(
+        (-p[6]).exp().is_infinite(),
+        "the fixture must overflow the exit scale, or the 0*inf it guards cannot form"
+    );
+    let plan = outer_plan_order2(&kernel);
+    assert!(
+        plan.u1.is_some(),
+        "the plan must still carry a u1 slot, or the two predicates agree here"
+    );
+    assert!(
+        plan.u1.unwrap_or([1.0; 5]).iter().all(|entry| *entry == 0.0),
+        "the u1 stack must be exactly zero, or this is an ordinary row"
+    );
+
+    assert!(finite(&program), "the generated program must not form 0*inf");
+    assert!(
+        finite(&opponent),
+        "the timed opponent must carry the program's activity contract, or the \
+         cell is racing two different jobs"
+    );
+    // `assert_close`, NOT `assert_same_channels`: the latter scores NaN against
+    // NaN as an agreement, which is the one verdict this pin must never return.
+    assert_close(opponent, program);
 }
 
 fn fixture() -> ([f64; K], Kernel) {
