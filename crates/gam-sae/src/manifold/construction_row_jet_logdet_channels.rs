@@ -1202,3 +1202,570 @@ impl SaeManifoldTerm {
         })
     }
 }
+
+/// #2333 — the algebraic identity the softmax Trace cutover rests on.
+///
+/// `SaeManifoldTerm::contracted_softmax_trace_adjoint` no longer computes the
+/// retired hand loop's `contract-then-subtract` shape
+/// `tr(inv_vv·D) − deflation_block_correction(inv_vv, D, …)`; it hands the seam a
+/// SINGLE weight `E_tt` and lets the kernel reduce `Σ_{a,b} E[a,b]·dh[a,b]`
+/// against the materialized tower. Every θ-adjoint value on the softmax route is
+/// therefore only as correct as
+/// `SaeManifoldTerm::deflation_folded_trace_weight` reproducing that
+/// subtraction inside the weight. These tests pin exactly that, at the RELATIVE
+/// tolerance the fold's reassociation of the same `f64` sum earns, for every
+/// branch of the correction the fold has to mirror.
+#[cfg(test)]
+mod tests_deflation_trace_fold_2333 {
+    use crate::manifold::{RowDeflationSpectrum, RowSpectralConditioning, SaeManifoldTerm};
+    use ndarray::{Array1, Array2, array};
+    use std::sync::Arc;
+
+    /// A `q×q` orthonormal basis built from an explicit rotation product, so the
+    /// fixture depends on no eigensolver's sign or ordering convention.
+    fn orthonormal_basis() -> Array2<f64> {
+        let (c1, s1) = (0.6_f64, 0.8_f64);
+        let (c2, s2) = ((0.28_f64).cos(), (0.28_f64).sin());
+        let r1 = array![[c1, -s1, 0.0], [s1, c1, 0.0], [0.0, 0.0, 1.0]];
+        let r2 = array![[1.0, 0.0, 0.0], [0.0, c2, -s2], [0.0, s2, c2]];
+        r1.dot(&r2)
+    }
+
+    /// Symmetric and positive definite, as a selected inverse of a symmetric PD
+    /// system is.
+    fn symmetric_inverse() -> Array2<f64> {
+        array![
+            [1.70, 0.35, -0.20],
+            [0.35, 1.15, 0.40],
+            [-0.20, 0.40, 2.05],
+        ]
+    }
+
+    /// Symmetric derivative blocks `D`. The identity must hold for EVERY
+    /// symmetric `D` the tower can produce, so the probe set spans diagonal,
+    /// off-diagonal, indefinite and rank-one shapes rather than one convenient
+    /// matrix.
+    fn symmetric_probes() -> Vec<Array2<f64>> {
+        let rank_one = {
+            let v = array![0.7_f64, -0.4, 0.55];
+            let mut m = Array2::<f64>::zeros((3, 3));
+            for a in 0..3 {
+                for b in 0..3 {
+                    m[[a, b]] = v[a] * v[b];
+                }
+            }
+            m
+        };
+        vec![
+            array![[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            array![[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            array![[0.9, -0.3, 0.15], [-0.3, -1.4, 0.22], [0.15, 0.22, 0.65]],
+            array![[-2.2, 0.05, -0.9], [0.05, 0.31, 0.04], [-0.9, 0.04, 1.7]],
+            rank_one,
+        ]
+    }
+
+    /// Exactly what the Trace kernel reduces: `Σ_{a,b} E[a,b]·dh[a,b]` over the
+    /// full `q×q` index range (`cpu_contracted_tile`'s Trace arm and
+    /// `sae_rowjet_trace_t` both walk both indices, so the weight is never
+    /// required to be symmetric).
+    fn seam_contraction(e: &Array2<f64>, d: &Array2<f64>) -> f64 {
+        let q = e.nrows();
+        let mut acc = 0.0_f64;
+        for a in 0..q {
+            for b in 0..q {
+                acc += e[[a, b]] * d[[a, b]];
+            }
+        }
+        acc
+    }
+
+    /// `tr(inv·D)` written out, with no symmetry assumed of either operand —
+    /// the same quantity the retired hand loop accumulated as
+    /// `Σ_{a,b} inv_vv[[b,a]]·dh[[a,b]]`.
+    fn trace_of_product(inv: &Array2<f64>, d: &Array2<f64>) -> f64 {
+        let q = inv.nrows();
+        let mut acc = 0.0_f64;
+        for a in 0..q {
+            for b in 0..q {
+                acc += inv[[a, b]] * d[[b, a]];
+            }
+        }
+        acc
+    }
+
+    /// The retired shape: contract against the raw selected inverse, then
+    /// subtract the Daleckii–Krein deflation correction.
+    fn contract_then_subtract(
+        inv: &Array2<f64>,
+        d: &Array2<f64>,
+        dirs: &[Array1<f64>],
+        spectrum: Option<&RowDeflationSpectrum>,
+    ) -> f64 {
+        trace_of_product(inv, d)
+            - SaeManifoldTerm::deflation_block_correction(inv, d, dirs, spectrum)
+    }
+
+    /// The spectral fixture: one raw-kept, one floor-clamped and one
+    /// unit-deflated direction, so `F` exercises the divided difference AND both
+    /// degenerate fallbacks in one weight.
+    fn spectral_fixture(u: Array2<f64>) -> RowDeflationSpectrum {
+        RowDeflationSpectrum {
+            evecs: u,
+            raw_evals: array![2.40_f64, 0.35, 0.02],
+            cond_evals: array![2.40_f64, 0.50, 1.00],
+            conditioning: Arc::from(
+                [
+                    RowSpectralConditioning::Raw,
+                    RowSpectralConditioning::FloorClamped,
+                    RowSpectralConditioning::UnitDeflated,
+                ]
+                .as_slice(),
+            ),
+        }
+    }
+
+    /// Relative to the trace being reproduced, because the fold reassociates the
+    /// same `f64` sum: an absolute bar would silently tighten or loosen with the
+    /// fixture's scale.
+    fn fold_tolerance(expected: f64) -> f64 {
+        1.0e-10 * (1.0 + expected.abs())
+    }
+
+    /// Spectral deflation: the folded seam weight must reproduce
+    /// `tr(inv_vv·D) − deflation_block_correction(…)` for every symmetric `D`.
+    #[test]
+    fn deflation_folded_trace_weight_reproduces_contract_then_subtract_2333() {
+        let inv = symmetric_inverse();
+        let spectrum = spectral_fixture(orthonormal_basis());
+        let dirs: Vec<Array1<f64>> = Vec::new();
+
+        let e = SaeManifoldTerm::deflation_folded_trace_weight(&inv, &dirs, Some(&spectrum));
+        assert_eq!(e.dim(), (3, 3), "the seam weight must stay q x q");
+
+        let mut worst_correction = 0.0_f64;
+        for d in symmetric_probes() {
+            let expected = contract_then_subtract(&inv, &d, &dirs, Some(&spectrum));
+            let folded = seam_contraction(&e, &d);
+            let tolerance = fold_tolerance(expected);
+            assert!(
+                (folded - expected).abs() <= tolerance,
+                "#2333 folded weight must reproduce contract-then-subtract: \
+                 folded={folded:.17e} expected={expected:.17e} tol={tolerance:.3e}"
+            );
+            let raw = trace_of_product(&inv, &d);
+            worst_correction = worst_correction.max((raw - expected).abs() / (1.0 + raw.abs()));
+        }
+        // Non-vacuity: a fold that simply returned `inv_vv` would satisfy the
+        // assertion above on a fixture whose correction is numerically zero.
+        assert!(
+            worst_correction > 1.0e-10,
+            "#2333 spectral fixture must carry a correction the fold has to \
+             reproduce; largest relative correction was {worst_correction:.3e}"
+        );
+    }
+
+    /// Gauge-only deflation (`spectrum = None`, non-empty `dirs`) folds to
+    /// `inv_vv − Σᵢ vᵢvᵢᵀ`, and an UNDEFLATED row folds to `inv_vv` itself. Both
+    /// are separate branches of the correction, so a fold that handled only the
+    /// spectral branch would still pass the test above.
+    #[test]
+    fn deflation_folded_trace_weight_covers_gauge_only_and_undeflated_branches_2333() {
+        let inv = symmetric_inverse();
+
+        let dirs = vec![
+            array![0.6_f64, -0.8, 0.0],
+            // Deliberately SHORT: the correction zero-extends a direction whose
+            // length is below `q`, and the fold must do the same.
+            array![0.0_f64, 0.5],
+        ];
+        let gauge = SaeManifoldTerm::deflation_folded_trace_weight(&inv, &dirs, None);
+        let mut worst_correction = 0.0_f64;
+        for d in symmetric_probes() {
+            let expected = contract_then_subtract(&inv, &d, &dirs, None);
+            let folded = seam_contraction(&gauge, &d);
+            let tolerance = fold_tolerance(expected);
+            assert!(
+                (folded - expected).abs() <= tolerance,
+                "#2333 gauge-only fold must reproduce contract-then-subtract: \
+                 folded={folded:.17e} expected={expected:.17e} tol={tolerance:.3e}"
+            );
+            let raw = trace_of_product(&inv, &d);
+            worst_correction = worst_correction.max((raw - expected).abs() / (1.0 + raw.abs()));
+        }
+        assert!(
+            worst_correction > 1.0e-10,
+            "#2333 gauge-only fixture must carry a correction the fold has to \
+             reproduce; largest relative correction was {worst_correction:.3e}"
+        );
+
+        // An undeflated row: the consumer hands the seam the raw selected
+        // inverse, bit for bit, because the correction's own zero branch does.
+        let undeflated = SaeManifoldTerm::deflation_folded_trace_weight(&inv, &[], None);
+        for a in 0..3 {
+            for b in 0..3 {
+                assert_eq!(
+                    undeflated[[a, b]].to_bits(),
+                    inv[[a, b]].to_bits(),
+                    "#2333 an undeflated row must fold to the raw selected inverse"
+                );
+            }
+        }
+    }
+
+    /// A degenerate raw pair carrying DIFFERENT conditioning decisions.
+    ///
+    /// `|λ_a − λ_b| ≤ gap_threshold` takes the divided difference to its
+    /// diagonal limit `f'(λ)`, which is `1` for a retained direction and `0` for
+    /// a conditioned one — so `F`, and hence the seam weight, is genuinely
+    /// ASYMMETRIC here. That is legal: both the CPU oracle and the device kernel
+    /// walk the full `(a,b)` range, and the identity still holds because
+    /// `Σ_{a,b} (U G Uᵀ)[a,b]·D[a,b] = Σ_{a,b} G[a,b]·(UᵀDU)[a,b]` needs no
+    /// symmetry of `G`.
+    #[test]
+    fn deflation_folded_trace_weight_handles_a_degenerate_pair_split_by_conditioning_2333() {
+        let inv = symmetric_inverse();
+        let spectrum = RowDeflationSpectrum {
+            evecs: orthonormal_basis(),
+            // The first two raw eigenvalues are EXACTLY equal, so their gap is
+            // below any threshold and both off-diagonal entries take the
+            // diagonal limit of their own row's conditioning.
+            raw_evals: array![0.02_f64, 0.02, 2.40],
+            cond_evals: array![0.02_f64, 1.00, 2.40],
+            conditioning: Arc::from(
+                [
+                    RowSpectralConditioning::Raw,
+                    RowSpectralConditioning::UnitDeflated,
+                    RowSpectralConditioning::Raw,
+                ]
+                .as_slice(),
+            ),
+        };
+        let dirs = vec![orthonormal_basis().column(1).to_owned()];
+
+        let e = SaeManifoldTerm::deflation_folded_trace_weight(&inv, &dirs, Some(&spectrum));
+        let mut asymmetry = 0.0_f64;
+        for a in 0..3 {
+            for b in 0..3 {
+                asymmetry = asymmetry.max((e[[a, b]] - e[[b, a]]).abs());
+            }
+        }
+        assert!(
+            asymmetry > 1.0e-10,
+            "#2333 the split degenerate pair must actually produce an asymmetric \
+             weight, else this fixture proves nothing about the (a,b) walk; \
+             asymmetry={asymmetry:.3e}"
+        );
+
+        for d in symmetric_probes() {
+            let expected = contract_then_subtract(&inv, &d, &dirs, Some(&spectrum));
+            let folded = seam_contraction(&e, &d);
+            let tolerance = fold_tolerance(expected);
+            assert!(
+                (folded - expected).abs() <= tolerance,
+                "#2333 degenerate-pair fold must reproduce contract-then-subtract: \
+                 folded={folded:.17e} expected={expected:.17e} tol={tolerance:.3e}"
+            );
+        }
+    }
+
+    /// The clamp-basin shape: a spectrum whose Daleckii–Krein map is
+    /// NON-IDENTITY while the row's deflated-direction list is EMPTY.
+    ///
+    /// `factor_spectral_deflated_criterion_row_with_geometry` reaches this state
+    /// through `ExactADirectionClassification::ClampBasin`, which reprices a
+    /// direction's conditioned eigenvalue without unit-deflating it — so it
+    /// pushes no direction and leaves `conditioning` on `Raw`. The ρ-trace
+    /// siblings gate on `spectrum.is_some() || !dirs.is_empty()` for exactly this
+    /// reason (#2515/#2336). The fold inherits that convention structurally: it
+    /// branches on the SPECTRUM, never on the direction list, so the seam
+    /// differentiates the priced spectral map here. Pinned because the retired
+    /// hand loop — and `logdet_theta_adjoint_dense`, this route's parity
+    /// reference — instead gate on `!dirs.is_empty()` alone and skip it.
+    #[test]
+    fn deflation_folded_trace_weight_prices_a_spectrum_with_no_deflated_direction_2333() {
+        let inv = symmetric_inverse();
+        let spectrum = spectral_fixture(orthonormal_basis());
+        let no_dirs: Vec<Array1<f64>> = Vec::new();
+
+        let e = SaeManifoldTerm::deflation_folded_trace_weight(&inv, &no_dirs, Some(&spectrum));
+        let mut worst_departure = 0.0_f64;
+        for d in symmetric_probes() {
+            let folded = seam_contraction(&e, &d);
+            let raw = trace_of_product(&inv, &d);
+            worst_departure = worst_departure.max((folded - raw).abs() / (1.0 + raw.abs()));
+            // The identity itself still holds: `deflation_block_correction` also
+            // reads only the spectrum on this branch.
+            let expected = contract_then_subtract(&inv, &d, &no_dirs, Some(&spectrum));
+            let tolerance = fold_tolerance(expected);
+            assert!(
+                (folded - expected).abs() <= tolerance,
+                "#2333 empty-direction spectral fold must reproduce \
+                 contract-then-subtract: folded={folded:.17e} \
+                 expected={expected:.17e} tol={tolerance:.3e}"
+            );
+        }
+        assert!(
+            worst_departure > 1.0e-10,
+            "#2333 an empty direction list must NOT disable the spectral fold; \
+             largest relative departure from the raw selected inverse was \
+             {worst_departure:.3e}"
+        );
+    }
+}
+
+/// #2333 — production acceptance for the softmax Trace cutover.
+///
+/// The identity tests above pin the seam WEIGHT. This pins the CONSUMER: that
+/// `contracted_softmax_trace_adjoint` supplies the row's likelihood metric,
+/// selected inverse and Daleckii–Krein fold to the seam correctly enough to
+/// reproduce the independent dense builder `logdet_theta_adjoint_dense`, which
+/// materializes the joint inverse and every `∂H/∂θ` entry densely and shares no
+/// row-jet contraction code with the seam.
+///
+/// This is the `<=1e-12` bar the issue's ruling names. It previously existed as
+/// `softmax_trace_whitening_prefold_matches_dense_adjoint_2333`; that test was
+/// removed one day after it landed by the workspace dead-code purge
+/// `c0a21b554`, which pruned the `ch5_dense_theta_adjoint_selfcheck` test-support
+/// helper it called. Rebuilt here against the production dense builder directly,
+/// so it depends on no test-only helper that a reachability sweep can prune.
+#[cfg(test)]
+mod tests_trace_adjoint_dense_parity_2333 {
+    use super::*;
+
+    /// Rows whose spectral/gauge deflation actually moves the fold away from the
+    /// raw selected inverse. A parity assertion taken on a fixture where every
+    /// row is undeflated would pass with the fold deleted.
+    fn fold_live_rows(cache: &ArrowFactorCache) -> usize {
+        (0..cache.n_rows())
+            .filter(|&row| {
+                let gauge = cache
+                    .deflated_row_directions
+                    .get(row)
+                    .is_some_and(|directions| !directions.is_empty());
+                let spectral = cache
+                    .deflation_row_spectra
+                    .get(row)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|spectrum| {
+                        spectrum
+                            .raw_evals
+                            .iter()
+                            .zip(spectrum.cond_evals.iter())
+                            .any(|(&raw, &conditioned)| raw.to_bits() != conditioned.to_bits())
+                    });
+                gauge || spectral
+            })
+            .count()
+    }
+
+    fn max_abs_gap(left: &SaeArrowVector, right: &SaeArrowVector) -> f64 {
+        let t = left
+            .t
+            .iter()
+            .zip(right.t.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f64, f64::max);
+        let beta = left
+            .beta
+            .iter()
+            .zip(right.beta.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f64, f64::max);
+        t.max(beta)
+    }
+
+    fn scale_of(vector: &SaeArrowVector) -> f64 {
+        vector
+            .t
+            .iter()
+            .chain(vector.beta.iter())
+            .fold(0.0_f64, |scale, &value| scale.max(value.abs()))
+    }
+
+    #[test]
+    fn softmax_trace_adjoint_matches_dense_reference_2333() {
+        let (mut base_term, mut target, base_rho) =
+            crate::manifold::tests_recovery_split_780::gamma_fd_tiny_fixture();
+        assert!(
+            matches!(base_term.assignment.mode, AssignmentMode::Softmax { .. }),
+            "#2333 acceptance must exercise the production Softmax Trace branch"
+        );
+        base_term.gpu_policy = gam_gpu::GpuPolicy::Off;
+        let (n, p) = (base_term.n_obs(), base_term.output_dim());
+        assert_eq!((n, p), (10, 3), "#2333 must retain the bounded 10x3 fixture");
+
+        // A full-rank metric that is neither the identity nor shared across rows:
+        // per-row whitening is the pre-fold under test, and a row-invariant metric
+        // would not detect the `beta_outputs` sharing the pre-fold has to break.
+        let rank = p;
+        let cell = [
+            [1.05_f64, 0.07, -0.03],
+            [-0.04, 0.90, 0.06],
+            [0.02, -0.05, 1.15],
+        ];
+        let drift_cell = [
+            [0.08_f64, 0.0, 0.0],
+            [0.0, -0.05, 0.0],
+            [0.0, 0.0, -0.07],
+        ];
+        let factors = Array2::<f64>::from_shape_fn((n, p * rank), |(row, col)| {
+            let out_col = col / rank;
+            let rank_col = col % rank;
+            let drift = row as f64 / (n - 1) as f64;
+            cell[out_col][rank_col] + drift * drift_cell[out_col][rank_col]
+        });
+        base_term
+            .set_row_metric(
+                gam_problem::RowMetric::behavioral_fisher(std::sync::Arc::new(factors), p, rank)
+                    .expect("#2333 row metric"),
+            )
+            .expect("#2333 row metric installs");
+        let metric = base_term.row_metric().expect("#2333 row metric present");
+        assert!(
+            metric.whitens_likelihood() && base_term.whiten_logdet_row_jets(),
+            "#2333 metric must engage likelihood whitening, else the pre-fold is untested"
+        );
+        assert_ne!(
+            metric.factor_entry(0, 0, 0).to_bits(),
+            metric.factor_entry(n - 1, 0, 0).to_bits(),
+            "#2333 metric must vary by row so decoder-border sharing is observable"
+        );
+
+        // Push the fixture off its own manifold so the row blocks are genuinely
+        // conditioned rather than exactly reconstructible.
+        for row in 0..n {
+            for col in 0..p {
+                let phase = (row as f64 + 0.35) / n as f64;
+                let theta = std::f64::consts::TAU * phase;
+                target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
+            }
+        }
+
+        let mut fit_rho = base_rho.clone();
+        fit_rho.log_lambda_sparse = -0.5;
+        fit_rho.log_lambda_smooth.fill(-1.0);
+        for axis in fit_rho.log_ard.iter_mut() {
+            axis.fill(-0.5);
+        }
+        base_term
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &fit_rho,
+                None,
+                40,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("#2333 row-metric fixture converges with both atoms alive");
+
+        // Fixed-state evaluation points, walked in a declared order; the FIRST one
+        // whose cache carries a live deflation fold is the anchor. Selection reads
+        // only the cache's own conditioning decisions — never any comparison
+        // against the dense reference — so it cannot select for agreement.
+        let ladder = [
+            (0.5_f64, -2.0_f64, -1.2_f64, -1.0_f64),
+            (0.5, -1.5, -1.2, -1.0),
+            (0.2, -2.0, -1.2, -1.0),
+            (0.2, -1.5, -1.0, -0.8),
+            (0.0, -1.5, -1.0, -0.8),
+            (-0.2, -1.2, -0.8, -0.6),
+            (-0.5, -1.0, -0.5, -0.5),
+        ];
+        let mut anchor = None;
+        for &(sparse, smooth, ard0, ard1) in &ladder {
+            let mut rho = fit_rho.clone();
+            rho.log_lambda_sparse = sparse;
+            rho.log_lambda_smooth.fill(smooth);
+            rho.log_ard = vec![
+                Array1::from_vec(vec![ard0]),
+                Array1::from_vec(vec![ard1]),
+            ];
+            let mut candidate = base_term.clone();
+            let Ok((_value, _loss, cache)) = candidate.penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                0,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            ) else {
+                continue;
+            };
+            let live = fold_live_rows(&cache);
+            if live > 0 {
+                anchor = Some((candidate, rho, cache, live, sparse, smooth));
+                break;
+            }
+        }
+        let (term, rho, cache, live_rows, anchor_sparse, anchor_smooth) = anchor
+            .expect("#2333 no declared evaluation point produced a live deflation fold");
+
+        let solver = DeflatedArrowSolver::plain(&cache);
+        let joint_inverse = term
+            .materialize_joint_inverse(&cache, &solver)
+            .expect("#2333 dense joint inverse");
+        let coordinate_inverse = term.materialize_block_diag_t_inverse(&cache);
+        let dense_joint = term
+            .logdet_theta_adjoint_dense(
+                &rho,
+                &cache,
+                &joint_inverse,
+                ThetaAdjointDhChannel::All,
+                false,
+                false,
+                None,
+            )
+            .expect("#2333 dense joint theta-adjoint");
+        let dense_coordinate = term
+            .logdet_theta_adjoint_dense(
+                &rho,
+                &cache,
+                &coordinate_inverse,
+                ThetaAdjointDhChannel::All,
+                false,
+                false,
+                None,
+            )
+            .expect("#2333 dense coordinate-block theta-adjoint");
+        let production_joint = term
+            .logdet_theta_adjoint(&rho, &cache, &solver)
+            .expect("#2333 production joint adjoint");
+        let production_coordinate = term
+            .coordinate_block_logdet_theta_adjoint(
+                &rho,
+                &cache,
+                EvidenceOperator::Majorizer,
+                None,
+            )
+            .expect("#2333 production coordinate-block adjoint");
+
+        let joint_gap = max_abs_gap(&dense_joint, &production_joint);
+        let coordinate_gap = max_abs_gap(&dense_coordinate, &production_coordinate);
+        let joint_scale = scale_of(&production_joint);
+        let coordinate_scale = scale_of(&production_coordinate);
+        eprintln!(
+            "#2333 TRACE_DENSE_PARITY live_fold_rows={live_rows} \
+             anchor=(sparse={anchor_sparse:.1}, smooth={anchor_smooth:.1}) \
+             joint_gap={joint_gap:.6e} joint_scale={joint_scale:.6e} \
+             coordinate_gap={coordinate_gap:.6e} coordinate_scale={coordinate_scale:.6e}"
+        );
+        assert!(
+            joint_scale > 0.0 && coordinate_scale > 0.0,
+            "#2333 both adjoint legs must be non-trivial; joint scale {joint_scale:.3e}, \
+             coordinate scale {coordinate_scale:.3e}"
+        );
+        assert!(
+            joint_gap <= 1.0e-12 * (1.0 + joint_scale),
+            "#2333 joint Trace/dense parity exceeded 1e-12 relative: gap={joint_gap:.6e} \
+             scale={joint_scale:.6e}"
+        );
+        assert!(
+            coordinate_gap <= 1.0e-12 * (1.0 + coordinate_scale),
+            "#2333 coordinate-block Trace/dense parity exceeded 1e-12 relative: \
+             gap={coordinate_gap:.6e} scale={coordinate_scale:.6e}"
+        );
+    }
+}
