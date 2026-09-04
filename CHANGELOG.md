@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The Bernoulli marginal-slope ψ-cross accumulator takes its primary-space vector as a view, so the axis sweep no longer allocates a two-element `Array1` three times per axis pair per row across nine call sites (#979).
+
 ### Fixed
 - `gam-pyffi`'s FFI prelude re-exported `infer_and_encode_column_major` after `ab6008bc3`
   deleted its only consumer, which fails `cargo check --workspace --all-targets` under

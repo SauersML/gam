@@ -477,7 +477,7 @@ impl BernoulliBlockHessianAccumulator {
         primary: &PrimarySlices,
         psi_block_idx: usize,
         psi_row: &Array1<f64>,
-        right_primary: &Array1<f64>,
+        right_primary: ArrayView1<'_, f64>,
     ) -> Result<(), String> {
         let psi_block = PsiBlock::from_index(psi_block_idx)?;
         let need_marg = right_primary[0] != 0.0;

@@ -1415,7 +1415,7 @@ impl BernoulliMarginalSlopeFamily {
                         slot.1 +=
                             &self.pullback_primary_vector(row, slices, primary, &f_pipi_dir)?;
 
-                        let right_primary = f_pipi.row(axis.idx_primary).to_owned();
+                        let right_primary = f_pipi.row(axis.idx_primary);
                         slot.2.add_rank1_psi_cross(
                             self,
                             row,
@@ -1423,7 +1423,7 @@ impl BernoulliMarginalSlopeFamily {
                             primary,
                             axis.block_idx,
                             &psi_row.local_vec,
-                            &right_primary,
+                            right_primary,
                         )?;
                         slot.2.add_pullback(self, row, slices, primary, &third);
                     }
@@ -1722,7 +1722,7 @@ impl BernoulliMarginalSlopeFamily {
                             // --- Hessian: bij outer pullback(f_pipi[idx_ij,:]) + transpose ---
                             if let Some(ref bij) = br_ij {
                                 let idx_ij = if bij.block_idx == 0 { 0 } else { 1 };
-                                let right_primary_ij = f_pipi.row(idx_ij).to_owned();
+                                let right_primary_ij = f_pipi.row(idx_ij);
                                 acc.2.add_rank1_psi_cross(
                                     self,
                                     row,
@@ -1730,7 +1730,7 @@ impl BernoulliMarginalSlopeFamily {
                                     primary,
                                     bij.block_idx,
                                     &bij.local_vec,
-                                    &right_primary_ij,
+                                    right_primary_ij,
                                 )?;
                             }
 
@@ -1745,7 +1745,7 @@ impl BernoulliMarginalSlopeFamily {
                             );
 
                             // --- br_i outer pullback(third_j[idx_i,:]) + transpose ---
-                            let right_primary_i = third_j.row(idx_i).to_owned();
+                            let right_primary_i = third_j.row(idx_i);
                             acc.2.add_rank1_psi_cross(
                                 self,
                                 row,
@@ -1753,11 +1753,11 @@ impl BernoulliMarginalSlopeFamily {
                                 primary,
                                 block_i,
                                 &br_i.local_vec,
-                                &right_primary_i,
+                                right_primary_i,
                             )?;
 
                             // --- br_j outer pullback(third_i[idx_j,:]) + transpose ---
-                            let right_primary_j = third_i.row(idx_j).to_owned();
+                            let right_primary_j = third_i.row(idx_j);
                             acc.2.add_rank1_psi_cross(
                                 self,
                                 row,
@@ -1765,7 +1765,7 @@ impl BernoulliMarginalSlopeFamily {
                                 primary,
                                 block_j,
                                 &br_j.local_vec,
-                                &right_primary_j,
+                                right_primary_j,
                             )?;
 
                             // --- fourth tensor pullback ---
@@ -2145,7 +2145,7 @@ impl BernoulliMarginalSlopeFamily {
                         let block_acc = &mut acc.2[i];
                         // bij outer pullback(f_pipi.row(idx_ij)) + transpose
                         if have_ij {
-                            let right_primary_ij = f_pipi_w.row(idx_i).to_owned();
+                            let right_primary_ij = f_pipi_w.row(idx_i);
                             block_acc.add_rank1_psi_cross(
                                 self,
                                 row,
@@ -2153,7 +2153,7 @@ impl BernoulliMarginalSlopeFamily {
                                 primary,
                                 block_i,
                                 &psi_local_ij_alpha,
-                                &right_primary_ij,
+                                right_primary_ij,
                             )?;
                         }
                         // br_i outer br_j(α) * f_pipi[[idx_i, idx_j]] (contracted over j)
@@ -2175,7 +2175,7 @@ impl BernoulliMarginalSlopeFamily {
                         }
                         // br_i outer pullback(third(dir(α)).row(idx_i)) + transpose
                         {
-                            let right_primary_i = third_alpha_w.row(idx_i).to_owned();
+                            let right_primary_i = third_alpha_w.row(idx_i);
                             block_acc.add_rank1_psi_cross(
                                 self,
                                 row,
@@ -2183,7 +2183,7 @@ impl BernoulliMarginalSlopeFamily {
                                 primary,
                                 block_i,
                                 &psi_local[i],
-                                &right_primary_i,
+                                right_primary_i,
                             )?;
                         }
                         // br_j(α) outer pullback(third_i.row(idx_j)) + transpose
@@ -2201,7 +2201,7 @@ impl BernoulliMarginalSlopeFamily {
                                 primary,
                                 axes[j].block,
                                 &psi_local[j],
-                                &right_primary_j,
+                                right_primary_j.view(),
                             )?;
                         }
                         // fourth tensor pullback (fourth already α-weighted via dir(α))
@@ -2370,7 +2370,7 @@ impl BernoulliMarginalSlopeFamily {
                         fourth.mapv_inplace(|v| v * w);
                     }
                     let psi_row = self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
-                    let right_primary = third_beta.row(idx_primary).to_owned();
+                    let right_primary = third_beta.row(idx_primary);
                     acc.add_rank1_psi_cross(
                         self,
                         row,
@@ -2378,7 +2378,7 @@ impl BernoulliMarginalSlopeFamily {
                         primary,
                         psi_row.block_idx,
                         &psi_row.local_vec,
-                        &right_primary,
+                        right_primary,
                     )?;
                     acc.add_pullback(self, row, slices, primary, &fourth);
                     let mut third_action = self.row_primary_third_contracted(
@@ -2511,7 +2511,7 @@ impl BernoulliMarginalSlopeFamily {
                         fourth.mapv_inplace(|v| v * w);
                     }
                     let psi_row = self.block_psi_row_from_map(row, block_idx, &psi_map, slices)?;
-                    let right_primary = third_beta.row(idx_primary).to_owned();
+                    let right_primary = third_beta.row(idx_primary);
                     acc.add_rank1_psi_cross(
                         self,
                         row,
@@ -2519,7 +2519,7 @@ impl BernoulliMarginalSlopeFamily {
                         primary,
                         psi_row.block_idx,
                         &psi_row.local_vec,
-                        &right_primary,
+                        right_primary,
                     )?;
                     acc.add_pullback(self, row, slices, primary, &fourth);
                     let mut third_action = self.row_primary_third_contracted(
