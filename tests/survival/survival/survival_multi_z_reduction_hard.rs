@@ -118,8 +118,8 @@ impl SplitMix64 {
 // ------------------------------------------------------------------
 // Test 8: marginal_slope_covariance_from_scores reductions:
 //   (a) two columns with col2 = alpha * col1 exactly -> Full, retaining coupling
-//   (b) three exactly-orthogonal scaled columns      -> Diagonal
-// We check `.shape()` only (numerical content tested by other tests).
+//   (b) orthogonal columns with nonzero means        -> Full after centering
+//   (c) exactly centered orthogonal columns           -> Diagonal
 // ------------------------------------------------------------------
 #[test]
 fn auto_derivation_shape_reductions() {
@@ -147,10 +147,8 @@ fn auto_derivation_shape_reductions() {
     );
     assert_ne!(cov_collinear.to_dense()[[0, 1]], 0.0);
 
-    // (b) Orthogonal scaled indicator columns -> Diagonal.
-    // Take three "scaled selector" columns whose row supports do not overlap;
-    // their sample cross-products are exactly zero, so off-diagonal entries
-    // vanish and the auto-derivation must collapse to Diagonal.
+    // (b) Disjoint supports have zero raw cross-products, but their nonzero
+    // means produce covariance Cov(X,Y) = -E[X]E[Y] (#2823).
     let n = 9;
     let mut scores3 = Array2::<f64>::zeros((n, 3));
     // First three rows feed column 0 only; next three rows feed column 1; etc.
@@ -166,12 +164,31 @@ fn auto_derivation_shape_reductions() {
     let weights3 = Array1::<f64>::from(vec![1.0; n]);
     let cov_orth = marginal_slope_covariance_from_scores(scores3.view(), &weights3)
         .expect("from_scores orthogonal");
+    assert_eq!(cov_orth.shape(), MarginalSlopeCovarianceShape::Full);
+    let means = scores3.mean_axis(ndarray::Axis(0)).expect("nonempty scores");
+    for a in 0..3 {
+        for b in 0..a {
+            let expected = -means[a] * means[b];
+            assert!((cov_orth.to_dense()[[a, b]] - expected).abs() < 1e-15);
+        }
+    }
+
+    // (c) Opposite signed pairs have exactly zero means as well as disjoint
+    // support, so their centered covariance is exactly diagonal.
+    let mut centered = Array2::<f64>::zeros((6, 3));
+    for (axis, scale) in [1.0, 2.0, 0.5].into_iter().enumerate() {
+        centered[[2 * axis, axis]] = scale;
+        centered[[2 * axis + 1, axis]] = -scale;
+    }
+    let cov_centered = marginal_slope_covariance_from_scores(centered.view(), &Array1::ones(6))
+        .expect("from_scores centered orthogonal");
     assert_eq!(
-        cov_orth.shape(),
+        cov_centered.shape(),
         MarginalSlopeCovarianceShape::Diagonal,
-        "K=3 orthogonal scaled columns should auto-detect Diagonal, got {:?}",
-        cov_orth.shape()
+        "K=3 centered orthogonal columns should auto-detect Diagonal",
     );
+    let expected = ndarray::array![1.0 / 3.0, 4.0 / 3.0, 0.25 / 3.0];
+    assert_eq!(cov_centered.to_dense(), Array2::from_diag(&expected));
 }
 
 // ------------------------------------------------------------------

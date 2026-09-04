@@ -198,68 +198,31 @@ fn survival_multi_z_fit_column_permutation_symmetric_neglog() {
     );
 }
 
-// ── Test 4 — Independence ⇒ Diagonal covariance shape on ≥ 90% of 30 seeds ─
-//
-// With z1 ⟂ z2 in the simulator (corr=0.0) the auto-derived population
-// covariance off-diagonals must be tiny relative to the diagonal scale,
-// triggering the `Diagonal` branch in `marginal_slope_covariance_from_scores`
-// (the threshold is offdiag_max ≤ 1e-10 * (1 + diag_max)). At N=2000 with
-// unit-variance Gaussian columns the SD of the sample cross-moment is
-// 1/√N ≈ 0.022, which is far above 1e-10, so the *exact* Diagonal branch
-// will trigger only by luck on individual seeds — but the task spec asks
-// the *auto-detected shape* to be Diagonal on ≥ 90% of seeds.
-//
-// To match the contract that's actually testable from the public API, we
-// down-weight the cross-moment exactly the way the production code does:
-// by simulating data whose columns are *empirically* uncorrelated after a
-// per-seed centering+rotation. We do this by sampling K=2 columns and then
-// re-orthogonalising in-place so the empirical cross moment is at machine
-// precision. This is what an upstream "z normalisation" stage would do
-// before handing scores to the covariance estimator.
+// Exactly centered, empirically uncorrelated scores must select Diagonal on
+// every seed. Sign-balanced quartets make both moments cancel exactly; a
+// floating-point Gram-Schmidt pass leaves a small, real nonzero covariance
+// that the estimator is required to retain (#2823).
 #[test]
 fn survival_multi_z_fit_independent_columns_autoderive_to_diagonal() {
-    let n_seeds = 30usize;
-    let mut diag_count = 0usize;
-
-    for seed_idx in 0..n_seeds as u64 {
-        let mut data = simulate(0x511_0500 + seed_idx, 0.0);
-
-        // Empirical orthogonalisation: centre, then remove the sample
-        // cross-product so the cross-moment is at machine precision.
-        // (LatentZPolicy::standardize does the analogous thing inside the
-        // real fit.)
-        let mut mean = [0.0_f64; K];
-        for i in 0..N {
-            mean[0] += data.z[[i, 0]];
-            mean[1] += data.z[[i, 1]];
+    for seed_idx in 0..30 {
+        let mut rng = Splitmix64::new(0x511_0500 + seed_idx);
+        let mut scores = Array2::<f64>::zeros((N, K));
+        for i in (0..N).step_by(4) {
+            let (a, b) = next_gauss_pair(&mut rng);
+            for (offset, (x, y)) in
+                [(a, b), (a, -b), (-a, b), (-a, -b)].into_iter().enumerate()
+            {
+                scores[[i + offset, 0]] = x;
+                scores[[i + offset, 1]] = y;
+            }
         }
-        mean[0] /= N as f64;
-        mean[1] /= N as f64;
-        for i in 0..N {
-            data.z[[i, 0]] -= mean[0];
-            data.z[[i, 1]] -= mean[1];
-        }
-        let mut s00 = 0.0_f64;
-        let mut s01 = 0.0_f64;
-        for i in 0..N {
-            s00 += data.z[[i, 0]] * data.z[[i, 0]];
-            s01 += data.z[[i, 0]] * data.z[[i, 1]];
-        }
-        let beta = if s00 > 0.0 { s01 / s00 } else { 0.0 };
-        for i in 0..N {
-            let z0 = data.z[[i, 0]];
-            data.z[[i, 1]] -= beta * z0;
-        }
-
-        let cov = marginal_slope_covariance_from_scores(data.z.view(), &data.weights).expect("cov");
-        if cov.shape() == MarginalSlopeCovarianceShape::Diagonal {
-            diag_count += 1;
-        }
+        let cov = marginal_slope_covariance_from_scores(scores.view(), &Array1::ones(N))
+            .expect("covariance of centered orthogonal scores");
+        assert_eq!(
+            cov.shape(),
+            MarginalSlopeCovarianceShape::Diagonal,
+            "seed {seed_idx}"
+        );
+        assert_eq!(cov.to_dense()[[0, 1]], 0.0);
     }
-
-    let frac = (diag_count as f64) / (n_seeds as f64);
-    assert!(
-        frac >= 0.9,
-        "expected ≥ 90% Diagonal shape under empirical independence, got {diag_count}/{n_seeds} ({frac:.2})"
-    );
 }
