@@ -82,27 +82,32 @@ pub enum GpuAvailabilityRef<'a> {
 /// no-op, the invariant we verify is that the size check precedes resolution.
 static RESOLUTION_CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// Install a process-wide panic hook (idempotent) that drops cudarc's
-/// `panic_no_lib_found` message instead of writing it to stderr. All other
-/// panics flow to the previously installed hook unchanged. The site cudarc
-/// 0.19 panics from is `cudarc-0.19.7/src/lib.rs:200` inside its dynamic
-/// loader; messages from that path start with `Unable to dynamically load`.
-/// Caller code wraps the same cudarc entry points in `catch_unwind`, so the
-/// panic is recovered — this hook just prevents the stderr noise that made
-/// operators think the fit had crashed.
+#[cfg(target_os = "linux")]
+thread_local! {
+    static CUDARC_RECOVERY_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(target_os = "linux")]
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+}
+
+/// Suppress loader diagnostics only while this thread can recover them.
+/// An unguarded loader panic must still reach the application's panic hook.
 #[cfg(target_os = "linux")]
 fn install_cudarc_panic_filter() {
     static HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
     HOOK_INSTALLED.get_or_init(|| {
         let prior = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
-            let payload = info.payload();
-            let message = payload
-                .downcast_ref::<&'static str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("");
-            if message.starts_with("Unable to dynamically load") {
+            if cfg!(panic = "unwind")
+                && CUDARC_RECOVERY_ACTIVE.with(Cell::get)
+                && panic_message(info.payload())
+                    .is_some_and(|message| message.starts_with("Unable to dynamically load"))
+            {
                 return;
             }
             prior(info);
@@ -110,8 +115,43 @@ fn install_cudarc_panic_filter() {
     });
 }
 
+/// Own both recovery and diagnostic suppression, including nested calls.
+/// Unrelated panics retain their normal hook and unwind behavior.
+#[cfg(target_os = "linux")]
+fn catch_cudarc<T>(call: impl FnOnce() -> T) -> Result<T, String> {
+    install_cudarc_panic_filter();
+    struct RecoveryScope(bool);
+    impl Drop for RecoveryScope {
+        fn drop(&mut self) {
+            CUDARC_RECOVERY_ACTIVE.with(|active| active.set(self.0));
+        }
+    }
+    let scope = RecoveryScope(CUDARC_RECOVERY_ACTIVE.with(|active| active.replace(true)));
+    let outcome = catch_unwind(AssertUnwindSafe(call));
+    drop(scope);
+    match outcome {
+        Ok(value) => Ok(value),
+        Err(payload) => match panic_message(payload.as_ref()) {
+            Some(message) if message.starts_with("Unable to dynamically load") => {
+                Err(message.to_owned())
+            }
+            _ => panic::resume_unwind(payload),
+        },
+    }
+}
+
 impl GpuRuntime {
     pub fn probe() -> Result<GpuAvailability, GpuError> {
+        #[cfg(target_os = "linux")]
+        {
+            catch_cudarc(Self::probe_devices)
+                .map_err(|reason| GpuError::RuntimeDependencyUnavailable { reason })?
+        }
+        #[cfg(not(target_os = "linux"))]
+        Self::probe_devices()
+    }
+
+    fn probe_devices() -> Result<GpuAvailability, GpuError> {
         #[cfg(not(target_os = "linux"))]
         {
             let reason = "CUDA support not compiled into this build";
@@ -138,7 +178,6 @@ impl GpuRuntime {
             // `panic_no_lib_found` message and wrap every cudarc entry point
             // below in `catch_unwind` to convert the panic into a typed
             // `GpuError::DriverCallFailed` instead.
-            install_cudarc_panic_filter();
             // #1017 probe-first fix: establish cudarc's primary context P and
             // initialize the CUDA runtime ON IT as the VERY FIRST CUDA action -- before
             // gam's libloading libcuda preload, the compute-lib dlopens, and device_count.
@@ -193,7 +232,7 @@ impl GpuRuntime {
             // cudarc's loader searches a disjoint set of names. Convert any such
             // panic into a typed probe failure so the runtime cleanly disables
             // CUDA and the CPU fallback proceeds without alarming stderr noise.
-            let device_count = match catch_unwind(AssertUnwindSafe(CudaContext::device_count)) {
+            let device_count = match catch_cudarc(CudaContext::device_count) {
                 Err(_) => {
                     return Err(GpuError::DriverCallFailed {
                         reason: "cudarc failed after the CUDA driver preflight succeeded"
@@ -240,21 +279,19 @@ impl GpuRuntime {
                 let ctx = cuda_context_for(ordinal).ok_or_else(|| {
                     gpu_err!("failed to create CUDA context for device {ordinal}")
                 })?;
-                catch_unwind(AssertUnwindSafe(|| ctx.bind_to_thread()))
+                catch_cudarc(|| ctx.bind_to_thread())
                     .map_err(|_| GpuError::DriverCallFailed {
                         reason: "CUDA context binding panicked after driver discovery".to_string(),
                     })?
                     .map_err(|err| GpuError::DriverCallFailed {
                         reason: err.to_string(),
                     })?;
-                devices.push(
-                    catch_unwind(AssertUnwindSafe(|| cuda_device_info(ordinal, &ctx))).map_err(
-                        |_| GpuError::DriverCallFailed {
-                            reason: "CUDA device inspection panicked after driver discovery"
-                                .to_string(),
-                        },
-                    )??,
-                );
+                devices.push(catch_cudarc(|| cuda_device_info(ordinal, &ctx)).map_err(
+                    |_| GpuError::DriverCallFailed {
+                        reason:
+                            "CUDA device inspection panicked after driver discovery".to_string(),
+                    },
+                )??);
             }
 
             devices.sort_by(|a, b| b.score().total_cmp(&a.score()));
@@ -531,7 +568,7 @@ fn bind_and_touch_runtime(ordinal: usize, ctx: &Arc<CudaContext>) {
     if BOUND_RUNTIME_ORDINAL.with(Cell::get) == Some(ordinal) {
         return;
     }
-    let bound = catch_unwind(AssertUnwindSafe(|| ctx.bind_to_thread()));
+    let bound = catch_cudarc(|| ctx.bind_to_thread());
     log::trace!(
         "[GPU] cuda_context_for bind ok={} ordinal={ordinal}",
         matches!(bound, Ok(Ok(())))
@@ -556,9 +593,7 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
     // cudarc 0.19 panics from `panic_no_lib_found` if its loader fails to
     // locate libcuda. Demote that to `None` so the runtime probe surfaces a
     // typed `DriverUnavailable` rather than tearing down the worker thread.
-    let ctx = catch_unwind(AssertUnwindSafe(|| CudaContext::new(ordinal)))
-        .ok()?
-        .ok()?;
+    let ctx = catch_cudarc(|| CudaContext::new(ordinal)).ok()?.ok()?;
     let out = {
         let mut guard = contexts.lock().ok()?;
         guard.entry(ordinal).or_insert_with(|| ctx.clone()).clone()
@@ -634,6 +669,82 @@ fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, 
 mod policy_resolution_contract_tests {
     use super::*;
     use crate::GpuPolicy;
+
+    /// Exercise the installed hook in fresh processes so other parallel tests
+    /// cannot replace it or hide a diagnostic in libtest's output capture.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cudarc_loader_panic_diagnostics_follow_recovery_scope() {
+        const CHILD_MODE: &str = "GAM_TEST_CUDARC_RECOVERY_MODE";
+        const LOADER_PANIC: &str = "Unable to dynamically load synthetic CUDA library";
+        if let Ok(mode) = std::env::var(CHILD_MODE) {
+            install_cudarc_panic_filter();
+            match mode.as_str() {
+                "caught" => {
+                    assert_eq!(
+                        catch_cudarc::<()>(|| panic!("{LOADER_PANIC}")),
+                        Err(LOADER_PANIC.into()),
+                    );
+                    assert!(!CUDARC_RECOVERY_ACTIVE.with(Cell::get));
+                }
+                "nested" => {
+                    let outer = catch_cudarc::<()>(|| {
+                        assert!(catch_cudarc::<()>(|| panic!("{LOADER_PANIC}")).is_err());
+                        assert!(CUDARC_RECOVERY_ACTIVE.with(Cell::get));
+                        panic!("{LOADER_PANIC}");
+                    });
+                    assert_eq!(outer, Err(LOADER_PANIC.into()));
+                    assert!(!CUDARC_RECOVERY_ACTIVE.with(Cell::get));
+                }
+                "after" => {
+                    assert!(catch_cudarc::<()>(|| panic!("{LOADER_PANIC}")).is_err());
+                    panic!("{LOADER_PANIC}");
+                }
+                "other_thread" => {
+                    catch_cudarc(|| {
+                        assert!(
+                            std::thread::spawn(|| panic!("{LOADER_PANIC}"))
+                                .join()
+                                .is_err()
+                        );
+                    })
+                    .expect("a different thread's panic must not enter this recovery");
+                }
+                "unrelated" => {
+                    catch_cudarc::<()>(|| panic!("unrelated failure"))
+                        .expect("unrelated panics must unwind");
+                }
+                "unguarded" => panic!("{LOADER_PANIC}"),
+                _ => panic!("unknown subprocess mode: {mode}"),
+            }
+            return;
+        }
+        for (mode, succeeds, diagnostic) in [
+            ("caught", true, None),
+            ("nested", true, None),
+            ("after", false, Some(LOADER_PANIC)),
+            ("other_thread", true, Some(LOADER_PANIC)),
+            ("unrelated", false, Some("unrelated failure")),
+            ("unguarded", false, Some(LOADER_PANIC)),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "device_runtime::policy_resolution_contract_tests::cudarc_loader_panic_diagnostics_follow_recovery_scope",
+                    "--nocapture",
+                ])
+                .env(CHILD_MODE, mode)
+                .output()
+                .expect("run hook regression subprocess");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), succeeds, "mode={mode}: {stderr}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+            match diagnostic {
+                Some(message) => assert!(stderr.contains(message), "mode={mode}: {stderr}"),
+                None => assert!(stderr.is_empty(), "mode={mode}: {stderr}"),
+            }
+        }
+    }
 
     #[test]
     fn auto_maps_only_typed_absence_to_none() {
@@ -745,4 +856,3 @@ mod policy_resolution_contract_tests {
         }
     }
 }
-
