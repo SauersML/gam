@@ -23,6 +23,7 @@
 
 use crate::linear_constraints::LinearInequalityConstraints;
 use ndarray::{Array1, Array2, ArrayView1};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
 
 /// Primal-feasibility tolerance of the inequality-constrained active-set Newton
@@ -86,6 +87,109 @@ pub const PRIMAL_FEASIBILITY_TOL: f64 = 1e-8;
 /// This does NOT collide with the legitimately-vacuous row: `‖a‖ = 0` with a
 /// bound at or below zero is finite, passes here, and keeps its own
 /// disposition in each rule.
+/// Why a [`ConstraintSet::max_scaled_violation`] sweep stops at a row.
+///
+/// The serial loop this replaces returned at the first such row in index
+/// order; the parallel sweep carries the smallest index instead, so the
+/// verdict does not depend on the row split.
+#[derive(Clone, Debug)]
+enum SweepTerminal {
+    /// The row's own norm or bound could not be read; carries the carrier's
+    /// own refusal so the sweep does not swallow it.
+    RowUnavailable(String),
+    /// `gam#2721`: a non-finite norm, bound or value. Feasibility of an
+    /// iterate that is not a number is undefined, and every comparison in the
+    /// sweep is false for `NaN`, so the row cannot be skipped.
+    Undecidable { norm: f64, bound: f64, value: f64 },
+    /// `0ᵀβ ≥ b` with `b > 0`: unsatisfiable by any `β`.
+    VacuousRowWithPositiveBound,
+}
+
+/// Running state of the row sweep: the first terminal row in index order, and
+/// the largest scaled violation with the smallest row that attains it.
+struct ScaledViolationSweep {
+    terminal: Option<(usize, SweepTerminal)>,
+    worst: f64,
+    worst_row: Option<usize>,
+}
+
+impl ScaledViolationSweep {
+    fn none() -> Self {
+        Self {
+            terminal: None,
+            worst: 0.0,
+            worst_row: None,
+        }
+    }
+
+    fn record_terminal(&mut self, row: usize, terminal: SweepTerminal) {
+        let keep = match self.terminal {
+            Some((seen, _)) => row < seen,
+            None => true,
+        };
+        if keep {
+            self.terminal = Some((row, terminal));
+        }
+    }
+
+    fn record_violation(&mut self, row: usize, violation: f64) {
+        // `>` alone reproduces the serial loop's smallest-index tie-break only
+        // while the rows arrive in order; the merge below restores it across
+        // chunks.
+        if violation > self.worst {
+            self.worst = violation;
+            self.worst_row = Some(row);
+        }
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        if let Some((row, terminal)) = other.terminal {
+            self.record_terminal(row, terminal);
+        }
+        let take_other = match (other.worst > self.worst, other.worst == self.worst) {
+            (true, _) => true,
+            (false, true) => match (other.worst_row, self.worst_row) {
+                (Some(candidate), Some(held)) => candidate < held,
+                (Some(_), None) => true,
+                _ => false,
+            },
+            _ => false,
+        };
+        if take_other {
+            self.worst = other.worst;
+            self.worst_row = other.worst_row;
+        }
+        self
+    }
+
+    fn verdict(self) -> Result<(f64, Option<usize>), String> {
+        match self.terminal {
+            Some((row, SweepTerminal::RowUnavailable(error))) => Err(format!(
+                "ConstraintSet::max_scaled_violation: row {row} has no readable norm or \
+                 bound: {error}"
+            )),
+            Some((
+                row,
+                SweepTerminal::Undecidable {
+                    norm,
+                    bound,
+                    value,
+                },
+            )) => Err(format!(
+                "ConstraintSet::max_scaled_violation: row {row} cannot be decided \
+                 (row norm {norm:.3e}, bound {bound:.3e}, value {value:.3e}); \
+                 feasibility of a non-finite iterate is undefined and every \
+                 comparison in the sweep is false for NaN, so the row cannot \
+                 be skipped (gam#2721)"
+            )),
+            Some((row, SweepTerminal::VacuousRowWithPositiveBound)) => {
+                Ok((f64::INFINITY, Some(row)))
+            }
+            None => Ok((self.worst, self.worst_row)),
+        }
+    }
+}
+
 pub fn feasibility_quantities_are_finite(quantities: &[f64]) -> bool {
     quantities.iter().all(|q| q.is_finite())
 }
@@ -735,39 +839,65 @@ impl ConstraintSet {
         beta: ArrayView1<'_, f64>,
     ) -> Result<(f64, Option<usize>), String> {
         let values = self.values(beta)?;
-        let mut worst = 0.0_f64;
-        let mut worst_row = None;
-        for (row, &value) in values.iter().enumerate() {
-            let norm = self.row_norm(row)?;
-            let bound = self.bound(row)?;
-            // Decidability before comparison (gam#2721): `violation > worst` is
-            // FALSE for `NaN`, so an undecidable row would leave `worst` at
-            // `0.0` and this metric — THE feasibility verdict — would call an
-            // iterate that is not a number feasible. `norm <= 0.0` is false for
-            // a `NaN` norm too, so the vacuous-row branch below cannot be the
-            // one that catches it. Refuse, naming the row and the quantities.
-            if !feasibility_quantities_are_finite(&[norm, bound, value]) {
-                return Err(format!(
-                    "ConstraintSet::max_scaled_violation: row {row} cannot be decided \
-                     (row norm {norm:.3e}, bound {bound:.3e}, value {value:.3e}); \
-                     feasibility of a non-finite iterate is undefined and every \
-                     comparison in the sweep is false for NaN, so the row cannot \
-                     be skipped (gam#2721)"
-                ));
-            }
-            if norm <= 0.0 {
-                if bound > 0.0 {
-                    return Ok((f64::INFINITY, Some(row)));
+        // The sweep is a max over independent rows, and it is THE feasibility
+        // verdict of every active-set solve, so it runs on every trial point.
+        // On the large-scale CTN cone it is 1.6 M rows, and profiling the
+        // preprocessor's reduced-face solve put 92 % of the process inside this
+        // one function on ONE core (gam#979). Rows fan across the pool.
+        //
+        // The serial loop it replaces returned at the FIRST row that ended the
+        // scan — an undecidable row, or a vacuous row with a positive bound —
+        // so the reduction below carries the smallest such row index rather
+        // than whichever thread found one first, and the running maximum breaks
+        // exact ties toward the smaller index. Both make the verdict, the named
+        // row, and the refusal text independent of how the rows were split.
+        let sweep = (0..values.len())
+            .into_par_iter()
+            .fold(ScaledViolationSweep::none, |mut sweep, row| {
+                let value = values[row];
+                let norm = match self.row_norm(row) {
+                    Ok(norm) => norm,
+                    Err(error) => {
+                        sweep.record_terminal(row, SweepTerminal::RowUnavailable(error));
+                        return sweep;
+                    }
+                };
+                let bound = match self.bound(row) {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        sweep.record_terminal(row, SweepTerminal::RowUnavailable(error));
+                        return sweep;
+                    }
+                };
+                // Decidability before comparison (gam#2721): `violation > worst`
+                // is FALSE for `NaN`, so an undecidable row would leave `worst`
+                // at `0.0` and this metric — THE feasibility verdict — would
+                // call an iterate that is not a number feasible. `norm <= 0.0`
+                // is false for a `NaN` norm too, so the vacuous-row branch below
+                // cannot be the one that catches it. Refuse, naming the row and
+                // the quantities.
+                if !feasibility_quantities_are_finite(&[norm, bound, value]) {
+                    sweep.record_terminal(
+                        row,
+                        SweepTerminal::Undecidable {
+                            norm,
+                            bound,
+                            value,
+                        },
+                    );
+                    return sweep;
                 }
-                continue;
-            }
-            let violation = (bound - value) / norm;
-            if violation > worst {
-                worst = violation;
-                worst_row = Some(row);
-            }
-        }
-        Ok((worst, worst_row))
+                if norm <= 0.0 {
+                    if bound > 0.0 {
+                        sweep.record_terminal(row, SweepTerminal::VacuousRowWithPositiveBound);
+                    }
+                    return sweep;
+                }
+                sweep.record_violation(row, (bound - value) / norm);
+                sweep
+            })
+            .reduce(ScaledViolationSweep::none, ScaledViolationSweep::merge);
+        sweep.verdict()
     }
 
     /// Largest `t ∈ [0, 1]` with `β + t·δ` feasible for every row, together
