@@ -1795,106 +1795,177 @@ pub(crate) fn duchon_hybrid_kernel_stable_integral(
     s_order: usize,
     k_dim: usize,
 ) -> Result<f64, BasisError> {
-    assert!(
-        duchon_hybrid_stable_integral_applies(p_order, s_order, k_dim),
-        "duchon_hybrid_kernel_stable_integral precondition violated: 2(p+s) > d and 2p < d required (p={p_order}, s={s_order}, d={k_dim})"
-    );
-    let profile = duchon_radial_profile(p_order, s_order, k_dim)?;
-    let p = p_order as f64;
-    let s = s_order as f64;
-    let half_d = 0.5 * k_dim as f64;
-    let b = p + s - half_d;
-    let pref = (4.0 * std::f64::consts::PI).powf(-half_d) / (gamma_lanczos(p) * gamma_lanczos(s));
-    let scale = pref * kappa.powf(-2.0 * b);
-    let value = if r == 0.0 {
-        scale * profile.origin_value()?
-    } else {
-        scale * profile.value(kappa * r)
-    };
-    if !value.is_finite() {
-        crate::bail_invalid_basis!(
-            "non-finite Duchon hybrid value (stable form) at r={r}, p={p_order}, s={s_order}, d={k_dim}"
-        );
-    }
-    Ok(value)
+    DuchonHybridEvaluator::new(kappa, p_order, s_order, k_dim)?.value(r)
 }
 
-/// Radial operator scalars `(q, t, t_r, t_rr)` of the hybrid Duchon–Matérn
-/// kernel via the same cancellation-free single integral as
-/// [`duchon_hybrid_kernel_stable_integral`], differentiated under the integral
-/// sign (gam#1424 / gam#1453).
+
+/// The hybrid Duchon–Matérn kernel of one shape at one length scale, bound
+/// once for a whole sweep.
 ///
-/// The partial-fraction operator core (`duchon_regularized_operator_core`)
-/// assembles `q, t` as a sign-alternating sum of polyharmonic and Matérn
-/// *operator* blocks. In high dimensions (e.g. d=16, p=1, s=9) each block is
-/// ~1e3 while the true operator scalar is ~1e-13, so f64 loses every
-/// significant digit — Kahan summation fixes accumulation, not the
-/// cancellation between huge opposing terms, leaving `q, t` with ~1e-2 relative
-/// noise. That floor sits above the Chebyshev profile certificate, so the
-/// production profile cannot certify (gam#1453).
-///
-/// This routine instead reads the radial derivatives `φ′…φ⁗` off the
-/// universal profile of `(p, s, d)`: `φ^{(m)}(r) = pref · κ^{m−2b} ·
-/// G^{(m)}(κ r)`, where [`duchon_radial_profile`] carries `G` and its first
-/// four derivatives, each the smooth per-`w` integrand differentiated under
-/// the integral sign (a single well-conditioned `z^a K_ν(z)` term list per
-/// slice, no cross-block cancellation) and certified against the adaptive
-/// reference. The operator scalars are then assembled from the standard
-/// radial relations
-/// `q = φ′/r`, `t = q′/r`, `t_r = (q″−t)/r`, `t_rr = q‴/r − 2q″/r² + 2q′/r³`.
-///
-/// Requires the same precondition as the kernel form
-/// ([`duchon_hybrid_stable_integral_applies`]) and `r > 0`.
-pub(crate) fn duchon_hybrid_operator_stable_integral(
-    r: f64,
-    kappa: f64,
+/// `φ(r) = pref · κ^{-2b} · G(κ r)` and `φ^{(m)}(r) = pref · κ^{m-2b} ·
+/// G^{(m)}(κ r)` split into a factor fixed by `(p, s, d, κ)` and the shape's
+/// certified profile. A design build walks its `n · k` pairs at one
+/// `(shape, κ)`, and so does every ψ sweep, so re-deriving that factor per
+/// pair — two `Γ` evaluations, two `powf`s, and a lookup of the profile —
+/// costs more than the Chebyshev evaluation it sets up: the lookup alone
+/// measured 37 % of a 6-D `n = 50 000`, `k = 100` fit (gam#2735). Binding it
+/// once leaves the per-pair work at the profile evaluation itself.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DuchonHybridEvaluator {
+    profile: &'static DuchonRadialProfile,
     p_order: usize,
     s_order: usize,
     k_dim: usize,
-) -> Result<DuchonRegularizedOperatorCore, BasisError> {
-    assert!(
-        duchon_hybrid_stable_integral_applies(p_order, s_order, k_dim),
-        "duchon_hybrid_operator_stable_integral precondition violated: 2(p+s) > d and 2p < d required (p={p_order}, s={s_order}, d={k_dim})"
-    );
-    assert!(
-        r > 0.0 && r.is_finite(),
-        "duchon_hybrid_operator_stable_integral requires r > 0, got r={r}"
-    );
-    let profile = duchon_radial_profile(p_order, s_order, k_dim)?;
-    let p = p_order as f64;
-    let s = s_order as f64;
-    let half_d = 0.5 * k_dim as f64;
-    let b = p + s - half_d;
-    let pref = (4.0 * std::f64::consts::PI).powf(-half_d) / (gamma_lanczos(p) * gamma_lanczos(s));
-    let g = profile.derivatives(kappa * r);
-    // φ^{(m)}(r) = pref · κ^{m−2b} · G^{(m)}(κ r).
-    let kappa_scale = pref * kappa.powf(-2.0 * b);
-    let phi1 = kappa_scale * kappa * g[1];
-    let phi2 = kappa_scale * kappa * kappa * g[2];
-    let phi3 = kappa_scale * kappa * kappa * kappa * g[3];
-    let phi4 = kappa_scale * kappa * kappa * kappa * kappa * g[4];
-    if !(phi1.is_finite() && phi2.is_finite() && phi3.is_finite() && phi4.is_finite()) {
-        crate::bail_invalid_basis!(
-            "non-finite Duchon hybrid operator (stable form) at r={r}, p={p_order}, s={s_order}, d={k_dim}"
+    kappa: f64,
+    /// `pref · κ^{-2b}`.
+    scale: f64,
+    /// `pref · κ^{-2b} · G(0)`, the closed-form `r = 0` diagonal, or `None`
+    /// for a kernel singular at the origin (`2(p+s) ≤ d`).
+    origin: Option<f64>,
+}
+
+impl DuchonHybridEvaluator {
+    /// Bind the certified profile of `(p, s, d)` and the `κ`-fixed factor.
+    ///
+    /// Callers must check [`duchon_hybrid_stable_integral_applies`] first;
+    /// [`duchon_hybrid_evaluator`] does that and is the usual entry point.
+    pub(crate) fn new(
+        kappa: f64,
+        p_order: usize,
+        s_order: usize,
+        k_dim: usize,
+    ) -> Result<Self, BasisError> {
+        assert!(
+            duchon_hybrid_stable_integral_applies(p_order, s_order, k_dim),
+            "DuchonHybridEvaluator precondition violated: 2(p+s) > d and 2p < d required (p={p_order}, s={s_order}, d={k_dim})"
         );
+        let profile = duchon_radial_profile(p_order, s_order, k_dim)?;
+        let scale = profile.kappa_scale(kappa);
+        let origin = profile.origin_value().ok().map(|g0| scale * g0);
+        Ok(Self {
+            profile,
+            p_order,
+            s_order,
+            k_dim,
+            kappa,
+            scale,
+            origin,
+        })
     }
 
-    // Assemble the operator scalars from the radial derivatives. For r > 0
-    // these divisions are removable-singularity quotients of moderate
-    // quantities (no cancellation between blocks remains).
-    let inv_r = 1.0 / r;
-    let q = phi1 * inv_r;
-    // q′ = φ″/r − φ′/r²; q″ = φ‴/r − 2φ″/r² + 2φ′/r³;
-    // q‴ = φ⁗/r − 3φ‴/r² + 6φ″/r³ − 6φ′/r⁴.
-    let q_r = phi2 * inv_r - phi1 * inv_r * inv_r;
-    let q_rr = phi3 * inv_r - 2.0 * phi2 * inv_r * inv_r + 2.0 * phi1 * inv_r * inv_r * inv_r;
-    let q_rrr = phi4 * inv_r - 3.0 * phi3 * inv_r * inv_r + 6.0 * phi2 * inv_r * inv_r * inv_r
-        - 6.0 * phi1 * inv_r * inv_r * inv_r * inv_r;
-    let t = q_r * inv_r;
-    let t_r = q_rr * inv_r - q_r * inv_r * inv_r;
-    let t_rr = q_rrr * inv_r - 2.0 * q_rr * inv_r * inv_r + 2.0 * q_r * inv_r * inv_r * inv_r;
+    /// `φ(r)`, including the closed-form `r = 0` diagonal.
+    pub(crate) fn value(&self, r: f64) -> Result<f64, BasisError> {
+        if !r.is_finite() || r < 0.0 {
+            crate::bail_invalid_basis!("Duchon kernel distance must be finite and non-negative");
+        }
+        let value = if r == 0.0 {
+            match self.origin {
+                Some(origin) => origin,
+                // The profile owns the refusal for a kernel singular at `r = 0`.
+                None => self.scale * self.profile.origin_value()?,
+            }
+        } else {
+            self.scale * self.profile.value(self.kappa * r)
+        };
+        if !value.is_finite() {
+            crate::bail_invalid_basis!(
+                "non-finite Duchon hybrid value (stable form) at r={r}, p={}, s={}, d={}",
+                self.p_order,
+                self.s_order,
+                self.k_dim
+            );
+        }
+        Ok(value)
+    }
 
-    Ok(DuchonRegularizedOperatorCore { q, t, t_r, t_rr })
+    /// Radial operator scalars `(q, t, t_r, t_rr)` of the hybrid Duchon–Matérn
+    /// kernel via the same cancellation-free single integral as
+    /// [`Self::value`], differentiated under the integral
+    /// sign (gam#1424 / gam#1453).
+    ///
+    /// The partial-fraction operator core (`duchon_regularized_operator_core`)
+    /// assembles `q, t` as a sign-alternating sum of polyharmonic and Matérn
+    /// *operator* blocks. In high dimensions (e.g. d=16, p=1, s=9) each block is
+    /// ~1e3 while the true operator scalar is ~1e-13, so f64 loses every
+    /// significant digit — Kahan summation fixes accumulation, not the
+    /// cancellation between huge opposing terms, leaving `q, t` with ~1e-2 relative
+    /// noise. That floor sits above the Chebyshev profile certificate, so the
+    /// production profile cannot certify (gam#1453).
+    ///
+    /// This reads the radial derivatives `φ′…φ⁗` off the
+    /// universal profile of `(p, s, d)`: `φ^{(m)}(r) = pref · κ^{m−2b} ·
+    /// G^{(m)}(κ r)`, where [`duchon_radial_profile`] carries `G` and its first
+    /// four derivatives, each the smooth per-`w` integrand differentiated under
+    /// the integral sign (a single well-conditioned `z^a K_ν(z)` term list per
+    /// slice, no cross-block cancellation) and certified against the adaptive
+    /// reference. The operator scalars are then assembled from the standard
+    /// radial relations
+    /// `q = φ′/r`, `t = q′/r`, `t_r = (q″−t)/r`, `t_rr = q‴/r − 2q″/r² + 2q′/r³`.
+    ///
+    /// Requires `r > 0`; the shape precondition is the constructor's.
+    pub(crate) fn operator_core(
+        &self,
+        r: f64,
+    ) -> Result<DuchonRegularizedOperatorCore, BasisError> {
+        assert!(
+            r > 0.0 && r.is_finite(),
+            "DuchonHybridEvaluator::operator_core requires r > 0, got r={r}"
+        );
+        let kappa = self.kappa;
+        let g = self.profile.derivatives(kappa * r);
+        // φ^{(m)}(r) = pref · κ^{m−2b} · G^{(m)}(κ r).
+        let phi1 = self.scale * kappa * g[1];
+        let phi2 = self.scale * kappa * kappa * g[2];
+        let phi3 = self.scale * kappa * kappa * kappa * g[3];
+        let phi4 = self.scale * kappa * kappa * kappa * kappa * g[4];
+        if !(phi1.is_finite() && phi2.is_finite() && phi3.is_finite() && phi4.is_finite()) {
+            crate::bail_invalid_basis!(
+                "non-finite Duchon hybrid operator (stable form) at r={r}, p={}, s={}, d={}",
+                self.p_order,
+                self.s_order,
+                self.k_dim
+            );
+        }
+        // Assemble the operator scalars from the radial derivatives. For r > 0
+        // these divisions are removable-singularity quotients of moderate
+        // quantities (no cancellation between blocks remains).
+        let inv_r = 1.0 / r;
+        let q = phi1 * inv_r;
+        // q′ = φ″/r − φ′/r²; q″ = φ‴/r − 2φ″/r² + 2φ′/r³;
+        // q‴ = φ⁗/r − 3φ‴/r² + 6φ″/r³ − 6φ′/r⁴.
+        let q_r = phi2 * inv_r - phi1 * inv_r * inv_r;
+        let q_rr = phi3 * inv_r - 2.0 * phi2 * inv_r * inv_r + 2.0 * phi1 * inv_r * inv_r * inv_r;
+        let q_rrr = phi4 * inv_r - 3.0 * phi3 * inv_r * inv_r + 6.0 * phi2 * inv_r * inv_r * inv_r
+            - 6.0 * phi1 * inv_r * inv_r * inv_r * inv_r;
+        let t = q_r * inv_r;
+        let t_r = q_rr * inv_r - q_r * inv_r * inv_r;
+        let t_rr = q_rrr * inv_r - 2.0 * q_rr * inv_r * inv_r + 2.0 * q_r * inv_r * inv_r * inv_r;
+        Ok(DuchonRegularizedOperatorCore { q, t, t_r, t_rr })
+    }
+}
+
+/// The bound hybrid evaluator for these orders, or `None` when the orders or
+/// the missing length scale put the evaluation on the partial-fraction path.
+///
+/// One owner for the question every caller of the hybrid kernel asks before
+/// its own loop: is this shape on the cancellation-free single-integral path,
+/// and at which `κ`?
+pub(crate) fn duchon_hybrid_evaluator(
+    length_scale: Option<f64>,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+) -> Result<Option<DuchonHybridEvaluator>, BasisError> {
+    let Some(length_scale) = length_scale else {
+        return Ok(None);
+    };
+    if !duchon_hybrid_stable_integral_applies(p_order, s_order, k_dim) {
+        return Ok(None);
+    }
+    let kappa = duchon_inverse_length_scale(length_scale, "Duchon hybrid kernel")?;
+    Ok(Some(DuchonHybridEvaluator::new(
+        kappa, p_order, s_order, k_dim,
+    )?))
 }
 
 /// Whether the cancellation-free [`duchon_hybrid_kernel_stable_integral`] is

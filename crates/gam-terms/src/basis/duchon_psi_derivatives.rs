@@ -541,15 +541,22 @@ pub(crate) fn duchon_radial_jets(
     let r_eval = r.max(r_floor);
     let d = k_dim as f64;
 
+    // The value and the operator read the same shape at the same κ, so the
+    // certified profile and the κ-fixed prefactor are bound once for both
+    // rather than resolved twice at every pair of every ψ sweep.
+    let hybrid = duchon_hybrid_evaluator(Some(length_scale), p_order, s_order, k_dim)?;
     // Value path keeps the intrinsic diagonal convention used by the actual basis.
-    let phi = duchon_matern_kernel_general_from_distance(
-        r,
-        Some(length_scale),
-        p_order,
-        s_order,
-        k_dim,
-        Some(coeffs),
-    )?;
+    let phi = match hybrid.as_ref() {
+        Some(hybrid) => hybrid.value(r)?,
+        None => duchon_matern_kernel_general_from_distance(
+            r,
+            Some(length_scale),
+            p_order,
+            s_order,
+            k_dim,
+            Some(coeffs),
+        )?,
+    };
     if !phi.is_finite() {
         crate::bail_invalid_basis!(
             "non-finite Duchon radial kernel value at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
@@ -567,10 +574,9 @@ pub(crate) fn duchon_radial_jets(
     // r^a K_ν(c r) term with no cross-block cancellation. The complementary
     // orders (s = 0 pure polyharmonic, or 2p ≥ d at low d) keep the direct
     // partial-fraction core, which has no meaningful cancellation there.
-    let operator_core = if duchon_hybrid_stable_integral_applies(p_order, s_order, k_dim) {
-        duchon_hybrid_operator_stable_integral(r_eval, kappa, p_order, s_order, k_dim)?
-    } else {
-        duchon_regularized_operator_core(r_eval, kappa, k_dim, coeffs)?
+    let operator_core = match hybrid.as_ref() {
+        Some(hybrid) => hybrid.operator_core(r_eval)?,
+        None => duchon_regularized_operator_core(r_eval, kappa, k_dim, coeffs)?,
     };
     let generic_jets = duchon_operator_jets_from_primary_core(operator_core, r_eval, d);
     let mut out = DuchonRadialJets {
@@ -1791,6 +1797,11 @@ pub(crate) fn duchon_kernel_chart(
         return DuchonKernelChart::IDENTITY;
     }
     let axis_scales = aniso_log_scales.map(aniso_axis_scales);
+    // One bound evaluator for the whole k² sweep (the chart is rebuilt for
+    // every κ trial).
+    let hybrid = duchon_hybrid_evaluator(length_scale, p_order, s_order, d)
+        .ok()
+        .flatten();
     let mut max_abs = 0.0_f64;
     let mut reference_pair = None;
     for i in 0..k {
@@ -1802,6 +1813,11 @@ pub(crate) fn duchon_kernel_chart(
             };
             let val = if let Some(ppc) = pure_poly_coeff {
                 ppc.eval(r)
+            } else if let Some(hybrid) = hybrid.as_ref() {
+                match hybrid.value(r) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                }
             } else {
                 match duchon_matern_kernel_general_from_distance(
                     r,
@@ -2068,6 +2084,13 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
     // uncertified builds fall back to the exact evaluator (the profile's
     // exact fallback IS `duchon_radial_jets`, whose value channel is the
     // same `duchon_matern_kernel_general_from_distance` evaluated below).
+    // The hybrid orders are answered from the shape's certified universal
+    // profile, bound here for the whole n·k sweep.
+    let hybrid_eval = if pure_poly_coeff.is_some() {
+        None
+    } else {
+        duchon_hybrid_evaluator(length_scale, p_order, duchon_power_to_usize(s_order), d)?
+    };
     let hybrid_kind = match (length_scale, coeffs.as_ref()) {
         (Some(ls), Some(c)) if pure_poly_coeff.is_none() => Some(RadialScalarKind::Duchon {
             length_scale: ls,
@@ -2078,7 +2101,11 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
         }),
         _ => None,
     };
-    let value_profile = hybrid_kind.as_ref().and_then(|kind| {
+    // A bound evaluator already answers those orders exactly; the per-build
+    // Chebyshev profile below would approximate the same universal G a second
+    // time, and the n·k distance pre-pass that sizes it would walk every pair
+    // before the loop that walks them again.
+    let value_profile = hybrid_kind.as_ref().filter(|_| hybrid_eval.is_none()).and_then(|kind| {
         if n.saturating_mul(k) < RADIAL_PROFILE_MIN_PAIRS {
             return None;
         }
@@ -2132,6 +2159,8 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
                     let raw = if let Some(ref ppc) = pure_poly_coeff {
                         // Pure Duchon: use precomputed coefficient, skip gamma calls.
                         ppc.eval(r)
+                    } else if let Some(hybrid) = hybrid_eval.as_ref() {
+                        hybrid.value(r)?
                     } else if let (Some(profile), Some(kind)) =
                         (value_profile.as_ref(), hybrid_kind.as_ref())
                     {

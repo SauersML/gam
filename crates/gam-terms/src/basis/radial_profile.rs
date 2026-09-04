@@ -169,7 +169,8 @@ impl RadialProfile {
         // 1. Tail decay per channel, relative to that channel's own scale.
         //
         // The samples are evaluated through the cancellation-free stable
-        // single-integral operator core (`duchon_hybrid_operator_stable_integral`,
+        // single-integral operator core
+        // (`DuchonHybridEvaluator::operator_core`,
         // gam#1424 / gam#1453), so even the high-dimensional Duchon `(q, t)`
         // channels are machine-accurate. The Chebyshev tail then decays
         // geometrically to `PROFILE_CERT_RTOL`, which is the genuine
@@ -346,7 +347,7 @@ mod tests {
         // certify under the geometric-decay tail gate (`PROFILE_CERT_RTOL`),
         // because the operator channels `(q, t)` are now evaluated through the
         // cancellation-free stable single integral
-        // (`duchon_hybrid_operator_stable_integral`) rather than the
+        // (`DuchonHybridEvaluator::operator_core`) rather than the
         // sign-alternating partial-fraction operator core. The old core left
         // `(q, t)` with ~1e-2 relative noise at dim=16, which no Chebyshev rung
         // could certify at any tolerance the profile actually guarantees; the

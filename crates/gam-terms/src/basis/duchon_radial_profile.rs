@@ -98,7 +98,7 @@
 use super::*;
 use gam_linalg::utils::KahanSum;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 /// Chebyshev coefficients per panel. A panel narrower than one e-fold whose
 /// interpoland is analytic in a strip of half-width `π` converges faster than
@@ -761,6 +761,11 @@ impl ProfileShape {
 #[derive(Clone, Debug)]
 pub(crate) struct DuchonRadialProfile {
     shape: ProfileShape,
+    /// `(4π)^{-d/2} / (Γ(p) Γ(s))`, the `κ`-free prefactor of
+    /// `φ(r) = pref · κ^{-2b} · G(κ r)`. Formed once at build time so that
+    /// evaluating the kernel does not repeat two `Γ` evaluations and a `powf`
+    /// at every pair of a design build.
+    prefactor: f64,
     /// `G(0) = Γ(b) B(s − b, p)` when `b > 0`; `None` for a kernel singular
     /// at the origin.
     g0: Option<f64>,
@@ -812,6 +817,8 @@ impl DuchonRadialProfile {
         } else {
             None
         };
+        let prefactor = (4.0 * std::f64::consts::PI).powf(-0.5 * d as f64)
+            / (gamma_lanczos(p as f64) * gamma_lanczos(s as f64));
         let u_value_lo = rho_value_floor(d, p).ln();
         let u_lo = rho_derivative_floor().ln();
         let u_hi = rho_ceiling().ln();
@@ -820,6 +827,7 @@ impl DuchonRadialProfile {
         let main = build_panels(&shape, CHANNELS, u_lo, u_hi)?;
         let profile = Self {
             shape,
+            prefactor,
             g0,
             u_value_lo,
             u_lo,
@@ -900,17 +908,9 @@ impl DuchonRadialProfile {
         (&set[idx], u_eval)
     }
 
-    /// `G^{(m)}(ρ)` for `ρ > 0`.
-    pub(crate) fn derivative(&self, m: usize, rho: f64) -> f64 {
-        assert!(
-            m <= MAX_DERIVATIVE_ORDER,
-            "Duchon radial profile carries derivatives up to order {MAX_DERIVATIVE_ORDER}, asked {m}"
-        );
-        assert!(
-            rho > 0.0 && rho.is_finite(),
-            "Duchon radial profile needs a finite positive rho, got {rho}"
-        );
-        let u = rho.ln();
+    /// `G^{(m)}(ρ)` from an already-formed `u = ln ρ`.
+    #[inline]
+    fn channel(&self, m: usize, rho: f64, u: f64) -> f64 {
         if m == 0
             && u < self.u_value_lo
             && let Some(g0) = self.g0
@@ -921,14 +921,49 @@ impl DuchonRadialProfile {
         panel.eval(m, u_eval) / envelope(self.alpha(m), rho)
     }
 
+    /// `G^{(m)}(ρ)` for `ρ > 0`.
+    pub(crate) fn derivative(&self, m: usize, rho: f64) -> f64 {
+        assert!(
+            m <= MAX_DERIVATIVE_ORDER,
+            "Duchon radial profile carries derivatives up to order {MAX_DERIVATIVE_ORDER}, asked {m}"
+        );
+        assert!(
+            rho > 0.0 && rho.is_finite(),
+            "Duchon radial profile needs a finite positive rho, got {rho}"
+        );
+        self.channel(m, rho, rho.ln())
+    }
+
     /// `G(ρ)`.
     pub(crate) fn value(&self, rho: f64) -> f64 {
         self.derivative(0, rho)
     }
 
     /// `[G, G′, G″, G‴, G⁗](ρ)`.
+    ///
+    /// Every derivative channel lives in the same all-channel panel set, so
+    /// the logarithm and the panel search are formed once for the whole jet
+    /// rather than once per channel (this is the per-pair call of the ψ
+    /// sweeps).
     pub(crate) fn derivatives(&self, rho: f64) -> [f64; CHANNELS] {
-        std::array::from_fn(|m| self.derivative(m, rho))
+        assert!(
+            rho > 0.0 && rho.is_finite(),
+            "Duchon radial profile needs a finite positive rho, got {rho}"
+        );
+        let u = rho.ln();
+        let (panel, u_eval) = self.locate(1, u);
+        std::array::from_fn(|m| {
+            if m == 0 {
+                self.channel(0, rho, u)
+            } else {
+                panel.eval(m, u_eval) / envelope(self.alpha(m), rho)
+            }
+        })
+    }
+
+    /// `pref · κ^{-2b}`: the whole `κ`-fixed factor of `φ(r) = scale · G(κ r)`.
+    pub(crate) fn kappa_scale(&self, kappa: f64) -> f64 {
+        self.prefactor * kappa.powf(-2.0 * self.shape.b)
     }
 
     /// The absolute error the certificate guarantees for `G^{(m)}(ρ)`, on the
@@ -1125,25 +1160,74 @@ fn build_panels(
     Ok(certified)
 }
 
+/// How many distinct shapes the lock-free index holds. A fit uses one shape
+/// per Duchon term, so a process reaching this bound is combining more than
+/// sixty distinct `(p, s, d)` smooths; those shapes keep the interning map's
+/// lock on every lookup, which is what every shape used to do.
+const PROFILE_INDEX_SLOTS: usize = 64;
+
+/// The lock-free index: `(shape, profile)` pairs published in slot order, so
+/// the first empty slot ends the occupied prefix and a miss is a scan of what
+/// is there, never a lock.
+static PROFILE_INDEX: [OnceLock<((usize, usize, usize), &'static DuchonRadialProfile)>;
+    PROFILE_INDEX_SLOTS] = [const { OnceLock::new() }; PROFILE_INDEX_SLOTS];
+
+/// Build `(p, s, d)` at most once per process and keep it for the process's
+/// life, handing back a shared reference.
+fn intern_duchon_radial_profile(
+    shape: (usize, usize, usize),
+) -> Result<&'static DuchonRadialProfile, BasisError> {
+    static PROFILES: OnceLock<Mutex<HashMap<(usize, usize, usize), &'static DuchonRadialProfile>>> =
+        OnceLock::new();
+    let profiles = PROFILES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(profile) = profiles
+        .lock()
+        .expect("Duchon radial profile cache poisoned")
+        .get(&shape)
+    {
+        return Ok(profile);
+    }
+    let (p, s, d) = shape;
+    let built: &'static DuchonRadialProfile = Box::leak(Box::new(DuchonRadialProfile::build(
+        p, s, d,
+    )?));
+    let mut guard = profiles.lock().expect("Duchon radial profile cache poisoned");
+    Ok(guard.entry(shape).or_insert(built))
+}
+
 /// The process-wide profile for `(p, s, d)`, built on first use.
+///
+/// A profile is a pure function of its shape and is never evicted, so the read
+/// path hands out a `&'static` reference found by scanning a lock-free index:
+/// no lock, no hash and no reference count on a path that a design build takes
+/// once per `(point, centre)` pair. Behind a mutex — which is what this used to
+/// be — that lookup measured 37 % of a 6-D `n = 50 000`, `k = 100` fit, more
+/// than the kernel arithmetic it was fetching (gam#2735).
 pub(crate) fn duchon_radial_profile(
     p: usize,
     s: usize,
     d: usize,
-) -> Result<Arc<DuchonRadialProfile>, BasisError> {
-    static PROFILES: OnceLock<Mutex<HashMap<(usize, usize, usize), Arc<DuchonRadialProfile>>>> =
-        OnceLock::new();
-    let cache = PROFILES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(profile) = cache
-        .lock()
-        .expect("Duchon radial profile cache poisoned")
-        .get(&(p, s, d))
-    {
-        return Ok(Arc::clone(profile));
+) -> Result<&'static DuchonRadialProfile, BasisError> {
+    let shape = (p, s, d);
+    for slot in PROFILE_INDEX.iter() {
+        match slot.get() {
+            Some(&(indexed, profile)) if indexed == shape => return Ok(profile),
+            Some(_) => continue,
+            None => break,
+        }
     }
-    let built = Arc::new(DuchonRadialProfile::build(p, s, d)?);
-    let mut guard = cache.lock().expect("Duchon radial profile cache poisoned");
-    Ok(Arc::clone(guard.entry((p, s, d)).or_insert(built)))
+    let profile = intern_duchon_radial_profile(shape)?;
+    for slot in PROFILE_INDEX.iter() {
+        if slot.get().is_some() {
+            continue;
+        }
+        // A slot lost to another shape leaves this one for the next lookup to
+        // publish; the profile itself is already interned either way.
+        if slot.set((shape, profile)).is_ok() {
+            break;
+        }
+    }
+    Ok(profile)
 }
 
 #[cfg(test)]
@@ -1406,6 +1490,42 @@ mod tests {
                     panic!("(d={d}, p={p}, s={s}) must build: {error}");
                 }
             }
+        }
+    }
+
+    /// Every reader of one shape gets the same interned profile, whichever
+    /// thread it asks from and whether it wins or loses the publication race.
+    #[test]
+    fn the_profile_index_hands_every_thread_one_interned_profile_per_shape() {
+        let shapes = [(1_usize, 3_usize, 6_usize), (2, 2, 6), (1, 2, 3)];
+        let first: Vec<&'static DuchonRadialProfile> = shapes
+            .iter()
+            .map(|&(p, s, d)| duchon_radial_profile(p, s, d).expect("profile builds"))
+            .collect();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    shapes
+                        .iter()
+                        .map(|&(p, s, d)| duchon_radial_profile(p, s, d).expect("profile builds"))
+                        .collect::<Vec<&'static DuchonRadialProfile>>()
+                })
+            })
+            .collect();
+        for handle in handles {
+            let seen = handle.join().expect("lookup thread joins");
+            for (got, want) in seen.iter().zip(first.iter()) {
+                assert!(
+                    std::ptr::eq(*got, *want),
+                    "a second thread got a different profile for the same shape"
+                );
+            }
+        }
+        // The bound factor is the closed-form prefactor at κ = 1.
+        for (&(p, s, d), profile) in shapes.iter().zip(first.iter()) {
+            let want = (4.0 * std::f64::consts::PI).powf(-0.5 * d as f64)
+                / (gamma_lanczos(p as f64) * gamma_lanczos(s as f64));
+            assert_eq!(profile.kappa_scale(1.0), want);
         }
     }
 
