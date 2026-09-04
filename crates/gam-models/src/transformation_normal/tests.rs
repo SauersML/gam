@@ -1,7 +1,7 @@
 #![cfg(test)]
 use super::*;
 use crate::custom_family::custom_family_outer_derivatives;
-use gam_test_support::assert_matrix_derivativefd;
+use gam_test_support::{assert_matrix_derivativefd, assert_matrix_derivativefd_rel};
 use ndarray::array;
 
 fn test_design_hyper_layout(
@@ -3133,7 +3133,7 @@ pub(crate) fn ctn_shape_penalties_annihilate_the_affine_transformation_2600() {
 #[test]
 pub(crate) fn ctn_hessian_diagonal_and_projected_trace_match_dense_assembly_2600() {
     let psi = array![0.15, -0.10];
-    let (family, _, state, _) = toy_family_and_derivatives(&psi);
+    let (family, _, state, spec) = toy_family_and_derivatives(&psi);
     let quantities = family
         .row_quantities(&state.beta)
         .expect("toy row quantities");
@@ -3180,17 +3180,15 @@ pub(crate) fn ctn_hessian_diagonal_and_projected_trace_match_dense_assembly_2600
             }
         }
     }
-    let row_grams = family
-        .scop_projected_response_gram_table(factor.view())
-        .expect("projected response Gram table");
-    let got = family
-        .scop_hessian_directional_trace_from_response_grams(
-            &state.beta,
-            &direction,
-            &quantities,
-            row_grams.view(),
-        )
-        .expect("projected directional trace");
+    let workspace = family
+        .exact_newton_joint_hessian_workspace(std::slice::from_ref(&state), &[spec])
+        .expect("workspace build")
+        .expect("workspace present");
+    let dh_op = workspace
+        .directional_derivative_operator(&direction)
+        .expect("dH operator call")
+        .expect("dH operator present");
+    let got = dh_op.trace_projected_factor(&factor);
     assert!(
         (got - expected).abs() <= 1.0e-10 * expected.abs().max(1.0),
         "projected trace {got:.17e} against dense assembly {expected:.17e}"
@@ -3200,6 +3198,84 @@ pub(crate) fn ctn_hessian_diagonal_and_projected_trace_match_dense_assembly_2600
         expected.abs() > 1.0e-6,
         "the probe direction produces no directional curvature ({expected:.3e}); \
          the comparison above would then be vacuous"
+    );
+}
+
+/// gam#979. The CTN Hessian's β-derivatives `D H[u]` and `D² H[u, v]` are each
+/// ONE weighted-Gram assembly (the `scop_curvature` module header), and the
+/// outer engine's operators now do nothing but read that assembly — which is
+/// what took the large-scale preprocessor off a 17 s-per-projection row sweep
+/// that never left one core.
+///
+/// Removing the second, row-streaming implementation removed the only thing
+/// the assembly was ever compared against, and comparing an operator with the
+/// builder it reads is not a comparison. So the gate is against the object
+/// these matrices are derivatives OF: a central difference of the value
+/// Hessian the inner solve actually minimises. A wrong block factor, a wrong
+/// power of `hp`, a transposed `(k, l)` placement, or a direction contracted
+/// on the wrong axis all move the analytic side off the difference.
+#[test]
+pub(crate) fn ctn_hessian_beta_derivatives_are_derivatives_of_the_value_hessian_979() {
+    let psi = array![0.15, -0.10];
+    let (family, _, state, _) = toy_family_and_derivatives(&psi);
+    let p_total = state.beta.len();
+    let u = toy_probe_vector(p_total, 9_701);
+    let v = toy_probe_vector(p_total, 9_702);
+    let step = 1.0e-6;
+
+    let value_hessian_at = |beta: &Array1<f64>| {
+        let quantities = family.row_quantities(beta).expect("shifted row quantities");
+        family
+            .scop_gradient_and_negative_hessian(beta, &quantities)
+            .expect("dense SCOP information")
+            .1
+    };
+    let directional_at = |beta: &Array1<f64>, direction: &Array1<f64>| {
+        let quantities = family.row_quantities(beta).expect("shifted row quantities");
+        family
+            .scop_hessian_directional_derivative(beta, direction, &quantities)
+            .expect("dense SCOP dH")
+    };
+    let shifted = |direction: &Array1<f64>, scale: f64| &state.beta + &(direction * scale);
+
+    let quantities = family
+        .row_quantities(&state.beta)
+        .expect("base row quantities");
+
+    // D H[u] against the central difference of H along u.
+    let analytic_dh = family
+        .scop_hessian_directional_derivative(&state.beta, &u, &quantities)
+        .expect("dense SCOP dH");
+    let fd_dh = (value_hessian_at(&shifted(&u, step)) - value_hessian_at(&shifted(&u, -step)))
+        / (2.0 * step);
+    assert_matrix_derivativefd_rel(&fd_dh, &analytic_dh, 1.0e-5, "CTN dH[u] against d/dt H");
+
+    // D² H[u, v] against the central difference of D H[u] along v.
+    let analytic_d2h = family
+        .scop_hessian_second_directional_derivative(&state.beta, &u, &v, &quantities)
+        .expect("dense SCOP d2H");
+    let fd_d2h = (directional_at(&shifted(&v, step), &u)
+        - directional_at(&shifted(&v, -step), &u))
+        / (2.0 * step);
+    assert_matrix_derivativefd_rel(
+        &fd_d2h,
+        &analytic_d2h,
+        1.0e-5,
+        "CTN d2H[u, v] against d/dt dH[u]",
+    );
+
+    // Both differences have to be reading real curvature, or every assertion
+    // above passes on a pair of zero matrices.
+    let peak = |matrix: &Array2<f64>| matrix.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    assert!(
+        peak(&analytic_dh) > 1.0e-4,
+        "the probe direction produces no first-order curvature drift ({:.3e})",
+        peak(&analytic_dh)
+    );
+    assert!(
+        peak(&analytic_d2h) > 1.0e-4,
+        "the probe pair produces no second-order curvature drift ({:.3e})",
+        peak(&analytic_d2h)
     );
 }
 

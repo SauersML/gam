@@ -274,17 +274,29 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
     }
 }
 
-/// Matrix-free directional derivative of the CTN joint Hessian.
+/// Directional derivative of the CTN joint Hessian, `D H[u]`.
 ///
-/// SCOP makes the derivative row-dependent through `γ_k(x)`, so this operator
-/// evaluates `D H[direction] · v` by streaming rows through the exact chain
-/// rule instead of using the old scalar-weighted `X_deriv' diag(.) X_deriv`
-/// identity.
+/// The direct-α chart is linear in the coefficients, so — see the
+/// `scop_curvature` module header — every `(k, l)` response block of this
+/// derivative is `covᵀ diag(w · (−2 m_k m_l · hp_u / hp³)) cov`: the same
+/// weighted-Gram kernel the value Hessian has always been assembled from. The
+/// whole `p × p` matrix is therefore ONE row sweep over the
+/// `p_resp(p_resp + 1)/2` blocks in parallel, and every action asked of this
+/// operator — `B · v`, `B · F`, `tr(Fᵀ B F)`, the dense form — is a read of
+/// that one assembly.
+///
+/// It used to stream all `n` rows once per PROBE COLUMN instead, on one
+/// thread: the outer Hessian's full-rank projection `B · W` then cost `2 n p k`
+/// scalar multiply–adds — 17 s per call at `n = 320000, p = k = 144` against
+/// ~0.03 s for the assembly — and the large-scale CTN preprocessor spent its
+/// entire budget there without ever leaving one core (gam#979).
 pub(crate) struct TransformationNormalDhMatrixFreeOperator {
     pub(crate) family: Arc<TransformationNormalFamily>,
     pub(crate) beta: Array1<f64>,
     pub(crate) row_quantities: TransformationNormalRowQuantityCache,
     pub(crate) direction: Array1<f64>,
+    /// Write-once assembly of `D H[direction]`; see the type documentation.
+    dense: OnceLock<Array2<f64>>,
 }
 
 impl TransformationNormalDhMatrixFreeOperator {
@@ -299,6 +311,7 @@ impl TransformationNormalDhMatrixFreeOperator {
             beta,
             row_quantities,
             direction,
+            dense: OnceLock::new(),
         }
     }
 
@@ -306,17 +319,17 @@ impl TransformationNormalDhMatrixFreeOperator {
         self.family.x_deriv_kron.ncols()
     }
 
-    pub(crate) fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        self.family
-            .scop_hessian_directional_matvec(&self.beta, &self.direction, &self.row_quantities, v)
-            .expect("validated CTN dH operator inputs should not fail")
-    }
-
-    pub(crate) fn projected_gram_cache_id(&self) -> usize {
-        let family_ptr = Arc::as_ptr(&self.family) as usize;
-        let design_dims = self.family.covariate_design.nrows()
-            ^ self.family.covariate_design.ncols().rotate_left(11);
-        family_ptr ^ design_dims.rotate_left(23)
+    /// `D H[direction]`, assembled on first use and reused thereafter.
+    fn dense(&self) -> &Array2<f64> {
+        self.dense.get_or_init(|| {
+            self.family
+                .scop_hessian_directional_derivative(
+                    &self.beta,
+                    &self.direction,
+                    &self.row_quantities,
+                )
+                .expect("validated CTN dH operator inputs should not fail")
+        })
     }
 }
 
@@ -327,82 +340,36 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         assert_eq!(v.len(), self.p_total());
-        self.apply(v)
+        gam_linalg::faer_ndarray::fast_av(self.dense(), v)
     }
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         assert_eq!(factor.nrows(), self.p_total());
-        self.family
-            .scop_hessian_directional_matmat(
-                &self.beta,
-                &self.direction,
-                &self.row_quantities,
-                factor,
-            )
-            .expect("validated CTN dH batched operator inputs should not fail")
-    }
-
-    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        assert_eq!(factor.nrows(), self.p_total());
-        let row_grams = self
-            .family
-            .scop_projected_response_gram_table(factor.view())
-            .expect("validated CTN dH projected Gram inputs should not fail");
-        self.family
-            .scop_hessian_directional_trace_from_response_grams(
-                &self.beta,
-                &self.direction,
-                &self.row_quantities,
-                row_grams.view(),
-            )
-            .expect("validated CTN dH projected trace inputs should not fail")
-    }
-
-    fn trace_projected_factor_cached(
-        &self,
-        factor: &Array2<f64>,
-        cache: &ProjectedFactorCache,
-    ) -> f64 {
-        assert_eq!(factor.nrows(), self.p_total());
-        let key =
-            ProjectedFactorKey::from_factor_view(self.projected_gram_cache_id(), factor.view());
-        let row_grams = cache.get_or_insert_with(key, || {
-            self.family
-                .scop_projected_response_gram_table(factor.view())
-                .expect("validated CTN dH cached projected Gram inputs should not fail")
-        });
-        self.family
-            .scop_hessian_directional_trace_from_response_grams(
-                &self.beta,
-                &self.direction,
-                &self.row_quantities,
-                row_grams.view(),
-            )
-            .expect("validated CTN dH cached projected trace inputs should not fail")
+        gam_linalg::faer_ndarray::fast_ab(self.dense(), factor)
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        self.family
-            .scop_hessian_directional_derivative(&self.beta, &self.direction, &self.row_quantities)
-            .expect("validated CTN dH operator inputs should not fail")
+        self.dense().clone()
     }
 
     fn is_implicit(&self) -> bool {
-        true
+        false
     }
 }
 
-/// Matrix-free second directional derivative of the CTN joint Hessian.
+/// Second directional derivative of the CTN joint Hessian, `D² H[u, v]`.
 ///
-/// This is the SCOP rowwise chain-rule operator for `D²H[u, v] · w`; it keeps
-/// the memory profile of matrix-free REML while matching the dense exact
-/// second derivative.
+/// `hp_uv = 0` for a linear map, so only the `6 m_k m_l · hp_u hp_v / hp⁴`
+/// term survives and this object is, block for block, the same weighted Gram
+/// as its first-order sibling above — assembled once and read the same way.
 pub(crate) struct TransformationNormalD2hMatrixFreeOperator {
     pub(crate) family: Arc<TransformationNormalFamily>,
     pub(crate) beta: Array1<f64>,
     pub(crate) row_quantities: TransformationNormalRowQuantityCache,
     pub(crate) direction_u: Array1<f64>,
     pub(crate) direction_v: Array1<f64>,
+    /// Write-once assembly of `D² H[u, v]`; see the type documentation.
+    dense: OnceLock<Array2<f64>>,
 }
 
 impl TransformationNormalD2hMatrixFreeOperator {
@@ -419,6 +386,7 @@ impl TransformationNormalD2hMatrixFreeOperator {
             row_quantities,
             direction_u,
             direction_v,
+            dense: OnceLock::new(),
         }
     }
 
@@ -426,16 +394,18 @@ impl TransformationNormalD2hMatrixFreeOperator {
         self.family.x_deriv_kron.ncols()
     }
 
-    pub(crate) fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        self.family
-            .scop_hessian_second_directional_matvec(
-                &self.beta,
-                &self.direction_u,
-                &self.direction_v,
-                &self.row_quantities,
-                v,
-            )
-            .expect("validated CTN d2H operator inputs should not fail")
+    /// `D² H[u, v]`, assembled on first use and reused thereafter.
+    fn dense(&self) -> &Array2<f64> {
+        self.dense.get_or_init(|| {
+            self.family
+                .scop_hessian_second_directional_derivative(
+                    &self.beta,
+                    &self.direction_u,
+                    &self.direction_v,
+                    &self.row_quantities,
+                )
+                .expect("validated CTN d2H operator inputs should not fail")
+        })
     }
 }
 
@@ -446,35 +416,20 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         assert_eq!(v.len(), self.p_total());
-        self.apply(v)
+        gam_linalg::faer_ndarray::fast_av(self.dense(), v)
     }
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         assert_eq!(factor.nrows(), self.p_total());
-        self.family
-            .scop_hessian_second_directional_matmat(
-                &self.beta,
-                &self.direction_u,
-                &self.direction_v,
-                &self.row_quantities,
-                factor,
-            )
-            .expect("validated CTN d2H batched operator inputs should not fail")
+        gam_linalg::faer_ndarray::fast_ab(self.dense(), factor)
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        self.family
-            .scop_hessian_second_directional_derivative(
-                &self.beta,
-                &self.direction_u,
-                &self.direction_v,
-                &self.row_quantities,
-            )
-            .expect("validated CTN d2H operator inputs should not fail")
+        self.dense().clone()
     }
 
     fn is_implicit(&self) -> bool {
-        true
+        false
     }
 }
 

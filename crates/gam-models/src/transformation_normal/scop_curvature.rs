@@ -186,16 +186,7 @@ impl TransformationNormalFamily {
         let response_deriv_basis = &self.response_deriv_basis;
 
         // Per-row directional derivative rate (linear in u).
-        let mut hp_dir = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let cov_row = cov.row(i);
-            let rd = response_deriv_basis.row(i);
-            let mut hp_u = 0.0;
-            for k in 0..p_resp {
-                hp_u += rd[k] * dir_mat.row(k).dot(&cov_row);
-            }
-            hp_dir[i] = hp_u;
-        }
+        let hp_dir = row_direction_rates(cov.as_ref(), response_deriv_basis, dir_mat);
 
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let response_pairs: Vec<(usize, usize)> = (0..p_resp)
@@ -273,20 +264,8 @@ impl TransformationNormalFamily {
         let h_prime = row_quantities.h_prime.as_ref();
         let response_deriv_basis = &self.response_deriv_basis;
 
-        let mut hp_u = Array1::<f64>::zeros(n);
-        let mut hp_v = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let cov_row = cov.row(i);
-            let rd = response_deriv_basis.row(i);
-            let mut hpu = 0.0;
-            let mut hpv = 0.0;
-            for k in 0..p_resp {
-                hpu += rd[k] * dir_u_mat.row(k).dot(&cov_row);
-                hpv += rd[k] * dir_v_mat.row(k).dot(&cov_row);
-            }
-            hp_u[i] = hpu;
-            hp_v[i] = hpv;
-        }
+        let hp_u = row_direction_rates(cov.as_ref(), response_deriv_basis, dir_u_mat);
+        let hp_v = row_direction_rates(cov.as_ref(), response_deriv_basis, dir_v_mat);
 
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let response_pairs: Vec<(usize, usize)> = (0..p_resp)
@@ -388,346 +367,6 @@ impl TransformationNormalFamily {
         Ok(())
     }
 
-    pub(crate) fn scop_hessian_directional_matvec(
-        &self,
-        beta: &Array1<f64>,
-        direction: &Array1<f64>,
-        row_quantities: &TransformationNormalRowQuantityCache,
-        probe: &Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        let mut probes = Array2::<f64>::zeros((probe.len(), 1));
-        probes.column_mut(0).assign(probe);
-        let out = self.scop_hessian_directional_matmat(beta, direction, row_quantities, &probes)?;
-        Ok(out.column(0).to_owned())
-    }
-
-    pub(crate) fn scop_hessian_directional_matmat(
-        &self,
-        beta: &Array1<f64>,
-        direction: &Array1<f64>,
-        row_quantities: &TransformationNormalRowQuantityCache,
-        probes: &Array2<f64>,
-    ) -> Result<Array2<f64>, String> {
-        let stage_start = std::time::Instant::now();
-        let (n, p_resp, p_cov, p_total) =
-            self.scop_check(beta, row_quantities, "SCOP dH matmat")?;
-        let n_probe = probes.ncols();
-        if direction.len() != p_total || probes.nrows() != p_total {
-            return Err(TransformationNormalError::InvalidInput {
-                reason: format!(
-                    "SCOP dH matmat length mismatch: direction={}, probes rows={}, expected={p_total}",
-                    direction.len(),
-                    probes.nrows()
-                ),
-            }
-            .into());
-        }
-        let dir_mat = direction
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP direction reshape failed: {e}"))?;
-        let cov = self
-            .covariate_dense_arc()
-            .map_err(|e| format!("SCOP dH matmat requires cached covariate design: {e}"))?;
-        let weights = self.effective_weights();
-        let h_prime = row_quantities.h_prime.as_ref();
-        let mut out = Array2::<f64>::zeros((p_total, n_probe));
-        let mut hp_probe = vec![0.0; n_probe];
-
-        for i in 0..n {
-            let cov_row = cov.row(i);
-            let rd = self.response_deriv_basis.row(i);
-            let wi = weights[i];
-            let inv_hp = 1.0 / h_prime[i];
-            let inv_hp_cu = inv_hp * inv_hp * inv_hp;
-
-            let mut hp_dir = 0.0;
-            hp_probe.iter_mut().for_each(|v| *v = 0.0);
-            for k in 0..p_resp {
-                hp_dir += rd[k] * dir_mat.row(k).dot(&cov_row);
-                let row_offset = k * p_cov;
-                for j in 0..n_probe {
-                    let mut pg = 0.0;
-                    for c in 0..p_cov {
-                        pg += probes[[row_offset + c, j]] * cov_row[c];
-                    }
-                    hp_probe[j] += rd[k] * pg;
-                }
-            }
-
-            for k in 0..p_resp {
-                for j in 0..n_probe {
-                    let scalar = wi * (-2.0 * rd[k] * hp_probe[j] * hp_dir * inv_hp_cu);
-                    for c in 0..p_cov {
-                        out[[k * p_cov + c, j]] += scalar * cov_row[c];
-                    }
-                }
-            }
-        }
-
-        log::info!(
-            "[STAGE] CTN scop_hessian_directional_matmat n={} p={} k={} elapsed={:.3}s",
-            n,
-            p_total,
-            n_probe,
-            stage_start.elapsed().as_secs_f64(),
-        );
-        Ok(out)
-    }
-
-    pub(crate) fn scop_projected_response_gram_table(
-        &self,
-        factor: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        let n = self.response_val_basis.nrows();
-        let p_resp = self.response_val_basis.ncols();
-        let p_cov = self.covariate_design.ncols();
-        let p_total = p_resp * p_cov;
-        let rank = factor.ncols();
-        if factor.nrows() != p_total {
-            return Err(TransformationNormalError::InvalidInput { reason: format!(
-                "SCOP projected response Gram factor row mismatch: factor_rows={}, expected={p_total}",
-                factor.nrows()
-            ) }.into());
-        }
-        let cov = self.covariate_dense_arc().map_err(|e| {
-            format!("SCOP projected response Gram requires cached covariate design: {e}")
-        })?;
-        let stride = p_resp * p_resp;
-        let mut grams = vec![0.0_f64; n * stride];
-
-        let fill_row = |i: usize, row_out: &mut [f64], projected: &mut [f64]| {
-            let cov_row = cov.row(i);
-            projected.fill(0.0);
-            for k in 0..p_resp {
-                let factor_row_base = k * p_cov;
-                let projected_base = k * rank;
-                for c in 0..p_cov {
-                    let x_ic = cov_row[c];
-                    if x_ic == 0.0 {
-                        continue;
-                    }
-                    let factor_row = factor_row_base + c;
-                    for col in 0..rank {
-                        projected[projected_base + col] += x_ic * factor[[factor_row, col]];
-                    }
-                }
-            }
-            for k in 0..p_resp {
-                let k_base = k * rank;
-                for l in 0..p_resp {
-                    let l_base = l * rank;
-                    let mut value = 0.0;
-                    for col in 0..rank {
-                        value += projected[k_base + col] * projected[l_base + col];
-                    }
-                    row_out[k * p_resp + l] = value;
-                }
-            }
-        };
-
-        if rayon::current_thread_index().is_some() {
-            let mut projected = vec![0.0_f64; p_resp * rank];
-            for (i, row_out) in grams.chunks_mut(stride).enumerate() {
-                fill_row(i, row_out, &mut projected);
-            }
-        } else {
-            use rayon::iter::{IndexedParallelIterator, ParallelIterator};
-            use rayon::slice::ParallelSliceMut;
-            grams.par_chunks_mut(stride).enumerate().for_each_init(
-                || vec![0.0_f64; p_resp * rank],
-                |projected, (i, row_out)| fill_row(i, row_out, projected),
-            );
-        }
-
-        Array2::from_shape_vec((n, stride), grams)
-            .map_err(|e| format!("SCOP projected response Gram table shape failed: {e}"))
-    }
-
-    pub(crate) fn scop_hessian_directional_trace_from_response_grams(
-        &self,
-        beta: &Array1<f64>,
-        direction: &Array1<f64>,
-        row_quantities: &TransformationNormalRowQuantityCache,
-        row_grams: ArrayView2<'_, f64>,
-    ) -> Result<f64, String> {
-        let (n, p_resp, p_cov, p_total) =
-            self.scop_check(beta, row_quantities, "SCOP dH projected trace")?;
-        if direction.len() != p_total {
-            return Err(TransformationNormalError::InvalidInput {
-                reason: format!(
-                    "SCOP dH projected trace direction length {} != expected {p_total}",
-                    direction.len()
-                ),
-            }
-            .into());
-        }
-        if row_grams.nrows() != n || row_grams.ncols() != p_resp * p_resp {
-            return Err(TransformationNormalError::InvalidInput {
-                reason: format!(
-                    "SCOP dH projected trace Gram shape {}x{} != expected {}x{}",
-                    row_grams.nrows(),
-                    row_grams.ncols(),
-                    n,
-                    p_resp * p_resp
-                ),
-            }
-            .into());
-        }
-        let dir_mat = direction
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP dH projected trace direction reshape failed: {e}"))?;
-        let cov = self.covariate_dense_arc().map_err(|e| {
-            format!("SCOP dH projected trace requires cached covariate design: {e}")
-        })?;
-        let weights = self.effective_weights();
-        let h_prime = row_quantities.h_prime.as_ref();
-
-        let row_trace = |i: usize| {
-            let cov_row = cov.row(i);
-            let rd = self.response_deriv_basis.row(i);
-            let wi = weights[i];
-            let inv_hp = 1.0 / h_prime[i];
-            let inv_hp_cu = inv_hp * inv_hp * inv_hp;
-
-            let mut hp_dir = 0.0;
-            for k in 0..p_resp {
-                hp_dir += rd[k] * dir_mat.row(k).dot(&cov_row);
-            }
-
-            let gram_row = row_grams.row(i);
-            let mut total = 0.0;
-            for k in 0..p_resp {
-                for l in 0..p_resp {
-                    let q_kl = -2.0 * rd[k] * rd[l] * hp_dir * inv_hp_cu;
-                    total += q_kl * gram_row[k * p_resp + l];
-                }
-            }
-            wi * total
-        };
-
-        if rayon::current_thread_index().is_some() {
-            Ok((0..n).map(row_trace).sum())
-        } else {
-            Ok(gam_linalg::pairwise_reduce::par_deterministic_block_fold(
-                n,
-                |range| {
-                    let mut sum = 0.0;
-                    for i in range {
-                        sum += row_trace(i);
-                    }
-                    sum
-                },
-                |a, b| a + b,
-            )
-            .unwrap_or(0.0))
-        }
-    }
-
-    pub(crate) fn scop_hessian_second_directional_matvec(
-        &self,
-        beta: &Array1<f64>,
-        direction_u: &Array1<f64>,
-        direction_v: &Array1<f64>,
-        row_quantities: &TransformationNormalRowQuantityCache,
-        probe: &Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        let mut probes = Array2::<f64>::zeros((probe.len(), 1));
-        probes.column_mut(0).assign(probe);
-        let out = self.scop_hessian_second_directional_matmat(
-            beta,
-            direction_u,
-            direction_v,
-            row_quantities,
-            &probes,
-        )?;
-        Ok(out.column(0).to_owned())
-    }
-
-    pub(crate) fn scop_hessian_second_directional_matmat(
-        &self,
-        beta: &Array1<f64>,
-        direction_u: &Array1<f64>,
-        direction_v: &Array1<f64>,
-        row_quantities: &TransformationNormalRowQuantityCache,
-        probes: &Array2<f64>,
-    ) -> Result<Array2<f64>, String> {
-        let stage_start = std::time::Instant::now();
-        let (n, p_resp, p_cov, p_total) =
-            self.scop_check(beta, row_quantities, "SCOP d2H matmat")?;
-        let n_probe = probes.ncols();
-        if direction_u.len() != p_total
-            || direction_v.len() != p_total
-            || probes.nrows() != p_total
-        {
-            return Err(TransformationNormalError::InvalidInput { reason: format!(
-                "SCOP d2H matmat length mismatch: u={}, v={}, probes rows={}, expected={p_total}",
-                direction_u.len(),
-                direction_v.len(),
-                probes.nrows()
-            ) }.into());
-        }
-        let dir_u_mat = direction_u
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP u direction reshape failed: {e}"))?;
-        let dir_v_mat = direction_v
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP v direction reshape failed: {e}"))?;
-        let cov = self
-            .covariate_dense_arc()
-            .map_err(|e| format!("SCOP d2H matmat requires cached covariate design: {e}"))?;
-        let weights = self.effective_weights();
-        let h_prime = row_quantities.h_prime.as_ref();
-        let mut out = Array2::<f64>::zeros((p_total, n_probe));
-        let mut hp_probe = vec![0.0; n_probe];
-
-        for i in 0..n {
-            let cov_row = cov.row(i);
-            let rd = self.response_deriv_basis.row(i);
-            let wi = weights[i];
-            let inv_hp = 1.0 / h_prime[i];
-            let inv_hp_sq = inv_hp * inv_hp;
-            let inv_hp_qu = inv_hp_sq * inv_hp_sq;
-
-            let mut hp_u = 0.0;
-            let mut hp_v = 0.0;
-            hp_probe.iter_mut().for_each(|value| *value = 0.0);
-            for k in 0..p_resp {
-                hp_u += rd[k] * dir_u_mat.row(k).dot(&cov_row);
-                hp_v += rd[k] * dir_v_mat.row(k).dot(&cov_row);
-                let row_offset = k * p_cov;
-                for j in 0..n_probe {
-                    let mut pg = 0.0;
-                    for c in 0..p_cov {
-                        pg += probes[[row_offset + c, j]] * cov_row[c];
-                    }
-                    hp_probe[j] += rd[k] * pg;
-                }
-            }
-
-            for k in 0..p_resp {
-                for j in 0..n_probe {
-                    let scalar = wi * (6.0 * rd[k] * hp_probe[j] * hp_u * hp_v * inv_hp_qu);
-                    for c in 0..p_cov {
-                        out[[k * p_cov + c, j]] += scalar * cov_row[c];
-                    }
-                }
-            }
-        }
-
-        log::info!(
-            "[STAGE] CTN scop_hessian_second_directional_matmat n={} p={} k={} elapsed={:.3}s",
-            n,
-            p_total,
-            n_probe,
-            stage_start.elapsed().as_secs_f64(),
-        );
-        Ok(out)
-    }
-
     pub(crate) fn scop_hessian_diagonal(
         &self,
         beta: &Array1<f64>,
@@ -760,4 +399,30 @@ impl TransformationNormalFamily {
         }
         Ok(diag)
     }
+}
+
+/// `hp_d[i] = Σ_k m_ik · (cov_i · d_k)`: the rate at which the row's `h'`
+/// moves along a coefficient direction `d` reshaped to `(p_resp, p_cov)`.
+///
+/// `cov_i · d_k` over all `(i, k)` is `cov · dᵀ`, one GEMM, so the whole
+/// vector is that product read against the response-derivative basis rather
+/// than `n · p_resp` separate row dot products (gam#979).
+fn row_direction_rates(
+    cov: &Array2<f64>,
+    response_deriv_basis: &Array2<f64>,
+    direction: ArrayView2<'_, f64>,
+) -> Array1<f64> {
+    let projected = gam_linalg::faer_ndarray::fast_abt(cov, &direction);
+    let n = cov.nrows();
+    let p_resp = response_deriv_basis.ncols();
+    assert_eq!(projected.shape(), [n, p_resp]);
+    let mut rates = Array1::<f64>::zeros(n);
+    for (i, rate) in rates.iter_mut().enumerate() {
+        let mut accumulated = 0.0;
+        for k in 0..p_resp {
+            accumulated += response_deriv_basis[[i, k]] * projected[[i, k]];
+        }
+        *rate = accumulated;
+    }
+    rates
 }
