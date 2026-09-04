@@ -2160,6 +2160,35 @@ pub(crate) fn run_outer_with_plan(
                         // ~64 outer-TR iters × ~30 trace_logdet calls per
                         // Hv) this halves the dominant per-fit work.
                         .with_cg_tolerance(0.5)
+                        // Stop the search on the test that will judge it.
+                        //
+                        // The certificate accepts a point when the Newton
+                        // decrement ½gᵀH⁻¹g at it is below the criterion's own
+                        // resolution `rel_cost_floor·(1 + |V|)` — the
+                        // curvature-resolvability rung, which is what mgcv
+                        // means by convergence and which the certificate
+                        // computes for itself at the end. The solver was
+                        // driven instead to an absolute projected-gradient
+                        // band, which on a flat REML valley is a far stricter
+                        // and unrelated standard: measured on a gaussian
+                        // n=50 000, p=93, K=11 fit, the band was 7.451e-4
+                        // while the certificate accepted 2.173e-2 — 29× wider
+                        // — so no seed could ever stop itself. All six runs
+                        // (three seeds, then the whole sweep again through the
+                        // budget-exhaustion retry) burned their 200-iteration
+                        // budget, 1200 outer evaluations, for a last-100
+                        // improvement of 4e-4 in a criterion of 5.3e4 (#2817).
+                        //
+                        // opt's Steihaug–Toint subsolve already computes the
+                        // decrement: on an interior step its predicted decrease
+                        // IS ½gᵀH⁻¹g. Handing it the certificate's tolerance
+                        // makes the stopping rule and the acceptance rule one
+                        // standard. Anchored on the seed's own cost, so the
+                        // threshold is fixed for the run rather than drifting
+                        // with the iterate.
+                        .with_model_decrement_tolerance(
+                            outer_rel_cost_floor(config) * (1.0 + seed_eval.cost.abs()),
+                        )
                         // The matrix-free route is exclusively for
                         // exact analytic Hessians; an `Unavailable`
                         // here is a routing/contract violation.

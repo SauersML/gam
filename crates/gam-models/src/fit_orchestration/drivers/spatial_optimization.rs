@@ -6031,6 +6031,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         }
 
         let termname = build_spec.name.clone();
+        let t_build = std::time::Instant::now();
         let local = build_single_local_smooth_term(
             self.data,
             &build_spec,
@@ -6088,6 +6089,16 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             spatial_frozen_radial_chart_shape(&build_spec),
             spatial_realized_radial_chart_shape(&local.metadata),
             local.design.ncols(),
+        );
+        // The n×k realization is the trial's dominant cost and had no timer of
+        // its own: the only per-trial number reported was the splice's, under a
+        // label that named the rebuild (measured on the 6-D isotropic Duchon
+        // fit at n=50 000, k=500: 16.6 s per κ trial, of which the splice the
+        // old line reported was 1.7 s).
+        log::info!(
+            "[STAGE] smooth term realization (term {term_idx}, '{termname}', local_cols={}): {:.3}s",
+            local.design.ncols(),
+            t_build.elapsed().as_secs_f64(),
         );
         let realization = wrap_local_build_as_realization(local, &build_spec)
             .map_err(EstimationError::InvalidInput)?;
@@ -6440,7 +6451,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         }
         self.dropped_penaltyinfo_by_term[term_idx] = dropped_penaltyinfo;
         log::info!(
-            "[STAGE] smooth basis rebuild (term {}, '{}', cols={}): {:.3}s",
+            "[STAGE] collection-gauge placement + splice (term {}, '{}', cols={}): {:.3}s",
             term_idx,
             target_term.name,
             coeff_range.len(),

@@ -4151,6 +4151,10 @@ pub(crate) fn stop_reason_from(reason: TerminationReason) -> OperatorTrustRegion
         | TerminationReason::SmallStepFlatObjective { .. }
         | TerminationReason::RelativeStationarityWindow { .. }
         | TerminationReason::ModelNoiseFloor { .. }
+        // The caller's own resolution rung: the solver stopped because the
+        // model's interior Newton decrement fell below the tolerance THIS
+        // crate handed it — the certificate's own test, applied online.
+        | TerminationReason::ModelDecrementTolerance { .. }
         | TerminationReason::StepNormTolerance { .. }
         | TerminationReason::FixedPointRequestedStop { .. } => {
             OperatorTrustRegionStopReason::Converged
