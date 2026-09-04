@@ -3118,6 +3118,92 @@ impl PirlsWorkingModel for WorkingModelSurvival {
     fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
         self.update_state(beta)
     }
+
+    /// Under left truncation the exact Hessian differs from any positive
+    /// definite stepping curvature — the per-row term is
+    /// `exp(η_exit)·a₁a₁ᵀ − exp(η_entry)·a₀a₀ᵀ + δ·ddᵀ/s²`, a DIFFERENCE of
+    /// positive semidefinite terms — so the inner loop's observed-then-Fisher
+    /// protocol applies to this model (#2814).
+    fn supports_observed_information_curvature(&self) -> bool {
+        true
+    }
+
+    /// `Observed` is the exact Hessian of the penalized negative log-likelihood,
+    /// the matrix the LAML criterion's `log|H|` is taken of. It is refused — so
+    /// the inner loop steps on `Fisher` — when it is not positive definite to
+    /// within its own rounding band (`γ_p·u·‖H‖₂`): a Newton direction on an
+    /// indefinite matrix is not a descent direction, and a heterogeneous-entry
+    /// Weibull cohort spent the whole 400-iteration budget on damped non-steps
+    /// at `|g| ≈ 1.3` on every seed.
+    ///
+    /// `Fisher` here is the modified-Newton matrix of Gill and Murray: the exact
+    /// spectrum with every eigenvalue below `√ε·‖H‖₂` raised to that floor, and
+    /// the exact gradient. `√ε·‖H‖₂` is the curvature the objective's own
+    /// values can resolve (the same floor the outer certificate's decrement
+    /// uses), so in every direction the objective's arithmetic can tell convex
+    /// from flat this IS the Newton step, and in a concave direction the step
+    /// is long — its length is then decided by the loop's damping and gain
+    /// ratio on the exact objective, not by a curvature that points the wrong
+    /// way. Two alternatives were measured first on the delayed-entry cohort:
+    /// the entry-term-free majorant crawled at `Δdev ≈ 3·10⁻⁷` per iteration
+    /// (a majorisation step is the true curvature over the majorant's, tiny
+    /// where entry and exit hazards are comparable), and the reflected spectrum
+    /// `|Λ|` stalled at `‖g‖ ≈ 1.4·10⁻²` because a concave direction of
+    /// magnitude `1.5·10³` shrank its step to `10⁻⁵`. At the certified mode
+    /// the loop asks for `Observed` again, and an indefinite answer there is
+    /// exported as `InvalidObservedCurvature`, never relabelled.
+    fn update_with_curvature(
+        &mut self,
+        beta: &Coefficients,
+        curvature: gam_solve::pirls::HessianCurvatureKind,
+    ) -> Result<WorkingState, EstimationError> {
+        let mut state = self.update_state(beta)?;
+        let Some(dense) = state.hessian.as_dense() else {
+            return Ok(state);
+        };
+        let (eigenvalues, eigenvectors) =
+            gam_linalg::faer_ndarray::FaerEigh::eigh(dense, faer::Side::Lower).map_err(|error| {
+                EstimationError::InvalidInput(format!(
+                    "survival observed information eigendecomposition failed: {error:?}"
+                ))
+            })?;
+        let spectral_radius = eigenvalues.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        let band = gam_linalg::roundoff::accumulation_growth(dense.nrows())
+            * gam_linalg::roundoff::UNIT_ROUNDOFF
+            * spectral_radius;
+        let min_eig = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
+        match curvature {
+            gam_solve::pirls::HessianCurvatureKind::Observed => {
+                if !(min_eig > -band) {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "survival observed information is indefinite at this iterate \
+                         (λ_min = {min_eig:.3e}, band = {band:.3e}): a delayed-entry cohort's \
+                         exact curvature is a difference of positive terms; stepping on the \
+                         modified-Newton matrix"
+                    )));
+                }
+                Ok(state)
+            }
+            gam_solve::pirls::HessianCurvatureKind::Fisher => {
+                let p = dense.nrows();
+                let resolvable = f64::EPSILON.sqrt() * spectral_radius;
+                let mut reflected = Array2::<f64>::zeros((p, p));
+                for k in 0..p {
+                    let magnitude = eigenvalues[k].max(resolvable);
+                    let v = eigenvectors.column(k);
+                    for i in 0..p {
+                        let scaled = magnitude * v[i];
+                        for j in 0..p {
+                            reflected[[i, j]] += scaled * v[j];
+                        }
+                    }
+                }
+                state.hessian = SymmetricMatrix::Dense(reflected);
+                state.hessian_curvature = gam_solve::pirls::HessianCurvatureKind::Fisher;
+                Ok(state)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
