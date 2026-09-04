@@ -66,7 +66,7 @@ resolver = "3"
 # This exact optimizer revision includes the projected-Wolfe bound-kink
 # repair, exact PSD trust-region subproblem, and true Armijo recovery used by
 # GAM. Pinning the source commit makes the line-search semantics reproducible.
-opt = { version = "=0.8.1", git = "https://github.com/SauersML/opt.git", rev = "048de2ef60f39637fd5db4faf354e0cf68c471ee" }
+opt = { version = "=0.8.1", git = "https://github.com/SauersML/opt.git", rev = "3a05cb31c4dc65cf3c85d5033286317864c8c019" }
 cudarc = { version = "0.19.8", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12000"] }
 
 [lints.rust]
