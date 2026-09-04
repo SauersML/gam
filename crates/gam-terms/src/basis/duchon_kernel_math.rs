@@ -2168,7 +2168,34 @@ pub(crate) fn duchon_hybrid_kernel_near_collision_value(
 pub(crate) fn stable_euclidean_norm<I>(components: I) -> f64
 where
     I: IntoIterator<Item = f64>,
+    I::IntoIter: Clone,
 {
+    let components = components.into_iter();
+    // The norm IS the square root of the sum of squares, and that sum is the
+    // right way to compute it for every vector whose squares are
+    // representable — which is every coordinate of a standardized design. It
+    // costs one multiply-add per component. The scaled recurrence below costs
+    // a branch and a DIVISION per component, and this function runs once per
+    // (point, centre) pair of every design build and every kappa trial, so
+    // paying for overflow protection that no coordinate needs is the whole
+    // cost of it.
+    //
+    // The two states where the plain sum is not the answer announce themselves
+    // in the accumulator, so nothing here assumes a bound on the inputs: an
+    // overflow (or a non-finite component) leaves it non-finite, and a total
+    // underflow leaves it exactly zero for a vector that has a non-zero
+    // component. Either way the scaled form runs and answers.
+    let mut plain = 0.0_f64;
+    let mut any_nonzero = false;
+    for component in components.clone() {
+        if component != 0.0 {
+            any_nonzero = true;
+        }
+        plain += component * component;
+    }
+    if plain.is_finite() && (plain > 0.0 || !any_nonzero) {
+        return plain.sqrt();
+    }
     let mut scale = 0.0_f64;
     let mut sumsq = 1.0_f64;
     let mut has_nonzero = false;
@@ -2198,6 +2225,41 @@ where
         scale * sumsq.sqrt()
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod stable_euclidean_norm_tests {
+    use super::stable_euclidean_norm;
+
+    /// The fast sum-of-squares path and the scaled recurrence answer the same
+    /// question, and the two regimes that force the scaled form — squares that
+    /// overflow, and squares that all underflow to zero — are exercised, not
+    /// assumed.
+    #[test]
+    fn the_norm_is_the_scaled_recurrences_answer_in_every_regime() {
+        let cases: [(&[f64], f64); 6] = [
+            (&[3.0, 4.0], 5.0),
+            (&[0.0, 0.0, 0.0], 0.0),
+            (&[-0.0, 0.0], 0.0),
+            (&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 9.539_392_014_169_456),
+            // Squares overflow: 1e200² is +inf, the norm is 1e200·√2.
+            (&[1e200, 1e200], std::f64::consts::SQRT_2 * 1e200),
+            // Squares underflow: 1e-200² is 0, the norm is 1e-200·√2.
+            (&[1e-200, 1e-200], std::f64::consts::SQRT_2 * 1e-200),
+        ];
+        for (components, want) in cases {
+            let got = stable_euclidean_norm(components.iter().copied());
+            let tol = 8.0 * f64::EPSILON * want.max(f64::MIN_POSITIVE);
+            assert!(
+                (got - want).abs() <= tol,
+                "norm of {components:?}: got {got:e}, want {want:e}"
+            );
+        }
+        // A non-finite component is reported as an infinite distance, which is
+        // what the callers' finiteness refusals read.
+        assert!(stable_euclidean_norm([1.0, f64::NAN].into_iter()).is_infinite());
+        assert!(stable_euclidean_norm([f64::INFINITY, 1.0].into_iter()).is_infinite());
     }
 }
 

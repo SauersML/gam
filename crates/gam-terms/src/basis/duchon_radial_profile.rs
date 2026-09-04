@@ -98,6 +98,7 @@
 use super::*;
 use gam_linalg::utils::KahanSum;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Chebyshev coefficients per panel. A panel narrower than one e-fold whose
@@ -1188,9 +1189,17 @@ static PROFILE_INDEX: [OnceLock<((usize, usize, usize), &'static DuchonRadialPro
 
 /// Build `(p, s, d)` at most once per process and keep it for the process's
 /// life, handing back a shared reference.
+/// How many times the read path has missed the lock-free index and taken the
+/// interning map's lock. The index exists to keep that lock off a path a design
+/// build takes once per `(point, centre)` pair, and a counter is the only form
+/// of that claim a test can assert on — a lookup that silently starts locking
+/// again looks exactly like one that does not.
+static PROFILE_INTERN_CALLS: AtomicUsize = AtomicUsize::new(0);
+
 fn intern_duchon_radial_profile(
     shape: (usize, usize, usize),
 ) -> Result<&'static DuchonRadialProfile, BasisError> {
+    PROFILE_INTERN_CALLS.fetch_add(1, Ordering::Relaxed);
     // Shape to the slot of `PROFILE_STORE` holding its profile. The map
     // serializes BUILDS -- a profile is an adaptive quadrature construction,
     // not something to race two threads through -- while the store owns the
@@ -1541,7 +1550,9 @@ mod tests {
     }
 
     /// Every reader of one shape gets the same interned profile, whichever
-    /// thread it asks from and whether it wins or loses the publication race.
+    /// thread it asks from and whether it wins or loses the publication race —
+    /// and, after the shape is published, WITHOUT taking the interning lock,
+    /// which is the whole point of the index.
     #[test]
     fn the_profile_index_hands_every_thread_one_interned_profile_per_shape() {
         let shapes = [(1_usize, 3_usize, 6_usize), (2, 2, 6), (1, 2, 3)];
@@ -1568,6 +1579,36 @@ mod tests {
                 );
             }
         }
+        // The read path stops entering the interning map once a shape is
+        // published: 4 threads × 3 shapes × 64 lookups add nothing to the
+        // count. Without the index every one of those would take the lock.
+        let interned_before = PROFILE_INTERN_CALLS.load(Ordering::Relaxed);
+        let hammer: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    for _ in 0..64 {
+                        for &(p, s, d) in shapes.iter() {
+                            duchon_radial_profile(p, s, d).expect("profile builds");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in hammer {
+            handle.join().expect("lookup thread joins");
+        }
+        // Other tests in this process intern their own shapes concurrently,
+        // so the bound is the module's whole shape inventory rather than zero:
+        // 768 lookups of published shapes may add at most the shapes that
+        // exist. Without the index every one of the 768 would add one.
+        let interned_after = PROFILE_INTERN_CALLS.load(Ordering::Relaxed);
+        assert!(
+            interned_after - interned_before <= SHAPES.len() + shapes.len(),
+            "a published shape must be answered from the lock-free index, not the interning              map: {} interns across {} lookups of already-published shapes",
+            interned_after - interned_before,
+            4 * 64 * shapes.len()
+        );
+
         // The bound factor is the closed-form prefactor at κ = 1.
         for (&(p, s, d), profile) in shapes.iter().zip(first.iter()) {
             let want = (4.0 * std::f64::consts::PI).powf(-0.5 * d as f64)
