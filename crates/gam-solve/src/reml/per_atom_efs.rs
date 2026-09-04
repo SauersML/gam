@@ -897,6 +897,7 @@ mod tests {
     /// enclosure with a fixed gap, so the #1011 EFS margin gate can be exercised.
     pub(crate) struct EnclosureGapObjective {
         pub(crate) inner: QuadraticObjective,
+        pub(crate) gap: f64,
     }
 
     impl OuterObjective for EnclosureGapObjective {
@@ -908,6 +909,11 @@ mod tests {
         }
         fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
             self.inner.eval(rho)
+        }
+        fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+            let mut eval = self.inner.eval_efs(rho)?;
+            eval.logdet_enclosure_gap = Some(self.gap);
+            Ok(eval)
         }
         fn reset(&mut self) {
             self.inner.reset()
@@ -942,6 +948,7 @@ mod tests {
                 a: a.clone(),
                 target: target.clone(),
             },
+            gap: 10.0 * cfg.tolerance,
         };
         let wide_result = run_per_atom_efs(&mut wide, &seed, &cfg, &topology).expect("wide run");
         assert!(
@@ -957,11 +964,24 @@ mod tests {
                 a,
                 target: target.clone(),
             },
+            gap: 0.1 * cfg.tolerance,
         };
         let tight_result = run_per_atom_efs(&mut tight, &seed, &cfg, &topology).expect("tight run");
         assert!(
             tight_result.converged,
             "an enclosure gap below the step tolerance must not obstruct convergence"
         );
+        for (label, result) in [("wide", &wide_result), ("tight", &tight_result)] {
+            assert!(
+                result.final_step_inf_norm < cfg.tolerance,
+                "{label}: the step criterion itself must be satisfied"
+            );
+            for (actual, expected) in result.rho.iter().zip(target.iter()) {
+                assert!(
+                    (actual - expected).abs() < cfg.tolerance,
+                    "{label}: the mock must reach its known optimum"
+                );
+            }
+        }
     }
 }

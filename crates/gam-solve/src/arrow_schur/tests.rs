@@ -6457,14 +6457,20 @@ fn evidence_classification_prices_a_clamp_basin_before_refusing_a_saddle_2515() 
         .beta_conditioning
         .as_ref()
         .expect("#2515: clamp-basin conditioning must retain its derivative carrier");
-    assert_eq!(
-        basin_spectrum.conditioning[0],
-        BetaSchurSpectralConditioning::Raw
-    );
-    assert_eq!(
-        basin_spectrum.conditioning[1],
-        BetaSchurSpectralConditioning::ClampBasin
-    );
+    // The carrier is indexed by eigenmode, not by the original coordinate.
+    // Classify each mode by its raw curvature so the assertion also survives
+    // a change in the eigensolver's ordering.
+    assert_eq!(basin_spectrum.raw_evals.len(), 2);
+    for (index, &raw) in basin_spectrum.raw_evals.iter().enumerate() {
+        let expected = if raw < 0.0 {
+            BetaSchurSpectralConditioning::ClampBasin
+        } else {
+            BetaSchurSpectralConditioning::Raw
+        };
+        assert_eq!(basin_spectrum.conditioning[index], expected);
+    }
+    assert_abs_diff_eq!(reconstructed_basin[[0, 0]], 4.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(reconstructed_basin[[0, 1]], 0.0, epsilon = 1.0e-12);
     assert_abs_diff_eq!(
         reconstructed_basin[[1, 1]],
         -7.997_610e-3 + 2.0e-2,

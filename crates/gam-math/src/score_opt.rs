@@ -1146,31 +1146,6 @@ where
             continue;
         }
 
-        // The derivative at the probe is below the interval evaluator's sign
-        // resolution, but strict concavity is already a quantitative
-        // optimality certificate. If f'' <= -mu < 0, then for the unique
-        // maximizer x* and any represented x,
-        //
-        //   f(x*) - f(x) <= f'(x)^2 / (2 mu).
-        //
-        // Evaluate that bound with directed intervals. This is the missing
-        // stopping rule in #2790: demanding a machine-scale LOCATION bracket
-        // after the exact objective gap is below the score evaluator's own
-        // forward error cannot add information. The returned category says
-        // resolution-flat optimum, not stationary point, so no KKT claim is
-        // manufactured from the cancellation-heavy derivative.
-        let point_score = certify_point(&mut sample, enclose)?.score;
-        if let Some((region, maximum)) = score_resolved_concave_maximum(
-            SearchNode { left, right },
-            enclosure,
-            sample.sample,
-            point_derivative,
-            root_curvature,
-            point_score,
-        ) {
-            return Ok(UniqueRootRefinement::ResolutionFlat { region, maximum });
-        }
-
         // The point derivative is itself unresolved at f64 precision. The
         // mean-value theorem gives THREE independent interval-Newton images of
         // the same unique root: one from the point and one from each signed
@@ -1208,6 +1183,25 @@ where
                 score,
                 curvature: root_curvature,
             }));
+        }
+        // If the Newton image cannot certify the requested location, strict
+        // concavity can still certify the score (#2790): for f'' <= -mu < 0,
+        // f(x*) - f(x) <= f'(x)^2 / (2 mu). Evaluate this bound with directed
+        // intervals against the score evaluator's own forward error.
+        //
+        // This value-only stopping rule must follow the root-width check:
+        // callers that require KKT stationarity need the stronger certificate
+        // whenever the same interval-Newton image already establishes it.
+        let point_score = certify_point(&mut sample, enclose)?.score;
+        if let Some((region, maximum)) = score_resolved_concave_maximum(
+            SearchNode { left, right },
+            enclosure,
+            sample.sample,
+            point_derivative,
+            root_curvature,
+            point_score,
+        ) {
+            return Ok(UniqueRootRefinement::ResolutionFlat { region, maximum });
         }
         if root.lo > left.sample.x || root.hi < right.sample.x {
             let mut new_left = if root.lo == sample.sample.x {
@@ -4503,6 +4497,64 @@ mod tests {
             .find(|point| point.bracket.contains(planted))
             .expect("the planted stationary point must be certified");
         assert!(stationary.bracket.hi - stationary.bracket.lo <= 1.0e-9);
+    }
+
+    #[test]
+    fn interval_newton_stationarity_is_not_preempted_by_a_resolved_score_gap() {
+        let planted = 0.25;
+        let resolution = 1.0e-9;
+        let mut unresolved_root_probes = 0;
+        let result = maximize_score_1d(
+            -1.0,
+            1.0,
+            resolution,
+            |x| -> Result<_, String> {
+                let shifted = x - planted;
+                Ok(ScoreJet {
+                    value: 1.0 - shifted * shifted,
+                    derivative: -2.0 * shifted,
+                    curvature: -2.0,
+                    third: 0.0,
+                })
+            },
+            |left, right| -> Result<_, String> {
+                let shifted = ClosedInterval::new(left.x, right.x)
+                    .sub(ClosedInterval::point(planted));
+                let value = ClosedInterval::point(1.0).sub(shifted.square());
+                // Certified roundoff leaves the derivative's sign unresolved
+                // at the root, while the interval-Newton image can still pin
+                // its location much more tightly than the requested width.
+                let derivative = shifted
+                    .scale(-2.0)
+                    .add(ClosedInterval::new(-1.0e-12, 1.0e-12));
+                if left.x == planted && right.x == planted {
+                    unresolved_root_probes += 1;
+                    assert!(derivative.contains_zero());
+                    assert!(derivative.lo < derivative.hi);
+                }
+                Ok(DerivativeEnclosure {
+                    score: ScoreValueEnclosure {
+                        value,
+                        evaluation_error: 1.0e-12,
+                    },
+                    derivative,
+                    curvature: ClosedInterval::point(-2.0),
+                })
+            },
+        )
+        .expect("the certified Newton image must retain the stationarity proof");
+        assert!(unresolved_root_probes > 0, "the ambiguous root must be probed");
+        let ScoreOptimumLocation::Stationary(index) = result.location else {
+            panic!(
+                "a resolved Newton root lost its stationarity proof: {:?}",
+                result.location
+            );
+        };
+        let point = result.stationary_points[index];
+        assert!(point.bracket.contains(planted));
+        assert!(point.bracket.hi - point.bracket.lo <= resolution);
+        assert!(point.curvature.hi < 0.0);
+        assert!(result.resolution_flat_regions.is_empty());
     }
 
     #[test]
