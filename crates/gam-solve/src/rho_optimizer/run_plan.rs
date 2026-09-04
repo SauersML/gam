@@ -157,6 +157,18 @@ fn eval_seed_restoring_rays(
             return Err(err);
         }
         let mut restored = seed.clone();
+        // A ray names a BLOCK, and a block's penalty strength is spread over
+        // `rho_count` coordinates. Raising every one of them by `ln r` closes
+        // the ray exactly; raising the subset that still has room raises the
+        // block's total strength by less, which is a step along the same
+        // direction and never the wrong way. Refusing the whole seed because
+        // ONE coordinate of the block sits at its ceiling threw away the others
+        // (gam#2695: the 1569 pair's rays span `rho[3..5]` and refuse on
+        // `rho[3]` alone), and the caller re-enters this loop, so a partial
+        // raise is re-evaluated and can be raised again — up to one restoration
+        // per rho coordinate.
+        let mut capped: Vec<(usize, f64, f64)> = Vec::new();
+        let mut raised_any = false;
         for j in ray.rho_indices() {
             let Some(current) = restored.get(j).copied() else {
                 return Err(err);
@@ -165,18 +177,49 @@ fn eval_seed_restoring_rays(
             // The closure may lie beyond the domain's ceiling: then the block
             // wants more strength than the model resolves, and the honest move
             // is to the ceiling itself (a block collapsing to its null space
-            // is a result, not a wall — #2812). A coordinate already at its
-            // ceiling cannot be raised, and the refusal stands.
+            // is a result, not a wall — #2812).
             let raised = (current + ray.log_strength_ratio).min(ceiling);
             if !(raised.is_finite() && raised > current) {
-                log::warn!(
-                    "[OUTER] {context}: seed {seed_idx} descends a ray on a coordinate already \
-                     at its domain ceiling (rho[{j}]={current:.4}, ceiling {ceiling:.4}); \
-                     refusing it as evaluated: {ray}"
-                );
-                return Err(err);
+                capped.push((j, current, ceiling));
+                continue;
             }
             restored[j] = raised;
+            raised_any = true;
+        }
+        if !raised_any {
+            // EVERY coordinate of the block is at its ceiling: no admissible
+            // strength closes this ray, and the refusal is the model's answer
+            // rather than a missed opportunity.
+            log::warn!(
+                "[OUTER] {context}: seed {seed_idx} descends a ray whose every coordinate is \
+                 already at its domain ceiling ({}); no admissible penalty strength closes it, \
+                 so refusing it as evaluated: {ray}",
+                capped
+                    .iter()
+                    .map(|(j, current, ceiling)| format!(
+                        "rho[{j}]={current:.4} vs ceiling {ceiling:.4}"
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return Err(err);
+        }
+        if !capped.is_empty() {
+            log::warn!(
+                "[OUTER] {context}: seed {seed_idx} raises the {} coordinate(s) of this block \
+                 that still have room and leaves {} at the ceiling ({}); the block gains less \
+                 than the ray's full {:.4}, which is a step along it, not past it",
+                ray.rho_count - capped.len(),
+                capped.len(),
+                capped
+                    .iter()
+                    .map(|(j, current, ceiling)| format!(
+                        "rho[{j}]={current:.4} vs ceiling {ceiling:.4}"
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                ray.log_strength_ratio,
+            );
         }
         log::warn!(
             "[OUTER] {context}: seed {seed_idx} is under-penalized, not failed — {ray}; \
