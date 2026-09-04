@@ -164,17 +164,23 @@ fn test_duchon_high_dim_single_matern_block_operator_jets_are_stable() {
 
     let jets = duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs).expect("jets");
 
-    // The point of this test is STABILITY of the production radial-jet path for a
-    // high-dimensional, low-smoothness single Matérn block (p=0, s=1, d=16) at a
-    // near-collision radius. For these orders the kernel is NOT C² at the origin
-    // (smoothness_order = 2·(p+s) = 2 ≤ d+2 = 18), so the RAW single-block
-    // operator scalars q, t genuinely DIVERGE as r→0: the bare block evaluator
-    // (`duchon_matern_operator_block_jets_with_ladder`) returns ~1e79..1e103 here
-    // — precisely the blow-up the production path (#1424/#1453) regularizes away.
-    // Demanding that `duchon_radial_jets` EQUAL that raw divergent block (the old
-    // assertion) was backwards: it pinned the unstable reference as the oracle.
-    // A stable result is a FINITE, non-exploding one that satisfies the operator
-    // consistency identities — mirroring the sibling
+    // A single Matérn block with p=0, s=1, d=16 sits below the kernel-existence
+    // threshold `2(p+s) > d` that `validate_duchon_collocation_orders` enforces
+    // for every production design: its spectrum `(κ²+|ω|²)^{-1}` is not
+    // integrable in 16 dimensions, the kernel is `~ r^{-14}` at the origin, and
+    // its operator scalars at a near-collision radius are astronomically large
+    // BECAUSE that is their value, not because an evaluator lost digits.
+    //
+    // The previous assertion here demanded `|q|, |t|, |φ''|, |lap| ≤ 1e6`. It
+    // held only because the single-integral evaluator of the time carried a
+    // `1/Γ(p)` prefactor, which is `1/Γ(0) = 0` for `p = 0`: every jet of this
+    // block was returned as exactly `0.0`, and the test pinned that silent zero
+    // as "regularization" (the same evaluator was 1 % off for half-integer `b`
+    // and 100 % off at large `κr`, see `duchon_radial_profile`). The reduction
+    // does not exist for `p = 0`, so the block now takes the bare partial-fraction
+    // path — a single Matérn block, no cancellation — and what this test can
+    // truthfully pin is that its jets are finite, non-zero, and satisfy the
+    // operator identities, mirroring the sibling
     // `test_duchon_high_dim_*_remain_finite_and_consistent` tests.
     assert!(jets.q.is_finite(), "q must be finite, got {}", jets.q);
     assert!(jets.t.is_finite(), "t must be finite, got {}", jets.t);
@@ -190,22 +196,13 @@ fn test_duchon_high_dim_single_matern_block_operator_jets_are_stable() {
         jets.phi_rr
     );
     assert!(jets.lap.is_finite(), "lap must be finite, got {}", jets.lap);
-
-    // Stability: the regularized scalars must NOT carry the raw block's
-    // astronomical near-origin magnitude. The kernel value φ and its admissible
-    // operator scalars are O(1) for this normalized block; a value > 1e6 would
-    // mean the divergence leaked through. (The raw block here is ~1e79.)
-    let stable_ceiling = 1.0e6;
     assert!(
-        jets.q.abs() <= stable_ceiling
-            && jets.t.abs() <= stable_ceiling
-            && jets.phi_rr.abs() <= stable_ceiling
-            && jets.lap.abs() <= stable_ceiling,
-        "regularized jets must stay bounded near the collision, got q={} t={} phi_rr={} lap={}",
+        jets.phi != 0.0 && jets.q != 0.0 && jets.t != 0.0,
+        "a p=0 block's jets are its own values, never the silent zero of 1/Γ(0): \
+         phi={} q={} t={}",
+        jets.phi,
         jets.q,
-        jets.t,
-        jets.phi_rr,
-        jets.lap
+        jets.t
     );
 
     // Internal operator-consistency identities the production jets must satisfy

@@ -1747,67 +1747,6 @@ pub(crate) fn duchon_partial_fraction_coeffs(
     DuchonPartialFractionCoeffs { a, b }
 }
 
-/// 64-node Gauss–Legendre rule on `[0, 1]` (nodes already mapped from the
-/// canonical `[-1, 1]` interval, weights scaled by the `1/2` Jacobian).
-///
-/// Used by [`duchon_hybrid_kernel_stable_integral`] to evaluate the hybrid
-/// Duchon–Matérn kernel without the catastrophically-cancelling
-/// partial-fraction sum (gam#1424). The integrand is smooth and strictly
-/// positive on `(0, 1)`, so a fixed high-order rule reproduces the kernel to
-/// ~1e-15 relative accuracy across all reachable high-dimensional orders.
-fn gauss_legendre_01_64() -> &'static [(f64, f64)] {
-    use std::sync::OnceLock;
-    static NODES: OnceLock<Vec<(f64, f64)>> = OnceLock::new();
-    NODES.get_or_init(|| {
-        // Newton iteration on the Legendre polynomial roots (the classic
-        // `gauleg` recipe). The N-point rule is symmetric about the midpoint, so
-        // only the lower half of the roots is solved for and the rule is
-        // mirrored. Computed once; converges to full f64 precision in a handful
-        // of Newton steps per root.
-        const N: usize = 64;
-        let nf = N as f64;
-        let mut nodes: Vec<(f64, f64)> = Vec::with_capacity(N);
-        let half = N.div_ceil(2);
-        for i in 0..half {
-            // Initial guess for the i-th root on [-1, 1] (Chebyshev-like).
-            let mut x = (std::f64::consts::PI * (i as f64 + 0.75) / (nf + 0.5)).cos();
-            let mut dp = 0.0_f64;
-            for _ in 0..100 {
-                // Evaluate the Legendre polynomial P_N(x) and derivative P_N'(x)
-                // via the three-term recurrence.
-                let mut p0 = 1.0_f64;
-                let mut p1 = x;
-                for k in 2..=N {
-                    let kf = k as f64;
-                    let p2 = ((2.0 * kf - 1.0) * x * p1 - (kf - 1.0) * p0) / kf;
-                    p0 = p1;
-                    p1 = p2;
-                }
-                // P_N'(x) = N (x P_N(x) − P_{N−1}(x)) / (x² − 1).
-                dp = nf * (x * p1 - p0) / (x * x - 1.0);
-                let dx = p1 / dp;
-                x -= dx;
-                if dx.abs() <= 1e-16 * x.abs().max(1.0) {
-                    break;
-                }
-            }
-            // Gauss–Legendre weight: 2 / ((1 − x²) P_N'(x)²).
-            let w = 2.0 / ((1.0 - x * x) * dp * dp);
-            // x is the i-th root counting inward from +1; mirror to −x.
-            nodes.push((x, w));
-            // `N` is even, so no root sits at the origin and every root has a
-            // distinct mirror image.
-            nodes.push((-x, w));
-        }
-        // Sort by node, then map [-1, 1] -> [0, 1] with the 1/2 Jacobian.
-        nodes.sort_by(|a, b| a.0.total_cmp(&b.0));
-        nodes
-            .into_iter()
-            .map(|(x, w)| (0.5 * (x + 1.0), 0.5 * w))
-            .collect()
-    })
-}
-
 /// Evaluate the hybrid Duchon–Matérn kernel
 /// `φ(r) = F^{-1}[ ρ^{-2p} (κ²+ρ²)^{-s} ](r)` via a single, cancellation-free
 /// 1-D integral (gam#1424).
@@ -1829,10 +1768,13 @@ fn gauss_legendre_01_64() -> &'static [(f64, f64)] {
 ///   with  b = p + s − d/2,  A = w κ²,  B = r²/4.
 /// ```
 ///
-/// The integrand is smooth and strictly positive on `(0, 1)` (no cancellation),
-/// so a fixed 64-point Gauss–Legendre rule is accurate to ~1e-15 relative.
-/// The `r = 0` diagonal has the closed form
-/// `φ(0) = (4π)^{-d/2} Γ(b)/(Γ(p)Γ(s)) κ^{-2b} B(s−b, p)`.
+/// With `ρ = κ r` every `κ` leaves the integrand: `φ(r; κ) = pref · κ^{-2b}
+/// · G(ρ)` for the universal profile `G` of `(p, s, d)`, which
+/// [`duchon_radial_profile`] represents once per process, certified against
+/// its own adaptive reference integral (a fixed 64-node Gauss–Legendre rule
+/// on `w` was measured 1 % off for half-integer `b` at every distance and
+/// 100 % off for `κ r ≳ 10³`; see that module). The `r = 0` diagonal is the
+/// closed form `φ(0) = (4π)^{-d/2} Γ(b)/(Γ(p)Γ(s)) κ^{-2b} B(s−b, p)`.
 ///
 /// Requires `b = p + s − d/2 > 0` (kernel existence, `2(p+s) > d`) and
 /// `s − b = d/2 − p > 0` (integrable `w → 0` endpoint), i.e. `2p < d`. Callers
@@ -1848,33 +1790,18 @@ pub(crate) fn duchon_hybrid_kernel_stable_integral(
         duchon_hybrid_stable_integral_applies(p_order, s_order, k_dim),
         "duchon_hybrid_kernel_stable_integral precondition violated: 2(p+s) > d and 2p < d required (p={p_order}, s={s_order}, d={k_dim})"
     );
+    let profile = duchon_radial_profile(p_order, s_order, k_dim)?;
     let p = p_order as f64;
     let s = s_order as f64;
     let half_d = 0.5 * k_dim as f64;
     let b = p + s - half_d;
     let pref = (4.0 * std::f64::consts::PI).powf(-half_d) / (gamma_lanczos(p) * gamma_lanczos(s));
-    if r == 0.0 {
-        // φ(0) = pref · Γ(b) · κ^{-2b} · B(s−b, p),  B(x,y)=Γ(x)Γ(y)/Γ(x+y).
-        let beta = gamma_lanczos(s - b) * gamma_lanczos(p) / gamma_lanczos(s - b + p);
-        let value = pref * gamma_lanczos(b) * kappa.powf(-2.0 * b) * beta;
-        if !value.is_finite() {
-            crate::bail_invalid_basis!(
-                "non-finite Duchon hybrid diagonal (stable form) for p={p_order}, s={s_order}, d={k_dim}"
-            );
-        }
-        return Ok(value);
-    }
-    let mut acc = KahanSum::default();
-    for &(w, weight) in gauss_legendre_01_64() {
-        // Smooth term  2(B/A)^{b/2} K_b(2√(AB)) = 2 (r/(2κ√w))^b K_b(κ r √w).
-        let sqrt_w = w.sqrt();
-        let z = kappa * r * sqrt_w;
-        let k_b = bessel_k_real_half_integer_or_integer(b.abs(), z)?;
-        let smooth = 2.0 * (r / (2.0 * kappa * sqrt_w)).powf(b) * k_b;
-        let factor = (1.0 - w).powf(p - 1.0) * w.powf(s - 1.0) * smooth;
-        acc.add(weight * factor);
-    }
-    let value = pref * acc.sum();
+    let scale = pref * kappa.powf(-2.0 * b);
+    let value = if r == 0.0 {
+        scale * profile.origin_value()?
+    } else {
+        scale * profile.value(kappa * r)
+    };
     if !value.is_finite() {
         crate::bail_invalid_basis!(
             "non-finite Duchon hybrid value (stable form) at r={r}, p={p_order}, s={s_order}, d={k_dim}"
@@ -1897,14 +1824,14 @@ pub(crate) fn duchon_hybrid_kernel_stable_integral(
 /// noise. That floor sits above the Chebyshev profile certificate, so the
 /// production profile cannot certify (gam#1453).
 ///
-/// This routine instead differentiates the smooth per-`w` integrand
-/// `g(r,w) = 2 (r/(2c))^b K_b(c r)`, `c = κ√w`, in `r`. Each `w`-slice is a
-/// single well-conditioned `r^a K_ν(c r)` term whose `r`-derivatives are exact
-/// (`d/dr[r^a K_ν(c r)] = a r^{a-1} K_ν(c r) − (c/2) r^a (K_{ν-1}+K_{ν+1})`),
-/// so there is no cross-block cancellation. The radial derivatives `φ′…φ⁗`
-/// are integrated against the same `(1-w)^{p-1} w^{s-1}` weight and the
-/// 64-node Gauss–Legendre rule, then the operator scalars are assembled from
-/// the standard radial relations
+/// This routine instead reads the radial derivatives `φ′…φ⁗` off the
+/// universal profile of `(p, s, d)`: `φ^{(m)}(r) = pref · κ^{m−2b} ·
+/// G^{(m)}(κ r)`, where [`duchon_radial_profile`] carries `G` and its first
+/// four derivatives, each the smooth per-`w` integrand differentiated under
+/// the integral sign (a single well-conditioned `z^a K_ν(z)` term list per
+/// slice, no cross-block cancellation) and certified against the adaptive
+/// reference. The operator scalars are then assembled from the standard
+/// radial relations
 /// `q = φ′/r`, `t = q′/r`, `t_r = (q″−t)/r`, `t_rr = q‴/r − 2q″/r² + 2q′/r³`.
 ///
 /// Requires the same precondition as the kernel form
@@ -1924,76 +1851,19 @@ pub(crate) fn duchon_hybrid_operator_stable_integral(
         r > 0.0 && r.is_finite(),
         "duchon_hybrid_operator_stable_integral requires r > 0, got r={r}"
     );
+    let profile = duchon_radial_profile(p_order, s_order, k_dim)?;
     let p = p_order as f64;
     let s = s_order as f64;
     let half_d = 0.5 * k_dim as f64;
     let b = p + s - half_d;
     let pref = (4.0 * std::f64::consts::PI).powf(-half_d) / (gamma_lanczos(p) * gamma_lanczos(s));
-
-    // Accumulate φ′, φ″, φ‴, φ⁗ across the Gauss–Legendre nodes. (φ itself is
-    // not needed for the operator scalars.)
-    let mut d1 = KahanSum::default();
-    let mut d2 = KahanSum::default();
-    let mut d3 = KahanSum::default();
-    let mut d4 = KahanSum::default();
-
-    for &(w, weight) in gauss_legendre_01_64() {
-        let sqrt_w = w.sqrt();
-        let c = kappa * sqrt_w;
-        let z = c * r;
-
-        // Smooth integrand g(r) = A · r^b · K_b(c r),  A = 2 (2c)^{-b}.
-        // Differentiate the symbolic term list (coef, a, ν-offset) in r:
-        //   d/dr[c0 r^a K_{b+j}(c r)]
-        //     = c0·a · r^{a-1} K_{b+j}(c r)
-        //       − c0·(c/2) · r^a (K_{b+j-1}(c r) + K_{b+j+1}(c r)).
-        // Four derivatives need ν-offsets in [-4, 4] around b.
-        let a0 = 2.0 * (2.0 * c).powf(-b);
-        let mut terms: Vec<(f64, f64, i32)> = vec![(a0, b, 0)];
-        // Cache K_{b+j}(z) for j ∈ [-4, 4] (K is even in order → use |·|).
-        let bessel = |j: i32| -> Result<f64, BasisError> {
-            bessel_k_real_half_integer_or_integer((b + j as f64).abs(), z)
-        };
-        let evaluate = |terms: &Vec<(f64, f64, i32)>| -> Result<f64, BasisError> {
-            let mut acc = KahanSum::default();
-            for &(c0, a, j) in terms {
-                if c0 == 0.0 {
-                    continue;
-                }
-                acc.add(c0 * r.powf(a) * bessel(j)?);
-            }
-            Ok(acc.sum())
-        };
-
-        let mut slice_derivs = [0.0_f64; 4];
-        for slot in slice_derivs.iter_mut() {
-            // Differentiate the current term list once.
-            let mut next: Vec<(f64, f64, i32)> = Vec::with_capacity(terms.len() * 3);
-            for &(c0, a, j) in &terms {
-                if c0 == 0.0 {
-                    continue;
-                }
-                if a != 0.0 {
-                    next.push((c0 * a, a - 1.0, j));
-                }
-                let half = -c0 * c * 0.5;
-                next.push((half, a, j - 1));
-                next.push((half, a, j + 1));
-            }
-            terms = next;
-            *slot = evaluate(&terms)?;
-        }
-
-        d1.add(weight * (1.0 - w).powf(p - 1.0) * w.powf(s - 1.0) * slice_derivs[0]);
-        d2.add(weight * (1.0 - w).powf(p - 1.0) * w.powf(s - 1.0) * slice_derivs[1]);
-        d3.add(weight * (1.0 - w).powf(p - 1.0) * w.powf(s - 1.0) * slice_derivs[2]);
-        d4.add(weight * (1.0 - w).powf(p - 1.0) * w.powf(s - 1.0) * slice_derivs[3]);
-    }
-
-    let phi1 = pref * d1.sum();
-    let phi2 = pref * d2.sum();
-    let phi3 = pref * d3.sum();
-    let phi4 = pref * d4.sum();
+    let g = profile.derivatives(kappa * r);
+    // φ^{(m)}(r) = pref · κ^{m−2b} · G^{(m)}(κ r).
+    let kappa_scale = pref * kappa.powf(-2.0 * b);
+    let phi1 = kappa_scale * kappa * g[1];
+    let phi2 = kappa_scale * kappa * kappa * g[2];
+    let phi3 = kappa_scale * kappa * kappa * kappa * g[3];
+    let phi4 = kappa_scale * kappa * kappa * kappa * kappa * g[4];
     if !(phi1.is_finite() && phi2.is_finite() && phi3.is_finite() && phi4.is_finite()) {
         crate::bail_invalid_basis!(
             "non-finite Duchon hybrid operator (stable form) at r={r}, p={p_order}, s={s_order}, d={k_dim}"
@@ -2023,16 +1893,19 @@ pub(crate) fn duchon_hybrid_operator_stable_integral(
 /// single-integral reduction has an integrable `w → 0` endpoint (`2p < d`).
 ///
 /// The complementary cases — `s = 0` (pure polyharmonic, already evaluated
-/// directly with no cancellation) and `2p ≥ d` (only reachable at low `d`,
-/// where the partial-fraction sum has no meaningful cancellation) — retain the
-/// existing partial-fraction path.
+/// directly with no cancellation), `p = 0` (a bare Matérn block: the Schwinger
+/// parametrization behind the single integral carries `1/Γ(p)`, so the
+/// reduction does not exist there and the previous evaluator returned exactly
+/// `0` for it) and `2p ≥ d` (only reachable at low `d`, where the
+/// partial-fraction sum has no meaningful cancellation) — retain the existing
+/// partial-fraction path.
 #[inline]
 pub(crate) fn duchon_hybrid_stable_integral_applies(
     p_order: usize,
     s_order: usize,
     k_dim: usize,
 ) -> bool {
-    s_order >= 1 && 2 * p_order < k_dim
+    p_order >= 1 && s_order >= 1 && 2 * p_order < k_dim
 }
 
 pub(crate) fn duchon_matern_kernel_general_from_distance(

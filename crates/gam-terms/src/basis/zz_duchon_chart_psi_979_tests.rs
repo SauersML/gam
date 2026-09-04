@@ -391,6 +391,7 @@ fn operator_penalty_gaps(
         let name = format!("{source:?}");
         let mut best_gap = f64::INFINITY;
         let mut fd_norm = 0.0;
+        let mut differences: Vec<Array2<f64>> = Vec::new();
         for &h in &[2.0e-3_f64, 1.0e-3] {
             let plus = forward_operator_penalties(&collocation, &centers, &spec_at_psi(spec, h));
             let minus = forward_operator_penalties(&collocation, &centers, &spec_at_psi(spec, -h));
@@ -410,6 +411,28 @@ fn operator_penalty_gaps(
             if gap < best_gap {
                 best_gap = gap;
                 fd_norm = frobenius(&fd);
+            }
+            differences.push(fd);
+        }
+        // The two central differences are second-order in `h`; their
+        // Richardson combination `fd_h + (fd_h − fd_2h)/3` cancels the `h²`
+        // truncation and is fourth-order. Measured 2026-09-04 at 3-D order 0
+        // power 9 once the hybrid kernel was evaluated exactly
+        // (`duchon_radial_profile`): the mass gap fell 3.71e-3 → 9.27e-4 as `h`
+        // halved (the `h²` law) while the extrapolated difference met the
+        // analytic jets to `1e-5` — the forward's own third ψ-derivative, not
+        // the jets, is what a step of `1e-3` cannot resolve there.
+        if let [coarse, fine] = differences.as_slice() {
+            let extrapolated = fine + &((fine - coarse) / 3.0);
+            let gap = frobenius(&(analytic - &extrapolated)) / frobenius(&extrapolated).max(1e-300);
+            eprintln!(
+                "[{label}] {name} richardson |an|={:.6e} |fd|={:.6e} gap={gap:.3e}",
+                frobenius(analytic),
+                frobenius(&extrapolated)
+            );
+            if gap < best_gap {
+                best_gap = gap;
+                fd_norm = frobenius(&extrapolated);
             }
         }
         out.push((name, fd_norm, best_gap));
