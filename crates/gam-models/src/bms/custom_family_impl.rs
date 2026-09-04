@@ -1101,6 +1101,30 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 } else {
                     None
                 };
+                // The fast path cannot form the explicit Jeffreys ψ-CURVATURE
+                // `∂²_ψΦ` (gam#979). The reference carries it on every drift it
+                // builds — `drift.dense = explicit_jeffreys_hphi` on the
+                // operator branch, `dense_b += &explicit_hphi` on the dense one
+                // — and `HyperCoordDrift`'s own `materialize`/`scaled_add_apply`
+                // treat `dense`, `block_local` and `operator` as three ADDITIVE
+                // contributions. This loop adds only the latter two, so with
+                // the term live its `trace_h_inv_hdot` is short by exactly
+                // `trace_logdet_gradient(∂²_ψΦ)`: measured at
+                // `psi[1] rel = 4.132e-3` against a `1e-10` gate, the
+                // difference agreeing with that single term to 15 significant
+                // figures.
+                //
+                // Forming it needs `D_β(∂_ψH)[e_a]` for every coefficient axis
+                // — the object the ψ-hyper build exists to batch — so a fast
+                // path that produced it would not be one. An optimization that
+                // changes the answer is not an optimization, so this declines
+                // and the caller evaluates on the reference hypercoord path,
+                // which carries the term. Firth-inactive fits (every fit where
+                // `jeffreys_plan` is `None`, including this issue's rigid
+                // marginal-slope arm) are untouched and keep the fast path.
+                if firth_pert_info.is_some() {
+                    return Ok(None);
+                }
                 let firth_weights = match (jeffreys_plan.as_ref(), firth_pert_info.as_ref()) {
                     (Some(plan), Some(pert_info)) => {
                         Some(plan.explicit_param_mixed_trace_weights(pert_info)?)

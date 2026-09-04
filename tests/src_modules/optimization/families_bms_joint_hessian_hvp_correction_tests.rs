@@ -1717,10 +1717,22 @@ fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
         .exact_newton_joint_psi_workspace_with_options(&states, &specs, &hyper_layout, &opts)
         .expect("psi workspace")
         .expect("psi workspace some");
-    let batched = family
+    // gam#979: the fast path DECLINES where it cannot form the explicit
+    // Jeffreys ψ-curvature `∂²_ψΦ` the reference carries in `drift.dense`,
+    // rather than returning a `trace_h_inv_hdot` short by that term. A decline
+    // is therefore a pass — but only in that regime, so the alternative is
+    // asserted rather than assumed: any other decline still fails here.
+    let Some(batched) = family
         .batched_outer_gradient_terms(&states, &specs, &hyper_layout, &rho, &opts, None)
         .expect("batched outer gradient")
-        .expect("batched terms some");
+    else {
+        assert!(
+            family.joint_jeffreys_term_required(),
+            "the batched outer gradient declined on a fixture with no Jeffreys term, so the \
+             decline cannot be the explicit-ψ curvature it is allowed to decline for"
+        );
+        return;
+    };
 
     let ranges = BernoulliMarginalSlopeFamily::block_ranges_from_specs(&specs);
     let total = ranges.last().map(|(_, end)| *end).expect("nonempty specs");

@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The Bernoulli marginal-slope batched outer gradient no longer returns a `trace_h_inv_hdot` short by the explicit Jeffreys ψ-curvature, which the reference hypercoord path carries in the drift's `dense` part and this path never added: it declines in that regime so the caller evaluates on the reference. Firth-inactive fits keep the fast path. The agreement gate had been red since 2026-07-31 at `rel = 4.132e-3` against `1e-10` (#979, #1607).
+
 - The Bernoulli marginal-slope ψ-cross rank-1 accumulator reads its two design rows into per-worker scratch instead of allocating and freeing two one-row matrices on every call; the ψ-hyper build makes that call three times per axis pair per row, and it was 6.9 % of the rigid arm's profile in `_int_malloc`/`_int_free` (#979).
 
 ### Fixed
