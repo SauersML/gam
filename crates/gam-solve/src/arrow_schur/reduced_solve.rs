@@ -2403,7 +2403,7 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                 let eval = match entry_evaluation.take() {
                     Some(eval) => eval,
                     None => plan
-                        .evaluate_preconditioned(
+                        .evaluate_family_preconditioned(
                             &matvec,
                             &precond,
                             state.cfg.cg_rel_tol,
@@ -2624,7 +2624,7 @@ pub fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     // #2576: the exact diag(S) is reachable from `resident` and measured NOT to
     // reduce iterations — see the refutation note at the surrogate-core call site.
     let precond = reduced_schur_shifted_preconditioner(sys, ridge_beta);
-    let eval = plan.evaluate_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
+    let eval = plan.evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
     Some((plan, eval))
 }
 
@@ -2712,7 +2712,7 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     let precond = reduced_schur_shifted_preconditioner(sys, ridge_beta);
     // Rank-0 pilot: fixes the |log|S|| scale and is the answer outright when no
     // deflation is requested or the bare bar already clears the target.
-    let pilot = base_plan.evaluate_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
+    let pilot = base_plan.evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
     if deflation_max_rank == 0 {
         return Some(DerivedRationalLogdetPlan {
             plan: base_plan,
@@ -2760,7 +2760,7 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
             seed,
             (basis_cg_rel_tol, cg_max_iters),
         )?;
-        let eval = plan.evaluate_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
+        let eval = plan.evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
         if eval.std_err <= target {
             return Some(DerivedRationalLogdetPlan {
                 plan,
@@ -2875,6 +2875,283 @@ pub fn reduced_schur_logdet_preconditioner_study<B: BatchedBlockSolver + Sync>(
         });
     }
     Some(out)
+}
+
+/// What one quadrature node of the shifted-solve ladder cost, and what the
+/// operator looked like there.
+#[derive(Debug, Clone)]
+pub struct ShiftLadderNodeProfile {
+    /// Position of this node in the ladder's DESCENDING walk (0 = largest shift,
+    /// solved first and cold; the rest are warm-started from their predecessor).
+    pub ladder_position: usize,
+    /// The shift `t_ℓ`.
+    pub shift: f64,
+    /// The quadrature weight `w_ℓ`.
+    pub weight: f64,
+    /// Iterations summed over every right-hand side solved at this node.
+    pub iterations: usize,
+    /// Largest single-solve iteration count at this node.
+    pub max_solve_iterations: usize,
+    /// Ritz condition estimate `θ_max/θ_min` of the PRECONDITIONED shifted
+    /// operator, read off the CG coefficients of this node's longest solve. `None`
+    /// when that solve converged before resolving two Ritz values.
+    pub krylov_condition: Option<f64>,
+}
+
+/// The complete work profile of one rational log-determinant evaluation, node by
+/// node, plus the residual history of its single most expensive solve.
+///
+/// This is the #2576 discriminator. The issue's headline evidence — "loosening
+/// the CG tolerance from 1e-8 to 1e-4 changes nothing" — is equally consistent
+/// with a solve stagnating at its iteration cap and a solve converging so fast
+/// that four decades of tolerance cost a handful of iterations, and those need
+/// opposite repairs. The two are told apart by the residual CURVE (geometric
+/// decay versus a flat line) and by the Ritz spectrum the same solve hands over
+/// for free. Neither existed before: the evaluation reported one summed
+/// iteration count and nothing else.
+#[derive(Debug, Clone)]
+pub struct ShiftLadderProfile {
+    /// One row per quadrature node, in ladder (descending-shift) order.
+    pub nodes: Vec<ShiftLadderNodeProfile>,
+    /// The surrogate value this evaluation produced.
+    pub log_det: f64,
+    /// Its Hutchinson error bar.
+    pub std_err: f64,
+    /// Iterations over the whole ladder — the quantity the existing
+    /// [`reduced_schur_logdet_preconditioner_study`] reports as a single number.
+    pub total_iterations: usize,
+    /// Full residual and coefficient history of the ladder's most expensive
+    /// single solve. This one is WARM-STARTED from the node above it, so its
+    /// curve begins wherever the previous shift's solution left it.
+    pub hardest_solve: ShiftedPcgTrace,
+    /// One COLD solve at the ladder's smallest shift, from a zero start, on the
+    /// first probe.
+    ///
+    /// This is the honest price of the family: the smallest shift is the
+    /// worst-conditioned member, and a Krylov space built from the right-hand
+    /// side alone — no warm start — is what any evaluator that serves all shifts
+    /// from ONE space must pay. It is also the trace whose residual curve is
+    /// interpretable, since it starts at `‖r‖/‖b‖ = 1` rather than wherever the
+    /// previous node's solution happened to land.
+    pub cold_seed_solve: ShiftedPcgTrace,
+    /// The same cold seed solve with NO diagonal, i.e. on the raw operator.
+    ///
+    /// A shifted family shares its Krylov space only when nothing shift-dependent
+    /// is applied to it, and this module's diagonal is `1/(d + t)` — shift
+    /// dependent by construction. So the two cold traces price the two ways to
+    /// serve the family from one space: rescale the operator by its diagonal ONCE
+    /// (and carry `Σ ln d_g` in the value), or keep the operator and pay the raw
+    /// conditioning. Which is cheaper is a measurement, not an argument.
+    pub cold_seed_solve_undiagonalized: ShiftedPcgTrace,
+    /// `|vᵀSw − wᵀSv| / (‖Sv‖·‖w‖)` on a deterministic probe pair. CG is only
+    /// valid on a symmetric operator, so a non-negligible value here means no
+    /// preconditioner can help and the algorithm itself is wrong for the problem.
+    pub symmetry_defect: f64,
+    /// The `[λ_min, λ_max]` bracket the plan was sized from. `λ_min` is the
+    /// deflation-floor convention `SPECTRAL_DEFLATION_REL_FLOOR·λ_max`, i.e. an
+    /// ASSUMED lower bound, not a measurement — comparing it against
+    /// `hardest_solve`'s smallest Ritz value is how one sees whether the
+    /// quadrature window is sized for a spectrum the operator does not have.
+    pub bracket: (f64, f64),
+}
+
+impl ShiftLadderProfile {
+    /// Iterations of the single hardest solve, against the whole ladder's total.
+    ///
+    /// A shifted family `(S + t_ℓ I)` spans ONE Krylov space for every `t_ℓ`, so
+    /// a multi-shift Krylov evaluator would pay the hardest solve and get the
+    /// rest as vector updates. This ratio is exactly what such a change could
+    /// win, and it is a measurement rather than an argument.
+    #[must_use]
+    pub fn ladder_concentration(&self) -> f64 {
+        let hardest = self.hardest_solve.iterations().max(1) as f64;
+        self.total_iterations as f64 / hardest
+    }
+
+    /// The applies ONE right-hand side may cost, given the operator's own
+    /// conditioning and the plan's own node count:
+    ///
+    /// ```text
+    /// ½·√κ·ln(2/rel_tol)  +  node_count
+    /// ```
+    ///
+    /// — the textbook CG bound for a single solve at the conditioning `κ` the
+    /// cold seed measured, plus one certification apply per node. Nothing here is
+    /// chosen: `κ` is read off the seed's Ritz values and the node count is the
+    /// plan's, so a better-conditioned operator or a coarser quadrature moves the
+    /// budget on its own.
+    ///
+    /// `κ` is the UNDIAGONALIZED seed's, because that is the space a family
+    /// evaluator can actually share: the diagonal here is `1/(diag(S) + t)` and
+    /// anything shift-dependent destroys the shift invariance the one-space
+    /// argument rests on. The diagonal remains available to the single-shift
+    /// repair path, where one fixed `t` makes it a preconditioner again.
+    ///
+    /// `None` when the cold seed resolved no spectrum.
+    #[must_use]
+    pub fn one_krylov_space_apply_budget(&self) -> Option<f64> {
+        Some(
+            self.cold_seed_solve_undiagonalized
+                .conditioning_iteration_bound()?
+                + self.nodes.len() as f64,
+        )
+    }
+}
+
+/// Profile one evaluation of the evidence lane's frozen rational
+/// log-determinant plan: what every quadrature node cost, and what the operator
+/// looked like at the node that cost the most.
+///
+/// Builds the plan, operator and preconditioner exactly as
+/// [`rational_reduced_schur_log_det`] does — same bracket, same probes, same
+/// nodes, same shared-block diagonal — and then evaluates it through a recording
+/// shifted solver. `RationalLogdetPlan::evaluate_with_shifted_solver` is the seam
+/// that makes this possible without a second copy of the ladder: the statistical
+/// functional is untouched and only the numerical inverse is instrumented, so
+/// the `log_det` this reports is the one production computes.
+///
+/// `None` on the same conditions as [`rational_reduced_schur_log_det`].
+pub fn reduced_schur_logdet_shift_ladder_profile<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    ridge_beta: f64,
+    backend: &B,
+    resident: Option<&SaeResidentReducedSchur>,
+    num_probes: usize,
+    seed: u64,
+    rel_tol: f64,
+    power_iters: usize,
+    cg_rel_tol: f64,
+    cg_max_iters: usize,
+) -> Option<ShiftLadderProfile> {
+    let k = sys.k;
+    if k == 0 {
+        return None;
+    }
+    let lambda_max = reduced_schur_lambda_max(
+        sys,
+        htt_factors,
+        ridge_beta,
+        backend,
+        resident,
+        None,
+        power_iters,
+        seed,
+    )?;
+    let lambda_min = (SPECTRAL_DEFLATION_REL_FLOOR * lambda_max).max(f64::MIN_POSITIVE);
+    let plan = RationalLogdetPlan::build(k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
+    let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident);
+    let matvec = |v: ArrayView1<f64>| -> Array1<f64> { op.apply(v) };
+    let precond = reduced_schur_shifted_preconditioner(sys, ridge_beta);
+
+    // (b) in the #2576 fault taxonomy: CG on a non-symmetric operator cannot be
+    // rescued by any preconditioner. Two deterministic probes, no RNG plumbing:
+    // an alternating-sign vector and a linear ramp are not related by any
+    // symmetry of an arrow system, so `vᵀSw = wᵀSv` here is a real test.
+    let mut v = Array1::<f64>::zeros(k);
+    let mut w = Array1::<f64>::zeros(k);
+    for index in 0..k {
+        v[index] = if index % 2 == 0 { 1.0 } else { -1.0 };
+        w[index] = (index as f64 + 1.0) / (k as f64);
+    }
+    let sv = matvec(v.view());
+    let sw = matvec(w.view());
+    let scale = (sv.dot(&sv).sqrt() * w.dot(&w).sqrt()).max(f64::MIN_POSITIVE);
+    let symmetry_defect = (w.dot(&sv) - v.dot(&sw)).abs() / scale;
+
+    // `(ladder_position, shift, iterations-per-solve, trace of the longest solve)`
+    // accumulated by the recording solver. The ladder walks nodes in descending
+    // shift order and every solve at one node happens before the next node's, so
+    // the recorded order IS the ladder position order.
+    type LadderRecord = (f64, Vec<usize>, ShiftedPcgTrace);
+    let recorded: std::sync::Mutex<Vec<LadderRecord>> = std::sync::Mutex::new(Vec::new());
+    let solve = |shift: f64, rhs: &Array1<f64>, warm: &Array1<f64>| {
+        let (outcome, trace) =
+            shifted_pcg_traced(&matvec, &precond, shift, rhs, warm, cg_rel_tol, cg_max_iters);
+        let iterations = trace.iterations();
+        let mut log = recorded.lock().ok()?;
+        match log.last_mut() {
+            Some(entry) if entry.0 == shift => {
+                entry.1.push(iterations);
+                if iterations > entry.2.iterations() {
+                    entry.2 = trace;
+                }
+            }
+            _ => log.push((shift, vec![iterations], trace)),
+        }
+        drop(log);
+        outcome
+    };
+    let eval = plan.evaluate_with_shifted_solver(&solve)?;
+    let log = recorded.into_inner().ok()?;
+
+    // The cold seed: the ladder's SMALLEST shift, first probe, zero start. Every
+    // solve above was warm-started from the node before it, so none of them
+    // prices what a single Krylov space costs from scratch — which is exactly
+    // the quantity a one-space evaluator would pay, and the only trace whose
+    // residual curve starts at 1 and is therefore readable as a convergence
+    // history.
+    let seed_shift = plan
+        .nodes
+        .iter()
+        .map(|(t, _)| *t)
+        .fold(f64::INFINITY, f64::min);
+    let cold_start = Array1::<f64>::zeros(k);
+    let (_, cold_seed_solve) = shifted_pcg_traced(
+        &matvec,
+        &precond,
+        seed_shift,
+        plan.probes.first()?,
+        &cold_start,
+        cg_rel_tol,
+        cg_max_iters,
+    );
+    let (_, cold_seed_solve_undiagonalized) = shifted_pcg_traced(
+        &matvec,
+        &ShiftedDiagonalPreconditioner::identity(),
+        seed_shift,
+        plan.probes.first()?,
+        &cold_start,
+        cg_rel_tol,
+        cg_max_iters,
+    );
+
+    let weight_of = |shift: f64| -> f64 {
+        plan.nodes
+            .iter()
+            .find(|(t, _)| *t == shift)
+            .map(|(_, w)| *w)
+            .unwrap_or(f64::NAN)
+    };
+    let mut hardest = ShiftedPcgTrace::default();
+    let mut nodes = Vec::with_capacity(log.len());
+    let mut total_iterations = 0usize;
+    for (ladder_position, (shift, per_solve, trace)) in log.into_iter().enumerate() {
+        let iterations: usize = per_solve.iter().sum();
+        total_iterations += iterations;
+        if trace.iterations() > hardest.iterations() {
+            hardest = trace.clone();
+        }
+        nodes.push(ShiftLadderNodeProfile {
+            ladder_position,
+            shift,
+            weight: weight_of(shift),
+            iterations,
+            max_solve_iterations: per_solve.iter().copied().max().unwrap_or(0),
+            krylov_condition: trace.krylov_condition_estimate(),
+        });
+    }
+    Some(ShiftLadderProfile {
+        nodes,
+        log_det: eval.estimate,
+        std_err: eval.std_err,
+        total_iterations,
+        hardest_solve: hardest,
+        cold_seed_solve,
+        cold_seed_solve_undiagonalized,
+        symmetry_defect,
+        bracket: (lambda_min, lambda_max),
+    })
 }
 
 /// Convergence certificate for one matrix-free reduced-Schur CG solve.

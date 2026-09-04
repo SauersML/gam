@@ -132,7 +132,10 @@ pub struct RationalLogdetEval {
     /// this evaluation; empty without deflation, and possibly shorter than the
     /// requested rank if the block collapsed.
     pub deflation_basis: Vec<Array1<f64>>,
-    /// Total CG iterations spent (diagnostic).
+    /// Total OPERATOR APPLIES spent (diagnostic). Under the family evaluator
+    /// this counts the seed Krylov steps, the per-node certification apply, and
+    /// any single-shift repair — i.e. the true cost, not an iteration count that
+    /// would omit the certifications.
     pub cg_iterations: usize,
 }
 
@@ -350,18 +353,25 @@ impl RationalLogdetPlan {
 
     /// Evaluate the surrogate `L̃ ≈ log det S` through `matvec(v) = S·v`.
     ///
-    /// Each shifted system is solved by plain CG to normwise backward error
-    /// `cg_rel_tol`, walking the shift ladder from the largest `t` (near-trivial
-    /// solves) down to the smallest, warm-starting each solve from the previous
-    /// shift's solution for the same probe. A stricter RHS-relative residual
-    /// also terminates the solve when it is attainable.
+    /// The whole quadrature ladder is served from ONE Krylov space per
+    /// right-hand side (`solve_shift_family`). A shift adds a multiple of the
+    /// identity and therefore changes no polynomial's span, so
+    /// `K_m(S + t_ℓ I, v)` is the SAME subspace for every node: rebuilding it
+    /// per node — which is what a per-shift ladder does, warm starts and all —
+    /// pays `node_count` times for one piece of information (#2576).
+    ///
+    /// Every returned solution still meets the same true-residual certificate
+    /// `shifted_pcg` enforces, and any that does not is finished by that same
+    /// solve. The functional is untouched: probes, quadrature nodes and the
+    /// frozen deflation basis are the plan's, and only the numerical means of
+    /// inverting each shifted system changes.
     pub fn evaluate(
         &self,
         matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
         cg_rel_tol: f64,
         cg_max_iters: usize,
     ) -> Option<RationalLogdetEval> {
-        self.evaluate_preconditioned(
+        self.evaluate_family_preconditioned(
             matvec,
             &IDENTITY_SHIFT_PRECONDITIONER,
             cg_rel_tol,
@@ -369,7 +379,79 @@ impl RationalLogdetPlan {
         )
     }
 
-    /// Evaluate with a diagonal preconditioner on the shifted solves.
+    /// [`Self::evaluate`] with a diagonal available to the single-shift repair
+    /// path.
+    ///
+    /// The family solve itself is necessarily undiagonalized — this module's
+    /// diagonal is `1/(diag(S) + t)`, which is shift-DEPENDENT, and applying
+    /// anything shift-dependent is exactly what destroys the shared Krylov space
+    /// the family solve exists to exploit. A shift whose multi-shift iterate
+    /// misses its certificate is finished by a single-shift `shifted_pcg`,
+    /// where one fixed `t` makes the diagonal a legitimate preconditioner again.
+    pub fn evaluate_family_preconditioned(
+        &self,
+        matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
+        repair_preconditioner: &ShiftedDiagonalPreconditioner,
+        cg_rel_tol: f64,
+        cg_max_iters: usize,
+    ) -> Option<RationalLogdetEval> {
+        let shifts: Vec<f64> = self.nodes.iter().map(|(t, _)| *t).collect();
+        let solve_family = |rhs: &Array1<f64>| {
+            solve_shift_family(
+                matvec,
+                repair_preconditioner,
+                &shifts,
+                rhs,
+                cg_rel_tol,
+                cg_max_iters,
+            )
+        };
+        self.evaluate_with_family_solver(&solve_family)
+    }
+
+    /// Evaluate this frozen rational functional with a caller-owned solver for
+    /// the WHOLE shifted family at one right-hand side.
+    ///
+    /// `solve(rhs)` must return one converged solution per quadrature node, in
+    /// `self.nodes` order, and the number of operator applies it spent. This is
+    /// the seam a structured or device-resident family evaluator plugs into
+    /// without touching the criterion.
+    pub fn evaluate_with_family_solver(
+        &self,
+        solve: &(impl Fn(&Array1<f64>) -> Option<(Vec<Array1<f64>>, usize)> + Sync),
+    ) -> Option<RationalLogdetEval> {
+        // FROZEN top-subspace deflation basis Q (empty without a DeflationSpec).
+        let basis: &[Array1<f64>] = self
+            .deflation
+            .as_ref()
+            .map(|d| d.basis.as_slice())
+            .unwrap_or(&[]);
+        let probes_proj = self.projected_probes(basis);
+        let (shifted, applies_probe) =
+            solve_family_block(solve, self.nodes.len(), &probes_proj)?;
+        let (deflation_solves, applies_basis) = if basis.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            solve_family_block(solve, self.nodes.len(), basis)?
+        };
+        self.assemble_eval(
+            probes_proj,
+            basis,
+            shifted,
+            deflation_solves,
+            applies_probe + applies_basis,
+        )
+    }
+
+    /// The PER-SHIFT baseline: one preconditioned CG per quadrature node, walked
+    /// from the largest shift down with warm starts.
+    ///
+    /// This is what the evidence lane ran before #2576's measurement, and it is
+    /// retained as the measurement's control arm — [`super::reduced_schur_logdet_shift_ladder_profile`]
+    /// takes its per-node breakdown, and the family evaluator is required to
+    /// agree with it on the value. It is not the production route: rebuilding a
+    /// Krylov space per node pays `node_count` times for a subspace that does not
+    /// depend on the shift at all (see [`Self::evaluate`]).
     ///
     /// The plan is the STATISTICAL functional — probes, quadrature nodes,
     /// deflation basis — and the shifted inverse is the NUMERICAL means of
@@ -377,10 +459,7 @@ impl RationalLogdetPlan {
     /// this returns is the same function of the operator that
     /// [`Self::evaluate`] returns, converged to the same certified residual,
     /// and its `Self::directional_derivative` is still that value's exact
-    /// gradient. What changes is how many iterations each shifted solve takes:
-    /// on an operator whose diagonal spans orders of magnitude — the
-    /// overcomplete arrow border's atom firing counts — that is the difference
-    /// between converging and running to the iteration cap (#2576).
+    /// gradient.
     pub fn evaluate_preconditioned(
         &self,
         matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
@@ -733,6 +812,323 @@ fn shifted_pcg(
     rel_tol: f64,
     max_iters: usize,
 ) -> Option<(Array1<f64>, usize)> {
+    // The production solve is the recorder-free instantiation: `record` is a
+    // no-op closure, so the monomorphized loop is the loop this function always
+    // ran. There is exactly ONE shifted-solve implementation and one
+    // convergence certificate; the trace cannot describe a different iteration
+    // from the one that produced the value.
+    shifted_pcg_core(
+        matvec,
+        preconditioner,
+        t,
+        b,
+        y0,
+        rel_tol,
+        max_iters,
+        &mut |_: ShiftedPcgStep| {},
+    )
+}
+
+/// One recorded step of the shifted-PCG recurrence: the residual entering the
+/// step and the two CG scalars that step produced.
+///
+/// These three numbers are everything the #2576 diagnosis needs. `residual_norm`
+/// is the convergence curve; `(alpha, beta)` are the CG coefficients, from which
+/// the Lanczos tridiagonal of the PRECONDITIONED shifted operator — and hence
+/// its Ritz spectrum and condition estimate — follow exactly, at no extra
+/// matvec.
+#[derive(Clone, Copy, Debug)]
+pub struct ShiftedPcgStep {
+    /// `‖r_j‖` (recursive CG residual) entering the step.
+    pub residual_norm: f64,
+    /// CG step length `α_j = rᵀz / pᵀAp`.
+    pub alpha: f64,
+    /// CG direction weight `β_j = r_{j+1}ᵀz_{j+1} / rᵀz`.
+    pub beta: f64,
+    /// True when the reliable-residual replacement restarted the recurrence
+    /// immediately before this step. The CG↔Lanczos identity holds only within a
+    /// restart-free run, so a trace reads its tridiagonal off the longest such
+    /// segment.
+    pub restarted: bool,
+}
+
+/// The convergence history of one shifted-PCG solve.
+///
+/// #2576's headline evidence was that loosening the CG tolerance by four orders
+/// of magnitude did not shorten the solve, which is consistent with two opposite
+/// situations — a solve stagnating at its cap, and a solve converging so fast
+/// that the last four decades cost a handful of iterations. Those need opposite
+/// repairs, and nothing in this crate could tell them apart, because the solve
+/// reported only a total iteration count. This records the curve itself.
+#[derive(Clone, Debug, Default)]
+pub struct ShiftedPcgTrace {
+    /// The shift `t` this solve ran at.
+    pub shift: f64,
+    /// `‖b‖`, the denominator of every relative residual below.
+    pub rhs_norm: f64,
+    /// The requested relative-residual target.
+    pub rel_tol: f64,
+    /// One entry per step actually taken.
+    pub steps: Vec<ShiftedPcgStep>,
+    /// True when the solve returned a certified iterate (`shifted_pcg` returning
+    /// `Some`); false when it refused (cap exhaustion or breakdown).
+    pub certified: bool,
+}
+
+impl ShiftedPcgTrace {
+    /// Iterations taken.
+    #[must_use]
+    pub fn iterations(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// The relative residual curve `‖r_j‖/‖b‖`, one point per step.
+    #[must_use]
+    pub fn relative_residuals(&self) -> Vec<f64> {
+        let scale = 1.0 / self.rhs_norm.max(f64::MIN_POSITIVE);
+        self.steps
+            .iter()
+            .map(|step| step.residual_norm * scale)
+            .collect()
+    }
+
+    /// The half-open step range `[start, end)` of the longest restart-free run,
+    /// which is the only segment over which the CG coefficients are the Lanczos
+    /// coefficients of one Krylov space.
+    fn unrestarted_segment(&self) -> (usize, usize) {
+        let mut best = (0usize, 0usize);
+        let mut start = 0usize;
+        for (index, step) in self.steps.iter().enumerate() {
+            if step.restarted && index > start {
+                if index - start > best.1 - best.0 {
+                    best = (start, index);
+                }
+                start = index;
+            }
+        }
+        if self.steps.len() - start > best.1 - best.0 {
+            best = (start, self.steps.len());
+        }
+        best
+    }
+
+    /// The symmetric tridiagonal `T_m` of the preconditioned shifted operator
+    /// `M⁻¹(S + tI)` restricted to the Krylov space the solve built, as
+    /// `(diagonal, off-diagonal)`.
+    ///
+    /// CG is Lanczos in disguise: with the step scalars `α_j`, `β_j` of a
+    /// restart-free run,
+    ///
+    /// ```text
+    /// T[j,j]   = 1/α_j + β_{j-1}/α_{j-1}   (β_{-1} = 0)
+    /// T[j,j+1] = √β_j / α_j
+    /// ```
+    ///
+    /// so the spectrum estimate below costs no matvec at all — it is read off
+    /// numbers the solve already produced. The eigenvalues of `T_m` are the Ritz
+    /// values, and they bracket the part of the spectrum CG has resolved.
+    #[must_use]
+    pub fn lanczos_tridiagonal(&self) -> (Vec<f64>, Vec<f64>) {
+        let (start, end) = self.unrestarted_segment();
+        let steps = &self.steps[start..end];
+        let mut diagonal = Vec::with_capacity(steps.len());
+        let mut off_diagonal = Vec::with_capacity(steps.len().saturating_sub(1));
+        for (j, step) in steps.iter().enumerate() {
+            if !(step.alpha.is_finite() && step.alpha > 0.0) {
+                break;
+            }
+            let previous = if j == 0 {
+                0.0
+            } else {
+                let earlier = &steps[j - 1];
+                if !(earlier.alpha.is_finite() && earlier.alpha > 0.0 && earlier.beta >= 0.0) {
+                    break;
+                }
+                earlier.beta / earlier.alpha
+            };
+            diagonal.push(1.0 / step.alpha + previous);
+            if j + 1 < steps.len() && step.beta >= 0.0 {
+                off_diagonal.push(step.beta.sqrt() / step.alpha);
+            }
+        }
+        off_diagonal.truncate(diagonal.len().saturating_sub(1));
+        (diagonal, off_diagonal)
+    }
+
+    /// The `count` Ritz values spread evenly through the resolved spectrum,
+    /// ascending, plus both extremes. Empty when the solve took no usable step.
+    #[must_use]
+    pub fn ritz_values(&self, count: usize) -> Vec<f64> {
+        let (diagonal, off_diagonal) = self.lanczos_tridiagonal();
+        let m = diagonal.len();
+        if m == 0 {
+            return Vec::new();
+        }
+        let wanted = count.max(2).min(m);
+        (0..wanted)
+            .map(|slot| {
+                let index = if wanted == 1 {
+                    0
+                } else {
+                    (slot * (m - 1)) / (wanted - 1)
+                };
+                tridiagonal_eigenvalue(&diagonal, &off_diagonal, index)
+            })
+            .collect()
+    }
+
+    /// `θ_max/θ_min` over the Ritz values — the condition number of the
+    /// preconditioned shifted operator RESTRICTED to the Krylov space the solve
+    /// explored. This is a lower bound on `κ` of the full operator, and it is the
+    /// conditioning that actually governs this solve's convergence rate, since CG
+    /// only ever sees the spectrum its own Krylov space resolves.
+    #[must_use]
+    pub fn krylov_condition_estimate(&self) -> Option<f64> {
+        let (diagonal, off_diagonal) = self.lanczos_tridiagonal();
+        let m = diagonal.len();
+        if m == 0 {
+            return None;
+        }
+        let low = tridiagonal_eigenvalue(&diagonal, &off_diagonal, 0);
+        let high = tridiagonal_eigenvalue(&diagonal, &off_diagonal, m - 1);
+        (low.is_finite() && low > 0.0 && high.is_finite()).then(|| high / low)
+    }
+
+    /// Iterations the standard CG bound needs to cut the ENERGY norm of the
+    /// error by `rel_tol` at the observed Krylov conditioning:
+    ///
+    /// ```text
+    /// ‖e_j‖_A ≤ 2·((√κ−1)/(√κ+1))^j·‖e_0‖_A   ⟹   j ≥ ½·√κ·ln(2/rel_tol)
+    /// ```
+    ///
+    /// The solve's own stopping test is on the relative RESIDUAL, whose bound
+    /// carries an extra `√κ` inside the logarithm, so this is not an upper bound
+    /// on that quantity in general — it is the operator's own conditioning
+    /// expressed in iterations, which is what an acceptance should be denominated
+    /// in rather than a hard-coded count. What makes it a gate is that the
+    /// per-shift ladder MISSES it by a wide margin and a one-Krylov-space
+    /// evaluator meets it; both directions are measured, not assumed.
+    #[must_use]
+    pub fn conditioning_iteration_bound(&self) -> Option<f64> {
+        let kappa = self.krylov_condition_estimate()?;
+        (kappa >= 1.0).then(|| 0.5 * kappa.sqrt() * (2.0 / self.rel_tol).ln())
+    }
+}
+
+/// Number of eigenvalues of the symmetric tridiagonal `(diagonal, off_diagonal)`
+/// strictly below `x`, by the Sturm/LDLᵀ sign count. Exact in exact arithmetic
+/// and monotone in `x` in floating point, which is what makes the bisection
+/// below terminate on the right eigenvalue.
+fn tridiagonal_sturm_count(diagonal: &[f64], off_diagonal: &[f64], x: f64) -> usize {
+    let mut count = 0usize;
+    let mut pivot = diagonal[0] - x;
+    if pivot < 0.0 {
+        count += 1;
+    }
+    for index in 1..diagonal.len() {
+        let e = off_diagonal[index - 1];
+        // A zero pivot splits the sequence; the standard remedy is to replace it
+        // by a quantity of the same sign and negligible magnitude, which leaves
+        // the count correct and the recurrence finite.
+        if pivot == 0.0 {
+            pivot = -f64::EPSILON * (e.abs() + diagonal[index].abs() + 1.0);
+        }
+        pivot = diagonal[index] - x - e * e / pivot;
+        if pivot < 0.0 {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// The `index`-th smallest eigenvalue of a symmetric tridiagonal, by bisection
+/// on the Sturm count inside the Gershgorin bracket. `O(m)` per bisection step
+/// and no dense eigensolver, so a trace thousands of steps long is still cheap
+/// to interrogate.
+fn tridiagonal_eigenvalue(diagonal: &[f64], off_diagonal: &[f64], index: usize) -> f64 {
+    let m = diagonal.len();
+    if m == 0 {
+        return f64::NAN;
+    }
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for (row, &d) in diagonal.iter().enumerate() {
+        let radius = off_diagonal.get(row).copied().unwrap_or(0.0).abs()
+            + row
+                .checked_sub(1)
+                .and_then(|prev| off_diagonal.get(prev).copied())
+                .unwrap_or(0.0)
+                .abs();
+        lo = lo.min(d - radius);
+        hi = hi.max(d + radius);
+    }
+    if !(lo.is_finite() && hi.is_finite()) {
+        return f64::NAN;
+    }
+    // Widen by one ulp-scale so the endpoints are strictly outside the spectrum.
+    let pad = f64::EPSILON * (lo.abs() + hi.abs()).max(1.0);
+    let (mut lo, mut hi) = (lo - pad, hi + pad);
+    // Bisection to the floating-point resolution of the bracket: each step halves
+    // the interval, so this terminates in at most the exponent range of f64.
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if !(mid > lo && mid < hi) {
+            break;
+        }
+        if tridiagonal_sturm_count(diagonal, off_diagonal, mid) > index {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// `shifted_pcg` with the recurrence recorded. The two share one body, so the
+/// trace is of the production iteration, not of a reimplementation of it.
+pub(crate) fn shifted_pcg_traced(
+    matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
+    preconditioner: &ShiftedDiagonalPreconditioner,
+    t: f64,
+    b: &Array1<f64>,
+    y0: &Array1<f64>,
+    rel_tol: f64,
+    max_iters: usize,
+) -> (Option<(Array1<f64>, usize)>, ShiftedPcgTrace) {
+    let mut trace = ShiftedPcgTrace {
+        shift: t,
+        rhs_norm: b.dot(b).sqrt(),
+        rel_tol,
+        steps: Vec::new(),
+        certified: false,
+    };
+    let outcome = {
+        let steps = &mut trace.steps;
+        shifted_pcg_core(
+            matvec,
+            preconditioner,
+            t,
+            b,
+            y0,
+            rel_tol,
+            max_iters,
+            &mut |step: ShiftedPcgStep| steps.push(step),
+        )
+    };
+    trace.certified = outcome.is_some();
+    (outcome, trace)
+}
+
+fn shifted_pcg_core<R: FnMut(ShiftedPcgStep)>(
+    matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
+    preconditioner: &ShiftedDiagonalPreconditioner,
+    t: f64,
+    b: &Array1<f64>,
+    y0: &Array1<f64>,
+    rel_tol: f64,
+    max_iters: usize,
+    record: &mut R,
+) -> Option<(Array1<f64>, usize)> {
     if !(rel_tol.is_finite() && rel_tol > 0.0) {
         return None;
     }
@@ -758,6 +1154,7 @@ fn shifted_pcg(
     let tol = rel_tol * b_norm;
     let mut iters = 0usize;
     let mut observed_operator_norm = 0.0_f64;
+    let mut restarted = false;
     loop {
         if residual_norm_sq.sqrt() <= tol {
             // Recursive CG residuals lose their equality to `b - A y` through
@@ -810,6 +1207,7 @@ fn shifted_pcg(
                 return None;
             }
             p = z.clone();
+            restarted = true;
         }
         if iters >= max_iters {
             return None;
@@ -837,13 +1235,22 @@ fn shifted_pcg(
         let alpha = rs / denom;
         y.scaled_add(alpha, &p);
         r.scaled_add(-alpha, &ap);
+        let residual_norm_before = residual_norm_sq.sqrt();
         residual_norm_sq = r.dot(&r);
         z = preconditioner.apply(&r, t);
         let rs_new = r.dot(&z);
         if !(rs_new.is_finite() && residual_norm_sq.is_finite()) {
             return None;
         }
-        p = &z + &(&p * (rs_new / rs));
+        let beta = rs_new / rs;
+        record(ShiftedPcgStep {
+            residual_norm: residual_norm_before,
+            alpha,
+            beta,
+            restarted,
+        });
+        restarted = false;
+        p = &z + &(&p * beta);
         rs = rs_new;
         iters += 1;
     }
@@ -1021,6 +1428,230 @@ fn build_inverse_deflation_basis(
         cols = orthonormalize(&applied?);
     }
     Some(cols)
+}
+
+/// Solve the WHOLE shifted family `(A + t_ℓ I) y_ℓ = b` from ONE Krylov space.
+///
+/// # Why this is not `L` independent solves
+///
+/// A shift adds a multiple of the identity, which changes no polynomial's span:
+///
+/// ```text
+/// K_m(A + tI, b) = span{b, (A+tI)b, …, (A+tI)^{m-1}b} = span{b, Ab, …, A^{m-1}b}
+/// ```
+///
+/// — the SAME subspace for every `t`. So the quadrature ladder's `L` systems are
+/// `L` different projections onto ONE Krylov space, and a single seed run's CG
+/// coefficients determine every shifted system's through a scalar recurrence.
+/// With `s = t − σ` the shift relative to the seed `σ`,
+///
+/// ```text
+/// ζ^t_{j+1} = ζ^t_j·ζ^t_{j-1}·α_{j-1}
+///           / ( α_j·β_{j-1}·(ζ^t_{j-1} − ζ^t_j) + ζ^t_{j-1}·α_{j-1}·(1 + α_j·s) )
+/// α^t_j = α_j·ζ^t_{j+1}/ζ^t_j,      β^t_j = β_j·(ζ^t_{j+1}/ζ^t_j)²
+/// p^t_{j+1} = ζ^t_{j+1}·r_{j+1} + β^t_j·p^t_j,   y^t_{j+1} = y^t_j + α^t_j·p^t_j
+/// ```
+///
+/// so each shifted system costs two length-`k` axpys per step and NO matvec of
+/// its own. The residuals stay collinear, `r^t_j = ζ^t_j·r_j`, which is why the
+/// seed must be the SMALLEST shift: `|ζ^t_j| ≤ 1` for `t ≥ σ`, so the seed is the
+/// last system to converge and its stopping test covers the family.
+///
+/// (Jegerlehner, "Krylov space solvers for shifted linear systems", 1996;
+/// Frommer, Glässner, "Restarted GMRES for shifted linear systems", 1998.)
+///
+/// # The certificate is unchanged
+///
+/// Collinearity is an exact-arithmetic identity; in floating point a shifted
+/// iterate can carry a residual gap. Every returned solution is therefore
+/// certified against its own TRUE residual, and any that misses is finished by
+/// [`shifted_pcg`] warm-started from the multi-shift iterate — the same single
+/// implementation, the same refusal contract. A family whose seed exhausts its
+/// budget degrades to exactly the per-shift solves this replaces, never to an
+/// uncertified iterate.
+///
+/// The returned count is MATVECS, not iterations: the seed's steps plus one
+/// certification apply per shift plus any repair steps. That is the quantity a
+/// before/after comparison must use, since the whole point is that iterations of
+/// the shifted systems no longer cost applies. (It is a conservative count
+/// against the per-shift ladder, which reports only its loop iterations and not
+/// the two residual applies each of its `node_count` solves also pays.)
+///
+/// Memory: one extra length-`k` direction vector per shift for the duration of
+/// one right-hand side. The evaluation already retains
+/// `node_count × (probes + deflation_rank)` solution vectors, so this adds a
+/// `1/(probes + deflation_rank)` fraction to the peak, and it is released before
+/// the next right-hand side.
+fn solve_shift_family(
+    matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
+    repair_preconditioner: &ShiftedDiagonalPreconditioner,
+    shifts: &[f64],
+    b: &Array1<f64>,
+    rel_tol: f64,
+    max_iters: usize,
+) -> Option<(Vec<Array1<f64>>, usize)> {
+    if shifts.is_empty() || !(rel_tol.is_finite() && rel_tol > 0.0) {
+        return None;
+    }
+    let dim = b.len();
+    let seed_index = shifts
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.is_finite())
+        .min_by(|(_, a), (_, c)| a.partial_cmp(c).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(index, _)| index)?;
+    let sigma = shifts[seed_index];
+    if !sigma.is_finite() {
+        return None;
+    }
+    let b_norm = b.dot(b).sqrt().max(f64::MIN_POSITIVE);
+    let tol = rel_tol * b_norm;
+
+    // Seed recurrence on `(A + σI) y = b` from `y = 0`, so `r_0 = b` and every
+    // shifted system starts from the same residual — the premise of the
+    // collinearity above, and the reason this path takes no warm start.
+    let apply_seed = |v: ArrayView1<f64>| -> Array1<f64> {
+        let mut out = matvec(v);
+        out.scaled_add(sigma, &v.to_owned());
+        out
+    };
+    let mut r = b.clone();
+    let mut rs = r.dot(&r);
+    if !rs.is_finite() {
+        return None;
+    }
+    let mut p = b.clone();
+    let mut solutions: Vec<Array1<f64>> = vec![Array1::<f64>::zeros(dim); shifts.len()];
+    let mut directions: Vec<Array1<f64>> = vec![b.clone(); shifts.len()];
+    // `ζ^t_0 = ζ^t_{-1} = 1`, `α_{-1} = 1`, `β_{-1} = 0` — the initialisation that
+    // makes the first step reproduce the closed form `ζ^t_1 = 1/(1 + α_0·s)`.
+    let mut zeta_previous = vec![1.0_f64; shifts.len()];
+    let mut zeta_current = vec![1.0_f64; shifts.len()];
+    let mut frozen = vec![false; shifts.len()];
+    let mut alpha_previous = 1.0_f64;
+    let mut beta_previous = 0.0_f64;
+    let mut matvecs = 0usize;
+
+    // The seed's budget: the caller's cap, but never more Krylov dimensions than
+    // the space has. A restart-free CG recurrence has explored all of `K(A, b)`
+    // after `dim` steps, so anything past that is roundoff rather than progress —
+    // and a recurrence that restarted to chase it would break the collinearity
+    // every shifted iterate above is built on. Overshooting the seed is bounded
+    // this way; correctness never depends on it, because the certification below
+    // finishes whatever the seed left short.
+    let seed_budget = max_iters.min(dim.max(1));
+    while rs.sqrt() > tol && matvecs < seed_budget {
+        let ap = apply_seed(p.view());
+        matvecs += 1;
+        let denom = p.dot(&ap);
+        if !(denom.is_finite() && denom > 0.0) {
+            return None;
+        }
+        let alpha = rs / denom;
+        if !alpha.is_finite() {
+            return None;
+        }
+        r.scaled_add(-alpha, &ap);
+        let rs_new = r.dot(&r);
+        if !rs_new.is_finite() {
+            return None;
+        }
+        let beta = rs_new / rs;
+        for (index, &shift) in shifts.iter().enumerate() {
+            if frozen[index] {
+                continue;
+            }
+            let relative = shift - sigma;
+            let zeta_j = zeta_current[index];
+            let zeta_back = zeta_previous[index];
+            let denominator = alpha * beta_previous * (zeta_back - zeta_j)
+                + zeta_back * alpha_previous * (1.0 + alpha * relative);
+            let zeta_next = zeta_j * zeta_back * alpha_previous / denominator;
+            // A collapsed or non-finite ζ means this shift's residual has fallen
+            // below what f64 can represent relative to the seed's, i.e. it is
+            // converged to the arithmetic floor. Freezing it keeps the iterate it
+            // has; the certification below decides whether that is good enough.
+            if !(zeta_next.is_finite() && denominator.is_finite() && denominator != 0.0)
+                || zeta_next == 0.0
+            {
+                frozen[index] = true;
+                continue;
+            }
+            let ratio = zeta_next / zeta_j;
+            let alpha_shifted = alpha * ratio;
+            let beta_shifted = beta * ratio * ratio;
+            if !(alpha_shifted.is_finite() && beta_shifted.is_finite()) {
+                frozen[index] = true;
+                continue;
+            }
+            let direction = &directions[index];
+            solutions[index].scaled_add(alpha_shifted, direction);
+            let mut next = &r * zeta_next;
+            next.scaled_add(beta_shifted, direction);
+            directions[index] = next;
+            zeta_previous[index] = zeta_j;
+            zeta_current[index] = zeta_next;
+        }
+        p = &r + &(&p * beta);
+        rs = rs_new;
+        alpha_previous = alpha;
+        beta_previous = beta;
+    }
+
+    // Certification, per shift, against the TRUE residual — the contract
+    // `shifted_pcg` enforces and this must not weaken. A miss is finished by that
+    // same solve, warm-started from the multi-shift iterate, on the caller's full
+    // per-solve budget: that is exactly the per-shift ladder this replaces, so a
+    // family that helps nowhere degrades to the old cost plus one seed rather
+    // than to a refusal.
+    for (index, &shift) in shifts.iter().enumerate() {
+        let mut residual = matvec(solutions[index].view());
+        residual.scaled_add(shift, &solutions[index]);
+        matvecs += 1;
+        let residual = b - &residual;
+        let residual_norm_sq = residual.dot(&residual);
+        if residual_norm_sq.is_finite() && residual_norm_sq.sqrt() <= tol {
+            continue;
+        }
+        let warm = std::mem::replace(&mut solutions[index], Array1::<f64>::zeros(0));
+        let (repaired, repair_iters) = shifted_pcg(
+            matvec,
+            repair_preconditioner,
+            shift,
+            b,
+            &warm,
+            rel_tol,
+            max_iters,
+        )?;
+        solutions[index] = repaired;
+        matvecs = matvecs.checked_add(repair_iters)?;
+    }
+    Some((solutions, matvecs))
+}
+
+/// Transpose one family solve per right-hand side into the `solves[node][vector]`
+/// layout the value and derivative assembly read, summing the applies spent.
+fn solve_family_block(
+    solve: &(impl Fn(&Array1<f64>) -> Option<(Vec<Array1<f64>>, usize)> + Sync),
+    node_count: usize,
+    vectors: &[Array1<f64>],
+) -> Option<(Vec<Vec<Array1<f64>>>, usize)> {
+    let mut solves: Vec<Vec<Array1<f64>>> = vec![Vec::with_capacity(vectors.len()); node_count];
+    let mut total = 0usize;
+    for rhs in vectors {
+        let (per_node, applies) = solve(rhs)?;
+        if per_node.len() != node_count {
+            return None;
+        }
+        total = total.checked_add(applies)?;
+        for (node, solution) in per_node.into_iter().enumerate() {
+            if solution.len() != rhs.len() || solution.iter().any(|value| !value.is_finite()) {
+                return None;
+            }
+            solves[node].push(solution);
+        }
+    }
+    Some((solves, total))
 }
 
 /// Solve `(S + t_ℓ I) y = v` for every input vector across the whole shift
