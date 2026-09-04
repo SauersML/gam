@@ -1160,11 +1160,25 @@ fn build_panels(
     Ok(certified)
 }
 
-/// How many distinct shapes the lock-free index holds. A fit uses one shape
-/// per Duchon term, so a process reaching this bound is combining more than
-/// sixty distinct `(p, s, d)` smooths; those shapes keep the interning map's
-/// lock on every lookup, which is what every shape used to do.
+/// How many distinct shapes a process interns. A fit uses one shape per Duchon
+/// term, so a process reaching this bound is combining more than sixty distinct
+/// `(p, s, d)` smooths.
+///
+/// The bound is what makes the `&'static` profile reference honest. A profile
+/// is built at run time, and a run-time value can only be borrowed for the
+/// process's life if it LIVES for the process's life, so the profiles are
+/// stored in a static array of cells rather than in leaked boxes. Exceeding the
+/// bound is refused rather than silently degraded: the unbounded alternative is
+/// a reference-counted profile handed out on a path that a design build takes
+/// once per `(point, centre)` pair, which is the cost this cache exists to
+/// remove.
 const PROFILE_INDEX_SLOTS: usize = 64;
+
+/// The interned profiles themselves, published for the process's life. A slot
+/// is written exactly once, under the interning lock, before any shape maps to
+/// it, so `get` on a mapped slot always observes the published profile.
+static PROFILE_STORE: [OnceLock<DuchonRadialProfile>; PROFILE_INDEX_SLOTS] =
+    [const { OnceLock::new() }; PROFILE_INDEX_SLOTS];
 
 /// The lock-free index: `(shape, profile)` pairs published in slot order, so
 /// the first empty slot ends the occupied prefix and a miss is a scan of what
@@ -1177,22 +1191,55 @@ static PROFILE_INDEX: [OnceLock<((usize, usize, usize), &'static DuchonRadialPro
 fn intern_duchon_radial_profile(
     shape: (usize, usize, usize),
 ) -> Result<&'static DuchonRadialProfile, BasisError> {
-    static PROFILES: OnceLock<Mutex<HashMap<(usize, usize, usize), &'static DuchonRadialProfile>>> =
-        OnceLock::new();
-    let profiles = PROFILES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(profile) = profiles
+    // Shape to the slot of `PROFILE_STORE` holding its profile. The map
+    // serializes BUILDS -- a profile is an adaptive quadrature construction,
+    // not something to race two threads through -- while the store owns the
+    // values.
+    static PROFILE_SLOTS: OnceLock<Mutex<HashMap<(usize, usize, usize), usize>>> = OnceLock::new();
+    let slots = PROFILE_SLOTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&slot) = slots
         .lock()
         .expect("Duchon radial profile cache poisoned")
         .get(&shape)
     {
-        return Ok(profile);
+        return published_profile(slot);
     }
     let (p, s, d) = shape;
-    let built: &'static DuchonRadialProfile = Box::leak(Box::new(DuchonRadialProfile::build(
-        p, s, d,
-    )?));
-    let mut guard = profiles.lock().expect("Duchon radial profile cache poisoned");
-    Ok(guard.entry(shape).or_insert(built))
+    let built = DuchonRadialProfile::build(p, s, d)?;
+    let mut guard = slots.lock().expect("Duchon radial profile cache poisoned");
+    // Another thread may have interned this shape while this one was building
+    // it. A profile is a pure function of its shape, so the published one is
+    // the same object; this build is dropped rather than given a second slot.
+    if let Some(&slot) = guard.get(&shape) {
+        return published_profile(slot);
+    }
+    // Slots are handed out in insertion order and never released, so the map's
+    // length IS the next free slot.
+    let slot = guard.len();
+    let cell = PROFILE_STORE.get(slot).ok_or_else(|| {
+        BasisError::InvalidInput(format!(
+            "this process has already interned {PROFILE_INDEX_SLOTS} distinct Duchon radial \
+             shapes and (p={p}, s={s}, d={d}) is one more; the profile store is fixed for the \
+             process's life"
+        ))
+    })?;
+    let profile = cell.get_or_init(|| built);
+    guard.insert(shape, slot);
+    Ok(profile)
+}
+
+/// The profile in an already-mapped slot. A shape is entered in the map only
+/// after its slot is initialized, so an empty cell here would mean the map and
+/// the store had disagreed.
+fn published_profile(slot: usize) -> Result<&'static DuchonRadialProfile, BasisError> {
+    PROFILE_STORE
+        .get(slot)
+        .and_then(OnceLock::get)
+        .ok_or_else(|| {
+            BasisError::InvalidInput(format!(
+                "Duchon radial profile slot {slot} is mapped but carries no published profile"
+            ))
+        })
 }
 
 /// The process-wide profile for `(p, s, d)`, built on first use.
