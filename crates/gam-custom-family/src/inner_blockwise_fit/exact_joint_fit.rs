@@ -7,6 +7,48 @@
 
 use super::*;
 
+/// The rounding band of the joint stationarity residual `∇L − Sβ` on this
+/// arithmetic, in the `∞`-norm the certificate measures it in (#2812).
+///
+/// Per coordinate the data gradient accumulates `n` rows and the penalty product
+/// `p_k` terms, so the residual carries at least
+/// `γ_n·u·|∇L|_∞ + max_k γ_{p_k}·u·‖|λ_k S_k|·|β_k| + ridge·|β_k|‖_∞` of
+/// rounding and a residual target below it asks the solve for digits the
+/// arithmetic does not have — which is how the strengths a derived ρ domain
+/// admits left the joint Newton refusing a stationary mode. The data term is
+/// the assembled gradient's magnitude, a LOWER bound on its summands', which is
+/// the safe direction: this band can only fail to certify a stationary point,
+/// never certify a non-stationary one. It is not built from the penalty's
+/// entries — a band from `‖S‖` alone certified a residual of `0.15`.
+fn joint_stationarity_rounding_band(
+    s_lambdas: &[Array2<f64>],
+    block_betas: &[&Array1<f64>],
+    diagonal_ridge: f64,
+    data_gradient_inf: f64,
+    total_n: usize,
+) -> f64 {
+    let u = gam_linalg::roundoff::UNIT_ROUNDOFF;
+    let mut penalty_band = 0.0_f64;
+    for (s_lambda, beta) in s_lambdas.iter().zip(block_betas.iter()) {
+        let p_k = beta.len();
+        if p_k == 0 || s_lambda.nrows() != p_k || s_lambda.ncols() != p_k {
+            continue;
+        }
+        let growth = gam_linalg::roundoff::accumulation_growth(p_k + 1) * u;
+        for j in 0..p_k {
+            let mut magnitude = 0.0_f64;
+            for l in 0..p_k {
+                magnitude += (s_lambda[[j, l]] * beta[l]).abs();
+            }
+            magnitude += (diagonal_ridge * beta[j]).abs();
+            penalty_band = penalty_band.max(growth * magnitude);
+        }
+    }
+    let data_band =
+        gam_linalg::roundoff::accumulation_growth(total_n.max(1)) * u * data_gradient_inf.abs();
+    data_band + penalty_band
+}
+
 /// Clear every cross-cycle statistic whose inference assumes a FIXED step model
 /// (gam#2612).
 ///
@@ -2160,7 +2202,27 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // `R/(1+scale)` beside it, which is exactly what this gate tests
         // against `inner_tol`.
         let stationarity_scale = grad_inf.max(penalty_inf);
-        let residual_tol = inner_tol * (1.0 + stationarity_scale);
+        // The caller's tolerance is a convergence choice; the residual's own
+        // rounding band is a resolution. The target is never below the
+        // resolution (#2812).
+        let stationarity_band = {
+            let block_betas: Vec<&Array1<f64>> = states.iter().map(|s| &s.beta).collect();
+            joint_stationarity_rounding_band(
+                &s_lambdas,
+                &block_betas,
+                joint_mode_diagonal_ridge,
+                grad_inf,
+                total_joint_n,
+            )
+        };
+        let residual_tol = (inner_tol * (1.0 + stationarity_scale)).max(stationarity_band);
+        if stationarity_band > inner_tol * (1.0 + stationarity_scale) {
+            log::info!(
+                "[PIRLS/joint-Newton] residual target raised to the residual's rounding band \
+                 {stationarity_band:.3e} (caller's {:.3e}) at n={total_joint_n}",
+                inner_tol * (1.0 + stationarity_scale)
+            );
+        }
         last_residual_tol = residual_tol;
         let current_stationarity_residual = current_kkt_norm;
         // Local-mode certificate: first-order KKT and a small Newton
@@ -4627,7 +4689,24 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // See the head-of-cycle site for why the denominator is named rather
         // than folded straight into the tolerance (gam#2713).
         let stationarity_scale = grad_inf.max(pen_inf).max(firth_score_inf);
-        let residual_tol = inner_tol * (1.0 + stationarity_scale);
+        // Same rule as the head-of-cycle site: the target is never below the
+        // residual's own rounding band (#2812).
+        let stationarity_band = {
+            let block_betas: Vec<&Array1<f64>> = states.iter().map(|s| &s.beta).collect();
+            let effective_ridge = if options.ridge_policy.accounts_for_objective() && ridge > 0.0 {
+                ridge
+            } else {
+                0.0
+            };
+            joint_stationarity_rounding_band(
+                &s_lambdas,
+                &block_betas,
+                effective_ridge,
+                grad_inf,
+                total_joint_n,
+            )
+        };
+        let residual_tol = (inner_tol * (1.0 + stationarity_scale)).max(stationarity_band);
         // Arm the Jeffreys second-order endgame completion (gam#979) once
         // the residual enters the convergence band; latched (never
         // un-armed) so the endgame model cannot oscillate between the
