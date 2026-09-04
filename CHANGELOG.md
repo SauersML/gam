@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The inner P-IRLS objective band and the joint Newton's residual band carry the unit roundoff once (`accumulation_growth` already includes it), restoring the LM rejection floor and both decrement certificates; the survival LAML gate accepts a residual inside the residual's own rounding band, not only `1e-8` relative (#2668, #2812).
+
 - The multinomial predictive's augmented-mode Newton accepts only a strictly rising trial, so a solve whose remaining gain sits under the log-posterior's round-off converges to resolution instead of exhausting its hundred iterations on steps that change nothing (#2812).
 
 - The SAE manifold joint fit logs one phase clock per iteration, per entry-sweep round and for its setup, and five of its serial row passes (frame refresh, coordinate seeding, target-aware reconstruction, deflation candidates, coherence projections) now fan across the Rayon pool (#2731).

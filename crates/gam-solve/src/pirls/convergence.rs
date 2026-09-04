@@ -14,9 +14,13 @@ use super::WorkingModelPirlsOptions;
 /// on top and is covered by the `p²` count.
 #[inline]
 pub(super) fn objective_rounding_band(n: usize, p: usize, magnitude: f64) -> f64 {
-    gam_linalg::roundoff::accumulation_growth(n + p * p)
-        * gam_linalg::roundoff::UNIT_ROUNDOFF
-        * magnitude.abs()
+    // `accumulation_growth` IS `γ_k = k·u/(1 − k·u)`: the unit roundoff is
+    // already inside it. Multiplying by `u` again made the band `k·u²·|F|`,
+    // sixteen orders below the arithmetic, so the LM rejection floor was
+    // zero, every plateau step was judged on its noise, the damping climbed
+    // past its ceiling and the shape-constrained and warm-started P-IRLS
+    // fixtures exited with unpolished KKT residuals (#2668).
+    gam_linalg::roundoff::accumulation_growth(n + p * p) * magnitude.abs()
 }
 
 /// Compute the effective KKT convergence tolerance, honouring the optional

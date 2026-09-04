@@ -12,7 +12,7 @@ use super::*;
 ///
 /// Per coordinate the data gradient accumulates `n` rows and the penalty product
 /// `p_k` terms, so the residual carries at least
-/// `γ_n·u·|∇L|_∞ + max_k γ_{p_k}·u·‖|λ_k S_k|·|β_k| + ridge·|β_k|‖_∞` of
+/// `γ_n·|∇L|_∞ + max_k γ_{p_k}·‖|λ_k S_k|·|β_k| + ridge·|β_k|‖_∞` of
 /// rounding and a residual target below it asks the solve for digits the
 /// arithmetic does not have — which is how the strengths a derived ρ domain
 /// admits left the joint Newton refusing a stationary mode. The data term is
@@ -27,14 +27,15 @@ fn joint_stationarity_rounding_band(
     data_gradient_inf: f64,
     total_n: usize,
 ) -> f64 {
-    let u = gam_linalg::roundoff::UNIT_ROUNDOFF;
+    // `accumulation_growth` is Wilkinson's `γ_k = k·u/(1 − k·u)`: the unit
+    // roundoff is inside it already (#2668 found the same `γ·u` in P-IRLS).
     let mut penalty_band = 0.0_f64;
     for (s_lambda, beta) in s_lambdas.iter().zip(block_betas.iter()) {
         let p_k = beta.len();
         if p_k == 0 || s_lambda.nrows() != p_k || s_lambda.ncols() != p_k {
             continue;
         }
-        let growth = gam_linalg::roundoff::accumulation_growth(p_k + 1) * u;
+        let growth = gam_linalg::roundoff::accumulation_growth(p_k + 1);
         for j in 0..p_k {
             let mut magnitude = 0.0_f64;
             for l in 0..p_k {
@@ -45,7 +46,7 @@ fn joint_stationarity_rounding_band(
         }
     }
     let data_band =
-        gam_linalg::roundoff::accumulation_growth(total_n.max(1)) * u * data_gradient_inf.abs();
+        gam_linalg::roundoff::accumulation_growth(total_n.max(1)) * data_gradient_inf.abs();
     data_band + penalty_band
 }
 

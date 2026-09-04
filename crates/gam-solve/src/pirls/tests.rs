@@ -3919,7 +3919,7 @@ mod root_cause_tests {
     #[test]
     pub(crate) fn rejected_noise_scale_step_can_finish_via_exact_decrement_certificate_2316() {
         let mut model = PlateauStatusModel {
-            gradient: 2e-5,
+            gradient: 1e-5,
             current_deviance: 1.0e6,
             candidate_deviance: 1.0e6 + 1.0,
         };
@@ -3943,16 +3943,19 @@ mod root_cause_tests {
         // The candidate is objectively worse, so the LM trial is rejected.
         // That says nothing about the unchanged current iterate's stationarity:
         // #2316 deliberately pays for one exact final Newton-decrement
-        // certificate after any finite bounded exit. Here H=1 and g=2e-5, so
-        // g'H^-1g=4e-10, far below tol²(1+objective)≈5e-7. The final iterate is
-        // therefore independently certified and promoted to Converged. The old
-        // June test predated #2316 and incorrectly made a trial-step verdict
-        // override the later final-state certificate.
+        // certificate after any finite bounded exit. Here H=1 and g=1e-5, so
+        // g'H^-1g=1e-10, inside twice the objective's rounding band
+        // (2·γ_{n+p²}·|½·D| ≈ 2.2e-10 at D=1e6 with one row and one
+        // coefficient): no step can be shown to improve the objective on this
+        // arithmetic, so the final iterate is independently certified and
+        // promoted to Converged. The old June test predated #2316 and
+        // incorrectly made a trial-step verdict override the later
+        // final-state certificate.
         assert!(model.candidate_deviance > model.current_deviance);
         let exact_decrement_sq = model.gradient * model.gradient;
         let final_penalized_objective = 0.5 * model.current_deviance;
-        let exact_decrement_bound = options.convergence_tolerance.powi(2)
-            * (1.0 + final_penalized_objective.abs());
+        let exact_decrement_bound =
+            2.0 * super::convergence::objective_rounding_band(1, 1, final_penalized_objective);
         assert!(
             exact_decrement_sq <= exact_decrement_bound,
             "fixture must carry the decisive #2316 exact-decrement certificate"

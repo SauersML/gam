@@ -2678,27 +2678,52 @@ impl WorkingModelSurvival {
         // whenever √(n·p) > 1+scale, i.e. the normal case for these baselines —
         // was certified by the solver and then refused here, fatally. Same
         // tolerance, same rule, one owner.
-        if !projected_norm.is_finite()
-            || !state.certifies_kkt(projected_norm, SURVIVAL_LAML_STATIONARITY_RELATIVE_TOL)
-        {
-            // DECLINING is right and stays: a one-step residual surrogate is
-            // not a differentiable substitute for a Laplace mode, so this
-            // trial has no LAML value to report. What was wrong is the KIND of
-            // refusal. `InvalidInput` is a statement about the configuration,
-            // and `is_trial_point_infeasible` answers `false` for it, so the
-            // outer lambda-search — whose documented response to "no value
-            // here" is to mark the point infeasible and step away — aborted
-            // the whole fit at the first such rho instead (#2531, and #1123's
-            // own closed guard went red on it). The inner mode's stationarity
-            // is a property of THIS rho: the same design at a neighbouring
-            // lambda converges perfectly well, which is why the CLI fits it.
+        // The residual's own rounding band: the penalty gradient `Σ_k λ_k S_k β_k`
+        // accumulated over n rows (it equals the data score at the mode, up to
+        // the residual) plus each block's `|λ_k S_k|·|β_k|` over its `p_k + 1`
+        // products. A residual inside it is stationary to the digits the
+        // arithmetic has; asking for `1e-8` relative below that asks the inner
+        // solve for digits it cannot produce (#2668, #2812), and the inner's
+        // own certificate — a Newton decrement under the objective's rounding
+        // band — is exactly what says so.
+        let residual_rounding_band = {
+            let mut penalty_gradient_inf = 0.0_f64;
+            let mut penalty_band = 0.0_f64;
+            for block in &active_penalty_blocks {
+                let p_k = block.range.len();
+                if p_k == 0 || block.matrix.nrows() != p_k || block.matrix.ncols() != p_k {
+                    continue;
+                }
+                let growth = gam_linalg::roundoff::accumulation_growth(p_k + 1);
+                for j in 0..p_k {
+                    let mut signed = 0.0_f64;
+                    let mut magnitude = 0.0_f64;
+                    for l in 0..p_k {
+                        let product =
+                            block.lambda * block.matrix[[j, l]] * beta[block.range.start + l];
+                        signed += product;
+                        magnitude += product.abs();
+                    }
+                    penalty_gradient_inf = penalty_gradient_inf.max(signed.abs());
+                    penalty_band = penalty_band.max(growth * magnitude);
+                }
+            }
+            let data_band = gam_linalg::roundoff::accumulation_growth(state.eta.len().max(1))
+                * penalty_gradient_inf;
+            data_band + penalty_band
+        };
+        let stationary_to_resolution = projected_norm.is_finite()
+            && (state.certifies_kkt(projected_norm, SURVIVAL_LAML_STATIONARITY_RELATIVE_TOL)
+                || projected_norm <= residual_rounding_band);
+        if !stationary_to_resolution {
             return Err(EstimationError::TrialPointRefused {
                 reason: format!(
                     "survival LAML requires a stationary inner mode: projected KKT residual \
                      {projected_norm:.3e} (relative {:.3e}) is not certified by the inner \
                      solver's convergence test at tolerance \
-                     {SURVIVAL_LAML_STATIONARITY_RELATIVE_TOL:.3e}; a one-step residual \
-                     surrogate is not a differentiable substitute for the Laplace mode",
+                     {SURVIVAL_LAML_STATIONARITY_RELATIVE_TOL:.3e} and sits above the \
+                     residual's own rounding band {residual_rounding_band:.3e}; a one-step \
+                     residual surrogate is not a differentiable substitute for the Laplace mode",
                     state.relative_gradient_norm(projected_norm)
                 ),
             });
