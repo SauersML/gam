@@ -1706,7 +1706,16 @@ pub(crate) fn fit_gaussian_location_scale_model(
     // and the scale-block Fisher information 2κ²a is strictly below gamlss's
     // floorless 2a, systematically over-smoothing the log-σ envelope
     // (#686 #688 #684 #685 #687). Fitting on y/s restores κ ≈ 1.
-    let response_scale = gaussian_response_sample_std(request.spec.y.view()).max(1e-6);
+    let response_scale = gaussian_response_sample_std(request.spec.y.view());
+    // A response with no spread has no scale to standardise by, and no
+    // location-scale model either: refuse it rather than fit `y / 1e-6`
+    // (#2469).
+    if !(response_scale > 0.0) || !response_scale.is_finite() {
+        return Err(format!(
+            "gaussian location-scale fit: the response has no finite positive spread \
+             (sample std = {response_scale:.3e}); a location-scale model needs one"
+        ));
+    }
     if response_scale != 1.0 {
         request.spec.y.mapv_inplace(|v| v / response_scale);
         // The mean (identity-link) offset rides in the same units as y; the
