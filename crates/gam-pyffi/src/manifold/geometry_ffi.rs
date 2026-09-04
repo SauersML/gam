@@ -56,9 +56,23 @@ fn sae_default_ordered_beta_bernoulli_concentration_for_k_atoms(k_atoms: usize) 
 /// they are echoed back under `config` so a caller records the cover it actually
 /// measured rather than the one it assumed.
 ///
-/// A refusal is a result, not an error: `observed_manifold` is then `None` and
-/// `refusal` carries the typed reason with its own counts. Only a malformed
-/// atlas (empty input, non-finite rows, no certifiable chart) raises.
+/// A refusal is a result, not an error, and the caller is required to say which
+/// case it is in. The return carries exactly one of
+///
+/// * `topology["named"]` — `kind` plus the full invariant block, or
+/// * `topology["refused"]` — `reason` (the typed refusal with its own counts)
+///   plus the same invariant block.
+///
+/// Both arms carry the invariants, because they are what a caller debugging a
+/// refused cloud needs; what they cannot do is read them without knowing which
+/// arm they are in. The invariants deliberately do NOT sit at the top level:
+/// structureless Gaussian noise measures `b0=1, b1=0, b2=1, chi=2` — the sphere
+/// row of the classification table — and is refused only by the
+/// orientation-subcomplex gate, so a top-level `betti` let a caller read a
+/// manifold's signature off a cloud that is not a manifold (#2280).
+///
+/// Only a malformed atlas (empty input, non-finite rows, no certifiable chart)
+/// raises.
 #[pyfunction]
 #[pyo3(signature = (z, intrinsic_dim, patch_count=None, patch_size=None, min_overlap=None))]
 fn sae_observe_atlas_topology<'py>(
@@ -151,15 +165,28 @@ fn sae_observe_atlas_topology<'py>(
         }
     };
 
-    let out = PyDict::new(py);
-    out.set_item(
-        "observed_manifold",
-        readout.observed_manifold().map(observed_manifold_name),
-    )?;
-    out.set_item("refusal", refusal)?;
-    out.set_item("intrinsic_dim", invariants.intrinsic_dim)?;
-    out.set_item("betti", betti)?;
-    out.set_item(
+    // #2280 — the invariants are reachable in BOTH arms, but only through a
+    // branch the caller cannot skip.
+    //
+    // They used to sit at the top level beside an optional `refusal`, so
+    // `result["betti"]` read fine on a refusal and returned a manifold's
+    // signature for a cloud that is not a manifold. That is not hypothetical:
+    // structureless Gaussian noise measures `b0=1, b1=0, b2=1, chi=2` here — the
+    // sphere row of the classification table, matching a planted sphere invariant
+    // for invariant — and is refused only by the orientation-subcomplex gate. A
+    // caller reading the invariants without the verdict saw a sphere in noise.
+    //
+    // The fix is NOT to hide the invariants on a refusal: they are exactly what a
+    // user debugging a refused cloud needs, and reading them on a refusal is how
+    // the above was found. It is to make the CASE mandatory. Exactly one of
+    // `topology["named"]` / `topology["refused"]` exists, each carrying the full
+    // invariant block, so the old mistake is now a `KeyError` rather than a wrong
+    // number. This matches the sibling surface `atlas_nerve_diagram`, which
+    // already gates its payload behind `computed`.
+    let invariant_block = PyDict::new(py);
+    invariant_block.set_item("intrinsic_dim", invariants.intrinsic_dim)?;
+    invariant_block.set_item("betti", betti)?;
+    invariant_block.set_item(
         "euler_characteristic",
         i64::try_from(invariants.euler_characteristic).map_err(|_| {
             py_value_error(format!(
@@ -168,23 +195,23 @@ fn sae_observe_atlas_topology<'py>(
             ))
         })?,
     )?;
-    out.set_item("simplex_counts", invariants.simplex_counts.clone())?;
-    out.set_item(
+    invariant_block.set_item("simplex_counts", invariants.simplex_counts.clone())?;
+    invariant_block.set_item(
         "orientation_class",
         match invariants.orientation_class {
             AtlasOrientability::Orientable => "orientable",
             AtlasOrientability::NonOrientable => "non_orientable",
         },
     )?;
-    out.set_item(
+    invariant_block.set_item(
         "orientation_cocycle_closes",
         invariants.orientation_cocycle_closes,
     )?;
-    out.set_item(
+    invariant_block.set_item(
         "open_orientation_triangles",
         invariants.open_orientation_triangles,
     )?;
-    out.set_item(
+    invariant_block.set_item(
         "unsigned_orientation_triangles",
         invariants.unsigned_orientation_triangles,
     )?;
@@ -192,13 +219,13 @@ fn sae_observe_atlas_topology<'py>(
     signed_betti.set_item("b0", invariants.signed_subcomplex_betti.b0)?;
     signed_betti.set_item("b1", invariants.signed_subcomplex_betti.b1)?;
     signed_betti.set_item("b2", invariants.signed_subcomplex_betti.b2)?;
-    out.set_item("signed_subcomplex_betti", signed_betti)?;
-    out.set_item("incoherent_overlap_pairs", invariants.incoherent_overlap_pairs)?;
-    out.set_item("max_cover_multiplicity", invariants.max_cover_multiplicity)?;
-    out.set_item("mean_cover_multiplicity", invariants.mean_cover_multiplicity)?;
-    out.set_item("chart_count", invariants.chart_count)?;
-    out.set_item("dropped_center_count", invariants.dropped_center_count)?;
-    out.set_item(
+    invariant_block.set_item("signed_subcomplex_betti", signed_betti)?;
+    invariant_block.set_item("incoherent_overlap_pairs", invariants.incoherent_overlap_pairs)?;
+    invariant_block.set_item("max_cover_multiplicity", invariants.max_cover_multiplicity)?;
+    invariant_block.set_item("mean_cover_multiplicity", invariants.mean_cover_multiplicity)?;
+    invariant_block.set_item("chart_count", invariants.chart_count)?;
+    invariant_block.set_item("dropped_center_count", invariants.dropped_center_count)?;
+    invariant_block.set_item(
         "orientation_gauge",
         readout
             .orientation_gauge()
@@ -206,7 +233,30 @@ fn sae_observe_atlas_topology<'py>(
             .map(|sign| i64::from(*sign))
             .collect::<Vec<_>>(),
     )?;
-    out.set_item("twisted_edges", readout.twisted_edges().to_vec())?;
+    invariant_block.set_item("twisted_edges", readout.twisted_edges().to_vec())?;
+
+    // Exactly one arm is present, so a caller must name the case it is in.
+    let topology = PyDict::new(py);
+    match (readout.observed_manifold(), refusal) {
+        (Some(kind), _) => {
+            invariant_block.set_item("kind", observed_manifold_name(kind))?;
+            topology.set_item("named", invariant_block)?;
+        }
+        (None, Some(reason)) => {
+            invariant_block.set_item("reason", reason)?;
+            topology.set_item("refused", invariant_block)?;
+        }
+        (None, None) => {
+            return Err(py_value_error(
+                "atlas readout named no manifold and carried no refusal; this is a \
+                 contradiction in the readout, not a result"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let out = PyDict::new(py);
+    out.set_item("topology", topology)?;
     out.set_item("config", cover)?;
     Ok(out.unbind())
 }
