@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The Bernoulli marginal-slope ψ-cross rank-1 accumulator reads its two design rows into per-worker scratch instead of allocating and freeing two one-row matrices on every call; the ψ-hyper build makes that call three times per axis pair per row, and it was 6.9 % of the rigid arm's profile in `_int_malloc`/`_int_free` (#979).
+
 ### Fixed
 - The `SLS-MACRO-CODEGEN-932` timing cell in `gam-row-macros` compared the generated
   location-scale program against a hand schedule that gated its `u1`/`g` terms on
