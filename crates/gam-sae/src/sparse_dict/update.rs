@@ -1848,74 +1848,133 @@ fn validate(
     Ok(())
 }
 
-/// Seed atoms with a deterministic k-means++-style farthest-point pass on the
-/// rows, so the initial dictionary already spans the data's principal
-/// directions (no RNG -> reproducible). For `K > N` the extra atoms wrap.
+/// Seed distinct signed lines by the largest remaining one-atom reconstruction
+/// residual. A decoder atom represents all scalar multiples of its direction:
+/// Euclidean row distance incorrectly treats an antipode as a new direction.
+/// Row-sign changes therefore leave this seed's projectors unchanged. Capacity
+/// beyond the represented rows remains dormant rather than duplicating a line.
 pub(super) fn seed_decoder(x: ArrayView2<'_, f32>, k: usize) -> Array2<f32> {
     let n = x.nrows();
     let p = x.ncols();
     let mut decoder = Array2::<f32>::zeros((k, p));
 
-    // First atom: the largest-norm row.
+    // f64 reductions keep every finite f32 row energy representable.
+    let norm2: Vec<f64> = x
+        .axis_iter(Axis(0))
+        .into_par_iter()
+        .map(|row| row.iter().map(|&v| (v as f64) * (v as f64)).sum())
+        .collect();
+    // With no atoms yet, the residual is the complete row energy.
     let mut first = 0usize;
-    let mut best = f32::NEG_INFINITY;
-    for i in 0..n {
-        let r = x.row(i);
-        let nrm: f32 = r.iter().map(|v| v * v).sum();
+    let mut best = 0.0_f64;
+    for (i, &nrm) in norm2.iter().enumerate() {
         if nrm > best {
             best = nrm;
             first = i;
         }
     }
+    if best == 0.0 {
+        return decoder;
+    }
     decoder.row_mut(0).assign(&x.row(first));
 
-    // Row-parallel distance refresh + reduction. Each row's `min_dist2[i]`
-    // update reads only row `i` and the single previous atom, so the parallel
-    // pass is elementwise-independent and bit-identical to the serial sweep;
-    // the argmax reduction breaks ties toward the LOWER row index (the serial
-    // scan's `>` comparison), keeping the seed deterministic. This pass was the
-    // measured single-thread wall at dictionary scale (`O(K·N·P)` serial ≈ 2 h
-    // at K=32k, N=96k, P=2048 — creditscope #1026); the work is unchanged, only
-    // spread across rows.
-    let mut min_dist2 = vec![f32::INFINITY; n];
-    for atom in 1..k {
+    // Update only against the newly admitted line, retaining the nearest-line
+    // residual across the preceding atoms. Rows are independent; ties choose
+    // the lower row index in both serial and parallel reductions.
+    let mut min_dist2 = norm2.clone();
+    min_dist2[first] = 0.0;
+    let mut previous_norm2 = best;
+    for atom in 1..k.min(n) {
         let prev = decoder.row(atom - 1);
-        let chosen = if atom < n {
-            let (bi, _bv) = min_dist2
-                .par_iter_mut()
-                .enumerate()
-                .map(|(i, md)| {
-                    let xi = x.row(i);
-                    let mut d2 = 0.0f32;
-                    for c in 0..p {
-                        let d = xi[c] - prev[c];
-                        d2 += d * d;
+        let (chosen, remaining) = min_dist2
+            .par_iter_mut()
+            .enumerate()
+            .map(|(i, md)| {
+                let xi = x.row(i);
+                let mut dot = 0.0_f64;
+                for c in 0..p {
+                    dot += xi[c] as f64 * prev[c] as f64;
+                }
+                // Evaluate the residual itself rather than subtracting two
+                // large energies. The latter can invent a positive residual
+                // even for an exact antipode and seed the same line twice.
+                let projection = dot / previous_norm2;
+                let mut d2 = 0.0_f64;
+                for c in 0..p {
+                    let residual = (-projection).mul_add(prev[c] as f64, xi[c] as f64);
+                    d2 += residual * residual;
+                }
+                if d2 < *md {
+                    *md = d2;
+                }
+                (i, *md)
+            })
+            .reduce(
+                || (usize::MAX, f64::NEG_INFINITY),
+                |a, b| {
+                    // Strictly-greater wins; on ties keep the lower index —
+                    // exactly the serial scan's first-max semantics.
+                    if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) {
+                        b
+                    } else {
+                        a
                     }
-                    if d2 < *md {
-                        *md = d2;
-                    }
-                    (i, *md)
-                })
-                .reduce(
-                    || (usize::MAX, f32::NEG_INFINITY),
-                    |a, b| {
-                        // Strictly-greater wins; on ties keep the lower index —
-                        // exactly the serial scan's first-max semantics.
-                        if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) {
-                            b
-                        } else {
-                            a
-                        }
-                    },
-                );
-            bi
-        } else {
-            // K > N wrap: no distance refresh needed, the atom repeats a row.
-            atom % n
-        };
+                },
+            );
+        if remaining == 0.0 {
+            break;
+        }
         decoder.row_mut(atom).assign(&x.row(chosen));
+        min_dist2[chosen] = 0.0;
+        previous_norm2 = norm2[chosen];
     }
     decoder
+}
+
+#[cfg(test)]
+mod seed_geometry_tests {
+    use super::seed_decoder;
+    use ndarray::array;
+
+    #[test]
+    fn antipodes_do_not_consume_distinct_atom_capacity() {
+        let x = array![[4.0_f32, 0.0], [-4.0, 0.0], [0.0, 3.0], [0.0, -3.0]];
+        let seed = seed_decoder(x.view(), 2);
+        assert_eq!(seed, array![[4.0_f32, 0.0], [0.0, 3.0]]);
+    }
+
+    #[test]
+    fn row_sign_changes_preserve_seed_projectors() {
+        let x = array![
+            [2.0_f32, 1.0, 0.0],
+            [-2.0, -1.0, 0.0],
+            [1.0, -2.0, 0.0],
+            [0.0, 0.0, 2.0]
+        ];
+        let mut reflected = x.clone();
+        reflected.row_mut(0).mapv_inplace(|v| -v);
+        reflected.row_mut(2).mapv_inplace(|v| -v);
+        let original = seed_decoder(x.view(), 3);
+        let flipped = seed_decoder(reflected.view(), 3);
+        for (a, b) in original.outer_iter().zip(flipped.outer_iter()) {
+            for i in 0..a.len() {
+                for j in 0..a.len() {
+                    assert_eq!(a[i] * a[j], b[i] * b[j]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_seed_support_is_dormant_and_finite_f32_energies_are_ordered() {
+        let x = array![[1.0e20_f32, 0.0], [0.0, 2.0e20], [0.0, -2.0e20]];
+        let seed = seed_decoder(x.view(), 5);
+        assert_eq!(seed.row(0), x.row(1));
+        assert_eq!(seed.row(1), x.row(0));
+        assert!(seed.slice(ndarray::s![2.., ..]).iter().all(|&v| v == 0.0));
+        let zero = ndarray::Array2::<f32>::zeros((3, 2));
+        assert!(seed_decoder(zero.view(), 5).iter().all(|&v| v == 0.0));
+    }
 }
 
 /// The assembled sparse decoder normal equations `(A + ρI) D = B`, with
@@ -3825,8 +3884,7 @@ mod exact_solve_tests {
         CgStop, DecoderNormalEq, DecoderRecycleSpace, EvPlateau, LINEAR_EV_PLATEAU_FRACTION,
         LINEAR_SUPPORT_SATURATION_ROUNDS, LiveSupportGrowth, SparseDictionaryError, cg_solve,
         explained_variance, kappa_from_cg_tridiagonal, open_round_is_stationary, pcg_multi_core,
-        recycled_component_preconditioner, route_and_code_all, run_seeded,
-        solve_decoder_recycled,
+        recycled_component_preconditioner, route_and_code_all, run_seeded, solve_decoder_recycled,
         solve_decoder_with_routability_gate_recycled,
     };
     use crate::sparse_dict::codes::SparseCode;
@@ -5647,7 +5705,6 @@ mod exact_solve_tests {
             fit.explained_variance
         );
     }
-
 }
 
 /// #2742: the decoder-recycle break-even latch is documented as one-way for the
@@ -5829,8 +5886,7 @@ mod decoder_recycle_latch_scope_2742_tests {
             "fixture is vacuous: continuation requires an outer boundary"
         );
         assert_eq!(
-            fit.convergence.seeded_inner_runs,
-            1,
+            fit.convergence.seeded_inner_runs, 1,
             "the O(K*N*P) farthest-point seed is a once-per-schedule operation"
         );
         assert_eq!(
