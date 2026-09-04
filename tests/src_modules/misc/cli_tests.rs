@@ -577,16 +577,30 @@ mod saved_survival_marginal_slope_test_support {
     }
 }
 
-fn csv_mean_at(path: &std::path::Path, row_idx: usize) -> f64 {
+/// Read one prediction cell BY COLUMN NAME. The prediction surface publishes
+/// the plug-in and the posterior mean side by side under their own names
+/// (#2670: there is no `--mode` to select one), and the schema differs by
+/// model class -- `posterior_mean` in the estimand-explicit schema, `mean`
+/// beside `mean_plugin` in the latent-window one. A caller therefore has to
+/// SAY which estimand it is asserting; a fixed `"mean"` silently read whatever
+/// the writer happened to put there.
+fn csv_value_at(path: &std::path::Path, row_idx: usize, column: &str) -> f64 {
     let mut rdr = csv::Reader::from_path(path)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "open prediction csv", e));
     let rows = rdr
         .deserialize::<BTreeMap<String, String>>()
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse prediction csv", e));
-    rows[row_idx]["mean"]
-        .parse::<f64>()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "mean should parse", e))
+    let row = &rows[row_idx];
+    let cell = row.get(column).unwrap_or_else(|| {
+        let available: Vec<&str> = row.keys().map(String::as_str).collect();
+        panic!(
+            "prediction csv has no `{column}` column; it published {}",
+            available.join(",")
+        )
+    });
+    cell.parse::<f64>()
+        .unwrap_or_else(|e| panic!("`{column}` should parse: {e:?}"))
 }
 
 fn write_binomial_location_scale_train_csv(path: &std::path::Path) {
@@ -1649,9 +1663,18 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "read survival prediction csv", e));
     // Exact header pin (the writer's column order is deterministic): a
     // substring check could pass with reordered/renamed/duplicated columns.
+    //
+    // Two columns changed with #2670. `survival_prob_plugin` is new: with no
+    // `--mode` to select an estimand, the plug-in is published BY NAME beside
+    // the posterior mean. And the `std_error`/band columns are gone from a
+    // request that did not ask for uncertainty: they used to ride along
+    // because `mode == PosteriorMean` (the default) was itself the switch that
+    // built the uncertainty object, so every default predict paid for a band
+    // it never requested. `--uncertainty` is now the only switch, as it
+    // already was for the estimand-explicit schema (#2136).
     let header = pred_text.lines().next().unwrap_or("");
     assert_eq!(
-        header, "eta,survival_prob,failure_prob,risk_score,std_error,mean_lower,mean_upper",
+        header, "eta,survival_prob_plugin,survival_prob,failure_prob,risk_score",
         "posterior-mean survival prediction header drifted"
     );
 }
@@ -1879,7 +1902,9 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
     // which keeps `mean` and adds the derived probabilities beside it. The
     // plain-survival header this used to expect belongs to a model whose mean
     // already IS a survival probability, and it drops the `mean` column that
-    // `csv_mean_at` reads back elsewhere in this file.
+    // `csv_value_at` reads back elsewhere in this file. `mean_plugin` leads the
+    // pair: the plug-in is published by name rather than selected by a mode
+    // (#2670).
     //
     // And `uncertainty: false` is point-only by contract:
     // `resolve_prediction_request` routes through
@@ -1888,7 +1913,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
     // (#2136). So the default predict carries no `std_error`/bands, and the
     // banded schema is asserted separately below.
     assert_eq!(
-        header, "eta,mean,event_prob,failure_prob,survival_prob,risk_score",
+        header, "eta,mean_plugin,mean,event_prob,failure_prob,survival_prob,risk_score",
         "posterior-mean marginal-slope prediction header drifted"
     );
 }
@@ -3028,7 +3053,10 @@ fn posterior_mean_prediction_for_model(model: &SavedModel) -> f64 {
     };
     run_predict(args)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "predict binomial location-scale", e));
-    csv_mean_at(&out_path, 0)
+    // The estimand-explicit schema publishes the plug-in pair and the
+    // posterior mean under their own names; this fixture is the MC comparison
+    // for the POSTERIOR mean, so it reads that column.
+    csv_value_at(&out_path, 0, "posterior_mean")
 }
 
 fn mc_nonwiggle_posterior_mean(
@@ -4379,11 +4407,25 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
         )
     });
 
-    let predicted = csv_mean_at(&out_path, 0);
+    // What is under test is the SAVED normalization being replayed on the new
+    // data (`z = 3.0`, sd 3 => the standardized 1.0), which is a statement
+    // about eta, so the deterministic plug-in `Phi(eta)` is the column that
+    // carries it exactly. The posterior mean of the same row is the same
+    // quantity integrated over the saved coefficient covariance --
+    // `Phi(1/sqrt(1 + v))`, a shrunk value that no closed form of the
+    // normalization alone predicts. Before #2670 this test selected the
+    // plug-in with `--mode map`; it now names the column instead.
+    let predicted = csv_value_at(&out_path, 0, "mean_plugin");
     let expected = normal_cdf(1.0);
     assert!(
         (predicted - expected).abs() <= 1e-12,
         "saved marginal-slope prediction should use normalized z: predicted={predicted}, expected={expected}"
+    );
+    // ... and the posterior mean IS published beside it, on the same row.
+    let posterior = csv_value_at(&out_path, 0, "mean");
+    assert!(
+        posterior.is_finite() && (0.0..=1.0).contains(&posterior),
+        "posterior mean should be a probability: {posterior}"
     );
 }
 
