@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="600" font-family="Helvetica, Arial, sans-serif"><rect width="1400" height="600" fill="white"/>
+<rect x="70" y="50" width="580" height="440" fill="#fbfbfb" stroke="#999"/>
+<line x1="70.0" y1="50" x2="70.0" y2="490" stroke="#e6e6e6"/><text x="70.0" y="508" font-size="12" text-anchor="middle" fill="#333">-4</text>
+<line x1="142.5" y1="50" x2="142.5" y2="490" stroke="#e6e6e6"/><text x="142.5" y="508" font-size="12" text-anchor="middle" fill="#333">-2</text>
+<line x1="215.0" y1="50" x2="215.0" y2="490" stroke="#e6e6e6"/><text x="215.0" y="508" font-size="12" text-anchor="middle" fill="#333">0</text>
+<line x1="287.5" y1="50" x2="287.5" y2="490" stroke="#e6e6e6"/><text x="287.5" y="508" font-size="12" text-anchor="middle" fill="#333">2</text>
+<line x1="360.0" y1="50" x2="360.0" y2="490" stroke="#e6e6e6"/><text x="360.0" y="508" font-size="12" text-anchor="middle" fill="#333">4</text>
+<line x1="432.5" y1="50" x2="432.5" y2="490" stroke="#e6e6e6"/><text x="432.5" y="508" font-size="12" text-anchor="middle" fill="#333">6</text>
+<line x1="505.0" y1="50" x2="505.0" y2="490" stroke="#e6e6e6"/><text x="505.0" y="508" font-size="12" text-anchor="middle" fill="#333">8</text>
+<line x1="577.5" y1="50" x2="577.5" y2="490" stroke="#e6e6e6"/><text x="577.5" y="508" font-size="12" text-anchor="middle" fill="#333">10</text>
+<line x1="650.0" y1="50" x2="650.0" y2="490" stroke="#e6e6e6"/><text x="650.0" y="508" font-size="12" text-anchor="middle" fill="#333">12</text>
+<line x1="70" y1="490.0" x2="650" y2="490.0" stroke="#e6e6e6"/><text x="64" y="494.0" font-size="12" text-anchor="end" fill="#333">0</text>
+<line x1="70" y1="402.0" x2="650" y2="402.0" stroke="#e6e6e6"/><text x="64" y="406.0" font-size="12" text-anchor="end" fill="#333">0.5</text>
+<line x1="70" y1="314.0" x2="650" y2="314.0" stroke="#e6e6e6"/><text x="64" y="318.0" font-size="12" text-anchor="end" fill="#333">1</text>
+<line x1="70" y1="226.0" x2="650" y2="226.0" stroke="#e6e6e6"/><text x="64" y="230.0" font-size="12" text-anchor="end" fill="#333">1.5</text>
+<line x1="70" y1="138.0" x2="650" y2="138.0" stroke="#e6e6e6"/><text x="64" y="142.0" font-size="12" text-anchor="end" fill="#333">2</text>
+<line x1="70" y1="50.0" x2="650" y2="50.0" stroke="#e6e6e6"/><text x="64" y="54.0" font-size="12" text-anchor="end" fill="#333">2.5</text>
+<line x1="215.0" y1="50" x2="215.0" y2="490" stroke="#bbb" stroke-dasharray="4 3"/>
+<text x="360.0" y="40" font-size="15" text-anchor="middle" font-weight="bold" fill="#222">Irrelevant s(z): REML along z's bending penalty (seeds 201–203)</text>
+<text x="360.0" y="530" font-size="13" text-anchor="middle" fill="#333">e-folds of the bending λ from each fit's own optimum (ρ − ρ̂)</text>
+<text transform="translate(30,270.0) rotate(-90)" font-size="13" text-anchor="middle" fill="#333">V − V̂  (nats)</text>
+<polyline points="142.5,290.2 215.0,490.0 287.5,445.5 360.0,423.5 432.5,416.5 505.0,415.0 577.5,414.8 650.0,414.7" fill="none" stroke="#1b6ca8" stroke-width="2.4"/>
+<polyline points="106.2,206.7 142.5,379.7 178.8,467.9 215.0,490.0 251.2,478.5 287.5,457.8 323.8,441.4 360.0,432.7 396.2,428.9 432.5,427.4 468.8,426.9 505.0,426.7 541.2,426.6 577.5,426.6 613.8,426.5 650.0,426.5" fill="none" stroke="#d1495b" stroke-width="2.4"/>
+<polyline points="142.5,254.5 178.8,436.0 215.0,490.0 251.2,461.5 287.5,425.4 323.8,409.3 360.0,404.6 396.2,403.4 432.5,403.0 468.8,402.9 505.0,402.9 541.2,402.8 577.5,402.8 613.8,402.8 650.0,402.8" fill="none" stroke="#3a9d5d" stroke-width="2.4"/>
+<circle cx="142.5" cy="424.0" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="215.0" cy="490.0" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="287.5" cy="472.3" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="360.0" cy="457.4" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="432.5" cy="453.9" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="505.0" cy="453.4" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="577.5" cy="453.3" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="650.0" cy="453.3" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="70.0" cy="79.3" r="5" fill="none" stroke="#d1495b" stroke-width="2"/>
+<circle cx="142.5" cy="410.6" r="5" fill="none" stroke="#d1495b" stroke-width="2"/>
+<circle cx="215.0" cy="490.0" r="5" fill="none" stroke="#d1495b" stroke-width="2"/>
+<circle cx="287.5" cy="468.0" r="5" fill="none" stroke="#d1495b" stroke-width="2"/>
+<circle cx="360.0" cy="456.2" r="5" fill="none" stroke="#d1495b" stroke-width="2"/>
+<circle cx="432.5" cy="454.2" r="5" fill="none" stroke="#d1495b" stroke-width="2"/>
+<circle cx="505.0" cy="453.9" r="5" fill="none" stroke="#d1495b" stroke-width="2"/>
+<circle cx="577.5" cy="453.8" r="5" fill="none" stroke="#d1495b" stroke-width="2"/>
+<circle cx="650.0" cy="453.8" r="5" fill="none" stroke="#d1495b" stroke-width="2"/>
+<circle cx="142.5" cy="283.0" r="5" fill="none" stroke="#3a9d5d" stroke-width="2"/>
+<circle cx="215.0" cy="490.0" r="5" fill="none" stroke="#3a9d5d" stroke-width="2"/>
+<circle cx="287.5" cy="436.1" r="5" fill="none" stroke="#3a9d5d" stroke-width="2"/>
+<circle cx="360.0" cy="413.9" r="5" fill="none" stroke="#3a9d5d" stroke-width="2"/>
+<circle cx="432.5" cy="410.7" r="5" fill="none" stroke="#3a9d5d" stroke-width="2"/>
+<circle cx="505.0" cy="410.3" r="5" fill="none" stroke="#3a9d5d" stroke-width="2"/>
+<circle cx="577.5" cy="410.3" r="5" fill="none" stroke="#3a9d5d" stroke-width="2"/>
+<circle cx="650.0" cy="410.3" r="5" fill="none" stroke="#3a9d5d" stroke-width="2"/>
+<line x1="320" y1="64" x2="346" y2="64" stroke="#222" stroke-width="2.4"/>
+<text x="354" y="68" font-size="12" fill="#222">gam profiled-REML evaluator (lines)</text>
+<circle cx="333" cy="82" r="5" fill="none" stroke="#222" stroke-width="2"/>
+<text x="354" y="86" font-size="12" fill="#222">mgcv bs="bs", m=c(3,2), select=TRUE (circles)</text>
+<line x1="320" y1="100" x2="346" y2="100" stroke="#1b6ca8" stroke-width="2.4"/>
+<text x="354" y="104" font-size="12" fill="#222">seed 201</text>
+<line x1="320" y1="118" x2="346" y2="118" stroke="#d1495b" stroke-width="2.4"/>
+<text x="354" y="122" font-size="12" fill="#222">seed 202</text>
+<line x1="320" y1="136" x2="346" y2="136" stroke="#3a9d5d" stroke-width="2.4"/>
+<text x="354" y="140" font-size="12" fill="#222">seed 203</text>
+<text x="320" y="430" font-size="12" fill="#444">λ→∞ face is 0.2–0.5 nats WORSE than the interior</text>
+<text x="320" y="446" font-size="12" fill="#444">optimum, in gam's criterion and in mgcv's</text>
+<rect x="780" y="50" width="580" height="440" fill="#fbfbfb" stroke="#999"/>
+<line x1="780.0" y1="50" x2="780.0" y2="490" stroke="#e6e6e6"/><text x="780.0" y="508" font-size="12" text-anchor="middle" fill="#333">-4</text>
+<line x1="852.5" y1="50" x2="852.5" y2="490" stroke="#e6e6e6"/><text x="852.5" y="508" font-size="12" text-anchor="middle" fill="#333">-2</text>
+<line x1="925.0" y1="50" x2="925.0" y2="490" stroke="#e6e6e6"/><text x="925.0" y="508" font-size="12" text-anchor="middle" fill="#333">0</text>
+<line x1="997.5" y1="50" x2="997.5" y2="490" stroke="#e6e6e6"/><text x="997.5" y="508" font-size="12" text-anchor="middle" fill="#333">2</text>
+<line x1="1070.0" y1="50" x2="1070.0" y2="490" stroke="#e6e6e6"/><text x="1070.0" y="508" font-size="12" text-anchor="middle" fill="#333">4</text>
+<line x1="1142.5" y1="50" x2="1142.5" y2="490" stroke="#e6e6e6"/><text x="1142.5" y="508" font-size="12" text-anchor="middle" fill="#333">6</text>
+<line x1="1215.0" y1="50" x2="1215.0" y2="490" stroke="#e6e6e6"/><text x="1215.0" y="508" font-size="12" text-anchor="middle" fill="#333">8</text>
+<line x1="1287.5" y1="50" x2="1287.5" y2="490" stroke="#e6e6e6"/><text x="1287.5" y="508" font-size="12" text-anchor="middle" fill="#333">10</text>
+<line x1="1360.0" y1="50" x2="1360.0" y2="490" stroke="#e6e6e6"/><text x="1360.0" y="508" font-size="12" text-anchor="middle" fill="#333">12</text>
+<line x1="780" y1="490.0" x2="1360" y2="490.0" stroke="#e6e6e6"/><text x="774" y="494.0" font-size="12" text-anchor="end" fill="#333">0</text>
+<line x1="780" y1="343.3" x2="1360" y2="343.3" stroke="#e6e6e6"/><text x="774" y="347.3" font-size="12" text-anchor="end" fill="#333">0.5</text>
+<line x1="780" y1="196.7" x2="1360" y2="196.7" stroke="#e6e6e6"/><text x="774" y="200.7" font-size="12" text-anchor="end" fill="#333">1</text>
+<line x1="780" y1="50.0" x2="1360" y2="50.0" stroke="#e6e6e6"/><text x="774" y="54.0" font-size="12" text-anchor="end" fill="#333">1.5</text>
+<line x1="925.0" y1="50" x2="925.0" y2="490" stroke="#bbb" stroke-dasharray="4 3"/>
+<text x="1070.0" y="40" font-size="15" text-anchor="middle" font-weight="bold" fill="#222">Linear data, s(x, k=20, bs=ps, double_penalty=True), seed 1</text>
+<text x="1070.0" y="530" font-size="13" text-anchor="middle" fill="#333">e-folds of the bending λ from each fit's own optimum (ρ − ρ̂)</text>
+<text transform="translate(740,270.0) rotate(-90)" font-size="13" text-anchor="middle" fill="#333">V − V̂  (nats)</text>
+<polyline points="852.5,250.2 888.8,431.7 925.0,490.0 961.2,439.7 997.5,325.9 1033.8,222.3 1070.0,163.2 1106.2,137.0 1142.5,126.6 1178.8,122.7 1215.0,121.3 1251.2,120.7 1287.5,120.5 1323.8,120.5 1360.0,120.2" fill="none" stroke="#1b6ca8" stroke-width="2.4"/>
+<circle cx="852.5" cy="250.0" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="925.0" cy="490.0" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="997.5" cy="325.9" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="1070.0" cy="163.1" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="1142.5" cy="126.5" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="1215.0" cy="121.1" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="1287.5" cy="120.4" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<circle cx="1360.0" cy="120.3" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<line x1="1030" y1="64" x2="1056" y2="64" stroke="#1b6ca8" stroke-width="2.4"/>
+<text x="1064" y="68" font-size="12" fill="#222">gam evaluator</text>
+<circle cx="1043" cy="82" r="5" fill="none" stroke="#1b6ca8" stroke-width="2"/>
+<text x="1064" y="86" font-size="12" fill="#222">mgcv bs="bs", select=TRUE</text>
+<text x="1030" y="430" font-size="12" fill="#444">edf 3.42 at the optimum (both implementations);</text>
+<text x="1030" y="446" font-size="12" fill="#444">the λ→∞ face (edf 2.00) is 1.26 nats worse</text>
+<text x="700.0" y="588" font-size="12" text-anchor="middle" fill="#666">#2668 group C — identical data (fixtures' own CSVs), identical basis family; gam evaluator = profiled Gaussian REML with the fit's design and penalties, scanned from the fitted ρ̂</text></svg>
