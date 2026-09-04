@@ -3452,6 +3452,9 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
     // sweep was the dominant per-κ-trial cost of large-scale fits (#979).
     // Out-of-range radii and uncertified builds fall back to the exact
     // evaluator per pair.
+    // One set of per-axis scales for the whole sweep (the per-pair form
+    // recomputed `d` exponentials and allocated per pair).
+    let aniso_scales = aniso_axis_scales(eta);
     let profile = if nk >= RADIAL_PROFILE_MIN_PAIRS {
         let mut r_lo = f64::INFINITY;
         let mut r_hi = 0.0_f64;
@@ -3465,7 +3468,7 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
                 for a in 0..dim {
                     cb[a] = centers[[j, a]];
                 }
-                let (r, _) = aniso_distance_and_components(&drb, &cb, eta);
+                let r = aniso_distance_with_scales(&drb, &cb, &aniso_scales);
                 if r > 0.0 {
                     r_lo = r_lo.min(r);
                     r_hi = r_hi.max(r);
@@ -3487,11 +3490,13 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
         let ap = SendPtr(axis_components.as_mut_ptr());
         let ferr = &first_err;
         let profile_ref = profile.as_ref();
+        let aniso_scales_ref = &aniso_scales;
         (0..nc).into_par_iter().for_each(move |ci| {
             let start = ci * cs;
             let end = start.saturating_add(cs).min(n);
             let mut drb = vec![0.0; dim];
             let mut cb = vec![0.0; dim];
+            let mut sv = vec![0.0; dim];
             for i in start..end {
                 for a in 0..dim {
                     drb[a] = data[[i, a]];
@@ -3500,7 +3505,12 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
                     for a in 0..dim {
                         cb[a] = centers[[j, a]];
                     }
-                    let (r, mut sv) = aniso_distance_and_components(&drb, &cb, eta);
+                    let r = aniso_distance_and_components_with_scales(
+                        &drb,
+                        &cb,
+                        aniso_scales_ref,
+                        &mut sv,
+                    );
                     let collision = if r == 0.0 {
                         Some(radial_kind.eval_per_axis_psi_carriers(r))
                     } else {
@@ -3692,13 +3702,14 @@ pub(crate) fn build_scalar_design_psi_derivatives_shared(
     // Same certified radial-profile amortization as the per-axis sweep
     // above: one distance-only pre-pass for the radius range, one profile
     // build, Clenshaw per pair, exact fallback out of range (#979).
+    let fixed_scales: Option<Vec<f64>> = fixed_eta.map(aniso_axis_scales);
     let pair_r = |i: usize, j: usize, drb: &mut [f64], cb: &mut [f64]| -> f64 {
-        if let Some(eta) = fixed_eta {
+        if let Some(scales) = fixed_scales.as_deref() {
             for a in 0..dim {
                 drb[a] = data[[i, a]];
                 cb[a] = centers[[j, a]];
             }
-            aniso_distance_and_components(drb, cb, eta).0
+            aniso_distance_with_scales(drb, cb, scales)
         } else {
             stable_euclidean_norm((0..dim).map(|a| data[[i, a]] - centers[[j, a]]))
         }
@@ -3746,18 +3757,23 @@ pub(crate) fn build_scalar_design_psi_derivatives_shared(
             let end = start.saturating_add(cs).min(n);
             let mut data_row_buf = vec![0.0; dim];
             let mut center_buf = vec![0.0; dim];
+            let mut component_buf = vec![0.0; dim];
             for i in start..end {
                 for a in 0..dim {
                     data_row_buf[a] = data[[i, a]];
                 }
                 for j in 0..k {
-                    let (r, scalar_component) = if let Some(eta) = fixed_eta {
+                    let (r, scalar_component) = if let Some(scales) = fixed_scales.as_deref() {
                         for a in 0..dim {
                             center_buf[a] = centers[[j, a]];
                         }
-                        let (r, components) =
-                            aniso_distance_and_components(&data_row_buf, &center_buf, eta);
-                        (r, components.into_iter().sum::<f64>())
+                        let r = aniso_distance_and_components_with_scales(
+                            &data_row_buf,
+                            &center_buf,
+                            scales,
+                            &mut component_buf,
+                        );
+                        (r, component_buf.iter().sum::<f64>())
                     } else {
                         let r =
                             stable_euclidean_norm((0..dim).map(|a| data[[i, a]] - centers[[j, a]]));

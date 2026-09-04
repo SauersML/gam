@@ -215,13 +215,22 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     let mut d2_raw =
         Array2::<f64>::zeros((if build_d2 { p_colloc * dim * dim } else { 0 }, n_basis));
     const R_EPS: f64 = 1e-10;
+    // The anisotropic metric is fixed for the whole block: its per-axis scales
+    // are formed once, and the center rows once, instead of `d` exponentials
+    // and two allocations per `(collocation, center)` pair.
+    let aniso_scales: Option<Vec<f64>> = aniso_log_scales.map(aniso_axis_scales);
+    let center_rows: Vec<Vec<f64>> = (0..n_basis)
+        .map(|j| (0..dim).map(|a| centers[[j, a]]).collect())
+        .collect();
+    let mut row_i: Vec<f64> = vec![0.0; dim];
     for i in 0..p_colloc {
         let scale_i = row_scales[i];
+        for (a, slot) in row_i.iter_mut().enumerate() {
+            *slot = collocation_points[[i, a]];
+        }
         for j in 0..n_basis {
-            let r = if let Some(eta) = aniso_log_scales {
-                let row_i: Vec<f64> = (0..dim).map(|a| collocation_points[[i, a]]).collect();
-                let row_j: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
-                aniso_distance(&row_i, &row_j, eta)
+            let r = if let Some(scales) = aniso_scales.as_deref() {
+                aniso_distance_with_scales(&row_i, &center_rows[j], scales)
             } else {
                 stable_euclidean_norm(
                     (0..dim).map(|axis| collocation_points[[i, axis]] - centers[[j, axis]]),
@@ -2226,6 +2235,37 @@ pub(crate) fn aniso_distance(data_row: &[f64], center: &[f64], eta: &[f64]) -> f
     stable_euclidean_norm(
         (0..data_row.len()).map(|a| aniso_axis_scale(eta[a], eta_mean) * (data_row[a] - center[a])),
     )
+}
+
+/// [`aniso_distance`] with the per-axis scales precomputed once by
+/// [`aniso_axis_scales`]. The per-call form recomputes the log-scale mean and
+/// `d` exponentials for every `(row, center)` pair — `1.5e8` exponentials per
+/// design pass at `n = 50,000`, `k = 500`, `d = 6`, measured as 2.6–3.8 % of a
+/// Duchon fit (`expf32x`) before the hot loops moved here.
+#[inline]
+pub(crate) fn aniso_distance_with_scales(data_row: &[f64], center: &[f64], scales: &[f64]) -> f64 {
+    assert_eq!(data_row.len(), center.len());
+    assert_eq!(data_row.len(), scales.len());
+    stable_euclidean_norm((0..data_row.len()).map(|a| scales[a] * (data_row[a] - center[a])))
+}
+
+/// [`aniso_distance_and_components`] with precomputed scales, writing the
+/// per-axis squared scaled components into `s_vec` instead of allocating them.
+#[inline]
+pub(crate) fn aniso_distance_and_components_with_scales(
+    data_row: &[f64],
+    center: &[f64],
+    scales: &[f64],
+    s_vec: &mut [f64],
+) -> f64 {
+    assert_eq!(data_row.len(), center.len());
+    assert_eq!(data_row.len(), scales.len());
+    assert_eq!(data_row.len(), s_vec.len());
+    for a in 0..data_row.len() {
+        let scaled_h_a = scales[a] * (data_row[a] - center[a]);
+        s_vec[a] = scaled_h_a * scaled_h_a;
+    }
+    stable_euclidean_norm((0..data_row.len()).map(|a| scales[a] * (data_row[a] - center[a])))
 }
 
 #[inline(always)]
