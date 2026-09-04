@@ -1,6 +1,9 @@
 pub mod amortized_encoder;
 pub mod assignment;
 pub mod assignment_state;
+// The #2280 null arm: the atlas readout measured on data with no manifold in it.
+// The file carries its own `#![cfg(test)]`, so the declaration is bare.
+mod atlas;
 pub mod atom_codes;
 pub mod atom_schema;
 pub mod attention_kernel;
