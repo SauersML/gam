@@ -6210,6 +6210,51 @@ pub(crate) fn stochastic_single_second_order_estimators_match_batched_paths() {
     );
 }
 
+/// gam#979. A backend that materializes its dense curvature for every other
+/// exact path must not refuse it to the active-constraint mode response.
+/// `assemble_h_dense_for_tangent_projection` has exactly one consumer —
+/// `try_tangent_projected_evaluate`, which needs `Z' M Z` — and its error is
+/// not a demotion to a slower route: it REFUSES THE TRIAL POINT. The
+/// matrix-free backend inherited the trait's "no dense form at all" default
+/// while `as_exact_dense_spectral` was handing that very matrix out, so the
+/// large-scale CTN preprocessor's outer search spent whole BFGS restarts on
+/// probes declined for a capability it had.
+#[test]
+pub(crate) fn matrix_free_spd_gives_the_tangent_projection_its_own_curvature_979() {
+    let hessian = array![[4.0, 1.0, 0.0], [1.0, 3.0, 0.5], [0.0, 0.5, 2.0]];
+    let applied = hessian.clone();
+    let op = MatrixFreeSpdOperator::new_with_mode(
+        hessian.nrows(),
+        move |v| applied.dot(v),
+        PseudoLogdetMode::Smooth,
+    );
+
+    let assembled = op
+        .assemble_h_dense_for_tangent_projection()
+        .expect("a backend that materializes its curvature must not refuse the mode response");
+    assert_eq!(assembled.dim(), hessian.dim());
+    for row in 0..hessian.nrows() {
+        for col in 0..hessian.ncols() {
+            assert_relative_eq!(assembled[[row, col]], hessian[[row, col]], epsilon = 1e-10);
+        }
+    }
+
+    // The projection this feeds is the point: it must reproduce `Zᵀ H Z` for a
+    // tangent basis, not merely return something of the right shape.
+    let z = array![[1.0, 0.0], [0.0, 1.0], [-1.0, 1.0]];
+    let want = z.t().dot(&hessian).dot(&z);
+    let got = z.t().dot(&assembled).dot(&z);
+    for row in 0..want.nrows() {
+        for col in 0..want.ncols() {
+            assert_relative_eq!(got[[row, col]], want[[row, col]], epsilon = 1e-10);
+        }
+    }
+    assert!(
+        want.iter().any(|v| v.abs() > 1.0),
+        "the tangent projection must be non-trivial, or the comparison is vacuous"
+    );
+}
+
 #[test]
 pub(crate) fn matrix_free_logdet_traces_use_exact_spectral_algebra() {
     let diag = array![4.0, 3.0, 2.0];

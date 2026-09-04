@@ -1493,6 +1493,30 @@ impl HessianFactorization for MatrixFreeSpdOperator {
         Some(self.exact_dense_spectral())
     }
 
+    /// The curvature this backend already materializes for every exact REML
+    /// algebra path (gam#979).
+    ///
+    /// The trait's default refusal is for backends that have no dense form at
+    /// all. This one has one: `as_exact_dense_spectral` above hands it out
+    /// unconditionally, and `dense_spectral()` caches it. Inheriting the
+    /// default therefore refused a matrix the operator builds anyway — and the
+    /// refusal is not a fallback to something slower. Its one consumer,
+    /// `try_tangent_projected_evaluate`, needs `Z' M Z` for the mode response
+    /// at an ACTIVE-CONSTRAINT iterate and turns the error into a REFUSED
+    /// TRIAL POINT. The large-scale CTN preprocessor's cone constraints are
+    /// active at nearly every trial, so its outer κ search spent entire BFGS
+    /// restarts on "infeasible probes" that were only ever this.
+    fn assemble_h_dense_for_tangent_projection(&self) -> Result<Array2<f64>, String> {
+        match self.dense_spectral() {
+            Some(spectral) => spectral.assemble_h_dense_for_tangent_projection(),
+            None => Err(format!(
+                "matrix-free SPD backend declined to materialize its dense curvature at \
+                 n_dim={}",
+                self.n_dim
+            )),
+        }
+    }
+
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
         self.exact_dense_spectral().trace_hinv_product(a)
     }

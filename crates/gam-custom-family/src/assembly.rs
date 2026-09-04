@@ -292,12 +292,22 @@ impl HessianFactorization for FirstOrderTraceSkipOperator {
         }
     }
 
+    /// Always the inner backend's, skip list or not (gam#979).
+    ///
+    /// This wrapper exists to serve a precomputed list of FIRST-ORDER TRACES,
+    /// and `as_exact_dense_spectral` above is gated because the eigenbasis
+    /// batch route computes traces and would walk straight past that list. A
+    /// dense stationarity curvature computes no trace and cannot bypass
+    /// anything: its one consumer is `try_tangent_projected_evaluate`, which
+    /// needs `Z' M Z` for the mode response at an ACTIVE-CONSTRAINT iterate.
+    ///
+    /// Refusing it there does not fall back to something slower — it refuses
+    /// the whole trial point as infeasible. On the large-scale CTN
+    /// preprocessor the cone constraints are active at nearly every trial
+    /// point, so the outer κ search burned entire BFGS restarts on probes
+    /// declined for a capability the backend underneath this wrapper has.
     fn assemble_h_dense_for_tangent_projection(&self) -> Result<Array2<f64>, String> {
-        if self.first_order_skip_active() {
-            Err("backend does not support tangent projection".to_string())
-        } else {
-            self.inner.assemble_h_dense_for_tangent_projection()
-        }
+        self.inner.assemble_h_dense_for_tangent_projection()
     }
 
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
@@ -2859,4 +2869,70 @@ pub(crate) struct CachedInnerMode {
     /// compares against this, not against a key rebuilt from the caller's
     /// coordinates.
     pub(crate) objective_state: InnerObjectiveState,
+}
+
+#[cfg(test)]
+mod first_order_trace_skip_tests {
+    use super::{Arc, DenseSpectralOperator, FirstOrderTraceSkipOperator, HessianFactorization};
+    use ndarray::array;
+
+    /// gam#979: the trace-skip wrapper must not refuse a capability its inner
+    /// backend has. `assemble_h_dense_for_tangent_projection` has one
+    /// consumer — the active-constraint mode response — and its refusal is not
+    /// a slow path but a REFUSED TRIAL POINT, which is what made the CTN
+    /// preprocessor's outer search spend whole restarts on infeasible probes.
+    ///
+    /// The skip list itself still has to work, and `as_exact_dense_spectral`
+    /// still has to be gated: that route batches traces in the eigenbasis and
+    /// would walk past the list this wrapper is serving.
+    #[test]
+    fn the_trace_skip_still_hands_back_the_dense_stationarity_curvature_979() {
+        let hessian = array![[4.0, 1.0], [1.0, 3.0]];
+        let inner: Arc<dyn HessianFactorization> =
+            Arc::new(DenseSpectralOperator::from_symmetric(&hessian).expect("SPD fixture"));
+        let want = inner
+            .assemble_h_dense_for_tangent_projection()
+            .expect("the inner backend assembles its own stationarity curvature");
+        // `DenseSpectralOperator` reconstructs `H` from its eigendecomposition,
+        // so the round trip is exact only to accumulation order.
+        for row in 0..hessian.nrows() {
+            for column in 0..hessian.ncols() {
+                let (got, expected) = (want[[row, column]], hessian[[row, column]]);
+                assert!(
+                    (got - expected).abs() <= 1.0e-12 * expected.abs().max(1.0),
+                    "the fixture's own curvature is what comes back: [{row}, {column}] \
+                     = {got:.17e} against {expected:.17e}"
+                );
+            }
+        }
+
+        let skipping = FirstOrderTraceSkipOperator::new(Arc::clone(&inner), 2);
+        assert!(
+            skipping.first_order_skip_active(),
+            "the fixture must start with the skip list live, or the gate below is vacuous"
+        );
+        let got = skipping
+            .assemble_h_dense_for_tangent_projection()
+            .expect("a live skip list must not refuse the inner backend's curvature");
+        assert_eq!(got, want);
+
+        assert!(
+            skipping.as_exact_dense_spectral().is_none(),
+            "the eigenbasis batch route stays closed while the skip list is live"
+        );
+        assert!(skipping.consume_first_order_trace());
+        assert!(skipping.consume_first_order_trace());
+        assert!(!skipping.consume_first_order_trace());
+        assert!(!skipping.first_order_skip_active());
+        assert!(
+            skipping.as_exact_dense_spectral().is_some(),
+            "with the list exhausted the eigenbasis route reopens"
+        );
+        assert_eq!(
+            skipping
+                .assemble_h_dense_for_tangent_projection()
+                .expect("still available once the list is exhausted"),
+            want
+        );
+    }
 }
