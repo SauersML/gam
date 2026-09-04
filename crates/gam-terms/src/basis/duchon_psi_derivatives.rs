@@ -2146,10 +2146,14 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
         .into_par_iter()
         .enumerate()
         .try_for_each(|(ci, mut chunk)| {
-            let mut kernel_row = vec![0.0; k];
+            let rows = chunk.nrows();
             let chunk_start = ci * chunk_size;
-            for local_i in 0..chunk.nrows() {
+            // The chunk's kernel block `K` (rows × k), filled row by row and
+            // then multiplied by `Z` in ONE call.
+            let mut kernel_block = Array2::<f64>::zeros((rows, k));
+            for local_i in 0..rows {
                 let i = chunk_start + local_i;
+                let mut kernel_row = kernel_block.row_mut(local_i);
                 for j in 0..k {
                     let r = if let Some(scales) = axis_scales.as_deref() {
                         aniso_distance_rows_with_scales(data, i, centers, j, scales)
@@ -2177,23 +2181,25 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
                     };
                     kernel_row[j] = raw * kernel_amp;
                 }
-                // Write basis row = kernel_row^T × Z using scatter-accumulate
-                // pattern: for each knot j with nonzero kernel, add its
-                // contribution to all columns at once. This is more cache-
-                // friendly than the column-by-column gather pattern since
-                // Z rows are contiguous in memory.
-                let mut row = chunk.row_mut(local_i);
-                row.slice_mut(s![..kernel_cols]).fill(0.0);
-                for j in 0..k {
-                    let kv = kernel_row[j];
-                    if kv != 0.0 {
-                        let z_row = z.row(j);
-                        for col in 0..kernel_cols {
-                            row[col] += kv * z_row[col];
-                        }
-                    }
-                }
             }
+            // The kernel block times the identifiability transform,
+            // `basis[chunk] = K · Z`, is a matrix product: one GEMM per chunk
+            // instead of a scatter-accumulate over `rows · k` rows of `Z`.
+            //
+            // Written out by hand this is the dominant cost of a wide design:
+            // `n · k · kernel_cols` scalar updates through bounds-checked
+            // indexing measured ≈ 1 GFLOP/s across the pool on the 6-D
+            // isotropic Duchon fit (n = 50 000, k = 100, 8 threads: 19 % of
+            // the whole fit's samples sat in this closure's own frame, and the
+            // per-κ-trial rebuild grows with `k²`). faer's kernel does the
+            // same arithmetic blocked and vectorised. It runs sequentially
+            // here because the chunk loop is already the parallel region — the
+            // pool is saturated by chunks, not by one product (#2735).
+            let mut product = Array2::<f64>::zeros((rows, kernel_cols));
+            gam_linalg::faer_ndarray::with_faer_sequential(|| {
+                gam_linalg::faer_ndarray::fast_ab_into(&kernel_block, &z, &mut product)
+            });
+            chunk.slice_mut(s![.., ..kernel_cols]).assign(&product);
             Ok(())
         });
     basis_result?;
