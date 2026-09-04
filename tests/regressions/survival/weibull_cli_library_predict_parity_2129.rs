@@ -171,11 +171,10 @@ fn weibull_cli_and_library_predict_surfaces_agree() {
         .arg("predict")
         .arg(&model_path)
         .arg(&grid)
-        .args(["--mode", "map"])
         .arg("--out")
         .arg(&cli_pred);
-    run_or_panic(predict_cmd, "gam predict (map)");
-    let cli_survival = read_column(&cli_pred, "survival_prob");
+    run_or_panic(predict_cmd, "gam predict");
+    let cli_survival = read_column(&cli_pred, "survival_prob_plugin");
     let cli_eta = read_column(&cli_pred, "eta");
 
     // Path B — the in-process library predict surface for the same model, same

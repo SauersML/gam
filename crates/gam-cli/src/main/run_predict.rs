@@ -1035,11 +1035,6 @@ pub(crate) fn run_predict_unified(
         // column map, so the weights are not reachable here without threading
         // the dataset through `run_predict_model`.
         observation_prior_weights: None,
-        point_estimate: if args.mode == PredictModeArg::PosteriorMean {
-            gam_predict::interval_policy::PointEstimate::PosteriorMeanWhenCurved
-        } else {
-            gam_predict::interval_policy::PointEstimate::ForcePlugin
-        },
     };
     let columns = gam_predict::interval_policy::resolve_prediction_request(
         predictor,
@@ -1068,13 +1063,9 @@ pub(crate) fn run_predict_unified(
         columns.point_covariance_source,
         columns.uncertainty_covariance_source,
     );
-    let specialised_point = match (args.mode, posterior_mean.as_ref()) {
-        (PredictModeArg::PosteriorMean, Some(posterior_mean)) => posterior_mean,
-        (PredictModeArg::PosteriorMean, None) => {
-            return Err("posterior-mean prediction did not produce a posterior mean".to_string());
-        }
-        (PredictModeArg::Map, _) => &mean_plugin,
-    };
+    let specialised_point = posterior_mean
+        .as_ref()
+        .ok_or_else(|| "posterior-mean prediction did not produce a posterior mean".to_string())?;
 
     // --- Write CSV output ---
 
@@ -1082,18 +1073,11 @@ pub(crate) fn run_predict_unified(
         class if class.publishes_estimand_explicit_schema() => {
             // `resolve_prediction_request` keeps `posterior_mean=Some(mean_plugin)`
             // for an effectively linear response because those two estimands are
-            // numerically equal. The CLI mode still owns which estimands the CSV
-            // publishes: a point-only `--mode map` request promises the plug-in
-            // pair only, so equality is not permission to add a posterior column.
-            // An uncertainty request is different: the accompanying
-            // `posterior_mean_*` columns require their named posterior point and
-            // the shared interval policy deliberately produces that estimand.
-            let published_posterior_mean =
-                if args.mode == PredictModeArg::Map && !args.uncertainty {
-                    None
-                } else {
-                    posterior_mean.as_ref().map(|values| values.view())
-                };
+            // numerically equal. The posterior column is published beside the
+            // plug-in pair in every case: the posterior mean is the one point
+            // estimand a prediction surface reports, and the plug-in pair is
+            // carried by name, not selected by a mode.
+            let published_posterior_mean = posterior_mean.as_ref().map(|values| values.view());
             write_estimand_explicit_prediction_csv(
                 &args.out,
                 linear_predictor_plugin.view(),
@@ -1129,6 +1113,7 @@ pub(crate) fn run_predict_unified(
             write_survival_binary_prediction_csv(
                 &args.out,
                 linear_predictor_plugin.view(),
+                mean_plugin.view(),
                 specialised_point.view(),
                 posterior_mean_standard_error.as_ref().map(|a| a.view()),
                 posterior_mean_lower.as_ref().map(|a| a.view()),
@@ -1654,9 +1639,6 @@ fn build_saved_latent_window_alo_input(
 
 pub(crate) struct LatentWindowPluginJet {
     survival: f64,
-    score_mu: f64,
-    score_q_entry: f64,
-    score_q_exit: f64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1687,33 +1669,34 @@ impl SavedLatentWindowKind {
         }
     }
 
-    fn response_gradient(self, jet: &LatentWindowPluginJet) -> [f64; 3] {
-        let scale = match self {
-            SavedLatentWindowKind::Survival => jet.survival,
-            SavedLatentWindowKind::EventProbability => -jet.survival,
-        };
-        [
-            scale * jet.score_mu,
-            scale * jet.score_q_entry,
-            scale * jet.score_q_exit,
-        ]
-    }
-
     fn write_predictions(
         self,
         path: &Path,
         eta: ArrayView1<'_, f64>,
+        mean_plugin: ArrayView1<'_, f64>,
         mean: ArrayView1<'_, f64>,
         mean_lower: Option<ArrayView1<'_, f64>>,
         mean_upper: Option<ArrayView1<'_, f64>>,
     ) -> CliResult<()> {
         match self {
-            SavedLatentWindowKind::Survival => {
-                write_survival_prediction_csv(path, eta, mean, None, mean_lower, mean_upper)
-            }
-            SavedLatentWindowKind::EventProbability => {
-                write_survival_binary_prediction_csv(path, eta, mean, None, mean_lower, mean_upper)
-            }
+            SavedLatentWindowKind::Survival => write_survival_prediction_csv(
+                path,
+                eta,
+                mean_plugin,
+                mean,
+                None,
+                mean_lower,
+                mean_upper,
+            ),
+            SavedLatentWindowKind::EventProbability => write_survival_binary_prediction_csv(
+                path,
+                eta,
+                mean_plugin,
+                mean,
+                None,
+                mean_lower,
+                mean_upper,
+            ),
         }
     }
 }
@@ -1745,39 +1728,8 @@ pub(crate) fn latent_window_plugin_survival(
         quadctx, &row, mu, sigma,
     )
     .map_err(|e| format!("latent hazard-window prediction failed: {e}"))?;
-    let score_q_entry = if row.mass_entry > 0.0 {
-        let bundle = gam::families::survival::lognormal_kernel::log_kernel_bundle(
-            quadctx,
-            row.mass_entry,
-            mu,
-            sigma,
-            1,
-        )
-        .map_err(|e| format!("latent hazard-window entry kernel evaluation failed: {e}"))?;
-        let ratio = (bundle.get(1) - bundle.get(0)).exp();
-        row.mass_entry * ratio
-    } else {
-        0.0
-    };
-    let score_q_exit = if row.mass_exit > 0.0 {
-        let bundle = gam::families::survival::lognormal_kernel::log_kernel_bundle(
-            quadctx,
-            row.mass_exit,
-            mu,
-            sigma,
-            1,
-        )
-        .map_err(|e| format!("latent hazard-window exit kernel evaluation failed: {e}"))?;
-        let ratio = (bundle.get(1) - bundle.get(0)).exp();
-        -row.mass_exit * ratio
-    } else {
-        0.0
-    };
     Ok(LatentWindowPluginJet {
         survival: jet.log_lik.exp().clamp(0.0, 1.0),
-        score_mu: jet.score,
-        score_q_entry,
-        score_q_exit,
     })
 }
 
@@ -1929,9 +1881,8 @@ pub(crate) fn run_predict_saved_latent_window_impl(
             .collect(),
     );
 
-    let need_covariance = args.mode == PredictModeArg::PosteriorMean || args.uncertainty;
     let covariance_mode = resolved_covariance_mode(args, model);
-    let local_covariances = if need_covariance {
+    let local_covariances = {
         let backend = prediction_backend_from_model(model, covariance_mode)?;
         if backend.nrows() != state.fit.beta.len() {
             return Err(format!(
@@ -1955,14 +1906,12 @@ pub(crate) fn run_predict_saved_latent_window_impl(
             &backend,
             kind,
         )?)
-    } else {
-        None
     };
 
-    let mut mean = plugin_mean.clone();
+    let mean: Array1<f64>;
     let mut mean_lo = None;
     let mut mean_hi = None;
-    if args.mode == PredictModeArg::PosteriorMean {
+    {
         let local_cov = local_covariances.as_ref().ok_or_else(|| {
             "internal error: latent window posterior mean requires local covariance".to_string()
         })?;
@@ -1995,10 +1944,21 @@ pub(crate) fn run_predict_saved_latent_window_impl(
                 ],
                 15,
                 |x| {
+                    // The Gaussian approximation of the coefficient posterior
+                    // is not confined to the cone the monotone time block lives
+                    // in, so a displaced node can carry `Λ(exit) < Λ(entry)` —
+                    // a baseline no fitted coefficient can produce and a row
+                    // the kernel refuses (`mass_exit >= mass_entry`). A node
+                    // outside the cone is projected onto its boundary: the
+                    // window carries no event mass there. With the plug-in
+                    // point this never arose; the posterior mean integrates the
+                    // approximation's tails and has to say what they mean.
+                    let q_entry = x[1];
+                    let q_exit = x[2].max(q_entry);
                     latent_window_plugin_survival(
                         &quadctx,
-                        x[1],
-                        x[2],
+                        q_entry,
+                        q_exit,
                         prepared.unloaded_mass_entry[i],
                         prepared.unloaded_mass_exit[i],
                         x[0],
@@ -2032,51 +1992,12 @@ pub(crate) fn run_predict_saved_latent_window_impl(
             mean_lo = Some(lo);
             mean_hi = Some(hi);
         }
-    } else if args.uncertainty {
-        validate_level(args.level)?;
-        let local_cov = local_covariances.as_ref().ok_or_else(|| {
-            "internal error: latent window uncertainty requires local covariance".to_string()
-        })?;
-        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-        let response_sd = Array1::from_vec(
-            (0..n)
-                .map(|i| {
-                    let grad = kind.response_gradient(&plugin_jets[i]);
-                    let cov = [
-                        [
-                            local_cov[0][0][i].max(0.0),
-                            local_cov[0][1][i],
-                            local_cov[0][2][i],
-                        ],
-                        [
-                            local_cov[1][0][i],
-                            local_cov[1][1][i].max(0.0),
-                            local_cov[1][2][i],
-                        ],
-                        [
-                            local_cov[2][0][i],
-                            local_cov[2][1][i],
-                            local_cov[2][2][i].max(0.0),
-                        ],
-                    ];
-                    let mut var = 0.0;
-                    for a in 0..3 {
-                        for b in 0..3 {
-                            var += grad[a] * cov[a][b] * grad[b];
-                        }
-                    }
-                    Ok::<_, String>(var.max(0.0).sqrt())
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        let (lo, hi) = response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
-        mean_lo = Some(lo);
-        mean_hi = Some(hi);
     }
 
     kind.write_predictions(
         &args.out,
         state.eta.view(),
+        plugin_mean.view(),
         mean.view(),
         mean_lo.as_ref().map(|a| a.view()),
         mean_hi.as_ref().map(|a| a.view()),
@@ -2091,9 +2012,8 @@ pub(crate) fn run_predict_saved_latent_window_impl(
         // request. Both the posterior-mean point and the band use the same
         // backend here.
         covariance_provenance_note(
-            (args.mode == PredictModeArg::PosteriorMean && need_covariance)
-                .then_some(covariance_mode),
-            (args.uncertainty && need_covariance).then_some(covariance_mode),
+            Some(covariance_mode),
+            args.uncertainty.then_some(covariance_mode),
         )
     );
     Ok(())
@@ -2458,23 +2378,20 @@ pub(crate) fn run_predict_survival(
         };
         let pred = predict_survival_location_scale(&pred_input, &saved_fit)
             .map_err(|e| format!("survival location-scale predict failed: {e}"))?;
-        let include_survival_location_scale_intervals =
-            args.mode == PredictModeArg::PosteriorMean || args.uncertainty;
-        let posterior_or_uncertainty = if include_survival_location_scale_intervals {
-            let cov_mat = covariance_from_model(model, covariance_mode)?;
-            Some(
-                gam::families::survival::location_scale::predict_survival_location_scalewith_uncertainty(
-                    &pred_input,
-                    &saved_fit,
-                    &cov_mat,
-                    args.mode == PredictModeArg::PosteriorMean,
-                    include_survival_location_scale_intervals,
-                )
-                .map_err(|e| format!("survival location-scale uncertainty predict failed: {e}"))?,
+        // The published survival probability is the posterior mean under the
+        // coefficient posterior; the response standard deviation is formed only
+        // when the caller asked for the band.
+        let cov_mat = covariance_from_model(model, covariance_mode)?;
+        let posterior_or_uncertainty = Some(
+            gam::families::survival::location_scale::predict_survival_location_scalewith_uncertainty(
+                &pred_input,
+                &saved_fit,
+                &cov_mat,
+                true,
+                args.uncertainty,
             )
-        } else {
-            None
-        };
+            .map_err(|e| format!("survival location-scale uncertainty predict failed: {e}"))?,
+        );
         let mean = posterior_or_uncertainty
             .as_ref()
             .map(|out| out.survival_prob.clone())
@@ -2486,7 +2403,7 @@ pub(crate) fn run_predict_survival(
         let eta_se_default = posterior_or_uncertainty
             .as_ref()
             .map(|out| out.eta_standard_error.clone());
-        if include_survival_location_scale_intervals {
+        if args.uncertainty {
             validate_level(args.level)?;
             let out = posterior_or_uncertainty.as_ref().ok_or_else(|| {
                 "internal error: survival location-scale uncertainty output missing".to_string()
@@ -2507,6 +2424,7 @@ pub(crate) fn run_predict_survival(
             write_survival_prediction_csv(
                 &args.out,
                 eta_out.view(),
+                pred.survival_prob.view(),
                 mean.view(),
                 Some(eta_se.view()),
                 Some(mean_lo.view()),
@@ -2516,6 +2434,7 @@ pub(crate) fn run_predict_survival(
             write_survival_prediction_csv(
                 &args.out,
                 eta_out.view(),
+                pred.survival_prob.view(),
                 mean.view(),
                 None,
                 None,
@@ -2530,8 +2449,8 @@ pub(crate) fn run_predict_survival(
             // requested definition is absent), consumed for both the
             // posterior-mean point and the SE/bounds surfaces.
             covariance_provenance_note(
-                (args.mode == PredictModeArg::PosteriorMean).then_some(covariance_mode),
-                include_survival_location_scale_intervals.then_some(covariance_mode),
+                Some(covariance_mode),
+                args.uncertainty.then_some(covariance_mode),
             )
         );
         return Ok(());
@@ -2600,7 +2519,7 @@ pub(crate) fn run_predict_survival(
             Option<Array1<f64>>,
             Option<Array1<f64>>,
             Option<Array1<f64>>,
-        ) = if args.mode == PredictModeArg::PosteriorMean {
+        ) = {
             let pm_options = PosteriorMeanOptions {
                 confidence_level: if args.uncertainty {
                     Some(args.level)
@@ -2631,40 +2550,13 @@ pub(crate) fn run_predict_survival(
             } else {
                 (eta, mean, None, None, None)
             }
-        } else if args.uncertainty {
-            validate_level(args.level)?;
-            let pred = predictor
-                .predict_full_uncertainty(
-                    &pred_input,
-                    &predictor_fit,
-                    &PredictUncertaintyOptions {
-                        confidence_level: args.level,
-                        covariance_mode,
-                        mean_interval_method: MeanIntervalMethod::TransformEta,
-                        includeobservation_interval: false,
-                        apply_bias_correction: !args.no_bias_correction,
-                        ..PredictUncertaintyOptions::default()
-                    },
-                )
-                .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;
-            (
-                pred.eta.clone(),
-                pred.eta.mapv(|value| normal_cdf(-value)),
-                Some(pred.eta_standard_error),
-                Some(pred.eta_upper.mapv(|value| normal_cdf(-value))),
-                Some(pred.eta_lower.mapv(|value| normal_cdf(-value))),
-            )
-        } else {
-            let eta = predictor
-                .predict_linear_predictor(&pred_input)
-                .map_err(|e| format!("predict_linear_predictor failed: {e}"))?;
-            let mean = eta.mapv(|value| normal_cdf(-value));
-            (eta, mean, None, None, None)
         };
+        let survival_plugin = eta.mapv(|value| normal_cdf(-value));
 
         write_survival_prediction_csv(
             &args.out,
             eta.view(),
+            survival_plugin.view(),
             mean.view(),
             eta_se_opt.as_ref().map(|values| values.view()),
             mean_lo.as_ref().map(|values| values.view()),
@@ -2674,12 +2566,7 @@ pub(crate) fn run_predict_survival(
             "wrote predictions: {} (rows={}){}",
             args.out.display(),
             mean.len(),
-            covariance_provenance_note(
-                (args.mode == PredictModeArg::PosteriorMean)
-                    .then_some(covariance_mode),
-                (args.mode == PredictModeArg::PosteriorMean || args.uncertainty)
-                    .then_some(covariance_mode),
-            )
+            covariance_provenance_note(Some(covariance_mode), Some(covariance_mode))
         );
         return Ok(());
     }
@@ -2752,8 +2639,8 @@ pub(crate) fn run_predict_survival(
             p
         ));
     }
-    let (eta, mean) = if args.mode == PredictModeArg::PosteriorMean {
-        let backend = prediction_backend_from_model(model, covariance_mode)?;
+    let backend = prediction_backend_from_model(model, covariance_mode)?;
+    let (eta, mean) = {
         let pred = predict_gam_posterior_meanwith_backend(
             x_exit.view(),
             beta.view(),
@@ -2763,16 +2650,15 @@ pub(crate) fn run_predict_survival(
         )
         .map_err(|e| format!("survival posterior-mean prediction failed: {e}"))?;
         (pred.eta, pred.mean)
-    } else {
-        let pred = predict_gam(
-            x_exit.view(),
-            beta.view(),
-            eta_offset_exit.view(),
-            LikelihoodSpec::royston_parmar(),
-        )
-        .map_err(|e| format!("survival prediction failed: {e}"))?;
-        (pred.eta, pred.mean)
     };
+    let survival_plugin = predict_gam(
+        x_exit.view(),
+        beta.view(),
+        eta_offset_exit.view(),
+        LikelihoodSpec::royston_parmar(),
+    )
+    .map_err(|e| format!("survival prediction failed: {e}"))?
+    .mean;
     let mut eta_se = None;
     let mut mean_lo = None;
     let mut mean_hi = None;
@@ -2789,30 +2675,30 @@ pub(crate) fn run_predict_survival(
                 covariance_mode,
                 mean_interval_method: MeanIntervalMethod::TransformEta,
                 includeobservation_interval: false,
-                apply_bias_correction: !args.no_bias_correction,
+                // One estimand policy for every front door: the band is centred
+                // on the posterior mean the point column reports, exactly as
+                // the library's `resolve_prediction_request` centres its bands.
+                apply_bias_correction: false,
                 ..PredictUncertaintyOptions::default()
             },
         )
         .map_err(|e| format!("survival uncertainty prediction failed: {e}"))?;
         let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
         eta_se = Some(uncertainty.eta_standard_error.clone());
-        let (lo, hi) = if args.mode == PredictModeArg::PosteriorMean {
-            response_interval_from_mean_sd(
-                mean.view(),
-                uncertainty.mean_standard_error.view(),
-                z,
-                0.0,
-                1.0,
-            )
-        } else {
-            (uncertainty.mean_lower, uncertainty.mean_upper)
-        };
+        let (lo, hi) = response_interval_from_mean_sd(
+            mean.view(),
+            uncertainty.mean_standard_error.view(),
+            z,
+            0.0,
+            1.0,
+        );
         mean_lo = Some(lo);
         mean_hi = Some(hi);
     }
     write_survival_prediction_csv(
         &args.out,
         eta.view(),
+        survival_plugin.view(),
         mean.view(),
         eta_se.as_ref().map(|a| a.view()),
         mean_lo.as_ref().map(|a| a.view()),
@@ -2822,12 +2708,7 @@ pub(crate) fn run_predict_survival(
         "wrote predictions: {} (rows={}){}",
         args.out.display(),
         mean.len(),
-        covariance_provenance_note(
-            (args.mode == PredictModeArg::PosteriorMean)
-                .then_some(covariance_mode),
-            (args.mode == PredictModeArg::PosteriorMean || args.uncertainty)
-                .then_some(covariance_mode),
-        )
+        covariance_provenance_note(Some(covariance_mode), Some(covariance_mode))
     );
     Ok(())
 }

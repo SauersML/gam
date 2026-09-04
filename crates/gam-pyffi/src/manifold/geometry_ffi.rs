@@ -7532,7 +7532,6 @@ fn predict_columns(
         observation_prior_weights: observation_prior_weights.clone(),
         // This entry point exposes no plug-in switch, so a curved link always
         // reports the posterior mean (SPEC: it is always the default).
-        point_estimate: gam_predict::interval_policy::PointEstimate::PosteriorMeanWhenCurved,
     };
     let resolved = gam_predict::interval_policy::resolve_prediction_request(
         &*predictor,
@@ -7761,8 +7760,6 @@ fn predict_columns_conformal(
             covariance_mode,
             observation_interval: false,
             observation_prior_weights: None,
-            point_estimate:
-                gam_predict::interval_policy::PointEstimate::PosteriorMeanWhenCurved,
         },
     )
     .map_err(|err| format!("conformal point prediction failed: {err}"))?;

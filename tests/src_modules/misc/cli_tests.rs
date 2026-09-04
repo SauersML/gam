@@ -15,7 +15,7 @@ use super::{
     write_survival_binary_prediction_csv, write_survival_prediction_csv,
 };
 use super::{
-    Cli, Command, FitArgs, InferenceCovarianceMode, PredictArgs, PredictModeArg, SampleArgs,
+    Cli, Command, FitArgs, InferenceCovarianceMode, PredictArgs, SampleArgs,
     run_fit, run_predict, run_sample, write_model_json,
 };
 use crate::config_resolve::{
@@ -659,20 +659,33 @@ fn location_scale_fit_args(
 }
 
 #[test]
-fn cli_predict_defaults_to_posterior_mean_instead_of_map() {
-    let cli = Cli::parse_from([
+fn cli_predict_has_no_point_estimand_switch_2670() {
+    // The posterior mean is the one point estimand `gam predict` publishes and
+    // the plug-in pair is carried beside it by name, so there is nothing for a
+    // `--mode` to select; the flag is rejected, not silently accepted.
+    let parsed = Cli::try_parse_from([
         "gam",
         "predict",
         "model.json",
         "new_data.csv",
         "--out",
         "predictions.csv",
+        "--mode",
+        "map",
     ]);
-    let Command::Predict(args) = cli.command else {
-        panic!("expected predict command");
-    };
-    assert_eq!(args.mode, PredictModeArg::PosteriorMean);
-    assert_ne!(args.mode, PredictModeArg::Map);
+    let error = parsed.expect_err("`--mode` is not an argument of `gam predict`");
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    let parsed = Cli::try_parse_from([
+        "gam",
+        "predict",
+        "model.json",
+        "new_data.csv",
+        "--out",
+        "predictions.csv",
+        "--no-bias-correction",
+    ]);
+    let error = parsed.expect_err("`--no-bias-correction` is not an argument of `gam predict`");
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
 #[test]
@@ -1624,8 +1637,6 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         uncertainty: false,
         level: 0.95,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
-        mode: PredictModeArg::PosteriorMean,
-        no_bias_correction: false,
     })
     .unwrap_or_else(|e| {
         panic!(
@@ -1851,8 +1862,6 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         uncertainty: false,
         level: 0.95,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
-        mode: PredictModeArg::PosteriorMean,
-        no_bias_correction: false,
     })
     .unwrap_or_else(|e| {
         panic!(
@@ -2502,8 +2511,6 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         uncertainty: false,
         level: 0.95,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
-        mode: PredictModeArg::PosteriorMean,
-        no_bias_correction: false,
     };
     run_predict(predict_args).unwrap_or_else(|e| {
         panic!(
@@ -2543,8 +2550,6 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         uncertainty: true,
         level: 0.95,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
-        mode: PredictModeArg::PosteriorMean,
-        no_bias_correction: false,
     };
     run_predict(band_args).unwrap_or_else(|e| {
         panic!(
@@ -2809,8 +2814,6 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         uncertainty: false,
         level: 0.95,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
-        mode: PredictModeArg::PosteriorMean,
-        no_bias_correction: false,
     };
     run_predict(predict_args).unwrap_or_else(|e| {
         panic!(
@@ -2850,8 +2853,6 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         uncertainty: true,
         level: 0.95,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
-        mode: PredictModeArg::PosteriorMean,
-        no_bias_correction: false,
     };
     run_predict(band_args).unwrap_or_else(|e| {
         panic!(
@@ -3024,8 +3025,6 @@ fn posterior_mean_prediction_for_model(model: &SavedModel) -> f64 {
         uncertainty: false,
         level: 0.95,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
-        mode: PredictModeArg::PosteriorMean,
-        no_bias_correction: false,
     };
     run_predict(args)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "predict binomial location-scale", e));
@@ -4374,8 +4373,6 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
         uncertainty: false,
         level: 0.95,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
-        mode: PredictModeArg::Map,
-        no_bias_correction: false,
     })
     .unwrap_or_else(|e| {
         panic!(
@@ -4754,14 +4751,22 @@ fn survival_prediction_csv_includes_explicit_semantics_columns() {
 
     let eta: Array1<f64> = array![0.5, -0.25];
     let surv = eta.mapv(|v| (-v.exp()).exp().clamp(0.0, 1.0));
-    write_survival_prediction_csv(&path, eta.view(), surv.view(), None, None, None)
+    write_survival_prediction_csv(
+        &path,
+        eta.view(),
+        surv.view(),
+        surv.view(),
+        None,
+        None,
+        None,
+    )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival prediction csv", e));
 
     let text =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
-        header, "eta,survival_prob,failure_prob,risk_score",
+        header, "eta,survival_prob_plugin,survival_prob,failure_prob,risk_score",
         "survival output schema changed unexpectedly"
     );
 
@@ -4779,14 +4784,22 @@ fn survival_binary_prediction_csv_includes_explicit_semantics_columns() {
 
     let eta: Array1<f64> = array![0.5, -0.25];
     let event = array![0.7, 0.2];
-    write_survival_binary_prediction_csv(&path, eta.view(), event.view(), None, None, None)
+    write_survival_binary_prediction_csv(
+        &path,
+        eta.view(),
+        event.view(),
+        event.view(),
+        None,
+        None,
+        None,
+    )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival binary prediction csv", e));
 
     let text =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
-        header, "eta,mean,event_prob,failure_prob,survival_prob,risk_score",
+        header, "eta,mean_plugin,mean,event_prob,failure_prob,survival_prob,risk_score",
         "survival binary output schema changed unexpectedly"
     );
 
@@ -4815,6 +4828,7 @@ fn survival_prediction_csv_emits_bounds_without_std_error() {
         &path,
         eta.view(),
         surv.view(),
+        surv.view(),
         None,
         Some(lower.view()),
         Some(upper.view()),
@@ -4830,7 +4844,7 @@ fn survival_prediction_csv_emits_bounds_without_std_error() {
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
-        header, "eta,survival_prob,failure_prob,risk_score,mean_lower,mean_upper",
+        header, "eta,survival_prob_plugin,survival_prob,failure_prob,risk_score,mean_lower,mean_upper",
         "survival output must include bounds when supplied without std_error",
     );
 
@@ -4857,6 +4871,7 @@ fn survival_prediction_csv_errors_on_half_supplied_bounds() {
         &path,
         eta.view(),
         surv.view(),
+        surv.view(),
         None,
         Some(lower.view()),
         None,
@@ -4872,6 +4887,7 @@ fn survival_prediction_csv_errors_on_half_supplied_bounds() {
     let err_upper_only = write_survival_prediction_csv(
         &path,
         eta.view(),
+        surv.view(),
         surv.view(),
         None,
         None,
@@ -4910,6 +4926,7 @@ fn survival_binary_prediction_csv_emits_bounds_without_std_error() {
         &path,
         eta.view(),
         event.view(),
+        event.view(),
         None,
         Some(lower.view()),
         Some(upper.view()),
@@ -4925,7 +4942,8 @@ fn survival_binary_prediction_csv_emits_bounds_without_std_error() {
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
-        header, "eta,mean,event_prob,failure_prob,survival_prob,risk_score,mean_lower,mean_upper",
+        header,
+        "eta,mean_plugin,mean,event_prob,failure_prob,survival_prob,risk_score,mean_lower,mean_upper",
         "survival binary output must include bounds when supplied without std_error",
     );
 
@@ -4951,6 +4969,7 @@ fn survival_binary_prediction_csv_errors_on_half_supplied_bounds() {
         &path,
         eta.view(),
         event.view(),
+        event.view(),
         None,
         Some(lower.view()),
         None,
@@ -4964,6 +4983,7 @@ fn survival_binary_prediction_csv_errors_on_half_supplied_bounds() {
     let err_upper_only = write_survival_binary_prediction_csv(
         &path,
         eta.view(),
+        event.view(),
         event.view(),
         None,
         None,
@@ -6084,9 +6104,11 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
-        covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
-        mode: PredictModeArg::Map,
-        no_bias_correction: false,
+        // The fit's published definition: these fixtures carry a conditional
+        // covariance only, and naming `SmoothingCorrected` is a requirement the
+        // fit refuses (#2779). The posterior-mean point needs a backend the
+        // model actually has.
+        covariance_mode: None,
     };
     super::run_predict_survival(
         &args,
@@ -6125,9 +6147,11 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
         let eta = rows[i]["eta"]
             .parse::<f64>()
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "eta should parse", e));
-        let survival_prob = rows[i]["survival_prob"]
+        // The library expectation is the plug-in `S(η̂)`; the CSV publishes it by
+        // name beside the posterior-mean `survival_prob`.
+        let survival_prob = rows[i]["survival_prob_plugin"]
             .parse::<f64>()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "survival_prob should parse", e));
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "survival_prob_plugin should parse", e));
         assert!(
             (eta - expected.eta[i]).abs() <= 1e-12,
             "row {i}: eta mismatch: got {eta}, expected {}",
@@ -6243,9 +6267,11 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
-        covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
-        mode: PredictModeArg::Map,
-        no_bias_correction: false,
+        // The fit's published definition: these fixtures carry a conditional
+        // covariance only, and naming `SmoothingCorrected` is a requirement the
+        // fit refuses (#2779). The posterior-mean point needs a backend the
+        // model actually has.
+        covariance_mode: None,
     };
 
     super::run_predict_survival(
@@ -6268,7 +6294,10 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "prediction csv", e));
     let lines = csv.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 3);
-    assert_eq!(lines[0], "eta,survival_prob,failure_prob,risk_score");
+    assert_eq!(
+        lines[0],
+        "eta,survival_prob_plugin,survival_prob,failure_prob,risk_score"
+    );
 
     let zero = Array1::zeros(data.nrows());
     let spec = generative_spec_for_saved_model(

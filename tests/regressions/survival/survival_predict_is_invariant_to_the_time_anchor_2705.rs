@@ -138,10 +138,15 @@ fn write_cli_predict_rows(path: &Path) {
 fn read_cli_survival(path: &Path) -> Array2<f64> {
     let mut reader = csv::Reader::from_path(path).expect("open CLI prediction csv");
     let headers = reader.headers().expect("CLI prediction headers").clone();
+    // The library surface below is the plug-in `S(η̂)`, so the CLI column
+    // compared against it is the plug-in one; the posterior-mean
+    // `survival_prob` beside it is a different estimand.
     let survival_column = headers
         .iter()
-        .position(|name| name == "survival_prob")
-        .unwrap_or_else(|| panic!("CLI prediction is missing survival_prob: {headers:?}"));
+        .position(|name| name == "survival_prob_plugin")
+        .unwrap_or_else(|| {
+            panic!("CLI prediction is missing survival_prob_plugin: {headers:?}")
+        });
     let values = reader
         .records()
         .map(|record| {
@@ -228,7 +233,6 @@ fn fit_at_anchor(
         .arg("predict")
         .arg(&model_path)
         .arg(&cli_data_path)
-        .args(["--mode", "map"])
         .arg("--out")
         .arg(&cli_output_path);
     run_or_panic(predict_cmd, "gam predict Royston-Parmar anchor replay");

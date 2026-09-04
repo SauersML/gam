@@ -1,5 +1,7 @@
 ## Unreleased
 
+- `gam predict` no longer takes `--mode` or `--no-bias-correction`: the posterior mean is the one point estimand every surface reports, the plug-in prediction is published beside it by name (`survival_prob_plugin` on survival CSVs, `mean_plugin` on latent event-probability CSVs, as `mean_plugin` already was on the standard surface), and every band is centred on the posterior mean as the library's policy already did (#2670).
+
 - The joint Newton's trust region (via `opt`) treats a step as numerically neutral only when both the realized change and the model's predicted reduction are inside the objective's round-off floor; a resolvable prediction that realizes nothing is rejected, not accepted with `ρ = 1` (#2765).
 
 - A survival marginal-slope fit that estimated its parametric baseline chart is saved with the fitted chart instead of being refused for a missing `--baseline-scale`, and the fixed-λ refit from a certified outer optimum admits a curvature certificate the criterion contradicted (`criterion-contradicted`) as it admits a positive-semidefinite one; only inadmissible or unevaluated curvature is refused (#2765).

@@ -11,10 +11,24 @@ pub(crate) const STANDARD_PREDICTION_STD_ERROR_COLUMN: &str =
     "posterior_mean_standard_error";
 pub(crate) const PREDICTION_NOISE_SCALE_COLUMN: &str = "noise_scale";
 pub(crate) const SPECIALIZED_PREDICTION_BASE_COLUMNS: [&str; 2] = ["eta", "mean"];
-pub(crate) const SURVIVAL_PREDICTION_BASE_COLUMNS: [&str; 4] =
-    ["eta", "survival_prob", "failure_prob", "risk_score"];
-pub(crate) const SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS: [&str; 6] = [
+/// Survival prediction columns. `survival_prob_plugin` is the plug-in
+/// `S(η̂)` at the fitted coefficients; `survival_prob` is the posterior mean
+/// `E[S(η)]` under the coefficient posterior — the point estimand every
+/// prediction surface reports — and `failure_prob` is its complement. Both
+/// estimands are published by name; there is no mode switch between them.
+pub(crate) const SURVIVAL_PREDICTION_BASE_COLUMNS: [&str; 5] = [
     "eta",
+    "survival_prob_plugin",
+    "survival_prob",
+    "failure_prob",
+    "risk_score",
+];
+/// Latent-window event-probability columns; `mean_plugin` is the plug-in event
+/// probability beside the posterior-mean `mean`, exactly as the standard
+/// surface carries `mean_plugin` beside `posterior_mean`.
+pub(crate) const SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS: [&str; 7] = [
+    "eta",
+    "mean_plugin",
     "mean",
     "event_prob",
     "failure_prob",
@@ -346,21 +360,27 @@ pub(crate) fn write_estimand_explicit_prediction_csv(
 pub(crate) fn write_survival_prediction_csv(
     path: &Path,
     eta: ArrayView1<'_, f64>,
+    survival_prob_plugin: ArrayView1<'_, f64>,
     survival_prob: ArrayView1<'_, f64>,
     eta_se: Option<ArrayView1<'_, f64>>,
     survival_lower: Option<ArrayView1<'_, f64>>,
     survival_upper: Option<ArrayView1<'_, f64>>,
 ) -> CliResult<()> {
     let eta_v: Vec<f64> = eta.to_vec();
+    let plugin_v: Vec<f64> = survival_prob_plugin
+        .iter()
+        .map(|&v| v.clamp(0.0, 1.0))
+        .collect();
     let surv_v: Vec<f64> = survival_prob.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
     let risk_v: Vec<f64> = eta_v.clone();
     let fail_v: Vec<f64> = surv_v.iter().map(|&s| (1.0 - s).clamp(0.0, 1.0)).collect();
 
     let mut cols: Vec<(&str, &[f64])> = vec![
         (SURVIVAL_PREDICTION_BASE_COLUMNS[0], &eta_v),
-        (SURVIVAL_PREDICTION_BASE_COLUMNS[1], &surv_v),
-        (SURVIVAL_PREDICTION_BASE_COLUMNS[2], &fail_v),
-        (SURVIVAL_PREDICTION_BASE_COLUMNS[3], &risk_v),
+        (SURVIVAL_PREDICTION_BASE_COLUMNS[1], &plugin_v),
+        (SURVIVAL_PREDICTION_BASE_COLUMNS[2], &surv_v),
+        (SURVIVAL_PREDICTION_BASE_COLUMNS[3], &fail_v),
+        (SURVIVAL_PREDICTION_BASE_COLUMNS[4], &risk_v),
     ];
 
     let se_v: Vec<f64>;
@@ -407,23 +427,29 @@ pub(crate) fn write_survival_prediction_csv(
 pub(crate) fn write_survival_binary_prediction_csv(
     path: &Path,
     eta: ArrayView1<'_, f64>,
+    event_prob_plugin: ArrayView1<'_, f64>,
     event_prob: ArrayView1<'_, f64>,
     eta_se: Option<ArrayView1<'_, f64>>,
     event_lower: Option<ArrayView1<'_, f64>>,
     event_upper: Option<ArrayView1<'_, f64>>,
 ) -> CliResult<()> {
     let eta_v: Vec<f64> = eta.to_vec();
+    let plugin_v: Vec<f64> = event_prob_plugin
+        .iter()
+        .map(|&v| v.clamp(0.0, 1.0))
+        .collect();
     let event_v: Vec<f64> = event_prob.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
     let risk_v: Vec<f64> = eta_v.clone();
     let survival_v: Vec<f64> = event_v.iter().map(|&p| (1.0 - p).clamp(0.0, 1.0)).collect();
 
     let mut cols: Vec<(&str, &[f64])> = vec![
         (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[0], &eta_v),
-        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[1], &event_v),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[1], &plugin_v),
         (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[2], &event_v),
         (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[3], &event_v),
-        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[4], &survival_v),
-        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[5], &risk_v),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[4], &event_v),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[5], &survival_v),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[6], &risk_v),
     ];
 
     let se_v: Vec<f64>;

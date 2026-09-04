@@ -3,7 +3,7 @@ use super::*;
 use gam::families::multinomial::{
     MULTINOMIAL_MODEL_CLASS, MultinomialFitRequest, MultinomialModelEnvelope,
     MultinomialSavedModel, fit_penalized_multinomial_formula, predict_multinomial_formula,
-    predict_multinomial_formula_plugin, predict_multinomial_formula_with_se,
+    predict_multinomial_formula_with_se,
 };
 
 /// Peek a model file's JSON discriminator to detect a persisted multinomial
@@ -215,23 +215,6 @@ pub(crate) fn run_predict_multinomial(args: &PredictArgs) -> Result<(), String> 
         .transpose()?;
 
     let (probs, prob_se) = if args.uncertainty {
-        // Sibling of the #2296 refusal just below, and for the same reason. The
-        // persisted multinomial spread is the integrated marginal sd AROUND THE
-        // POSTERIOR-MEAN probability; no spread around the plug-in (posterior
-        // mode) point is stored. Honouring `--mode map` here would pair a
-        // plug-in centre with a posterior-mean band -- two estimands under one
-        // label, which is the same defect as ignoring the flag, only harder to
-        // notice. Refuse instead.
-        if args.mode == PredictModeArg::Map {
-            return Err(
-                "multinomial --mode map (the plug-in softmax at the posterior mode) has \
-                 no persisted standard error: the stored multinomial uncertainty is the \
-                 integrated spread around the posterior-MEAN probability, a different \
-                 estimand. Drop --uncertainty for the plug-in point estimate, or pass \
-                 --mode posterior-mean to keep the band."
-                    .to_string(),
-            );
-        }
         // #2296: multinomial fits persist only the conditional joint-Laplace
         // coefficient covariance. A smoothing-corrected request (the global
         // default) must refuse rather than silently deliver the narrower
@@ -249,24 +232,13 @@ pub(crate) fn run_predict_multinomial(args: &PredictArgs) -> Result<(), String> 
             .map_err(|e| format!("multinomial predict failed: {e}"))?;
         (probs, Some(prob_se))
     } else {
-        // `--mode` reached every other model class and was dropped on the floor
-        // here: `run_predict` short-circuits to this function before any mode
-        // handling, and this function only ever branched on `--uncertainty`, so
-        // `args.mode` was never read at all.
-        //
-        // The two functions genuinely are the pair the flag names --
-        // `predict_multinomial_formula` integrates `E[softmax(eta)]` over the
-        // Laplace posterior, `predict_multinomial_formula_plugin` evaluates
-        // `softmax(x'beta_hat)` at the posterior MODE, and its own doc says a
-        // caller who wants the mode's probability "has to ask for it here, by
-        // name". Nobody could: the plug-in estimand had no production caller,
-        // and `--mode map` silently returned the posterior-mean answer.
-        let probs = if args.mode == PredictModeArg::Map {
-            predict_multinomial_formula_plugin(&saved, &ds)
-        } else {
-            predict_multinomial_formula(&saved, &ds)
-        }
-        .map_err(|e| format!("multinomial predict failed: {e}"))?;
+        // The published probability is the posterior MEAN `E[softmax(η)]` over
+        // the Laplace posterior, the one point estimand every prediction
+        // surface reports (SPEC: never MAP). The plug-in softmax at the
+        // posterior mode stays a library function for its callers, but it is
+        // not a CLI estimand.
+        let probs = predict_multinomial_formula(&saved, &ds)
+            .map_err(|e| format!("multinomial predict failed: {e}"))?;
         (probs, None)
     };
 

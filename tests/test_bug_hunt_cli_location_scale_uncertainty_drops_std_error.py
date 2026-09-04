@@ -56,7 +56,7 @@ def test_cli_location_scale_uncertainty_preserves_std_error(tmp_path: Path) -> N
     data_path = tmp_path / "ls.csv"
     model_path = tmp_path / "ls.gam"
     pred_path = tmp_path / "ls_pred.csv"
-    map_path = tmp_path / "ls_map.csv"
+    point_path = tmp_path / "ls_map.csv"
 
     rng = random.Random(51)
     with data_path.open("w", newline="") as f:
@@ -129,24 +129,26 @@ def test_cli_location_scale_uncertainty_preserves_std_error(tmp_path: Path) -> N
             abs_tol=1e-8,
         )
 
+    # A point-only predict publishes the plug-in pair beside the posterior mean
+    # and the fitted noise scale, and nothing else: no std_error column exists
+    # without --uncertainty, and there is no mode that drops the posterior column.
     subprocess.run(
         [
             gam,
             "predict",
-            "--mode",
-            "map",
             "--out",
-            str(map_path),
+            str(point_path),
             str(model_path),
             str(data_path),
         ],
         check=True,
     )
-    with map_path.open(newline="") as f:
+    with point_path.open(newline="") as f:
         reader = csv.DictReader(f)
         assert reader.fieldnames == [
             "linear_predictor_plugin",
             "mean_plugin",
+            "posterior_mean",
             "noise_scale",
         ]
         assert list(reader)
