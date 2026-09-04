@@ -1266,7 +1266,7 @@ impl<'a> GaussianRemlRhoResponse<'a> {
 
     /// `(∂μ̂_i/∂ρ)_i` over the training rows and `∂μ̂_*/∂ρ` at the test row, at
     /// one `(ρ, z)`: the pointwise sensitivities the analytic Lipschitz bound
-    /// ([`Self::score_rho_lipschitz_sup`]) dominates for every `ρ` at once.
+    /// (`score_rho_lipschitz_sup`) dominates for every `ρ` at once.
     pub fn mean_sensitivity_to_rho(
         &self,
         rho: f64,
