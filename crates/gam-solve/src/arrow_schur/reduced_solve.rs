@@ -2730,6 +2730,50 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     let precond = reduced_schur_shifted_preconditioner(sys, ridge_beta);
     // Rank-0 pilot: fixes the |log|S|| scale and is the answer outright when no
     // deflation is requested or the bare bar already clears the target.
+    // `log|S|` exists only for a positive-definite `S`, and every shifted solve
+    // below is a conjugate-gradient recurrence that assumes it. Nothing checked
+    // that assumption: the bracket's LOWER end is not measured, it is set to a
+    // fixed fraction of the estimated `lambda_max`, so an operator whose
+    // spectrum reaches below zero was planned for as if it did not, and the
+    // first thing to notice was a CG breakdown tens of iterations in, reported
+    // as "no finite solution". Measured on gam#2731: `pᵀ(A+σI)p = -1.50e10` at
+    // seed shift `4.2e-15`, on a fit that had already converged.
+    //
+    // A quadratic form is a ONE-SIDED certificate: `vᵀ(S + t_lo·I)v <= 0` proves
+    // the operator is indefinite on this bracket, while a positive value over
+    // finitely many probes proves nothing. So this refuses when it fires and is
+    // silent otherwise — the breakdown path still catches what it misses, and
+    // now names itself. The probes are the plan's own, so this costs one extra
+    // operator application each and introduces no new randomness.
+    let seed_shift = base_plan
+        .nodes
+        .iter()
+        .map(|(t, _)| *t)
+        .filter(|t| t.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    if seed_shift.is_finite() {
+        for (index, probe) in base_plan.probes.iter().enumerate() {
+            let norm_sq = probe.dot(probe);
+            if !(norm_sq > 0.0) {
+                continue;
+            }
+            let mut shifted = matvec(probe.view());
+            shifted.scaled_add(seed_shift, probe);
+            let form = probe.dot(&shifted);
+            if !(form.is_finite() && form > 0.0) {
+                return Err(format!(
+                    "the reduced Schur is not positive definite on this bracket, so log|S| is \
+                     not defined at this iterate: probe {index} gives \
+                     vᵀ(S + {seed_shift:.6e}·I)v = {form:.6e} with ‖v‖² = {norm_sq:.6e} \
+                     (reduced Schur dim {k}, bracket [{lambda_min:.6e}, {lambda_max:.6e}] whose \
+                     lower end is SPECTRAL_DEFLATION_REL_FLOOR × λ_max, not a measured \
+                     eigenvalue). A converged fit reaching here has converged to a point with \
+                     negative curvature in the reduced Schur, which is a statement about the \
+                     iterate, not about the surrogate."
+                ));
+            }
+        }
+    }
     let pilot = base_plan
         .evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)
         .ok_or_else(|| {
@@ -2737,7 +2781,10 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
                 "rank-0 pilot solve broke down: the shifted-CG family did not return a finite \
                  solution on the bracket [{lambda_min:.6e}, {lambda_max:.6e}] at cg_rel_tol \
                  {cg_rel_tol:.3e}, cg_max_iters {cg_max_iters} (reduced Schur dim {k}). The \
-                 seed system's own budget is min(cg_max_iters, dim) = {} iterations.",
+                 seed system's own budget is min(cg_max_iters, dim) = {} iterations. The \
+                 one-sided definiteness probe above did not fire, so this is either an \
+                 indefiniteness those probes missed or a genuine loss of accuracy; the \
+                 `[rational-logdet] shifted-CG seed breakdown` line says which.",
                 cg_max_iters.min(k.max(1))
             )
         })?;
