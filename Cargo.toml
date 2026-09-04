@@ -328,6 +328,15 @@ codegen-units = 1
 [profile.test.package.gam-models]
 codegen-units = 16
 
+# The solver's test target also needs parallel code generation. On MSI acn112,
+# with four build workers and warm dependencies, its single-unit compilation
+# was still running after 6m02s; the identical source compiled with 16 units in
+# 2m49s. The focused solver population (10 tests, 48.61s) and spline callers
+# (19 tests, 14.19s) passed. Keep this scoped to test builds: the SAE measurement
+# above still governs that crate, and release optimization is independent.
+[profile.test.package.gam-solve]
+codegen-units = 16
+
 # Dev/`maturin develop` profile — same rationale as [profile.test]. Cargo's
 # default dev profile emits full DWARF (`debug = 2`), which is what lets
 # `target/` balloon to ~30 GB (the dep + crate object files carry the bulk of
