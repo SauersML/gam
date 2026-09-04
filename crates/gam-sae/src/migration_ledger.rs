@@ -462,6 +462,39 @@ impl SaeMigrationLedger {
         }
     }
 
+    /// The `pc_reseed_events == 0` acceptance bar, as a checked verdict.
+    ///
+    /// The module header has named this function since the ledger landed and it
+    /// did not exist, so the bar it describes had no way to be enforced and no
+    /// caller could ask for it (#2023). It returns `Err` naming the offending
+    /// moves rather than panicking, because a fit path that discovers a forbidden
+    /// seed should surface a typed refusal, not abort the process.
+    ///
+    /// A caveat that belongs next to the check rather than in an issue comment:
+    /// this is only as strong as the seed the recording site passes. A birth
+    /// recorded as [`BirthSeed::ResidualFactor`] by a caller that did not observe
+    /// its own seed will pass this bar whatever it actually drew from. The bar
+    /// certifies what was RECORDED; making what is recorded equal what was USED
+    /// is the recording site's job.
+    pub fn assert_no_pc_reseed(&self) -> Result<(), String> {
+        if self.pc_reseed_events == 0 {
+            return Ok(());
+        }
+        let offenders: Vec<usize> = self
+            .moves
+            .iter()
+            .enumerate()
+            .filter(|(_, mv)| {
+                matches!(&mv.kind, SaeMove::Birth { seed, .. } if seed.is_pc_reseed())
+            })
+            .map(|(index, _)| index)
+            .collect();
+        Err(format!(
+            "#2023: {} principal-component reseed event(s) recorded; births must draw \
+             from the residual-factor pool (offending move indices {:?})",
+            self.pc_reseed_events, offenders
+        ))
+    }
 }
 
 /// The ladder rung a structure-search move lands on: a `Birth` candidate is a new
@@ -487,6 +520,88 @@ mod ledger_tests {
         // ln 2 nats == exactly 1 bit.
         assert!((bits_from_nats(LN_2) - 1.0).abs() < 1e-12);
         assert!((bits_from_nats(2.0 * LN_2) - 2.0).abs() < 1e-12);
+    }
+
+    /// #2023 — the `pc_reseed_events == 0` bar, with the POSITIVE control it has
+    /// never had.
+    ///
+    /// `BirthSeed::PrincipalComponent` is constructed nowhere in the tree: every
+    /// occurrence at `origin/main` is this enum's own definition, its own
+    /// `matches!`, its own `code()` arm, and doc comments. So every existing
+    /// assertion that `pc_reseed_events == 0` is satisfied by a counter that no
+    /// code path can increment — a guard nobody has watched fail, which is
+    /// indistinguishable from a guard that cannot fail.
+    ///
+    /// This test makes the guard real from both sides: it FORCES the forbidden
+    /// seed and requires the counter to fire and the bar to refuse, then runs the
+    /// sanctioned seed through the identical call and requires it to pass. A
+    /// counter wired to a constant fails the first arm; a bar that refuses
+    /// everything fails the second.
+    #[test]
+    fn pc_reseed_bar_fires_on_the_forbidden_seed_and_passes_the_sanctioned_one_2023() {
+        // NEGATIVE control: the architecture's only sanctioned birth seed.
+        let mut sanctioned = SaeMigrationLedger::new();
+        sanctioned.birth(
+            MoveStage::Curved,
+            BirthSeed::ResidualFactor,
+            3,
+            Some(0),
+            MoveEvidence::none(),
+            f64::NAN,
+        );
+        assert_eq!(
+            sanctioned.n_births, 3,
+            "#2023: a residual-factor birth must still be counted as a birth"
+        );
+        assert_eq!(
+            sanctioned.pc_reseed_events, 0,
+            "#2023: the sanctioned seed must not trip the PC-reseed counter"
+        );
+        assert!(
+            sanctioned.assert_no_pc_reseed().is_ok(),
+            "#2023: a residual-factor-only ledger must clear the acceptance bar"
+        );
+
+        // POSITIVE control: the seed the architecture forbids. Without this arm
+        // the assertions above are vacuous.
+        let mut forbidden = SaeMigrationLedger::new();
+        forbidden.birth(
+            MoveStage::Curved,
+            BirthSeed::PrincipalComponent,
+            2,
+            Some(0),
+            MoveEvidence::none(),
+            f64::NAN,
+        );
+        assert_eq!(
+            forbidden.pc_reseed_events, 2,
+            "#2023: the counter must count the MULTIPLICITY of a forbidden birth, \
+             not merely that one occurred"
+        );
+        let refusal = forbidden
+            .assert_no_pc_reseed()
+            .expect_err("#2023: a recorded PC reseed must fail the acceptance bar");
+        assert!(
+            refusal.contains("[0]"),
+            "#2023: the refusal must name the offending move INDEX LIST so a failure \
+             is actionable, got {refusal:?}"
+        );
+
+        // A forbidden birth must not be laundered by a later sanctioned one: the
+        // bar is over the whole history, not the last move.
+        forbidden.birth(
+            MoveStage::Curved,
+            BirthSeed::ResidualFactor,
+            1,
+            Some(1),
+            MoveEvidence::none(),
+            f64::NAN,
+        );
+        assert_eq!(forbidden.pc_reseed_events, 2);
+        assert!(
+            forbidden.assert_no_pc_reseed().is_err(),
+            "#2023: a later sanctioned birth cannot clear an earlier forbidden one"
+        );
     }
 
 }
