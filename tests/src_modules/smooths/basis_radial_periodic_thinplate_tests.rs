@@ -4695,7 +4695,7 @@ fn hybrid_duchon_fractional_default_d4_rejects_realized_nonfinite_kernel() {
         .expect_err("hybrid d=4 fractional power must reject before non-finite Gram");
     let msg = err.to_string();
     assert!(
-        msg.contains("Duchon pointwise kernel values require 2*(p+s) > dimension"),
+        msg.contains("Duchon pointwise kernel values: 2*(p+s) > dimension is required"),
         "unexpected error: {msg}"
     );
 }
