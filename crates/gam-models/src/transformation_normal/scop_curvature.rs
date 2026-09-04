@@ -407,7 +407,7 @@ impl TransformationNormalFamily {
 /// `cov_i · d_k` over all `(i, k)` is `cov · dᵀ`, one GEMM, so the whole
 /// vector is that product read against the response-derivative basis rather
 /// than `n · p_resp` separate row dot products (gam#979).
-fn row_direction_rates(
+pub(crate) fn row_direction_rates(
     cov: &Array2<f64>,
     response_deriv_basis: &Array2<f64>,
     direction: ArrayView2<'_, f64>,

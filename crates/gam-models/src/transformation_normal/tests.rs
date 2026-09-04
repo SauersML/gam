@@ -1412,113 +1412,99 @@ pub(crate) fn ctn_psi_workspace_first_order_matches_per_axis_path_bit_equivalent
     }
 }
 
-/// Direct kernel-level bit-equivalence guard for the fused all-axes
-/// projected-trace path (Fix #2). Compares
-/// [`scop_psi_hessian_trace_factor_all_axes_chunk_from_cov`] called once
-/// with every ψ axis's `cov_psi` against
-/// [`scop_psi_hessian_trace_factor_from_cov`] called once per axis. Both
-/// kernels accumulate over the same rows in the same parallel rayon
-/// reduction tree, so the fused output must equal the per-axis output to
-/// well within any reasonable floating-point reduction tolerance.
+/// gam#979. `∂H/∂ψ_axis` is a weighted Gram over the response blocks and is
+/// assembled once per axis per evaluation
+/// (`scop_psi_hessian_dense_from_cov`); every action the outer engine asks
+/// this operator for is a read of that assembly. Nothing in the file derives
+/// the same matrix a second way any more, so the gate is against the object
+/// the matrix IS: `∂H/∂ψ` is the β-Jacobian of the ψ score, and `score_psi`
+/// is computed by a completely separate row loop in `scop_psi_terms`.
+///
+/// This differences the WHOLE Jacobian, not one direction: a wrong block
+/// factor, a wrong power of `h'`, a `(k, l)` block placed at `(l, k)` when the
+/// two differ, or a missing symmetrisation of the `cov`/`cψ` cross term all
+/// move at least one column off its difference.
 #[test]
-pub(crate) fn ctn_psi_hessian_trace_all_axes_matches_per_axis_path_bit_equivalent() {
+pub(crate) fn ctn_psi_hessian_assembly_is_the_beta_jacobian_of_the_psi_score_979() {
     let psi = array![0.15, -0.10];
-    let (family, derivative_blocks, state, _spec) = toy_family_and_derivatives(&psi);
-    let n_psi = derivative_blocks[0].len();
-    assert!(
-        n_psi >= 2,
-        "toy CTN fixture must expose at least 2 ψ axes for the fused trace check, got {n_psi}"
-    );
+    let (family, derivative_blocks, state, spec) = toy_family_and_derivatives(&psi);
+    let specs = vec![spec];
+    let beta = state.beta.clone();
+    let p_total = beta.len();
+    let step = 1.0e-6;
 
-    let row_quantities = family
-        .row_quantities(&state.beta)
-        .expect("toy CTN row quantities");
-
-    // Build a non-trivial dense factor so every block of the ψ-Hessian
-    // contributes to the projected trace. Three columns exercise both the
-    // diagonal and off-diagonal Kronecker structure.
-    let p_total = state.beta.len();
-    let rank = 3;
-    let mut factor = Array2::<f64>::zeros((p_total, rank));
-    for col in 0..rank {
-        let seed = 17_001_u64.wrapping_add(col as u64 * 13_337);
-        factor
-            .column_mut(col)
-            .assign(&toy_probe_vector(p_total, seed));
-    }
-
-    // Materialise covariate and per-axis cov_psi over the full row range.
-    let cov_arc = family
-        .covariate_dense_arc()
-        .expect("toy CTN covariate dense");
-    let cov: &Array2<f64> = cov_arc.as_ref();
-    let block_derivs = &derivative_blocks[0];
-    let op_arc = block_derivs[0]
-        .implicit_operator
-        .as_ref()
-        .expect("toy CTN ψ operator")
-        .clone();
-    let op = op_arc
-        .as_any()
-        .downcast_ref::<TensorKroneckerPsiOperator>()
-        .expect("toy CTN ψ operator must be tensor-backed");
-    let mut cov_psi_arrays: Vec<Array2<f64>> = Vec::with_capacity(n_psi);
-    for deriv in block_derivs.iter() {
-        cov_psi_arrays.push(
-            op.materialize_cov_first_axis(deriv.implicit_axis)
-                .expect("toy CTN ψ cov derivative materialise"),
-        );
-    }
-    let cov_psi_views: Vec<ArrayView2<'_, f64>> = cov_psi_arrays.iter().map(|m| m.view()).collect();
-
-    // Per-axis ground truth: invoke the legacy single-axis kernel n_psi
-    // times.
-    let per_axis_traces: Vec<f64> = (0..n_psi)
-        .map(|axis_idx| {
-            family
-                .scop_psi_hessian_trace_factor_from_cov(
-                    &state.beta,
-                    &row_quantities,
-                    block_derivs[axis_idx].implicit_axis,
-                    cov,
-                    &cov_psi_arrays[axis_idx],
-                    factor.view(),
-                )
-                .expect("per-axis ψ projected trace")
-        })
-        .collect();
-
-    // Fused all-axes pass: a single row-streaming traversal across every
-    // axis. Calling the chunked kernel with `row_start=0` and the full-n
-    // covariate views is equivalent to streaming a single chunk that
-    // covers the entire dataset.
-    let fused_traces = family
-        .scop_psi_hessian_trace_factor_all_axes_chunk_from_cov(
-            &state.beta,
-            &row_quantities,
+    let terms = family
+        .exact_newton_joint_psi_terms(
+            std::slice::from_ref(&state),
+            &specs,
+            &test_design_hyper_layout(&derivative_blocks),
             0,
-            cov.view(),
-            &cov_psi_views,
-            factor.view(),
         )
-        .expect("fused all-axes ψ projected trace");
+        .expect("analytic psi first-order terms")
+        .expect("first-order terms should be present");
+    let operator = terms
+        .hessian_psi_operator
+        .as_ref()
+        .expect("CTN psi first-order Hessian must be operator-backed");
+    let analytic = operator.to_dense();
+    assert_eq!(analytic.nrows(), p_total);
+    assert_eq!(analytic.ncols(), p_total);
 
-    assert_eq!(
-        per_axis_traces.len(),
-        fused_traces.len(),
-        "per-axis vs fused trace length mismatch"
-    );
-    for (axis_idx, (&per_axis, &fused)) in
-        per_axis_traces.iter().zip(fused_traces.iter()).enumerate()
-    {
-        let scale = per_axis.abs().max(fused.abs()).max(1.0);
-        let abs_diff = (per_axis - fused).abs();
-        let rel_diff = abs_diff / scale;
-        assert!(
-            rel_diff < 1.0e-12,
-            "axis {axis_idx}: per-axis kernel = {per_axis:.6e}, fused kernel = {fused:.6e}, |Δ| = {abs_diff:.3e}, rel = {rel_diff:.3e}"
-        );
+    let score_at = |beta_eval: &Array1<f64>| {
+        let mut shifted = state.clone();
+        shifted.beta = beta_eval.clone();
+        family
+            .exact_newton_joint_psi_terms(
+                std::slice::from_ref(&shifted),
+                &specs,
+                &test_design_hyper_layout(&derivative_blocks),
+                0,
+            )
+            .expect("first-order psi terms at shifted beta")
+            .expect("shifted first-order terms should be present")
+            .score_psi
+    };
+
+    let mut peak = 0.0_f64;
+    for column in 0..p_total {
+        let mut plus = beta.clone();
+        let mut minus = beta.clone();
+        plus[column] += step;
+        minus[column] -= step;
+        let fd = (score_at(&plus) - score_at(&minus)) / (2.0 * step);
+        for row in 0..p_total {
+            let want = fd[row];
+            let got = analytic[[row, column]];
+            peak = peak.max(want.abs());
+            let tol = 2.0e-5 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tol,
+                "psi Hessian assembly [{row}, {column}] = {got:.9e} against the score's own \
+                 central difference {want:.9e} (tol {tol:.3e})"
+            );
+        }
     }
+
+    // The matrix is a Hessian: symmetric to accumulation order.
+    for row in 0..p_total {
+        for column in row + 1..p_total {
+            let (upper, lower) = (analytic[[row, column]], analytic[[column, row]]);
+            let tol = 1.0e-11 * upper.abs().max(1.0) + 1.0e-11;
+            assert!(
+                (upper - lower).abs() <= tol,
+                "psi Hessian assembly is not symmetric at ({row}, {column}): \
+                 {upper:.9e} vs {lower:.9e}"
+            );
+        }
+    }
+
+    // The fixture has to move the Hessian at all, or every comparison above
+    // passes on a pair of zero matrices.
+    assert!(
+        peak > 1.0e-4,
+        "the fixture's psi axis produces no Hessian drift (peak |fd| = {peak:.3e}); \
+         the comparison above would then be vacuous"
+    );
 }
 
 #[test]

@@ -811,12 +811,18 @@ pub(crate) struct TransformationNormalPsiWorkspaceCacheEntry {
     pub(crate) score_psi: Array1<f64>,
     pub(crate) op_arc: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     pub(crate) axis: usize,
-    pub(crate) trace_axes: Arc<Vec<usize>>,
-    pub(crate) trace_axis_pos: usize,
     pub(crate) row_gamma: Arc<Array2<f64>>,
     pub(crate) row_h: Arc<Array1<f64>>,
     pub(crate) row_h_prime: Arc<Array1<f64>>,
     pub(crate) beta: Arc<Array1<f64>>,
+    /// One `∂H/∂ψ_axis` assembly per axis, for this evaluation.
+    ///
+    /// The operator below is rebuilt on every
+    /// `exact_newton_joint_psi_terms` call by design, so the assembly cannot
+    /// live in it: the cell lives here, where the evaluation's cached axis
+    /// state lives, and every rebuilt operator gets a clone of the handle
+    /// (gam#979).
+    pub(crate) hessian_dense: Arc<gam_runtime::resource::RayonSafeOnce<Array2<f64>>>,
 }
 
 pub(crate) struct TransformationNormalPsiWorkspaceAxisSnapshot {
@@ -1105,7 +1111,6 @@ impl TransformationNormalPsiWorkspace {
             mut score_psi,
         } = accum;
         let beta_arc = Arc::new(beta.clone());
-        let trace_axes = Arc::new(axes.clone());
         let mut out: Vec<TransformationNormalPsiWorkspaceCacheEntry> = Vec::with_capacity(n_psi);
         for (axis_idx, &axis) in axes.iter().enumerate() {
             // Take the per-axis score buffer out of the accumulator without
@@ -1117,12 +1122,11 @@ impl TransformationNormalPsiWorkspace {
                 score_psi: score_axis,
                 op_arc: Arc::clone(&op_arcs[axis_idx]),
                 axis,
-                trace_axes: Arc::clone(&trace_axes),
-                trace_axis_pos: axis_idx,
                 row_gamma: Arc::clone(&row.alpha),
                 row_h: Arc::clone(&row.h),
                 row_h_prime: Arc::clone(&row.h_prime),
                 beta: Arc::clone(&beta_arc),
+                hessian_dense: Arc::new(gam_runtime::resource::RayonSafeOnce::new()),
             });
         }
         Ok(out)
@@ -1359,16 +1363,15 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
         // numeric `score_psi` buffer is cloned because `ExactNewtonJointPsiTerms`
         // is not `Clone`-derivable through the `dyn HyperOperator` field.
         let hessian_psi_operator: Arc<dyn HyperOperator> =
-            Arc::new(TransformationNormalPsiHessianOperator::new_with_trace_axes(
+            Arc::new(TransformationNormalPsiHessianOperator::new(
                 Arc::new(self.family.clone()),
                 (*entry.beta).clone(),
                 Arc::clone(&entry.op_arc),
                 entry.axis,
-                Arc::clone(&entry.trace_axes),
-                entry.trace_axis_pos,
                 Arc::clone(&entry.row_gamma),
                 Arc::clone(&entry.row_h),
                 Arc::clone(&entry.row_h_prime),
+                Arc::clone(&entry.hessian_dense),
             ));
         Ok(Some(ExactNewtonJointPsiTerms {
             objective_psi: entry.objective_psi,

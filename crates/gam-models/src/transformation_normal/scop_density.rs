@@ -81,24 +81,6 @@ pub(crate) fn scop_second_order_h(
     [h_i, h_j, h_ij, hp_i, hp_j, hp_ij]
 }
 
-/// Accumulates the psi-direction transform quantities `(h_psi, hp_psi)` for one
-/// row from the response bases and the per-knot psi directional derivatives of
-/// α. Shared verbatim across the SCOP psi setup loops.
-pub(crate) fn scop_psi_marginal(
-    rv: ArrayView1<'_, f64>,
-    rd: ArrayView1<'_, f64>,
-    p_resp: usize,
-    alpha_psi: &[f64],
-) -> (f64, f64) {
-    let mut h_psi = 0.0;
-    let mut hp_psi = 0.0;
-    for k in 0..p_resp {
-        h_psi += rv[k] * alpha_psi[k];
-        hp_psi += rd[k] * alpha_psi[k];
-    }
-    (h_psi, hp_psi)
-}
-
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
@@ -237,16 +219,5 @@ mod tests {
             ]
         );
     }
-
-    // ---- scop_psi_marginal ----
-
-    #[test]
-    fn scop_psi_marginal_matches_hand_formula() {
-        let rv = array![1.0, 4.0];
-        let rd = array![1.0, 6.0];
-        let alpha_psi = [9.0, 10.0];
-        let (h_psi, hp_psi) = scop_psi_marginal(rv.view(), rd.view(), 2, &alpha_psi);
-        assert_eq!(h_psi, 9.0 + 4.0 * 10.0);
-        assert_eq!(hp_psi, 9.0 + 6.0 * 10.0);
-    }
 }
+

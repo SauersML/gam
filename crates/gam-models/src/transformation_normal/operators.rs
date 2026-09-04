@@ -296,7 +296,13 @@ pub(crate) struct TransformationNormalDhMatrixFreeOperator {
     pub(crate) row_quantities: TransformationNormalRowQuantityCache,
     pub(crate) direction: Array1<f64>,
     /// Write-once assembly of `D H[direction]`; see the type documentation.
-    dense: OnceLock<Array2<f64>>,
+    ///
+    /// `RayonSafeOnce`, not `OnceLock`: the assembly dispatches an
+    /// `into_par_iter` over the response blocks, and these operators are
+    /// applied from inside rayon workers. A `OnceLock::get_or_init` would park
+    /// sibling workers on the OS mutex while the leader tries to schedule
+    /// child tasks no worker is free to steal.
+    dense: gam_runtime::resource::RayonSafeOnce<Array2<f64>>,
 }
 
 impl TransformationNormalDhMatrixFreeOperator {
@@ -311,7 +317,7 @@ impl TransformationNormalDhMatrixFreeOperator {
             beta,
             row_quantities,
             direction,
-            dense: OnceLock::new(),
+            dense: gam_runtime::resource::RayonSafeOnce::new(),
         }
     }
 
@@ -321,7 +327,7 @@ impl TransformationNormalDhMatrixFreeOperator {
 
     /// `D H[direction]`, assembled on first use and reused thereafter.
     fn dense(&self) -> &Array2<f64> {
-        self.dense.get_or_init(|| {
+        self.dense.get_or_compute(|| {
             self.family
                 .scop_hessian_directional_derivative(
                     &self.beta,
@@ -368,8 +374,9 @@ pub(crate) struct TransformationNormalD2hMatrixFreeOperator {
     pub(crate) row_quantities: TransformationNormalRowQuantityCache,
     pub(crate) direction_u: Array1<f64>,
     pub(crate) direction_v: Array1<f64>,
-    /// Write-once assembly of `D² H[u, v]`; see the type documentation.
-    dense: OnceLock<Array2<f64>>,
+    /// Write-once assembly of `D² H[u, v]`; see the type documentation, and
+    /// its first-order sibling above for why this is not a `OnceLock`.
+    dense: gam_runtime::resource::RayonSafeOnce<Array2<f64>>,
 }
 
 impl TransformationNormalD2hMatrixFreeOperator {
@@ -386,7 +393,7 @@ impl TransformationNormalD2hMatrixFreeOperator {
             row_quantities,
             direction_u,
             direction_v,
-            dense: OnceLock::new(),
+            dense: gam_runtime::resource::RayonSafeOnce::new(),
         }
     }
 
@@ -396,7 +403,7 @@ impl TransformationNormalD2hMatrixFreeOperator {
 
     /// `D² H[u, v]`, assembled on first use and reused thereafter.
     fn dense(&self) -> &Array2<f64> {
-        self.dense.get_or_init(|| {
+        self.dense.get_or_compute(|| {
             self.family
                 .scop_hessian_second_directional_derivative(
                     &self.beta,
@@ -438,10 +445,25 @@ pub(crate) struct TransformationNormalPsiHessianOperator {
     pub(crate) beta: Array1<f64>,
     pub(crate) op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     pub(crate) axis: usize,
-    pub(crate) trace_axes: Arc<Vec<usize>>,
-    pub(crate) trace_axis_pos: usize,
-    pub(crate) trace_cache_id: usize,
     pub(crate) row_quantities: TransformationNormalRowQuantityCache,
+    /// Write-once assembly of `∂H/∂ψ_axis`.
+    ///
+    /// `∂H/∂ψ` is a weighted Gram over the response blocks
+    /// (`scop_psi_hessian_dense_from_cov`), which is ONE row sweep; the outer
+    /// engine asks this operator for `B · W` at full rank and for
+    /// `tr(Wᵀ B W)`, and answering either from the rows costs `2 n p k` scalar
+    /// multiply–adds per call. Every action is now a read of the assembly
+    /// (gam#979).
+    ///
+    /// The handle is shared: `TransformationNormalPsiWorkspace` rebuilds this
+    /// operator on every `exact_newton_joint_psi_terms` call by design, so a
+    /// per-instance cache would never be reused. The workspace owns one cell
+    /// per ψ axis for the life of its evaluation and hands out clones.
+    ///
+    /// `RayonSafeOnce`, not `OnceLock`: the assembly fans across the response
+    /// blocks with `into_par_iter` and this operator is applied from inside
+    /// rayon workers (see `feedback_oncelock_rayon_deadlock`).
+    pub(crate) dense: Arc<gam_runtime::resource::RayonSafeOnce<Array2<f64>>>,
 }
 
 impl TransformationNormalPsiHessianOperator {
@@ -453,44 +475,14 @@ impl TransformationNormalPsiHessianOperator {
         row_gamma: Arc<Array2<f64>>,
         row_h: Arc<Array1<f64>>,
         row_h_prime: Arc<Array1<f64>>,
-    ) -> Self {
-        Self::new_with_trace_axes(
-            family,
-            beta,
-            op,
-            axis,
-            Arc::new(vec![axis]),
-            0,
-            row_gamma,
-            row_h,
-            row_h_prime,
-        )
-    }
-
-    pub(crate) fn new_with_trace_axes(
-        family: Arc<TransformationNormalFamily>,
-        beta: Array1<f64>,
-        op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
-        axis: usize,
-        trace_axes: Arc<Vec<usize>>,
-        trace_axis_pos: usize,
-        row_gamma: Arc<Array2<f64>>,
-        row_h: Arc<Array1<f64>>,
-        row_h_prime: Arc<Array1<f64>>,
+        dense: Arc<gam_runtime::resource::RayonSafeOnce<Array2<f64>>>,
     ) -> Self {
         let log_likelihood = 0.0;
-        let op_ptr = Arc::as_ptr(&op) as *const () as usize;
-        let row_ptr = Arc::as_ptr(&row_gamma) as usize;
-        let axes_ptr = Arc::as_ptr(&trace_axes) as usize;
-        let trace_cache_id = op_ptr ^ row_ptr.rotate_left(17) ^ axes_ptr.rotate_left(31);
         Self {
             family,
             beta: beta.clone(),
             op,
             axis,
-            trace_axes,
-            trace_axis_pos,
-            trace_cache_id,
             row_quantities: TransformationNormalRowQuantityCache {
                 beta: Arc::new(beta),
                 alpha: row_gamma,
@@ -498,7 +490,31 @@ impl TransformationNormalPsiHessianOperator {
                 h_prime: row_h_prime,
                 log_likelihood,
             },
+            dense,
         }
+    }
+
+    /// `∂H/∂ψ_axis`, assembled on first use and shared with every operator
+    /// the workspace rebuilds for this axis.
+    fn dense_matrix(&self) -> &Array2<f64> {
+        self.dense.get_or_compute(|| {
+            let cov = self
+                .family
+                .covariate_dense_arc()
+                .expect("validated CTN psi Hessian covariate cache should not fail");
+            let cov_psi = self
+                .tensor_op()
+                .materialize_cov_first_axis(self.axis)
+                .expect("validated CTN psi Hessian covariate derivative should not fail");
+            self.family
+                .scop_psi_hessian_dense_from_cov(
+                    &self.beta,
+                    &self.row_quantities,
+                    cov.as_ref(),
+                    &cov_psi,
+                )
+                .expect("validated CTN psi Hessian dense inputs should not fail")
+        })
     }
 
     pub(crate) fn tensor_op(&self) -> &TensorKroneckerPsiOperator {
@@ -508,82 +524,6 @@ impl TransformationNormalPsiHessianOperator {
             .expect("validated CTN psi operator must remain tensor-backed")
     }
 
-    pub(crate) fn apply_columns_with_shared_cov(
-        &self,
-        factor: &Array2<f64>,
-        cov: &Array2<f64>,
-        cov_psi: &Array2<f64>,
-    ) -> Array2<f64> {
-        self.family
-            .scop_psi_hessian_hvp_mat_from_cov(
-                &self.beta,
-                &self.row_quantities,
-                self.axis,
-                cov,
-                cov_psi,
-                factor.view(),
-            )
-            .expect("validated CTN psi Hessian operator batched input should not fail")
-    }
-
-    pub(crate) fn projected_trace_table(&self, factor: &Array2<f64>) -> Array2<f64> {
-        assert_eq!(factor.nrows(), self.dim());
-        let axes = self.trace_axes.as_slice();
-        if axes.is_empty() {
-            return Array2::<f64>::zeros((0, 1));
-        }
-        let n = self.family.response_val_basis.nrows();
-        let p_cov = self.family.covariate_design.ncols();
-        let policy = ResourcePolicy::default_library();
-        let rows_per_chunk = gam_runtime::resource::rows_for_target_bytes(
-            policy.row_chunk_target_bytes,
-            p_cov.saturating_mul(axes.len() + 1).max(1),
-        )
-        .max(1)
-        .min(n.max(1));
-
-        let op = self.tensor_op();
-        let mut traces = vec![0.0_f64; axes.len()];
-        for start in (0..n).step_by(rows_per_chunk) {
-            let end = (start + rows_per_chunk).min(n);
-            let rows = start..end;
-            let cov = self
-                .family
-                .covariate_design
-                .try_row_chunk(rows.clone())
-                .expect(
-                    "validated CTN psi Hessian projected trace covariate chunk should not fail",
-                );
-            let mut cov_psi_chunks: Vec<Array2<f64>> = Vec::with_capacity(axes.len());
-            for &axis in axes {
-                cov_psi_chunks.push(
-                    op.cov_first_axis_row_chunk_streaming(axis, rows.clone())
-                        .expect("validated CTN psi Hessian projected trace first-axis chunk should not fail"),
-                );
-            }
-            let cov_psi_views: Vec<ArrayView2<'_, f64>> =
-                cov_psi_chunks.iter().map(|chunk| chunk.view()).collect();
-            let chunk_traces = self
-                .family
-                .scop_psi_hessian_trace_factor_all_axes_chunk_from_cov(
-                    &self.beta,
-                    &self.row_quantities,
-                    start,
-                    cov.view(),
-                    &cov_psi_views,
-                    factor.view(),
-                )
-                .expect(
-                    "validated CTN psi Hessian all-axis projected trace inputs should not fail",
-                );
-            assert_eq!(chunk_traces.len(), traces.len());
-            for (total, value) in traces.iter_mut().zip(chunk_traces.into_iter()) {
-                *total += value;
-            }
-        }
-        Array2::from_shape_vec((traces.len(), 1), traces)
-            .expect("validated CTN psi Hessian projected trace table shape")
-    }
 }
 
 impl HyperOperator for TransformationNormalPsiHessianOperator {
@@ -592,77 +532,21 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        self.family
-            .scop_psi_hessian_apply_from_operator(
-                &self.beta,
-                &self.row_quantities,
-                self.tensor_op(),
-                self.axis,
-                v,
-            )
-            .expect("validated CTN psi Hessian operator inputs should not fail")
+        assert_eq!(v.len(), self.dim());
+        gam_linalg::faer_ndarray::fast_av(self.dense_matrix(), v)
     }
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
         assert_eq!(factor.nrows(), self.dim());
-        let p = factor.nrows();
-        let k = factor.ncols();
-        let cov = self
-            .family
-            .covariate_dense_arc()
-            .expect("validated CTN psi Hessian operator covariate cache should not fail");
-        let cov_psi = self
-            .tensor_op()
-            .materialize_cov_first_axis(self.axis)
-            .expect("validated CTN psi Hessian operator covariate derivative should not fail");
-        let out = self.apply_columns_with_shared_cov(factor, cov.as_ref(), &cov_psi);
-        assert_eq!(out.nrows(), p);
-        assert_eq!(out.ncols(), k);
-        out
-    }
-
-    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        assert_eq!(factor.nrows(), self.dim());
-        let cov = self
-            .family
-            .covariate_dense_arc()
-            .expect("validated CTN psi Hessian projected trace covariate cache should not fail");
-        let cov_psi = self
-            .tensor_op()
-            .materialize_cov_first_axis(self.axis)
-            .expect(
-                "validated CTN psi Hessian projected trace covariate derivative should not fail",
-            );
-        self.family
-            .scop_psi_hessian_trace_factor_from_cov(
-                &self.beta,
-                &self.row_quantities,
-                self.axis,
-                cov.as_ref(),
-                &cov_psi,
-                factor.view(),
-            )
-            .expect("validated CTN psi Hessian projected trace inputs should not fail")
-    }
-
-    fn trace_projected_factor_cached(
-        &self,
-        factor: &Array2<f64>,
-        cache: &ProjectedFactorCache,
-    ) -> f64 {
-        let key = ProjectedFactorKey::from_factor_view(self.trace_cache_id, factor.view());
-        let table = cache.get_or_insert_with(key, || self.projected_trace_table(factor));
-        table[[self.trace_axis_pos, 0]]
+        gam_linalg::faer_ndarray::fast_ab(self.dense_matrix(), factor)
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        let p = self.dim();
-        let dense = self.mul_mat(&Array2::<f64>::eye(p));
-        0.5 * (&dense + &dense.t())
+        self.dense_matrix().clone()
     }
 
     fn is_implicit(&self) -> bool {
-        true
+        false
     }
 }
 
