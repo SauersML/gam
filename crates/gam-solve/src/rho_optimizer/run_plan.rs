@@ -1578,6 +1578,18 @@ pub(crate) fn run_outer_with_plan(
     // identically in each. Re-deriving a constant of the problem once per seed
     // buys nothing; `max_seeds` / `seed_budget` are inert against it.
     let mut cold_entry_leg_refusal: Option<String> = None;
+    // Non-converged outcomes this ladder has already produced, by value.
+    //
+    // `uniform_structural_key` below catches a cascade of seeds that are
+    // REJECTED for the same reason. It cannot see the other uniform failure
+    // mode: a seed that RUNS, exhausts its budget, and lands on the point a
+    // previous seed already landed on. Measured on gam#2748 (n = 4000 matern
+    // flexible): four seeds, four EFS runs, each `hit max_iter=200` at
+    // `final_value = 2.786987e3` — the same value to seven digits every time —
+    // 14 minutes apart, and the cell died at its 3600 s wall inside the fifth.
+    // Three of those four runs could not have told anyone anything the first
+    // had not.
+    let mut non_converged_outcome_values: Vec<f64> = Vec::new();
 
     'seed_attempts: for (seed_idx, seed_as_generated) in seeds.iter().enumerate() {
         // The seed the solver starts from: the generated point, or that point
@@ -3479,8 +3491,39 @@ pub(crate) fn run_outer_with_plan(
                         best.as_ref().map(CertifiedOuterCandidate::result),
                     )
                 };
+                // A seed that ran its budget out and stopped where an earlier
+                // seed already stopped is the completed-run twin of a uniform
+                // structural rejection: the remaining seeds reach the same
+                // attractor, and each costs a full solve to say so again
+                // (gam#2748). Compare on the exact bits — two independent runs
+                // agreeing to the last bit is the signature of the same
+                // attractor, whereas a tolerance would also swallow genuinely
+                // distinct nearby optima. Only NON-converged outcomes count: a
+                // converged optimum reached from several seeds is the multi-start
+                // working, and keep-best still wants every one of them.
+                let mut ladder_reached_a_repeated_attractor = false;
+                if !candidate.result().converged() {
+                    let value = candidate.result().final_value;
+                    if value.is_finite() {
+                        if non_converged_outcome_values
+                            .iter()
+                            .any(|seen| seen.to_bits() == value.to_bits())
+                        {
+                            ladder_reached_a_repeated_attractor = true;
+                        } else {
+                            non_converged_outcome_values.push(value);
+                        }
+                    }
+                }
                 if candidate_improved {
                     best = Some(candidate);
+                }
+                if ladder_reached_a_repeated_attractor {
+                    log::warn!(
+                        "[OUTER] {context}: seed {seed_idx} exhausted its budget at exactly the                          value a previous seed already reached (bit-identical); the remaining                          seeds descend to the same attractor, so stopping the ladder here                          instead of re-deriving it up to {} more time(s)",
+                        seed_budget.saturating_sub(started_seeds)
+                    );
+                    break 'seed_attempts;
                 }
                 let quality_compare_remaining_gaussian_seeds =
                     config.seed_config.risk_profile.uses_lowest_cost_keep_best()
