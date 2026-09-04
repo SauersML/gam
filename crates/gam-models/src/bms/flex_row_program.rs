@@ -869,10 +869,17 @@ impl BmsFlexRowProgram {
         }
 
         if let Some(range) = self.primary.w.as_ref() {
-            for (local, idx) in range.clone().enumerate() {
-                let basis = u.compose_unary(index.link_stacks[local]);
-                inside = vars[idx].multiply_add(&basis, &inside);
-            }
+            // `Σ_local β_local · b_local(u)` over the link-deviation basis. Every
+            // term composes at the SAME point `u`, so the loop this replaced
+            // allocated and streamed `2·|w|` derivative blocks — a composition
+            // and a product per coefficient — that all re-read one `u`. The
+            // fused form is one block (gam#979).
+            inside = S::weighted_compose_sum(
+                &vars[range.clone()],
+                &u,
+                &index.link_stacks,
+                &inside,
+            );
         }
         inside.scale(self.scale)
     }

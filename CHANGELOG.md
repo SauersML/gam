@@ -1,5 +1,13 @@
 ## Unreleased
 
+### Performance
+- The flex BMS row program's link-deviation basis sum is now one fused jet operation
+  (`RuntimeJetScalar::weighted_compose_sum`) rather than a per-coefficient
+  `compose_unary` + `multiply_add` loop that streamed `2*|w|` derivative blocks and
+  re-composed the same point each time. Measured 3.27x on the order-3 link-deviation
+  path at tier width 12, bringing its dynamic-vs-fixed ratio (1.09) onto the score
+  warp's (1.08), which was already a single fused operation. (#979, #932)
+
 - The Bernoulli marginal-slope ψ-cross accumulator takes its primary-space vector as a view, so the axis sweep no longer allocates a two-element `Array1` three times per axis pair per row across nine call sites (#979).
 
 ### Fixed
