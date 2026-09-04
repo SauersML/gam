@@ -201,6 +201,30 @@ mod per_term_edf_tests {
     /// term's EDF, which is structurally impossible for a sum of non-negative
     /// per-term contributions. After the optimizer reconciles both channels to
     /// the same rank-revealing inverse, `edf_total ≥ max per-term EDF` holds.
+    /// A custom-family fit has no dispersion to scale `H⁻¹` by: its objective
+    /// is the complete negative log-likelihood, so the Laplace covariance is
+    /// the inverse penalized Hessian as it stands (gam#2765). A Gaussian fit
+    /// keeps its profiled `σ̂²`.
+    #[test]
+    fn a_fit_without_an_engine_level_family_scales_its_precision_by_one_2765() {
+        let gaussian = fit_single_thinplate_consistent_edf();
+        let gaussian_scale = gaussian
+            .coefficient_covariance_scale()
+            .expect("a Gaussian fit has a profiled scale");
+        assert!(
+            (gaussian_scale - gaussian.standard_deviation * gaussian.standard_deviation).abs()
+                <= 1e-12 * (1.0 + gaussian_scale.abs()),
+            "Gaussian scale must be σ̂²: got {gaussian_scale}, σ̂ = {}",
+            gaussian.standard_deviation
+        );
+        let mut custom = fit_single_thinplate_consistent_edf();
+        custom.likelihood_family = None;
+        assert_eq!(
+            custom.coefficient_covariance_scale().expect("a custom-family scale is defined"),
+            1.0
+        );
+    }
+
     fn fit_single_thinplate_consistent_edf() -> UnifiedFitResult {
         // p = 11: one intercept column (index 0, unpenalised, EDF 1) plus a
         // 10-coefficient thin-plate block that has spent 7 EDF (F diagonal 0.7).
@@ -4534,8 +4558,13 @@ impl UnifiedFitResult {
     /// profiled residual variance `σ̂²` for the scale-free profiled Gaussian and
     /// `1.0` for every family whose IRLS working weight already carries the
     /// dispersion / full Fisher information (Gamma, Tweedie, Beta,
-    /// Negative-Binomial, Poisson, Binomial) — see #679. For custom/GAMLSS
-    /// paths with no engine-level family it is undefined.
+    /// Negative-Binomial, Poisson, Binomial) — see #679. A fit with no
+    /// engine-level family is a custom-family fit whose objective is its
+    /// complete negative log-likelihood — every scale it has is a coefficient —
+    /// so its Laplace posterior precision is the penalized Hessian itself and
+    /// the scale is `1.0`. Refusing it here left a saved custom-family model
+    /// (survival marginal-slope, fitted through the library route) unable to
+    /// reconstruct the covariance the load gate asks for (gam#2765).
     pub fn coefficient_covariance_scale(&self) -> Result<f64, EstimationError> {
         match &self.likelihood_family {
             Some(spec) => {
@@ -4554,10 +4583,7 @@ impl UnifiedFitResult {
                 glm.coefficient_covariance_scale(dispersion.phi())
                     .map_err(|error| EstimationError::InvalidInput(error.to_string()))
             }
-            None => Err(EstimationError::InvalidInput(
-                "this fit has no engine-level family and therefore no scalar coefficient-covariance scale"
-                    .to_string(),
-            )),
+            None => Ok(1.0),
         }
     }
 

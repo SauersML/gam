@@ -2083,7 +2083,7 @@ fn payload_for_survival_marginal_slope(
     ms_result: SurvivalMarginalSlopeFitResult,
 ) -> Result<FittedModelPayload, String> {
     use crate::survival::construction::{
-        build_survival_time_basis, parse_survival_baseline_config, parse_survival_likelihood_mode,
+        build_survival_time_basis, parse_survival_likelihood_mode,
         parse_survival_time_basis_config, resolve_survival_time_anchor_for_mode,
         survival_likelihood_modename, survival_marginal_slope_offset_baseline_config,
     };
@@ -2145,13 +2145,14 @@ fn payload_for_survival_marginal_slope(
         age_entry[i] = t0;
         age_exit[i] = t1;
     }
-    let baseline_cfg = parse_survival_baseline_config(
-        &fit_config.baseline_target,
-        fit_config.baseline_scale,
-        fit_config.baseline_shape,
-        fit_config.baseline_rate,
-        fit_config.baseline_makeham,
-    )?;
+    // The saved baseline chart is the one the fit CERTIFIED, not a re-parse of
+    // the request. A request names only the target (`--baseline-target
+    // weibull`) and leaves scale and shape to the fit's own ψ coordinates;
+    // re-parsing it here demanded `--baseline-scale > 0` and refused to save
+    // exactly the fits that estimated their chart (gam#2765: a follow-up-varying
+    // slope on a Weibull chart converged and then could not leave the process).
+    // `baseline_config` on the fit result is the chart at the certified θ.
+    let baseline_cfg = ms_result.baseline_config.clone();
     let likelihood_mode = parse_survival_likelihood_mode(fit_config.resolved_survival_likelihood())?;
     let time_cfg = if parsed.timewiggle.is_some() {
         crate::survival::construction::SurvivalTimeBasisConfig::None

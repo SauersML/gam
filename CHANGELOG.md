@@ -1,5 +1,7 @@
 ## Unreleased
 
+- A survival marginal-slope fit that estimated its parametric baseline chart is saved with the fitted chart instead of being refused for a missing `--baseline-scale`, and the fixed-λ refit from a certified outer optimum admits a curvature certificate the criterion contradicted (`criterion-contradicted`) as it admits a positive-semidefinite one; only inadmissible or unevaluated curvature is refused (#2765).
+
 - Exact coefficient-mode profiling (survival marginal-slope, bernoulli marginal-slope, transformation-normal) warm-starts every outer evaluation from the certified mode of the accepted outer iterate instead of a cold seed once the search has started; a refused or non-converged probe never becomes the start of the next one (#2765).
 
 - The inner P-IRLS objective band and the joint Newton's residual band carry the unit roundoff once (`accumulation_growth` already includes it), restoring the LM rejection floor and both decrement certificates; the survival LAML gate accepts a residual inside the residual's own rounding band, not only `1e-8` relative (#2668, #2812).
