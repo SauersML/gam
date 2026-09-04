@@ -1556,17 +1556,18 @@ pub(super) fn pirls_soft_acceptance(
             predicted_reduction,
             current_penalized,
         } => {
-            // LM-rejection floor: a model-predicted reduction below
-            // `1e-12 · |Φ|` is indistinguishable from numerical noise on the
-            // quadratic model relative to the objective's own magnitude. The
-            // predicted reduction and the penalized objective `Φ` both scale as
-            // `O(a²)` under `y → a·y`, so this relative floor is
-            // scale-equivariant. The historical `.max(1.0)` absolute floor
-            // broke that: for a micro-unit response it pinned the floor at
-            // `1e-12` while genuine reductions were themselves `O(a²) ≈ 1e-12`,
-            // accepting a non-converged iterate (issue #1127). For a well-scaled
-            // objective (`|Φ| ≳ 1`) the floor is unchanged.
-            let reduction_noise_floor = current_penalized.abs() * 1e-12;
+            // LM-rejection band: a model-predicted reduction inside the
+            // objective's own rounding band `γ_{n+p²}·u·|Φ|` is arithmetic on
+            // the quadratic model, not progress (#2469; it replaced a
+            // `1e-12·|Φ|` constant). It scales as `O(a²)` under `y → a·y`
+            // exactly as the predicted reduction does (#1127). `|Φ|` is a lower
+            // bound on the accumulated magnitude when deviance and penalty
+            // cancel, which only makes this acceptance rarer, never wider.
+            let reduction_noise_floor = super::convergence::objective_rounding_band(
+                state.eta.len(),
+                state.gradient.len(),
+                current_penalized,
+            );
             state.near_stationary_kkt(projected_grad, kkt_tol)
                 && predicted_reduction.abs() <= reduction_noise_floor
         }

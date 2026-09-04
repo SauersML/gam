@@ -67,6 +67,42 @@ pub(super) fn madsen_lm_accept_factor(rho: f64) -> f64 {
     (1.0 - cube).clamp(1.0 / 3.0, 2.0)
 }
 
+/// The rounding band of the penalized objective this loop differences,
+/// `½·(s·D + βᵀSβ)`, at `state` — see
+/// [`super::convergence::objective_rounding_band`]. The magnitude is the sum of
+/// the two accumulated pieces' absolute values, not `|F|`, so a penalty that
+/// nearly cancels a deviance does not shrink the band below what either piece
+/// carries.
+fn penalized_objective_rounding_band(state: &WorkingState, dev_scale: f64) -> f64 {
+    let magnitude =
+        0.5 * (dev_scale * state.deviance).abs() + 0.5 * state.penalty_term.abs();
+    super::convergence::objective_rounding_band(state.eta.len(), state.gradient.len(), magnitude)
+}
+
+/// The threshold the squared Newton decrement `gᵀH⁻¹g` is certified against —
+/// one definition, used by both the in-loop check and the post-loop rescue.
+///
+/// The Newton step's predicted decrease is `½·gᵀH⁻¹g`. Once that decrease is
+/// inside the objective's own rounding band no step can be shown to improve the
+/// objective on this arithmetic, so the state is stationary to the resolution
+/// the objective has — the decrement-against-resolution test the outer engine's
+/// `curvature-resolvability` rung applies to the REML criterion, applied to the
+/// inner objective (#2469, #2814).
+///
+/// Until #2814 this was `tol²·(1 + |F|)` with `tol` the caller's KKT tolerance.
+/// At the survival routes' `tol = 1e-8` that is `≈ u·|F|`: a standard the sum
+/// of `n` rounded terms cannot meet, so a converged fixed-λ survival solve at
+/// `λ ≈ 5e7` was refused at `|Pg| = 7.5e-5` against a penalized deviance of
+/// 139, and the outer selector had to carry a private loose tolerance to stay
+/// away from it. The #2273 history stays on record: an unattainable threshold
+/// once exposed a polish stepping on the wrong curvature (`X'WX + S` instead of
+/// `X'WX + S − HΦ`), which a floor would have masked. That defect is fixed and
+/// pinned by its own test; this band is not a tolerance chosen to pass anything
+/// but the resolution below which the objective cannot tell two states apart.
+fn exact_newton_decrement_threshold(state: &WorkingState, dev_scale: f64) -> f64 {
+    2.0 * penalized_objective_rounding_band(state, dev_scale)
+}
+
 /// Exact squared Newton decrement `gᵀH⁻¹g` for the bare penalized Hessian.
 ///
 /// The ordinary in-loop bound derives this quantity from the damped LM step.
@@ -77,24 +113,6 @@ pub(super) fn madsen_lm_accept_factor(rho: f64) -> f64 {
 /// objective plateau we pay for one bare factorization and certify the actual
 /// local quadratic geometry instead. Failure to factorize is not a
 /// certificate; callers simply continue the iteration.
-/// The threshold the squared Newton decrement is certified against — one
-/// definition, used by both the in-loop check and the post-loop rescue.
-///
-/// Deliberately NOT floored at the objective's roundoff. That was tried while
-/// tracing #2273 and measurement killed it: the fixture that motivated a floor
-/// (`y ~ x + link(type=probit)`, n=6, Firth) was reaching
-/// `decrement² = 3.43e-15` against a `2.70e-20` threshold, four orders past what
-/// the arithmetic seemed to allow — but the cause was the undamped Newton polish
-/// solving `X'WX + S` instead of the objective's `X'WX + S − HΦ`, so it removed
-/// only part of the residual. With the polish stepping on the right curvature
-/// the same solve reaches `‖g‖ = 1.18e-15` and `decrement² = 5.57e-31`, and
-/// clears this threshold by eleven orders. A tolerance floor next to the real
-/// defect would have hidden it, and would have loosened the inner convergence
-/// contract engine-wide to compensate for one wrong matrix.
-fn exact_newton_decrement_threshold(kkt_tolerance: f64, objective: f64) -> f64 {
-    kkt_tolerance * kkt_tolerance * (1.0 + objective.abs())
-}
-
 pub(super) fn exact_newton_decrement_sq(
     state: &WorkingState,
     correction: Option<&Array2<f64>>,
@@ -1434,20 +1452,16 @@ where
                     let screening_reduction = current_penalized - screening_penalized;
 
                     // 4. Gain Ratio
-                    // When predicted reduction is at floating-point noise level
-                    // relative to the objective, both predicted and actual are
-                    // meaningless — treat as a neutral step (rho = 1) rather
-                    // than hard-rejecting on the sign of noise. The floor tracks
-                    // the penalized objective's own magnitude (issue #1127): the
-                    // predicted/screening reductions and `current_penalized` all
-                    // scale as `O(a²)` under `y → a·y`, so a relative floor is
-                    // scale-equivariant. The previous `.max(1.0)` absolute floor
-                    // pinned it at `1e-14` for a micro-unit response, mismatching
-                    // genuine `O(a²)` reductions and biasing the step screening
-                    // toward the over-smoothed iterate. A converged objective
-                    // (`current_penalized == 0`) yields a `0` floor, so the
-                    // `predicted_reduction > floor` branch still governs.
-                    let noise_floor = current_penalized.abs() * 1e-14;
+                    // When the predicted reduction is inside the objective's own
+                    // rounding band, predicted and actual are both arithmetic —
+                    // treat the step as neutral (rho = 1) rather than
+                    // hard-rejecting on the sign of noise. The band is the
+                    // objective's `γ_{n+p²}·u·(|½·s·D| + |½·βᵀSβ|)` (#2469; it
+                    // replaced a `1e-14·|F|` constant): it scales as `O(a²)`
+                    // under `y → a·y` exactly as the reductions do (#1127), and a
+                    // converged objective (`F == 0`) yields a `0` band, so the
+                    // `predicted_reduction > band` branch still governs.
+                    let noise_floor = penalized_objective_rounding_band(&state, penalized_dev_scale);
                     let screening_rho = if predicted_reduction > noise_floor {
                         screening_reduction / predicted_reduction
                     } else if screening_reduction >= -noise_floor {
@@ -1771,10 +1785,8 @@ where
                         } else {
                             None
                         };
-                        let exact_nd_threshold = exact_newton_decrement_threshold(
-                            kkt_tolerance,
-                            penalizedobjective(final_state_ref, penalized_dev_scale),
-                        );
+                        let exact_nd_threshold =
+                            exact_newton_decrement_threshold(final_state_ref, penalized_dev_scale);
                         let exact_nd_pass = exact_decrement_sq
                             .is_some_and(|decrement_sq| decrement_sq <= exact_nd_threshold);
                         if should_check_exact_nd {
@@ -2623,10 +2635,7 @@ where
     };
     let final_decrement_threshold = if final_exact_decrement_sq.is_some() {
         let final_dev_scale = model.penalized_deviance_scale()?;
-        exact_newton_decrement_threshold(
-            kkt_tolerance,
-            penalizedobjective(&state, final_dev_scale),
-        )
+        exact_newton_decrement_threshold(&state, final_dev_scale)
     } else {
         0.0
     };

@@ -739,11 +739,13 @@ impl BaselineDerivativeContract {
         use gam_problem::{DeclaredHessianForm, Derivative};
         match self {
             // BFGS on a 2–3 dim problem with an exact gradient typically
-            // converges in 5–10 outer evaluations.
+            // converges in 5–10 outer evaluations. The stationarity standard is
+            // the engine's own (#2814): a private `1e-4` sat here only because
+            // the inner solve refused to certify at the strengths the engine's
+            // default walked to.
             BaselineDerivativeContract::GradientOnly => problem
                 .with_gradient(Derivative::Analytic)
                 .with_hessian(DeclaredHessianForm::Unavailable)
-                .with_tolerance(1e-4)
                 .with_max_iter(240),
         }
     }
