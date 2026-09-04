@@ -1384,7 +1384,25 @@ impl BernoulliMarginalSlopeFamily {
                         };
                         let mut dir = Array1::<f64>::zeros(primary.total);
                         dir[dir_idx] = psi_local.dot(&block_states[axis.block_idx].beta);
-                        let mut f_pipi = f_pipi_base.clone();
+                        // `f_pipi_base` is the row's primary Hessian and is
+                        // shared by every ψ axis: the only per-axis change made
+                        // to it is the uniform `w` scale, and `w ≡ 1.0` on the
+                        // contiguous unit-weight row set the large-scale fit
+                        // actually runs on. The clone therefore allocated and
+                        // copied a whole primary Hessian once per (row, axis) —
+                        // `axis_count × n` times per ψ-hyper build, 32 × 326k
+                        // here — to hand back a bit-identical matrix. Borrow it
+                        // unscaled and materialize a scaled copy only on the
+                        // genuinely weighted path (gam#979).
+                        let f_pipi_scaled;
+                        let f_pipi = if w != 1.0 {
+                            let mut scaled = f_pipi_base.clone();
+                            scaled.mapv_inplace(|v| v * w);
+                            f_pipi_scaled = scaled;
+                            &f_pipi_scaled
+                        } else {
+                            &f_pipi_base
+                        };
                         let mut third = self.row_primary_third_contracted(
                             row,
                             block_states,
@@ -1401,9 +1419,10 @@ impl BernoulliMarginalSlopeFamily {
                             },
                             local_vec: psi_local,
                         };
-                        let mut f_pipi_dir = f_pipi.dot(&dir);
+                        // Unscaled, exactly as before: the original computed
+                        // this product before applying `w` to `f_pipi`.
+                        let mut f_pipi_dir = f_pipi_base.dot(&dir);
                         if w != 1.0 {
-                            f_pipi.mapv_inplace(|v| v * w);
                             third.mapv_inplace(|v| v * w);
                             f_pipi_dir.mapv_inplace(|v| v * w);
                         }
