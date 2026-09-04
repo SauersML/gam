@@ -1595,6 +1595,11 @@ struct CanonicalChart<'a> {
     /// Raw-parameter domain the canonical map is inverted inside.
     lo: f64,
     hi: f64,
+    /// The axis period the atom's own `LatentManifold` wraps at — the period
+    /// [`SaeManifoldTerm::steer_rows`]'s group action uses. Checked against the
+    /// canonical topology at construction, and used to report each row's raw step
+    /// as its SHORTEST representative.
+    axis_period: Option<f64>,
 }
 
 /// The canonical (arc-length) reading of one `d = 1` chart, plus the gauge
@@ -1681,6 +1686,15 @@ fn canonical_chart<'a>(
         .as_matrix()
         .column(0)
         .to_owned();
+    let axis_period = *model.assignment.coords[atom_k]
+        .effective_axis_periods()
+        .first()
+        .ok_or_else(|| {
+            format!(
+                "canonical chart: atom {atom_k} ('{}') has no latent axis",
+                atom.name
+            )
+        })?;
     let (span, lo, hi, domain_anchor) = match &topology {
         CanonicalChartTopology::Circle { period } => (*period, 0.0, *period, None),
         CanonicalChartTopology::Interval => {
@@ -1700,6 +1714,23 @@ fn canonical_chart<'a>(
             atom.name
         ));
     }
+    // The canonical chart is defined on the domain the arc-length map integrates,
+    // and the move is realized by the group action, which wraps at the MANIFOLD's
+    // own axis period. If those two disagree the surface would silently steer to a
+    // different point than the one it reports; refuse instead.
+    let periods_agree = match (&topology, axis_period) {
+        (CanonicalChartTopology::Circle { period }, Some(axis)) => axis == *period,
+        (CanonicalChartTopology::Interval, None) => true,
+        _ => false,
+    };
+    if !periods_agree {
+        return Err(format!(
+            "canonical chart: atom {atom_k} ('{}') has canonical topology {topology:?} but its \
+             manifold wraps its axis at {axis_period:?}; the arc-length domain and the group \
+             action's period must be the same object",
+            atom.name
+        ));
+    }
     Ok(CanonicalChart {
         atom: atom_k,
         name: &atom.name,
@@ -1710,6 +1741,7 @@ fn canonical_chart<'a>(
         span,
         lo,
         hi,
+        axis_period,
     })
 }
 
@@ -1914,11 +1946,18 @@ pub fn steer_rows_unit_speed(
             .map(|&c| chart.advance(c, residual))
             .collect();
         let moved = chart.invert(&targets)?;
-        moved
-            .iter()
-            .zip(base_raw.iter())
-            .map(|(&to, &from)| to - from)
-            .collect()
+        // The step is reported as its SHORTEST representative, through the same
+        // helper `steer_delta` uses. Both endpoints lie in the chart's own domain,
+        // so a row near the wrap seam would otherwise be reported as taking the
+        // long way round (`0.95 → 0.06` as `−0.89` rather than `+0.11`). The group
+        // action lands identically either way — `retract` wraps — but the reported
+        // spread over rows is only the gauge error if each step is the short one.
+        let periods = [chart.axis_period];
+        let mut steps = Vec::with_capacity(moved.len());
+        for (&to, &from) in moved.iter().zip(base_raw.iter()) {
+            steps.push(shortest_coordinate_delta(&[from], &[to], &periods)?[0]);
+        }
+        steps
     };
 
     let p = model.output_dim();
