@@ -525,3 +525,245 @@ fn sae_exact_a_theta_adjoint_gap_measure_2330_patchd_weighted() {
         }
     }
 }
+
+// ─── #2080 / #2712 from-probes θ-adjoint parity, restored (#2818) ───────────
+//
+// `c0a21b554` deleted this gate because it no longer compiled, and it no longer
+// compiled because `d484a091a` had deleted the FD-anchor scaffolding it stood
+// on — `certified_fd_anchor`, `FdAnchorRegime`, `FdAnchorCandidate`,
+// `rho_ladder_family`, `sparse_lift_ladder`, `deflation_blind_cache`. Every one
+// of those was `#[cfg(test)]`, where the sweep's criterion ("no production
+// artifact links this function") is true of everything by construction.
+//
+// The three production entry points the gate actually grades —
+// `SaeManifoldTerm::logdet_theta_adjoint`,
+// `SaeManifoldTerm::logdet_theta_adjoint_from_probes`, and
+// `ArrowFactorCache::schur_inverse_apply` — were untouched, so this is a
+// rebuild against them directly. Everything the anchor machinery did for the
+// `any_maximum()` regime this gate declared is inlined as closures: walk the
+// declared `log λ_sparse` ladder, converge each member's own inner mode, freeze
+// it at `inner_max_iter = 0`, and accept the first member the criterion prices
+// finitely. Nothing in that acceptance can see the finite difference or the
+// analytic value, so it still cannot converge on "whatever agrees".
+
+/// #2080 θ-adjoint from-probes — SOFTMAX fixture. Exercises the softmax entropy
+/// dense off-diagonal channel + the core t–t / t–β / β–β selected-inverse folds.
+///
+/// The matrix-free θ-adjoint reconstructed from the FULL-BASIS probe bundle
+/// (`z_j = √k·e_j`, exact dense `S⁻¹` via `cache.schur_inverse_apply`) must
+/// reproduce the dense selected-inverse θ-adjoint. This isolates the from-probes
+/// reconstruction; the dense adjoint is already FD-validated against `log|H|`
+/// elsewhere.
+///
+/// On a DEFLATED cache the two have to be told apart from the deflation-blind
+/// operator before agreement means anything: the deflated and undeflated
+/// θ-adjoints coincide wherever the deflation is inactive, so machine-precision
+/// agreement is ALSO what a port that ignored deflation would produce. The gate
+/// measures `‖Γ_dense − Γ_deflation-blind‖∞` first and refuses to read parity as
+/// evidence unless the two provably separate.
+#[test]
+fn sae_logdet_theta_adjoint_from_probes_matches_dense_softmax_2080() {
+    // The declared `log λ_sparse` ladder. The assignment-strength penalty is the
+    // dial that moves a state between the deflating and non-deflating regimes,
+    // so it is the natural declared axis for a regime the gate needs but cannot
+    // control directly. Ordered by lift; the accepted member is reported.
+    const SPARSE_LIFTS: [f64; 9] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5];
+
+    let (base_term, target, base_rho) =
+        crate::manifold::tests_recovery_split_780::gamma_fd_tiny_fixture();
+
+    // The `any_maximum()` anchor regime, inlined: the frozen state must merely
+    // BE a maximum the criterion will price. Everything the gate then
+    // differentiates is defined there; nothing further is asserted about it.
+    let mut rejections: Vec<String> = Vec::with_capacity(SPARSE_LIFTS.len());
+    let mut certified: Option<(String, SaeManifoldTerm, SaeManifoldRho, ArrowFactorCache)> = None;
+    for &lift in &SPARSE_LIFTS {
+        let description = format!("log_lambda_sparse={lift:.2}");
+        let mut rho = base_rho.clone();
+        rho.log_lambda_sparse = lift;
+        let mut term = base_term.clone();
+        // Reach this member's own mode first. A solve that refuses is a
+        // rejection of this member, not a panic.
+        if let Err(error) = term.penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            200,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        ) {
+            rejections.push(format!("  {description}: inner solve refused: {error}"));
+            continue;
+        }
+        // `inner_max_iter = 0` freezes θ̂ where the ladder put it: the anchor is
+        // the point the gate declares, not wherever the solve would wander.
+        match term.penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            0,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        ) {
+            Ok((value, loss, cache)) if value.is_finite() && loss.total().is_finite() => {
+                certified = Some((description, term, rho, cache));
+                break;
+            }
+            Ok((value, loss, _)) => rejections.push(format!(
+                "  {description}: frozen state priced non-finitely (value={value}, loss={})",
+                loss.total()
+            )),
+            Err(error) => rejections.push(format!(
+                "  {description}: criterion refused the frozen state: {error}"
+            )),
+        }
+    }
+    let (accepted, term, rho, cache) = certified.unwrap_or_else(|| {
+        panic!(
+            "#2080 from-probes softmax parity: no member of the declared ladder is a maximum \
+             the criterion will price. Widening the ladder is a fixture decision and dropping \
+             the regime would change what is proved. Rejections:\n{}",
+            rejections.join("\n")
+        )
+    });
+    eprintln!("#2080 from-probes softmax parity: anchor certified at {accepted}");
+
+    let solver = DeflatedArrowSolver::plain(&cache);
+    let dense = term
+        .logdet_theta_adjoint(&rho, &cache, &solver)
+        .expect("dense theta-adjoint");
+
+    let deflated_rows = cache
+        .deflated_row_directions
+        .iter()
+        .filter(|d| !d.is_empty())
+        .count();
+    // The deflation-blind operator: the production dense adjoint against the
+    // same cache with ONLY the deflation metadata stripped — the per-row
+    // Cholesky factors and the reduced Schur are untouched. That is exactly what
+    // a from-probes port which silently dropped the Daleckii–Krein correction
+    // would return, so the distance to it is the resolution this gate has. It is
+    // a REFERENCE, never a route.
+    let separation = if deflated_rows == 0 {
+        0.0
+    } else {
+        let mut blind = cache.clone();
+        let rows = cache.deflated_row_directions.len();
+        blind.deflated_row_directions = std::sync::Arc::from(vec![Vec::new(); rows]);
+        blind.deflation_row_spectra = std::sync::Arc::from(vec![None; rows]);
+        let blind_solver = DeflatedArrowSolver::plain(&blind);
+        let blind_gamma = term
+            .logdet_theta_adjoint(&rho, &blind, &blind_solver)
+            .expect("deflation-blind dense theta-adjoint");
+        dense
+            .t
+            .iter()
+            .zip(blind_gamma.t.iter())
+            .chain(dense.beta.iter().zip(blind_gamma.beta.iter()))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max)
+    };
+
+    let k = cache.k;
+    assert!(
+        k > 0,
+        "fixture must have a non-empty border to exercise S⁻¹ folds"
+    );
+    let sqrt_k = (k as f64).sqrt();
+    let probes: Vec<Array1<f64>> = (0..k)
+        .map(|j| {
+            let mut v = Array1::<f64>::zeros(k);
+            v[j] = sqrt_k;
+            v
+        })
+        .collect();
+    let sinv: Vec<Array1<f64>> = probes
+        .iter()
+        .map(|v| {
+            cache
+                .schur_inverse_apply(v.view())
+                .expect("schur_inverse_apply")
+        })
+        .collect();
+    let mf = term
+        .logdet_theta_adjoint_from_probes(
+            &rho,
+            &cache,
+            &probes,
+            &sinv,
+            EvidenceOperator::Majorizer,
+            None,
+        )
+        .expect("matrix-free theta-adjoint");
+
+    assert_eq!(dense.t.len(), mf.t.len());
+    assert_eq!(dense.beta.len(), mf.beta.len());
+    let mut max_abs = 0.0_f64;
+    let mut parity = 0.0_f64;
+    for (d, m) in dense
+        .t
+        .iter()
+        .zip(mf.t.iter())
+        .chain(dense.beta.iter().zip(mf.beta.iter()))
+    {
+        parity = parity.max((d - m).abs());
+        max_abs = max_abs.max(d.abs());
+    }
+    eprintln!(
+        "#2080/#2712 from-probes θ-adjoint gate: {deflated_rows} deflated row(s), \
+         ‖Γ_dense‖∞ = {max_abs:.6e}, ‖Γ_dense − Γ_from-probes‖∞ = {parity:.6e}, \
+         ‖Γ_dense − Γ_deflation-blind‖∞ = {separation:.6e}"
+    );
+    // #2712: `1e-8` per entry is the historical undeflated bar; on a deflated
+    // cache it has to be finer than the correction it is supposed to be
+    // sensitive to, which the assertion at the end checks against the measured
+    // separation.
+    let relative_tolerance = if deflated_rows > 0 { 1.0e-10 } else { 1.0e-8 };
+    for (i, (d, m)) in dense.t.iter().zip(mf.t.iter()).enumerate() {
+        assert!(
+            (d - m).abs() <= relative_tolerance * (1.0 + d.abs()),
+            "theta-adjoint gamma_t[{i}] mismatch: dense={d:.10e}, from_probes={m:.10e}"
+        );
+    }
+    for (i, (d, m)) in dense.beta.iter().zip(mf.beta.iter()).enumerate() {
+        assert!(
+            (d - m).abs() <= relative_tolerance * (1.0 + d.abs()),
+            "theta-adjoint gamma_beta[{i}] mismatch: dense={d:.10e}, from_probes={m:.10e}"
+        );
+    }
+    assert!(
+        max_abs > 0.0 && max_abs.is_finite(),
+        "the theta-adjoint must be non-trivial to make the parity check meaningful"
+    );
+    if deflated_rows > 0 {
+        // Non-vacuity, stated as a RATIO against the MEASURED separation rather
+        // than as an absolute threshold. On the historical fixture the
+        // correction moves Γ by 8.5e-8 against ‖Γ‖∞ = 98.9 — the deflated
+        // direction is a near-null the raw derivative barely touches — so an
+        // absolute floor would reject an honest fixture, while the per-entry
+        // `1e-8·(1+|Γ|)` parity tolerance ALONE would admit a deflation-blind
+        // port (8.5e-8 < 1e-6). The ratio is the margin by which such a port is
+        // actually caught.
+        assert!(
+            separation > 0.0 && parity * 1.0e3 <= separation,
+            "the deflated and deflation-blind θ-adjoints must SEPARATE before parity \
+             is evidence of anything: a port that dropped the Daleckii–Krein \
+             correction would also agree here. Measured separation {separation:.6e} \
+             against parity error {parity:.6e} on {deflated_rows} deflated row(s)."
+        );
+        // ...and the parity tolerance the loops above applied must itself be
+        // finer than the separation, or a deflation-blind port would slip
+        // through them even though the ratio above holds.
+        let loop_tolerance = relative_tolerance * (1.0 + max_abs);
+        assert!(
+            loop_tolerance < separation,
+            "the per-entry parity tolerance {loop_tolerance:.6e} is coarser than the \
+             {separation:.6e} distance to the deflation-blind operator, so the \
+             element-wise assertions above would pass a port that dropped the \
+             Daleckii–Krein correction. Tighten them or pick a fixture on which the \
+             correction is larger."
+        );
+    }
+}
