@@ -1555,8 +1555,7 @@ pub fn transport_ladder(
 #[cfg(test)]
 mod invert_tests {
     use super::*;
-    use faer::Side;
-    use gam_linalg::faer_ndarray::FaerEigh;
+    use gam_linalg::faer_ndarray::FaerQr;
     use ndarray::Array1;
 
     fn interval(lo: f64, hi: f64) -> ChartTopology {
@@ -1657,24 +1656,31 @@ mod invert_tests {
         let n = 64;
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
         let to: Array1<f64> = from.mapv(|t| 1.0 - 0.5 * t - 0.5 * t * t);
-        let ft = fit_transport_map(
+        let quadratic = fitted_from_target(from.view(), to.view(), 0.0, 1.0);
+        // Keep a fitted, orientation-reversing arm as well. This nonpolynomial
+        // map has h′ in [-1.25, -0.75] and nonzero spline approximation residual,
+        // so the Gaussian REML scale is identified without artificial noise.
+        let nonlinear = from.mapv(|t| 1.0 - t - 0.25 * (TAU * t).sin() / TAU);
+        let fitted = fit_transport_map(
             from.view(),
-            to.view(),
+            nonlinear.view(),
             interval(0.0, 1.0),
             interval(0.0, 1.0),
         )
-        .expect("fit");
-        assert!(ft.topology_preserved);
+        .expect("fit decreasing nonlinear map");
         let probe = Array1::from_iter((1..10).map(|i| i as f64 / 10.0));
-        let fwd = ft.eval(probe.view()).expect("eval");
-        let back = ft.invert(fwd.view()).expect("invert");
-        for i in 0..probe.len() {
-            assert!(
-                (back[i] - probe[i]).abs() < 1e-6,
-                "t={} back={}",
-                probe[i],
-                back[i]
-            );
+        for (label, ft) in [("quadratic", quadratic), ("fitted", fitted)] {
+            assert!(ft.topology_preserved, "{label}");
+            let fwd = ft.eval(probe.view()).expect("eval");
+            let back = ft.invert(fwd.view()).expect("invert");
+            for i in 0..probe.len() {
+                assert!(
+                    (back[i] - probe[i]).abs() < 1e-6,
+                    "{label}: t={} back={}",
+                    probe[i],
+                    back[i]
+                );
+            }
         }
     }
 
@@ -1709,21 +1715,16 @@ mod invert_tests {
         let n = 32;
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
         let to: Array1<f64> = from.mapv(|t| 0.5 * t);
-        let ft = fit_transport_map(
-            from.view(),
-            to.view(),
-            interval(0.0, 1.0),
-            interval(0.0, 1.0),
-        )
-        .expect("fit");
+        let ft = fitted_from_target(from.view(), to.view(), 0.0, 1.0);
         assert!(ft.invert(Array1::from_elem(1, 0.9).view()).is_err());
     }
 
     /// Build a `FittedTransport` on an interval whose pre-wrap map interpolates
-    /// `h` by an unpenalized least-squares spline fit (so a deliberately narrow
-    /// fold in `h` survives into the coefficients, unlike a REML fit which would
-    /// smooth it away). Fields irrelevant to `eval`/`derivative`/`invert` are
-    /// filled with sound placeholders.
+    /// `h` by an unpenalized least-squares spline fit. Exact affine/quadratic
+    /// targets do not identify a positive residual variance for Gaussian REML;
+    /// these fixtures test the inverse geometry of a specified map (#2822).
+    /// Unpenalized QR also preserves deliberately narrow folds without a ridge
+    /// perturbing their location. Inference-only fields are placeholders.
     fn fitted_from_target(
         from: ArrayView1<'_, f64>,
         target: ArrayView1<'_, f64>,
@@ -1733,23 +1734,31 @@ mod invert_tests {
         let basis = DomainBasis::build(interval(lo, hi), from).expect("basis");
         let design = basis.value_rows(from).expect("design");
         let m = design.ncols();
-        // Normal equations XᵀX β = Xᵀy with a tiny ridge for conditioning only.
-        let mut xtx = design.t().dot(&design);
-        let xty = design.t().dot(&target);
-        let diag = (0..m).map(|i| xtx[[i, i]].abs()).fold(1.0_f64, f64::max);
-        for i in 0..m {
-            xtx[[i, i]] += 1e-10 * diag;
-        }
-        let (evals, evecs) = xtx.eigh(Side::Lower).expect("eigh");
-        let rotated = evecs.t().dot(&xty);
+        let (q, r) = design.qr().expect("fixture QR");
+        let rhs = q.t().dot(&target);
         let mut beta = Array1::<f64>::zeros(m);
-        for i in 0..m {
-            let d = evals[i].max(f64::MIN_POSITIVE);
-            let c = rotated[i] / d;
-            for j in 0..m {
-                beta[j] += evecs[[j, i]] * c;
-            }
+        for i in (0..m).rev() {
+            assert!(
+                r[[i, i]].is_finite() && r[[i, i]] != 0.0,
+                "full-rank fixture"
+            );
+            let tail: f64 = ((i + 1)..m).map(|j| r[[i, j]] * beta[j]).sum();
+            beta[i] = (rhs[i] - tail) / r[[i, i]];
         }
+        let scale = target.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+        let tolerance = (from.len() + m) as f64 * f64::EPSILON * scale;
+        for (actual, expected) in design.dot(&beta).iter().zip(target.iter()) {
+            assert!((actual - expected).abs() <= tolerance, "fixture interpolation");
+        }
+        let derivative = basis
+            .derivative_rows(domain_grid(interval(lo, hi), FOLD_CHECK_GRID).view())
+            .expect("fixture derivative")
+            .dot(&beta);
+        let orientation = (target[target.len() - 1] - target[0]).signum();
+        let min_directional_derivative = derivative
+            .iter()
+            .map(|slope| orientation * slope)
+            .fold(f64::INFINITY, f64::min);
         FittedTransport {
             topology_from: interval(lo, hi),
             topology_to: interval(lo, hi),
@@ -1764,8 +1773,8 @@ mod invert_tests {
             n_obs: from.len(),
             isometry_defect: 0.0,
             isometry_defect_se: 0.0,
-            topology_preserved: true,
-            min_directional_derivative: 1.0,
+            topology_preserved: min_directional_derivative > 0.0,
+            min_directional_derivative,
             residual_rms: 0.0,
             coefficient_score_influence: Array2::<f64>::zeros((m, from.len())),
             basis,
@@ -1822,17 +1831,28 @@ mod invert_tests {
     }
 
     #[test]
-    fn invert_rejects_non_finite_targets() {
-        let n = 64;
-        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
-        let to: Array1<f64> = from.mapv(|t| 0.5 * t);
-        let ft = fit_transport_map(
+    fn transport_fit_rejects_unidentified_dispersion_for_exact_affine_data() {
+        let from = Array1::linspace(0.0, 1.0, 64);
+        let to = from.mapv(|t| 0.5 * t);
+        let refusal = fit_transport_map(
             from.view(),
             to.view(),
             interval(0.0, 1.0),
             interval(0.0, 1.0),
         )
-        .expect("fit");
+        .expect_err("exact interpolation cannot identify a positive Gaussian scale");
+        assert!(
+            refusal.contains("profiled residual") && refusal.contains("not resolvably positive"),
+            "the refusal must identify the missing dispersion information: {refusal}"
+        );
+    }
+
+    #[test]
+    fn invert_rejects_non_finite_targets() {
+        let n = 64;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let to: Array1<f64> = from.mapv(|t| 0.5 * t);
+        let ft = fitted_from_target(from.view(), to.view(), 0.0, 1.0);
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(
                 ft.invert(Array1::from_elem(1, bad).view()).is_err(),
@@ -1850,13 +1870,7 @@ mod invert_tests {
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
         let scale = 1.0e-8;
         let to: Array1<f64> = from.mapv(|t| scale * t);
-        let ft = fit_transport_map(
-            from.view(),
-            to.view(),
-            interval(0.0, 1.0),
-            interval(0.0, 1.0),
-        )
-        .expect("fit");
+        let ft = fitted_from_target(from.view(), to.view(), 0.0, 1.0);
         let outside = 1.05e-8;
         assert!(
             ft.invert(Array1::from_elem(1, outside).view()).is_err(),
