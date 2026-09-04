@@ -563,6 +563,57 @@ pub(crate) fn ensure_positive_definitewithridge(
     })
 }
 
+/// The curvature a Newton DESCENT direction is taken from: the exact Hessian
+/// wherever it is positive definite (a strict Cholesky decides), and otherwise
+/// its Gill–Murray modification — every eigenvalue below the curvature the
+/// objective's values can resolve, `√ε·‖H‖₂`, raised to that floor.
+///
+/// A symmetric solve does not know it is minimising: on an indefinite matrix
+/// the LLᵀ → LDLᵀ → LBLᵀ fallback returns the exact SADDLE step, the
+/// unperturbed-system certificate below passes on it, and the LM controller
+/// accepts it as a Newton step. A delayed-entry survival Hessian
+/// (`exp(η_exit)a₁a₁ᵀ − exp(η_entry)a₀a₀ᵀ`) is indefinite away from its mode,
+/// and that is how a heterogeneous-entry cohort crawled to its iteration cap
+/// (#2814). On the modified model convex directions keep their Newton step
+/// exactly, and a negative-curvature direction gets the long step whose length
+/// the damping and gain ratio then judge on the true objective. The floor is
+/// the resolvable curvature, not a tolerance; positive definite input is
+/// returned untouched, so every convex model is bit-for-bit as before.
+pub(super) fn descent_curvature(
+    hessian: &Array2<f64>,
+) -> Result<std::borrow::Cow<'_, Array2<f64>>, EstimationError> {
+    if gam_linalg::faer_ndarray::FaerCholesky::cholesky(hessian, faer::Side::Lower).is_ok() {
+        return Ok(std::borrow::Cow::Borrowed(hessian));
+    }
+    let (eigenvalues, eigenvectors) =
+        gam_linalg::faer_ndarray::FaerEigh::eigh(hessian, faer::Side::Lower).map_err(|error| {
+            EstimationError::InvalidInput(format!(
+                "Newton curvature is not positive definite and its eigendecomposition failed: \
+                 {error:?}"
+            ))
+        })?;
+    let spectral_radius = eigenvalues.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let floor = f64::EPSILON.sqrt() * spectral_radius;
+    let p = hessian.nrows();
+    let mut modified = Array2::<f64>::zeros((p, p));
+    for k in 0..p {
+        let magnitude = eigenvalues[k].max(floor);
+        let v = eigenvectors.column(k);
+        for i in 0..p {
+            let scaled = magnitude * v[i];
+            for j in 0..p {
+                modified[[i, j]] += scaled * v[j];
+            }
+        }
+    }
+    log::debug!(
+        "[PIRLS] Newton curvature not positive definite (λ_min={:.3e}, ‖H‖₂={spectral_radius:.3e}): \
+         descent direction taken on the Gill–Murray modification floored at {floor:.3e}",
+        eigenvalues.iter().copied().fold(f64::INFINITY, f64::min)
+    );
+    Ok(std::borrow::Cow::Owned(modified))
+}
+
 pub(super) fn solve_direction_with_dense_factor(
     factor: &FaerSymmetricFactor,
     gradient: &Array1<f64>,
@@ -652,8 +703,9 @@ pub(super) fn solve_newton_direction_dense(
 
     let cpu_route = String::from("CPU stable solver");
 
+    let curvature = descent_curvature(hessian)?;
     let factor = StableSolver::new()
-        .factorize(hessian)
+        .factorize(curvature.as_ref())
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     solve_direction_with_dense_factor(&factor, gradient, direction_out);
 
@@ -663,7 +715,7 @@ pub(super) fn solve_newton_direction_dense(
     // unperturbed system. Surface that failure to the LM controller rather
     // than silently changing the system or replacing it with a pseudoinverse.
     let validation_residual = {
-        let h_delta = hessian.dot(direction_out);
+        let h_delta = curvature.dot(direction_out);
         h_delta
             .iter()
             .zip(gradient.iter())
@@ -1947,8 +1999,13 @@ pub(crate) fn solve_subsystem_direction(
     if out.len() != n {
         *out = Array1::zeros(n);
     }
+    // The free block of an active-set step is a Newton direction of the same
+    // minimisation: it is taken on the block's descent curvature (see
+    // `descent_curvature`), never on a saddle of an indefinite block.
+    let h_owned = h_sub.to_owned();
+    let curvature = descent_curvature(&h_owned)?;
     let factor = StableSolver::new()
-        .factorize_any(&h_sub)
+        .factorize_any(curvature.as_ref())
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     out.assign(&g_sub);
     let mut rhs = array1_to_col_matmut(out);

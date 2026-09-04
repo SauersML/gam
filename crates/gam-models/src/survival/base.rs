@@ -3183,22 +3183,18 @@ impl PirlsWorkingModel for WorkingModelSurvival {
     /// Weibull cohort spent the whole 400-iteration budget on damped non-steps
     /// at `|g| ≈ 1.3` on every seed.
     ///
-    /// `Fisher` here is the modified-Newton matrix of Gill and Murray: the exact
-    /// spectrum with every eigenvalue below `√ε·‖H‖₂` raised to that floor, and
-    /// the exact gradient. `√ε·‖H‖₂` is the curvature the objective's own
-    /// values can resolve (the same floor the outer certificate's decrement
-    /// uses), so in every direction the objective's arithmetic can tell convex
-    /// from flat this IS the Newton step, and in a concave direction the step
-    /// is long — its length is then decided by the loop's damping and gain
-    /// ratio on the exact objective, not by a curvature that points the wrong
-    /// way. Two alternatives were measured first on the delayed-entry cohort:
-    /// the entry-term-free majorant crawled at `Δdev ≈ 3·10⁻⁷` per iteration
-    /// (a majorisation step is the true curvature over the majorant's, tiny
-    /// where entry and exit hazards are comparable), and the reflected spectrum
-    /// `|Λ|` stalled at `‖g‖ ≈ 1.4·10⁻²` because a concave direction of
-    /// magnitude `1.5·10³` shrank its step to `10⁻⁵`. At the certified mode
-    /// the loop asks for `Observed` again, and an indefinite answer there is
-    /// exported as `InvalidObservedCurvature`, never relabelled.
+    /// `Fisher` is the SAME exact Hessian carrying the `Fisher` label: the
+    /// inner loop's Newton solves take their direction on the descent
+    /// curvature of the block they factorise (`newton_solve::descent_curvature`
+    /// — the exact block where it is positive definite, its Gill–Murray
+    /// modification otherwise), so the model must not pre-modify the full
+    /// matrix. Doing so was measured to pollute the free block of the
+    /// active-set step once the concave direction was blocked by a structural
+    /// bound: the full-space floor mixed `+10³` of curvature into a face whose
+    /// true curvature was `≈ 0`, and the projected Newton step crawled at
+    /// `10⁻⁵`. At the certified mode the loop asks for `Observed` again, and an
+    /// indefinite answer there is exported as `InvalidObservedCurvature`, never
+    /// relabelled.
     fn update_with_curvature(
         &mut self,
         beta: &Coefficients,
@@ -3208,7 +3204,7 @@ impl PirlsWorkingModel for WorkingModelSurvival {
         let Some(dense) = state.hessian.as_dense() else {
             return Ok(state);
         };
-        let (eigenvalues, eigenvectors) =
+        let (eigenvalues, _) =
             gam_linalg::faer_ndarray::FaerEigh::eigh(dense, faer::Side::Lower).map_err(|error| {
                 EstimationError::InvalidInput(format!(
                     "survival observed information eigendecomposition failed: {error:?}"
@@ -3225,27 +3221,13 @@ impl PirlsWorkingModel for WorkingModelSurvival {
                     return Err(EstimationError::InvalidInput(format!(
                         "survival observed information is indefinite at this iterate \
                          (λ_min = {min_eig:.3e}, band = {band:.3e}): a delayed-entry cohort's \
-                         exact curvature is a difference of positive terms; stepping on the \
-                         modified-Newton matrix"
+                         exact curvature is a difference of positive terms; the loop steps on \
+                         its descent curvature"
                     )));
                 }
                 Ok(state)
             }
             gam_solve::pirls::HessianCurvatureKind::Fisher => {
-                let p = dense.nrows();
-                let resolvable = f64::EPSILON.sqrt() * spectral_radius;
-                let mut reflected = Array2::<f64>::zeros((p, p));
-                for k in 0..p {
-                    let magnitude = eigenvalues[k].max(resolvable);
-                    let v = eigenvectors.column(k);
-                    for i in 0..p {
-                        let scaled = magnitude * v[i];
-                        for j in 0..p {
-                            reflected[[i, j]] += scaled * v[j];
-                        }
-                    }
-                }
-                state.hessian = SymmetricMatrix::Dense(reflected);
                 state.hessian_curvature = gam_solve::pirls::HessianCurvatureKind::Fisher;
                 Ok(state)
             }
@@ -3995,6 +3977,85 @@ mod tests {
                 "gradient/deviance mismatch at idx={idx}: grad={} fd={fd}",
                 grad[idx]
             );
+        }
+    }
+
+    /// The delayed-entry objective's β-gradient and β-Hessian are the
+    /// derivatives of the deviance `update_state` reports — checked by central
+    /// differences on a fixture with a genuine entry interval, since the
+    /// left-truncation Hessian is the one term the right-censored tests never
+    /// exercise (#2814).
+    #[test]
+    fn delayed_entry_gradient_and_hessian_match_finite_differences_2814() {
+        let age_entry = array![0.5_f64, 0.0, 0.3, 0.9];
+        let age_exit = array![1.4_f64, 1.0, 2.0, 1.1];
+        let event_target = array![1u8, 1u8, 0u8, 1u8];
+        let event_competing = array![0u8, 0u8, 0u8, 0u8];
+        let sampleweight = array![1.0_f64, 2.5, 0.7, 1.3];
+        let rows = age_entry.len();
+        let mut x_entry = Array2::<f64>::zeros((rows, 2));
+        let mut x_exit = Array2::<f64>::zeros((rows, 2));
+        let mut x_derivative = Array2::<f64>::zeros((rows, 2));
+        for i in 0..rows {
+            x_entry[[i, 0]] = 1.0;
+            x_entry[[i, 1]] = age_entry[i].max(1e-8).ln();
+            x_exit[[i, 0]] = 1.0;
+            x_exit[[i, 1]] = age_exit[i].ln();
+            x_derivative[[i, 1]] = 1.0 / age_exit[i];
+        }
+        let o_entry = array![0.2_f64, 0.0, 0.1, 0.05];
+        let o_exit = array![0.4_f64, 0.5, 0.7, 0.3];
+        let o_deriv = array![0.3_f64, 0.8, 0.5, 0.6];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
+        let model = survival_model_with_offsets(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
+            Some(SurvivalBaselineOffsets {
+                eta_entry: o_entry.view(),
+                eta_exit: o_exit.view(),
+                derivative_exit: o_deriv.view(),
+            }),
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("model build");
+        let beta = array![-0.7_f64, 0.6];
+        let state = model.update_state(&beta).expect("state");
+        let objective = |b: &Array1<f64>| 0.5 * model.update_state(b).expect("state").deviance;
+        let gradient = |b: &Array1<f64>| model.update_state(b).expect("state").gradient;
+        let h = 1e-5;
+        for j in 0..beta.len() {
+            let mut plus = beta.clone();
+            let mut minus = beta.clone();
+            plus[j] += h;
+            minus[j] -= h;
+            let fd = (objective(&plus) - objective(&minus)) / (2.0 * h);
+            assert!(
+                (state.gradient[j] - fd).abs() <= 1e-6 * (1.0 + fd.abs()),
+                "∂(½ deviance)/∂β[{j}]: analytic={:.9e} fd={:.9e}",
+                state.gradient[j],
+                fd
+            );
+            let fd_row = (gradient(&plus) - gradient(&minus)) / (2.0 * h);
+            let hessian = state.hessian.as_dense().expect("dense hessian");
+            for k in 0..beta.len() {
+                assert!(
+                    (hessian[[k, j]] - fd_row[k]).abs() <= 1e-5 * (1.0 + fd_row[k].abs()),
+                    "∂²(½ deviance)/∂β[{k}]∂β[{j}]: analytic={:.9e} fd={:.9e}",
+                    hessian[[k, j]],
+                    fd_row[k]
+                );
+            }
         }
     }
 
