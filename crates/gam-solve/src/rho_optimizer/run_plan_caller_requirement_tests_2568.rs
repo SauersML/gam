@@ -211,3 +211,161 @@ fn the_rung_refactor_moved_no_band_2688() {
         }
     }
 }
+
+// ─── #2568 caller-requirement band gates, restored (#2818) ──────────────────
+//
+// `c0a21b554` deleted these four gates because `d484a091a` had already deleted
+// the two `#[cfg(test)]` helpers they shared from this same file —
+// `fn outer_stationarity_band_at` and `fn wide_band_config_2568` — under a
+// criterion ("no production artifact links this function") that is vacuously
+// true of every test-only item. `outer_gradient_tolerance` and
+// `outer_stationarity_band_and_rung_at`, the two production entry points these
+// gates grade, were never touched.
+//
+// Both helpers are inlined as closures in each gate. `outer_stationarity_band_at`
+// was a one-line projection of the production return type
+// (`outer_stationarity_band_and_rung_at(config, cost).bound`); #2688 moved the
+// rung into that type on purpose, so the value-only form belongs beside the
+// tests that compare bands to each other. The duplication is deliberate: a
+// closure has no item name for a symbol-table sweep to name and miss.
+
+/// The load-bearing half of #2568. If the caller's requirement did not reach
+/// the SOLVER's band, the outer loop would still stop at the sealed bound and
+/// the requirement could only ever be a post-hoc rejection.
+#[test]
+fn a_caller_requirement_tightens_the_solver_band_2568() {
+    // The saturating shape this issue was filed against: an objective whose
+    // declared scale widens the engine's band by six orders, so a point nowhere
+    // near stationary clears it.
+    let wide_band_config = |required: Option<f64>| OuterConfig {
+        tolerance: 1e-5,
+        objective_scale: Some(1.0e6),
+        required_projected_gradient_norm: required,
+        ..Default::default()
+    };
+
+    let engine = outer_gradient_tolerance(&wide_band_config(None)).abs;
+    assert!(
+        engine > 1.0e-3,
+        "fixture must reproduce a saturated engine band, got {engine:.6e}"
+    );
+    let tightened = outer_gradient_tolerance(&wide_band_config(Some(1.0e-3))).abs;
+    assert_eq!(
+        tightened, 1.0e-3,
+        "the caller's requirement must become the band the optimizer is told to \
+         reach (engine band was {engine:.6e})"
+    );
+}
+
+/// The widening is what produced `bound = 1.000e0`, so a requirement applied
+/// before it would be defeated by precisely the case it exists for.
+#[test]
+fn a_caller_requirement_survives_the_score_relative_widening_2568() {
+    let wide_band_config = |required: Option<f64>| OuterConfig {
+        tolerance: 1e-5,
+        objective_scale: Some(1.0e6),
+        required_projected_gradient_norm: required,
+        ..Default::default()
+    };
+    let band_at = |config: &OuterConfig, cost_at_point: f64| {
+        outer_stationarity_band_and_rung_at(config, cost_at_point).bound
+    };
+
+    let cost = 1.0e6;
+    let engine = band_at(&wide_band_config(None), cost);
+    assert!(
+        engine > 1.0e-3,
+        "fixture must reproduce a widened certificate band, got {engine:.6e}"
+    );
+    let capped = band_at(&wide_band_config(Some(1.0e-3)), cost);
+    assert_eq!(
+        capped, 1.0e-3,
+        "the certificate band must be capped at the caller's requirement, not \
+         widened past it (engine band was {engine:.6e})"
+    );
+}
+
+/// A caller asking for LESS accuracy than the engine already guarantees is not
+/// asking for anything. If this inverted, the knob would be a way to launder a
+/// fit past a standard the engine derived from the criterion.
+#[test]
+fn a_looser_caller_requirement_never_weakens_the_engine_band_2568() {
+    let band_at = |config: &OuterConfig, cost_at_point: f64| {
+        outer_stationarity_band_and_rung_at(config, cost_at_point).bound
+    };
+
+    let cfg_tight_engine = OuterConfig {
+        tolerance: 1.0e-9,
+        ..Default::default()
+    };
+    let engine = outer_gradient_tolerance(&cfg_tight_engine).abs;
+    // Non-vacuity: a requirement can only be shown not to LOOSEN a band that is
+    // tighter than the requirement to begin with.
+    assert!(
+        engine < 1.0,
+        "the engine band {engine:.6e} must be tighter than the 1.0 requirement below, or \
+         'never weakens' is asserted where there was nothing to weaken"
+    );
+    let with_loose = outer_gradient_tolerance(&OuterConfig {
+        required_projected_gradient_norm: Some(1.0),
+        ..cfg_tight_engine.clone()
+    })
+    .abs;
+    assert_eq!(
+        with_loose, engine,
+        "a requirement of 1.0 must leave a {engine:.6e} engine band in force"
+    );
+    let cost = 1.0e3;
+    let engine_band = band_at(&cfg_tight_engine, cost);
+    assert!(
+        engine_band < 1.0e9,
+        "the engine certificate band {engine_band:.6e} must be tighter than the 1e9 \
+         requirement below for the same reason"
+    );
+    let loose_band = band_at(
+        &OuterConfig {
+            required_projected_gradient_norm: Some(1.0e9),
+            ..cfg_tight_engine
+        },
+        cost,
+    );
+    assert_eq!(
+        loose_band, engine_band,
+        "nor may it widen the certificate band"
+    );
+}
+
+/// The compatibility claim, stated as a test rather than asserted in a doc
+/// comment: `None` must be byte-for-byte today's behaviour on both bands.
+#[test]
+fn an_absent_requirement_reproduces_the_engine_exactly_2568() {
+    let band_at = |config: &OuterConfig, cost_at_point: f64| {
+        outer_stationarity_band_and_rung_at(config, cost_at_point).bound
+    };
+
+    for scale in [None, Some(1.0), Some(1.0e6)] {
+        for cost in [0.0, 1.0, -3.7e2, 1.0e6, f64::INFINITY] {
+            let cfg = OuterConfig {
+                tolerance: 1e-5,
+                objective_scale: scale,
+                required_projected_gradient_norm: None,
+                ..Default::default()
+            };
+            let bare = OuterConfig {
+                tolerance: 1e-5,
+                objective_scale: scale,
+                ..Default::default()
+            };
+            assert_eq!(
+                outer_gradient_tolerance(&cfg).abs,
+                outer_gradient_tolerance(&bare).abs,
+                "solver band moved with scale={scale:?}"
+            );
+            assert_eq!(
+                band_at(&cfg, cost),
+                band_at(&bare, cost),
+                "certificate band moved with scale={scale:?} cost={cost}"
+            );
+        }
+    }
+}
