@@ -56,6 +56,9 @@ def main():
     arms = {}
     for spec in args.arm:
         name, path = spec.split("=", 1)
+        if not os.path.exists(path):
+            print(f"[splice] arm {name}: {path} missing, skipped", flush=True)
+            continue
         mm = np.memmap(path, dtype=np.float32, mode="r")
         if mm.size % p != 0:
             raise SystemExit(f"{path}: {mm.size} floats is not a multiple of p={p}")

@@ -1,0 +1,4445 @@
+{
+  "layer": 12,
+  "doses": [
+    -2.0,
+    -1.0,
+    -0.5,
+    0.0,
+    0.5,
+    1.0,
+    2.0,
+    4.0
+  ],
+  "blocks": [
+    {
+      "block": 9445,
+      "firings": 2266,
+      "mean_gate": 0.27561962604522705,
+      "targets": [
+        {
+          "token_id": 18050,
+          "token": "  \n\n"
+        },
+        {
+          "token_id": 641,
+          "token": " ."
+        },
+        {
+          "token_id": 194805,
+          "token": " .**"
+        },
+        {
+          "token_id": 208683,
+          "token": " :*"
+        },
+        {
+          "token_id": 62798,
+          "token": " Booker"
+        },
+        {
+          "token_id": 35617,
+          "token": " additionally"
+        },
+        {
+          "token_id": 98401,
+          "token": "\ufffd"
+        },
+        {
+          "token_id": 76507,
+          "token": "  \n\n\n"
+        },
+        {
+          "token_id": 32811,
+          "token": "   \n\n"
+        },
+        {
+          "token_id": 42104,
+          "token": " moreover"
+        }
+      ],
+      "controls": [
+        18051,
+        1116,
+        194806,
+        208684,
+        62799,
+        35618,
+        98402,
+        76508,
+        32812,
+        42105
+      ],
+      "dose_curve": [
+        {
+          "dose": -2.0,
+          "target_mean_dlogp": -0.31128954887390137,
+          "control_mean_dlogp": -0.07016754150390625
+        },
+        {
+          "dose": -1.0,
+          "target_mean_dlogp": -0.16068296134471893,
+          "control_mean_dlogp": -0.03884606435894966
+        },
+        {
+          "dose": -0.5,
+          "target_mean_dlogp": -0.08260612189769745,
+          "control_mean_dlogp": -0.02104043960571289
+        },
+        {
+          "dose": 0.0,
+          "target_mean_dlogp": 0.0,
+          "control_mean_dlogp": 0.0
+        },
+        {
+          "dose": 0.5,
+          "target_mean_dlogp": 0.08592839539051056,
+          "control_mean_dlogp": 0.023347998037934303
+        },
+        {
+          "dose": 1.0,
+          "target_mean_dlogp": 0.1735788881778717,
+          "control_mean_dlogp": 0.04697136953473091
+        },
+        {
+          "dose": 2.0,
+          "target_mean_dlogp": 0.3608819544315338,
+          "control_mean_dlogp": 0.10406494140625
+        },
+        {
+          "dose": 4.0,
+          "target_mean_dlogp": 0.7846692800521851,
+          "control_mean_dlogp": 0.25346654653549194
+        }
+      ],
+      "ablation_target_mean_dlogp": 0.31900516152381897,
+      "ablation_control_mean_dlogp": 0.23739762604236603
+    },
+    {
+      "block": 569,
+      "firings": 2163,
+      "mean_gate": 0.2578897178173065,
+      "targets": [
+        {
+          "token_id": 26533,
+          "token": " subsequently"
+        },
+        {
+          "token_id": 25950,
+          "token": " afterwards"
+        },
+        {
+          "token_id": 43492,
+          "token": " thereafter"
+        },
+        {
+          "token_id": 35617,
+          "token": " additionally"
+        },
+        {
+          "token_id": 4611,
+          "token": " however"
+        },
+        {
+          "token_id": 2502,
+          "token": " ;"
+        },
+        {
+          "token_id": 46343,
+          "token": " afterward"
+        },
+        {
+          "token_id": 42104,
+          "token": " moreover"
+        },
+        {
+          "token_id": 24095,
+          "token": " Later"
+        },
+        {
+          "token_id": 83551,
+          "token": " Afterwards"
+        }
+      ],
+      "controls": [
+        16067,
+        15147,
+        21250,
+        35618,
+        78400,
+        513,
+        51420,
+        42105,
+        57713,
+        83550
+      ],
+      "dose_curve": [
+        {
+          "dose": -2.0,
+          "target_mean_dlogp": -0.2646433711051941,
+          "control_mean_dlogp": -0.051398564130067825
+        },
+        {
+          "dose": -1.0,
+          "target_mean_dlogp": -0.13948039710521698,
+          "control_mean_dlogp": -0.030524443835020065
+        },
+        {
+          "dose": -0.5,
+          "target_mean_dlogp": -0.0716099739074707,
+          "control_mean_dlogp": -0.017102431505918503
+        },
+        {
+          "dose": 0.0,
+          "target_mean_dlogp": 0.0,
+          "control_mean_dlogp": 0.0
+        },
+        {
+          "dose": 0.5,
+          "target_mean_dlogp": 0.07694177329540253,
+          "control_mean_dlogp": 0.019878482446074486
+        },
+        {
+          "dose": 1.0,
+          "target_mean_dlogp": 0.15852375328540802,
+          "control_mean_dlogp": 0.04389362409710884
+        },
+        {
+          "dose": 2.0,
+          "target_mean_dlogp": 0.3305850028991699,
+          "control_mean_dlogp": 0.09673328697681427
+        },
+        {
+          "dose": 4.0,
+          "target_mean_dlogp": 0.739514946937561,
+          "control_mean_dlogp": 0.2448558807373047
+        }
+      ],
+      "ablation_target_mean_dlogp": 0.6650385856628418,
+      "ablation_control_mean_dlogp": 0.45389890670776367
+    },
+    {
+      "block": 12968,
+      "firings": 1993,
+      "mean_gate": 0.26628294587135315,
+      "targets": [
+        {
+          "token_id": 641,
+          "token": " ."
+        },
+        {
+          "token_id": 208683,
+          "token": " :*"
+        },
+        {
+          "token_id": 194805,
+          "token": " .**"
+        },
+        {
+          "token_id": 62798,
+          "token": " Booker"
+        },
+        {
+          "token_id": 7054,
+          "token": " Also"
+        },
+        {
+          "token_id": 79952,
+          "token": " Shank"
+        },
+        {
+          "token_id": 40134,
+          "token": " Isaac"
+        },
+        {
+          "token_id": 13891,
+          "token": " Thus"
+        },
+        {
+          "token_id": 10022,
+          "token": " Although"
+        },
+        {
+          "token_id": 21708,
+          "token": " Additionally"
+        }
+      ],
+      "controls": [
+        1116,
+        208684,
+        194806,
+        62799,
+        37316,
+        79953,
+        40135,
+        13894,
+        1103,
+        15095
+      ],
+      "dose_curve": [
+        {
+          "dose": -2.0,
+          "target_mean_dlogp": -0.2694023549556732,
+          "control_mean_dlogp": -0.03067808225750923
+        },
+        {
+          "dose": -1.0,
+          "target_mean_dlogp": -0.14067625999450684,
+          "control_mean_dlogp": -0.019643593579530716
+        },
+        {
+          "dose": -0.5,
+          "target_mean_dlogp": -0.07231311500072479,
+          "control_mean_dlogp": -0.011950206942856312
+        },
+        {
+          "dose": 0.0,
+          "target_mean_dlogp": 0.0,
+          "control_mean_dlogp": 0.0
+        },
+        {
+          "dose": 0.5,
+          "target_mean_dlogp": 0.07787585258483887,
+          "control_mean_dlogp": 0.01568164862692356
+        },
+        {
+          "dose": 1.0,
+          "target_mean_dlogp": 0.15777873992919922,
+          "control_mean_dlogp": 0.03121662139892578
+        },
+        {
+          "dose": 2.0,
+          "target_mean_dlogp": 0.3317264914512634,
+          "control_mean_dlogp": 0.07368917763233185
+        },
+        {
+          "dose": 4.0,
+          "target_mean_dlogp": 0.7491387128829956,
+          "control_mean_dlogp": 0.19827599823474884
+        }
+      ],
+      "ablation_target_mean_dlogp": 0.39313381910324097,
+      "ablation_control_mean_dlogp": 0.3320213854312897
+    },
+    {
+      "block": 12719,
+      "firings": 1983,
+      "mean_gate": 0.275082528591156,
+      "targets": [
+        {
+          "token_id": 641,
+          "token": " ."
+        },
+        {
+          "token_id": 208683,
+          "token": " :*"
+        },
+        {
+          "token_id": 194805,
+          "token": " .**"
+        },
+        {
+          "token_id": 18050,
+          "token": "  \n\n"
+        },
+        {
+          "token_id": 80093,
+          "token": " :\\"
+        },
+        {
+          "token_id": 40134,
+          "token": " Isaac"
+        },
+        {
+          "token_id": 62798,
+          "token": " Booker"
+        },
+        {
+          "token_id": 98401,
+          "token": "\ufffd"
+        },
+        {
+          "token_id": 45830,
+          "token": " .*"
+        },
+        {
+          "token_id": 90479,
+          "token": " Hao"
+        }
+      ],
+      "controls": [
+        1116,
+        208684,
+        194806,
+        18051,
+        80094,
+        40135,
+        62799,
+        98402,
+        45815,
+        90480
+      ],
+      "dose_curve": [
+        {
+          "dose": -2.0,
+          "target_mean_dlogp": -0.37265148758888245,
+          "control_mean_dlogp": -0.047875069081783295
+        },
+        {
+          "dose": -1.0,
+          "target_mean_dlogp": -0.1909141093492508,
+          "control_mean_dlogp": -0.028020668774843216
+        },
+        {
+          "dose": -0.5,
+          "target_mean_dlogp": -0.09666724503040314,
+          "control_mean_dlogp": -0.01584300957620144
+        },
+        {
+          "dose": 0.0,
+          "target_mean_dlogp": 0.0,
+          "control_mean_dlogp": 0.0
+        },
+        {
+          "dose": 0.5,
+          "target_mean_dlogp": 0.10060391575098038,
+          "control_mean_dlogp": 0.01808028295636177
+        },
+        {
+          "dose": 1.0,
+          "target_mean_dlogp": 0.20333585143089294,
+          "control_mean_dlogp": 0.037642620503902435
+        },
+        {
+          "dose": 2.0,
+          "target_mean_dlogp": 0.41789430379867554,
+          "control_mean_dlogp": 0.08440141379833221
+        },
+        {
+          "dose": 4.0,
+          "target_mean_dlogp": 0.9012380838394165,
+          "control_mean_dlogp": 0.21687397360801697
+        }
+      ],
+      "ablation_target_mean_dlogp": 0.023378897458314896,
+      "ablation_control_mean_dlogp": 0.18597379326820374
+    },
+    {
+      "block": 7845,
+      "firings": 1895,
+      "mean_gate": 0.15070602297782898,
+      "targets": [
+        {
+          "token_id": 138,
+          "token": "\ufffd"
+        },
+        {
+          "token_id": 18374,
+          "token": "\u03b1"
+        },
+        {
+          "token_id": 169100,
+          "token": "\u03a6"
+        },
+        {
+          "token_id": 54087,
+          "token": "\u2011"
+        },
+        {
+          "token_id": 7049,
+          "token": "-F"
+        },
+        {
+          "token_id": 10592,
+          "token": "-R"
+        },
+        {
+          "token_id": 97831,
+          "token": "\u5ddd"
+        },
+        {
+          "token_id": 169614,
+          "token": "\u221a"
+        },
+        {
+          "token_id": 38308,
+          "token": "-St"
+        },
+        {
+          "token_id": 41741,
+          "token": "HN"
+        }
+      ],
+      "controls": [
+        139,
+        18375,
+        169101,
+        54088,
+        7050,
+        10593,
+        97832,
+        169616,
+        38309,
+        41742
+      ],
+      "dose_curve": [
+        {
+          "dose": -2.0,
+          "target_mean_dlogp": -0.13458728790283203,
+          "control_mean_dlogp": 0.012758636847138405
+        },
+        {
+          "dose": -1.0,
+          "target_mean_dlogp": -0.06923256069421768,
+          "control_mean_dlogp": 0.004435920622199774
+        },
+        {
+          "dose": -0.5,
+          "target_mean_dlogp": -0.03676605224609375,
+          "control_mean_dlogp": 0.0003452301025390625
+        },
+        {
+          "dose": 0.0,
+          "target_mean_dlogp": 0.0,
+          "control_mean_dlogp": 0.0
+        },
+        {
+          "dose": 0.5,
+          "target_mean_dlogp": 0.03685398027300835,
+          "control_mean_dlogp": -0.0009744644048623741
+        },
+        {
+          "dose": 1.0,
+          "target_mean_dlogp": 0.0722782164812088,
+          "control_mean_dlogp": -0.0028841018211096525
+        },
+        {
+          "dose": 2.0,
+          "target_mean_dlogp": 0.1467204988002777,
+          "control_mean_dlogp": -0.004852294921875
+        },
+        {
+          "dose": 4.0,
+          "target_mean_dlogp": 0.30393773317337036,
+          "control_mean_dlogp": -0.00449447613209486
+        }
+      ],
+      "ablation_target_mean_dlogp": 0.32545891404151917,
+      "ablation_control_mean_dlogp": 0.10411300510168076
+    },
+    {
+      "block": 10070,
+      "firings": 1885,
+      "mean_gate": 0.2668113112449646,
+      "targets": [
+        {
+          "token_id": 641,
+          "token": " ."
+        },
+        {
+          "token_id": 194805,
+          "token": " .**"
+        },
+        {
+          "token_id": 208683,
+          "token": " :*"
+        },
+        {
+          "token_id": 62798,
+          "token": " Booker"
+        },
+        {
+          "token_id": 7054,
+          "token": " Also"
+        },
+        {
+          "token_id": 13891,
+          "token": " Thus"
+        },
+        {
+          "token_id": 79952,
+          "token": " Shank"
+        },
+        {
+          "token_id": 18050,
+          "token": "  \n\n"
+        },
+        {
+          "token_id": 40134,
+          "token": " Isaac"
+        },
+        {
+          "token_id": 35617,
+          "token": " additionally"
+        }
+      ],
+      "controls": [
+        1116,
+        194806,
+        208684,
+        62799,
+        37316,
+        13894,
+        79953,
+        18051,
+        40135,
+        35618
+      ],
+      "dose_curve": [
+        {
+          "dose": -2.0,
+          "target_mean_dlogp": -0.2726193368434906,
+          "control_mean_dlogp": -0.02284226380288601
+        },
+        {
+          "dose": -1.0,
+          "target_mean_dlogp": -0.14197830855846405,
+          "control_mean_dlogp": -0.016515780240297318
+        },
+        {
+          "dose": -0.5,
+          "target_mean_dlogp": -0.07257013022899628,
+          "control_mean_dlogp": -0.009732866659760475
+        },
+        {
+          "dose": 0.0,
+          "target_mean_dlogp": 0.0,
+          "control_mean_dlogp": 0.0
+        },
+        {
+          "dose": 0.5,
+          "target_mean_dlogp": 0.07762584835290909,
+          "control_mean_dlogp": 0.011923456564545631
+        },
+        {
+          "dose": 1.0,
+          "target_mean_dlogp": 0.15813836455345154,
+          "control_mean_dlogp": 0.0261401180177927
+        },
+        {
+          "dose": 2.0,
+          "target_mean_dlogp": 0.3327036499977112,
+          "control_mean_dlogp": 0.0633767619729042
+        },
+        {
+          "dose": 4.0,
+          "target_mean_dlogp": 0.744944155216217,
+          "control_mean_dlogp": 0.17723555862903595
+        }
+      ],
+      "ablation_target_mean_dlogp": 0.4167923033237457,
+      "ablation_control_mean_dlogp": 0.31611180305480957
+    },
+    {
+      "block": 7506,
+      "firings": 1865,
+      "mean_gate": 0.14397725462913513,
+      "targets": [
+        {
+          "token_id": 159917,
+          "token": " consci"
+        },
+        {
+          "token_id": 171,
+          "token": "\ufffd"
+        },
+        {
+          "token_id": 40090,
+          "token": " conscience"
+        },
+        {
+          "token_id": 157,
+          "token": "\ufffd"
+        },
+        {
+          "token_id": 169752,
+          "token": "\ufb01"
+        },
+        {
+          "token_id": 108114,
+          "token": "\u73c2"
+        },
+        {
+          "token_id": 158,
+          "token": "\ufffd"
+        },
+        {
+          "token_id": 53213,
+          "token": "\u201e"
+        },
+        {
+          "token_id": 50382,
+          "token": "\ufffd"
+        },
+        {
+          "token_id": 56999,
+          "token": "\ufffd"
+        }
+      ],
+      "controls": [
+        159918,
+        172,
+        40105,
+        156,
+        169753,
+        108115,
+        159,
+        53214,
+        50368,
+        57000
+      ],
+      "dose_curve": [
+        {
+          "dose": -2.0,
+          "target_mean_dlogp": -0.14821891486644745,
+          "control_mean_dlogp": -0.028264235705137253
+        },
+        {
+          "dose": -1.0,
+          "target_mean_dlogp": -0.07403354346752167,
+          "control_mean_dlogp": -0.014275550842285156
+        },
+        {
+          "dose": -0.5,
+          "target_mean_dlogp": -0.039214324206113815,
+          "control_mean_dlogp": -0.008594894781708717
+        },
+        {
+          "dose": 0.0,
+          "target_mean_dlogp": 0.0,
+          "control_mean_dlogp": 0.0
+        },
+        {
+          "dose": 0.5,
+          "target_mean_dlogp": 0.038477517664432526,
+          "control_mean_dlogp": 0.008548164740204811
+        },
+        {
+          "dose": 1.0,
+          "target_mean_dlogp": 0.07563743740320206,
+          "control_mean_dlogp": 0.01694202423095703
+        },
+        {
+          "dose": 2.0,
+          "target_mean_dlogp": 0.15286579728126526,
+          "control_mean_dlogp": 0.03476257249712944
+        },
+        {
+          "dose": 4.0,
+          "target_mean_dlogp": 0.31165677309036255,
+          "control_mean_dlogp": 0.07641582190990448
+        }
+      ],
+      "ablation_target_mean_dlogp": 0.5379589200019836,
+      "ablation_control_mean_dlogp": 0.16072559356689453
+    },
+    {
+      "block": 14522,
+      "firings": 1792,
+      "mean_gate": 0.27905306220054626,
+      "targets": [
+        {
+          "token_id": 18050,
+          "token": "  \n\n"
+        },
+        {
+          "token_id": 641,
+          "token": " ."
+        },
+        {
+          "token_id": 194805,
+          "token": " .**"
+        },
+        {
+          "token_id": 76507,
+          "token": "  \n\n\n"
+        },
+        {
+          "token_id": 21996,
+          "token": " \n\n\n\n"
+        },
+        {
+          "token_id": 62798,
+          "token": " Booker"
+        },
+        {
+          "token_id": 248065,
+          "token": "<|file_sep|>"
+        },
+        {
+          "token_id": 32811,
+          "token": "   \n\n"
+        },
+        {
+          "token_id": 29773,
+          "token": "  \n  \n"
+        },
+        {
+          "token_id": 98401,
+          "token": "\ufffd"
+        }
+      ],
+      "controls": [
+        18051,
+        1116,
+        194806,
+        76508,
+        21980,
+        62799,
+        248066,
+        32812,
+        29774,
+        98402
+      ],
+      "dose_curve": [
+        {
+          "dose": -2.0,
+          "target_mean_dlogp": -0.3514992594718933,
+          "control_mean_dlogp": -0.09634485095739365
+        },
+        {
+          "dose": -1.0,
+          "target_mean_dlogp": -0.18091340363025665,
+          "control_mean_dlogp": -0.05171193927526474
+        },
+        {
+          "dose": -0.5,
+          "target_mean_dlogp": -0.0889592170715332,
+          "control_mean_dlogp": -0.027066946029663086
+        },
+        {
+          "dose": 0.0,
+          "target_mean_dlogp": 0.0,
+          "control_mean_dlogp": 0.0
+        },
+        {
+          "dose": 0.5,
+          "target_mean_dlogp": 0.09428157657384872,
+          "control_mean_dlogp": 0.029689406976103783
+        },
+        {
+          "dose": 1.0,
+          "target_mean_dlogp": 0.19170860946178436,
+          "control_mean_dlogp": 0.06050529330968857
+        },
+        {
+          "dose": 2.0,
+          "target_mean_dlogp": 0.3992019593715668,
+          "control_mean_dlogp": 0.13115262985229492
+        },
+        {
+          "dose": 4.0,
+          "target_mean_dlogp": 0.8609945178031921,
+          "control_mean_dlogp": 0.3084295690059662
+        }
+      ],
+      "ablation_target_mean_dlogp": -0.04550299793481827,
+      "ablation_control_mean_dlogp": 0.14929823577404022
+    },
+    {
+      "block": 9339,
+      "firings": 1742,
+      "mean_gate": 0.2834432125091553,
+      "targets": [
+        {
+          "token_id": 641,
+          "token": " ."
+        },
+        {
+          "token_id": 18050,
+          "token": "  \n\n"
+        },
+        {
+          "token_id": 208683,
+          "token": " :*"
+        },
+        {
+          "token_id": 98401,
+          "token": "\ufffd"
+        },
+        {
+          "token_id": 194805,
+          "token": " .**"
+        },
+        {
+          "token_id": 248065,
+          "token": "<|file_sep|>"
+        },
+        {
+          "token_id": 62798,
+          "token": " Booker"
+        },
+        {
+          "token_id": 76507,
+          "token": "  \n\n\n"
+        },
+        {
+          "token_id": 80093,
+          "token": " :\\"
+        },
+        {
+          "token_id": 32811,
+          "token": "   \n\n"
+        }
+      ],
+      "controls": [
+        1116,
+        18051,
+        208684,
+        98402,
+        194806,
+        248066,
+        62799,
+        76508,
+        80094,
+        32812
+      ],
+      "dose_curve": [
+        {
+          "dose": -2.0,
+          "target_mean_dlogp": -0.34936437010765076,
+          "control_mean_dlogp": -0.0861320048570633
+        },
+        {
+          "dose": -1.0,
+          "target_mean_dlogp": -0.17983679473400116,
+          "control_mean_dlogp": -0.04705343395471573
+        },
+        {
+          "dose": -0.5,
+          "target_mean_dlogp": -0.09091820567846298,
+          "control_mean_dlogp": -0.025403212755918503
+        },
+        {
+          "dose": 0.0,
+          "target_mean_dlogp": 0.0,
+          "control_mean_dlogp": 0.0
+        },
+        {
+          "dose": 0.5,
+          "target_mean_dlogp": 0.09410019218921661,
+          "control_mean_dlogp": 0.027405213564634323
+        },
+        {
+          "dose": 1.0,
+          "target_mean_dlogp": 0.19054213166236877,
+          "control_mean_dlogp": 0.05645627900958061
+        },
+        {
+          "dose": 2.0,
+          "target_mean_dlogp": 0.39106813073158264,
+          "control_mean_dlogp": 0.12310590595006943
+        },
+        {
+          "dose": 4.0,
+          "target_mean_dlogp": 0.8383716344833374,
+          "control_mean_dlogp": 0.2924417555332184
+        }
+      ],
+      "ablation_target_mean_dlogp": -0.08279280364513397,
+      "ablation_control_mean_dlogp": 0.16447024047374725
+    },
+    {
+      "block": 6436,
+      "firings": 1722,
+      "mean_gate": 0.24912650883197784,
+      "targets": [
+        {
+          "token_id": 4611,
+          "token": " however"
+        },
+        {
+          "token_id": 2502,
+          "token": " ;"
+        },
+        {
+          "token_id": 35999,
+          "token": " nevertheless"
+        },
+        {
+          "token_id": 42104,
+          "token": " moreover"
+        },
+        {
+          "token_id": 7643,
+          "token": " although"
+        },
+        {
+          "token_id": 36563,
+          "token": " nonetheless"
+        },
+        {
+          "token_id": 35020,
+          "token": " meanwhile"
+        },
+        {
+          "token_id": 94459,
+          "token": "however"
+        },
+        {
+          "token_id": 3384,
+          "token": " though"
+        },
+        {
+          "token_id": 19248,
+          "token": " whereas"
+        }
+      ],
+      "controls": [
+        78400,
+        513,
+        36074,
+        42105,
+        5734,
+        36564,
+        12622,
+        94460,
+        10373,
+        48576
+      ],
+      "dose_curve": [
+        {
+          "dose": -2.0,
+          "target_mean_dlogp": -0.30333614349365234,
+          "control_mean_dlogp": -0.015699291601777077
+        },
+        {
+          "dose": -1.0,
+          "target_mean_dlogp": -0.15924187004566193,
+          "control_mean_dlogp": -0.01383361779153347
+        },
+        {
+          "dose": -0.5,
+          "target_mean_dlogp": -0.08060340583324432,
+          "control_mean_dlogp": -0.008136844262480736
+        },
+        {
+          "dose": 0.0,
+          "target_mean_dlogp": 0.0,
+          "control_mean_dlogp": 0.0
+        },
+        {
+          "dose": 0.5,
+          "target_mean_dlogp": 0.08525858074426651,
+          "control_mean_dlogp": 0.010824012570083141
+        },
+        {
+          "dose": 1.0,
+          "target_mean_dlogp": 0.17362633347511292,
+          "control_mean_dlogp": 0.024530505761504173
+        },
+        {
+          "dose": 2.0,
+          "target_mean_dlogp": 0.3584054112434387,
+          "control_mean_dlogp": 0.05738401412963867
+        },
+        {
+          "dose": 4.0,
+          "target_mean_dlogp": 0.7790689468383789,
+          "control_mean_dlogp": 0.16045323014259338
+        }
+      ],
+      "ablation_target_mean_dlogp": 0.6579940915107727,
+      "ablation_control_mean_dlogp": 0.4428896903991699
+    },
+    {
+      "block": 9958,
+      "firings": 1721,
+      "mean_gate": 0.24701349437236786,
+      "targets": [
+        {
+          "token_id": 4611,
+          "token": " however"
+        },
+        {
+          "token_id": 35999,
+          "token": " nevertheless"
+        },
+        {
+          "token_id": 26533,
+          "token": " subsequently"
+        },
+        {
+          "token_id": 36563,
+          "token": " nonetheless"
+        },
+        {
+          "token_id": 94459,
+          "token": "however"
+        },
+        {
+          "token_id": 25950,
+          "token": " afterwards"
+        },
+        {
+          "token_id": 42104,
+          "token": " moreover"
+        },
+        {
+          "token_id": 43492,
+          "token": " thereafter"
+        },
+        {
+          "token_id": 4213,
+          "token": " However"
+        },
+        {
+          "token_id": 7643,
+          "token": " although"
+        }
+      ],
+      "controls": [
+        78400,
+        36074,
+        16067,
+        36564,
+        94460,
+        15147,
+        42105,
+        21250,
+        11183,
+        5734
+      ],
+      "dose_curve": [
+        {
+          "dose": -2.0,
+          "target_mean_dlogp": -0.27712440490722656,
+          "control_mean_dlogp": -0.01016311626881361
+        },
+        {
+          "dose": -1.0,
+          "target_mean_dlogp": -0.146968275308609,
+          "control_mean_dlogp": -0.010789299383759499
+        },
+        {
+          "dose": -0.5,
+          "target_mean_dlogp": -0.07366981357336044,
+          "control_mean_dlogp": -0.006435585208237171
+        },
+        {
+          "dose": 0.0,
+          "target_mean_dlogp": 0.0,
+          "control_mean_dlogp": 0.0
+        },
+        {
+          "dose": 0.5,
+          "target_mean_dlogp": 0.0773598700761795,
+          "control_mean_dlogp": 0.008006858639419079
+        },
+        {
+          "dose": 1.0,
+          "target_mean_dlogp": 0.16203173995018005,
+          "control_mean_dlogp": 0.02074909210205078
+        },
+        {
+          "dose": 2.0,
+          "target_mean_dlogp": 0.33747807145118713,
+          "control_mean_dlogp": 0.05052204057574272
+        },
+        {
+          "dose": 4.0,
+          "target_mean_dlogp": 0.7463936805725098,
+          "control_mean_dlogp": 0.14759425818920135
+        }
+      ],
+      "ablation_target_mean_dlogp": 0.7572051286697388,
+      "ablation_control_mean_dlogp": 0.5061834454536438
+    },
+    {
+      "block": 5944,
+      "firings": 1701,
+      "mean_gate": 0.277934730052948,
+      "targets": [
+        {
+          "token_id": 194805,
+          "token": " .**"
+        },
+        {
+          "token_id": 35617,
+          "token": " additionally"
+        },
+        {
+          "token_id": 62798,
+          "token": " Booker"
+        },
+        {
+          "token_id": 641,
+          "token": " ."
+        },
+        {
+          "token_id": 21708,
+          "token": " Additionally"
+        },
+        {
+          "token_id": 79952,
+          "token": " Shank"
+        },
+        {
+          "token_id": 7054,
+          "token": " Also"
+        },
+        {
+          "token_id": 18050,
+          "token": "  \n\n"
+        },
+        {
+          "token_id": 177676,
+          "token": " \u0647\u0645\u0686\u0646\u06cc\u0646"
+        },
+        {
+          "token_id": 4213,
+          "token": " However"
+        }
+      ],
+      "controls": [
+        194806,
+        35618,
+        62799,
+        1116,
+        15095,
+        79953,
+        37316,
+        18051,
+        177677,
+        11183
+      ],
+      "dose_curve": [
+        {
+          "dose": -2.0,
+          "target_mean_dlogp": -0.2863871455192566,
+          "control_mean_dlogp": -0.037283755838871
+        },
+        {
+          "dose": -1.0,
+          "target_mean_dlogp": -0.1504581868648529,
+          "control_mean_dlogp": -0.02366051636636257
+        },
+        {
+          "dose": -0.5,
+          "target_mean_dlogp": -0.0782509297132492,
+          "control_mean_dlogp": -0.014465903863310814
+        },
+        {
+          "dose": 0.0,
+          "target_mean_dlogp": 0.0,
+          "control_mean_dlogp": 0.0
+        },
+        {
+          "dose": 0.5,
+          "target_mean_dlogp": 0.08271217346191406,
+          "control_mean_dlogp": 0.015949297696352005
+        },
+        {
+          "dose": 1.0,
+          "target_mean_dlogp": 0.17008304595947266,
+          "control_mean_dlogp": 0.0340336337685585
+        },
+        {
+          "dose": 2.0,
+          "target_mean_dlogp": 0.35573649406433105,
+          "control_mean_dlogp": 0.0772794708609581
+        },
+        {
+          "dose": 4.0,
+          "target_mean_dlogp": 0.8039184808731079,
+          "control_mean_dlogp": 0.204325869679451
+        }
+      ],
+      "ablation_target_mean_dlogp": 0.4667995572090149,
+      "ablation_control_mean_dlogp": 0.2984464764595032
+    }
+  ],
+  "angle_sweep": [
+    {
+      "block": 9445,
+      "bins": [
+        {
+          "theta": -3.141592653589793,
+          "top_tokens": [
+            ",",
+            ".",
+            "/dashboard",
+            "-hero",
+            "\u060c",
+            "\u80ce",
+            "-national",
+            "-ul"
+          ],
+          "top_token_ids": [
+            11,
+            13,
+            39802,
+            88628,
+            66459,
+            98501,
+            71993,
+            62773
+          ],
+          "top_dlogp": [
+            0.22799301147460938,
+            0.13044071197509766,
+            0.1270904541015625,
+            0.126434326171875,
+            0.12508583068847656,
+            0.122039794921875,
+            0.12172126770019531,
+            0.12143707275390625
+          ]
+        },
+        {
+          "theta": -2.8797932657906435,
+          "top_tokens": [
+            ",",
+            "-hero",
+            "/dashboard",
+            ")\u201d",
+            "!\u201d",
+            "-ul",
+            "\u80c3",
+            "\u2014if"
+          ],
+          "top_token_ids": [
+            11,
+            88628,
+            39802,
+            94890,
+            17306,
+            62773,
+            97777,
+            86674
+          ],
+          "top_dlogp": [
+            0.1977710723876953,
+            0.1305694580078125,
+            0.125946044921875,
+            0.1187744140625,
+            0.11573600769042969,
+            0.11460304260253906,
+            0.113800048828125,
+            0.11204719543457031
+          ]
+        },
+        {
+          "theta": -2.6179938779914944,
+          "top_tokens": [
+            "!\u201d",
+            "\u201d",
+            ",",
+            ")\u201d",
+            ",\u201d",
+            "\u201d)",
+            "!\u201d.",
+            "!\""
+          ],
+          "top_token_ids": [
+            17306,
+            828,
+            11,
+            94890,
+            2340,
+            31438,
+            222825,
+            8687
+          ],
+          "top_dlogp": [
+            0.1719074249267578,
+            0.15761375427246094,
+            0.15548992156982422,
+            0.15246963500976562,
+            0.13982009887695312,
+            0.13846206665039062,
+            0.1367206573486328,
+            0.1356182098388672
+          ]
+        },
+        {
+          "theta": -2.356194490192345,
+          "top_tokens": [
+            "!\u201d",
+            "\u201d",
+            ")\u201d",
+            "\u201d)",
+            ",\u201d",
+            "\uff01\u201d",
+            "!\"",
+            "\u201d\u2014"
+          ],
+          "top_token_ids": [
+            17306,
+            828,
+            94890,
+            31438,
+            2340,
+            73169,
+            8687,
+            60537
+          ],
+          "top_dlogp": [
+            0.2157745361328125,
+            0.19806289672851562,
+            0.1772747039794922,
+            0.17676734924316406,
+            0.17499351501464844,
+            0.1744232177734375,
+            0.16118240356445312,
+            0.1611175537109375
+          ]
+        },
+        {
+          "theta": -2.0943951023931957,
+          "top_tokens": [
+            "!\u201d",
+            "\u201d",
+            "\uff01\u201d",
+            "\u201d)",
+            ",\u201d",
+            "!\u2019",
+            ")\u201d",
+            "\u201d\u2014"
+          ],
+          "top_token_ids": [
+            17306,
+            828,
+            73169,
+            31438,
+            2340,
+            68913,
+            94890,
+            60537
+          ],
+          "top_dlogp": [
+            0.24291610717773438,
+            0.22074508666992188,
+            0.2086353302001953,
+            0.19979286193847656,
+            0.19545745849609375,
+            0.1910552978515625,
+            0.1887187957763672,
+            0.18122291564941406
+          ]
+        },
+        {
+          "theta": -1.8325957145940461,
+          "top_tokens": [
+            "!\u201d",
+            "\u201d",
+            "\uff01\u201d",
+            "!\u2019",
+            "\u201d)",
+            ",\u201d",
+            ",\u2019",
+            "\u201d**"
+          ],
+          "top_token_ids": [
+            17306,
+            828,
+            73169,
+            68913,
+            31438,
+            2340,
+            21686,
+            173464
+          ],
+          "top_dlogp": [
+            0.261749267578125,
+            0.23609542846679688,
+            0.23535537719726562,
+            0.22763824462890625,
+            0.217529296875,
+            0.20836448669433594,
+            0.20684432983398438,
+            0.20320510864257812
+          ]
+        },
+        {
+          "theta": -1.5707963267948966,
+          "top_tokens": [
+            "!\u201d",
+            "!\u2019",
+            "\uff01\u201d",
+            "\u201d",
+            "\u201d)",
+            "\u201d**",
+            ",\u2019",
+            "\u2019)"
+          ],
+          "top_token_ids": [
+            17306,
+            68913,
+            73169,
+            828,
+            31438,
+            173464,
+            21686,
+            91823
+          ],
+          "top_dlogp": [
+            0.2588157653808594,
+            0.24180984497070312,
+            0.24163436889648438,
+            0.2321643829345703,
+            0.2169170379638672,
+            0.21680259704589844,
+            0.2112140655517578,
+            0.20567703247070312
+          ]
+        },
+        {
+          "theta": -1.3089969389957472,
+          "top_tokens": [
+            "!\u2019",
+            "!\u201d",
+            "\uff01\u201d",
+            "\u201d**",
+            "\u201d",
+            " delicate",
+            " burdens",
+            ",\u2019"
+          ],
+          "top_token_ids": [
+            68913,
+            17306,
+            73169,
+            173464,
+            828,
+            34036,
+            60850,
+            21686
+          ],
+          "top_dlogp": [
+            0.23990821838378906,
+            0.2377777099609375,
+            0.23270416259765625,
+            0.21430015563964844,
+            0.21232986450195312,
+            0.21100616455078125,
+            0.20392799377441406,
+            0.2021312713623047
+          ]
+        },
+        {
+          "theta": -1.0471975511965979,
+          "top_tokens": [
+            "!\u2019",
+            " delicate",
+            "\uff01\u201d",
+            " civilized",
+            "!\u201d",
+            " \u2018",
+            "\u201d**",
+            "?\u2019"
+          ],
+          "top_token_ids": [
+            68913,
+            34036,
+            73169,
+            82048,
+            17306,
+            3260,
+            173464,
+            42690
+          ],
+          "top_dlogp": [
+            0.2254486083984375,
+            0.2190074920654297,
+            0.2100677490234375,
+            0.20697402954101562,
+            0.2030487060546875,
+            0.20211029052734375,
+            0.1997852325439453,
+            0.1971759796142578
+          ]
+        },
+        {
+          "theta": -0.7853981633974483,
+          "top_tokens": [
+            " .'",
+            " delicate",
+            " civilized",
+            " persec",
+            " anyhow",
+            " .**",
+            "!\u2019",
+            " belie"
+          ],
+          "top_token_ids": [
+            42142,
+            34036,
+            82048,
+            36228,
+            85904,
+            194805,
+            68913,
+            2728
+          ],
+          "top_dlogp": [
+            0.21706867218017578,
+            0.21210098266601562,
+            0.19906234741210938,
+            0.19843482971191406,
+            0.19573020935058594,
+            0.19524002075195312,
+            0.19083786010742188,
+            0.189422607421875
+          ]
+        },
+        {
+          "theta": -0.5235987755982991,
+          "top_tokens": [
+            " .'",
+            " .**",
+            " persec",
+            " prezi",
+            " moreover",
+            " .*",
+            " :\\",
+            "\ufffd"
+          ],
+          "top_token_ids": [
+            42142,
+            194805,
+            36228,
+            191811,
+            42104,
+            45830,
+            80093,
+            96169
+          ],
+          "top_dlogp": [
+            0.22061634063720703,
+            0.2087879180908203,
+            0.20647621154785156,
+            0.19940948486328125,
+            0.19809722900390625,
+            0.19646453857421875,
+            0.1954212188720703,
+            0.19215965270996094
+          ]
+        },
+        {
+          "theta": -0.2617993877991496,
+          "top_tokens": [
+            " .'",
+            " .**",
+            " moreover",
+            " :\\",
+            " Phelps",
+            " prezi",
+            " .*",
+            " persec"
+          ],
+          "top_token_ids": [
+            42142,
+            194805,
+            42104,
+            80093,
+            94152,
+            191811,
+            45830,
+            36228
+          ],
+          "top_dlogp": [
+            0.20782470703125,
+            0.20570945739746094,
+            0.2036151885986328,
+            0.20278167724609375,
+            0.20037460327148438,
+            0.19961166381835938,
+            0.1982097625732422,
+            0.19737625122070312
+          ]
+        },
+        {
+          "theta": 0.0,
+          "top_tokens": [
+            " Booker",
+            " :\\",
+            " Isaac",
+            " .**",
+            " Phelps",
+            " moreover",
+            " Perkins",
+            " Frederick"
+          ],
+          "top_token_ids": [
+            62798,
+            80093,
+            40134,
+            194805,
+            94152,
+            42104,
+            62715,
+            48959
+          ],
+          "top_dlogp": [
+            0.2131195068359375,
+            0.20119857788085938,
+            0.1998615264892578,
+            0.19733810424804688,
+            0.19703292846679688,
+            0.19502639770507812,
+            0.19001007080078125,
+            0.1893606185913086
+          ]
+        },
+        {
+          "theta": 0.26179938779914913,
+          "top_tokens": [
+            " Booker",
+            " Gow",
+            " Shank",
+            " Isaac",
+            " Perkins",
+            " Zheng",
+            " Authors",
+            "  \n\n"
+          ],
+          "top_token_ids": [
+            62798,
+            89279,
+            79952,
+            40134,
+            62715,
+            73832,
+            23369,
+            18050
+          ],
+          "top_dlogp": [
+            0.21378517150878906,
+            0.19870758056640625,
+            0.19491004943847656,
+            0.19260025024414062,
+            0.18835830688476562,
+            0.18707847595214844,
+            0.18676376342773438,
+            0.18626022338867188
+          ]
+        },
+        {
+          "theta": 0.5235987755982987,
+          "top_tokens": [
+            " Booker",
+            " Shank",
+            " Gow",
+            " Authors",
+            " ISBN",
+            " Later",
+            " additionally",
+            " Afterwards"
+          ],
+          "top_token_ids": [
+            62798,
+            79952,
+            89279,
+            23369,
+            32318,
+            24095,
+            35617,
+            83551
+          ],
+          "top_dlogp": [
+            0.2029132843017578,
+            0.19925308227539062,
+            0.19569015502929688,
+            0.18562889099121094,
+            0.185028076171875,
+            0.17972755432128906,
+            0.17924880981445312,
+            0.1791839599609375
+          ]
+        },
+        {
+          "theta": 0.7853981633974478,
+          "top_tokens": [
+            " Archived",
+            " ISBN",
+            "https",
+            " Shank",
+            " Reddit",
+            " Website",
+            " Afterwards",
+            " Wikipedia"
+          ],
+          "top_token_ids": [
+            94377,
+            32318,
+            2349,
+            79952,
+            25778,
+            15551,
+            83551,
+            25737
+          ],
+          "top_dlogp": [
+            0.2160205841064453,
+            0.21077346801757812,
+            0.19847869873046875,
+            0.19286155700683594,
+            0.1923084259033203,
+            0.18988800048828125,
+            0.18818092346191406,
+            0.18805503845214844
+          ]
+        },
+        {
+          "theta": 1.0471975511965974,
+          "top_tokens": [
+            " Archived",
+            "https",
+            " ISBN",
+            " Reddit",
+            " Wikipedia",
+            " Media",
+            " Website",
+            " Quote"
+          ],
+          "top_token_ids": [
+            94377,
+            2349,
+            32318,
+            25778,
+            25737,
+            7569,
+            15551,
+            23760
+          ],
+          "top_dlogp": [
+            0.2466259002685547,
+            0.22035598754882812,
+            0.2201671600341797,
+            0.2037830352783203,
+            0.2032299041748047,
+            0.20188522338867188,
+            0.19868850708007812,
+            0.19684791564941406
+          ]
+        },
+        {
+          "theta": 1.3089969389957465,
+          "top_tokens": [
+            " Archived",
+            "https",
+            " ISBN",
+            "[[",
+            " Wikipedia",
+            " Media",
+            " Twitter",
+            " Quote"
+          ],
+          "top_token_ids": [
+            94377,
+            2349,
+            32318,
+            15050,
+            25737,
+            7569,
+            6074,
+            23760
+          ],
+          "top_dlogp": [
+            0.2636566162109375,
+            0.22703170776367188,
+            0.217529296875,
+            0.20850372314453125,
+            0.20328521728515625,
+            0.20281028747558594,
+            0.20227813720703125,
+            0.20154190063476562
+          ]
+        },
+        {
+          "theta": 1.5707963267948966,
+          "top_tokens": [
+            " Archived",
+            "https",
+            "[[",
+            " Twitter",
+            " ISBN",
+            " ESPN",
+            " Media",
+            " Quote"
+          ],
+          "top_token_ids": [
+            94377,
+            2349,
+            15050,
+            6074,
+            32318,
+            25362,
+            7569,
+            23760
+          ],
+          "top_dlogp": [
+            0.2655048370361328,
+            0.21956825256347656,
+            0.2193450927734375,
+            0.20360755920410156,
+            0.19817352294921875,
+            0.19676780700683594,
+            0.19550132751464844,
+            0.19525718688964844
+          ]
+        },
+        {
+          "theta": 1.8325957145940457,
+          "top_tokens": [
+            " Archived",
+            "[[",
+            "\u2212",
+            " DVD",
+            "https",
+            " UK",
+            " Twitter",
+            " Metro"
+          ],
+          "top_token_ids": [
+            94377,
+            15050,
+            32160,
+            17553,
+            2349,
+            6222,
+            6074,
+            20317
+          ],
+          "top_dlogp": [
+            0.2466278076171875,
+            0.21565628051757812,
+            0.2015247344970703,
+            0.1985187530517578,
+            0.1978302001953125,
+            0.19370174407958984,
+            0.19102096557617188,
+            0.1880207061767578
+          ]
+        },
+        {
+          "theta": 2.094395102393195,
+          "top_tokens": [
+            " Archived",
+            "\u2212",
+            "[[",
+            " DVD",
+            ",",
+            " UK",
+            " MVP",
+            "-{"
+          ],
+          "top_token_ids": [
+            94377,
+            32160,
+            15050,
+            17553,
+            11,
+            6222,
+            30820,
+            61209
+          ],
+          "top_dlogp": [
+            0.21535110473632812,
+            0.2095813751220703,
+            0.19791221618652344,
+            0.19201087951660156,
+            0.187103271484375,
+            0.18015289306640625,
+            0.17787551879882812,
+            0.17360305786132812
+          ]
+        },
+        {
+          "theta": 2.356194490192345,
+          "top_tokens": [
+            ",",
+            "\u2212",
+            " MVP",
+            " DVD",
+            "<vector",
+            " Archived",
+            "[[",
+            "-{"
+          ],
+          "top_token_ids": [
+            11,
+            32160,
+            30820,
+            17553,
+            23518,
+            94377,
+            15050,
+            61209
+          ],
+          "top_dlogp": [
+            0.22251319885253906,
+            0.20294761657714844,
+            0.1788349151611328,
+            0.17663002014160156,
+            0.17303848266601562,
+            0.170013427734375,
+            0.1662158966064453,
+            0.16038131713867188
+          ]
+        },
+        {
+          "theta": 2.617993877991494,
+          "top_tokens": [
+            ",",
+            "\u2212",
+            " MVP",
+            "<vector",
+            ".",
+            "GB",
+            " DVD",
+            "\u80ce"
+          ],
+          "top_token_ids": [
+            11,
+            32160,
+            30820,
+            23518,
+            13,
+            5213,
+            17553,
+            98501
+          ],
+          "top_dlogp": [
+            0.24219989776611328,
+            0.18301010131835938,
+            0.167205810546875,
+            0.1627941131591797,
+            0.14878368377685547,
+            0.14707565307617188,
+            0.1469287872314453,
+            0.1459808349609375
+          ]
+        },
+        {
+          "theta": 2.879793265790643,
+          "top_tokens": [
+            ",",
+            "\u2212",
+            ".",
+            "<vector",
+            " MVP",
+            "\u80ce",
+            "\u060c",
+            "\u03b2"
+          ],
+          "top_token_ids": [
+            11,
+            32160,
+            13,
+            23518,
+            30820,
+            98501,
+            66459,
+            49531
+          ],
+          "top_dlogp": [
+            0.24358654022216797,
+            0.15265464782714844,
+            0.14570903778076172,
+            0.14480018615722656,
+            0.1434955596923828,
+            0.14015769958496094,
+            0.1395854949951172,
+            0.13660049438476562
+          ]
+        }
+      ],
+      "distinct_top1_tokens_over_angles": 6
+    },
+    {
+      "block": 569,
+      "bins": [
+        {
+          "theta": -3.141592653589793,
+          "top_tokens": [
+            " Peb",
+            " *\"",
+            " Freddy",
+            "[\"$",
+            " Madden",
+            " Valley",
+            " Podcast",
+            " Trey"
+          ],
+          "top_token_ids": [
+            85848,
+            88064,
+            92469,
+            91391,
+            80700,
+            12673,
+            28796,
+            78651
+          ],
+          "top_dlogp": [
+            0.1756458282470703,
+            0.17111778259277344,
+            0.1665496826171875,
+            0.16454315185546875,
+            0.1569042205810547,
+            0.1552734375,
+            0.14934349060058594,
+            0.14914321899414062
+          ]
+        },
+        {
+          "theta": -2.8797932657906435,
+          "top_tokens": [
+            " *\"",
+            "[\"$",
+            " Peb",
+            " Freddy",
+            " Valley",
+            " Hood",
+            " McD",
+            " \"$"
+          ],
+          "top_token_ids": [
+            88064,
+            91391,
+            85848,
+            92469,
+            12673,
+            34172,
+            48566,
+            5036
+          ],
+          "top_dlogp": [
+            0.1619586944580078,
+            0.1605968475341797,
+            0.14925384521484375,
+            0.1447467803955078,
+            0.14209747314453125,
+            0.14107513427734375,
+            0.13624954223632812,
+            0.13560867309570312
+          ]
+        },
+        {
+          "theta": -2.6179938779914944,
+          "top_tokens": [
+            "[\"$",
+            " *\"",
+            "\u2122",
+            "\u80ba",
+            "!\"",
+            " \"$",
+            "\u9774",
+            " Hood"
+          ],
+          "top_token_ids": [
+            91391,
+            88064,
+            15635,
+            97964,
+            8687,
+            5036,
+            107820,
+            34172
+          ],
+          "top_dlogp": [
+            0.14943885803222656,
+            0.14545440673828125,
+            0.13454818725585938,
+            0.13088607788085938,
+            0.12900733947753906,
+            0.12880325317382812,
+            0.12854385375976562,
+            0.12829971313476562
+          ]
+        },
+        {
+          "theta": -2.356194490192345,
+          "top_tokens": [
+            ",",
+            "!\"",
+            "...\"",
+            "\u2122",
+            "\u9774",
+            "\u2591",
+            "\u80ba",
+            "[\"$"
+          ],
+          "top_token_ids": [
+            11,
+            8687,
+            20564,
+            15635,
+            107820,
+            81159,
+            97964,
+            91391
+          ],
+          "top_dlogp": [
+            0.1405620574951172,
+            0.13393020629882812,
+            0.12940597534179688,
+            0.1272602081298828,
+            0.12558937072753906,
+            0.12291145324707031,
+            0.122528076171875,
+            0.12245559692382812
+          ]
+        },
+        {
+          "theta": -2.0943951023931957,
+          "top_tokens": [
+            ",",
+            "!\"",
+            "...\"",
+            "!\u201d",
+            "\"!",
+            "\"",
+            "!\u201d.",
+            "-hero"
+          ],
+          "top_token_ids": [
+            11,
+            8687,
+            20564,
+            17306,
+            220921,
+            1,
+            222825,
+            88628
+          ],
+          "top_dlogp": [
+            0.16711902618408203,
+            0.1318531036376953,
+            0.1274089813232422,
+            0.12652587890625,
+            0.12398529052734375,
+            0.1239633560180664,
+            0.12212753295898438,
+            0.121978759765625
+          ]
+        },
+        {
+          "theta": -1.8325957145940461,
+          "top_tokens": [
+            ",",
+            "\"",
+            "\u201d",
+            "!\u201d",
+            "!\u201d.",
+            "\u201d,",
+            "\"!",
+            "!\""
+          ],
+          "top_token_ids": [
+            11,
+            1,
+            828,
+            17306,
+            222825,
+            9059,
+            220921,
+            8687
+          ],
+          "top_dlogp": [
+            0.18426036834716797,
+            0.13561058044433594,
+            0.13207626342773438,
+            0.13109970092773438,
+            0.13100624084472656,
+            0.1265125274658203,
+            0.12403488159179688,
+            0.12365341186523438
+          ]
+        },
+        {
+          "theta": -1.5707963267948966,
+          "top_tokens": [
+            ",",
+            "\u201d",
+            "\u201d,",
+            "\u201d.",
+            "\u2014if",
+            "\u201d:",
+            "\u00bb:",
+            "\""
+          ],
+          "top_token_ids": [
+            11,
+            828,
+            9059,
+            10878,
+            86674,
+            54639,
+            178049,
+            1
+          ],
+          "top_dlogp": [
+            0.1851367950439453,
+            0.15376663208007812,
+            0.15249061584472656,
+            0.1449737548828125,
+            0.14453125,
+            0.14049530029296875,
+            0.13928794860839844,
+            0.13729190826416016
+          ]
+        },
+        {
+          "theta": -1.3089969389957472,
+          "top_tokens": [
+            ",",
+            "\u201d,",
+            "\u201d",
+            "\u2014if",
+            "\u201d.",
+            "\u201d:",
+            "\u00bb:",
+            " gastric"
+          ],
+          "top_token_ids": [
+            11,
+            9059,
+            828,
+            86674,
+            10878,
+            54639,
+            178049,
+            85244
+          ],
+          "top_dlogp": [
+            0.17433643341064453,
+            0.1649456024169922,
+            0.16328048706054688,
+            0.15860939025878906,
+            0.15738868713378906,
+            0.15166664123535156,
+            0.14985084533691406,
+            0.1402587890625
+          ]
+        },
+        {
+          "theta": -1.0471975511965979,
+          "top_tokens": [
+            "\u2014if",
+            "\u201d,",
+            "\u201d",
+            " hazardous",
+            "\u201d.",
+            " merely",
+            " poorer",
+            ","
+          ],
+          "top_token_ids": [
+            86674,
+            9059,
+            828,
+            48244,
+            10878,
+            15756,
+            62981,
+            11
+          ],
+          "top_dlogp": [
+            0.16757774353027344,
+            0.16643142700195312,
+            0.15794944763183594,
+            0.15717124938964844,
+            0.15704917907714844,
+            0.15478801727294922,
+            0.15455245971679688,
+            0.15238380432128906
+          ]
+        },
+        {
+          "theta": -0.7853981633974483,
+          "top_tokens": [
+            " poorer",
+            " hazardous",
+            " merely",
+            " rather",
+            " nevertheless",
+            "\u2014if",
+            " perhaps",
+            " abandoning"
+          ],
+          "top_token_ids": [
+            62981,
+            48244,
+            15756,
+            4598,
+            35999,
+            86674,
+            8106,
+            74597
+          ],
+          "top_dlogp": [
+            0.17266273498535156,
+            0.1701641082763672,
+            0.17008686065673828,
+            0.1692066192626953,
+            0.16689777374267578,
+            0.16663169860839844,
+            0.16439151763916016,
+            0.16253662109375
+          ]
+        },
+        {
+          "theta": -0.5235987755982991,
+          "top_tokens": [
+            " nevertheless",
+            " fortunately",
+            " poorer",
+            " rather",
+            " perhaps",
+            " merely",
+            " abandoning",
+            " invariably"
+          ],
+          "top_token_ids": [
+            35999,
+            83834,
+            62981,
+            4598,
+            8106,
+            15756,
+            74597,
+            71016
+          ],
+          "top_dlogp": [
+            0.20513629913330078,
+            0.1791515350341797,
+            0.17903518676757812,
+            0.17894840240478516,
+            0.17723655700683594,
+            0.17167091369628906,
+            0.1715526580810547,
+            0.16916847229003906
+          ]
+        },
+        {
+          "theta": -0.2617993877991496,
+          "top_tokens": [
+            " nevertheless",
+            " fortunately",
+            " perhaps",
+            " invariably",
+            " nonetheless",
+            " rather",
+            " consequ",
+            " cep"
+          ],
+          "top_token_ids": [
+            35999,
+            83834,
+            8106,
+            71016,
+            36563,
+            4598,
+            12136,
+            59998
+          ],
+          "top_dlogp": [
+            0.23212432861328125,
+            0.19039535522460938,
+            0.18163776397705078,
+            0.1792316436767578,
+            0.17752552032470703,
+            0.17702960968017578,
+            0.17635154724121094,
+            0.1740894317626953
+          ]
+        },
+        {
+          "theta": 0.0,
+          "top_tokens": [
+            " nevertheless",
+            " nonetheless",
+            " fortunately",
+            " however",
+            " consequ",
+            " although",
+            " likewise",
+            " invariably"
+          ],
+          "top_token_ids": [
+            35999,
+            36563,
+            83834,
+            4611,
+            12136,
+            7643,
+            36670,
+            71016
+          ],
+          "top_dlogp": [
+            0.24228858947753906,
+            0.19209766387939453,
+            0.18764495849609375,
+            0.1875324249267578,
+            0.1853199005126953,
+            0.18512821197509766,
+            0.1780681610107422,
+            0.17502212524414062
+          ]
+        },
+        {
+          "theta": 0.26179938779914913,
+          "top_tokens": [
+            " nevertheless",
+            " however",
+            " nonetheless",
+            " although",
+            " subsequently",
+            " moreover",
+            " likewise",
+            " furthermore"
+          ],
+          "top_token_ids": [
+            35999,
+            4611,
+            36563,
+            7643,
+            26533,
+            42104,
+            36670,
+            74887
+          ],
+          "top_dlogp": [
+            0.23617267608642578,
+            0.2002248764038086,
+            0.1938190460205078,
+            0.19004535675048828,
+            0.18831157684326172,
+            0.18793487548828125,
+            0.18743133544921875,
+            0.185638427734375
+          ]
+        },
+        {
+          "theta": 0.5235987755982987,
+          "top_tokens": [
+            " nevertheless",
+            " however",
+            " subsequently",
+            " moreover",
+            " meanwhile",
+            " likewise",
+            " furthermore",
+            " nonetheless"
+          ],
+          "top_token_ids": [
+            35999,
+            4611,
+            26533,
+            42104,
+            35020,
+            36670,
+            74887,
+            36563
+          ],
+          "top_dlogp": [
+            0.21470260620117188,
+            0.19782638549804688,
+            0.19553184509277344,
+            0.19142913818359375,
+            0.18616008758544922,
+            0.18436050415039062,
+            0.18373870849609375,
+            0.18363380432128906
+          ]
+        },
+        {
+          "theta": 0.7853981633974478,
+          "top_tokens": [
+            " subsequently",
+            " moreover",
+            " however",
+            " meanwhile",
+            " nevertheless",
+            " thereafter",
+            " afterwards",
+            " additionally"
+          ],
+          "top_token_ids": [
+            26533,
+            42104,
+            4611,
+            35020,
+            35999,
+            43492,
+            25950,
+            35617
+          ],
+          "top_dlogp": [
+            0.1908702850341797,
+            0.18297576904296875,
+            0.1826324462890625,
+            0.1804485321044922,
+            0.17927074432373047,
+            0.17498207092285156,
+            0.17490863800048828,
+            0.17140769958496094
+          ]
+        },
+        {
+          "theta": 1.0471975511965974,
+          "top_tokens": [
+            " Booker",
+            " subsequently",
+            " Isaac",
+            " Shank",
+            " moreover",
+            " meanwhile",
+            " additionally",
+            " afterwards"
+          ],
+          "top_token_ids": [
+            62798,
+            26533,
+            40134,
+            79952,
+            42104,
+            35020,
+            35617,
+            25950
+          ],
+          "top_dlogp": [
+            0.1870574951171875,
+            0.1717357635498047,
+            0.17092323303222656,
+            0.16167449951171875,
+            0.1612224578857422,
+            0.16066455841064453,
+            0.16049957275390625,
+            0.15935230255126953
+          ]
+        },
+        {
+          "theta": 1.3089969389957465,
+          "top_tokens": [
+            " Booker",
+            " Rick",
+            " Isaac",
+            " Gow",
+            " Shank",
+            " Carey",
+            " Hao",
+            " Iris"
+          ],
+          "top_token_ids": [
+            62798,
+            21690,
+            40134,
+            89279,
+            79952,
+            63016,
+            90479,
+            63506
+          ],
+          "top_dlogp": [
+            0.19507789611816406,
+            0.17995834350585938,
+            0.17921829223632812,
+            0.1722545623779297,
+            0.1717700958251953,
+            0.16716766357421875,
+            0.1662120819091797,
+            0.16550445556640625
+          ]
+        },
+        {
+          "theta": 1.5707963267948966,
+          "top_tokens": [
+            " Rick",
+            " Nick",
+            " Booker",
+            " Perkins",
+            " Carol",
+            "\u82b7",
+            " Isaac",
+            " Zend"
+          ],
+          "top_token_ids": [
+            21690,
+            14557,
+            62798,
+            62715,
+            9946,
+            107938,
+            40134,
+            30099
+          ],
+          "top_dlogp": [
+            0.19620513916015625,
+            0.1924877166748047,
+            0.19196701049804688,
+            0.1878223419189453,
+            0.1811676025390625,
+            0.17673683166503906,
+            0.1763763427734375,
+            0.17543792724609375
+          ]
+        },
+        {
+          "theta": 1.8325957145940457,
+          "top_tokens": [
+            " Nick",
+            " Perkins",
+            " Rick",
+            " Zend",
+            " Carol",
+            " .*",
+            " Freddie",
+            " Lindsey"
+          ],
+          "top_token_ids": [
+            14557,
+            62715,
+            21690,
+            30099,
+            9946,
+            45830,
+            64994,
+            62108
+          ],
+          "top_dlogp": [
+            0.20600509643554688,
+            0.2039356231689453,
+            0.1969318389892578,
+            0.19478988647460938,
+            0.1908407211303711,
+            0.18941307067871094,
+            0.1883392333984375,
+            0.18721389770507812
+          ]
+        },
+        {
+          "theta": 2.094395102393195,
+          "top_tokens": [
+            " Nick",
+            " Perkins",
+            " Freddie",
+            " Zend",
+            " Lindsey",
+            "[\\",
+            " .*",
+            " Rick"
+          ],
+          "top_token_ids": [
+            14557,
+            62715,
+            64994,
+            30099,
+            62108,
+            25223,
+            45830,
+            21690
+          ],
+          "top_dlogp": [
+            0.2074289321899414,
+            0.20714187622070312,
+            0.20443344116210938,
+            0.20117568969726562,
+            0.2007293701171875,
+            0.19654464721679688,
+            0.1935443878173828,
+            0.1898651123046875
+          ]
+        },
+        {
+          "theta": 2.356194490192345,
+          "top_tokens": [
+            " Freddie",
+            "[\\",
+            " Lindsey",
+            " [\\",
+            " Lounge",
+            " Zend",
+            " Perkins",
+            " Nick"
+          ],
+          "top_token_ids": [
+            64994,
+            25223,
+            62108,
+            90581,
+            47995,
+            30099,
+            62715,
+            14557
+          ],
+          "top_dlogp": [
+            0.21116065979003906,
+            0.2035503387451172,
+            0.20267677307128906,
+            0.1984405517578125,
+            0.197174072265625,
+            0.1962738037109375,
+            0.1939563751220703,
+            0.1932229995727539
+          ]
+        },
+        {
+          "theta": 2.617993877991494,
+          "top_tokens": [
+            " Freddie",
+            " Lounge",
+            "[\\",
+            " [\\",
+            " Lindsey",
+            " Madden",
+            " Peb",
+            " Wrestle"
+          ],
+          "top_token_ids": [
+            64994,
+            47995,
+            25223,
+            90581,
+            62108,
+            80700,
+            85848,
+            94905
+          ],
+          "top_dlogp": [
+            0.20155906677246094,
+            0.19524002075195312,
+            0.19321441650390625,
+            0.19257545471191406,
+            0.19129371643066406,
+            0.1878376007080078,
+            0.1861114501953125,
+            0.18181800842285156
+          ]
+        },
+        {
+          "theta": 2.879793265790643,
+          "top_tokens": [
+            " Peb",
+            " Madden",
+            " Freddie",
+            " Lounge",
+            " Freddy",
+            " *\"",
+            " [\\",
+            "[\\"
+          ],
+          "top_token_ids": [
+            85848,
+            80700,
+            64994,
+            47995,
+            92469,
+            88064,
+            90581,
+            25223
+          ],
+          "top_dlogp": [
+            0.1876983642578125,
+            0.1794300079345703,
+            0.17914962768554688,
+            0.1778564453125,
+            0.17592811584472656,
+            0.17578125,
+            0.17550277709960938,
+            0.17311477661132812
+          ]
+        }
+      ],
+      "distinct_top1_tokens_over_angles": 12
+    },
+    {
+      "block": 12968,
+      "bins": [
+        {
+          "theta": -3.141592653589793,
+          "top_tokens": [
+            ",",
+            "...\u201d",
+            "!\u201d.",
+            "...\"",
+            ".",
+            "\"",
+            "\u201d.",
+            "!\u201d"
+          ],
+          "top_token_ids": [
+            11,
+            218194,
+            222825,
+            20564,
+            13,
+            1,
+            10878,
+            17306
+          ],
+          "top_dlogp": [
+            0.1933155059814453,
+            0.1338348388671875,
+            0.13195419311523438,
+            0.13165855407714844,
+            0.12814903259277344,
+            0.12761497497558594,
+            0.1263408660888672,
+            0.1255970001220703
+          ]
+        },
+        {
+          "theta": -2.8797932657906435,
+          "top_tokens": [
+            ",",
+            "...\u201d",
+            "...\"",
+            "!\u201d.",
+            ",\u2014",
+            "\u2026\u201d",
+            "!\u201d",
+            "\u2026\""
+          ],
+          "top_token_ids": [
+            11,
+            218194,
+            20564,
+            222825,
+            91814,
+            48493,
+            17306,
+            53259
+          ],
+          "top_dlogp": [
+            0.1907815933227539,
+            0.14165115356445312,
+            0.13010597229003906,
+            0.1294879913330078,
+            0.12780380249023438,
+            0.12752532958984375,
+            0.126953125,
+            0.12353515625
+          ]
+        },
+        {
+          "theta": -2.6179938779914944,
+          "top_tokens": [
+            ",",
+            ",\u2014",
+            "...\u201d",
+            "\u2026\u201d",
+            "\u2026\u00bb",
+            "\u03c0\u03c4",
+            "\u2026\"",
+            "\u2026)."
+          ],
+          "top_token_ids": [
+            11,
+            91814,
+            218194,
+            48493,
+            232166,
+            152015,
+            53259,
+            201474
+          ],
+          "top_dlogp": [
+            0.1740131378173828,
+            0.14624786376953125,
+            0.14412307739257812,
+            0.1419811248779297,
+            0.13243484497070312,
+            0.13021278381347656,
+            0.1295318603515625,
+            0.12666893005371094
+          ]
+        },
+        {
+          "theta": -2.356194490192345,
+          "top_tokens": [
+            "\u2026\u201d",
+            ",\u2014",
+            "\u2026**",
+            ",",
+            "\u2026\u00bb",
+            "...\u201d",
+            "\u2026\"",
+            "\u03c0\u03c4"
+          ],
+          "top_token_ids": [
+            48493,
+            91814,
+            193691,
+            11,
+            232166,
+            218194,
+            53259,
+            152015
+          ],
+          "top_dlogp": [
+            0.1503620147705078,
+            0.14716529846191406,
+            0.1458568572998047,
+            0.14462566375732422,
+            0.1432952880859375,
+            0.13732528686523438,
+            0.131011962890625,
+            0.13080215454101562
+          ]
+        },
+        {
+          "theta": -2.0943951023931957,
+          "top_tokens": [
+            "\u2026**",
+            "\u2026*",
+            "\u2026\u00bb",
+            "\u2026\u201d",
+            " \u2013**",
+            ",\u2014",
+            "**\u201d",
+            "**\u2013"
+          ],
+          "top_token_ids": [
+            193691,
+            207961,
+            232166,
+            48493,
+            184142,
+            91814,
+            187237,
+            180201
+          ],
+          "top_dlogp": [
+            0.17455101013183594,
+            0.14908981323242188,
+            0.1473827362060547,
+            0.1459980010986328,
+            0.1454486846923828,
+            0.14406585693359375,
+            0.1426830291748047,
+            0.14245223999023438
+          ]
+        },
+        {
+          "theta": -1.8325957145940461,
+          "top_tokens": [
+            "\u2026**",
+            " \u2013**",
+            "\u2026*",
+            "**\u2013",
+            "**\u201d",
+            "\u7f2d",
+            " **\u2018",
+            "...**"
+          ],
+          "top_token_ids": [
+            193691,
+            184142,
+            207961,
+            180201,
+            187237,
+            100530,
+            209336,
+            192549
+          ],
+          "top_dlogp": [
+            0.18600845336914062,
+            0.1717205047607422,
+            0.16559791564941406,
+            0.14955520629882812,
+            0.14369583129882812,
+            0.14172935485839844,
+            0.14099502563476562,
+            0.1401348114013672
+          ]
+        },
+        {
+          "theta": -1.5707963267948966,
+          "top_tokens": [
+            "\u2026**",
+            " \u2013**",
+            "\u2026*",
+            " **[",
+            "**\u2013",
+            "\u7f2d",
+            " **\u2018",
+            "_________"
+          ],
+          "top_token_ids": [
+            193691,
+            184142,
+            207961,
+            176217,
+            180201,
+            100530,
+            209336,
+            218758
+          ],
+          "top_dlogp": [
+            0.19034194946289062,
+            0.18962669372558594,
+            0.17396163940429688,
+            0.16162109375,
+            0.14938926696777344,
+            0.1470050811767578,
+            0.1454944610595703,
+            0.1434764862060547
+          ]
+        },
+        {
+          "theta": -1.3089969389957472,
+          "top_tokens": [
+            " \u2013**",
+            "\u2026**",
+            " **[",
+            "\u2026*",
+            "(/^\\",
+            "  \n  \n",
+            " excav",
+            "_________"
+          ],
+          "top_token_ids": [
+            184142,
+            193691,
+            176217,
+            207961,
+            88722,
+            29773,
+            42650,
+            218758
+          ],
+          "top_dlogp": [
+            0.19611740112304688,
+            0.18421363830566406,
+            0.17271804809570312,
+            0.17197799682617188,
+            0.15665817260742188,
+            0.15355300903320312,
+            0.15119171142578125,
+            0.1501941680908203
+          ]
+        },
+        {
+          "theta": -1.0471975511965979,
+          "top_tokens": [
+            " \u2013**",
+            " **[",
+            "(/^\\",
+            "  \n  \n",
+            "\u2026**",
+            "  \n\n",
+            "\u2026*",
+            "(redis"
+          ],
+          "top_token_ids": [
+            184142,
+            176217,
+            88722,
+            29773,
+            193691,
+            18050,
+            207961,
+            94304
+          ],
+          "top_dlogp": [
+            0.1913318634033203,
+            0.17238998413085938,
+            0.1712799072265625,
+            0.16876983642578125,
+            0.16348838806152344,
+            0.16245079040527344,
+            0.1602153778076172,
+            0.1584949493408203
+          ]
+        },
+        {
+          "theta": -0.7853981633974483,
+          "top_tokens": [
+            " Frederick",
+            "(/^\\",
+            " :\\",
+            "  \n\n",
+            " .**",
+            " \u2013**",
+            " :*",
+            "  \n  \n"
+          ],
+          "top_token_ids": [
+            48959,
+            88722,
+            80093,
+            18050,
+            194805,
+            184142,
+            208683,
+            29773
+          ],
+          "top_dlogp": [
+            0.1770343780517578,
+            0.1745128631591797,
+            0.17335128784179688,
+            0.17162513732910156,
+            0.16968727111816406,
+            0.1689472198486328,
+            0.16713905334472656,
+            0.1670970916748047
+          ]
+        },
+        {
+          "theta": -0.5235987755982991,
+          "top_tokens": [
+            " Frederick",
+            "  \n\n",
+            " .**",
+            " Fr\u00e9d",
+            " :*",
+            " :\\",
+            "\u957f\u4e50",
+            "\u82b7"
+          ],
+          "top_token_ids": [
+            48959,
+            18050,
+            194805,
+            168293,
+            208683,
+            80093,
+            140415,
+            107938
+          ],
+          "top_dlogp": [
+            0.19194507598876953,
+            0.17917633056640625,
+            0.1787242889404297,
+            0.17661285400390625,
+            0.17528724670410156,
+            0.17506027221679688,
+            0.17215347290039062,
+            0.1717987060546875
+          ]
+        },
+        {
+          "theta": -0.2617993877991496,
+          "top_tokens": [
+            " Frederick",
+            " Perkins",
+            " Gow",
+            "\u82b7",
+            " Booker",
+            " Fr\u00e9d",
+            " Isaac",
+            "  \n\n"
+          ],
+          "top_token_ids": [
+            48959,
+            62715,
+            89279,
+            107938,
+            62798,
+            168293,
+            40134,
+            18050
+          ],
+          "top_dlogp": [
+            0.19148921966552734,
+            0.18105697631835938,
+            0.17898178100585938,
+            0.1788196563720703,
+            0.17823219299316406,
+            0.17816734313964844,
+            0.17670440673828125,
+            0.17589187622070312
+          ]
+        },
+        {
+          "theta": 0.0,
+          "top_tokens": [
+            " Booker",
+            " Isaac",
+            " Perkins",
+            " Frederick",
+            " Rick",
+            " Gow",
+            " Carey",
+            "\u82b7"
+          ],
+          "top_token_ids": [
+            62798,
+            40134,
+            62715,
+            48959,
+            21690,
+            89279,
+            63016,
+            107938
+          ],
+          "top_dlogp": [
+            0.196502685546875,
+            0.18277740478515625,
+            0.18209457397460938,
+            0.1792144775390625,
+            0.17811012268066406,
+            0.1779022216796875,
+            0.1745433807373047,
+            0.1735992431640625
+          ]
+        },
+        {
+          "theta": 0.26179938779914913,
+          "top_tokens": [
+            " Booker",
+            " Authors",
+            " Rick",
+            " Fr\u00e9d\u00e9ric",
+            " Isaac",
+            " Zheng",
+            " Perkins",
+            " Loren"
+          ],
+          "top_token_ids": [
+            62798,
+            23369,
+            21690,
+            227628,
+            40134,
+            73832,
+            62715,
+            49468
+          ],
+          "top_dlogp": [
+            0.198822021484375,
+            0.18599510192871094,
+            0.1830463409423828,
+            0.18038177490234375,
+            0.17831993103027344,
+            0.1762256622314453,
+            0.1730632781982422,
+            0.16970062255859375
+          ]
+        },
+        {
+          "theta": 0.5235987755982987,
+          "top_tokens": [
+            " Authors",
+            " Booker",
+            " Fr\u00e9d\u00e9ric",
+            " Zheng",
+            " Rick",
+            " Later",
+            " Zhao",
+            " Also"
+          ],
+          "top_token_ids": [
+            23369,
+            62798,
+            227628,
+            73832,
+            21690,
+            24095,
+            66935,
+            7054
+          ],
+          "top_dlogp": [
+            0.20223617553710938,
+            0.19226837158203125,
+            0.17736244201660156,
+            0.1763286590576172,
+            0.1753244400024414,
+            0.1741504669189453,
+            0.17329978942871094,
+            0.17285728454589844
+          ]
+        },
+        {
+          "theta": 0.7853981633974478,
+          "top_tokens": [
+            " Authors",
+            " Beng",
+            " Comment",
+            " Writer",
+            " Metrics",
+            " Crit",
+            " Labels",
+            " Aria"
+          ],
+          "top_token_ids": [
+            23369,
+            24448,
+            11905,
+            28444,
+            52369,
+            32104,
+            58941,
+            215413
+          ],
+          "top_dlogp": [
+            0.20027923583984375,
+            0.18375015258789062,
+            0.18355369567871094,
+            0.17908668518066406,
+            0.17769813537597656,
+            0.17694664001464844,
+            0.176422119140625,
+            0.17575454711914062
+          ]
+        },
+        {
+          "theta": 1.0471975511965974,
+          "top_tokens": [
+            " Metrics",
+            " Authors",
+            " Comment",
+            " Beng",
+            " Comments",
+            " Writer",
+            " Attacks",
+            " Dialogue"
+          ],
+          "top_token_ids": [
+            52369,
+            23369,
+            11905,
+            24448,
+            17155,
+            28444,
+            63910,
+            67137
+          ],
+          "top_dlogp": [
+            0.19343948364257812,
+            0.19341659545898438,
+            0.19312477111816406,
+            0.18890762329101562,
+            0.1820526123046875,
+            0.18071556091308594,
+            0.1806354522705078,
+            0.17792320251464844
+          ]
+        },
+        {
+          "theta": 1.3089969389957465,
+          "top_tokens": [
+            " Metrics",
+            " Comment",
+            " Beng",
+            " Dialogue",
+            " Attributes",
+            " Values",
+            " Attacks",
+            " Label"
+          ],
+          "top_token_ids": [
+            52369,
+            11905,
+            24448,
+            67137,
+            32998,
+            24188,
+            63910,
+            9123
+          ],
+          "top_dlogp": [
+            0.1973590850830078,
+            0.18771743774414062,
+            0.18501853942871094,
+            0.18262290954589844,
+            0.18069076538085938,
+            0.18021202087402344,
+            0.17951583862304688,
+            0.17769432067871094
+          ]
+        },
+        {
+          "theta": 1.5707963267948966,
+          "top_tokens": [
+            " Metrics",
+            " Dialogue",
+            " Attributes",
+            " Values",
+            " Comment",
+            " Arguments",
+            " Collapse",
+            " Attacks"
+          ],
+          "top_token_ids": [
+            52369,
+            67137,
+            32998,
+            24188,
+            11905,
+            26804,
+            73227,
+            63910
+          ],
+          "top_dlogp": [
+            0.1884613037109375,
+            0.17658615112304688,
+            0.1745014190673828,
+            0.17101669311523438,
+            0.17037010192871094,
+            0.16800308227539062,
+            0.16791534423828125,
+            0.1674633026123047
+          ]
+        },
+        {
+          "theta": 1.8325957145940457,
+          "top_tokens": [
+            "ergic",
+            "-Agent",
+            " Defensive",
+            "\u8fc7\u654f",
+            " Metrics",
+            "-Russian",
+            " Psychological",
+            " Attributes"
+          ],
+          "top_token_ids": [
+            71811,
+            43612,
+            67773,
+            100972,
+            52369,
+            81138,
+            66635,
+            32998
+          ],
+          "top_dlogp": [
+            0.17897415161132812,
+            0.1748981475830078,
+            0.17293930053710938,
+            0.17232322692871094,
+            0.16997146606445312,
+            0.16446876525878906,
+            0.1603546142578125,
+            0.1586761474609375
+          ]
+        },
+        {
+          "theta": 2.094395102393195,
+          "top_tokens": [
+            "ergic",
+            "-Agent",
+            " Defensive",
+            "\u8fc7\u654f",
+            "-Russian",
+            " allergic",
+            " Alabama",
+            "agnol"
+          ],
+          "top_token_ids": [
+            71811,
+            43612,
+            67773,
+            100972,
+            81138,
+            54602,
+            19998,
+            205497
+          ],
+          "top_dlogp": [
+            0.18274879455566406,
+            0.1766986846923828,
+            0.1714935302734375,
+            0.16902923583984375,
+            0.16863632202148438,
+            0.15775299072265625,
+            0.1559009552001953,
+            0.15209388732910156
+          ]
+        },
+        {
+          "theta": 2.356194490192345,
+          "top_tokens": [
+            "ergic",
+            "-Agent",
+            "-Russian",
+            " Defensive",
+            "\u8fc7\u654f",
+            " allergic",
+            "UE",
+            "\")."
+          ],
+          "top_token_ids": [
+            71811,
+            43612,
+            81138,
+            67773,
+            100972,
+            54602,
+            2158,
+            1764
+          ],
+          "top_dlogp": [
+            0.17336654663085938,
+            0.16948509216308594,
+            0.16107559204101562,
+            0.15588760375976562,
+            0.1528644561767578,
+            0.1517181396484375,
+            0.14734458923339844,
+            0.14641761779785156
+          ]
+        },
+        {
+          "theta": 2.617993877991494,
+          "top_tokens": [
+            ",",
+            "ergic",
+            "-Agent",
+            "\").",
+            "-Russian",
+            "\"",
+            "\".",
+            "\u71d5\u9ea6"
+          ],
+          "top_token_ids": [
+            11,
+            71811,
+            43612,
+            1764,
+            81138,
+            1,
+            3158,
+            128140
+          ],
+          "top_dlogp": [
+            0.16321945190429688,
+            0.1535167694091797,
+            0.15112876892089844,
+            0.1462535858154297,
+            0.14361000061035156,
+            0.1432056427001953,
+            0.14142990112304688,
+            0.138946533203125
+          ]
+        },
+        {
+          "theta": 2.879793265790643,
+          "top_tokens": [
+            ",",
+            "\"",
+            "\").",
+            "/dashboard",
+            ".",
+            "\".",
+            "\u71d5\u9ea6",
+            "\u201d."
+          ],
+          "top_token_ids": [
+            11,
+            1,
+            1764,
+            39802,
+            13,
+            3158,
+            128140,
+            10878
+          ],
+          "top_dlogp": [
+            0.1845235824584961,
+            0.14050769805908203,
+            0.1345367431640625,
+            0.13448333740234375,
+            0.13362789154052734,
+            0.13214874267578125,
+            0.1305065155029297,
+            0.12827491760253906
+          ]
+        }
+      ],
+      "distinct_top1_tokens_over_angles": 9
+    },
+    {
+      "block": 12719,
+      "bins": [
+        {
+          "theta": -3.141592653589793,
+          "top_tokens": [
+            ",",
+            "\u060c",
+            ".",
+            "-hero",
+            "-ul",
+            ":",
+            "\u03b2",
+            "\u80c3"
+          ],
+          "top_token_ids": [
+            11,
+            66459,
+            13,
+            88628,
+            62773,
+            25,
+            49531,
+            97777
+          ],
+          "top_dlogp": [
+            0.23850059509277344,
+            0.13163375854492188,
+            0.13148784637451172,
+            0.13133621215820312,
+            0.1272258758544922,
+            0.1262226104736328,
+            0.12539100646972656,
+            0.12376785278320312
+          ]
+        },
+        {
+          "theta": -2.8797932657906435,
+          "top_tokens": [
+            ",",
+            "\u060c",
+            "\ufffd",
+            "\uff0c",
+            "-ul",
+            "\u03c8",
+            "\u2014if",
+            "-national"
+          ],
+          "top_token_ids": [
+            11,
+            66459,
+            138,
+            3709,
+            62773,
+            151339,
+            86674,
+            71993
+          ],
+          "top_dlogp": [
+            0.2826824188232422,
+            0.16062355041503906,
+            0.15179443359375,
+            0.14660072326660156,
+            0.14620018005371094,
+            0.1425952911376953,
+            0.14164352416992188,
+            0.14151573181152344
+          ]
+        },
+        {
+          "theta": -2.6179938779914944,
+          "top_tokens": [
+            ",",
+            "\u060c",
+            "\uff0c",
+            "\ufffd",
+            "\u03c8",
+            " \u03c8",
+            ";",
+            "\u2014at"
+          ],
+          "top_token_ids": [
+            11,
+            66459,
+            3709,
+            138,
+            151339,
+            164119,
+            26,
+            95060
+          ],
+          "top_dlogp": [
+            0.3155403137207031,
+            0.18400192260742188,
+            0.17325782775878906,
+            0.1731586456298828,
+            0.171051025390625,
+            0.16310501098632812,
+            0.16199588775634766,
+            0.160614013671875
+          ]
+        },
+        {
+          "theta": -2.356194490192345,
+          "top_tokens": [
+            ",",
+            "\u060c",
+            "\u03c8",
+            " \u03c8",
+            "\ufffd",
+            ";",
+            "\uff0c",
+            "\u6751\u5b98"
+          ],
+          "top_token_ids": [
+            11,
+            66459,
+            151339,
+            164119,
+            138,
+            26,
+            3709,
+            131124
+          ],
+          "top_dlogp": [
+            0.3189258575439453,
+            0.18808555603027344,
+            0.18692970275878906,
+            0.18567276000976562,
+            0.179718017578125,
+            0.17952537536621094,
+            0.1792163848876953,
+            0.17549514770507812
+          ]
+        },
+        {
+          "theta": -2.0943951023931957,
+          "top_tokens": [
+            ",",
+            " \u03c8",
+            "\u03c8",
+            ";",
+            "\u060c",
+            "\u6751\u5b98",
+            "\uff0c",
+            "ergi"
+          ],
+          "top_token_ids": [
+            11,
+            164119,
+            151339,
+            26,
+            66459,
+            131124,
+            3709,
+            159429
+          ],
+          "top_dlogp": [
+            0.3052492141723633,
+            0.1937236785888672,
+            0.18914413452148438,
+            0.1861104965209961,
+            0.18309593200683594,
+            0.18083953857421875,
+            0.18063735961914062,
+            0.17610549926757812
+          ]
+        },
+        {
+          "theta": -1.8325957145940461,
+          "top_tokens": [
+            ",",
+            " \u03c8",
+            ";",
+            "\u03c8",
+            "\ufffd",
+            "ergi",
+            "\u6751\u5b98",
+            "\u7845\u85fb"
+          ],
+          "top_token_ids": [
+            11,
+            164119,
+            26,
+            151339,
+            95830,
+            159429,
+            131124,
+            137992
+          ],
+          "top_dlogp": [
+            0.27155494689941406,
+            0.18866348266601562,
+            0.184478759765625,
+            0.18093299865722656,
+            0.1800384521484375,
+            0.17813491821289062,
+            0.17727088928222656,
+            0.16917991638183594
+          ]
+        },
+        {
+          "theta": -1.5707963267948966,
+          "top_tokens": [
+            ",",
+            "\ufffd",
+            " \u03c8",
+            " Lob",
+            ";",
+            "ergi",
+            " Protestant",
+            "\u6751\u5b98"
+          ],
+          "top_token_ids": [
+            11,
+            95830,
+            164119,
+            65239,
+            26,
+            159429,
+            57637,
+            131124
+          ],
+          "top_dlogp": [
+            0.21772384643554688,
+            0.17862319946289062,
+            0.172607421875,
+            0.1709766387939453,
+            0.16680908203125,
+            0.16364288330078125,
+            0.16235733032226562,
+            0.15940475463867188
+          ]
+        },
+        {
+          "theta": -1.3089969389957472,
+          "top_tokens": [
+            " Lob",
+            "\ufffd",
+            " Protestant",
+            " parish",
+            "\u5a18\u5bb6",
+            "\u516d\u4e03",
+            " Walnut",
+            " Cooperative"
+          ],
+          "top_token_ids": [
+            65239,
+            95830,
+            57637,
+            49475,
+            129109,
+            130584,
+            82263,
+            82745
+          ],
+          "top_dlogp": [
+            0.1826190948486328,
+            0.1682415008544922,
+            0.1613445281982422,
+            0.15664291381835938,
+            0.1544780731201172,
+            0.15398788452148438,
+            0.15117835998535156,
+            0.15116500854492188
+          ]
+        },
+        {
+          "theta": -1.0471975511965979,
+          "top_tokens": [
+            " Lob",
+            " Roosevelt",
+            " Boh",
+            " Assy",
+            " Walnut",
+            " parish",
+            " churches",
+            " Desmond"
+          ],
+          "top_token_ids": [
+            65239,
+            44409,
+            49623,
+            93669,
+            82263,
+            49475,
+            28935,
+            93188
+          ],
+          "top_dlogp": [
+            0.18747329711914062,
+            0.16660499572753906,
+            0.15970420837402344,
+            0.15534400939941406,
+            0.15470314025878906,
+            0.15321922302246094,
+            0.15220260620117188,
+            0.15061187744140625
+          ]
+        },
+        {
+          "theta": -0.7853981633974483,
+          "top_tokens": [
+            " Lob",
+            " Assy",
+            " Roosevelt",
+            " Desmond",
+            " Boh",
+            " Augustine",
+            " Perkins",
+            " Consequently"
+          ],
+          "top_token_ids": [
+            65239,
+            93669,
+            44409,
+            93188,
+            49623,
+            70967,
+            62715,
+            50275
+          ],
+          "top_dlogp": [
+            0.17720603942871094,
+            0.17413711547851562,
+            0.17348670959472656,
+            0.167877197265625,
+            0.1645355224609375,
+            0.1573162078857422,
+            0.15730667114257812,
+            0.1555042266845703
+          ]
+        },
+        {
+          "theta": -0.5235987755982991,
+          "top_tokens": [
+            " Assy",
+            " Perkins",
+            " Desmond",
+            " Roosevelt",
+            "\ufffd",
+            " Wick",
+            " moreover",
+            " Carey"
+          ],
+          "top_token_ids": [
+            93669,
+            62715,
+            93188,
+            44409,
+            96169,
+            71586,
+            42104,
+            63016
+          ],
+          "top_dlogp": [
+            0.1848316192626953,
+            0.1820659637451172,
+            0.17431068420410156,
+            0.17119598388671875,
+            0.1708812713623047,
+            0.1668701171875,
+            0.16204833984375,
+            0.1611156463623047
+          ]
+        },
+        {
+          "theta": -0.2617993877991496,
+          "top_tokens": [
+            " Perkins",
+            " Booker",
+            " Phelps",
+            " Assy",
+            "  \n\n",
+            " Wick",
+            "\ufffd",
+            " moreover"
+          ],
+          "top_token_ids": [
+            62715,
+            62798,
+            94152,
+            93669,
+            18050,
+            71586,
+            96169,
+            42104
+          ],
+          "top_dlogp": [
+            0.19521331787109375,
+            0.18911361694335938,
+            0.18397903442382812,
+            0.18262672424316406,
+            0.1812419891357422,
+            0.1805744171142578,
+            0.1793537139892578,
+            0.17731475830078125
+          ]
+        },
+        {
+          "theta": 0.0,
+          "top_tokens": [
+            " Booker",
+            " Isaac",
+            " Gow",
+            "\u82b7",
+            " :\\",
+            " Zheng",
+            " Phelps",
+            " Frederick"
+          ],
+          "top_token_ids": [
+            62798,
+            40134,
+            89279,
+            107938,
+            80093,
+            73832,
+            94152,
+            48959
+          ],
+          "top_dlogp": [
+            0.22352027893066406,
+            0.2100048065185547,
+            0.2041797637939453,
+            0.19760513305664062,
+            0.19653701782226562,
+            0.19629669189453125,
+            0.1958751678466797,
+            0.19509124755859375
+          ]
+        },
+        {
+          "theta": 0.26179938779914913,
+          "top_tokens": [
+            " Booker",
+            " Isaac",
+            " :\\",
+            " Clarkson",
+            " Gow",
+            " Hao",
+            " :*",
+            " Fr\u00e9d\u00e9ric"
+          ],
+          "top_token_ids": [
+            62798,
+            40134,
+            80093,
+            89984,
+            89279,
+            90479,
+            208683,
+            227628
+          ],
+          "top_dlogp": [
+            0.24481201171875,
+            0.24304771423339844,
+            0.23754501342773438,
+            0.22990703582763672,
+            0.22938156127929688,
+            0.22837448120117188,
+            0.22562026977539062,
+            0.22192955017089844
+          ]
+        },
+        {
+          "theta": 0.5235987755982987,
+          "top_tokens": [
+            " :\\",
+            " Isaac",
+            " Hao",
+            " :*",
+            " Booker",
+            " Clarkson",
+            " [:",
+            " Gow"
+          ],
+          "top_token_ids": [
+            80093,
+            40134,
+            90479,
+            208683,
+            62798,
+            89984,
+            20229,
+            89279
+          ],
+          "top_dlogp": [
+            0.2638835906982422,
+            0.2612895965576172,
+            0.25345420837402344,
+            0.2519702911376953,
+            0.2503986358642578,
+            0.24854278564453125,
+            0.24660301208496094,
+            0.23830795288085938
+          ]
+        },
+        {
+          "theta": 0.7853981633974478,
+          "top_tokens": [
+            " :\\",
+            " [:",
+            " :*",
+            " Hao",
+            " Isaac",
+            " Clarkson",
+            " :",
+            " Iris"
+          ],
+          "top_token_ids": [
+            80093,
+            20229,
+            208683,
+            90479,
+            40134,
+            89984,
+            535,
+            63506
+          ],
+          "top_dlogp": [
+            0.27243995666503906,
+            0.2680625915527344,
+            0.26043128967285156,
+            0.25826263427734375,
+            0.2572345733642578,
+            0.2518768310546875,
+            0.24621200561523438,
+            0.2418975830078125
+          ]
+        },
+        {
+          "theta": 1.0471975511965974,
+          "top_tokens": [
+            " [:",
+            " :\\",
+            " :",
+            " Hao",
+            " :*",
+            " Anime",
+            " anthology",
+            " Album"
+          ],
+          "top_token_ids": [
+            20229,
+            80093,
+            535,
+            90479,
+            208683,
+            49395,
+            80141,
+            24847
+          ],
+          "top_dlogp": [
+            0.2714691162109375,
+            0.2600574493408203,
+            0.2584848403930664,
+            0.25030517578125,
+            0.2484149932861328,
+            0.24158668518066406,
+            0.24142074584960938,
+            0.2410144805908203
+          ]
+        },
+        {
+          "theta": 1.3089969389957465,
+          "top_tokens": [
+            " [:",
+            " :",
+            " anthology",
+            " Anime",
+            " Album",
+            " anime",
+            " Albums",
+            " Showcase"
+          ],
+          "top_token_ids": [
+            20229,
+            535,
+            80141,
+            49395,
+            24847,
+            22099,
+            83731,
+            84059
+          ],
+          "top_dlogp": [
+            0.25535011291503906,
+            0.2545509338378906,
+            0.24845504760742188,
+            0.2438335418701172,
+            0.2431011199951172,
+            0.23789215087890625,
+            0.23549652099609375,
+            0.2344970703125
+          ]
+        },
+        {
+          "theta": 1.5707963267948966,
+          "top_tokens": [
+            " anthology",
+            " anime",
+            " Anime",
+            " :",
+            " Album",
+            " album",
+            " scanner",
+            " Albums"
+          ],
+          "top_token_ids": [
+            80141,
+            22099,
+            49395,
+            535,
+            24847,
+            7766,
+            20142,
+            83731
+          ],
+          "top_dlogp": [
+            0.23920059204101562,
+            0.23644638061523438,
+            0.23430442810058594,
+            0.23139667510986328,
+            0.22910118103027344,
+            0.22902870178222656,
+            0.2265644073486328,
+            0.2223796844482422
+          ]
+        },
+        {
+          "theta": 1.8325957145940457,
+          "top_tokens": [
+            " anime",
+            " anthology",
+            " album",
+            " Anime",
+            " scanner",
+            "\u66dd",
+            " Album",
+            " Albums"
+          ],
+          "top_token_ids": [
+            22099,
+            80141,
+            7766,
+            49395,
+            20142,
+            102906,
+            24847,
+            83731
+          ],
+          "top_dlogp": [
+            0.21734619140625,
+            0.2154521942138672,
+            0.20895767211914062,
+            0.20842552185058594,
+            0.2075366973876953,
+            0.20498085021972656,
+            0.20132064819335938,
+            0.1967449188232422
+          ]
+        },
+        {
+          "theta": 2.094395102393195,
+          "top_tokens": [
+            " anime",
+            "\u66dd",
+            " banner",
+            " sweep",
+            " anthology",
+            " album",
+            " scanner",
+            " Eclipse"
+          ],
+          "top_token_ids": [
+            22099,
+            102906,
+            22598,
+            22424,
+            80141,
+            7766,
+            20142,
+            34928
+          ],
+          "top_dlogp": [
+            0.18199920654296875,
+            0.17997360229492188,
+            0.179107666015625,
+            0.175048828125,
+            0.17496871948242188,
+            0.17470741271972656,
+            0.1731128692626953,
+            0.17296218872070312
+          ]
+        },
+        {
+          "theta": 2.356194490192345,
+          "top_tokens": [
+            " banner",
+            "...\",",
+            " sweep",
+            "\u66dd",
+            " splash",
+            " cassette",
+            " Eclipse",
+            " anime"
+          ],
+          "top_token_ids": [
+            22598,
+            45279,
+            22424,
+            102906,
+            33486,
+            78456,
+            34928,
+            22099
+          ],
+          "top_dlogp": [
+            0.15386581420898438,
+            0.14658355712890625,
+            0.1465301513671875,
+            0.14022254943847656,
+            0.13946151733398438,
+            0.1370830535888672,
+            0.1368560791015625,
+            0.13678932189941406
+          ]
+        },
+        {
+          "theta": 2.617993877991494,
+          "top_tokens": [
+            "/dashboard",
+            "...\",",
+            " splash",
+            "...\"",
+            "imator",
+            "...\u201d",
+            " banner",
+            "...)."
+          ],
+          "top_token_ids": [
+            39802,
+            45279,
+            33486,
+            20564,
+            13296,
+            218194,
+            22598,
+            211178
+          ],
+          "top_dlogp": [
+            0.13245391845703125,
+            0.1257171630859375,
+            0.12136077880859375,
+            0.11988258361816406,
+            0.11865234375,
+            0.11595344543457031,
+            0.11480331420898438,
+            0.11359786987304688
+          ]
+        },
+        {
+          "theta": 2.879793265790643,
+          "top_tokens": [
+            ",",
+            "/dashboard",
+            "-hero",
+            "-flash",
+            "\u03c0\u03c4",
+            "\u80c3",
+            ".",
+            "/#{"
+          ],
+          "top_token_ids": [
+            11,
+            39802,
+            88628,
+            89681,
+            152015,
+            97777,
+            13,
+            41431
+          ],
+          "top_dlogp": [
+            0.17317676544189453,
+            0.13283920288085938,
+            0.12058639526367188,
+            0.11794090270996094,
+            0.11469078063964844,
+            0.11388206481933594,
+            0.11293792724609375,
+            0.10910797119140625
+          ]
+        }
+      ],
+      "distinct_top1_tokens_over_angles": 11
+    }
+  ]
+}

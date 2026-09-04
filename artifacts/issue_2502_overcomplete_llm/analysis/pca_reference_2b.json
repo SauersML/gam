@@ -1,0 +1,24 @@
+{
+  "source": "numpy eigh of the train second moment (exact PCA comparator)",
+  "n_train": 300000,
+  "n_eval": 100000,
+  "p": 2048,
+  "eigenvalue_mass_top16": 0.24609364633921296,
+  "eigenvalue_mass_top32": 0.33088601220339653,
+  "ranks": {
+    "25": {
+      "rank": 25,
+      "heldout_fvu": 0.7073464786281349,
+      "heldout_explained_variance": 0.29265352137186507,
+      "active_scalars_per_token": 25,
+      "selection_bits_per_token": 0.0
+    },
+    "50": {
+      "rank": 50,
+      "heldout_fvu": 0.6169950195377502,
+      "heldout_explained_variance": 0.38300498046224984,
+      "active_scalars_per_token": 50,
+      "selection_bits_per_token": 0.0
+    }
+  }
+}

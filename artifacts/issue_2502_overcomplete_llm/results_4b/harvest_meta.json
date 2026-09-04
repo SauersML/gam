@@ -1,0 +1,20 @@
+{
+  "model": "Qwen/Qwen3.5-4B-Base",
+  "dataset": "Salesforce/wikitext/wikitext-103-raw-v1:train",
+  "layer": 16,
+  "block_path": "model.layers",
+  "hidden_size": 2560,
+  "seq_len": 512,
+  "skip_positions": 8,
+  "train_rows": 300000,
+  "eval_rows": 100000,
+  "eval_sequences": 199,
+  "articles_seen": 29444,
+  "articles_used_train": 22037,
+  "articles_used_eval": 7407,
+  "articles_in_both": 0,
+  "eval_doc_frac": 0.25,
+  "split_rule": "md5(str(doc_index))[:8]/2**32 < eval_doc_frac",
+  "torch": "2.14.0+cu126",
+  "wall_seconds": 162.87089276313782
+}

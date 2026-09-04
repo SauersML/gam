@@ -1,0 +1,137 @@
+{
+  "arm": "seedpair_coordinate",
+  "crate_version": "0.3.154",
+  "dictionary": {
+    "G_blocks": 4096,
+    "K_atoms": 8192,
+    "block_size": 2,
+    "block_topk": 8,
+    "decoder_bytes": 83886080,
+    "decoder_bytes_expected": 83886080,
+    "gamma": 0.20187437534332275,
+    "overcomplete_ratio_K_over_p": 3.2,
+    "train_mean_bytes": 10240
+  },
+  "engine": "gam_sae::sparse_dict::BlockSparseStreamState",
+  "epochs": [
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 3064,
+      "epoch": 1,
+      "gamma": 0.2239937037229538,
+      "seconds": 76.393959594,
+      "train_explained_variance": -0.5659869482571633
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 3167,
+      "epoch": 2,
+      "gamma": 0.30978384613990784,
+      "seconds": 149.591234986,
+      "train_explained_variance": 0.15616641242871998
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 3167,
+      "epoch": 3,
+      "gamma": 0.1903892308473587,
+      "seconds": 229.594833631,
+      "train_explained_variance": 0.17540678458781211
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 3167,
+      "epoch": 4,
+      "gamma": 0.18402639031410217,
+      "seconds": 298.655773536,
+      "train_explained_variance": 0.1580333245419011
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 3167,
+      "epoch": 5,
+      "gamma": 0.20361557602882385,
+      "seconds": 369.074261974,
+      "train_explained_variance": 0.23987885182485602
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 3167,
+      "epoch": 6,
+      "gamma": 0.1924719214439392,
+      "seconds": 443.040689192,
+      "train_explained_variance": 0.24924201014510772
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 3167,
+      "epoch": 7,
+      "gamma": 0.1950400024652481,
+      "seconds": 516.810617283,
+      "train_explained_variance": 0.22613502132937557
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 3167,
+      "epoch": 8,
+      "gamma": 0.20187437534332275,
+      "seconds": 597.293193904,
+      "train_explained_variance": 0.24683932706320055
+    }
+  ],
+  "fit": {
+    "aux_k": 0,
+    "converged": false,
+    "device_admitted": true,
+    "epochs_run": 8,
+    "gpu_policy": "Off",
+    "seed_coordinate_fallback_blocks": 0,
+    "seed_policy": "Coordinate",
+    "train_explained_variance": 0.24683932706320055,
+    "train_seconds": 596.349919055
+  },
+  "heldout": {
+    "explained_variance": 0.19088651251572963,
+    "explained_variance_joint_ls": 0.28010350554944496,
+    "fvu": 0.8091134874842704,
+    "fvu_about_train_mean": 0.804077349531231,
+    "fvu_joint_ls": 0.719896494450555,
+    "rows_scored": 100000,
+    "rss": 7695079.0408501495,
+    "rss_joint_ls": 6846580.2532251775,
+    "seconds": 63.905709299,
+    "tss_about_eval_mean": 9510506.449195419,
+    "tss_about_train_mean": 9570073.134551425
+  },
+  "inputs": {
+    "eval": "/scratch.global/sauer354/a5acts/eval.npy",
+    "n_eval": 100000,
+    "n_train": 100000,
+    "p": 2560,
+    "train": "/scratch.global/sauer354/a5acts/train.npy"
+  },
+  "issue": 2502,
+  "overcompleteness": {
+    "G_blocks": 4096,
+    "K_atoms": 8192,
+    "ambient_p": 2560,
+    "atoms_used_exceeds_ambient_p": false,
+    "atoms_used_on_heldout": 1858,
+    "blocks_used_on_heldout": 929,
+    "note": "atoms_used > p implies the used sub-dictionary is linearly dependent"
+  },
+  "rate": {
+    "active_scalars_per_token": 16,
+    "firings_per_token": 8,
+    "selection_bits_per_token": 96.0
+  },
+  "wall_seconds": 661.403642414
+}

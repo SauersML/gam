@@ -39,6 +39,12 @@ def parse_args():
     return ap.parse_args()
 
 
+def best_fvu(entry):
+    """The gamma-free least-squares decode where the arm has one, else its own."""
+    h = entry["heldout"]
+    return h.get("fvu_joint_ls", h["fvu"])
+
+
 def load_dump(fit_dir, k, b):
     blocks = np.fromfile(os.path.join(fit_dir, "eval_blocks.u32"), dtype=np.uint32)
     codes = np.fromfile(os.path.join(fit_dir, "eval_codes.f32"), dtype=np.float32)
@@ -46,7 +52,7 @@ def load_dump(fit_dir, k, b):
     return blocks.reshape(n, k), codes.reshape(n, k, b), n
 
 
-def fig_charts(fit_dir, k, b, interp, out):
+def fig_charts(fit_dir, k, b, interp, subject, out):
     blocks, codes, n = load_dump(fit_dir, k, b)
     counts = np.bincount(blocks.reshape(-1), minlength=blocks.max() + 1)
     order = np.argsort(-counts)[:12]
@@ -70,7 +76,7 @@ def fig_charts(fit_dir, k, b, interp, out):
         ax.axvline(0, color="w", lw=0.4, alpha=0.4)
     fig.suptitle(
         "Held-out code clouds of the 12 most-used blocks — each panel is one "
-        "2-D chart of the Qwen3.5-4B layer-16 residual manifold",
+        f"2-D chart of the {subject} residual manifold",
         fontsize=13,
     )
     fig.tight_layout()
@@ -95,7 +101,7 @@ def fig_tiling(fit_dir, acts_dir, k, b, out):
     show = np.argsort(-counts)[:8]
     fig, axes = plt.subplots(1, 2, figsize=(15, 6.5))
     axes[0].hexbin(proj[:, 0], proj[:, 1], gridsize=80, bins="log", cmap="Greys", mincnt=1)
-    axes[0].set_title("held-out layer-16 activations, 2 leading directions")
+    axes[0].set_title("held-out activations, 2 leading directions")
     cmap = plt.get_cmap("tab10")
     axes[1].scatter(proj[:, 0], proj[:, 1], s=1, c="0.85", linewidths=0)
     for i, gid in enumerate(show):
@@ -139,9 +145,9 @@ def fig_overcompleteness(fit_dir, arms, atoms, k, b, out):
 
     if arms:
         names = list(arms)
-        fvu = [arms[a]["heldout"]["fvu"] for a in names]
+        fvu = [best_fvu(arms[a]) for a in names]
         axes[2].bar(names, fvu, color=["tab:blue", "tab:orange", "tab:green", "0.5"][: len(names)])
-        axes[2].set_ylabel("held-out FVU (lower is better)")
+        axes[2].set_ylabel("held-out FVU, LS decode (lower is better)")
         axes[2].set_title("value of the extra atoms, at matched active scalars")
         axes[2].tick_params(axis="x", rotation=20)
     fig.suptitle("Overcompleteness, demonstrated", fontsize=13)
@@ -152,21 +158,21 @@ def fig_overcompleteness(fit_dir, arms, atoms, k, b, out):
 
 def fig_benchmark(arms, out):
     names = list(arms)
-    fvu = [arms[a]["heldout"]["fvu"] for a in names]
+    fvu = [best_fvu(arms[a]) for a in names]
     scalars = [arms[a]["rate"]["active_scalars_per_token"] for a in names]
     sel = [arms[a]["rate"]["selection_bits_per_token"] for a in names]
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
     axes[0].bar(names, fvu, color="tab:blue")
     for i, v in enumerate(fvu):
         axes[0].text(i, v, f"{v:.4f}", ha="center", va="bottom", fontsize=9)
-    axes[0].set_ylabel("held-out FVU")
+    axes[0].set_ylabel("held-out FVU, least-squares decode")
     axes[0].set_title("matched active scalars per token")
     axes[0].tick_params(axis="x", rotation=20)
     axes[1].scatter(scalars, fvu, s=60)
     for nm, sc, fv in zip(names, scalars, fvu):
         axes[1].annotate(nm, (sc, fv), fontsize=8, xytext=(4, 4), textcoords="offset points")
     axes[1].set_xlabel("active scalars / token")
-    axes[1].set_ylabel("held-out FVU")
+    axes[1].set_ylabel("held-out FVU, least-squares decode")
     axes[1].set_title("rate-distortion placement (selection bits annotated)")
     for nm, sc, fv, sb in zip(names, scalars, fvu, sel):
         axes[1].annotate(f"+{sb:.0f} sel bits", (sc, fv), fontsize=7,
@@ -291,13 +297,22 @@ def fig_steering(steer, out):
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
-    interp = json.load(open(args.interp_json)) if args.interp_json else None
+    def load_optional(path):
+        if path and os.path.exists(path):
+            return json.load(open(path))
+        if path:
+            print(f"skipping {path}: missing", flush=True)
+        return None
+
+    interp = load_optional(args.interp_json)
     arms = {}
     if args.arms_json:
         for name, path in json.load(open(args.arms_json)).items():
             arms[name] = json.load(open(path))
 
-    fig_charts(args.fit_dir, args.topk, args.block_size, interp,
+    meta = json.load(open(os.path.join(args.acts_dir, "meta.json")))
+    subject = f"{meta['model'].split('/')[-1]} layer-{meta['layer']}"
+    fig_charts(args.fit_dir, args.topk, args.block_size, interp, subject,
                os.path.join(args.out_dir, "manifold_charts.png"))
     print("wrote manifold_charts.png", flush=True)
     fig_tiling(args.fit_dir, args.acts_dir, args.topk, args.block_size,
@@ -312,12 +327,12 @@ def main():
     fig_cofiring(args.fit_dir, args.topk, args.block_size,
                  os.path.join(args.out_dir, "cofiring_clouds.png"))
     print("wrote cofiring_clouds.png", flush=True)
-    if args.splice_json:
-        fig_splice(json.load(open(args.splice_json)),
-                   os.path.join(args.out_dir, "splice.png"))
+    splice = load_optional(args.splice_json)
+    if splice:
+        fig_splice(splice, os.path.join(args.out_dir, "splice.png"))
         print("wrote splice.png", flush=True)
-    if args.steer_json:
-        steer = json.load(open(args.steer_json))
+    steer = load_optional(args.steer_json)
+    if steer:
         fig_steering(steer, os.path.join(args.out_dir, "steering.png"))
         print("wrote steering.png", flush=True)
         if fig_chart_semantics(steer, os.path.join(args.out_dir, "chart_semantics.png")):

@@ -183,6 +183,93 @@ fn joint_ls_row(
     }
 }
 
+
+/// Greedy orthogonal matching pursuit over a SHORTLIST, then the exact
+/// projection onto the atoms it picks.
+///
+/// The block lane's router is one-shot: it ranks blocks by `‖x D_gᵀ‖₂` against
+/// `x` and takes the top `k`, with no residual update between picks. On a highly
+/// coherent overcomplete dictionary that selects near-duplicates. OMP instead
+/// re-scores against the RESIDUAL after every pick, which is the routing the
+/// campaign's earlier external benchmark actually used. Running the full pursuit
+/// over `K = 32768` atoms per row is a `K x p` matvec per step; restricting it to
+/// the top-`M` blocks the one-shot gate already produced keeps the cost at
+/// `M·b·p` per step while leaving OMP free to reorder and replace within that
+/// pool. `M = k` reduces exactly to the one-shot support.
+///
+/// Returns the reconstruction (the projection onto the span of the picked
+/// atoms), which is what `joint_ls_row` returns for the one-shot support.
+fn omp_row(
+    row: &[f32],
+    decoder: ArrayView2<'_, f32>,
+    shortlist: &[u32],
+    block_size: usize,
+    n_pick: usize,
+    out: &mut [f32],
+) {
+    let p = row.len();
+    assert_eq!(
+        out.len(),
+        p,
+        "omp_row writes one reconstruction entry per input feature"
+    );
+    let drop_ratio = f32::EPSILON.sqrt();
+    let atoms: Vec<usize> = shortlist
+        .iter()
+        .flat_map(|g| (0..block_size).map(move |r| *g as usize * block_size + r))
+        .collect();
+    let mut residual: Vec<f32> = row.to_vec();
+    let mut basis: Vec<Vec<f32>> = Vec::with_capacity(n_pick);
+    let mut taken = vec![false; atoms.len()];
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+    for _ in 0..n_pick {
+        let mut best = usize::MAX;
+        let mut best_abs = 0.0f32;
+        for (idx, atom) in atoms.iter().enumerate() {
+            if taken[idx] {
+                continue;
+            }
+            let d = decoder.row(*atom);
+            let c: f32 = residual.iter().zip(d.iter()).map(|(a, b)| a * b).sum();
+            let c = c.abs();
+            if c > best_abs {
+                best_abs = c;
+                best = idx;
+            }
+        }
+        if best == usize::MAX {
+            break;
+        }
+        taken[best] = true;
+        let d = decoder.row(atoms[best]);
+        let mut q: Vec<f32> = d.iter().copied().collect();
+        let norm0 = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+        for e in basis.iter() {
+            let dot: f32 = q.iter().zip(e.iter()).map(|(a, b)| a * b).sum();
+            for (a, b) in q.iter_mut().zip(e.iter()) {
+                *a -= dot * b;
+            }
+        }
+        let norm = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if !(norm > drop_ratio * norm0) {
+            continue;
+        }
+        for v in q.iter_mut() {
+            *v /= norm;
+        }
+        let c: f32 = row.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+        for (o, b) in out.iter_mut().zip(q.iter()) {
+            *o += c * b;
+        }
+        for (r, b) in residual.iter_mut().zip(q.iter()) {
+            *r -= c * b;
+        }
+        basis.push(q);
+    }
+}
+
 struct Args {
     train: PathBuf,
     eval: PathBuf,
@@ -204,6 +291,7 @@ struct Args {
     seed_policy: SeedPolicy,
     load_decoder: PathBuf,
     load_gamma: f32,
+    omp_shortlist_blocks: usize,
     gpu: gam_gpu::GpuPolicy,
 }
 
@@ -305,6 +393,7 @@ fn parse_args() -> Result<Args, String> {
         seed_policy: SeedPolicy::Rows,
         load_decoder: PathBuf::new(),
         load_gamma: f32::NAN,
+        omp_shortlist_blocks: 0,
         gpu: gam_gpu::GpuPolicy::Auto,
     };
     let mut i = 1usize;
@@ -363,6 +452,11 @@ fn parse_args() -> Result<Args, String> {
                         ));
                     }
                 }
+            }
+            "--omp-shortlist-blocks" => {
+                a.omp_shortlist_blocks = value
+                    .parse()
+                    .map_err(|e| format!("--omp-shortlist-blocks: {e}"))?
             }
             "--load-decoder" => a.load_decoder = PathBuf::from(value),
             "--load-gamma" => {
@@ -597,6 +691,12 @@ fn main() -> Result<(), String> {
 
     let mut rss = 0.0f64;
     let mut rss_ls = 0.0f64;
+    let mut rss_omp = 0.0f64;
+    let omp_blocks = if args.omp_shortlist_blocks == 0 {
+        0
+    } else {
+        args.omp_shortlist_blocks.min(g)
+    };
     let mut tss_about_eval_mean = 0.0f64;
     let mut tss_about_train_mean = 0.0f64;
     let mut block_hits = vec![0u64; g];
@@ -645,6 +745,38 @@ fn main() -> Result<(), String> {
             Some(&mean_f32),
         );
         let view = buf.slice(ndarray::s![0..take, ..]);
+        // OMP arm: the same gate produces a wider shortlist, then the pursuit
+        // re-scores against the residual inside it.
+        let omp_recon = if omp_blocks > k {
+            let (short, _sg, _sc) = block_sparse_dictionary_transform(
+                view,
+                decoder.view(),
+                gamma,
+                args.block_size,
+                omp_blocks,
+                args.block_tile,
+            )?;
+            let mut out = Array2::<f32>::zeros((take, p));
+            out.axis_iter_mut(ndarray::Axis(0))
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(i, mut out_row)| {
+                    let rowv: Vec<f32> = view.row(i).to_vec();
+                    let sel: Vec<u32> = (0..omp_blocks).map(|j| short[[i, j]]).collect();
+                    let slice = out_row.as_slice_mut().expect("contiguous row");
+                    omp_row(
+                        &rowv,
+                        decoder.view(),
+                        &sel,
+                        args.block_size,
+                        k * args.block_size,
+                        slice,
+                    );
+                });
+            Some(out)
+        } else {
+            None
+        };
         let (blocks, _gates, codes) = block_sparse_dictionary_transform(
             view,
             decoder.view(),
@@ -687,6 +819,10 @@ fn main() -> Result<(), String> {
                 rss += d * d;
                 let d_ls = target - recon_ls[[i, c]] as f64;
                 rss_ls += d_ls * d_ls;
+                if let Some(om) = omp_recon.as_ref() {
+                    let d_omp = target - om[[i, c]] as f64;
+                    rss_omp += d_omp * d_omp;
+                }
                 // Both totals are about a CONSTANT predictor; the eval-mean one is
                 // the standard FVU denominator, the train-mean one is what an
                 // honest out-of-sample Tier-0 would actually have achieved.
@@ -751,6 +887,11 @@ fn main() -> Result<(), String> {
     let ev = 1.0 - rss / tss_about_eval_mean;
     let fvu = rss / tss_about_eval_mean;
     let fvu_ls = rss_ls / tss_about_eval_mean;
+    let fvu_omp = if omp_blocks > k {
+        Some(rss_omp / tss_about_eval_mean)
+    } else {
+        None
+    };
 
     // Fixed-width rate accounting, the #2283 currency: every firing pays a
     // selection index over G blocks plus b amplitude scalars. Reported as counts
@@ -814,6 +955,8 @@ fn main() -> Result<(), String> {
             "explained_variance": ev,
             "fvu": fvu,
             "fvu_joint_ls": fvu_ls,
+            "fvu_omp_shortlist": fvu_omp,
+            "omp_shortlist_blocks": omp_blocks,
             "explained_variance_joint_ls": 1.0 - fvu_ls,
             "rss_joint_ls": rss_ls,
             "fvu_about_train_mean": rss / tss_about_train_mean,
@@ -847,7 +990,7 @@ fn main() -> Result<(), String> {
     .map_err(|e| format!("write {}: {e}", numbers.display()))?;
     println!(
         "[a5] arm={} heldout_ev={:.6} fvu={:.6} fvu_joint_ls={:.6} blocks_used={}/{} \
-         atoms_used={}/{} (p={}) scalars/token={} sel_bits/token={:.2} wrote {}",
+         atoms_used={}/{} (p={}) scalars/token={} sel_bits/token={:.2} fvu_omp={:?} wrote {}",
         args.arm,
         ev,
         fvu,
@@ -859,6 +1002,7 @@ fn main() -> Result<(), String> {
         p,
         scalars_per_token,
         selection_bits_per_token,
+        fvu_omp,
         numbers.display()
     );
     Ok(())

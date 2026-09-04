@@ -1,0 +1,161 @@
+{
+  "arm": "pca32",
+  "crate_version": "0.3.154",
+  "dictionary": {
+    "G_blocks": 1,
+    "K_atoms": 32,
+    "block_size": 32,
+    "block_topk": 1,
+    "decoder_bytes": 327680,
+    "decoder_bytes_expected": 327680,
+    "gamma": 1.0,
+    "overcomplete_ratio_K_over_p": 0.0125,
+    "train_mean_bytes": 10240
+  },
+  "engine": "gam_sae::sparse_dict::BlockSparseStreamState",
+  "epochs": [
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 1,
+      "gamma": 0.9999998807907104,
+      "seconds": 86.67829586,
+      "train_explained_variance": 0.11543844517971324
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 2,
+      "gamma": 1.0,
+      "seconds": 164.567023248,
+      "train_explained_variance": 0.268519985452788
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 3,
+      "gamma": 1.0,
+      "seconds": 243.63965801,
+      "train_explained_variance": 0.2868989638206588
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 4,
+      "gamma": 1.0,
+      "seconds": 323.353309469,
+      "train_explained_variance": 0.2921795695682998
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 5,
+      "gamma": 1.0,
+      "seconds": 401.567130369,
+      "train_explained_variance": 0.29436570572244936
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 6,
+      "gamma": 1.0,
+      "seconds": 479.743325255,
+      "train_explained_variance": 0.2954234384697415
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 7,
+      "gamma": 1.0,
+      "seconds": 556.738907366,
+      "train_explained_variance": 0.2959930951517855
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 8,
+      "gamma": 1.0,
+      "seconds": 632.045718903,
+      "train_explained_variance": 0.29632787406176475
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 9,
+      "gamma": 1.0,
+      "seconds": 707.395007838,
+      "train_explained_variance": 0.29653881225405065
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 10,
+      "gamma": 1.0,
+      "seconds": 782.191810975,
+      "train_explained_variance": 0.29667909758961475
+    },
+    {
+      "accepted_births": 0,
+      "converged": true,
+      "dead": 0,
+      "epoch": 11,
+      "gamma": 1.0,
+      "seconds": 857.521303182,
+      "train_explained_variance": 0.29677642299543716
+    }
+  ],
+  "fit": {
+    "aux_k": 64,
+    "converged": true,
+    "device_admitted": false,
+    "epochs_run": 11,
+    "gpu_policy": "Off",
+    "seed_coordinate_fallback_blocks": 0,
+    "seed_policy": "Rows",
+    "train_explained_variance": 0.29677642299543716,
+    "train_seconds": 846.612264337
+  },
+  "heldout": {
+    "explained_variance": 0.28955392570961436,
+    "fvu": 0.7104460742903856,
+    "fvu_about_train_mean": 0.7079839024537592,
+    "rows_scored": 100000,
+    "rss": 6756701.9690862335,
+    "seconds": 15.513868835,
+    "tss_about_eval_mean": 9510506.446017068,
+    "tss_about_train_mean": 9543581.35215869
+  },
+  "inputs": {
+    "eval": "/scratch.global/sauer354/a5acts/eval.npy",
+    "n_eval": 100000,
+    "n_train": 300000,
+    "p": 2560,
+    "train": "/scratch.global/sauer354/a5acts/train.npy"
+  },
+  "issue": 2502,
+  "overcompleteness": {
+    "G_blocks": 1,
+    "K_atoms": 32,
+    "ambient_p": 2560,
+    "atoms_used_exceeds_ambient_p": false,
+    "atoms_used_on_heldout": 32,
+    "blocks_used_on_heldout": 1,
+    "note": "atoms_used > p implies the used sub-dictionary is linearly dependent"
+  },
+  "rate": {
+    "active_scalars_per_token": 32,
+    "firings_per_token": 1,
+    "selection_bits_per_token": 0.0
+  },
+  "wall_seconds": 873.120534165
+}
