@@ -1549,15 +1549,32 @@ fn solve_shift_family(
         matvecs += 1;
         let denom = p.dot(&ap);
         if !(denom.is_finite() && denom > 0.0) {
+            // `pᵀ(A + σI)p ≤ 0` is not ill-conditioning: the seed operator is
+            // NOT positive definite at the smallest quadrature shift, so the
+            // conjugate-gradient recurrence has no descent direction and the
+            // whole rational plan is being built on a bracket the operator does
+            // not satisfy. That is a different repair from a solve that merely
+            // ran out of accuracy, and the caller can only report "no finite
+            // solution" for both — so say which one here (gam#2731).
+            log::warn!(
+                "[rational-logdet] shifted-CG seed breakdown at iteration {matvecs}/{seed_budget}:                  pᵀ(A+σI)p = {denom:.6e} is not positive at seed shift σ = {sigma:.6e}                  (dim {dim}, ‖b‖ = {b_norm:.6e}, ‖r‖ = {:.6e}). The seed operator is not                  positive definite on this bracket; the spectral bracket's LOWER end is assumed                  as a fixed fraction of the estimated λ_max, not measured, so a spectrum that                  reaches below it — or below zero — lands here.",
+                rs.sqrt()
+            );
             return None;
         }
         let alpha = rs / denom;
         if !alpha.is_finite() {
+            log::warn!(
+                "[rational-logdet] shifted-CG seed breakdown at iteration {matvecs}/{seed_budget}:                  step length α = rᵀr/pᵀAp = {rs:.6e}/{denom:.6e} is not finite at seed shift                  σ = {sigma:.6e} (dim {dim})"
+            );
             return None;
         }
         r.scaled_add(-alpha, &ap);
         let rs_new = r.dot(&r);
         if !rs_new.is_finite() {
+            log::warn!(
+                "[rational-logdet] shifted-CG seed breakdown at iteration {matvecs}/{seed_budget}:                  the residual left the finite range (‖r‖² = {rs_new:.6e}) after a step of                  α = {alpha:.6e} at seed shift σ = {sigma:.6e} (dim {dim})"
+            );
             return None;
         }
         let beta = rs_new / rs;
