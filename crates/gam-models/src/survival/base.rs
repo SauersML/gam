@@ -1521,32 +1521,77 @@ impl WorkingModelSurvival {
         }
     }
 
-    /// Clamped structural derivative: `max(deriv, floor)` for derivatives
-    /// above the roundoff tolerance, `None` outside structural monotonicity
-    /// or for genuinely negative derivatives.
+    /// The structural derivative `dη/dt` against its own rounding band, for a
+    /// row whose band is `band` (see [`Self::derivative_bands`]): `None`
+    /// outside structural monotonicity or for a derivative that is negative
+    /// beyond rounding; otherwise `(value, slope)`.
     ///
-    /// Returns `(value, slope)` where `slope` is the exact derivative of the
-    /// clamp itself: 1 on the identity branch, 0 on the floored branch.
-    /// Every consumer that differentiates through the structural derivative
-    /// MUST scale its derivative-channel terms by `slope` — the floored
-    /// branch is locally constant in β, so gradients and Hessians of
-    /// `ln(value)` and `1/value` are exactly zero there. Emitting the
-    /// reciprocal-scale terms of the UNclamped expression (≈1e12 gradient,
-    /// ≈1e24 curvature at deriv = 5e-13) against a value branch that is flat
-    /// desynchronizes the objective from its derivatives.
-    fn stabilized_structural_derivative(&self, deriv: f64) -> Option<(f64, f64)> {
-        const STRUCTURAL_MONO_ROUNDOFF_TOL: f64 = 1e-7;
-        const STRUCTURAL_DERIV_FLOOR: f64 = 1e-12;
+    /// The structural derivative is `Σ_j γ_j·M_j(t)` with `γ_j ≥ 0` and an
+    /// M-spline basis `M_j ≥ 0`, so in exact arithmetic it is non-negative and
+    /// a negative value is rounding. A derivative inside the band is a flat
+    /// baseline at that time: the value is reported as the band (the smallest
+    /// derivative the arithmetic distinguishes from zero) with `slope = 0`,
+    /// because the clamp is locally constant in β there — every consumer that
+    /// differentiates through the structural derivative scales its
+    /// derivative-channel terms by `slope`, so `ln(value)` and `1/value` carry
+    /// no gradient or curvature on that branch. Until #2469 the floor was the
+    /// constant `1e-12` and the tolerated negativity `1e-7`, neither of which
+    /// was the arithmetic's.
+    fn stabilized_structural_derivative(&self, deriv: f64, band: f64) -> Option<(f64, f64)> {
         if !self.structurally_monotonic {
             return None;
         }
-        if deriv >= STRUCTURAL_DERIV_FLOOR {
+        if deriv > band {
             return Some((deriv, 1.0));
         }
-        if deriv >= -STRUCTURAL_MONO_ROUNDOFF_TOL {
-            return Some((STRUCTURAL_DERIV_FLOOR, 0.0));
+        if deriv >= -band {
+            return Some((band, 0.0));
         }
         None
+    }
+
+    /// Per-row rounding bands of the three linear predictors at `beta`:
+    /// `(exit, entry, derivative)`, each `γ_{p+1}·u·(Σ_j |x_ij·β_j| + |offset_i|)`
+    /// — the accumulated rounding of the dot product and its offset, the
+    /// quantity every monotonicity and increment guard below is stated
+    /// against. One `O(n·p)` pass per state evaluation, the cost of one more
+    /// design product.
+    fn predictor_bands(&self, beta: &Array1<f64>) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+        let n = self.nrows();
+        let p = self.coefficient_dim();
+        let growth = gam_linalg::roundoff::accumulation_growth(p + 1)
+            * gam_linalg::roundoff::UNIT_ROUNDOFF;
+        let mut exit = Array1::<f64>::zeros(n);
+        let mut entry = Array1::<f64>::zeros(n);
+        let mut derivative = Array1::<f64>::zeros(n);
+        let mut row = vec![0.0_f64; p];
+        let magnitude = |row: &[f64], beta: &Array1<f64>| -> f64 {
+            row.iter().zip(beta.iter()).map(|(x, b)| (x * b).abs()).sum::<f64>()
+        };
+        for i in 0..n {
+            self.fill_exit_row(i, &mut row);
+            exit[i] = growth * (magnitude(&row, beta) + self.offset_eta_exit[i].abs());
+            self.fill_entry_row(i, &mut row);
+            entry[i] = growth * (magnitude(&row, beta) + self.offset_eta_entry[i].abs());
+            self.fill_derivative_row(i, &mut row);
+            derivative[i] =
+                growth * (magnitude(&row, beta) + self.offset_derivative_exit[i].abs());
+        }
+        (exit, entry, derivative)
+    }
+
+    /// The floor an observed derivative must clear at a row with band `band`
+    /// for the monotonicity rule: an event row needs a hazard the arithmetic
+    /// resolves as positive (`ln(deriv)` and `1/deriv` enter its likelihood),
+    /// a censored row only a derivative not negative beyond rounding. A
+    /// user-supplied monotonicity tolerance is honoured to within the band.
+    fn derivative_floor(&self, event: bool, band: f64) -> f64 {
+        let tolerance = self.derivative_guard();
+        if event {
+            (tolerance - band).max(band)
+        } else {
+            tolerance - band
+        }
     }
 
     fn validate_penalties(
@@ -1579,32 +1624,6 @@ impl WorkingModelSurvival {
             return 0.0;
         }
         self.monotonicity.tolerance.max(0.0)
-    }
-
-    fn derivative_guard_numerical(&self) -> f64 {
-        let derivative_guard = self.derivative_guard();
-        if derivative_guard <= 0.0 {
-            // For structural monotonicity (guard = 0), tiny negative derivs are
-            // tolerated because `stabilized_structural_derivative` lifts the
-            // value back to a small positive floor before any `ln`/`1/deriv`
-            // use. For *non-structural* monotonicity with tolerance == 0 the
-            // raw derivative flows straight through into the event-row
-            // `deriv.ln()` and `1.0 / deriv`, so any non-positive value would
-            // produce NaN / huge negative weights. Keep the slack only when
-            // the structural stabilizer is active.
-            if self.structurally_monotonic {
-                -1e-10
-            } else {
-                1e-12
-            }
-        } else {
-            (derivative_guard - (1e-10_f64).min(0.01 * derivative_guard)).max(1e-12)
-        }
-    }
-
-    fn interval_increment_guard(&self, h_entry: f64, h_exit: f64) -> f64 {
-        let scale = h_entry.abs().max(h_exit.abs()).max(1.0);
-        1e-10 * scale
     }
 
     fn structural_time_coefficient_constraints(&self) -> Option<LinearInequalityConstraints> {
@@ -2113,7 +2132,7 @@ impl WorkingModelSurvival {
 
         let mut nll = 0.0;
         let derivative_guard = self.derivative_guard();
-        let derivative_guard_numerical = self.derivative_guard_numerical();
+        let (exit_band, entry_band, derivative_band) = self.predictor_bands(beta);
         let mut workspace = self
             .workspace
             .lock()
@@ -2157,29 +2176,35 @@ impl WorkingModelSurvival {
             let interval_scaled = h_e_scaled - h_s_scaled;
             let interval = Self::scaled_exp_component(interval_scale, interval_scaled)?;
             let (deriv, deriv_slope) = self
-                .stabilized_structural_derivative(derivative_raw[i])
+                .stabilized_structural_derivative(derivative_raw[i], derivative_band[i])
                 .unwrap_or((derivative_raw[i], 1.0));
             // Monotonicity of η(t) = log H(t) is a structural property of the
             // whole Royston-Parmar spline. If d_eta/dt is *strictly negative*
             // at any observed exit time, the cumulative hazard H(t) decreases
             // there and S(t) is not a valid survival function — both event
             // and censored rows have to refuse that case. Event rows further
-            // need deriv strictly above the numerical guard because their
-            // NLL contains `deriv.ln()` and `1.0 / deriv`; censored rows do
-            // not, so a boundary value of exactly zero is feasible there.
-            let mono_floor = if d > 0.0 {
-                derivative_guard_numerical
-            } else {
-                0.0
-            };
+            // need a derivative the arithmetic resolves as positive because
+            // their NLL contains `deriv.ln()` and `1.0 / deriv`; censored rows
+            // do not, so a value that is zero to within rounding is feasible
+            // there. The floors are the row's own rounding band (#2469).
+            let mono_floor = self.derivative_floor(d > 0.0, derivative_band[i]);
             if !deriv.is_finite() || deriv < mono_floor {
                 return Err(EstimationError::ParameterConstraintViolation(format!(
-                    "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
-                    i, deriv, derivative_guard
+                    "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e} \
+                     (band {:.3e})",
+                    i, deriv, derivative_guard, derivative_band[i]
                 )));
             }
             if has_entry_interval {
-                let increment_guard = self.interval_increment_guard(h_s_scaled, h_e_scaled);
+                // `H(exit) − H(entry)` is `exp(η_exit) − exp(η_entry)` up to the
+                // shared scale; each exponential carries its argument's rounding
+                // band times its value, plus one rounding of its own. A
+                // decrease inside that band is arithmetic, beyond it the
+                // cumulative hazard genuinely decreased and S(t) is not a
+                // survival function (#2469; this was a `1e-10·scale` constant).
+                let increment_guard = h_e_scaled * exit_band[i]
+                    + h_s_scaled * entry_band[i]
+                    + gam_linalg::roundoff::UNIT_ROUNDOFF * (h_e_scaled + h_s_scaled);
                 if interval_scaled + increment_guard < 0.0 {
                     return Err(EstimationError::ParameterConstraintViolation(format!(
                         "survival cumulative hazard decreased over row {}: H(exit)-H(entry)={:.6e}",
@@ -2332,7 +2357,7 @@ impl WorkingModelSurvival {
         let exp_entry = eta_entry.mapv(f64::exp);
         let exp_exit = eta_exit.mapv(f64::exp);
         let guard = self.derivative_guard();
-        let guard_numerical = self.derivative_guard_numerical();
+        let (_, _, derivative_band) = self.predictor_bands(beta);
 
         let jac = Array1::<f64>::ones(p);
         let curvature = Array1::<f64>::zeros(p);
@@ -2409,7 +2434,7 @@ impl WorkingModelSurvival {
 
             // Event part: d/dbeta [ gsd gsd^T / s^2 - diag(he) - diag(hsd / s) ][u_k]
             let (s_i, s_slope) = self
-                .stabilized_structural_derivative(deriv_raw[i])
+                .stabilized_structural_derivative(deriv_raw[i], derivative_band[i])
                 .unwrap_or((deriv_raw[i], 1.0));
             if !s_i.is_finite() {
                 return Err(EstimationError::ParameterConstraintViolation(format!(
@@ -2422,10 +2447,11 @@ impl WorkingModelSurvival {
                 // block is identically zero in a neighborhood of β, so its
                 // directional derivative vanishes and the whole event part is
                 // skipped.
-                if s_i < guard_numerical {
+                if s_i < self.derivative_floor(true, derivative_band[i]) {
                     return Err(EstimationError::ParameterConstraintViolation(format!(
                         "survival monotonicity violated in unified trace contraction at row {i}: \
-                         d_eta/dt={s_i:.3e} <= tolerance={guard:.3e}",
+                         d_eta/dt={s_i:.3e} <= tolerance={guard:.3e} (band {:.3e})",
+                        derivative_band[i]
                     )));
                 }
                 let inv_s = 1.0 / s_i;
@@ -2503,7 +2529,7 @@ impl WorkingModelSurvival {
         let eta_exit = self.exit_dot(beta) + &self.offset_eta_exit;
         let derivative_raw = self.derivative_dot(beta) + &self.offset_derivative_exit;
 
-        let derivative_guard_numerical = self.derivative_guard_numerical();
+        let (_, _, derivative_band) = self.predictor_bands(beta);
         let mut r_exit = Array1::<f64>::zeros(n);
         let mut r_entry = Array1::<f64>::zeros(n);
         let mut r_deriv = Array1::<f64>::zeros(n);
@@ -2544,13 +2570,9 @@ impl WorkingModelSurvival {
             // `deriv > guard` because `1/deriv` enters their score.
             let deriv_raw = derivative_raw[i];
             let (deriv, deriv_slope) = self
-                .stabilized_structural_derivative(deriv_raw)
+                .stabilized_structural_derivative(deriv_raw, derivative_band[i])
                 .unwrap_or((deriv_raw, 1.0));
-            let mono_floor = if d > 0.0 {
-                derivative_guard_numerical
-            } else {
-                0.0
-            };
+            let mono_floor = self.derivative_floor(d > 0.0, derivative_band[i]);
             if !deriv.is_finite() || deriv < mono_floor {
                 return Err(EstimationError::ParameterConstraintViolation(format!(
                     "offset_channel_residuals: derivative ≤ numerical guard at row {i}: {deriv:.3e}"
