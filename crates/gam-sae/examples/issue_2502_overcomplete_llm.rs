@@ -138,6 +138,11 @@ fn joint_ls_row(
     out: &mut [f32],
 ) {
     let p = row.len();
+    assert_eq!(
+        out.len(),
+        p,
+        "joint_ls_row writes one reconstruction entry per input feature"
+    );
     let drop_ratio = f32::EPSILON.sqrt();
     let mut basis: Vec<Vec<f32>> = Vec::with_capacity(blocks.len() * block_size);
     for (j, &gsel) in blocks.iter().enumerate() {
@@ -176,7 +181,6 @@ fn joint_ls_row(
             *o += c * b;
         }
     }
-    debug_assert_eq!(out.len(), p);
 }
 
 struct Args {

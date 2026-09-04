@@ -812,11 +812,11 @@ fn shifted_pcg(
     rel_tol: f64,
     max_iters: usize,
 ) -> Option<(Array1<f64>, usize)> {
-    // The production solve is the recorder-free instantiation: `record` is a
-    // no-op closure, so the monomorphized loop is the loop this function always
-    // ran. There is exactly ONE shifted-solve implementation and one
-    // convergence certificate; the trace cannot describe a different iteration
-    // from the one that produced the value.
+    // The production solve keeps no steps, so it passes no recorder — and it
+    // runs the SAME non-generic core the recording entry point runs, not a
+    // second monomorphization of it. There is exactly ONE shifted-solve
+    // implementation and one convergence certificate; the trace cannot describe
+    // a different iteration from the one that produced the value.
     shifted_pcg_core(
         matvec,
         preconditioner,
@@ -825,7 +825,7 @@ fn shifted_pcg(
         y0,
         rel_tol,
         max_iters,
-        &mut |_: ShiftedPcgStep| {},
+        None,
     )
 }
 
@@ -1104,6 +1104,8 @@ pub(crate) fn shifted_pcg_traced(
     };
     let outcome = {
         let steps = &mut trace.steps;
+        let mut record = |step: ShiftedPcgStep| steps.push(step);
+        let record: Option<&mut dyn FnMut(ShiftedPcgStep)> = Some(&mut record);
         shifted_pcg_core(
             matvec,
             preconditioner,
@@ -1112,14 +1114,14 @@ pub(crate) fn shifted_pcg_traced(
             y0,
             rel_tol,
             max_iters,
-            &mut |step: ShiftedPcgStep| steps.push(step),
+            record,
         )
     };
     trace.certified = outcome.is_some();
     (outcome, trace)
 }
 
-fn shifted_pcg_core<R: FnMut(ShiftedPcgStep)>(
+fn shifted_pcg_core(
     matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
     preconditioner: &ShiftedDiagonalPreconditioner,
     t: f64,
@@ -1127,7 +1129,7 @@ fn shifted_pcg_core<R: FnMut(ShiftedPcgStep)>(
     y0: &Array1<f64>,
     rel_tol: f64,
     max_iters: usize,
-    record: &mut R,
+    mut record: Option<&mut dyn FnMut(ShiftedPcgStep)>,
 ) -> Option<(Array1<f64>, usize)> {
     if !(rel_tol.is_finite() && rel_tol > 0.0) {
         return None;
@@ -1243,12 +1245,14 @@ fn shifted_pcg_core<R: FnMut(ShiftedPcgStep)>(
             return None;
         }
         let beta = rs_new / rs;
-        record(ShiftedPcgStep {
-            residual_norm: residual_norm_before,
-            alpha,
-            beta,
-            restarted,
-        });
+        if let Some(record) = record.as_deref_mut() {
+            record(ShiftedPcgStep {
+                residual_norm: residual_norm_before,
+                alpha,
+                beta,
+                restarted,
+            });
+        }
         restarted = false;
         p = &z + &(&p * beta);
         rs = rs_new;
