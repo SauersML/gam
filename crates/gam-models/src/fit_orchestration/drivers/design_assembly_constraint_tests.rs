@@ -4847,4 +4847,66 @@ fn spatial_anisotropy_pilot_initializer_seeds_geometry_without_fit() {
         _ => panic!("expected Matern term"),
     }
 }
+
+/// #979 planner-routing pin, restored (#2818): a large-ψ anisotropic joint must
+/// KEEP its exact curvature declared for the terminal certificate while the
+/// SEARCH runs gradient-only, so no iterate pays for a rebuilt fourth-order ψ
+/// tower.
+///
+/// The contract lives entirely in `gam_solve::rho_optimizer::plan`, a pure
+/// function of the declared capability, so this gate calls that production
+/// entry point directly and owns no fixture scaffolding a reachability sweep
+/// could prune.
+///
+/// Deleted by `c0a21b554` as collateral of the `d484a091a` sweep (whose
+/// criterion — "no production artifact links this function" — is vacuously true
+/// of every test), not because the contract changed: `plan`, `OuterCapability`
+/// and its eight fields are all still here.
+#[test]
+fn spatial_aniso_joint_large_psi_dim_reserves_exact_curvature_for_terminal_mint_979() {
+    let cap = gam_solve::rho_optimizer::OuterCapability {
+        gradient: gam_problem::Derivative::Analytic,
+        hessian: gam_problem::DeclaredHessianForm::Either,
+        n_params: 40,
+        psi_dim: 31,
+        fixed_point_available: true,
+        barrier_config: None,
+        // Exact curvature remains declared for the terminal certificate, but
+        // search must not rebuild the fourth-order ψ tower at every iterate.
+        prefer_gradient_only: true,
+        disable_fixed_point: false,
+    };
+    assert!(
+        cap.hessian.is_analytic(),
+        "the terminal certificate's exact curvature must stay DECLARED; a capability that \
+         dropped it would route gradient-only for the wrong reason"
+    );
+    let route = gam_solve::rho_optimizer::plan(&cap);
+    assert_eq!(route.solver, gam_solve::rho_optimizer::Solver::Bfgs);
+    assert_eq!(
+        route.hessian_source,
+        gam_solve::rho_optimizer::HessianSource::BfgsApprox
+    );
+
+    // Non-vacuity, in-test: the verdict above has to be produced BY
+    // `prefer_gradient_only`, not by the declared-Analytic pair alone. Flip only
+    // that one field and the same capability must route to the exact-curvature
+    // solver. Without this arm the assertions would also pass on a planner that
+    // ignored the flag and answered Bfgs for some other reason.
+    let exact = gam_solve::rho_optimizer::plan(&gam_solve::rho_optimizer::OuterCapability {
+        prefer_gradient_only: false,
+        ..cap.clone()
+    });
+    assert_eq!(
+        exact.solver,
+        gam_solve::rho_optimizer::Solver::Arc,
+        "with the same declared curvature and prefer_gradient_only cleared the planner must \
+         take the exact-curvature route; if it does not, the assertions above are insensitive \
+         to the field this gate is about"
+    );
+    assert_eq!(
+        exact.hessian_source,
+        gam_solve::rho_optimizer::HessianSource::Analytic
+    );
+}
 }

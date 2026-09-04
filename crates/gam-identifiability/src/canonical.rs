@@ -2382,4 +2382,243 @@ mod tests {
         );
     }
 
+
+    // ─── #2748 coefficient-coordinate declaration, restored (#2818) ─────────
+    //
+    // `c0a21b554` deleted these four gates because they no longer compiled, and
+    // they no longer compiled because `d484a091a` had deleted the two helpers
+    // they shared — `fn spanning_coordinates` and
+    // `fn dealiased_warp_against_mean_block_specs`, both `#[cfg(test)]`, where
+    // the sweep's criterion ("no production artifact links this function") is
+    // true of everything by construction. `CoefficientCoordinate` and
+    // `Gauge::is_identity` were never touched.
+    //
+    // The public wrapper `canonicalize_for_identifiability` was NOT so lucky:
+    // the same sweep deleted it, leaving only the private
+    // `canonicalize_for_identifiability_inner` and the public
+    // `canonicalize_for_identifiability_with_operating_scalars`. Every remaining
+    // mention of the old name in this crate is prose or an error string naming a
+    // function that no longer exists (`canonical.rs:595`, `:653`, `:1231`,
+    // `:1558`, and `audit.rs:12`). These gates therefore call the surviving
+    // public entry point with `None` operating scalars, which is byte-for-byte
+    // what the deleted wrapper did: its entire body was
+    // `canonicalize_for_identifiability_inner(specs, coordinates, true, None)`.
+    //
+    // Rebuilt with both helpers inlined as closures inside each gate: a closure
+    // has no item name for a symbol-table sweep to miss, so the same criterion
+    // cannot orphan these a second time. The duplication is deliberate.
+    //
+    // The fixture, in all four: a monotone link-wiggle warp residualised against
+    // a higher-priority mean block. `B⊥ = B − X A` is rank-deficient BY
+    // CONSTRUCTION — de-aliasing annihilates exactly `range(B) ∩ range(X)` — so
+    // `warp[.., 0] = mean[.., 1]` puts column 0 of the warp exactly in the mean
+    // block's span, which is the one direction the orthogonaliser absorbs.
+
+    /// NON-VACUITY CONTROL for the gate below. With both coordinates declared
+    /// `Spanning` the orthogonaliser DOES absorb the warp's shared direction and
+    /// the block leaves canonicalisation one column narrower — the behaviour
+    /// that desynchronised `BinomialMeanWiggleFamily::block_geometry`'s
+    /// raw-width rebuild and refused every outer seed with `dynamic wiggle
+    /// design col mismatch: got 11, expected 10` (gam#2748).
+    ///
+    /// Asserted so the pair isolates the DECLARATION and nothing else: same
+    /// designs, same priorities, only the coordinate kind moves.
+    #[test]
+    fn a_spanning_warp_coordinate_is_absorbed_by_the_mean_block_2748() {
+        use gam_problem::test_support::spec_from_dense_with_priority;
+        let dealiased_warp_against_mean_block_specs =
+            |mean_priority: u8, warp_priority: u8| -> [ParameterBlockSpec; 2] {
+                let n = 240;
+                let t = linspace(n);
+                let mut mean = Array2::<f64>::zeros((n, 3));
+                let mut warp = Array2::<f64>::zeros((n, 4));
+                for i in 0..n {
+                    mean[[i, 0]] = 1.0;
+                    mean[[i, 1]] = t[i];
+                    mean[[i, 2]] = (2.0 * t[i]).sin();
+                    // Exactly in the mean block's span: the de-aliasing null direction.
+                    warp[[i, 0]] = t[i];
+                    warp[[i, 1]] = t[i] * t[i];
+                    warp[[i, 2]] = t[i] * t[i] * t[i];
+                    warp[[i, 3]] = (3.0 * t[i]).cos();
+                }
+                [
+                    spec_from_dense_with_priority("eta", mean, mean_priority),
+                    spec_from_dense_with_priority("wiggle", warp, warp_priority),
+                ]
+            };
+
+        let specs = dealiased_warp_against_mean_block_specs(100, 80);
+        let declarations = vec![CoefficientCoordinate::Spanning; specs.len()];
+        let canon = canonicalize_for_identifiability_with_operating_scalars(
+            &specs,
+            &declarations,
+            None,
+        )
+            .expect("a rank-deficient overlap must canonicalise, not fail closed");
+        assert_eq!(
+            canon.reduced_specs[1].design.ncols(),
+            specs[1].design.ncols() - 1,
+            "the fixture must present a shared direction the orthogonaliser actually removes; \
+             it removed none, so the veto test below would be vacuous"
+        );
+        assert_eq!(
+            canon.reduced_specs[0].design.ncols(),
+            specs[0].design.ncols(),
+            "the higher-priority mean block keeps its columns",
+        );
+    }
+
+    /// A block whose COEFFICIENT COORDINATE is structural keeps its basis AND
+    /// its width, even though an ordering to absorb it plainly exists (gam#2748).
+    ///
+    /// This is the whole repair. `gauge_priority` says whose column yields when
+    /// one must; it does not say that the yielding block's coordinate may be
+    /// ROTATED. For the monotone warp it may not: its family's
+    /// `block_linear_constraints` returns `I·β_w ≥ 0` sized from
+    /// `spec.design.ncols()`, so a reparameterised block would be handed a cone
+    /// in coordinates the constraint means nothing in, and
+    /// `post_update_block_beta` would project onto it.
+    #[test]
+    fn a_structural_warp_coordinate_is_never_absorbed_2748() {
+        use gam_problem::test_support::spec_from_dense_with_priority;
+        let dealiased_warp_against_mean_block_specs =
+            |mean_priority: u8, warp_priority: u8| -> [ParameterBlockSpec; 2] {
+                let n = 240;
+                let t = linspace(n);
+                let mut mean = Array2::<f64>::zeros((n, 3));
+                let mut warp = Array2::<f64>::zeros((n, 4));
+                for i in 0..n {
+                    mean[[i, 0]] = 1.0;
+                    mean[[i, 1]] = t[i];
+                    mean[[i, 2]] = (2.0 * t[i]).sin();
+                    warp[[i, 0]] = t[i];
+                    warp[[i, 1]] = t[i] * t[i];
+                    warp[[i, 2]] = t[i] * t[i] * t[i];
+                    warp[[i, 3]] = (3.0 * t[i]).cos();
+                }
+                [
+                    spec_from_dense_with_priority("eta", mean, mean_priority),
+                    spec_from_dense_with_priority("wiggle", warp, warp_priority),
+                ]
+            };
+
+        let specs = dealiased_warp_against_mean_block_specs(100, 80);
+        let canon = canonicalize_for_identifiability_with_operating_scalars(
+            &specs,
+            &[
+                CoefficientCoordinate::Spanning,
+                CoefficientCoordinate::Structural,
+            ],
+            None,
+        )
+        .expect("declining a reparameterisation must not fail the fit");
+        for (raw, reduced) in specs.iter().zip(canon.reduced_specs.iter()) {
+            assert_eq!(
+                reduced.design.ncols(),
+                raw.design.ncols(),
+                "block '{}' changed width under a structural-coordinate declaration",
+                raw.name,
+            );
+        }
+        assert!(
+            canon.gauge.is_identity(),
+            "a declined reparameterisation must leave the gauge an identity, so the family's \
+             own raw-width geometry and the spec it is graded against stay the same object",
+        );
+    }
+
+    /// The declaration is per BLOCK, not per fit: a structural coordinate must
+    /// not cost an unrelated block its legitimate reduction.
+    ///
+    /// Here the ROLES ARE SWAPPED relative to the two gates above — the warp is
+    /// the higher-priority anchor and the plain mean block is the one absorbed,
+    /// which is exactly the layout the spatial mean-wiggle driver builds
+    /// (`LINK_WIGGLE_GAUGE_PRIORITY` on `eta`, `DEFAULT_GAUGE_PRIORITY` on
+    /// `wiggle`). Declaring the warp structural must leave that path alone.
+    #[test]
+    fn a_structural_coordinate_does_not_veto_another_blocks_reduction_2748() {
+        use gam_problem::test_support::spec_from_dense_with_priority;
+        let dealiased_warp_against_mean_block_specs =
+            |mean_priority: u8, warp_priority: u8| -> [ParameterBlockSpec; 2] {
+                let n = 240;
+                let t = linspace(n);
+                let mut mean = Array2::<f64>::zeros((n, 3));
+                let mut warp = Array2::<f64>::zeros((n, 4));
+                for i in 0..n {
+                    mean[[i, 0]] = 1.0;
+                    mean[[i, 1]] = t[i];
+                    mean[[i, 2]] = (2.0 * t[i]).sin();
+                    warp[[i, 0]] = t[i];
+                    warp[[i, 1]] = t[i] * t[i];
+                    warp[[i, 2]] = t[i] * t[i] * t[i];
+                    warp[[i, 3]] = (3.0 * t[i]).cos();
+                }
+                [
+                    spec_from_dense_with_priority("eta", mean, mean_priority),
+                    spec_from_dense_with_priority("wiggle", warp, warp_priority),
+                ]
+            };
+
+        let specs = dealiased_warp_against_mean_block_specs(80, 100);
+        let canon = canonicalize_for_identifiability_with_operating_scalars(
+            &specs,
+            &[
+                CoefficientCoordinate::Spanning,
+                CoefficientCoordinate::Structural,
+            ],
+            None,
+        )
+        .expect("a rank-deficient overlap must canonicalise, not fail closed");
+        assert_eq!(
+            canon.reduced_specs[1].design.ncols(),
+            specs[1].design.ncols(),
+            "the structural warp keeps every column",
+        );
+        assert_eq!(
+            canon.reduced_specs[0].design.ncols(),
+            specs[0].design.ncols() - 1,
+            "the plain lower-priority mean block still yields its shared direction",
+        );
+    }
+
+    /// The declaration list is a per-block statement, so a caller that supplied
+    /// the wrong number of them has not made the statement at all.
+    #[test]
+    fn a_mismatched_coordinate_list_is_refused_2748() {
+        use gam_problem::test_support::spec_from_dense_with_priority;
+        let dealiased_warp_against_mean_block_specs =
+            |mean_priority: u8, warp_priority: u8| -> [ParameterBlockSpec; 2] {
+                let n = 240;
+                let t = linspace(n);
+                let mut mean = Array2::<f64>::zeros((n, 3));
+                let mut warp = Array2::<f64>::zeros((n, 4));
+                for i in 0..n {
+                    mean[[i, 0]] = 1.0;
+                    mean[[i, 1]] = t[i];
+                    mean[[i, 2]] = (2.0 * t[i]).sin();
+                    warp[[i, 0]] = t[i];
+                    warp[[i, 1]] = t[i] * t[i];
+                    warp[[i, 2]] = t[i] * t[i] * t[i];
+                    warp[[i, 3]] = (3.0 * t[i]).cos();
+                }
+                [
+                    spec_from_dense_with_priority("eta", mean, mean_priority),
+                    spec_from_dense_with_priority("wiggle", warp, warp_priority),
+                ]
+            };
+
+        let specs = dealiased_warp_against_mean_block_specs(100, 80);
+        let err = canonicalize_for_identifiability_with_operating_scalars(
+            &specs,
+            &[CoefficientCoordinate::Spanning],
+            None,
+        )
+            .expect_err("one declaration for two blocks is not a declaration");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("coefficient-coordinate declaration"),
+            "the refusal must name what was missing: {text}"
+        );
+    }
 }

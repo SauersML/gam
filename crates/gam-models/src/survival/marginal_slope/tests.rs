@@ -8771,3 +8771,212 @@ fn time_shrinkage_metric_excludes_timewiggle_placeholder_columns() {
     );
     assert!(ridge[[1, 1]] > 0.0, "the null direction of the value block must be shrunk");
 }
+
+/// #932 single-source pin, restored (#2818): the SPECIALIZED rigid-row
+/// contractions must equal the INDEPENDENT dense `Tower4<4>`'s own contractions
+/// on the exact inputs the release measurement is taken at, and — in release —
+/// must be measurably faster than that dense tower.
+///
+/// ─── What was deleted, and what it cost ───
+///
+/// `c0a21b554` deleted this gate because it no longer compiled, and it no longer
+/// compiled because `d484a091a` had deleted `Tower4::third_contracted` and
+/// `Tower4::fourth_contracted` from `gam-math` — two `pub` Rust-library methods
+/// whose only callers were tests, so no symbol for them appears in the CLI or
+/// pyffi binary and the sweep's criterion held vacuously. `program_full_tower`,
+/// `rigid_row_nll`, `RigidRowInputs` and `SurvivalMarginalSlopeRigidNllProgram`
+/// were all untouched: only the two-line contraction of the dense tensor went.
+///
+/// The rebuild therefore performs that contraction here, from the `pub` `t3` /
+/// `t4` fields, in the DEFINITIONAL full-nest form
+/// `out[a][b] = Σ_c t3[a][b][c]·u[c]` / `Σ_{c,d} t4[a][b][c][d]·u[c]·v[d]`.
+/// That is strictly better than what was lost: the oracle no longer routes
+/// through a shared helper that the code under test could have been co-wrong
+/// with, and the gate now owns nothing a symbol-table sweep can name.
+#[test]
+fn release_measure_rigid_contracted_towers_vs_generic_tower_932() {
+    use super::row_kernel::{RigidRowInputs, rigid_row_nll};
+    use gam_math::jet_scalar::{OneSeed, TwoSeed};
+    use gam_math::jet_tower::program_full_tower;
+    use gam_math::paired_timing::{SpeedGate, paired_interleaved};
+
+    // The dense tower's contractions, written from its `pub` tensors. Closures,
+    // not `fn`s: a reachability sweep computed from a stripped symbol table is
+    // vacuously true of any test-only item, which is what orphaned this gate.
+    let dense_third = |tower: &gam_math::jet_tower::Tower4<4>, dir: &[f64; 4]| {
+        let mut out = [[0.0_f64; 4]; 4];
+        for a in 0..4 {
+            for b in 0..4 {
+                let mut acc = 0.0;
+                for c in 0..4 {
+                    acc += tower.t3[a][b][c] * dir[c];
+                }
+                out[a][b] = acc;
+            }
+        }
+        out
+    };
+    let dense_fourth = |tower: &gam_math::jet_tower::Tower4<4>, u: &[f64; 4], v: &[f64; 4]| {
+        let mut out = [[0.0_f64; 4]; 4];
+        for a in 0..4 {
+            for b in 0..4 {
+                let mut acc = 0.0;
+                for c in 0..4 {
+                    for d in 0..4 {
+                        acc += tower.t4[a][b][c][d] * u[c] * v[d];
+                    }
+                }
+                out[a][b] = acc;
+            }
+        }
+        out
+    };
+
+    // One ordinary interior row per event branch (censored / event are
+    // distinct live derivative stacks).
+    let cases: [[f64; 8]; 2] = [
+        [-0.7, 0.4, 0.8, -0.3, 0.6, 1.0, 0.0, 0.75],
+        [0.2, -0.5, 1.4, 0.9, -1.1, 0.8, 1.0, 1.0],
+    ];
+    let dir_u = [0.7_f64, -1.3, 0.4, 0.6];
+    let dir_v = [-0.4_f64, 0.6, 1.1, -0.2];
+
+    // Non-vacuity: the parity assertions below must be judged against a tower
+    // that is genuinely third- and fourth-order live. A fixture whose t3/t4
+    // contractions were numerically zero would agree with anything.
+    let mut max_dense_third = 0.0_f64;
+    let mut max_dense_fourth = 0.0_f64;
+
+    let mut gate = (!cfg!(debug_assertions)).then(|| SpeedGate::open("RIGID-CONTRACTED-932"));
+    for &[q0, q1, qd1, g, z, w, d, probit_scale] in &cases {
+        let inputs = RigidRowInputs {
+            row: 0,
+            wi: w,
+            di: d,
+            z_sum: z,
+            covariance_ones: 1.0,
+            probit_scale,
+            qd1_lower: 1.0e-8,
+        };
+        let mut program = SurvivalMarginalSlopeRigidNllProgram {
+            primaries: vec![[q0, q1, qd1, g]],
+            z: vec![z],
+            w: vec![w],
+            d: vec![d],
+            probit_scale,
+        };
+
+        // Parity pin on the exact benchmarked inputs: the specialized
+        // contractions must equal the dense tower's contractions.
+        let dense = program_full_tower(&program, 0).expect("dense tower");
+        let third_vars: [OneSeed<4>; 4] =
+            std::array::from_fn(|a| OneSeed::seed_direction([q0, q1, qd1, g][a], a, dir_u[a]));
+        let third =
+            rigid_row_nll::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry, _>(&third_vars, &inputs)
+                .expect("specialized third")
+                .contracted_third();
+        let fourth_vars: [TwoSeed<4>; 4] =
+            std::array::from_fn(|a| TwoSeed::seed([q0, q1, qd1, g][a], a, dir_u[a], dir_v[a]));
+        let fourth =
+            rigid_row_nll::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry, _>(&fourth_vars, &inputs)
+                .expect("specialized fourth")
+                .contracted_fourth();
+        let dense_third_row = dense_third(&*dense, &dir_u);
+        let dense_fourth_row = dense_fourth(&*dense, &dir_u, &dir_v);
+        for a in 0..4 {
+            for b in 0..4 {
+                max_dense_third = max_dense_third.max(dense_third_row[a][b].abs());
+                max_dense_fourth = max_dense_fourth.max(dense_fourth_row[a][b].abs());
+                let band = 1e-11 * third[a][b].abs().max(dense_third_row[a][b].abs()).max(1.0);
+                assert!(
+                    (third[a][b] - dense_third_row[a][b]).abs() <= band,
+                    "event={d:.0} third[{a}][{b}]: specialized {:+.15e} vs dense {:+.15e}",
+                    third[a][b],
+                    dense_third_row[a][b],
+                );
+                let band = 1e-11
+                    * fourth[a][b]
+                        .abs()
+                        .max(dense_fourth_row[a][b].abs())
+                        .max(1.0);
+                assert!(
+                    (fourth[a][b] - dense_fourth_row[a][b]).abs() <= band,
+                    "event={d:.0} fourth[{a}][{b}]: specialized {:+.15e} vs dense {:+.15e}",
+                    fourth[a][b],
+                    dense_fourth_row[a][b],
+                );
+            }
+        }
+
+        let Some(gate) = gate.as_mut() else {
+            continue;
+        };
+        // The nudge perturbs the slope primary, so no tower evaluation is
+        // loop-invariant across calls.
+        let third = paired_interleaved(
+            15,
+            20_000,
+            0x9320_C0_03 ^ (d.to_bits() >> 60),
+            |perturbation| {
+                let perturbed_g = g + perturbation;
+                let vars: [OneSeed<4>; 4] = std::array::from_fn(|a| {
+                    OneSeed::seed_direction([q0, q1, qd1, perturbed_g][a], a, dir_u[a])
+                });
+                let t =
+                    rigid_row_nll::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry, _>(&vars, &inputs)
+                        .expect("specialized third")
+                        .contracted_third();
+                t[0][0] + t[3][3]
+            },
+            |perturbation| {
+                program.primaries[0][3] = g + perturbation;
+                let tower = program_full_tower(&program, 0).expect("dense tower");
+                let t = dense_third(&*tower, &dir_u);
+                t[0][0] + t[3][3]
+            },
+        );
+        gate.faster(
+            &format!("order=3 event={d:.0}"),
+            &third,
+            "production",
+            "generic_tower",
+        );
+        let fourth = paired_interleaved(
+            15,
+            20_000,
+            0x9320_C0_04 ^ (d.to_bits() >> 60),
+            |perturbation| {
+                let perturbed_g = g + perturbation;
+                let vars: [TwoSeed<4>; 4] = std::array::from_fn(|a| {
+                    TwoSeed::seed([q0, q1, qd1, perturbed_g][a], a, dir_u[a], dir_v[a])
+                });
+                let t =
+                    rigid_row_nll::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry, _>(&vars, &inputs)
+                        .expect("specialized fourth")
+                        .contracted_fourth();
+                t[0][0] + t[3][3]
+            },
+            |perturbation| {
+                program.primaries[0][3] = g + perturbation;
+                let tower = program_full_tower(&program, 0).expect("dense tower");
+                let t = dense_fourth(&*tower, &dir_u, &dir_v);
+                t[0][0] + t[3][3]
+            },
+        );
+        gate.faster(
+            &format!("order=4 event={d:.0}"),
+            &fourth,
+            "production",
+            "generic_tower",
+        );
+    }
+    assert!(
+        max_dense_third > 1e-3 && max_dense_fourth > 1e-3,
+        "the fixture's dense third/fourth contractions are numerically dead \
+         (max|third|={max_dense_third:.3e}, max|fourth|={max_dense_fourth:.3e}), so the \
+         parity assertions above would agree with anything"
+    );
+    if let Some(gate) = gate {
+        gate.finish();
+    }
+}
