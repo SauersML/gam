@@ -1,5 +1,6 @@
+use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 const MAX_STATS: usize = 1024;
 
@@ -21,30 +22,83 @@ pub struct KernelStatsSnapshot {
     pub stats: Vec<KernelStat>,
 }
 
-/// One thread's dispatch ring. Written only by the thread that owns it and read
+/// One thread's dispatch ring: written only by the thread that owns it and read
 /// by [`snapshot`] / [`clear`], so the lock the write path takes is one no other
 /// thread holds while a dispatch is in flight.
-type DispatchRing = Arc<Mutex<VecDeque<KernelStat>>>;
+type DispatchRing = Mutex<VecDeque<KernelStat>>;
 
-/// Every ring that has ever been created, held strongly so a worker pool's
-/// history survives the pool's shutdown — the silent truncation this module
-/// exists to prevent. A ring is created on a thread's FIRST recorded dispatch
-/// and grows on demand, so the registry costs one pointer per thread that
-/// actually dispatched and each ring holds at most [`MAX_STATS`] entries.
-static RINGS: OnceLock<Mutex<Vec<DispatchRing>>> = OnceLock::new();
+/// How many rings one arena block holds. An allocation-granularity choice, not
+/// a thread bound: the chain grows a block at a time and never stops.
+const RING_BLOCK: usize = 64;
 
-fn rings() -> &'static Mutex<Vec<DispatchRing>> {
-    RINGS.get_or_init(|| Mutex::new(Vec::new()))
+/// The append-only, process-lifetime home of every thread's ring.
+///
+/// A ring must outlive the thread that writes it — a worker pool's history is
+/// exactly what a snapshot after the pool shuts down needs — and the reference
+/// a thread keeps to its own ring must have no destructor, so that a dispatch
+/// issued while that thread's other locals are being torn down still has
+/// somewhere to go. Both follow from owning the rings in a `static`: a filled
+/// slot is never emptied and a link is never cleared, so `&'static` comes from
+/// the structure rather than from a leak.
+struct RingArena {
+    slots: [OnceLock<DispatchRing>; RING_BLOCK],
+    next: OnceLock<Box<RingArena>>,
 }
 
-thread_local! {
-    static RING: DispatchRing = {
-        let ring: DispatchRing = Arc::new(Mutex::new(VecDeque::new()));
-        if let Ok(mut registry) = rings().lock() {
-            registry.push(Arc::clone(&ring));
+impl RingArena {
+    const fn new() -> Self {
+        Self {
+            slots: [const { OnceLock::new() }; RING_BLOCK],
+            next: OnceLock::new(),
         }
-        ring
-    };
+    }
+
+    /// Take the first free slot, growing the chain when a block is full.
+    ///
+    /// A slot lost to a thread claiming concurrently is simply skipped; the
+    /// walk carries on to the next one, so two threads never share a ring.
+    fn claim(&'static self) -> &'static DispatchRing {
+        let mut block: &'static RingArena = self;
+        loop {
+            for slot in block.slots.iter() {
+                if slot.set(Mutex::new(VecDeque::new())).is_ok() {
+                    return slot.get().expect("the slot was filled just above");
+                }
+            }
+            block = block.next.get_or_init(|| Box::new(RingArena::new())).as_ref();
+        }
+    }
+
+    /// Every ring handed out so far, oldest block first.
+    fn claimed(&'static self) -> Vec<&'static DispatchRing> {
+        let mut rings = Vec::new();
+        let mut block: &'static RingArena = self;
+        loop {
+            for slot in block.slots.iter() {
+                match slot.get() {
+                    Some(ring) => rings.push(ring),
+                    // Slots fill in order, so the first empty one ends the
+                    // occupied prefix of this block.
+                    None => return rings,
+                }
+            }
+            match block.next.get() {
+                Some(next) => block = next.as_ref(),
+                None => return rings,
+            }
+        }
+    }
+}
+
+static RING_ARENA: RingArena = RingArena::new();
+
+thread_local! {
+    /// This thread's ring, claimed on its first recorded dispatch.
+    ///
+    /// A `Cell<Option<&'static _>>` has no destructor, so this local is
+    /// readable for as long as the thread runs — including while its other
+    /// locals are being destroyed — and `with` has no failure case to swallow.
+    static RING: Cell<Option<&'static DispatchRing>> = const { Cell::new(None) };
 }
 
 /// Record one dispatch attempt.
@@ -55,41 +109,41 @@ thread_local! {
 /// Rayon fan-out issues thousands of times per outer evaluation, and including
 /// the ones the size gate declines before any device is consulted. Behind a
 /// single process-wide `Mutex` those writes were not a diagnostic but a
-/// serialization point: on this issue's rigid marginal-slope arm at 16 threads
-/// a frame-pointer profile put 19.5 % of the whole run inside this function and
-/// a further 14.8 % in `lock_contended` beneath it — a third of the fit spent
-/// maintaining a 1024-entry ring whose contents at that call rate are the last
-/// microsecond of history (gam#979).
+/// serialization point: on the #979 rigid marginal-slope arm at 16 threads a
+/// frame-pointer profile put 19.5 % of the whole run inside this function and a
+/// further 14.8 % in `lock_contended` beneath it, and the arm's 40-minute wall
+/// carried 325 minutes of system time against 188 of user time — sixteen
+/// threads taking turns in the kernel to maintain a 1024-entry ring whose
+/// contents at that call rate are the last microsecond of history.
 ///
 /// Each thread therefore keeps its own ring and takes only its own lock. The
 /// recorded SET is unchanged: every attempt, device-bound or not, is still
-/// kept, and no ring is discarded. Only the interleaving of different threads'
-/// entries changes, and a ring written by racing threads never defined one.
+/// kept, and no ring is discarded when its thread ends. Only the interleaving
+/// of different threads' entries changes, and a ring written by racing threads
+/// never defined one.
 pub fn record(stat: KernelStat) {
-    match RING.try_with(|ring| {
+    RING.with(|cell| {
+        let ring = match cell.get() {
+            Some(ring) => ring,
+            None => {
+                let ring = RING_ARENA.claim();
+                cell.set(Some(ring));
+                ring
+            }
+        };
         if let Ok(mut guard) = ring.lock() {
             if guard.len() == MAX_STATS {
                 guard.pop_front();
             }
             guard.push_back(stat);
         }
-    }) {
-        // Recorded into this thread's ring.
-        Ok(()) => {}
-        // `try_with` rather than `with`: a dispatch issued while this thread's
-        // locals are being destroyed has no ring left to write to. Dropping
-        // that one attempt is the right answer; panicking in a teardown is not.
-        Err(_) => {}
-    }
+    });
 }
 
 /// Every recorded dispatch, from every thread that has recorded one.
 pub fn snapshot() -> KernelStatsSnapshot {
-    let Ok(registry) = rings().lock() else {
-        return KernelStatsSnapshot::default();
-    };
     let mut stats = Vec::new();
-    for ring in registry.iter() {
+    for ring in RING_ARENA.claimed() {
         if let Ok(guard) = ring.lock() {
             stats.extend(guard.iter().cloned());
         }
@@ -99,10 +153,7 @@ pub fn snapshot() -> KernelStatsSnapshot {
 
 /// Empty every ring.
 pub fn clear() {
-    let Ok(registry) = rings().lock() else {
-        return;
-    };
-    for ring in registry.iter() {
+    for ring in RING_ARENA.claimed() {
         if let Ok(mut guard) = ring.lock() {
             guard.clear();
         }
@@ -224,7 +275,9 @@ mod dispatch_ring_979_tests {
     static EXCLUSIVE: Mutex<()> = Mutex::new(());
 
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-        EXCLUSIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        EXCLUSIVE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn stat(name: &'static str, n: usize) -> KernelStat {
@@ -248,23 +301,20 @@ mod dispatch_ring_979_tests {
     fn every_thread_dispatch_reaches_one_snapshot() {
         const THREADS: usize = 8;
         const PER_THREAD: usize = 32;
-        let _exclusive = exclusive();
+        let exclusive = exclusive();
         clear();
-        let started = std::sync::atomic::AtomicUsize::new(0);
+        // Hold every thread open until all of them have recorded, so the rings
+        // genuinely coexist instead of being visited one after another by a
+        // scheduler that serialises the spawns.
+        let recorded = std::sync::Barrier::new(THREADS);
         std::thread::scope(|scope| {
             for thread in 0..THREADS {
-                let started = &started;
+                let recorded = &recorded;
                 scope.spawn(move || {
                     for index in 0..PER_THREAD {
                         record(stat("ring_test", thread * PER_THREAD + index));
                     }
-                    started.fetch_add(1, std::sync::atomic::Ordering::Release);
-                    // Hold every thread open until all of them have recorded, so
-                    // the rings genuinely coexist instead of being visited one
-                    // after another by a scheduler that serialises the spawns.
-                    while started.load(std::sync::atomic::Ordering::Acquire) < THREADS {
-                        std::hint::spin_loop();
-                    }
+                    recorded.wait();
                 });
             }
         });
@@ -282,13 +332,14 @@ mod dispatch_ring_979_tests {
             "no thread's dispatches may be lost or duplicated"
         );
         clear();
+        drop(exclusive);
     }
 
     /// `clear` empties every ring, not only the caller's, and a dispatch after
     /// it is visible again.
     #[test]
     fn clear_empties_every_ring_and_recording_resumes() {
-        let _exclusive = exclusive();
+        let exclusive = exclusive();
         clear();
         std::thread::scope(|scope| {
             scope.spawn(|| record(stat("before_clear", 1)));
@@ -309,13 +360,14 @@ mod dispatch_ring_979_tests {
         assert_eq!(after.len(), 1, "recording must resume after a clear");
         assert_eq!(after[0].n, 3);
         clear();
+        drop(exclusive);
     }
 
     /// A ring is bounded: the oldest attempt is dropped, never the newest, so
     /// the diagnostic is the tail of the run and not a leak.
     #[test]
     fn a_rings_capacity_drops_the_oldest_attempt() {
-        let _exclusive = exclusive();
+        let exclusive = exclusive();
         clear();
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -337,5 +389,6 @@ mod dispatch_ring_979_tests {
             "the newest attempt is kept"
         );
         clear();
+        drop(exclusive);
     }
 }

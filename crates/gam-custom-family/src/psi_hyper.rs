@@ -719,11 +719,12 @@ impl JeffreysPsiWeightCache {
         let prepared = self
             .plan
             .explicit_param_mixed_trace_weights(&self.pert_first[axis])?;
-        if slot.set(prepared).is_err() {
-            // A concurrent first use stored the same weights first: they are a
-            // pure function of the plan and this axis's derivative, so whose
-            // copy the slot holds does not matter. Read the stored one.
-            debug_assert!(slot.get().is_some(), "a refused set means a filled slot");
+        // `set` hands the weights back when a concurrent first use filled the
+        // slot first. They are a pure function of the plan and this axis's
+        // derivative, so whose copy the slot holds does not matter: the loser's
+        // is dropped and every caller reads the stored one.
+        if let Err(duplicate) = slot.set(prepared) {
+            drop(duplicate);
         }
         Ok(slot.get().expect("weights stored for this axis"))
     }
