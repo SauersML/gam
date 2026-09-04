@@ -210,6 +210,11 @@ mod test_support {
 // `gam_terms::smooth` where the `include!` was commented out). The file is a
 // self-contained `#[cfg(test)] mod`, so it adds nothing to the non-test build.
 include!("iso_kappa_reml_gradient_fd_tests.rs");
+// gam#2760: the incremental realizer's rebuild at the fit's own length scale
+// must BE the collection's realized term — design, penalties, nullities and
+// criterion — or the joint [ρ, ψ] search minimizes a different model than the
+// one it is graded against. Self-contained `#[cfg(test)] mod`.
+include!("spatial_realizer_chart_2760_tests.rs");
 // #901 re-home: the Matérn κ-optimizer convergence/monotone gates the issue
 // listed as stalling on the wrong projected-logdet gradient. Same #1601
 // orphaning story — driver deps live HERE post-carve. Self-contained

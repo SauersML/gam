@@ -938,6 +938,7 @@ impl GlobalIdentifiabilityPlan {
         local_identifiability_transform: Option<Array2<f64>>,
         coefficient_transform: Array2<f64>,
         local_columns: usize,
+        joint_null_rotation: Option<crate::basis::JointNullRotation>,
     ) -> Option<SmoothCollectionGauge> {
         let (arm, block) = match self {
             Self::Absent => return None,
@@ -952,6 +953,7 @@ impl GlobalIdentifiabilityPlan {
             local_identifiability_transform,
             coefficient_transform,
             local_columns,
+            joint_null_rotation,
         })
     }
 }
@@ -1689,6 +1691,11 @@ fn apply_global_smooth_identifiability(
                 basis_local_identifiability_transform(&term.metadata),
                 transform,
                 design_local.ncols(),
+                // `design_local` is the block AFTER the aggregation loop rotated
+                // it by the term's joint-null `Q`, so `transform` was derived on
+                // the rotated coordinates; a replay must rotate before it
+                // applies `transform` (gam#2760).
+                term.joint_null_rotation.clone(),
             )
             .expect("a derived collection coefficient chart implies a present gauge")
         });

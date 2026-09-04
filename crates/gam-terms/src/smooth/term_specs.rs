@@ -903,14 +903,39 @@ pub struct SmoothCollectionGauge {
     /// term reached the splice one column short and every κ fixture on a Duchon
     /// term refused in 0.2 s.
     ///
-    /// `None` means the term-local build applied no chart of its own — the usual
-    /// case for the radial families, whose `OrthogonalToParametric` policy defers
-    /// entirely to this gauge.
+    /// `None` means the term-local build applied no chart of its own. The radial
+    /// families under `OrthogonalToParametric` defer entirely to this gauge and
+    /// report an identity placeholder instead (`freeze_raw_spatial_metadata`), so
+    /// for them this is `Some(I)`; either way it carries no rotation.
     ///
     /// Like `C` and the arm, this is ψ-INDEPENDENT: it is a center-space
     /// constraint (`1ᵀα = 0`, a linear-orthogonality frame) or a frozen replay
     /// chart, never a function of the realized design.
     pub local_identifiability_transform: Option<Array2<f64>>,
+    /// The stage-2 joint-null absorption rotation `Q` the collection applied to
+    /// this term's TERM-LOCAL build BEFORE it derived
+    /// [`Self::coefficient_transform`] (gam#2760).
+    ///
+    /// The aggregation loop rotates the local design and penalties by `Q`, and
+    /// `T0` is then derived on `X_local · Q`, so the complete fixed map from the
+    /// local build's own coordinates to the collection's is `Q · T0`. Once the
+    /// gauge has composed `Q · T0` into the term's metadata the term reports
+    /// `None` for its own rotation, and `Q` cannot be recovered from the
+    /// composition, so it travels here: a moving-ψ replay rebuilds in the local
+    /// chart above, applies `Q`, and only then the fixed `T0` — the order the
+    /// collection used.
+    ///
+    /// Measured before this existed, on the `kappa_loop_n_scaling` Duchon spec
+    /// at the fit's OWN length scale: the replay put the unrotated block through
+    /// the chart derived on the rotated one, every design column and every
+    /// penalty block came out wrong (`‖ΔS‖_F/‖S‖_F` 0.69–1.41, nullities
+    /// `[1,10,0,0,1] → [4,10,2,1,3]`), and the criterion sat 679 above the
+    /// collection's at n = 1000 — the "route agreement" gap the joint κ search
+    /// was then minimizing against.
+    ///
+    /// ψ-INDEPENDENT like the rest of this gauge: an orthogonal chart chosen once
+    /// at the reference realization and never re-derived.
+    pub joint_null_rotation: Option<crate::basis::JointNullRotation>,
     /// The collection coefficient chart derived at the fit's reference
     /// realization, in TERM-LOCAL coefficient coordinates.
     ///

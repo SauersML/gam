@@ -5357,6 +5357,16 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 &mut replay.basis,
                 gauge.local_identifiability_transform.as_ref(),
             );
+            // The rotation `Q` the collection applied BEFORE it derived `T0`
+            // (gam#2760). The freeze copied the term's own `joint_null_rotation`,
+            // which the collection cleared once it composed `Q·T0` into the
+            // metadata, and the chart restored above is the pre-`Q` one — so
+            // without this the replay put an unrotated block through a chart
+            // derived on the rotated one. The local build honours a persisted
+            // rotation instead of re-deriving one, and
+            // `wrap_local_build_as_realization` applies it before the gauge
+            // applies `T0`: the collection's own order.
+            replay.joint_null_rotation = gauge.joint_null_rotation.clone();
         }
         let spec = spec;
         let fixed_blocks = build_term_collection_fixed_blocks(data, &spec)
