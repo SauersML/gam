@@ -771,16 +771,19 @@ These track how the *same* dictionary atom moves as you sweep a third axis —
 training checkpoints or model layers — the OLMo-trajectory capability.
 
 `gamfit.sae_checkpoint_dynamics` takes a grid of per-checkpoint decoder
-evaluations and reports how each atom drifts across checkpoints with an
-anytime-valid stability test:
+evaluations on a shared latent grid and reports each atom's displacement
+between consecutive checkpoints: its vector and L2 norm at the central grid
+node, plus the RMS and maximum L2 displacement over the grid. These are
+descriptive changes; the grid does not supply sampling uncertainty or a
+statistical stability test. The shared coordinates fix the correspondence
+without fitting a transport.
 
 ```python
 dyn = gamfit.sae_checkpoint_dynamics(
     decoder_grid,                 # decoder evaluations across checkpoints
     checkpoint_ids=["step10k", "step20k", ...],
     atom_names=["atom0", "atom1", ...],
-    latent_grid,                  # shared latent grid the atoms are evaluated on
-    alpha=0.05,
+    latent_grid=latent_grid,      # shared latent grid the atoms are evaluated on
 )
 ```
 

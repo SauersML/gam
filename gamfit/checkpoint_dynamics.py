@@ -1,8 +1,8 @@
 """Cross-checkpoint descriptive SAE atom-trajectory dynamics (issue #1102).
 
 Thin wrapper over the Rust core ``gam::inference::checkpoint_dynamics``: all math
-(per-step descriptive decoder change, inter-checkpoint transport maps) lives in
-Rust; this module only marshals numpy arrays across the FFI boundary.
+(per-step descriptive decoder change) lives in Rust; this module only marshals
+numpy arrays across the FFI boundary.
 
 The setting: an SAE is fitted at each of several training checkpoints on the same
 prompts at a layer; every atom ``k`` has a decoder curve ``g_k^(c)(t)`` sampled
@@ -17,7 +17,7 @@ Functions
 ---------
 sae_checkpoint_dynamics
     Run the per-atom descriptive cross-checkpoint dynamics and return one
-    trajectory per atom (descriptive step changes and transport maps).
+    trajectory per atom containing descriptive step changes.
 """
 
 from __future__ import annotations
@@ -54,14 +54,15 @@ def sae_checkpoint_dynamics(
     Returns
     -------
     dict
-        ``{"trajectories": [ {"atom_name", "descriptive_step_changes": [...],
-        "transports": [...]} ]}``. Each entry in ``descriptive_step_changes`` is
+        ``{"trajectories": [{"atom_name": ..., "descriptive_step_changes": [...]}]}``.
+        Each entry in ``descriptive_step_changes`` is
         one consecutive-checkpoint step with ``checkpoint_from``,
         ``checkpoint_to``, ``latent_coordinate`` (the central grid node),
         ``displacement_at_mode`` (the ambient displacement vector there),
         ``l2_at_mode``, ``grid_rms_l2``, and ``grid_max_l2``. These are plain
         measured decoder changes: NO e-values, NO debiased contrasts, and NO
-        coverage claim.
+        coverage claim. The shared latent grid fixes the chart correspondence
+        exactly, so there is no estimated transport in the output.
     """
     grid = np.ascontiguousarray(decoder_grid, dtype=np.float64)
     if grid.ndim != 4:

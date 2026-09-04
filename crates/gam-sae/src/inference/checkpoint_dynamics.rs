@@ -2,12 +2,12 @@
 //!
 //! The input is a deterministic grid of already-fitted decoder values. Such a
 //! grid contains no observation-level scores, sampling covariance, or null
-//! distribution, so this module reports geometric displacements and chart
-//! transports only. It deliberately emits no standard errors, p-values, or
-//! e-values. Calibrated change evidence requires fit-time influence data (or an
-//! external replicated checkpoint experiment) in a future input schema.
+//! distribution, so this module reports geometric displacements only. The
+//! shared latent grid fixes the chart correspondence exactly; no transport fit
+//! is needed or identified by these inputs. It emits no standard errors,
+//! p-values, or e-values. Calibrated change evidence requires fit-time influence
+//! data (or an external replicated checkpoint experiment) in a future input schema.
 
-use crate::inference::layer_transport::{ChartTopology, LayerTransportReport, fit_layer_transport};
 use ndarray::{Array1, ArrayView1, ArrayView4};
 
 /// Inputs for one cross-checkpoint atom-dynamics run.
@@ -40,17 +40,13 @@ pub struct CheckpointStepChange {
 pub struct AtomTrajectory {
     pub atom_name: String,
     pub descriptive_step_changes: Vec<CheckpointStepChange>,
-    /// Consecutive-checkpoint chart correspondences (checkpoint axis reused as
-    /// the transport "layer" axis).
-    pub transports: Vec<LayerTransportReport>,
 }
 
 /// Run cross-checkpoint descriptive dynamics for every atom.
 ///
-/// For each atom, walks consecutive checkpoints and, at each step `c → c+1`:
-/// 1. fits the transport map between the two checkpoints' latent charts
-///    ([`fit_layer_transport`], checkpoint axis as the layer axis);
-/// 2. reads direct decoder displacement summaries on the shared grid.
+/// For each atom, reads direct decoder displacement summaries between
+/// consecutive checkpoints on the supplied shared grid. Its identity chart
+/// correspondence is part of the input, not a statistical estimate.
 pub fn checkpoint_atom_dynamics(
     input: &CheckpointDynamicsInput<'_>,
 ) -> Result<Vec<AtomTrajectory>, String> {
@@ -90,45 +86,31 @@ pub fn checkpoint_atom_dynamics(
     if input.latent_grid.iter().any(|v| !v.is_finite()) {
         return Err("checkpoint dynamics latent grid must be finite".to_string());
     }
+    let lo = input
+        .latent_grid
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let hi = input
+        .latent_grid
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    if hi <= lo {
+        return Err("checkpoint dynamics latent_grid must have positive range".to_string());
+    }
 
-    // The mode index: the latent-grid node where the contrast is evaluated.
-    // Use the central node so it sits inside any chart and away from edge
-    // interpolation artifacts.
+    // Evaluate the point summary at the central supplied node; no estimated
+    // mode or interpolation is needed for this descriptive comparison.
     let mode_index = n_grid / 2;
-    let (lo, hi) = interval_bounds(input.latent_grid)?;
-    let topology = ChartTopology::Interval { lo, hi };
-    let latent_coords = input.latent_grid.to_owned();
-
     let mut trajectories = Vec::with_capacity(n_atoms);
     for atom in 0..n_atoms {
         let atom_name = input.atom_names[atom].clone();
         let mut descriptive_step_changes = Vec::with_capacity(n_checkpoints - 1);
-        let mut transports = Vec::with_capacity(n_checkpoints - 1);
 
         for step in 0..n_checkpoints - 1 {
             let c0 = step;
             let c1 = step + 1;
-
-            // --- transport map across the checkpoint axis --------------------
-            // The chart coordinate is the supplied latent grid itself. Decoder
-            // output components are ambient values and may be non-injective
-            // (for a circle, a component can be cos(t)); they are never used as
-            // latent coordinates.
-            let transport = fit_layer_transport(
-                c0,
-                c1,
-                latent_coords.view(),
-                latent_coords.view(),
-                topology,
-                topology,
-            )
-            .map_err(|e| {
-                format!(
-                    "checkpoint transport for atom '{atom_name}' step {} → {} failed: {e}",
-                    input.checkpoint_ids[c0], input.checkpoint_ids[c1]
-                )
-            })?;
-            transports.push(transport);
 
             let mut displacement_at_mode = Array1::<f64>::zeros(ambient_dim);
             let mut grid_sum_sq = 0.0_f64;
@@ -161,22 +143,10 @@ pub fn checkpoint_atom_dynamics(
         trajectories.push(AtomTrajectory {
             atom_name,
             descriptive_step_changes,
-            transports,
         });
     }
 
     Ok(trajectories)
-}
-
-/// Strict interval bounds for the supplied latent chart.
-fn interval_bounds(grid: ArrayView1<'_, f64>) -> Result<(f64, f64), String> {
-    let lo = grid.iter().copied().fold(f64::INFINITY, f64::min);
-    let hi = grid.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if hi <= lo {
-        return Err("checkpoint dynamics latent_grid must have positive range".to_string());
-    }
-    let pad = (hi - lo) * 1e-6;
-    Ok((lo - pad, hi + pad))
 }
 
 #[cfg(test)]
@@ -214,9 +184,9 @@ mod tests {
     #[test]
     fn no_change_atom_has_zero_descriptive_displacement() {
         let n_ckpt = 5;
-        // The transport fit requires at least MIN_TRANSPORT_OBS (16) paired
-        // grid samples, so the shared latent grid must be at least that long.
-        let n_grid = 17;
+        // Descriptive changes need only a shared grid. In particular they do
+        // not inherit a regression fit's minimum observation count.
+        let n_grid = 2;
         let ambient = 3;
         let grid = drift_grid(n_ckpt, n_grid, ambient, 0.5);
         let latent: Array1<f64> = Array1::linspace(0.0, 1.0, n_grid);
@@ -247,9 +217,6 @@ mod tests {
             );
             assert_eq!(change.grid_max_l2, 0.0);
         }
-        // The transport across identical checkpoint charts is the identity map
-        // on the shared latent grid — a degree-free, fold-free interval homeo.
-        assert_eq!(constant.transports.len(), n_ckpt - 1);
     }
 
     #[test]
@@ -346,5 +313,29 @@ mod tests {
             latent_grid: latent.view(),
         };
         assert!(checkpoint_atom_dynamics(&input).is_err());
+    }
+
+    #[test]
+    fn rejects_degenerate_and_nonfinite_shared_charts() {
+        let grid = Array4::<f64>::zeros((2, 1, 2, 1));
+        let ids = vec!["before".to_string(), "after".to_string()];
+        let names = vec!["atom".to_string()];
+        for (coordinates, diagnostic) in [
+            ([0.0, 0.0], "positive range"),
+            ([f64::NAN, 1.0], "must be finite"),
+            ([0.0, f64::INFINITY], "must be finite"),
+        ] {
+            let latent = Array1::from_vec(coordinates.to_vec());
+            let input = CheckpointDynamicsInput {
+                decoder_grid: grid.view(),
+                checkpoint_ids: &ids,
+                atom_names: &names,
+                latent_grid: latent.view(),
+            };
+            let error = checkpoint_atom_dynamics(&input)
+                .err()
+                .expect("invalid chart");
+            assert!(error.contains(diagnostic), "{error}");
+        }
     }
 }

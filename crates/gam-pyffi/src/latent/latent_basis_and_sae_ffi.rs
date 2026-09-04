@@ -3610,13 +3610,13 @@ fn certify_chart_transfer(
 /// atom's decoder curve sampled on the shared `latent_grid` at every checkpoint.
 /// `checkpoint_ids` / `atom_names` label the checkpoint and atom axes (lengths
 /// must match the corresponding grid axes). For each atom this walks consecutive
-/// checkpoints and, per step `c → c+1`, fits the inter-checkpoint transport map
-/// (checkpoint axis reused as the transport "layer" axis) and records the
-/// DESCRIPTIVE decoder change of that step: the displacement vector at the
-/// most-moved latent coordinate, its L2 norm, and the grid RMS / max L2 change.
+/// checkpoints and records the descriptive decoder change of each step: the
+/// displacement vector at the central latent-grid node, its L2 norm, and the
+/// grid RMS / max L2 change. The shared grid fixes the chart correspondence;
+/// no transport is estimated from it.
 ///
-/// Returns `{"trajectories": [ {atom_name, descriptive_step_changes:[...],
-/// transports:[...transport...]} ]}`. `descriptive_step_changes` are plain
+/// Returns `{"trajectories": [{atom_name, descriptive_step_changes:[...]}]}`.
+/// `descriptive_step_changes` are plain
 /// measured decoder changes — NO e-values, NO penalty-debiased Riesz contrasts,
 /// and NO coverage claim: the anytime-valid change e-process and the Riesz
 /// contrast estimator were removed because a bare decoder grid does not supply
@@ -3665,11 +3665,6 @@ fn sae_checkpoint_dynamics(
             steps.append(c)?;
         }
         t.set_item("descriptive_step_changes", steps)?;
-        let transports = PyList::empty(py);
-        for report in &traj.transports {
-            transports.append(layer_transport_report_to_pydict(py, report)?)?;
-        }
-        t.set_item("transports", transports)?;
         traj_list.append(t)?;
     }
     out.set_item("trajectories", traj_list)?;
