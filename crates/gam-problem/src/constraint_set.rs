@@ -87,6 +87,44 @@ pub const PRIMAL_FEASIBILITY_TOL: f64 = 1e-8;
 /// This does NOT collide with the legitimately-vacuous row: `‖a‖ = 0` with a
 /// bound at or below zero is finite, passes here, and keeps its own
 /// disposition in each rule.
+/// Where one sweep reads a row's scaling denominator and right-hand side.
+///
+/// `row_norm(row)?` and `bound(row)?` are `Result`-returning methods that
+/// re-derive the row's carrier, slot and index on every call. The sweep calls
+/// them once per row, and on the large-scale CTN cone (1.6 M rows) they were
+/// 34 % of the profile — more than the products they scale. The factored cone
+/// answers both from slices instead; every other carrier keeps its accessors,
+/// so there is still exactly one scan and one decidability contract (gam#979).
+enum RowMetrics<'a> {
+    /// The factored cone: `norms[row % tile]` with `bounds` indexed by row,
+    /// `0` when the cone is homogeneous.
+    Tiled {
+        norms: &'a [f64],
+        tile: usize,
+        bounds: Option<&'a [f64]>,
+    },
+    /// Anything else: through the carrier's own accessors.
+    Carrier(&'a ConstraintSet),
+}
+
+impl RowMetrics<'_> {
+    #[inline]
+    fn read(&self, row: usize) -> Result<(f64, f64), String> {
+        match self {
+            RowMetrics::Tiled {
+                norms,
+                tile,
+                bounds,
+            } => {
+                let norm = norms[row % tile];
+                let bound = bounds.map_or(0.0, |values| values[row]);
+                Ok((norm, bound))
+            }
+            RowMetrics::Carrier(set) => Ok((set.row_norm(row)?, set.bound(row)?)),
+        }
+    }
+}
+
 /// Why a [`ConstraintSet::max_scaled_violation`] sweep stops at a row.
 ///
 /// The serial loop this replaces returned at the first such row in index
@@ -515,12 +553,22 @@ impl KhatriRaoConeConstraints {
             ));
         }
         let n = self.factor.nrows();
-        let mut out = Array1::<f64>::zeros(self.nrows());
+        let slots = self.coupled_rows.len();
+        // One `Ψ · B` for every slot at once. `Array2::dot(&Array1)` is
+        // ndarray's per-row `unrolled_dot`; `Array2::dot(&Array2)` is a real
+        // matrix product, and this runs on every feasibility sweep of every
+        // trial point at `n = 320000` (gam#979).
+        let mut blocks = Array2::<f64>::zeros((p_cov, slots));
         for (slot, &k) in self.coupled_rows.iter().enumerate() {
-            let block = beta.slice(ndarray::s![k * p_cov..(k + 1) * p_cov]);
-            let alpha = self.factor.dot(&block);
+            blocks
+                .column_mut(slot)
+                .assign(&beta.slice(ndarray::s![k * p_cov..(k + 1) * p_cov]));
+        }
+        let alpha = self.factor.dot(&blocks);
+        let mut out = Array1::<f64>::zeros(self.nrows());
+        for slot in 0..slots {
             out.slice_mut(ndarray::s![slot * n..(slot + 1) * n])
-                .assign(&alpha);
+                .assign(&alpha.column(slot));
         }
         Ok(out)
     }
@@ -554,6 +602,29 @@ impl KhatriRaoConeConstraints {
     pub fn bound(&self, row: usize) -> Result<f64, String> {
         self.split_row_id(row)?;
         Ok(self.bounds.as_ref().map_or(0.0, |bounds| bounds[row]))
+    }
+
+    /// The `Ψ`-row norms, one per `i`, shared across every coupled slot.
+    ///
+    /// Read directly by [`RowMetrics::Tiled`]: `row_norm(row)?` is the same
+    /// lookup behind a slot split, a range check and a `Result`, and the
+    /// feasibility sweep does it once per row (gam#979).
+    pub(crate) fn row_norms_slice(&self) -> &[f64] {
+        self.factor_row_norms
+            .as_slice()
+            .expect("factor row norms are contiguous")
+    }
+
+    /// Rows per coupled slot, so `row % tile_rows()` is the `Ψ` row index.
+    pub(crate) fn tile_rows(&self) -> usize {
+        self.factor.nrows()
+    }
+
+    /// The per-row right-hand sides, `None` for the homogeneous cone.
+    pub(crate) fn bounds_slice(&self) -> Option<&[f64]> {
+        self.bounds
+            .as_ref()
+            .map(|bounds| bounds.as_slice().expect("bounds are contiguous"))
     }
 
     /// Materialize the requested rows as a dense system (active-set KKT use;
@@ -851,19 +922,20 @@ impl ConstraintSet {
         // than whichever thread found one first, and the running maximum breaks
         // exact ties toward the smaller index. Both make the verdict, the named
         // row, and the refusal text independent of how the rows were split.
+        let metrics = match self {
+            ConstraintSet::KhatriRaoCone(cone) => RowMetrics::Tiled {
+                norms: cone.row_norms_slice(),
+                tile: cone.tile_rows(),
+                bounds: cone.bounds_slice(),
+            },
+            _ => RowMetrics::Carrier(self),
+        };
         let sweep = (0..values.len())
             .into_par_iter()
             .fold(ScaledViolationSweep::none, |mut sweep, row| {
                 let value = values[row];
-                let norm = match self.row_norm(row) {
-                    Ok(norm) => norm,
-                    Err(error) => {
-                        sweep.record_terminal(row, SweepTerminal::RowUnavailable(error));
-                        return sweep;
-                    }
-                };
-                let bound = match self.bound(row) {
-                    Ok(bound) => bound,
+                let (norm, bound) = match metrics.read(row) {
+                    Ok(pair) => pair,
                     Err(error) => {
                         sweep.record_terminal(row, SweepTerminal::RowUnavailable(error));
                         return sweep;

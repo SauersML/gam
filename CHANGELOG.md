@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The feasibility sweep reads the factored cone's row norm and bound from slices instead of calling two `Result`-returning accessors per row that re-derive the row's carrier and slot, and the cone's constraint values are one `Ψ · B` matrix product instead of one `Array2::dot(&Array1)` per coupled slot. Together those were half of the sweep's remaining profile after it was parallelised (#979).
+
 - The library and Python survival prediction publish `survival_prob_plugin` beside `survival_prob`, the pair `gam predict` already prints: the posterior-mean path integrates that surface on its way to the mean and now reports it instead of discarding it (#2670).
 
 - `ConstraintSet::max_scaled_violation` — the feasibility verdict every active-set solve takes on every trial point — fans its rows across the pool instead of scanning them on one thread. On the large-scale CTN cone (1.6 M rows) a profile of the preprocessor's reduced-face solve put 92 % of the process inside this one function. The reduction carries the smallest terminal row rather than whichever thread reached one first, so the verdict, the row a refusal names and its text are what the serial loop produced (#979, #2721).
