@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The dense-product GPU dispatch diagnostic keeps one ring per thread instead of one process-wide `Mutex<VecDeque>`. Every `fast_ab` in the workspace passes through that seam, so on the #979 rigid marginal-slope arm at 16 threads a frame-pointer profile spent 19.5 % of the run inside `record` and 14.8 % in `lock_contended` beneath it, against 4.2 % in the Hessian accumulation it was observing; the arm's 40-minute wall carried 325 minutes of system time against 188 of user time. The recorded set is unchanged — every dispatch attempt, device-bound or not, and no ring is discarded when its thread ends (#979).
+
 - The process-wide Duchon radial profile cache stores its profiles in a static `OnceLock` array instead of leaking them, so the compile gate's ban scanner passes; a process may intern at most 64 distinct `(p, s, d)` shapes and the next one is refused rather than silently unbounded (#2670, #2735).
 
 - The survival time-basis smoothing-lambda refusal no longer points the user at `--time-smooth-lambda` / `time_smooth_lambda=`, neither of which exists; it names the seed's real provenance (`FitConfig::time_smooth_lambda`, saved as `survival_time_smooth_lambda`) (#2670).
