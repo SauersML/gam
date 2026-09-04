@@ -376,7 +376,15 @@ fn penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth()
     // near the penalty null space would leave it monotone/endpoint-pinned).
     let target = array![[8.0], [2.0], [15.0], [-3.0], [21.0], [6.0]];
 
-    let log_lambda_grid = [-8.0_f64, -4.0, -1.0, 1.0, 4.0, 8.0, 12.0];
+    // The minimum sits near log λ ≈ −6 (measured 2026-09-04 on this fixture:
+    // V = 11.35, 10.35, 9.35, 8.36, 7.42, 6.85, 8.98, 29.6 at log λ = −16, −14,
+    // −12, −10, −8, −6, −4, −2). A grid whose first two points straddle it
+    // reports the LEFT ENDPOINT as the argmin and reads a working Occam term as
+    // a missing one; the grid must extend past the minimum on both sides at a
+    // spacing finer than the basin.
+    let log_lambda_grid = [
+        -16.0_f64, -12.0, -10.0, -8.0, -6.0, -4.0, -2.0, 0.0, 4.0, 8.0, 12.0, 16.0,
+    ];
     let mut best = (f64::INFINITY, f64::NAN);
     for &ll in &log_lambda_grid {
         // Fresh term per grid point — penalized_quasi_laplace_criterion fits (t,β) in place, so a
