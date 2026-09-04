@@ -148,8 +148,7 @@ fn pole_and_equator_spread(radians: bool, pole_lat_rad: f64) -> (f64, f64) {
             .arg(&model_path)
             .arg(input)
             .arg("--out")
-            .arg(out)
-            .args(["--mode", "posterior-mean"]);
+            .arg(out);
         run_or_panic(cmd, label);
     }
 
