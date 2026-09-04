@@ -4239,17 +4239,11 @@ impl SaeManifoldTerm {
                 ));
             }
             let ev = verdict.explained_variance;
-            let dictionary_degenerate = verdict.degenerate(k);
-            if !dictionary_degenerate
-                && let Some((j, kk, coherence)) = self.structural_coherence_collapse_detected()?
-            {
-                log::warn!(
-                    "SaeManifoldTerm: structural coherence collapse — atoms ({j}, {kk}) decode a \
-                     shared output subspace (μ̂={coherence:.4} above the derived random-subspace \
-                     null) at healthy EV={ev:.4}; diagnostic only, deferred to the structure search"
-                );
-            }
-            if !dictionary_degenerate {
+            // A healthy dictionary's structural coherence is the question
+            // [`Self::enforce_structural_coherence_guard`] asks of the same
+            // accepted iterate right after this guard; the diagnostic-only scan
+            // that repeated it here (gam#2731) is gone.
+            if !verdict.degenerate(k) {
                 return Ok(());
             }
             let collapse_event_floor = verdict.collapse_event_floor(k).ok_or_else(|| {
@@ -5145,8 +5139,18 @@ impl SaeManifoldTerm {
         // smaller intrinsic dimension bounds the null correlation). No inherited
         // constant. A true duplicate (`Y_j ∝ Y_k`, cos→1) clears it and still fires;
         // the benign overcomplete pair (cos≈E_null) does not.
-        // Gated per-row contributions `Y_k` for every atom appearing in a candidate
-        // (computed once each). `None` = no gated design available for that atom.
+        // gam#2731 — the contribution cosine is a bilinear form in each atom's
+        // two SMALL factors and never needs the n×p contributions themselves.
+        // With the gated basis `W_k = diag(a_·k)·Φ_k` (n × M_k),
+        //   ⟨Y_j, Y_k⟩_F = tr(B_jᵀ · W_jᵀW_k · B_k) = ⟨W_jᵀW_k, B_jB_kᵀ⟩_F,
+        // so a pair costs `n·M_j·M_k + M_j·M_k·p` flops — the same products the
+        // materialized `Y_j`, `Y_k` were built from, summed in the other
+        // association — instead of two n×M×p decodes held in memory (one n×p
+        // block per candidate atom, 3.4 GB at the p = 2048 / 32-chart tier,
+        // re-read once per pair) plus an n·p dot per pair. That materialized
+        // scan was the largest single cost of the joint fit's per-iteration
+        // tail at that tier (measured 2.4–3.6 s of a 17 s iteration, and it
+        // ran three times per accepted iterate).
         let gates = self.assignment.assignments();
         let n = gates.nrows();
         let mut in_candidate = vec![false; k];
@@ -5154,58 +5158,60 @@ impl SaeManifoldTerm {
             in_candidate[j] = true;
             in_candidate[kk] = true;
         }
-        // #2731 — one gated `n × p` projection per candidate atom, independent
-        // across atoms (each reads its own basis, decoder and gate column), so
-        // they fan across the pool under the row-pass gate; the GEMM inside is
-        // pinned to one core by the joint fit's sequential-faer scope, which is
-        // what made this loop serial.
-        let contribution_of = |atom: usize| -> Option<Array2<f64>> {
-            if !in_candidate[atom] {
-                return None;
-            }
-            let phi = &self.atoms[atom].basis_values;
-            if phi.nrows() != n || n == 0 {
-                return None;
-            }
-            // Per-atom decode `Φ_k · B_k` (N×M · M×p). This runs inside the
-            // per-accepted-iterate structural-coherence guard, so route the
-            // matrix-matrix product through the faer GEMM (small shapes fall
-            // back to `ndarray::dot` inside `fast_ab`; the reduction order may
-            // differ, acceptable per the crate convention).
-            let mut y = fast_ab(phi, self.atoms[atom].decoder_coefficients());
-            for row in 0..n {
-                let g = gates[[row, atom]];
-                for col in 0..y.ncols() {
-                    y[[row, col]] *= g;
+        // `None` = no gated design for that atom (decoder-only detector call
+        // before any gated design), the same contract as before.
+        let gated_basis: Vec<Option<Array2<f64>>> = (0..k)
+            .map(|atom| {
+                if !in_candidate[atom] {
+                    return None;
                 }
-            }
-            Some(y)
+                let phi = &self.atoms[atom].basis_values;
+                if phi.nrows() != n || n == 0 {
+                    return None;
+                }
+                let mut gated = phi.clone();
+                for (row, mut basis_row) in gated.rows_mut().into_iter().enumerate() {
+                    let g = gates[[row, atom]];
+                    basis_row.mapv_inplace(|value| value * g);
+                }
+                Some(gated)
+            })
+            .collect();
+        // ⟨Y_j, Y_k⟩_F from the two M_j × M_k Grams; `None` when either atom
+        // has no gated design.
+        let contribution_inner = |j: usize, kk: usize| -> Option<f64> {
+            let (wj, wk) = (gated_basis[j].as_ref()?, gated_basis[kk].as_ref()?);
+            let basis_gram = fast_atb(wj, wk);
+            let decoder_gram = gam_linalg::faer_ndarray::fast_abt(
+                self.atoms[j].decoder_coefficients(),
+                self.atoms[kk].decoder_coefficients(),
+            );
+            Some(
+                basis_gram
+                    .iter()
+                    .zip(decoder_gram.iter())
+                    .map(|(basis, decoder)| basis * decoder)
+                    .sum::<f64>(),
+            )
         };
-        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
-        let contribution: Vec<Option<Array2<f64>>> = if parallel {
-            use rayon::prelude::*;
-            (0..k).into_par_iter().map(contribution_of).collect()
-        } else {
-            (0..k).map(contribution_of).collect()
-        };
-        let mut collapsed = Vec::with_capacity(candidates.len());
-        for (j, kk) in candidates {
+        // ‖Y_k‖²_F once per candidate atom (the Gram diagonal, clamped at zero
+        // against roundoff on a vanished contribution).
+        let contribution_norm_sq: Vec<Option<f64>> = (0..k)
+            .map(|atom| contribution_inner(atom, atom).map(|value| value.max(0.0)))
+            .collect();
+        let score_pair = |(j, kk): (usize, usize)| -> Option<(usize, usize, f64, f64)> {
             let d_eff = (self.atoms[j].basis_size().max(1) * frames[j].ncols().max(1))
                 .min(self.atoms[kk].basis_size().max(1) * frames[kk].ncols().max(1))
                 as f64;
             let e_null = (2.0 / (std::f64::consts::PI * d_eff)).sqrt();
             let contribution_bar = 0.5 * (e_null.min(1.0) + 1.0);
-            let contribution_cos = match (&contribution[j], &contribution[kk]) {
-                (Some(yj), Some(yk)) => {
-                    let mut dot = 0.0_f64;
-                    let mut nj = 0.0_f64;
-                    let mut nk = 0.0_f64;
-                    for (a, b) in yj.iter().zip(yk.iter()) {
-                        dot += a * b;
-                        nj += a * a;
-                        nk += b * b;
-                    }
-                    let denom = (nj * nk).sqrt();
+            let contribution_cos = match (
+                contribution_inner(j, kk),
+                contribution_norm_sq[j],
+                contribution_norm_sq[kk],
+            ) {
+                (Some(dot), Some(norm_j), Some(norm_k)) => {
+                    let denom = (norm_j * norm_k).sqrt();
                     if denom > 0.0 {
                         (dot / denom).abs()
                     } else {
@@ -5226,10 +5232,15 @@ impl SaeManifoldTerm {
                     }
                 }
             };
-            if contribution_cos > contribution_bar {
-                collapsed.push((j, kk, contribution_cos, contribution_bar));
-            }
-        }
+            (contribution_cos > contribution_bar).then_some((j, kk, contribution_cos, contribution_bar))
+        };
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let collapsed: Vec<(usize, usize, f64, f64)> = if parallel {
+            use rayon::prelude::*;
+            candidates.into_par_iter().filter_map(score_pair).collect()
+        } else {
+            candidates.into_iter().filter_map(score_pair).collect()
+        };
         Ok(collapsed)
     }
 
@@ -7818,6 +7829,7 @@ impl SaeManifoldTerm {
             if !kkt_quiescent {
                 self.enforce_active_mass_guard(outer_iteration, Some(rho))?;
             }
+            tail_marks.push(("guard_mass", iteration_started.elapsed().as_secs_f64()));
             // #976 Layer-1 guard 3b (decoder arm): the gate-mass guard above is
             // blind to a dictionary whose gates stay spread but whose decoders
             // have all collapsed to ≈0 (the real-data K>1 failure that drives
@@ -7826,10 +7838,11 @@ impl SaeManifoldTerm {
             // residual; a strict no-op for K=1. CONTAINMENT class (b): always
             // live, never quiesced.
             self.enforce_decoder_norm_guard(target, outer_iteration, rho, Some(&target_col_stats))?;
+            tail_marks.push(("guard_decoder", iteration_started.elapsed().as_secs_f64()));
             if !kkt_quiescent {
                 self.enforce_structural_coherence_guard(target, outer_iteration, rho)?;
             }
-            tail_marks.push(("guards", iteration_started.elapsed().as_secs_f64()));
+            tail_marks.push(("guard_coherence", iteration_started.elapsed().as_secs_f64()));
             // #2089 defense-in-depth: never grind a hopeless fit (and never let a
             // CPU watchdog SIGKILL the host while it does). Once the co-collapse
             // multi-start budget is spent, re-test the exact same typed, same-state
@@ -7953,20 +7966,32 @@ impl SaeManifoldTerm {
             // full-`B` path). A kept move is a real transition of the evidence
             // map; without the bit the wrapper could report
             // `fixed_point=true` after U moved invisibly (#2253).
+            tail_marks.push(("verdict", iteration_started.elapsed().as_secs_f64()));
+            let hook_marks = std::cell::RefCell::new(Vec::<(&'static str, f64)>::new());
             if self.run_objective_guarded_hook(target, rho, analytic_penalties, 0.0, |term| {
                 term.retract_unit_speed_charts_in_loop()?;
+                hook_marks
+                    .borrow_mut()
+                    .push(("hook_retract", iteration_started.elapsed().as_secs_f64()));
                 term.fix_decoder_scale_gauge()?;
+                hook_marks
+                    .borrow_mut()
+                    .push(("hook_gauge", iteration_started.elapsed().as_secs_f64()));
                 if term.frames_active() {
                     term.refresh_active_frames_from_data(target)
                         .map_err(|err| {
                             format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
                         })?;
+                    hook_marks
+                        .borrow_mut()
+                        .push(("hook_frames", iteration_started.elapsed().as_secs_f64()));
                 }
                 Ok(())
             })? {
                 state_moved = true;
                 moved_at.get_or_insert(StateMoveSite::FrameRefresh);
             }
+            tail_marks.extend(hook_marks.into_inner());
             // Unconditional warranty-bank update (see the bank's declaration):
             // strictly-better penalized objective ⇒ this accepted boundary is
             // the new exit-warranty fallback, independent of any EV/coherence
@@ -7980,12 +8005,17 @@ impl SaeManifoldTerm {
                 warranty_obj = boundary_obj;
                 warranty_state = Some(self.snapshot_mutable_state());
             }
-            if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
+            let ev_result = self.dictionary_reconstruction_ev(target, rho);
+            tail_marks.push(("ev_reconstruction", iteration_started.elapsed().as_secs_f64()));
+            if let Ok(ev) = ev_result {
                 // #2230 — keep the best state on the PENALIZED OBJECTIVE first
                 // (the walk's own referee) and, at (near-)equal objective, on the
                 // #2081 EV-then-uniformity certificate ([`prefer_candidate_state`]).
-                if self.structural_coherence_collapse_detected()?.is_none() {
+                let collapse = self.structural_coherence_collapse_detected()?;
+                tail_marks.push(("ev_coherence", iteration_started.elapsed().as_secs_f64()));
+                if collapse.is_none() {
                     let candidate_uniformity = self.coordinate_uniformity_aggregate();
+                    tail_marks.push(("ev_uniformity", iteration_started.elapsed().as_secs_f64()));
                     let candidate_obj = boundary_obj;
                     if prefer_candidate_state(
                         candidate_obj,

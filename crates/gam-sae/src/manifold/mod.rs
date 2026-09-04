@@ -260,6 +260,9 @@ mod tests_chart_evaluator_jets;
 mod tests_collapse_prevention;
 
 #[cfg(test)]
+mod coherence_scan_2731_tests;
+
+#[cfg(test)]
 mod tests_collapse_2132;
 
 #[cfg(test)]
