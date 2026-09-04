@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The joint Newton's trust region (via `opt`) treats a step as numerically neutral only when both the realized change and the model's predicted reduction are inside the objective's round-off floor; a resolvable prediction that realizes nothing is rejected, not accepted with `ρ = 1` (#2765).
+
 - A survival marginal-slope fit that estimated its parametric baseline chart is saved with the fitted chart instead of being refused for a missing `--baseline-scale`, and the fixed-λ refit from a certified outer optimum admits a curvature certificate the criterion contradicted (`criterion-contradicted`) as it admits a positive-semidefinite one; only inadmissible or unevaluated curvature is refused (#2765).
 
 - Exact coefficient-mode profiling (survival marginal-slope, bernoulli marginal-slope, transformation-normal) warm-starts every outer evaluation from the certified mode of the accepted outer iterate instead of a cold seed once the search has started; a refused or non-converged probe never becomes the start of the next one (#2765).
