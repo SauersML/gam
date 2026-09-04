@@ -2408,17 +2408,40 @@ mod jet_tower_oracle_tests {
         Ok((tower.t3, tower.t4))
     }
 
-    /// #932 transcendental de-duplication: the combined
-    /// [`rigid_standard_normal_third_and_fourth_full`] builder reads BOTH the
-    /// third and fourth uncontracted tensors off ONE shared
-    /// `rigid_standard_normal_tower` (one Mills-ratio transcendental per row),
-    /// and must be BIT-IDENTICAL to the two separate single-tensor builders
-    /// (`rigid_standard_normal_third_full` + `rigid_standard_normal_fourth_full`,
-    /// two transcendentals). This pins the exactness of the redundancy
-    /// elimination: `==`, max diff exactly 0.0 — same tower, no accuracy or
-    /// generality change, only the redundant second transcendental removed.
+    /// The production row programs must reproduce the independent `Tower4<2>`
+    /// jet oracle.
+    ///
+    /// This test asserted BITWISE equality on the premise — true when #932 wrote
+    /// it — that `rigid_standard_normal_third_full` and
+    /// `rigid_standard_normal_fourth_full` each built a
+    /// `rigid_standard_normal_tower` themselves, so the combined builder could
+    /// only ever be a redundancy elimination over identical arithmetic. That
+    /// premise is gone. BOTH single-tensor builders now evaluate generated row
+    /// schedules (`rigid_standard_normal_program_{third,fourth}_full`) and do
+    /// not build a tower at all, while
+    /// `rigid_standard_normal_third_and_fourth_full` here is a TEST-ONLY oracle
+    /// reading `Tower4`. Two different evaluation schedules for one expression
+    /// are not a bitwise-equal pair, and the t4 half does in fact differ by one
+    /// ULP (`-0.10729419447530505` against `-0.10729419447530503`). The t3 half
+    /// still matches bitwise, but that is a coincidence of its schedule rather
+    /// than a contract, so pinning it as one would only make the next schedule
+    /// change look like a defect.
+    ///
+    /// What IS a contract — and what this pins — is that the generated
+    /// production lowering agrees with the independent exact jet oracle to a few
+    /// ULP. A real defect in a schedule (a dropped term, a wrong coefficient, a
+    /// mis-symmetrized index) moves an entry by orders of magnitude, not by an
+    /// ULP, so the bound below still catches one; the failure message reports
+    /// the offending entry and its observed deviation, so drift is legible
+    /// rather than merely red (gam#979).
     #[test]
-    fn rigid_third_and_fourth_full_shares_one_tower_bit_identical() {
+    fn rigid_third_and_fourth_full_match_the_tower_oracle() {
+        // Two schedules for one expression agree to a handful of ULP. The
+        // observed worst case across this fixture is a single ULP; the bound sits
+        // four orders of magnitude above that, so ordinary schedule churn is not
+        // a failure, and still ~11 orders below the smallest departure that could
+        // plausibly be called a defect.
+        const ORACLE_SCHEDULE_TOL: f64 = 1e-13;
         let eta = [0.3_f64, -0.7, 0.05, 0.9, -1.2, 2.1, -2.4];
         let g = [0.2_f64, -0.5, 0.35, -0.15, 0.6, 0.45, -0.55];
         let z = [0.4_f64, -1.1, 0.0, 0.7, -0.3, 1.6, -1.4];
@@ -2458,18 +2481,35 @@ mod jet_tower_oracle_tests {
                     probit_scale,
                 )
                 .expect("combined third+fourth");
-                // Exact bitwise equality (same tower) — no tolerance.
+                // Agreement between two evaluation schedules for the same
+                // expression, on a scale that does not blow up as an entry
+                // approaches zero.
+                let deviation = |lhs: f64, rhs: f64| -> f64 {
+                    (lhs - rhs).abs() / (1.0 + lhs.abs().max(rhs.abs()))
+                };
                 for a in 0..2 {
                     for b in 0..2 {
                         for c in 0..2 {
-                            assert_eq!(
-                                t3_comb[a][b][c], t3_sep[a][b][c],
-                                "t3[{a}][{b}][{c}] row {r} scale {probit_scale} not bit-identical"
+                            let dev3 = deviation(t3_comb[a][b][c], t3_sep[a][b][c]);
+                            assert!(
+                                dev3 < ORACLE_SCHEDULE_TOL,
+                                "t3[{a}][{b}][{c}] row {r} scale {probit_scale}: generated \
+                                 schedule departs from the Tower4 oracle: program={}, \
+                                 oracle={}, deviation={dev3:.3e} (bound \
+                                 {ORACLE_SCHEDULE_TOL:.1e})",
+                                t3_sep[a][b][c],
+                                t3_comb[a][b][c],
                             );
                             for d in 0..2 {
-                                assert_eq!(
-                                    t4_comb[a][b][c][d], t4_sep[a][b][c][d],
-                                    "t4[{a}][{b}][{c}][{d}] row {r} scale {probit_scale} not bit-identical"
+                                let dev4 = deviation(t4_comb[a][b][c][d], t4_sep[a][b][c][d]);
+                                assert!(
+                                    dev4 < ORACLE_SCHEDULE_TOL,
+                                    "t4[{a}][{b}][{c}][{d}] row {r} scale {probit_scale}: \
+                                     generated schedule departs from the Tower4 oracle: \
+                                     program={}, oracle={}, deviation={dev4:.3e} (bound \
+                                     {ORACLE_SCHEDULE_TOL:.1e})",
+                                    t4_sep[a][b][c][d],
+                                    t4_comb[a][b][c][d],
                                 );
                             }
                         }
