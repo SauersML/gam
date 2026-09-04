@@ -50,7 +50,12 @@ impl LcgNormal {
             .state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        (self.state >> 33) as u32
+        // The top 32 bits of the 64-bit state. `>> 33` yields a 31-bit value,
+        // which caps the unit draw at 0.5 and turns every sampler built on it
+        // into a (0, 0.5] "uniform" — Poisson counts at roughly half the
+        // intended rate, Box–Muller normals with inflated variance (#1263; the
+        // same defect `large_scale_accuracy_sweep.rs` already fixed).
+        (self.state >> 32) as u32
     }
     fn next_unit(&mut self) -> f64 {
         (self.next_u32() as f64 + 1.0) / ((u32::MAX as f64) + 1.0)

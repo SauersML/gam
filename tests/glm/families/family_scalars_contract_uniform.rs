@@ -32,7 +32,11 @@ fn lcg_next(state: &mut u64) -> f64 {
     *state = state
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
-    let bits = (*state >> 33) as u32;
+    // The top 32 bits of the 64-bit state: `>> 33` yields a 31-bit value, so
+    // the affine map below covered only [-1, 0) and every "random" design
+    // entry was negative (#1263; the same defect `large_scale_accuracy_sweep.rs`
+    // already fixed).
+    let bits = (*state >> 32) as u32;
     (bits as f64) / (u32::MAX as f64) * 2.0 - 1.0
 }
 
