@@ -1509,9 +1509,20 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         );
         self.realizer
             .apply_log_kappa(&log_kappa, &self.spatial_terms)?;
+        // The ψ this realization is FOR. `ensure_theta` is memoized on θ, so
+        // every line here is a distinct point, and the cost of a spatial fit is
+        // the number of them: 518 realizations against 189 reported outer
+        // evaluations on the 6-D k=100 fit. Which points those are — a line
+        // search, a probe ladder, or one evaluation re-entered — cannot be read
+        // from a line that prints only how long it took (#2735).
         log::info!(
-            "[STAGE] ensure_theta (apply_log_kappa, {} terms): {:.3}s",
+            "[STAGE] ensure_theta (apply_log_kappa, {} terms) psi={:?}: {:.3}s",
             self.spatial_terms.len(),
+            theta
+                .iter()
+                .skip(self.rho_dim)
+                .map(|value| format!("{value:.6}"))
+                .collect::<Vec<_>>(),
             t_ensure.elapsed().as_secs_f64(),
         );
         self.current_theta = Some(theta.clone());
