@@ -1036,6 +1036,22 @@ impl GrassmannCrossMoment {
     }
 
     /// Read the accumulated `p × r` cross-moment.
+    /// Add a precomputed `targetsᵀ·coords` block (p × r), the per-chunk form
+    /// of [`Self::accumulate`] (#2731).
+    pub fn add_block(&mut self, block: ArrayView2<'_, f64>) -> Result<(), String> {
+        if block.nrows() != self.moment.nrows() || block.ncols() != self.moment.ncols() {
+            return Err(format!(
+                "GrassmannCrossMoment::add_block: expected ({}, {}); got ({}, {})",
+                self.moment.nrows(),
+                self.moment.ncols(),
+                block.nrows(),
+                block.ncols()
+            ));
+        }
+        self.moment += &block;
+        Ok(())
+    }
+
     pub fn moment(&self) -> ArrayView2<'_, f64> {
         self.moment.view()
     }

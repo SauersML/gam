@@ -292,6 +292,7 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
         refine_progress_extension: bool,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), SaeCriterionError> {
+        let criterion_entered = std::time::Instant::now();
         self.assignment.validate_rho_domain(rho)?;
         // #976 evidence-ledger scope (see `penalized_quasi_laplace_criterion_with_refine_policy_
         // and_lane`): direct cache-lane callers also get a fresh per-evaluation
@@ -329,6 +330,10 @@ impl SaeManifoldTerm {
         //    at the first coarse-KKT-band hit: the value and its implicit
         //    derivative must describe the same differentiable root (#2253).
         let mut rho_fixed = rho.clone();
+        log::info!(
+            "[SAE-ENTRY] initial joint fit starts {:.2}s after criterion entry",
+            criterion_entered.elapsed().as_secs_f64(),
+        );
         let initial_fit = self.run_joint_fit_arrow_schur_for_quasi_laplace(
             target,
             &mut rho_fixed,
@@ -338,6 +343,10 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
         )?;
+        log::info!(
+            "[SAE-ENTRY] initial joint fit done {:.2}s after criterion entry",
+            criterion_entered.elapsed().as_secs_f64(),
+        );
         let mut loss = initial_fit.loss;
         let mut criterion_fixed_point = initial_fit.fixed_point;
 
@@ -1654,6 +1663,10 @@ impl SaeManifoldTerm {
                 .map_err(|err| {
                     format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}")
                 })?;
+            log::info!(
+                "[SAE-REFINE] round={refine_rounds} penalized_objective={new_loss_total:.10e} \
+                 ‖g‖={grad_norm:.6e}",
+            );
             // Two stagnation signals, both required: (1) the latest refine round
             // contributed a negligible FRACTION of the total objective reduction
             // achieved since entry — the fit has captured essentially all the
@@ -3075,10 +3088,17 @@ impl SaeManifoldTerm {
             if damping < smallest_damping {
                 damping = 0.0;
             }
+            // The penalized objective at the committed state, next to the merit
+            // the step was accepted on: this phase descends ‖g‖², the refine
+            // window descends the objective, and whether they agree on the
+            // direction of progress is readable only with both on one line.
+            let committed_objective = self
+                .penalized_objective_total(target, rho_fixed, registry, 1.0)
+                .unwrap_or(f64::NAN);
             log::info!(
                 "[SAE-NEWTON] step {} phases: assemble={assemble_seconds:.2}s \
                  trials={trials} in {:.2}s (ν={:.6e}, ‖Δ‖={:.6e}, damped rank {}/{}) \
-                 total={:.2}s",
+                 total={:.2}s penalized_objective={committed_objective:.10e}",
                 step + 1,
                 backtrack_started.elapsed().as_secs_f64(),
                 accepted.damping,

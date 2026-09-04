@@ -4902,27 +4902,14 @@ impl SaeManifoldTerm {
         let mut residual = target.to_owned();
         let mut remaining: Vec<usize> = (0..k).collect();
         while !remaining.is_empty() {
-            let mut best_atom = remaining[0];
-            let mut best_energy = f64::NEG_INFINITY;
-            let mut best_beta: Option<Array2<f64>> = None;
-            for &atom in &remaining {
+            // #2731 — the candidates are independent (each forms its own gated
+            // design, least squares and fitted energy against the SAME residual),
+            // so they fan across the pool under the row-pass gate; the greedy
+            // choice is made after. Measured serial on the p = 2048 / 32-chart
+            // shape: this loop is the structural-coherence guard's 4–10 s per
+            // joint-fit iteration.
+            let score_candidate = |atom: usize| -> Result<(usize, f64, Array2<f64>), String> {
                 let d = gated_design(self, atom);
-                // A gated design `D_k = diag(a_·k)·Φ_k` that is all-zero means atom
-                // `k` is gated OFF at every row: its reconstruction is identically
-                // zero for ANY decoder, so the reduced joint problem this seed ρ
-                // presents is rank-deficient and its closed-form quasi-Laplace score is
-                // undefined — the SAME infeasible-ρ class as the non-PD Schur /
-                // per-row Hessian refusals (#1782). It arises for a legitimate seed
-                // state (a threshold gate that numerically underflows on every row at an
-                // off-optimum seed ρ), NOT a coding defect, and fitting the resulting
-                // all-off (zero) dictionary just makes the outer optimizer grind on a
-                // gradient-free landscape. Surface a DISTINCT, classifiable refusal so
-                // `is_recoverable_value_probe_refusal` reads it as the finite collapse
-                // wall and the outer solver steers ρ back to where atoms turn on (or
-                // ships best-so-far), instead of `solve_design_least_squares`'s
-                // generic "zero numerical rank" error aborting the whole fit ("no
-                // candidate seeds passed outer startup validation"). The generic error
-                // stays fatal for every other (genuinely defective) caller.
                 if d.iter().all(|&v| v == 0.0) {
                     return Err(format!(
                         "refit_decoder_sequential_deflation: atom {atom} is {}; the seed ρ \
@@ -4934,7 +4921,25 @@ impl SaeManifoldTerm {
                 let beta = solve_design_least_squares(d.view(), residual.view())?;
                 let fit = d.dot(&beta);
                 let energy: f64 = fit.iter().map(|v| v * v).sum();
-                // Strict `>` keeps the tie-break at the lower index (deterministic).
+                Ok((atom, energy, beta))
+            };
+            let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+            let scored: Vec<(usize, f64, Array2<f64>)> = if parallel {
+                use rayon::prelude::*;
+                remaining
+                    .par_iter()
+                    .map(|&atom| score_candidate(atom))
+                    .collect::<Result<Vec<_>, String>>()?
+            } else {
+                remaining
+                    .iter()
+                    .map(|&atom| score_candidate(atom))
+                    .collect::<Result<Vec<_>, String>>()?
+            };
+            let mut best_atom = remaining[0];
+            let mut best_energy = f64::NEG_INFINITY;
+            let mut best_beta: Option<Array2<f64>> = None;
+            for (atom, energy, beta) in scored {
                 if energy > best_energy {
                     best_energy = energy;
                     best_atom = atom;
@@ -5149,14 +5154,18 @@ impl SaeManifoldTerm {
             in_candidate[j] = true;
             in_candidate[kk] = true;
         }
-        let mut contribution: Vec<Option<Array2<f64>>> = vec![None; k];
-        for atom in 0..k {
+        // #2731 — one gated `n × p` projection per candidate atom, independent
+        // across atoms (each reads its own basis, decoder and gate column), so
+        // they fan across the pool under the row-pass gate; the GEMM inside is
+        // pinned to one core by the joint fit's sequential-faer scope, which is
+        // what made this loop serial.
+        let contribution_of = |atom: usize| -> Option<Array2<f64>> {
             if !in_candidate[atom] {
-                continue;
+                return None;
             }
             let phi = &self.atoms[atom].basis_values;
             if phi.nrows() != n || n == 0 {
-                continue;
+                return None;
             }
             // Per-atom decode `Φ_k · B_k` (N×M · M×p). This runs inside the
             // per-accepted-iterate structural-coherence guard, so route the
@@ -5170,8 +5179,15 @@ impl SaeManifoldTerm {
                     y[[row, col]] *= g;
                 }
             }
-            contribution[atom] = Some(y);
-        }
+            Some(y)
+        };
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let contribution: Vec<Option<Array2<f64>>> = if parallel {
+            use rayon::prelude::*;
+            (0..k).into_par_iter().map(contribution_of).collect()
+        } else {
+            (0..k).map(contribution_of).collect()
+        };
         let mut collapsed = Vec::with_capacity(candidates.len());
         for (j, kk) in candidates {
             let d_eff = (self.atoms[j].basis_size().max(1) * frames[j].ncols().max(1))
@@ -6087,19 +6103,40 @@ impl SaeManifoldTerm {
                         "SaeManifoldTerm::seed_coords_by_decoder_projection: atom {atom_idx}: {error}"
                     )
                 })?;
-                for &row in &visit_order {
+                // #2731 — one independent 1-D minimization per row: fan the
+                // rows across the pool under the same gate every other row pass
+                // uses (never nested inside a worker). Measured serial on the
+                // p = 2048 / 32-chart shape: 2.5 s per sweep round.
+                let solve_row = |row: usize| -> Result<f64, String> {
                     let linear = decoder.dot(&target.row(row));
                     let coefficients = linear.as_slice().ok_or_else(|| {
                         "SaeManifoldTerm::seed_coords_by_decoder_projection: Fourier coefficients are not contiguous".to_string()
                     })?;
-                    seeded[[row, 0]] = extrema
+                    extrema
                         .minimize_squared_distance(coefficients)
+                        .map(|solution| solution.coordinate)
                         .map_err(|error| {
                             format!(
                                 "SaeManifoldTerm::seed_coords_by_decoder_projection: row {row}, atom {atom_idx}: {error}"
                             )
-                        })?
-                        .coordinate;
+                        })
+                };
+                let parallel =
+                    n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+                let solved: Vec<(usize, f64)> = if parallel {
+                    use rayon::prelude::*;
+                    visit_order
+                        .par_iter()
+                        .map(|&row| solve_row(row).map(|coordinate| (row, coordinate)))
+                        .collect::<Result<Vec<_>, String>>()?
+                } else {
+                    visit_order
+                        .iter()
+                        .map(|&row| solve_row(row).map(|coordinate| (row, coordinate)))
+                        .collect::<Result<Vec<_>, String>>()?
+                };
+                for (row, coordinate) in solved {
+                    seeded[[row, 0]] = coordinate;
                 }
                 let flat = Array1::from_iter(seeded.iter().copied());
                 self.assignment.coords[atom_idx].set_flat(flat.view());
@@ -6504,6 +6541,8 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
         allow_heuristic_termination: bool,
     ) -> Result<JointFitOutcome, String> {
+        let joint_fit_entered = std::time::Instant::now();
+        let mut setup_marks: Vec<(&'static str, f64)> = Vec::new();
         *rho = rho.clone().for_assignment(self.assignment.mode);
         self.assignment.validate_rho_domain(rho)?;
         if !(step_size.is_finite() && step_size > 0.0) {
@@ -6540,6 +6579,7 @@ impl SaeManifoldTerm {
         let faer_sequential_inner_fit = gam_linalg::faer_ndarray::FaerSequentialScope::enter();
         self.refresh_basis_from_current_coords()
             .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+        setup_marks.push(("refresh_basis", joint_fit_entered.elapsed().as_secs_f64()));
         // #850 / gam#577 / gam#579 — `max_iter == 0` is a genuine FREEZE of the
         // warm-started inner `(t, β)` state, a verbatim reuse and NOT a
         // convergence request. The caller (`penalized_quasi_laplace_criterion_with_cache_refine_policy`
@@ -6593,6 +6633,7 @@ impl SaeManifoldTerm {
         // design, decoder, and penalized quasi-Laplace criterion are byte-for-byte the historical
         // full-`B` path.
         self.reduce_atoms_to_data_supported_rank()?;
+        setup_marks.push(("reduce_atoms", joint_fit_entered.elapsed().as_secs_f64()));
         // #972 / #977 T1 — magic-by-default decoder-frame activation. Before the
         // outer loop, auto-derive and install the low-rank Grassmann frames
         // (each atom independently, only when the factorization materially
@@ -6603,6 +6644,7 @@ impl SaeManifoldTerm {
         // joint solve runs in the factored coordinate space.
         self.ensure_decoder_frames_active_for_current_decoder()
             .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+        setup_marks.push(("decoder_frames", joint_fit_entered.elapsed().as_secs_f64()));
         // #976 Layer-1 guard ledger is per joint fit for ORDINARY fits: each
         // standalone inner solve gets a fresh re-seed budget and reports only
         // its own breaches. EVIDENCE lanes (`allow_heuristic_termination ==
@@ -6640,6 +6682,7 @@ impl SaeManifoldTerm {
         // decoder norm, so the guard returns early and the cold-start path is
         // untouched.
         self.enforce_decoder_norm_guard(target, 0, rho, None)?;
+        setup_marks.push(("entry_guards", joint_fit_entered.elapsed().as_secs_f64()));
         // ── Pre-fit decoder identifiability audit ──────────────────────────
         //
         // Each decoder atom `k` contributes `η_i += a_ik · Φ_k(t_ik) · B_k`,
@@ -6672,6 +6715,7 @@ impl SaeManifoldTerm {
             self.accumulate_decoder_gram(&mut grams)?;
             self.finalize_decoder_identifiability_audit(&grams, self.n_obs())?;
         }
+        setup_marks.push(("identifiability_audit", joint_fit_entered.elapsed().as_secs_f64()));
         // #2027 — COLD-START disjoint decoder placement. The joint Newton solve
         // below relies on its first step to place decoder mass from the seed, but an
         // all-≈0 cold decoder is a DEGENERATE stationary start: with every `B_k = 0`
@@ -6702,6 +6746,7 @@ impl SaeManifoldTerm {
             // fitting the dominant factor (high EV, no structure recovery).
             self.seed_cold_start_disjoint_charts(target)?;
         }
+        setup_marks.push(("cold_start_charts", joint_fit_entered.elapsed().as_secs_f64()));
         // #1026/#2230 — keep the best state found inside this bounded inner
         // solve, keyed on the PENALIZED OBJECTIVE (`prefer_candidate_state`):
         // the same scalar the Armijo lane descends and the outer penalized quasi-Laplace score
@@ -6887,6 +6932,7 @@ impl SaeManifoldTerm {
         // harvest a fresh ε-decrease ⇒ refused as non-idempotent at 512). The
         // evidence lane therefore commits only MATERIAL decreases
         // (STALL_FRACTION of scale): the rescue passes, the harvest cannot.
+        setup_marks.push(("pre_sweep", joint_fit_entered.elapsed().as_secs_f64()));
         if self.sweep_blocks_to_objective_fixed_point(
             target,
             rho,
@@ -6896,7 +6942,36 @@ impl SaeManifoldTerm {
             state_moved = true;
             moved_at.get_or_insert(StateMoveSite::EntryBlockSweep);
         }
+        // #2731 — one phase clock per iteration. The joint fit is where a
+        // criterion evaluation at frontier width spends its wall clock (p=2048,
+        // 32 charts: 24 s per iteration, on 1.5 of 128 cores), and a shape that
+        // is not attributed to a phase cannot be fixed.
+        {
+            let mut setup_report = String::new();
+            let mut previous_mark = 0.0;
+            for (name, at) in &setup_marks {
+                setup_report.push_str(&format!(" {name}={:.2}s", at - previous_mark));
+                previous_mark = *at;
+            }
+            // Whether this joint fit runs inside a Rayon worker: every row-parallel
+            // pass in this crate declines to nest (`rayon::current_thread_index()
+            // .is_none()`), so a criterion evaluated from inside the pool runs
+            // its passes serially — the `cpu=1.5/128` shape of #2731.
+            log::info!(
+                "[SAE/inner] setup before the first iteration: {:.2}s (max_iter={max_iter}) \
+                 phases:{setup_report} entry_sweep={:.2}s in_rayon_worker={} \
+                 rayon_threads={}",
+                joint_fit_entered.elapsed().as_secs_f64(),
+                joint_fit_entered.elapsed().as_secs_f64() - previous_mark,
+                rayon::current_thread_index().is_some(),
+                rayon::current_num_threads(),
+            );
+        }
+        let mut previous_iteration_end: Option<std::time::Instant> = None;
         for outer_iteration in 0..max_iter {
+            let iteration_started = std::time::Instant::now();
+            let previous_tail_seconds = previous_iteration_end
+                .map_or(0.0, |end| end.elapsed().as_secs_f64());
             let temperature_before = self.assignment.mode.temperature();
             if self
                 .advance_temperature_schedule()?
@@ -6919,6 +6994,7 @@ impl SaeManifoldTerm {
             let mut sys = self
                 .assemble_arrow_schur(target, rho, analytic_penalties)
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+            let assemble_seconds = iteration_started.elapsed().as_secs_f64();
             let plan = self
                 .streaming_plan()
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?
@@ -7021,6 +7097,7 @@ impl SaeManifoldTerm {
                     &solve_options,
                 )
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+            let solve_done_seconds = iteration_started.elapsed().as_secs_f64();
             // #1095/#2228 (second root) — per-row STEP gauge fixing. On a chart
             // over-parametrized for its intrinsic data dimension (d=2 chart on an
             // intrinsically 1-D circle) every per-row `H_tt` carries a rank-1
@@ -7452,6 +7529,8 @@ impl SaeManifoldTerm {
                 None
             };
             let accepted = accepted_step.is_some();
+            let trials_done_seconds = iteration_started.elapsed().as_secs_f64();
+            let mut tail_marks: Vec<(&'static str, f64)> = Vec::new();
             // #2267 — per-iteration STEP ACCEPTANCE trace. A crawling inner solve
             // has exactly three distinguishable causes and they are told apart
             // here, not by inference: an accepted step far below the warm start
@@ -7460,11 +7539,12 @@ impl SaeManifoldTerm {
             // step toward steepest descent; and a rejected step routes to the
             // proximal correction. Together with `‖g‖`/`‖Δ‖`/`gᵀΔ` this is the
             // whole per-iterate state of the globalization.
-            log::debug!(
+            log::info!(
                 "[SAE/inner] it={outer_iteration} ‖g‖={grad_norm:.6e} \
                  ‖Π⊥g‖={quotient_grad_norm:.6e} ‖Δ‖={:.6e} gᵀΔ={directional_decrease:.6e} \
                  alpha={} warm={:.4e} ridge_t={:.3e} ridge_b={:.3e} \
-                 obj={pre_step_total:.9e}",
+                 obj={pre_step_total:.9e} phases: assemble={assemble_seconds:.2}s \
+                 solve={:.2}s trials={:.2}s previous_tail={previous_tail_seconds:.2}s",
                 step_norm_sq.sqrt(),
                 match accepted_step.as_ref() {
                     Some(step) => format!("{:.4e}", step.step),
@@ -7473,7 +7553,10 @@ impl SaeManifoldTerm {
                 globalization.warm_step,
                 globalization.lm_ridge_t,
                 globalization.lm_ridge_b,
+                solve_done_seconds - assemble_seconds,
+                trials_done_seconds - solve_done_seconds,
             );
+            previous_iteration_end = Some(std::time::Instant::now());
             if let Some(step) = accepted_step {
                 state_moved = true;
                 moved_at.get_or_insert(StateMoveSite::AcceptedNewtonStep);
@@ -7699,6 +7782,7 @@ impl SaeManifoldTerm {
             self.run_objective_guarded_hook(target, rho, analytic_penalties, 0.0, |term| {
                 term.canonicalize_affine_gauge_after_accept(Some(rho))
             })?;
+            tail_marks.push(("commit+gauge_hook", iteration_started.elapsed().as_secs_f64()));
             // #976 Layer-1 guard 3: after an accepted step (Armijo or proximal
             // — the rejection paths `break` above), check every atom's support
             // and answer breaches with a bounded re-seed or a terminal
@@ -7745,6 +7829,7 @@ impl SaeManifoldTerm {
             if !kkt_quiescent {
                 self.enforce_structural_coherence_guard(target, outer_iteration, rho)?;
             }
+            tail_marks.push(("guards", iteration_started.elapsed().as_secs_f64()));
             // #2089 defense-in-depth: never grind a hopeless fit (and never let a
             // CPU watchdog SIGKILL the host while it does). Once the co-collapse
             // multi-start budget is spent, re-test the exact same typed, same-state
@@ -7886,9 +7971,11 @@ impl SaeManifoldTerm {
             // strictly-better penalized objective ⇒ this accepted boundary is
             // the new exit-warranty fallback, independent of any EV/coherence
             // basin preference below.
+            tail_marks.push(("verdict+retract_hook", iteration_started.elapsed().as_secs_f64()));
             let boundary_obj = self
                 .penalized_objective_total(target, rho, analytic_penalties, 1.0)
                 .unwrap_or(f64::INFINITY);
+            tail_marks.push(("boundary_objective", iteration_started.elapsed().as_secs_f64()));
             if boundary_obj.is_finite() && boundary_obj < warranty_obj {
                 warranty_obj = boundary_obj;
                 warranty_state = Some(self.snapshot_mutable_state());
@@ -7917,6 +8004,17 @@ impl SaeManifoldTerm {
                     }
                 }
             }
+            tail_marks.push(("ev+uniformity", iteration_started.elapsed().as_secs_f64()));
+            let mut tail_report = String::new();
+            let mut previous_mark = trials_done_seconds;
+            for (name, at) in &tail_marks {
+                tail_report.push_str(&format!(" {name}={:.2}s", at - previous_mark));
+                previous_mark = *at;
+            }
+            log::info!(
+                "[SAE/inner-tail] it={outer_iteration}{tail_report} iteration_total={:.2}s",
+                iteration_started.elapsed().as_secs_f64(),
+            );
             self.reclaim_arrow_assembly_workspace(&mut sys);
         }
         // #1117 — the rank-`r_k` oracle is already pinned: each rank-deficient
@@ -8223,29 +8321,62 @@ impl SaeManifoldTerm {
         };
         let frames = self.frames_active();
         let mut moved = false;
+        let mut sweep_round = 0usize;
         loop {
             let snapshot = self.snapshot_mutable_state();
+            // #2731 — one clock per round: on p = 2048 / 32 charts this loop is
+            // 425 s of the 437 s before the first Newton iteration, and which
+            // of its five passes owns that is not readable from the total.
+            let round_started = std::time::Instant::now();
+            let mut marks: Vec<(&'static str, f64)> = Vec::new();
+            let run_frames = |term: &mut Self, marks: &mut Vec<(&'static str, f64)>, name| -> Result<(), String> {
+                if frames {
+                    term.refresh_active_frames_from_data(target)
+                        .map_err(|err| format!("sweep frame re-polar: {err}"))?;
+                }
+                marks.push((name, round_started.elapsed().as_secs_f64()));
+                Ok(())
+            };
             let round = self
                 .refit_decoder_least_squares_at_current_state(target, Some(rho))
                 .and_then(|()| {
-                    if frames {
-                        self.refresh_active_frames_from_data(target)
-                            .map_err(|err| format!("sweep frame re-polar: {err}"))?;
-                    }
-                    Ok(())
+                    marks.push(("refit_lsq", round_started.elapsed().as_secs_f64()));
+                    run_frames(self, &mut marks, "frames")
                 })
-                .and_then(|()| self.seed_coords_by_decoder_projection(target))
-                .and_then(|()| self.refit_decoder_least_squares_at_current_state(target, Some(rho)))
                 .and_then(|()| {
-                    if frames {
-                        self.refresh_active_frames_from_data(target)
-                            .map_err(|err| format!("sweep frame re-polar: {err}"))?;
-                    }
+                    self.seed_coords_by_decoder_projection(target)?;
+                    marks.push(("seed_coords", round_started.elapsed().as_secs_f64()));
                     Ok(())
                 })
                 .and_then(|()| {
-                    self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                    self.refit_decoder_least_squares_at_current_state(target, Some(rho))?;
+                    marks.push(("refit_lsq_2", round_started.elapsed().as_secs_f64()));
+                    run_frames(self, &mut marks, "frames_2")
+                })
+                .and_then(|()| {
+                    let value =
+                        self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+                    marks.push(("objective", round_started.elapsed().as_secs_f64()));
+                    Ok(value)
                 });
+            sweep_round += 1;
+            {
+                let mut report = String::new();
+                let mut previous = 0.0;
+                for (name, at) in &marks {
+                    report.push_str(&format!(" {name}={:.2}s", at - previous));
+                    previous = *at;
+                }
+                log::info!(
+                    "[SAE/entry-sweep] round={sweep_round} value={} best={best_objective:.10e} \
+                     total={:.2}s phases:{report}",
+                    match &round {
+                        Ok(value) => format!("{value:.10e}"),
+                        Err(err) => format!("Err({err})"),
+                    },
+                    round_started.elapsed().as_secs_f64(),
+                );
+            }
             // Commit only on a STRICT decrease of the penalized objective,
             // scaled by the objective magnitude so the test is meaningful at
             // any loss scale. Anything else (already-converged decoder, a

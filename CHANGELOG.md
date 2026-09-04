@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The SAE manifold joint fit logs one phase clock per iteration, per entry-sweep round and for its setup, and five of its serial row passes (frame refresh, coordinate seeding, target-aware reconstruction, deflation candidates, coherence projections) now fan across the Rayon pool (#2731).
+
 - The custom-family joint Newton arms the exact Jeffreys second-order completion before any decrement certificate is taken (#2714); a slow-geometric-rate exit carries the ray it stalled on (`RayRestoration`), and the outer's seed evaluation restores a named seed by that ray's log-strength ratio before evaluating it again (#2695).
 
 - The penalty pseudo-log-determinant treats a coordinate no penalty block covers as structurally null whether or not a ridge is present, so its rank agrees with the penalized subspace the Hessian carries (#2454, #2760).

@@ -3469,12 +3469,14 @@ impl SaeManifoldTerm {
             // `a_k²` weight on the cross-moment that matches the C-block normal
             // equations (residual leg carries `a_k`, coordinate leg carries
             // `a_k`).
-            let mut targets = Array2::<f64>::zeros((n, p));
-            let mut rcoords = Array2::<f64>::zeros((n, r));
-            // Per-row build of `(a_k·e_k, a_k·ĉ_k)`: each row reads only immutable
-            // state and writes ONLY its own `targets`/`rcoords` rows (disjoint), so
-            // the row-parallel path is bit-identical to the serial sweep. Pure
-            // scalar work (no faer GEMM) — no nested-parallel guard needed.
+            // #2731 — the moment is accumulated per row CHUNK and never as an
+            // `n × p` buffer: on the p = 2048 / 32-chart shape that buffer was
+            // 105 MB per atom, copied once more inside the accumulator, then
+            // multiplied by a GEMM that the joint fit's sequential-faer scope
+            // pins to one core — 4 s per refresh, twice per sweep round. Each
+            // chunk builds its rows, forms its own `targetsᵀ·coords` block, and
+            // the blocks are summed; the chunks fan across the pool under the
+            // same gate every other row pass uses.
             let atom = &self.atoms[atom_idx];
             let build_row = |row: usize, trow: &mut [f64], rrow: &mut [f64]| {
                 let a = assignments[row][atom_idx];
@@ -3492,28 +3494,42 @@ impl SaeManifoldTerm {
                     rrow[j] = a * acc;
                 }
             };
-            if parallel {
-                use rayon::prelude::*;
-                targets
-                    .axis_iter_mut(ndarray::Axis(0))
-                    .into_par_iter()
-                    .zip(rcoords.axis_iter_mut(ndarray::Axis(0)).into_par_iter())
-                    .enumerate()
-                    .for_each(|(row, (mut trow, mut rrow))| {
-                        let trow = trow.as_slice_mut().expect("contiguous targets row");
-                        let rrow = rrow.as_slice_mut().expect("contiguous rcoords row");
-                        build_row(row, trow, rrow);
-                    });
-            } else {
-                for row in 0..n {
-                    let mut trow = targets.row_mut(row);
+            let chunk_block = |rows: std::ops::Range<usize>| -> Array2<f64> {
+                let width = rows.len();
+                let mut targets = Array2::<f64>::zeros((width, p));
+                let mut rcoords = Array2::<f64>::zeros((width, r));
+                for (local, row) in rows.enumerate() {
+                    let mut trow = targets.row_mut(local);
                     let trow = trow.as_slice_mut().expect("contiguous targets row");
-                    let mut rrow = rcoords.row_mut(row);
+                    let mut rrow = rcoords.row_mut(local);
                     let rrow = rrow.as_slice_mut().expect("contiguous rcoords row");
                     build_row(row, trow, rrow);
                 }
+                gam_linalg::faer_ndarray::fast_atb(&targets, &rcoords)
+            };
+            let chunk_rows = SAE_LOSS_PARALLEL_ROW_MIN.max(1);
+            let chunks: Vec<std::ops::Range<usize>> = (0..n)
+                .step_by(chunk_rows)
+                .map(|start| start..(start + chunk_rows).min(n))
+                .collect();
+            let block: Option<Array2<f64>> = if parallel {
+                use rayon::prelude::*;
+                chunks
+                    .into_par_iter()
+                    .map(chunk_block)
+                    .reduce_with(|mut left, right| {
+                        left += &right;
+                        left
+                    })
+            } else {
+                chunks.into_iter().map(chunk_block).reduce(|mut left, right| {
+                    left += &right;
+                    left
+                })
+            };
+            if let Some(block) = block {
+                cross.add_block(block.view())?;
             }
-            cross.accumulate(targets.view(), rcoords.view())?;
             // `polar(A_k)` is well-defined only when the moment is non-trivial;
             // a zero moment (e.g. a fully collapsed atom) leaves the frame as-is.
             if cross.moment().iter().all(|&v| v == 0.0) {
@@ -4159,20 +4175,21 @@ impl SaeManifoldTerm {
         // leave-this-atom-out residual is then `target − full + a_k·γ_k`.
         let full_curved = self.try_fitted_with_rho(rho, false)?;
         let mut out = Array2::<f64>::zeros((n, p));
-        let mut g_buf = vec![0.0_f64; p];
-        let mut decoded_buf = vec![0.0_f64; p];
-        let mut resid_buf = vec![0.0_f64; p];
-        for row in 0..n {
-            let a = match rho {
-                Some(_) => self.assignment.try_assignments_row(row)?,
-                None => self.assignment.try_assignments_row(row)?,
-            };
+        // #2731 — one independent row at a time: every row reads immutable
+        // state and writes only its own output row, so the rows fan across the
+        // pool under the same gate every other row pass uses. Measured serial
+        // on the p = 2048 / 32-chart shape: this reconstruction is inside the
+        // collapse verdict and the reconstruction EV, ~4 s per joint-fit
+        // iteration each.
+        let fill_row = |row: usize, out_row: &mut [f64]| -> Result<(), String> {
+            let mut g_buf = vec![0.0_f64; p];
+            let mut decoded_buf = vec![0.0_f64; p];
+            let mut resid_buf = vec![0.0_f64; p];
+            let a = self.assignment.try_assignments_row(row)?;
             for atom_idx in 0..k_atoms {
                 let a_k = a[atom_idx];
                 if let Some(image) = linear_images.get(&atom_idx) {
                     if image.is_collapse_rescued() {
-                        // Recompute this row's coordinate from its own
-                        // leave-this-atom-out residual projected onto `v`.
                         self.atoms[atom_idx].fill_decoded_row(row, &mut decoded_buf);
                         for col in 0..p {
                             resid_buf[col] = target[[row, col]] - full_curved[[row, col]]
@@ -4185,20 +4202,34 @@ impl SaeManifoldTerm {
                         })?;
                         image.fill_row(coord, &mut g_buf);
                     } else {
-                        // Ordinary straight image: decode at the atom's own coord.
                         let own_t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
                         image.fill_row(own_t, &mut g_buf);
                     }
                 } else {
                     self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
                 }
-                let mut out_row = out.row_mut(row);
                 for out_col in 0..p {
                     out_row[out_col] += a_k * g_buf[out_col];
                 }
             }
+            Ok(())
+        };
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        if parallel {
+            use rayon::prelude::*;
+            out.axis_iter_mut(ndarray::Axis(0))
+                .into_par_iter()
+                .enumerate()
+                .try_for_each(|(row, mut out_row)| {
+                    let out_row = out_row.as_slice_mut().expect("contiguous output row");
+                    fill_row(row, out_row)
+                })?;
+        } else {
+            for (row, mut out_row) in out.axis_iter_mut(ndarray::Axis(0)).enumerate() {
+                let out_row = out_row.as_slice_mut().expect("contiguous output row");
+                fill_row(row, out_row)?;
+            }
         }
-        // #2023 C4 — Tier-0 shared mean add-back (no-op when inactive).
         self.add_tier0_mean_inplace(&mut out);
         Ok(out)
     }
