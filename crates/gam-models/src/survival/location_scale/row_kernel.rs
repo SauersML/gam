@@ -5142,22 +5142,46 @@ mod patterned_order2_perf_tests {
 
         let censored_weight = kernel.w * (1.0 - kernel.d);
         let event_weight = kernel.w * kernel.d;
+
+        // THE SAME CONTRACT AS PRODUCTION, which is what makes this a race and
+        // not a comparison of two different jobs. `sls_row_nll` — and the
+        // program emitted from it — gates each term on the term's OWN
+        // coefficient stack (`stack_is_exactly_zero`), never on the row weight.
+        // The two predicates differ on a real row: a censored row whose exit
+        // residual channels are all zero carries a nonzero weight and an
+        // exactly zero stack, and applying the chain rule to that zero stack
+        // against a far-tail index jet forms `0 * inf`. Gating on the weight
+        // there returns NaN where production and the generic tower both return
+        // a finite zero, so a weight-gated schedule is not one production could
+        // ship and its saving is the guard it is missing
+        // (`the_hand_carries_productions_activity_contract_932`).
+        let mut u1_value = 0.0;
         let mut u1_first = 0.0;
         let mut u1_second = 0.0;
         if censored_weight != 0.0 {
-            value -= censored_weight * kernel.log_s1;
+            u1_value -= censored_weight * kernel.log_s1;
             u1_first += censored_weight * kernel.r1;
             u1_second += censored_weight * kernel.dr1;
         }
 
+        let mut g_value = 0.0;
         let mut g_first = 0.0;
         let mut g_second = 0.0;
         if event_weight != 0.0 {
-            value -= event_weight * (kernel.logphi1 + kernel.log_g);
+            u1_value -= event_weight * kernel.logphi1;
             u1_first -= event_weight * kernel.dlogphi1;
             u1_second -= event_weight * kernel.d2logphi1;
+            g_value = -event_weight * kernel.log_g;
             g_first = -event_weight * kernel.d_log_g;
             g_second = -event_weight * kernel.d2_log_g;
+        }
+        let u1_active = u1_value != 0.0 || u1_first != 0.0 || u1_second != 0.0;
+        let g_active = g_value != 0.0 || g_first != 0.0 || g_second != 0.0;
+        if u1_active {
+            value += u1_value;
+        }
+        if g_active {
+            value += g_value;
         }
 
         let u0_g4 = -entry_exp;
@@ -5174,12 +5198,12 @@ mod patterned_order2_perf_tests {
         gradient[0] = u0_first;
         gradient[4] = u0_first * u0_g4;
         gradient[7] = u0_first * u0_g7;
-        if censored_weight != 0.0 || event_weight != 0.0 {
+        if u1_active {
             gradient[1] += u1_first;
             gradient[3] += u1_first * u1_g3;
             gradient[6] += u1_first * u1_g6;
         }
-        if event_weight != 0.0 {
+        if g_active {
             gradient[2] += g_first;
             gradient[3] += g_first * g3;
             gradient[5] += g_first * g5;
@@ -5205,7 +5229,7 @@ mod patterned_order2_perf_tests {
         symmetric!(4, 7, u0_second * u0_g4 * u0_g7 + u0_first * entry_exp);
         symmetric!(7, 7, u0_second * u0_g7 * u0_g7 - u0_first * u0_g7);
 
-        if censored_weight != 0.0 || event_weight != 0.0 {
+        if u1_active {
             symmetric!(1, 1, u1_second);
             symmetric!(1, 3, u1_second * u1_g3);
             symmetric!(1, 6, u1_second * u1_g6);
@@ -5214,7 +5238,7 @@ mod patterned_order2_perf_tests {
             symmetric!(6, 6, u1_second * u1_g6 * u1_g6 - u1_first * u1_g6);
         }
 
-        if event_weight != 0.0 {
+        if g_active {
             symmetric!(2, 2, g_second);
             symmetric!(2, 3, g_second * g3);
             symmetric!(2, 5, g_second * g5);
@@ -5361,6 +5385,88 @@ mod patterned_order2_perf_tests {
 
     type SlsOrder2 = gam_math::jet_scalar::PatternedOrder2<SlsHessianPattern, SLS_ROW_K, 24>;
     use gam_math::paired_timing::{SpeedGate, batched, paired_interleaved};
+
+    /// A censored FAR-TAIL row whose `u1` coefficient stack is EXACTLY zero
+    /// while its weight is not: `w > 0`, `d = 0`, the exit residual channels all
+    /// zero, and the exit log-scale far enough out that `exp(-eta_ls_exit)`
+    /// overflows. The batched lowering's own documentation names this row shape
+    /// — "a row's `u1` stack can be all-zero even though the row weight is
+    /// nonzero" — and it is the whole reason the program gates on the stack.
+    fn far_tail_zero_u1_stack_row() -> ([f64; SLS_ROW_K], SurvivalExactRowKernel) {
+        let (mut p, mut kernel) = fixture();
+        p[6] = -1000.0;
+        kernel.d = 0.0;
+        kernel.log_s1 = 0.0;
+        kernel.r1 = 0.0;
+        kernel.dr1 = 0.0;
+        kernel.ddr1 = 0.0;
+        kernel.dddr1 = 0.0;
+        (p, kernel)
+    }
+
+    /// THE OPPONENT IS ON PRODUCTION'S CONTRACT, and this is the row that says
+    /// so. The timed cell below asserts production beats the strongest hand
+    /// schedule *of the same contract*; a hand that gated on the row weight
+    /// instead of the term's coefficient stack was not on that contract, and
+    /// the difference is not academic — on this row it applies the chain rule
+    /// to a zero stack against an overflowed index jet and returns `NaN` in
+    /// `gradient[3]` and `gradient[6]` where production and the independent
+    /// generic tower both return a finite zero. Measured before the fix:
+    ///
+    /// ```text
+    /// production g[1]=+0e0 g[3]=+0e0 g[6]=+0e0
+    /// hand       g[1]=+0e0 g[3]=NaN  g[6]=NaN
+    /// tower      g[1]=+0e0 g[3]=+0e0 g[6]=+0e0
+    /// ```
+    ///
+    /// So this pin is what keeps the race honest: if the opponent ever drops
+    /// the guard again to look faster, it fails here rather than winning a cell.
+    #[test]
+    fn the_hand_carries_productions_activity_contract_932() {
+        let (p, kernel) = far_tail_zero_u1_stack_row();
+        let production = sls_row_vgh_generated(&p, &kernel);
+        let opponent = hand_fused(&p, &kernel);
+        let tower = dense(&p, &kernel);
+        let all_finite = |channels: &(f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K])| {
+            channels.0.is_finite()
+                && channels.1.iter().all(|channel| channel.is_finite())
+                && channels.2.iter().flatten().all(|channel| channel.is_finite())
+        };
+
+        // NON-VACUITY: the row must actually reach the regime the pin is about,
+        // or every assertion below is about an ordinary row.
+        assert!(
+            (-p[6]).exp().is_infinite(),
+            "the fixture must overflow the exit scale, or the 0*inf it guards cannot form"
+        );
+        assert!(
+            kernel.w * (1.0 - kernel.d) != 0.0,
+            "the row's censoring weight must be nonzero, or the two predicates agree here"
+        );
+
+        assert!(
+            all_finite(&production),
+            "production must not form 0*inf on a zero stack: {production:?}"
+        );
+        assert!(
+            all_finite(&tower),
+            "the generic tower is the independent oracle and must agree: {tower:?}"
+        );
+        assert!(
+            all_finite(&opponent),
+            "the timed opponent must carry production's activity contract, or the cell \
+             is racing two different jobs: {opponent:?}"
+        );
+        for axis in 0..SLS_ROW_K {
+            assert_eq!(
+                opponent.1[axis].to_bits(),
+                production.1[axis].to_bits(),
+                "opponent gradient[{axis}] {} vs production {}",
+                opponent.1[axis],
+                production.1[axis]
+            );
+        }
+    }
 
     fn fixture() -> ([f64; SLS_ROW_K], SurvivalExactRowKernel) {
         (
