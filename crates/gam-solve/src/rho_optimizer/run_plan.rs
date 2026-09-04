@@ -1583,12 +1583,17 @@ pub(crate) fn run_outer_with_plan(
     // `uniform_structural_key` below catches a cascade of seeds that are
     // REJECTED for the same reason. It cannot see the other uniform failure
     // mode: a seed that RUNS, exhausts its budget, and lands on the point a
-    // previous seed already landed on. Measured on gam#2748 (n = 4000 matern
-    // flexible): four seeds, four EFS runs, each `hit max_iter=200` at
-    // `final_value = 2.786987e3` — the same value to seven digits every time —
-    // 14 minutes apart, and the cell died at its 3600 s wall inside the fifth.
-    // Three of those four runs could not have told anyone anything the first
-    // had not.
+    // previous seed already landed on.
+    //
+    // What was actually observed on gam#2748 (n = 4000 matern flexible), stated
+    // without the inference I first drew from it: inside ONE EFS dispatch, the
+    // fixed point reached `max_iter=200` at `final_value = 2.786987e3` — the
+    // same value to seven digits — twice, 12 m 42 s apart, and the cell died at
+    // its 3600 s wall. Whether those were two iterations of THIS ladder or one
+    // seed re-entered elsewhere is not decidable from that log, because nothing
+    // printed the seed index at the point the solver was entered; the `seed N`
+    // strings there come only from the early screening messages. The marker
+    // added at the head of this loop is what makes the next run answer it.
     let mut non_converged_outcome_values: Vec<f64> = Vec::new();
 
     'seed_attempts: for (seed_idx, seed_as_generated) in seeds.iter().enumerate() {
@@ -1597,6 +1602,17 @@ pub(crate) fn run_outer_with_plan(
         // inner solve read off its ray (#2695).
         let mut seed_owned = seed_as_generated.clone();
         let seed = &mut seed_owned;
+        // The seed index at the point the ladder enters a solver (gam#2748).
+        // Every other `seed N` line in an outer log comes from a screening or
+        // rejection message, so a seed that runs straight through to the solver
+        // printed no index at all — and a log showing only `seed 0` was
+        // therefore consistent both with one seed and with several. One line
+        // here makes "how many seeds ran, and which one produced this outcome"
+        // a reading rather than an inference.
+        log::info!(
+            "[OUTER] {context}: entering seed {seed_idx} of {} (started {started_seeds},              budget {seed_budget}) on {the_plan}",
+            seeds.len(),
+        );
         if !should_start_next_seed(started_seeds, seed_budget, best.is_some()) {
             break;
         }
