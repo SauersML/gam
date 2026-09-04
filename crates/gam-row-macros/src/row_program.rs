@@ -4068,6 +4068,15 @@ fn rust_order2_body(
         SymbolicTarget::Rust,
     )?;
     let mut source = "{\n".to_string();
+    // Channels whose value is `0.0` on EVERY path reaching the statement being
+    // emitted. A mutable channel starts here when its declaration is `0.0`, and
+    // stays here only while every gate that assigns it assigns `0.0` too, so a
+    // later `channel = 0.0` in a gate is writing the value the channel already
+    // has on both edges of that branch. Together with the self-assignment case
+    // below this is what keeps a gate from restating the channels its term does
+    // not contribute to: an added term touches a handful of channels, and the
+    // union support made it restate all of them (#932).
+    let mut known_zero: HashSet<String> = HashSet::new();
     for statement in &schedule.statements {
         match statement {
             SymbolicStatement::Local(local) => {
@@ -4086,26 +4095,33 @@ fn rust_order2_body(
                 } else {
                     local.value.support()
                 };
-                source.push_str(&format!(
-                    "    let {mutable}{}_v: f64 = {};\n",
-                    local.name, local.value.value
-                ));
+                let mut declare = |source: &mut String, channel: String, value: &str| {
+                    if value == "0.0" {
+                        known_zero.insert(channel.clone());
+                    }
+                    source.push_str(&format!("    let {mutable}{channel}: f64 = {value};\n"));
+                };
+                declare(
+                    &mut source,
+                    format!("{}_v", local.name),
+                    &local.value.value,
+                );
                 for axis in 0..dimension {
                     if support.gradient[axis] {
-                        source.push_str(&format!(
-                            "    let {mutable}{}_g{axis}: f64 = {};\n",
-                            local.name,
+                        declare(
+                            &mut source,
+                            format!("{}_g{axis}", local.name),
                             symbolic_component(&local.value.gradient[axis]),
-                        ));
+                        );
                     }
                     for other in axis..dimension {
                         let index = axis * dimension + other;
                         if support.hessian[index] {
-                            source.push_str(&format!(
-                                "    let {mutable}{}_h{axis}_{other}: f64 = {};\n",
-                                local.name,
+                            declare(
+                                &mut source,
+                                format!("{}_h{axis}_{other}", local.name),
                                 symbolic_component(&local.value.hessian[index]),
-                            ));
+                            );
                         }
                     }
                 }
@@ -4121,26 +4137,53 @@ fn rust_order2_body(
                         .mutable_support
                         .get(&assignment.target)
                         .expect("mutable symbolic assignment support exists");
-                    source.push_str(&format!(
-                        "        {}_v = {};\n",
-                        assignment.target, assignment.value.value,
-                    ));
+                    // An assignment a gate does not need to make. `channel =
+                    // channel` restates the value the channel already holds on
+                    // both edges, and `channel = 0.0` where the channel is `0.0`
+                    // on every path into the gate does the same. Both come from
+                    // the union support: a term contributes to a handful of
+                    // channels and the union makes it name all of them. Skipping
+                    // them leaves the channel's value untouched, which IS the
+                    // value the skipped statement would have written, so the
+                    // emitted schedule is unchanged in what it computes and is
+                    // two thirds shorter on a three-term row program (#932).
+                    let mut assign = |source: &mut String, channel: String, value: &str| {
+                        if value == channel {
+                            return;
+                        }
+                        if value == "0.0" {
+                            if known_zero.contains(&channel) {
+                                return;
+                            }
+                            // Zero on the taken edge only: the channel is no
+                            // longer known-zero after the branch.
+                            known_zero.remove(&channel);
+                        } else {
+                            known_zero.remove(&channel);
+                        }
+                        source.push_str(&format!("        {channel} = {value};\n"));
+                    };
+                    assign(
+                        &mut source,
+                        format!("{}_v", assignment.target),
+                        &assignment.value.value,
+                    );
                     for axis in 0..dimension {
                         if support.gradient[axis] {
-                            source.push_str(&format!(
-                                "        {}_g{axis} = {};\n",
-                                assignment.target,
+                            assign(
+                                &mut source,
+                                format!("{}_g{axis}", assignment.target),
                                 symbolic_component(&assignment.value.gradient[axis]),
-                            ));
+                            );
                         }
                         for other in axis..dimension {
                             let index = axis * dimension + other;
                             if support.hessian[index] {
-                                source.push_str(&format!(
-                                    "        {}_h{axis}_{other} = {};\n",
-                                    assignment.target,
+                                assign(
+                                    &mut source,
+                                    format!("{}_h{axis}_{other}", assignment.target),
                                     symbolic_component(&assignment.value.hessian[index]),
-                                ));
+                                );
                             }
                         }
                     }
@@ -5071,6 +5114,88 @@ mod tests {
         assert!(!rust.contains("SparseOrder2"));
         assert!(!rust.contains("*0.0"));
         assert!(!rust.contains("0.0*"));
+    }
+
+    /// #932: a gate assigns the channels its term reaches, and no others.
+    ///
+    /// The union support tells a gate which channels the mutable carries across
+    /// ALL of its assignments, and the emitter used to write every one of them
+    /// in every gate. A term that reaches three channels then restated the other
+    /// forty — as `channel = channel` for a channel an earlier term had set, and
+    /// as `channel = 0.0` for one nothing had touched. On the survival
+    /// location-scale row that was two thirds of the emitted order-2 body.
+    /// Neither form can change a value, so dropping them leaves the schedule
+    /// computing exactly what it computed.
+    #[test]
+    fn a_gate_assigns_only_the_channels_its_term_reaches_932() {
+        let rust = emitted_function(
+            quote! {
+                fn two_terms(x, y; take_a, take_b)
+                emit [order2];
+                leaves { curve => curve_stack => d_curve }
+                witnesses [];
+                {
+                    let mut out = zero();
+                    if (take_a > 0.0) { out = compose(curve, x); }
+                    if (take_b > 0.0) { out = add(out, mul(y, y)); }
+                    return out;
+                }
+            },
+            "two_terms_order2",
+        )
+        .replace(' ', "");
+
+        // Each channel the mutable carries is declared zero once, where the
+        // scheduler places its declaration.
+        for channel in ["out_v", "out_g0", "out_h0_0", "out_g1", "out_h1_1"] {
+            assert!(
+                rust.contains(&format!("letmut{channel}:f64=0.0;")),
+                "the mutable's {channel} channel is declared zero:\n{rust}"
+            );
+        }
+
+        // The first term is a function of `x` alone, so it must not write the
+        // `y` channels — on the released emitter it wrote them as `= 0.0`.
+        for restated in ["out_g1=0.0;", "out_h1_1=0.0;", "out_h0_1=0.0;"] {
+            assert!(
+                !rust.contains(restated),
+                "a gate restated a channel that is already zero: {restated}\n{rust}"
+            );
+        }
+        // The second term adds `y·y`, which reaches neither `out_g0` nor
+        // `out_h0_0`, so it must not restate them — on the released emitter it
+        // wrote them as `channel = channel`.
+        for restated in ["out_g0=out_g0;", "out_h0_0=out_h0_0;"] {
+            assert!(
+                !rust.contains(restated),
+                "a gate restated a channel its term leaves alone: {restated}\n{rust}"
+            );
+        }
+
+        // NON-VACUITY. Each gate still assigns what its term does reach, and
+        // the one channel both terms carry is still read-modify-written, or the
+        // assertions above would pass on an emitter that assigned nothing.
+        for assigned in [
+            "out_g0=out_stack0[1];",
+            "out_g1=(y+y);",
+            "out_h1_1=(1.0+1.0);",
+            "out_v=(out_v+(y*y));",
+        ] {
+            assert!(
+                rust.contains(assigned),
+                "the gates must still assign the channels their terms reach: {assigned}\n{rust}"
+            );
+        }
+        assert_eq!(
+            rust.matches("if(take_a>0.0){").count(),
+            1,
+            "the first gate is emitted"
+        );
+        assert_eq!(
+            rust.matches("if(take_b>0.0){").count(),
+            1,
+            "the second gate is emitted"
+        );
     }
 
     #[test]
