@@ -1,8 +1,9 @@
 {
-  "created_at_utc": "2026-09-04T16:35:52.550647+00:00",
-  "status": "failed",
+  "created_at_utc": "2026-09-04T21:00:15.250088+00:00",
+  "status": "timeout",
   "method": "rust_survival_margslope_aniso_duchon16d_gm_linkwiggle_scorewarp_timewiggle_fast",
   "dataset": "survival",
   "family": "survival",
-  "error": "error: unexpected argument '--time-smooth-lambda' found\n\n  tip: to pass '--time-smooth-lambda' as a value, use '-- --time-smooth-lambda'\n\nUsage: gam fit --out <OUT> --survival-likelihood <SURVIVAL_LIKELIHOOD> --time-basis <TIME_BASIS> --time-degree <TIME_DEGREE> --time-num-internal-knots <TIME_NUM_INTERNAL_KNOTS> <DATA> [FORMULA]\n\nFor more information, try '--help'."
+  "timeout_sec": 300,
+  "error": "[HEARTBEAT] command-timeout rc=124 timeout_sec=300 pid=2485 cmd='/home/runner/work/gam/gam/target/release/gam --log-level info fit --survival-likelihood ...'"
 }
