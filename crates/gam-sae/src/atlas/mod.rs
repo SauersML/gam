@@ -252,3 +252,95 @@ fn the_null_is_bit_identical_run_to_run_2280() {
         assert_eq!(a, None, "noise in R^4 read at d={d} was named {a:?}: {why_a}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The roll sweep: is the verdict actually intrinsic?
+//
+// #2280's thesis is that "every input to the verdict is a transition between
+// charts, and a transition is intrinsic". The trefoil row tests that for a
+// 1-manifold and passes. This tests it for the case the issue's acceptance list
+// names and the readout currently refuses: the swiss roll.
+//
+// The sweep holds the INTRINSIC manifold fixed — every arm is a flat rectangular
+// sheet, `chi = 1`, `b1 = 0`, a disk — and varies only how tightly the ambient
+// embedding winds it. If the verdict is intrinsic, every arm reads `Disk`. If the
+// verdict tracks the winding, then the ambient embedding is reaching the readout,
+// and the mechanism is the cover: `LocalAtlas` grows its patches by AMBIENT
+// nearest rows, so on a tight roll a patch spans two sheets that are ambient-near
+// and geodesically far. That is the same "genuine neighbour vs. ambient near-miss"
+// distinction the trefoil-400 regression on this issue already exposed, and this
+// sweep is built to say whether the swiss-roll refusal is one defect with it or
+// two.
+// ---------------------------------------------------------------------------
+
+/// A flat `(t, h)` sheet wound into ambient 3-D across `turns` revolutions,
+/// spanning a FIXED radial extent.
+///
+/// Holding the radial extent fixed while raising `turns` is what makes this a
+/// control rather than a demonstration: the gap between successive windings
+/// shrinks as `turns` grows, while the sheet stays intrinsically the same flat
+/// rectangle. `turns = 1.5` reproduces the acceptance list's "swiss roll (1.5+
+/// turns)"; the small-`turns` arms are gently curved sheets whose ambient and
+/// geodesic metrics agree.
+fn rolled_sheet(n_t: usize, n_h: usize, turns: f64) -> Array2<f64> {
+    const INNER_RADIUS: f64 = 1.0;
+    const OUTER_RADIUS: f64 = 4.0;
+    const HEIGHT: f64 = 2.0;
+    let n = n_t * n_h;
+    let mut z = Array2::<f64>::zeros((n, 3));
+    let mut row = 0usize;
+    for it in 0..n_t {
+        let s = (it as f64) / (n_t as f64 - 1.0);
+        let radius = INNER_RADIUS + (OUTER_RADIUS - INNER_RADIUS) * s;
+        let angle = std::f64::consts::TAU * turns * s;
+        for ih in 0..n_h {
+            z[[row, 0]] = radius * angle.cos();
+            z[[row, 1]] = radius * angle.sin();
+            z[[row, 2]] = HEIGHT * (ih as f64) / (n_h as f64 - 1.0);
+            row += 1;
+        }
+    }
+    z
+}
+
+/// Every arm of the roll sweep is intrinsically a disk, so the readout must
+/// either say `Disk` or say nothing — and it must say `Disk` where the ambient
+/// and geodesic metrics agree.
+///
+/// The gentle arm is the non-vacuity control: without it, "refuses on every arm"
+/// would pass while telling us only that the harness is broken. The assertion at
+/// the tight end is deliberately the weaker, honest one — no misnaming — because
+/// the tight roll's verdict is the open question this issue records, and asserting
+/// `Disk` there would be asserting the fix rather than measuring the defect.
+#[test]
+fn a_rolled_sheet_is_a_disk_at_every_winding_or_nothing_at_all_2280() {
+    let mut rows = Vec::new();
+    for turns in [0.25_f64, 0.5, 1.0, 1.5, 2.5] {
+        let z = rolled_sheet(40, 12, turns);
+        let (named, why) = verdict(z.view(), 2);
+        rows.push((turns, named, why));
+    }
+    for (turns, _, why) in &rows {
+        eprintln!("[2280-roll] turns={turns:>4} {why}");
+    }
+
+    let gentle = rows
+        .first()
+        .expect("the sweep has a gentle arm by construction");
+    assert_eq!(
+        gentle.1,
+        Some(GraphCompressionKind::Disk),
+        "a barely-curved sheet must read as a disk, or the sweep below measures a \
+         broken harness rather than the winding: {}",
+        gentle.2
+    );
+
+    for (turns, named, why) in &rows {
+        assert!(
+            matches!(named, None | Some(GraphCompressionKind::Disk)),
+            "a rolled sheet is intrinsically a disk at every winding, so the readout \
+             may name `Disk` or refuse — naming anything else is a misnaming, which is \
+             the one property this readout has never violated. turns={turns}: {why}"
+        );
+    }
+}
