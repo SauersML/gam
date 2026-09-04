@@ -2518,9 +2518,37 @@ impl SaeSupportSparseTerm {
         ard_precisions: &[Vec<f64>],
         beta_offsets: &[usize],
     ) -> Result<Vec<SupportOuterDifferentialRow>, String> {
-        let mut rows = Vec::with_capacity(self.n_obs());
-        let mut scratch = ActiveAtomScratch::default();
-        for row in 0..self.n_obs() {
+        // Rows are independent; the per-row work (an active-slot fill, a
+        // second-jet evaluation and a handful of small allocations per slot)
+        // fans across the pool exactly as `raw_stationarity_with_residual`
+        // does. Serial, the 3000-row chart of #2576 spent seconds here on
+        // every classifier call.
+        (0..self.n_obs())
+            .into_par_iter()
+            .map_init(
+                ActiveAtomScratch::default,
+                |scratch, row| -> Result<SupportOuterDifferentialRow, String> {
+                    self.support_outer_differential_row(
+                        target,
+                        ard_precisions,
+                        beta_offsets,
+                        row,
+                        scratch,
+                    )
+                },
+            )
+            .collect::<Result<Vec<_>, String>>()
+    }
+
+    fn support_outer_differential_row(
+        &self,
+        target: ArrayView2<'_, f64>,
+        ard_precisions: &[Vec<f64>],
+        beta_offsets: &[usize],
+        row: usize,
+        scratch: &mut ActiveAtomScratch,
+    ) -> Result<SupportOuterDifferentialRow, String> {
+        {
             let support = self.assignment.support_indices(row);
             let q = support
                 .iter()
@@ -2537,7 +2565,7 @@ impl SaeSupportSparseTerm {
                 let atom = &self.atoms[atom_index];
                 let d = atom.latent_dim();
                 let m = atom.basis_size();
-                self.fill_active(row, slot, &mut scratch)?;
+                self.fill_active(row, slot, scratch)?;
                 fitted += &scratch.decoded;
                 jacobian
                     .slice_mut(ndarray::s![coordinate_offset..coordinate_offset + d, ..])
@@ -2606,17 +2634,15 @@ impl SaeSupportSparseTerm {
                 });
                 coordinate_offset += d;
             }
-            rows.push(SupportOuterDifferentialRow {
+            Ok(SupportOuterDifferentialRow {
                 slots,
                 jacobian,
                 residual: &target.row(row) - &fitted,
                 prior_hessian_remainder,
                 prior_majorizer_derivative,
-            });
+            })
         }
-        Ok(rows)
     }
-
     fn support_outer_exact_hessian_apply(
         &self,
         system: &ArrowSchurSystem,
@@ -5712,7 +5738,29 @@ impl SaeSupportSparseTerm {
         if !delta_t.iter().chain(delta_beta.iter()).all(|v| v.is_finite()) {
             return Ok(None);
         }
+        // The majorizer model's own prediction for this step: `d` solves
+        // `B d = −g`, so the quadratic model predicts a decrease of
+        // `−g·d·(s − s²/2)` at scale `s`. The acceptance line below reports
+        // the actual decrease against it. Measured on the 3000×48 chart of
+        // #2576 the ratio's median is 0.46 (q25 0.32, q75 0.56) and 72 % of
+        // the steps are halved at least once: the objective's curvature along
+        // the step is 2.3–4.1× the majorizer's, the residual's second-jet term
+        // the majorizer drops. That ratio is the number to watch when the
+        // step's model changes.
         let (beta_offsets, beta_dim) = self.beta_layout()?;
+        let gradient_dot_step = {
+            let mut acc = 0.0_f64;
+            for (row, block) in system.rows.iter().enumerate() {
+                let offset = system.row_offsets[row];
+                for j in 0..system.row_dims[row] {
+                    acc += block.gt[j] * delta_t[offset + j];
+                }
+            }
+            for (g, d) in system.gb.iter().zip(delta_beta.iter()) {
+                acc += g * d;
+            }
+            acc
+        };
         if delta_beta.len() != beta_dim {
             return Err(format!(
                 "SaeSupportSparseTerm::joint_newton_step: arrow border width {} != decoder \
@@ -5784,6 +5832,13 @@ impl SaeSupportSparseTerm {
             let objective_resolution =
                 objective_cells.sqrt() * f64::EPSILON * objective.abs();
             if trial.is_finite() && objective - trial > objective_resolution {
+                let predicted = -gradient_dot_step * (scale - 0.5 * scale * scale);
+                log::info!(
+                    "support joint Newton: accepted scale=2^-{halving} predicted={predicted:+.3e} \
+                     actual={:+.3e} ratio={:.3} objective={objective:.9e} -> {trial:.9e}",
+                    objective - trial,
+                    if predicted != 0.0 { (objective - trial) / predicted } else { f64::NAN },
+                );
                 self.reconstruct_into(fitted)?;
                 return Ok(Some(trial));
             }

@@ -1081,6 +1081,42 @@ where
     F: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
     P: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
 {
+    solve_b_preconditioned_gmres_to(rhs, initial, apply_a, precondition, f64::EPSILON.sqrt())
+}
+
+/// [`solve_b_preconditioned_gmres_from`] with the certificate the CALLER
+/// needs: the solve returns once the physical residual `‖rhs − A x‖` is at
+/// most `relative_tolerance·‖rhs‖`, never asking for less than the arithmetic
+/// floor `√ε·‖rhs‖` a floating-point residual can certify. An inexact Newton
+/// step inside a line search asks for a forcing tolerance; a profile adjoint
+/// asks for the floor.
+///
+/// The Arnoldi recurrence exits its cycle the moment its own residual
+/// estimate meets the target (#2576). Before this the cycle ran its full
+/// `restart` length regardless, and with `restart = dim` on a large system
+/// the physical-residual check at the cycle's end was unreachable in
+/// practice: measured on a 19,680-dimensional exact-observed-information
+/// solve, the estimate passed `√ε` before iteration 256 and the loop was
+/// still running at iteration 512 (725 s). The exit is on the ESTIMATE; the
+/// physical residual at the cycle's end is what certifies, and a cycle whose
+/// estimate lied (an adaptive preconditioner can make it) simply restarts.
+pub(crate) fn solve_b_preconditioned_gmres_to<F, P>(
+    rhs: &SaeArrowVector,
+    initial: &SaeArrowVector,
+    apply_a: F,
+    precondition: P,
+    relative_tolerance: f64,
+) -> Result<(SaeArrowVector, usize), String>
+where
+    F: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+    P: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+{
+    if !(relative_tolerance.is_finite() && relative_tolerance > 0.0) {
+        return Err(format!(
+            "solve_b_preconditioned_gmres: relative tolerance must be finite and positive, got \
+             {relative_tolerance}"
+        ));
+    }
     let t_len = rhs.t.len();
     let beta_len = rhs.beta.len();
     if initial.t.len() != t_len || initial.beta.len() != beta_len {
@@ -1116,7 +1152,7 @@ where
     }
     let b = rhs_flat;
     let b_norm = rhs_norm;
-    let relative_floor = f64::EPSILON.sqrt();
+    let relative_floor = relative_tolerance.max(f64::EPSILON.sqrt());
     // Full-memory whenever the live memory ledger admits it. Each restarted
     // cycle must make a strictly representable reduction in the original
     // residual, and inability to do so is the typed numerical-stagnation
@@ -1270,6 +1306,11 @@ where
             // least-squares decide the cycle, stopping early only when Arnoldi
             // proves the generated space itself is closed.
             if arnoldi_space_closed {
+                break;
+            }
+            // The Arnoldi estimate of the residual has met the target: leave
+            // the cycle and let the physical residual below certify it.
+            if g[j + 1].abs() <= relative_floor * b_norm {
                 break;
             }
         }
