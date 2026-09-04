@@ -529,7 +529,14 @@ impl<'a> MultinomialPredictiveModel<'a> {
                     trial[i] = theta[i] + length * step[i];
                 }
                 let trial_value = self.log_posterior(&trial, extra, tilt);
-                if trial_value.is_finite() && trial_value >= value {
+                // A step is accepted only when the objective actually rises.
+                // A trial that leaves the value bit-identical is not progress,
+                // and accepting it (`>=`) let a solve whose remaining gain sat
+                // under the objective's own round-off — a strong penalty makes
+                // `L` large and its resolution `ε|L|` larger than the
+                // decrement target — burn every iteration on steps that changed
+                // nothing and then report non-convergence.
+                if trial_value.is_finite() && trial_value > value {
                     theta = trial;
                     value = trial_value;
                     accepted = true;

@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The multinomial predictive's augmented-mode Newton accepts only a strictly rising trial, so a solve whose remaining gain sits under the log-posterior's round-off converges to resolution instead of exhausting its hundred iterations on steps that change nothing (#2812).
+
 - The SAE manifold joint fit logs one phase clock per iteration, per entry-sweep round and for its setup, and five of its serial row passes (frame refresh, coordinate seeding, target-aware reconstruction, deflation candidates, coherence projections) now fan across the Rayon pool (#2731).
 
 - The custom-family joint Newton arms the exact Jeffreys second-order completion before any decrement certificate is taken (#2714); a slow-geometric-rate exit carries the ray it stalled on (`RayRestoration`), and the outer's seed evaluation restores a named seed by that ray's log-strength ratio before evaluating it again (#2695).
