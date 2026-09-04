@@ -4663,14 +4663,33 @@ impl SaeManifoldTerm {
                 SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Linear
             )
         });
+        // #2023 — record the seed ACTUALLY TAKEN, in both arms.
+        //
+        // The migration ledger's acceptance bar is "no PC reseed events in the
+        // log", and before these counters it could not fail:
+        // `BirthSeed::PrincipalComponent` had no constructor anywhere in the
+        // tree, this file had no reference to the ledger at all, and
+        // `record_search_round` stamped every accepted birth
+        // `BirthSeed::ResidualFactor` unconditionally — so the seed was
+        // ASSERTED, never observed, and `pc_reseed_events == 0` held by
+        // construction rather than by evidence. Incrementing on the branch taken
+        // is what makes the bar capable of failing; a bar that cannot fail
+        // measures nothing, however green it reads.
+        //
+        // Per reseeded ATOM, not per call: one exhausted-pool retry that
+        // re-plants four atoms on the same leading PCs is four chances to
+        // re-collapse, and a per-call count would report it as one.
         let seeded = if data_row_reseed && all_flat && n > 0 && pc_pair_offset >= pc_pairs.max(1) {
             // Distinct anchor row per (atom, retry), spanning the full n-row range
             // so successive exhausted-pool retries never re-anchor identically.
             let anchor_rows: Vec<usize> = (0..atoms.len())
                 .map(|slot| (slot + pc_pair_offset.wrapping_mul(atoms.len().max(1))) % n)
                 .collect();
+            self.data_row_reseeded_atoms =
+                self.data_row_reseeded_atoms.saturating_add(atoms.len());
             sae_data_row_anchored_euclidean_coords(residual.view(), &dims, &anchor_rows)?
         } else {
+            self.pc_reseeded_atoms = self.pc_reseeded_atoms.saturating_add(atoms.len());
             sae_pca_seed_initial_coords_with_pc_offset(
                 residual.view(),
                 &basis_kinds,

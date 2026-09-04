@@ -880,6 +880,10 @@ impl SaeManifoldTerm {
             criterion_gauge_deflation_reanchors: 0,
             criterion_gauge_deflation_last_delta_sign: 0,
             dictionary_cocollapse_reseeds: 0,
+            // #2023 — seed-provenance counters for the co-collapse reseed; see
+            // the field docs on `term.rs` for why they are never reset.
+            pc_reseeded_atoms: 0,
+            data_row_reseeded_atoms: 0,
             inner_globalization_hint: None,
             best_cocollapse_incumbent: None,
             best_fit_incumbent: None,

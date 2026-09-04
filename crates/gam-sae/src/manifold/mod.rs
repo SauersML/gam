@@ -260,6 +260,9 @@ mod tests_chart_evaluator_jets;
 mod tests_collapse_prevention;
 
 #[cfg(test)]
+mod tests_pc_reseed_provenance_2023;
+
+#[cfg(test)]
 mod coherence_scan_2731_tests;
 
 #[cfg(test)]
