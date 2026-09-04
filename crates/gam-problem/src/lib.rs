@@ -109,7 +109,7 @@ pub use custom_family_blockwise::{
 pub use custom_family_error::{
     CustomFamilyError,
     InnerConvergenceTerminalState,
-    JointNewtonTerminalReason,
+    JointNewtonTerminalReason, RayRestoration,
     relative_stationarity,
 };
 pub use dispersion::{Dispersion, DispersionError};

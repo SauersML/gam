@@ -31,7 +31,64 @@ pub enum JointNewtonTerminalReason {
         projected_cycles_to_tolerance: usize,
         residual: f64,
         residual_tol: f64,
+        /// The block whose penalty is too weak to close the ray, and the
+        /// strength at which it would: `None` when no block's penalty opposes
+        /// the accepted step (an unpenalized ray, which no ρ can close).
+        ray: Option<RayRestoration>,
     },
+}
+
+/// The block-level reading of a ray the joint Newton was descending when it
+/// stopped: along the last accepted step `δ`, the likelihood term slopes
+/// down by `likelihood_slope = ∇(−ℓ)·δ < 0` while block `block`'s penalty
+/// slopes up by only `penalty_slope = (λ_b S_b β)·δ > 0`. The penalized
+/// objective is stationary along `δ` at the strength ratio
+/// `r = −likelihood_slope / penalty_slope > 1`, so raising every log
+/// strength of that block by `log_strength_ratio = ln r` closes the ray at
+/// the iterate the solve stopped on. The ratio is read off the two slopes the
+/// solve already had; nothing here is a step size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RayRestoration {
+    /// Index of the parameter block carrying the ray.
+    pub block: usize,
+    /// The outer ρ coordinates of that block's penalties: `rho_count` of
+    /// them, contiguous from `rho_first` (ρ is laid out block by block).
+    pub rho_first: usize,
+    pub rho_count: usize,
+    /// `ln r`, the amount every one of `rho_indices` has to rise.
+    pub log_strength_ratio: f64,
+    /// `∇(−ℓ)·δ` along the accepted step (negative: the likelihood descends).
+    pub likelihood_slope: f64,
+    /// `(λ_b S_b β)·δ` along the accepted step (positive: the penalty resists).
+    pub penalty_slope: f64,
+    /// `‖δ_b‖∞`, the block's share of the accepted step.
+    pub block_step_inf: f64,
+}
+
+impl RayRestoration {
+    /// The outer ρ coordinates this restoration raises.
+    pub fn rho_indices(&self) -> std::ops::Range<usize> {
+        self.rho_first..self.rho_first + self.rho_count
+    }
+}
+
+impl std::fmt::Display for RayRestoration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "block {} is under-penalized along the accepted step (likelihood slope \
+             {:.3e}, penalty slope {:.3e}, block step {:.3e}): the ray closes at \
+             {:.4}x its penalty strength, i.e. rho[{}..{}] += {:.4}",
+            self.block,
+            self.likelihood_slope,
+            self.penalty_slope,
+            self.block_step_inf,
+            self.log_strength_ratio.exp(),
+            self.rho_first,
+            self.rho_first + self.rho_count,
+            self.log_strength_ratio,
+        )
+    }
 }
 
 impl std::fmt::Display for JointNewtonTerminalReason {
@@ -64,6 +121,7 @@ impl std::fmt::Display for JointNewtonTerminalReason {
                 projected_cycles_to_tolerance,
                 residual,
                 residual_tol,
+                ray,
             } => {
                 if *rate_per_cycle < 1.0 {
                     write!(
@@ -73,7 +131,7 @@ impl std::fmt::Display for JointNewtonTerminalReason {
                          {projected_cycles_to_tolerance} further cycles to reach \
                          {residual_tol:.6e}: the solve was descending along a direction with \
                          no finite minimizer in reach, not stuck"
-                    )
+                    )?;
                 } else {
                     write!(
                         f,
@@ -81,7 +139,15 @@ impl std::fmt::Display for JointNewtonTerminalReason {
                          cycle over the last {window_cycles} cycles, every step accepted) and \
                          cannot reach {residual_tol:.6e}: the solve was descending along a \
                          direction with no finite minimizer in reach, not stuck"
-                    )
+                    )?;
+                }
+                match ray {
+                    Some(ray) => write!(f, "; {ray}"),
+                    None => write!(
+                        f,
+                        "; no block's penalty opposes the accepted step, so no penalty \
+                         strength closes this ray"
+                    ),
                 }
             }
         }

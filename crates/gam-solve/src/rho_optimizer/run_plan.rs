@@ -88,6 +88,104 @@ fn should_await_promoted_parsimony_seed(
 /// cannot reject a seed or initialize an optimizer. Lift the shared cap only for
 /// this sample, preserving any continuation/pilot warm state, then restore the
 /// scheduler before search begins.
+/// The typed ray a custom-family inner solve reported when it stopped
+/// descending a direction with no finite minimizer in reach at this ρ.
+fn ray_restoration_in(err: &EstimationError) -> Option<&gam_problem::RayRestoration> {
+    match err {
+        EstimationError::CustomFamily(gam_problem::CustomFamilyError::InnerSolveNotConverged {
+            terminal:
+                Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
+                    termination_reason:
+                        gam_problem::JointNewtonTerminalReason::SlowGeometricRate {
+                            ray: Some(ray), ..
+                        },
+                    ..
+                }),
+            ..
+        }) => Some(ray),
+        _ => None,
+    }
+}
+
+/// The ceiling a ray restoration may raise a log strength to (the model's own
+/// upper domain) and the number of ρ coordinates, which bounds how many
+/// restorations one seed may take.
+#[derive(Clone, Copy)]
+struct RayRestorationDomain<'a> {
+    upper: &'a Array1<f64>,
+    rho_dim: usize,
+}
+
+/// Evaluate a seed at full inner fidelity, restoring it when the inner solve
+/// reports a ray (#2695): the inner solve names the block whose penalty is too
+/// weak to close the direction it was descending and the strength ratio at
+/// which it would, so the seed is not a failed seed but an under-penalized
+/// one, and its named log strengths are raised by that ratio and the
+/// evaluation repeated. Each restoration strictly raises the named
+/// coordinates; it stops at the model's own domain ceiling, or after as many
+/// restorations as there are ρ coordinates (a ray that survives that many
+/// closures is not closing), and then the original refusal is returned.
+fn eval_seed_restoring_rays(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    seed: &mut Array1<f64>,
+    order: OuterEvalOrder,
+    domain: RayRestorationDomain<'_>,
+    context: &str,
+    seed_idx: usize,
+) -> Result<OuterEval, EstimationError> {
+    let RayRestorationDomain { upper, rho_dim } = domain;
+    let mut restorations = 0usize;
+    loop {
+        let err = match eval_seed_at_full_inner_fidelity(obj, config, seed, order) {
+            Ok(eval) => return Ok(eval),
+            Err(err) => err,
+        };
+        let Some(ray) = ray_restoration_in(&err) else {
+            return Err(err);
+        };
+        if restorations >= rho_dim {
+            log::warn!(
+                "[OUTER] {context}: seed {seed_idx} still descends a ray after {restorations} \
+                 restorations (one per rho coordinate); refusing it as evaluated: {ray}"
+            );
+            return Err(err);
+        }
+        let mut restored = seed.clone();
+        for j in ray.rho_indices() {
+            let Some(current) = restored.get(j).copied() else {
+                return Err(err);
+            };
+            let ceiling = upper.get(j).copied().unwrap_or(f64::INFINITY);
+            // The closure may lie beyond the domain's ceiling: then the block
+            // wants more strength than the model resolves, and the honest move
+            // is to the ceiling itself (a block collapsing to its null space
+            // is a result, not a wall — #2812). A coordinate already at its
+            // ceiling cannot be raised, and the refusal stands.
+            let raised = (current + ray.log_strength_ratio).min(ceiling);
+            if !(raised.is_finite() && raised > current) {
+                log::warn!(
+                    "[OUTER] {context}: seed {seed_idx} descends a ray on a coordinate already \
+                     at its domain ceiling (rho[{j}]={current:.4}, ceiling {ceiling:.4}); \
+                     refusing it as evaluated: {ray}"
+                );
+                return Err(err);
+            }
+            restored[j] = raised;
+        }
+        log::warn!(
+            "[OUTER] {context}: seed {seed_idx} is under-penalized, not failed — {ray}; \
+             restoring rho[{}..{}] from {:?} to {:?} and re-evaluating",
+            ray.rho_first,
+            ray.rho_first + ray.rho_count,
+            ray.rho_indices().map(|j| seed[j]).collect::<Vec<_>>(),
+            ray.rho_indices().map(|j| restored[j]).collect::<Vec<_>>(),
+        );
+        *seed = restored;
+        restorations += 1;
+    }
+}
+
 fn eval_seed_at_full_inner_fidelity(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
@@ -1433,7 +1531,12 @@ pub(crate) fn run_outer_with_plan(
     // buys nothing; `max_seeds` / `seed_budget` are inert against it.
     let mut cold_entry_leg_refusal: Option<String> = None;
 
-    'seed_attempts: for (seed_idx, seed) in seeds.iter().enumerate() {
+    'seed_attempts: for (seed_idx, seed_as_generated) in seeds.iter().enumerate() {
+        // The seed the solver starts from: the generated point, or that point
+        // with the under-penalized block's strengths raised by the ratio the
+        // inner solve read off its ray (#2695).
+        let mut seed_owned = seed_as_generated.clone();
+        let seed = &mut seed_owned;
         if !should_start_next_seed(started_seeds, seed_budget, best.is_some()) {
             break;
         }
@@ -1891,11 +1994,14 @@ pub(crate) fn run_outer_with_plan(
         let seed_slot;
         let result: Result<OuterResult, EstimationError> = match the_plan.solver {
             Solver::Arc => {
-                let seed_eval = eval_seed_at_full_inner_fidelity(
+                let seed_eval = eval_seed_restoring_rays(
                     obj,
                     config,
                     seed,
                     OuterEvalOrder::ValueGradientHessian,
+                    RayRestorationDomain { upper: &bounds_template.1, rho_dim: layout.rho_dim() },
+                    context,
+                    seed_idx,
                 )
                     .map_err(|err| into_objective_error("outer eval failed", err));
                 let seed_eval = match seed_eval {
@@ -2505,11 +2611,14 @@ pub(crate) fn run_outer_with_plan(
                     // only need the wrapper for its bail-on-invalid behaviour.
                     outer_max_iterations(config.max_iter)?;
                     let axis_caps_dev = bfgs_axis_step_caps(config, layout);
-                    let seed_eval_dev = match eval_seed_at_full_inner_fidelity(
+                    let seed_eval_dev = match eval_seed_restoring_rays(
                             obj,
                             config,
                             seed,
                             OuterEvalOrder::ValueAndGradient,
+                            RayRestorationDomain { upper: &bounds_template.1, rho_dim: layout.rho_dim() },
+                            context,
+                            seed_idx,
                         )
                         .map_err(|err| into_objective_error("outer eval failed", err))
                     {
@@ -2606,11 +2715,14 @@ pub(crate) fn run_outer_with_plan(
                             // re-running the seed evaluation; the
                             // existing branch will re-validate it and
                             // proceed.
-                            let seed_eval = eval_seed_at_full_inner_fidelity(
+                            let seed_eval = eval_seed_restoring_rays(
                             obj,
                             config,
                             seed,
                             OuterEvalOrder::ValueAndGradient,
+                            RayRestorationDomain { upper: &bounds_template.1, rho_dim: layout.rho_dim() },
+                            context,
+                            seed_idx,
                         )
                                 .map_err(|err| into_objective_error("outer eval failed", err));
                             let seed_eval = match seed_eval {
@@ -2654,11 +2766,14 @@ pub(crate) fn run_outer_with_plan(
                         }
                     }
                 } else {
-                    let seed_eval = eval_seed_at_full_inner_fidelity(
+                    let seed_eval = eval_seed_restoring_rays(
                             obj,
                             config,
                             seed,
                             OuterEvalOrder::ValueAndGradient,
+                            RayRestorationDomain { upper: &bounds_template.1, rho_dim: layout.rho_dim() },
+                            context,
+                            seed_idx,
                         )
                         .map_err(|err| into_objective_error("outer eval failed", err));
                     let seed_eval = match seed_eval {

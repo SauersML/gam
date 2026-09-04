@@ -4939,11 +4939,32 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         let numerical_null_stationarity = joint_spectrum
             .as_ref()
             .map(|spectrum| spectrum.numerical_null_stationarity_inf());
+        // The decrement certificate is a statement about the objective's own
+        // Hessian: `½gᵀH⁻¹g ≤ τ` says no resolvable descent remains ALONG THE
+        // MODEL. On a Firth-armed fit the step model between cycles carries the
+        // divided-difference Jeffreys curvature, not the exact one, so a
+        // certificate taken on it can fire while the residual is still
+        // contracting geometrically under the surrogate. Measured on the #2714
+        // frailty witness: the certificate fired at cycle 10 with
+        // `residual = 1.597e-3` against `residual_tol = 3.082e-10` (the
+        // residual had contracted 0.55× per cycle for ten cycles), the outer
+        // gradient the implicit-function theorem then formed from that
+        // non-stationary mode was wrong at the `1e-2` level, and every outer
+        // seed died in a fifty-attempt line search at `|g| ≈ 1.6e-2`. So under
+        // a surrogate model the precondition arms the exact completion instead
+        // of certifying; the certificate is only ever taken on the complete
+        // Hessian, whose Newton step also closes the residual quadratically.
         if decrement_precondition
             && head_jeffreys_term.is_some()
             && head_jeffreys_completion.is_none()
-            && numerical_null_stationarity.is_some_and(|v| v > residual_tol)
         {
+            log::info!(
+                "[PIRLS/joint-Newton model] cycle {cycle:>3} | the decrement certificate would \
+                 fire on a step model that is not the objective's Hessian \
+                 (residual={residual:.3e} against tol={residual_tol:.3e}, \
+                 |Δobj|={objective_change:.3e} against {objective_tol:.3e}); arming the \
+                 exact Jeffreys second-order completion before any certificate is taken"
+            );
             jeffreys_completion_endgame = true;
             continue 'joint_newton_cycles;
         }
@@ -6052,6 +6073,71 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 );
                 // A typed outcome, so the outer's seed statistics can tell a
                 // descending ray from a stuck solve (gam#2695).
+                // Which block's penalty is too weak to close the ray, read off
+                // the step this cycle accepted (#2695): along `δ = β_new − β_old`
+                // the likelihood slopes down by `∇(−ℓ)·δ` and block b's penalty
+                // slopes up by `(λ_b S_b β)·δ`; the objective is stationary along
+                // `δ` at `r_b = −(∇(−ℓ)·δ) / ((λ_b S_b β)·δ)` times the block's
+                // strength. The outer reads `ln r_b` as the restoration of an
+                // under-penalized seed rather than as a failed seed.
+                let ray = {
+                    let beta_old_joint = Array1::from_iter(old_beta.iter().flat_map(|b| b.iter().copied()));
+                    let beta_new_joint =
+                        Array1::from_iter(states.iter().flat_map(|s| s.beta.iter().copied()));
+                    if beta_old_joint.len() == total_p
+                        && beta_new_joint.len() == total_p
+                        && grad_joint.len() == total_p
+                    {
+                        let delta = &beta_new_joint - &beta_old_joint;
+                        let s_beta = apply_joint_block_penalty(
+                            &ranges,
+                            &s_lambdas,
+                            &beta_old_joint,
+                            0.0,
+                            joint_bundle,
+                        );
+                        let mut best: Option<gam_problem::RayRestoration> = None;
+                        let mut rho_offset = 0usize;
+                        for (block, &(start, end)) in ranges.iter().enumerate() {
+                            let n_pen = specs.get(block).map_or(0, |spec| spec.penalties.len());
+                            let rho_first = rho_offset;
+                            rho_offset += n_pen;
+                            let likelihood_slope: f64 =
+                                (start..end).map(|i| -grad_joint[i] * delta[i]).sum();
+                            let penalty_slope: f64 = (start..end).map(|i| s_beta[i] * delta[i]).sum();
+                            let block_step_inf = delta
+                                .slice(ndarray::s![start..end])
+                                .iter()
+                                .map(|v| v.abs())
+                                .fold(0.0_f64, f64::max);
+                            if n_pen == 0 || !(penalty_slope > 0.0) || !(likelihood_slope < 0.0) {
+                                continue;
+                            }
+                            let ratio = -likelihood_slope / penalty_slope;
+                            if !(ratio.is_finite() && ratio > 1.0) {
+                                continue;
+                            }
+                            let candidate = gam_problem::RayRestoration {
+                                block,
+                                rho_first,
+                                rho_count: n_pen,
+                                log_strength_ratio: ratio.ln(),
+                                likelihood_slope,
+                                penalty_slope,
+                                block_step_inf,
+                            };
+                            if best
+                                .as_ref()
+                                .is_none_or(|c| candidate.log_strength_ratio > c.log_strength_ratio)
+                            {
+                                best = Some(candidate);
+                            }
+                        }
+                        best
+                    } else {
+                        None
+                    }
+                };
                 if let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
                     termination_reason,
                     ..
@@ -6063,6 +6149,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         projected_cycles_to_tolerance: effective_projection_cap,
                         residual,
                         residual_tol,
+                        ray,
                     };
                 }
                 cycles_done = cycle + 1;
