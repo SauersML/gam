@@ -1967,6 +1967,16 @@ struct SurvivalSmoothingSelection {
     lambdas: Vec<f64>,
     outer_iterations: usize,
     criterion_certificate: Option<gam_solve::estimate::OuterCriterionCertificate>,
+    /// The inner mode β̂ the selector certified at its last evaluation. The
+    /// outer engine's finalize re-runs the inner solve at the selected ρ, so
+    /// after a successful selection this is the strict-`Converged` coefficient
+    /// vector at `lambdas` itself. The fixed-λ solve that mints the fit starts
+    /// here and re-certifies it, instead of re-deriving it from the cold
+    /// structural seed: on a heterogeneous delayed-entry cohort the cold path
+    /// crawls from the corner of the `γ ≥ 0` box (396 iterations at the seed
+    /// ρ, a 20-step objective plateau exit at the selected ρ) and the fit was
+    /// refused although its certified mode already existed (#2670).
+    certified_mode: Array1<f64>,
 }
 
 fn optimize_survival_transformation_smoothing(
@@ -2316,6 +2326,7 @@ fn optimize_survival_transformation_smoothing(
         lambdas,
         outer_iterations,
         criterion_certificate,
+        certified_mode: warm_beta.into_inner(),
     }))
 }
 
@@ -3492,29 +3503,34 @@ pub(crate) fn fit_survival_transformation_model(
         .iter()
         .any(|&t| t > crate::survival::ENTRY_AT_ORIGIN_THRESHOLD);
     let p_time_total = prepared.time_design_exit.ncols();
-    let (survival_outer_iterations, survival_outer_certificate) = if let Some(selection) =
-        optimize_survival_transformation_smoothing(
-            &model,
-            &penalty_blocks,
-            &beta0,
-            structural_lower_bounds.as_ref(),
-            p_time_total,
-            is_left_truncated,
-        )? {
+    let (survival_outer_iterations, survival_outer_certificate, selected_mode) = if let Some(
+        selection,
+    ) = optimize_survival_transformation_smoothing(
+        &model,
+        &penalty_blocks,
+        &beta0,
+        structural_lower_bounds.as_ref(),
+        p_time_total,
+        is_left_truncated,
+    )? {
         model
             .set_penalty_lambdas(&selection.lambdas)
             .map_err(|e| e.to_string())?;
         for (block, &lam) in penalty_blocks.iter_mut().zip(selection.lambdas.iter()) {
             block.lambda = lam;
         }
-        (selection.outer_iterations, selection.criterion_certificate)
+        (
+            selection.outer_iterations,
+            selection.criterion_certificate,
+            Some(selection.certified_mode),
+        )
     } else {
         // No smoothing coordinate was optimized (e.g. the fixed-λ parametric
         // Weibull baseline path): the fit is fixed-outer, so it carries 0 outer
         // iterations and no analytic certificate — assembly reads that as
         // `Fixed` convergence evidence rather than demanding a certificate
         // (#2301 defect D).
-        (0, None)
+        (0, None, None)
     };
     let opts = gam_solve::pirls::WorkingModelPirlsOptions {
         max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
@@ -3540,20 +3556,29 @@ pub(crate) fn fit_survival_transformation_model(
         expected_beta_len,
     );
     let mut opts = opts;
-    let beta_start = match persistent_warm_start_store.as_ref().and_then(|store| {
-        load_survival_transformation_persistent_warm_start(
-            store,
-            &persistent_warm_start_key,
-            &spec,
-            expected_beta_len,
-            &rho_for_cache,
-        )
-    }) {
-        Some((beta, lm_lambda)) => {
-            opts.initial_lm_lambda = lm_lambda;
-            beta
-        }
-        None => beta0,
+    // The final fixed-λ solve is the inner problem at the selected ρ, which
+    // the selector has just solved and certified: start from that mode so the
+    // solve below is its re-certification (O(1) iterations), not a second cold
+    // derivation from the structural seed. The persistent store is consulted
+    // only when no selection ran (the fixed-outer paths), and the structural
+    // seed only when neither exists.
+    let beta_start = match selected_mode {
+        Some(mode) => mode,
+        None => match persistent_warm_start_store.as_ref().and_then(|store| {
+            load_survival_transformation_persistent_warm_start(
+                store,
+                &persistent_warm_start_key,
+                &spec,
+                expected_beta_len,
+                &rho_for_cache,
+            )
+        }) {
+            Some((beta, lm_lambda)) => {
+                opts.initial_lm_lambda = lm_lambda;
+                beta
+            }
+            None => beta0,
+        },
     };
     let summary = gam_solve::pirls::runworking_model_pirls(
         &mut model,
