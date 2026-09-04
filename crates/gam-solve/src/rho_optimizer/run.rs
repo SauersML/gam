@@ -8894,22 +8894,53 @@ pub(crate) fn run_outer_uncertified(
                         break Ok(result);
                     };
                     if let Some(prev_g) = prev_attempt_grad_norm {
+                        // The gate's job, in its own words above, is to catch a
+                        // trajectory that "didn't move the gradient norm" — a
+                        // REPLAY: same seed, same trust radius, cold caches,
+                        // deterministic optimizer, so the retry recomputes what
+                        // the previous attempt already computed. That is
+                        // `cur >= prev`.
+                        //
+                        // It was implemented as `cur < 0.5 * prev`, which is a
+                        // HALVING requirement, and a retry that improves the
+                        // gradient by less than a factor of two was declared a
+                        // replay and threw away the rest of a two-retry budget.
+                        // Measured on gam#2735's stress fixture: `|g|` went
+                        // 1.966390e0 → 1.605910e0, an 18 % reduction — plainly
+                        // not a replay — and the ladder fell through to the
+                        // degraded plan with a retry still unspent. The retry
+                        // count (`arc_retries_left = 2`) is what bounds slow
+                        // grinding; this gate only has to tell motion from
+                        // stillness.
                         let progressed = cur_grad_norm.is_finite()
                             && prev_g.is_finite()
-                            && cur_grad_norm < 0.5 * prev_g;
+                            && cur_grad_norm < prev_g;
                         if !progressed {
                             log::info!(
                                 "[OUTER] {context}: ARC retry stalled at \
-                                 iter={} cost={:.6e} |g|={:.6e} (prev |g|={:.6e}); \
-                                 deterministic replay suspected, falling through \
-                                 to degraded plan",
+                                 iter={} cost={:.6e} |g|={:.6e} (prev |g|={:.6e}, \
+                                 ratio {:.4}); the retry did not reduce the gradient \
+                                 at all, so deterministic replay is suspected and \
+                                 further retries cannot help; falling through to \
+                                 degraded plan",
                                 result.iterations,
                                 result.final_value,
                                 cur_grad_norm,
                                 prev_g,
+                                cur_grad_norm / prev_g,
                             );
                             break Ok(result);
                         }
+                        log::info!(
+                            "[OUTER] {context}: ARC retry reduced the gradient \
+                             {:.6e} -> {:.6e} (ratio {:.4}); spending another of \
+                             the {} remaining retries rather than reading slow \
+                             progress as a replay",
+                            prev_g,
+                            cur_grad_norm,
+                            cur_grad_norm / prev_g,
+                            arc_retries_left,
+                        );
                     }
                     let next_trust_radius =
                         sanitized_operator_trust_restart_radius(result.operator_trust_radius);
