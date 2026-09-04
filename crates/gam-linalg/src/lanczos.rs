@@ -419,9 +419,7 @@ pub fn symmetric_extreme_lanczos_eigenpairs(
             for _ in 0..2 {
                 for qi in &basis {
                     let projection = -dot(&w, qi);
-                    for (output, &basis_value) in w.iter_mut().zip(qi) {
-                        *output = projection.mul_add(basis_value, *output);
-                    }
+                    crate::faer_ndarray::fma_axpy_into(projection, qi, &mut w);
                 }
             }
         }

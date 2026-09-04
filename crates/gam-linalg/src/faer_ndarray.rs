@@ -802,6 +802,15 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 //   * faster — several independent FMA accumulators expose the
 //     instruction-level parallelism the backend lowers to packed AVX
 //     `vfmadd` lanes, and the row work fans out across the Rayon pool; and
+//     (`f64::mul_add` is only an instruction when the code is COMPILED with
+//     the `fma` target feature; the portable x86_64 baseline this workspace
+//     ships has none, so a plain build lowered every `mul_add` here to a
+//     call into the runtime `fma` dispatcher — measured on a gaussian
+//     n=50,000 / p=93 fit: zero `vfmadd` in the row-major matvec closure and
+//     28% of the fit's cycles inside `fma`/`fma_with_fma`. Each kernel below
+//     is therefore compiled twice, once for the baseline and once with
+//     `fma,avx2` enabled, and its entry point picks the second whenever the
+//     running CPU reports both features — see `fma_avx2_available`.)
 //   * more accurate — `f64::mul_add` fuses each product into its accumulator
 //     with a single rounding (no rounded intermediate product), the lanes
 //     reduce as a small pairwise tree, and the long Xᵀr reduction is split
@@ -861,7 +870,7 @@ fn av_parallel_chunk_rows(p: usize) -> usize {
 /// is hidden under the memory traffic of streaming `X`, so accuracy rises with
 /// no throughput cost.
 #[inline(always)]
-fn fma_dot(a: &[f64], b: &[f64]) -> f64 {
+fn fma_dot_body(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len(), "fma_dot: operand length mismatch");
     let mut sum = [0.0f64; FMA_LANES];
     let mut comp = [0.0f64; FMA_LANES];
@@ -902,6 +911,40 @@ fn fma_dot(a: &[f64], b: &[f64]) -> f64 {
     total
 }
 
+/// Whether the running x86_64 CPU executes the `fma,avx2` kernel variants.
+///
+/// `is_x86_feature_detected!` caches its probe in a process-wide static, so
+/// this is a load and a bit test per call — invisible next to any kernel whose
+/// row is at least [`FMA_LANES`] long.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn fma_avx2_available() -> bool {
+    std::arch::is_x86_feature_detected!("fma") && std::arch::is_x86_feature_detected!("avx2")
+}
+
+/// [`fma_dot_body`] compiled with the `fma,avx2` target features, so its
+/// `mul_add`s are `vfmadd` instructions over packed lanes instead of calls.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma,avx2")]
+fn fma_dot_fma_avx2(a: &[f64], b: &[f64]) -> f64 {
+    fma_dot_body(a, b)
+}
+
+/// Compensated dot product: [`fma_dot_body`] on the CPU-feature variant the
+/// running machine supports. Bit-identical across variants — an FMA is an FMA
+/// whether it is an instruction or the runtime library's implementation of
+/// one, and the eight lanes keep their per-lane order under vectorization.
+#[inline]
+fn fma_dot(a: &[f64], b: &[f64]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if fma_avx2_available() {
+        // SAFETY: `fma_avx2_available` is the cached CPU probe for exactly the
+        // `fma` and `avx2` features this variant enables.
+        return unsafe { fma_dot_fma_avx2(a, b) };
+    }
+    fma_dot_body(a, b)
+}
+
 /// `out[i] = Σ_j X[i,j]·v[j]` for row-major-contiguous `x_all` (len `n·p`) and
 /// `v` (len `p`). Each output row is an independent [`fma_dot`]; rows fan out
 /// in chunks across the Rayon pool when the work is large.
@@ -937,7 +980,7 @@ fn fast_av_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mut
 /// the saved arithmetic matters when the same cache-resident matrix is applied
 /// hundreds of times.
 #[inline(always)]
-fn standard_fma_dot(a: &[f64], b: &[f64]) -> f64 {
+fn standard_fma_dot_body(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(
         a.len(),
         b.len(),
@@ -960,6 +1003,26 @@ fn standard_fma_dot(a: &[f64], b: &[f64]) -> f64 {
     let pair45 = sum[4] + sum[5];
     let pair67 = sum[6] + sum[7];
     remainder + (pair01 + pair23) + (pair45 + pair67)
+}
+
+/// [`standard_fma_dot_body`] compiled with the `fma,avx2` target features.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma,avx2")]
+fn standard_fma_dot_fma_avx2(a: &[f64], b: &[f64]) -> f64 {
+    standard_fma_dot_body(a, b)
+}
+
+/// Ordinary FMA dot product on the CPU-feature variant the running machine
+/// supports (bit-identical across variants, as for [`fma_dot`]).
+#[inline]
+fn standard_fma_dot(a: &[f64], b: &[f64]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if fma_avx2_available() {
+        // SAFETY: `fma_avx2_available` is the cached CPU probe for exactly the
+        // `fma` and `avx2` features this variant enables.
+        return unsafe { standard_fma_dot_fma_avx2(a, b) };
+    }
+    standard_fma_dot_body(a, b)
 }
 
 fn standard_av_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mut [f64]) {
@@ -1025,13 +1088,7 @@ fn fast_atv_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mu
         let start = b * ATV_BLOCK_ROWS;
         let end = (start + ATV_BLOCK_ROWS).min(n);
         let mut acc = vec![0.0f64; p];
-        for i in start..end {
-            let vi = v[i];
-            let row = &x_all[i * p..i * p + p];
-            for (a, &xij) in acc.iter_mut().zip(row.iter()) {
-                *a = xij.mul_add(vi, *a);
-            }
-        }
+        atv_block_accumulate(&x_all[start * p..end * p], &v[start..end], &mut acc);
         acc
     };
 
@@ -1043,6 +1100,71 @@ fn fast_atv_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mu
     };
 
     pairwise_sum_into(&partials, out);
+}
+
+/// `acc[j] += Σ_i rows[i,j]·v[i]` over a row-major block `rows` of `v.len()`
+/// rows and `acc.len()` columns: the private partial of one
+/// [`fast_atv_rowmajor_into`] reduction block, one FMA per entry.
+#[inline(always)]
+fn atv_block_accumulate_body(rows: &[f64], v: &[f64], acc: &mut [f64]) {
+    let p = acc.len();
+    assert_eq!(rows.len(), v.len() * p, "atv_block_accumulate: block length");
+    for (&vi, row) in v.iter().zip(rows.chunks_exact(p)) {
+        for (a, &xij) in acc.iter_mut().zip(row.iter()) {
+            *a = xij.mul_add(vi, *a);
+        }
+    }
+}
+
+/// [`atv_block_accumulate_body`] compiled with the `fma,avx2` target features.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma,avx2")]
+fn atv_block_accumulate_fma_avx2(rows: &[f64], v: &[f64], acc: &mut [f64]) {
+    atv_block_accumulate_body(rows, v, acc)
+}
+
+/// Block partial of `Xᵀv` on the CPU-feature variant the running machine
+/// supports (bit-identical across variants, as for [`fma_dot`]).
+#[inline]
+fn atv_block_accumulate(rows: &[f64], v: &[f64], acc: &mut [f64]) {
+    #[cfg(target_arch = "x86_64")]
+    if fma_avx2_available() {
+        // SAFETY: `fma_avx2_available` is the cached CPU probe for exactly the
+        // `fma` and `avx2` features this variant enables.
+        return unsafe { atv_block_accumulate_fma_avx2(rows, v, acc) };
+    }
+    atv_block_accumulate_body(rows, v, acc)
+}
+
+/// `y[i] = alpha·x[i] + y[i]` with one FMA per entry, on the CPU-feature
+/// variant the running machine supports (bit-identical across variants, as
+/// for the compensated dot above). The
+/// Lanczos reorthogonalization's projection update is this kernel over the
+/// full basis at every step, so it pays the same per-`mul_add` call price as
+/// the matvecs without it.
+pub(crate) fn fma_axpy_into(alpha: f64, x: &[f64], y: &mut [f64]) {
+    #[cfg(target_arch = "x86_64")]
+    if fma_avx2_available() {
+        // SAFETY: `fma_avx2_available` is the cached CPU probe for exactly the
+        // `fma` and `avx2` features this variant enables.
+        return unsafe { fma_axpy_into_fma_avx2(alpha, x, y) };
+    }
+    fma_axpy_into_body(alpha, x, y)
+}
+
+#[inline(always)]
+fn fma_axpy_into_body(alpha: f64, x: &[f64], y: &mut [f64]) {
+    assert_eq!(x.len(), y.len(), "fma_axpy_into: operand length mismatch");
+    for (yi, &xi) in y.iter_mut().zip(x.iter()) {
+        *yi = alpha.mul_add(xi, *yi);
+    }
+}
+
+/// [`fma_axpy_into_body`] compiled with the `fma,avx2` target features.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma,avx2")]
+fn fma_axpy_into_fma_avx2(alpha: f64, x: &[f64], y: &mut [f64]) {
+    fma_axpy_into_body(alpha, x, y)
 }
 
 /// Compute A * v using faer's SIMD-optimized GEMV.
@@ -3684,6 +3806,64 @@ mod tests {
             b.push(next() * scale);
         }
         (a, b)
+    }
+
+    /// The `fma,avx2` variants of every dispatched kernel are bit-identical
+    /// to the baseline bodies: the dispatch changes how an FMA is executed,
+    /// never what it computes. Run on the same ill-conditioned ensemble the
+    /// accuracy gate uses, so any lane reassociation would surface as a
+    /// changed bit. The CPU must execute the variants for this to be a
+    /// comparison at all, so a machine without `fma,avx2` fails loudly
+    /// instead of comparing a body with itself.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fma_avx2_kernel_variants_are_bit_identical_to_the_baseline_bodies() {
+        assert!(
+            super::fma_avx2_available(),
+            "this machine reports no fma/avx2: the variant path cannot be exercised here"
+        );
+        for seed in 0..64u64 {
+            let len = 200 + (seed as usize % 57);
+            let (a, b) = ill_conditioned_pair(len, 0x9E37_79B9 ^ seed.wrapping_mul(2654435761));
+            // SAFETY: the assertion above established the CPU features these
+            // variants enable.
+            let (dot_v, std_v) = unsafe {
+                (
+                    super::fma_dot_fma_avx2(&a, &b),
+                    super::standard_fma_dot_fma_avx2(&a, &b),
+                )
+            };
+            assert_eq!(dot_v.to_bits(), super::fma_dot_body(&a, &b).to_bits(), "fma_dot seed={seed}");
+            assert_eq!(
+                std_v.to_bits(),
+                super::standard_fma_dot_body(&a, &b).to_bits(),
+                "standard_fma_dot seed={seed}"
+            );
+            // Xᵀv block partial: `len` rows of width 7 (a remainder-bearing
+            // width), and the axpy over the same data.
+            let p = 7;
+            let rows: Vec<f64> = (0..len * p).map(|k| a[k % len] * (1.0 + (k % 3) as f64)).collect();
+            let mut acc_body = vec![0.0f64; p];
+            let mut acc_var = vec![0.0f64; p];
+            super::atv_block_accumulate_body(&rows, &b, &mut acc_body);
+            // SAFETY: as above.
+            unsafe { super::atv_block_accumulate_fma_avx2(&rows, &b, &mut acc_var) };
+            assert_eq!(
+                acc_var.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                acc_body.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "atv block seed={seed}"
+            );
+            let mut y_body = b.clone();
+            let mut y_var = b.clone();
+            super::fma_axpy_into_body(a[0], &a, &mut y_body);
+            // SAFETY: as above.
+            unsafe { super::fma_axpy_into_fma_avx2(a[0], &a, &mut y_var) };
+            assert_eq!(
+                y_var.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                y_body.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "axpy seed={seed}"
+            );
+        }
     }
 
     /// `fma_dot` (compensated Dot2) error-vs-truth never exceeds the naive
