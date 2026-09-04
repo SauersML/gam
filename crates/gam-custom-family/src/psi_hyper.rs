@@ -3239,6 +3239,53 @@ fn canonicalize_screened_objective(
     Ok(screened)
 }
 
+/// The verdict a mode profile reports when no coefficient-mode candidate
+/// survived screening.
+///
+/// It used to be [`CustomFamilyError::UnsupportedConfiguration`] unconditionally,
+/// with every candidate's typed error already rendered to prose. That is the
+/// discard [`CustomFamilyError::into_trial_point`] and the [`From<String>`]
+/// impl next to it both document: `UnsupportedConfiguration` is what
+/// `is_trial_point_infeasible()` answers `false` for, so a profile whose
+/// candidates all said "this theta is infeasible" told the outer search the
+/// PROBLEM was unsupported. The seed loop then had nothing recoverable to
+/// step to and the fit aborted.
+///
+/// Measured on gam#979's large-scale CTN preprocessor: 25 minutes in, with a
+/// certified incumbent already recorded (`best=5.3059e5`), the only candidate
+/// refused with `h' has non-positive values` — a monotonicity refusal at one
+/// trial β, true or false by moving theta — and the whole fit died. The same
+/// mistake is recorded twice before, at #2553 and #2590; this is the third.
+///
+/// So the aggregate carries the aggregate of the verdicts: rho-local only if
+/// EVERY rejection was rho-local. One structural failure among them keeps the
+/// whole profile structural, because a configuration error does not become
+/// true or false by moving theta and must not be retried at every seed.
+fn mode_profile_exhausted_error(
+    rejected_candidates: &[Option<String>],
+    rejection_is_rho_local: &[bool],
+) -> CustomFamilyError {
+    let reasons = rejected_candidates
+        .iter()
+        .enumerate()
+        .map(|(idx, reason)| {
+            format!(
+                "candidate {idx}: {}",
+                reason.as_deref().unwrap_or("no finite converged result")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let reason = format!(
+        "no coefficient-mode candidate produced a finite converged profile objective: {reasons}"
+    );
+    if rejection_is_rho_local.iter().all(|rho_local| *rho_local) {
+        CustomFamilyError::trial_point(reason)
+    } else {
+        CustomFamilyError::UnsupportedConfiguration { reason }
+    }
+}
+
 /// Profile a nonconvex coefficient mode without assembling expensive outer
 /// derivatives for every candidate.
 ///
@@ -3269,6 +3316,11 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
 
     let mut screened_objectives = vec![None; candidates.len()];
     let mut rejected_candidates = vec![None; candidates.len()];
+    // Whether each candidate's rejection is a property of THIS theta. The two
+    // in-loop rejections below (non-convergence, non-finite objective) are
+    // rho-local by construction, so the default is `true` and only a typed
+    // evaluator error can lower it.
+    let mut rejection_is_rho_local = vec![true; candidates.len()];
     let mut screened_results: Vec<Option<OuterObjectiveEvalResult>> =
         (0..candidates.len()).map(|_| None).collect();
     let penalty_counts = validate_blockspecs(specs)?;
@@ -3297,16 +3349,24 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         ) {
             Ok(candidate) => candidate,
             Err(error) => {
+                // Keep the producer's verdict, not just its prose. Rendering
+                // the error to `String` here is exactly the discard
+                // `CustomFamilyError::into_trial_point` documents, and the
+                // aggregate below is the only thing the outer search sees.
+                rejection_is_rho_local[candidate_idx] = error.is_trial_point_infeasible();
                 rejected_candidates[candidate_idx] = Some(format!("evaluator error: {error}"));
                 continue;
             }
         };
         if !candidate.inner_converged {
+            // Rho-local by the same rule `InnerSolveNotConverged` is: the
+            // inner solve missed its condition at THIS theta.
             rejected_candidates[candidate_idx] =
                 Some("inner coefficient solve did not converge".to_string());
             continue;
         }
         if !candidate.objective.is_finite() {
+            // Likewise: the profiled objective becomes finite by moving theta.
             rejected_candidates[candidate_idx] =
                 Some("profile objective was non-finite".to_string());
             continue;
@@ -3329,22 +3389,10 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
             .then_with(|| left.cmp(right))
     });
     if ranked_candidates.is_empty() {
-        let reasons = rejected_candidates
-            .iter()
-            .enumerate()
-            .map(|(idx, reason)| {
-                format!(
-                    "candidate {idx}: {}",
-                    reason.as_deref().unwrap_or("no finite converged result")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(CustomFamilyError::UnsupportedConfiguration {
-            reason: format!(
-                "no coefficient-mode candidate produced a finite converged profile objective: {reasons}"
-            ),
-        });
+        return Err(mode_profile_exhausted_error(
+            &rejected_candidates,
+            &rejection_is_rho_local,
+        ));
     }
 
     if matches!(eval_mode, EvalMode::ValueOnly) {
@@ -4223,5 +4271,71 @@ mod caller_contract_2695_tests {
             Some(&terminal),
             f64::NAN
         ));
+    }
+}
+
+#[cfg(test)]
+mod mode_profile_exhausted_verdict_tests {
+    use super::mode_profile_exhausted_error;
+    use gam_problem::CustomFamilyError;
+
+    /// gam#979. The aggregate of "this theta is infeasible" is "this theta is
+    /// infeasible". `UnsupportedConfiguration` is the variant
+    /// `is_trial_point_infeasible()` answers `false` for, so reporting it here
+    /// tells the seed loop the PROBLEM is unsupported and it aborts the fit —
+    /// which is what killed the large-scale CTN preprocessor 25 minutes in,
+    /// with a certified incumbent already in hand, on a single candidate's
+    /// monotonicity refusal.
+    #[test]
+    fn every_rejection_rho_local_makes_the_profile_rho_local_979() {
+        let rejected = vec![
+            Some("evaluator error: inner solve refused this trial point: h' <= 0".to_string()),
+            Some("inner coefficient solve did not converge".to_string()),
+        ];
+        let error = mode_profile_exhausted_error(&rejected, &[true, true]);
+        assert!(
+            error.is_trial_point_infeasible(),
+            "a profile whose candidates all refused THIS theta must let the outer \
+             search step away, not abort the fit: {error}"
+        );
+        // The reasons still reach the message; the verdict is what changed.
+        let rendered = error.to_string();
+        assert!(rendered.contains("candidate 0"), "{rendered}");
+        assert!(rendered.contains("candidate 1"), "{rendered}");
+        assert!(rendered.contains("h' <= 0"), "{rendered}");
+    }
+
+    /// The mirror, and the reason this is not simply "always rho-local": a
+    /// structural failure does not become true or false by moving theta, so
+    /// one of them among the candidates keeps the whole profile structural and
+    /// the seed loop stops instead of retrying it at every seed.
+    #[test]
+    fn one_structural_rejection_keeps_the_profile_structural_979() {
+        let rejected = vec![
+            Some("evaluator error: inner solve refused this trial point: h' <= 0".to_string()),
+            Some("evaluator error: block layout is over-parameterized".to_string()),
+        ];
+        let error = mode_profile_exhausted_error(&rejected, &[true, false]);
+        assert!(
+            !error.is_trial_point_infeasible(),
+            "a structural rejection must not be graded rho-local: {error}"
+        );
+        assert!(matches!(
+            error,
+            CustomFamilyError::UnsupportedConfiguration { .. }
+        ));
+    }
+
+    /// A candidate list with no recorded reason still has to produce a verdict,
+    /// and the type system forces a guess there. The guess is the one
+    /// `CustomFamilyError`'s own `From<String>` documents: trial point, because
+    /// grading a rho-local refusal structural aborts a fit that was fittable
+    /// one rho away, while the reverse only costs a bounded number of cheap
+    /// identical failures.
+    #[test]
+    fn a_reasonless_rejection_defaults_to_the_trial_point_verdict_979() {
+        let error = mode_profile_exhausted_error(&[None], &[true]);
+        assert!(error.is_trial_point_infeasible(), "{error}");
+        assert!(error.to_string().contains("no finite converged result"));
     }
 }

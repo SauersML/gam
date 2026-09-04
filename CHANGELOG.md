@@ -1,5 +1,7 @@
 ## Unreleased
 
+- A coefficient-mode profile whose candidates all refused the trial point now reports a trial-point refusal instead of `UnsupportedConfiguration`, so the outer search steps away instead of aborting the fit. On the large-scale CTN preprocessor a single `h' has non-positive values` refusal killed a 25-minute fit that already had a certified incumbent; one structural rejection among the candidates still keeps the whole profile structural (#979, #2553, #2590).
+
 - `Cargo.lock` resolves `numpy` against the workspace's own `ndarray 0.17.2` again: a re-resolution had flipped that one edge to `ndarray 0.16.1`, which left `gam-pyffi` with 945 compile errors (every `into_pyarray` / `from_owned_array` at the Python boundary) because the two crates no longer shared an `ArrayBase` type. No gate job builds the FFI crate, so nothing caught it (#2670).
 
 - The `SLS-ROW-VGH-932` speed cell's hand opponent gates each term on the term's coefficient stack, as production does, instead of on the row weight. The two predicates differ on a censored far-tail row whose stack is exactly zero while its weight is not, where the weight-gated schedule forms `0 * inf` and returns `NaN` in two gradient axes that production and the generic tower both return finite — so the opponent was cheaper by the guard it was missing. Against the corrected opponent production wins by ~9 % where it won by ~2 %, and `the_hand_carries_productions_activity_contract_932` pins the contract on that row (#932).
