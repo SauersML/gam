@@ -4180,19 +4180,10 @@ mod tests {
         assert!(MechanismSparsityJacobian::new(1.0, 0.0).is_err());
     }
 
-    /// Build a `(n, d)` `(mean, scale)` pair whose stacked signature
-    /// `[μ ‖ log σ]` has full rank `2d` (so it satisfies the Khemakhem
-    /// Theorem 1 precondition baked into `ConditionalPriorIvae::new`).
-    ///
-    /// Each per-column function is given a distinct *frequency* (not a
-    /// shared frequency with a column-dependent phase) so the resulting
-    /// `2d` columns are genuinely linearly independent. `sin(ω·t + φ)`
-    /// with a shared `ω` lives in the 2-dimensional span of `{sin(ω t),
-    /// cos(ω t)}`, so the earlier `sin(0.7t + 0.3c)` / `cos(0.5t + 0.9c)`
-    /// fixture only ever produced rank `≤ 4`, no matter how many `d`
-    /// columns it built. Distinct frequencies push each column into its
-    /// own subspace, so for `n ≥ 2d + 1` the SVD of `[μ ‖ log σ]` has
-    /// `2d` non-trivial singular values.
+    /// Build varying Gaussian means and scales for the iVAE tests. The
+    /// constructor checks the rank of baseline differences in the natural
+    /// parameters `[μ/σ² ‖ −1/(2σ²)]`; the rank of `[μ ‖ log σ]` alone does
+    /// not establish that precondition.
     fn ivae_precondition_pair(n: usize, d: usize) -> (Array2<f64>, Array2<f64>) {
         assert!(n >= 2 * d + 1, "need at least 2d+1 rows");
         let mut mean = Array2::<f64>::zeros((n, d));
@@ -4308,7 +4299,8 @@ mod tests {
         let scale = Array2::<f64>::from_elem((n, d), 1.5);
         let err = ConditionalPriorIvae::new(mean, scale, 1.0).unwrap_err();
         assert!(
-            err.contains("trivial unconditional") && err.contains("Khemakhem"),
+            err.contains("numerical rank 0 < 2·latent_dim = 6")
+                && err.contains("baseline differences of Gaussian natural parameters"),
             "unexpected error: {err}"
         );
     }
@@ -4329,9 +4321,8 @@ mod tests {
     #[test]
     fn conditional_prior_ivae_rejects_rank_deficient_signature() {
         // Enough rows (n = 9 ≥ 2·3+1 = 7) and rows are NOT all identical,
-        // but the stacked [μ ‖ log σ] matrix lies in a strict subspace of
-        // ℝ^{2d}: column 0 of μ equals column 0 of log σ, and columns 1,2
-        // of both μ and σ are zero / one. So the signature has rank 1, far
+        // but only coordinate 0 varies. Baseline differences of the natural
+        // parameters have at most two nonzero columns, hence rank at most 2,
         // below the required 2·3 = 6.
         let n = 9;
         let d = 3;
