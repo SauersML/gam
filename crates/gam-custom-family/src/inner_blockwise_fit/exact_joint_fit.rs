@@ -79,6 +79,86 @@ fn clear_stall_evidence_collected_under_the_previous_model(
     geometric_tail_history.clear();
 }
 
+/// The block whose penalty is too weak to close the direction the last
+/// accepted step was descending, and the strength at which it would close it
+/// (gam#2695).
+///
+/// Along `δ = β_new − β_old` the likelihood slopes down by `∇(−ℓ)·δ < 0` while
+/// block `b`'s penalty slopes up by only `(λ_b S_b β)·δ > 0`; the penalized
+/// objective is stationary along `δ` when that block's strength is multiplied
+/// by `r_b = −(∇(−ℓ)·δ) / ((λ_b S_b β)·δ)`, so the outer can read `ln r_b` as
+/// the restoration of an under-penalized seed rather than as a failed seed.
+/// The block needing the largest raise is the binding one and is the one
+/// reported.
+///
+/// `None` when the shapes do not line up, or when no block both resists the
+/// step and needs a strictly larger strength — an unpenalized ray, which no ρ
+/// closes.
+///
+/// This is ONE owner deliberately: the quantity is a property of the accepted
+/// step, not of the exit that noticed it, and computing it at only one of the
+/// three non-converged exits is what left the #2695 seeds refusing "as
+/// evaluated" when they were merely under-penalized.
+fn descending_ray_restoration(
+    old_beta: &[Array1<f64>],
+    states: &[ParameterBlockState],
+    grad_joint: &Array1<f64>,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    specs: &[ParameterBlockSpec],
+    joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
+    total_p: usize,
+) -> Option<gam_problem::RayRestoration> {
+    let beta_old_joint = Array1::from_iter(old_beta.iter().flat_map(|b| b.iter().copied()));
+    let beta_new_joint = Array1::from_iter(states.iter().flat_map(|s| s.beta.iter().copied()));
+    if beta_old_joint.len() != total_p
+        || beta_new_joint.len() != total_p
+        || grad_joint.len() != total_p
+    {
+        return None;
+    }
+    let delta = &beta_new_joint - &beta_old_joint;
+    let s_beta =
+        apply_joint_block_penalty(ranges, s_lambdas, &beta_old_joint, 0.0, joint_bundle);
+    let mut best: Option<gam_problem::RayRestoration> = None;
+    let mut rho_offset = 0usize;
+    for (block, &(start, end)) in ranges.iter().enumerate() {
+        let n_pen = specs.get(block).map_or(0, |spec| spec.penalties.len());
+        let rho_first = rho_offset;
+        rho_offset += n_pen;
+        let likelihood_slope: f64 = (start..end).map(|i| -grad_joint[i] * delta[i]).sum();
+        let penalty_slope: f64 = (start..end).map(|i| s_beta[i] * delta[i]).sum();
+        let block_step_inf = delta
+            .slice(ndarray::s![start..end])
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        if n_pen == 0 || !(penalty_slope > 0.0) || !(likelihood_slope < 0.0) {
+            continue;
+        }
+        let ratio = -likelihood_slope / penalty_slope;
+        if !(ratio.is_finite() && ratio > 1.0) {
+            continue;
+        }
+        let candidate = gam_problem::RayRestoration {
+            block,
+            rho_first,
+            rho_count: n_pen,
+            log_strength_ratio: ratio.ln(),
+            likelihood_slope,
+            penalty_slope,
+            block_step_inf,
+        };
+        if best
+            .as_ref()
+            .is_none_or(|c| candidate.log_strength_ratio > c.log_strength_ratio)
+        {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
 pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
     context: ExactJointFitContext<'_, F>,
 ) -> Result<BlockwiseInnerResult, CustomFamilyError> {
@@ -5967,6 +6047,34 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 last_joint_math.as_ref(),
             );
             last_kkt_refusal_report = Some(report);
+            // gam#2695 — this exit is where the 1569 pair's seeds 0-3 leave,
+            // with every step accepted at a good model ratio, the objective
+            // still falling and the block residual growing: a descending ray,
+            // which the outer restores rather than discards. The ray was
+            // computed only at the slow-rate exit below, so those seeds were
+            // refused "as evaluated" and the next seed started cold.
+            if let Some(ray) = descending_ray_restoration(
+                &old_beta,
+                &states,
+                &grad_joint,
+                &ranges,
+                &s_lambdas,
+                specs,
+                joint_bundle,
+                total_p,
+            ) && let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
+                termination_reason,
+                ..
+            }) = terminal_convergence_state.as_mut()
+            {
+                *termination_reason =
+                    gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay {
+                        residual,
+                        residual_tol,
+                        cycles: cycles_done,
+                        ray,
+                    };
+            }
             converged = false;
             break;
         }
@@ -6062,6 +6170,31 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 inner_max_cycles,
             );
             cycles_done = cycle + 1;
+            // The same reading as the divergence exit above (gam#2695): a flat
+            // residual whose accepted steps still descend an unclosed ray is
+            // an under-penalized seed, not a failed one.
+            if let Some(ray) = descending_ray_restoration(
+                &old_beta,
+                &states,
+                &grad_joint,
+                &ranges,
+                &s_lambdas,
+                specs,
+                joint_bundle,
+                total_p,
+            ) && let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
+                termination_reason,
+                ..
+            }) = terminal_convergence_state.as_mut()
+            {
+                *termination_reason =
+                    gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay {
+                        residual,
+                        residual_tol,
+                        cycles: cycles_done,
+                        ray,
+                    };
+            }
             converged = false;
             break;
         }
@@ -6160,64 +6293,16 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // `δ` at `r_b = −(∇(−ℓ)·δ) / ((λ_b S_b β)·δ)` times the block's
                 // strength. The outer reads `ln r_b` as the restoration of an
                 // under-penalized seed rather than as a failed seed.
-                let ray = {
-                    let beta_old_joint = Array1::from_iter(old_beta.iter().flat_map(|b| b.iter().copied()));
-                    let beta_new_joint =
-                        Array1::from_iter(states.iter().flat_map(|s| s.beta.iter().copied()));
-                    if beta_old_joint.len() == total_p
-                        && beta_new_joint.len() == total_p
-                        && grad_joint.len() == total_p
-                    {
-                        let delta = &beta_new_joint - &beta_old_joint;
-                        let s_beta = apply_joint_block_penalty(
-                            &ranges,
-                            &s_lambdas,
-                            &beta_old_joint,
-                            0.0,
-                            joint_bundle,
-                        );
-                        let mut best: Option<gam_problem::RayRestoration> = None;
-                        let mut rho_offset = 0usize;
-                        for (block, &(start, end)) in ranges.iter().enumerate() {
-                            let n_pen = specs.get(block).map_or(0, |spec| spec.penalties.len());
-                            let rho_first = rho_offset;
-                            rho_offset += n_pen;
-                            let likelihood_slope: f64 =
-                                (start..end).map(|i| -grad_joint[i] * delta[i]).sum();
-                            let penalty_slope: f64 = (start..end).map(|i| s_beta[i] * delta[i]).sum();
-                            let block_step_inf = delta
-                                .slice(ndarray::s![start..end])
-                                .iter()
-                                .map(|v| v.abs())
-                                .fold(0.0_f64, f64::max);
-                            if n_pen == 0 || !(penalty_slope > 0.0) || !(likelihood_slope < 0.0) {
-                                continue;
-                            }
-                            let ratio = -likelihood_slope / penalty_slope;
-                            if !(ratio.is_finite() && ratio > 1.0) {
-                                continue;
-                            }
-                            let candidate = gam_problem::RayRestoration {
-                                block,
-                                rho_first,
-                                rho_count: n_pen,
-                                log_strength_ratio: ratio.ln(),
-                                likelihood_slope,
-                                penalty_slope,
-                                block_step_inf,
-                            };
-                            if best
-                                .as_ref()
-                                .is_none_or(|c| candidate.log_strength_ratio > c.log_strength_ratio)
-                            {
-                                best = Some(candidate);
-                            }
-                        }
-                        best
-                    } else {
-                        None
-                    }
-                };
+                let ray = descending_ray_restoration(
+                    &old_beta,
+                    &states,
+                    &grad_joint,
+                    &ranges,
+                    &s_lambdas,
+                    specs,
+                    joint_bundle,
+                    total_p,
+                );
                 if let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
                     termination_reason,
                     ..

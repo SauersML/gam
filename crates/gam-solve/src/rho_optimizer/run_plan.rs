@@ -95,14 +95,19 @@ fn ray_restoration_in(err: &EstimationError) -> Option<&gam_problem::RayRestorat
         EstimationError::CustomFamily(gam_problem::CustomFamilyError::InnerSolveNotConverged {
             terminal:
                 Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
-                    termination_reason:
-                        gam_problem::JointNewtonTerminalReason::SlowGeometricRate {
-                            ray: Some(ray), ..
-                        },
+                    termination_reason,
                     ..
                 }),
             ..
-        }) => Some(ray),
+        }) => match termination_reason {
+            // A ray is a property of the accepted step, so every terminal
+            // reason that can carry one is read here (gam#2695): the
+            // slow-rate exit, and the residual-stall / divergence exits that
+            // used to drop it.
+            gam_problem::JointNewtonTerminalReason::SlowGeometricRate { ray, .. } => ray.as_ref(),
+            gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay { ray, .. } => Some(ray),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -3709,6 +3714,10 @@ pub(crate) fn run_outer_with_plan(
         }
     })
 }
+
+#[cfg(test)]
+#[path = "zz_ray_restoration_reasons_2695_tests.rs"]
+mod zz_ray_restoration_reasons_2695_tests;
 
 #[cfg(test)]
 #[path = "run_plan_tests.rs"]

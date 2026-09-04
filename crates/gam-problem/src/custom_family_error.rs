@@ -36,6 +36,25 @@ pub enum JointNewtonTerminalReason {
         /// the accepted step (an unpenalized ray, which no ρ can close).
         ray: Option<RayRestoration>,
     },
+    /// The solve left on a residual-stall or divergence guard while its last
+    /// accepted step was still descending a direction no block's penalty
+    /// closes (gam#2695).
+    ///
+    /// Read exactly like [`Self::SlowGeometricRate`]'s `ray`: the seed is
+    /// under-penalized, not failed, and the outer restores it rather than
+    /// discarding it. It is a SEPARATE reason because these exits certify
+    /// nothing about a rate — the residual was flat or growing, not
+    /// contracting slowly — and reporting them as a slow rate would claim a
+    /// contraction that was not measured. On the #2695 1569 pair seeds 0-3
+    /// leave here (`early-exit non-converged (divergence/stall guard)`) with
+    /// every step accepted at a good model ratio, the objective still falling
+    /// and `‖β‖∞` still growing, which is the ray this names.
+    StalledOnDescendingRay {
+        residual: f64,
+        residual_tol: f64,
+        cycles: usize,
+        ray: RayRestoration,
+    },
 }
 
 /// The block-level reading of a ray the joint Newton was descending when it
@@ -150,6 +169,18 @@ impl std::fmt::Display for JointNewtonTerminalReason {
                     ),
                 }
             }
+            Self::StalledOnDescendingRay {
+                residual,
+                residual_tol,
+                cycles,
+                ray,
+            } => write!(
+                f,
+                "residual {residual:.6e} stalled or grew against {residual_tol:.6e} over \
+                 {cycles} cycles while the accepted steps kept descending a direction with no \
+                 finite minimizer in reach, so the seed is under-penalized rather than \
+                 failed; {ray}"
+            ),
         }
     }
 }
