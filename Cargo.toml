@@ -337,6 +337,13 @@ codegen-units = 16
 [profile.test.package.gam-solve]
 codegen-units = 16
 
+# A named package override also reaches its build script, ahead of Cargo's
+# unoptimized build-script default. The root scanner took 104.76s unoptimized
+# versus 55.50s at opt-level 2 on the same MSI source, with identical directive
+# and diagnostic output. The test library already uses opt-level 2 above.
+[profile.test.package.gam]
+opt-level = 2
+
 # Dev/`maturin develop` profile — same rationale as [profile.test]. Cargo's
 # default dev profile emits full DWARF (`debug = 2`), which is what lets
 # `target/` balloon to ~30 GB (the dep + crate object files carry the bulk of
