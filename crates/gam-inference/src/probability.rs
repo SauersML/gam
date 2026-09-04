@@ -713,8 +713,9 @@ fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
         // for an exact zero in its recurrence (Numerical Recipes §6.2). It is a
         // component of the algorithm, not a floor on a result: any value below
         // the smallest normal quotient works and the converged fraction does not
-        // depend on it.
-        const LENTZ_TINY: f64 = 1e-300;
+        // depend on it, so it is the arithmetic's own smallest normal, not a
+        // chosen magnitude (#2469).
+        const LENTZ_TINY: f64 = f64::MIN_POSITIVE;
         let mut b = x + 1.0 - a;
         let mut c = 1.0 / LENTZ_TINY;
         let mut d = 1.0 / b;

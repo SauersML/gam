@@ -2158,11 +2158,15 @@ pub(super) fn ensure_finite_fourth_full_cache_row(
     }
 }
 
+/// Derivatives of `√x` through 4th order, for `x ≥ 0`. At `x = 0` every
+/// derivative is infinite and that is what is returned; a negative `x` yields
+/// `NaN`. Neither is clamped: a floor fabricated finite derivatives of a
+/// function nobody evaluated (#2469).
 pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
     // One reciprocal: with `s = √x`, `1/x = r²` for `r = 1/s`, so every
     // derivative is a power of `r` times a constant (the pre-#932 hand chain
     // divided four times).
-    let s = x.max(1e-300).sqrt();
+    let s = x.sqrt();
     let r = 1.0 / s;
     let r2 = r * r;
     let r3 = r2 * r;
@@ -2180,15 +2184,14 @@ pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
 /// as its own leaf keeps the row program division-free, which is what the
 /// `row_program!` SSA vocabulary supports.
 ///
-/// The `max(1e-300)` floor mirrors [`unary_derivatives_sqrt`]: the argument is
+/// Like [`unary_derivatives_sqrt`] this does not clamp: the argument is
 /// `1 + s²·V ≥ 1` on every reachable path (`V = gᵀΣg ≥ 0` by the covariance
-/// admission check), so the floor is unreachable in production and exists only
-/// so a corrupted argument yields a finite value rather than an ∞/NaN cascade
-/// with no provenance.
+/// admission check), and a corrupted argument yields the honest IEEE result
+/// (`∞`/`NaN`) rather than the derivatives of a fabricated floor (#2469).
 pub(crate) fn unary_derivatives_inverse_sqrt(x: f64) -> [f64; 5] {
     // One reciprocal: `1/x = r²` for `r = 1/√x`, so the stack is odd powers
     // of `r` (the previous body divided five times).
-    let s = x.max(1e-300).sqrt();
+    let s = x.sqrt();
     let r = 1.0 / s;
     let r2 = r * r;
     let r3 = r2 * r;

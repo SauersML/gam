@@ -25,12 +25,24 @@ pub(crate) fn sas_log_delta_edge_barriercostgrad(raw_log_delta: f64) -> (f64, f6
         return (0.0, 0.0);
     }
     let b = sas_log_delta_bound().max(f64::EPSILON);
-    let t = (raw_log_delta / b).tanh();
-    let one_minus_t2 = (1.0 - t * t).max(1e-12);
-    let cost = -w * one_minus_t2.ln();
+    let u = raw_log_delta / b;
+    let t = u.tanh();
+    // `−w·ln(1 − t²) = 2w·ln cosh u`, in the form that never forms `1 − t²`
+    // (see `ln_cosh`); the former `(1 − t²).max(1e-12)` capped the barrier at
+    // `27.6·w` once `tanh` had rounded to `±1` (#2469).
+    let cost = 2.0 * w * ln_cosh(u);
     // d/draw[-w log(1-t^2)] = (2w/B) * t.
     let grad = (2.0 * w / b) * t;
     (cost, grad)
+}
+
+/// `ln cosh u` without forming `cosh u` (overflows past `|u| ≈ 710`) or
+/// `1 − tanh²u` (cancels to exactly zero past `|u| ≈ 19`):
+/// `ln cosh u = |u| + ln(1 + e^{−2|u|}) − ln 2`, exact for every finite `u`.
+#[inline]
+fn ln_cosh(u: f64) -> f64 {
+    let a = u.abs();
+    a + (-2.0 * a).exp().ln_1p() - std::f64::consts::LN_2
 }
 
 #[inline]
@@ -64,10 +76,14 @@ pub(crate) fn sas_log_delta_edge_barriercostgradhess(raw_log_delta: f64) -> (f64
         return (0.0, 0.0, 0.0);
     }
     let b = sas_log_delta_bound().max(f64::EPSILON);
-    let t = (raw_log_delta / b).tanh();
-    let one_minus_t2 = (1.0 - t * t).max(1e-12);
-    let cost = -w * one_minus_t2.ln();
+    let u = raw_log_delta / b;
+    let t = u.tanh();
+    let ln_cosh_u = ln_cosh(u);
+    let cost = 2.0 * w * ln_cosh_u;
     let grad = (2.0 * w / b) * t;
+    // `1 − t² = sech²u = e^{−2·ln cosh u}`: underflows to an honest zero far
+    // past the bound instead of being floored.
+    let one_minus_t2 = (-2.0 * ln_cosh_u).exp();
     let hess = (2.0 * w / (b * b)) * one_minus_t2;
     (cost, grad, hess)
 }
