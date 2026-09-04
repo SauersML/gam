@@ -7978,8 +7978,8 @@ fn predict_encoded_table_jackknife_plus_impl(
 /// λ̂ was selected from all training responses, the frozen-λ score construction
 /// is not permutation symmetric in the n+1 augmented points, so the
 /// distribution-free finite-sample coverage theorem applies only where the
-/// per-row frozen-ρ certificate accepts (`frozen_rho_certified` = 1.0, under
-/// the global-ρ grid-Lipschitz assumption); a 0.0 row is the frozen-λ
+/// per-row frozen-ρ certificate accepts (`frozen_rho_certified` = 1.0, on the
+/// REML branch through the augmented optimum); a 0.0 row is the frozen-λ
 /// approximation with no finite-sample guarantee. The exact set is a union of
 /// intervals; the returned `mean_lower`/`mean_upper` are its outer envelope (a
 /// superset).
@@ -8093,7 +8093,7 @@ fn predict_encoded_table_full_conformal_impl(
             "full-conformal at frozen smoothing parameters (exact set given Sλ; the \
              distribution-free finite-sample ≥{:.0}% guarantee needs the symmetric \
              ρ-re-selecting fit and is certified per row only where \
-             frozen_rho_certified=1, under the global-ρ grid-Lipschitz assumption)",
+             frozen_rho_certified=1, on the REML branch through the augmented optimum)",
             conformal_level * 100.0
         )),
         covariance_source: None,
@@ -8110,8 +8110,8 @@ fn predict_encoded_table_full_conformal_impl(
 /// given the frozen `Sλ`; the distribution-free finite-sample
 /// ≥`conformal_level` marginal-coverage theorem additionally requires the
 /// symmetric ρ-re-selecting fit and is certified per row only where the
-/// returned `frozen_rho_certified` column is 1.0 (Layer-3 certificate, under
-/// the global-ρ grid-Lipschitz assumption). Returns the same column JSON as
+/// returned `frozen_rho_certified` column is 1.0 (Layer-3 certificate, on the
+/// REML branch through the augmented optimum). Returns the same column JSON as
 /// `predict_table` plus that certificate column.
 ///
 /// Raises a descriptive Python exception for ineligible models (non-Gaussian,

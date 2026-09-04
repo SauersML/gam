@@ -53,9 +53,9 @@
 //! - **Layer 3 (the research core, contract below):** the smoothing
 //!   response dρ̂/dz through the exact outer IFT — the first full-conformal
 //!   procedure that re-selects smoothing per candidate — plus the
-//!   **frozen-ρ certificate**: a per-dataset computable bound that can
-//!   conditionally accept (or refuse) freezing ρ̂, with the rho-excursion
-//!   step explicitly reported as a grid-checked Lipschitz assumption.
+//!   **frozen-ρ certificate**: an exact per-dataset bound that accepts or
+//!   refuses freezing ρ̂ — the ρ-excursion is bounded on the REML branch
+//!   through the augmented optimum by a closed-form wall test, not sampled.
 //!
 //! # Layer 1 math (what the code below implements)
 //!
@@ -175,7 +175,7 @@
 //! comparison that decides the set's boundary intervals — `min over
 //! deciding pairs |e_i(z) − e_*(z)|` at the Layer-1 breakpoints, with
 //! critical ties contributing zero — then the frozen-ρ set equals the
-//! honest set under that grid-checked Lipschitz assumption. When the check
+//! honest set on the REML branch through the augmented optimum. When the check
 //! fails, the procedure says so and runs Layer 3 instead of silently
 //! returning an unchecked set.
 //!
@@ -730,10 +730,12 @@ pub struct DiscreteFullConformalSet {
 }
 
 /// Layer-3 verdict for the frozen-ρ shortcut. Produced by comparing the
-/// grid-checked ρ-excursion bound against the exact engine's
-/// `boundary_margin` (see module doc). `Certified` is conditional on the
-/// stated rho-grid Lipschitz assumption; `Refused` carries the two numbers
-/// so the caller can show exactly how far from acceptable the shortcut was.
+/// exact ρ-excursion bound (`L · E`, see
+/// [`GaussianRemlRhoResponse::certified_full_conformal`]) against the exact
+/// engine's `boundary_margin` (see module doc). `Certified` is conditional on
+/// the REML branch through the anchor being the branch the fit follows;
+/// `Refused` carries the two numbers so the caller can show exactly how far
+/// from acceptable the shortcut was.
 #[derive(Clone, Debug)]
 pub enum FrozenRhoCertificate {
     Certified {
@@ -762,6 +764,100 @@ impl FrozenRhoCertificate {
                 boundary_margin,
             }
         }
+    }
+}
+
+/// Wilkinson growth for the response's Cholesky-based solves — the operation
+/// count `eval` charges its gradient band at, shared with the stationarity
+/// quadratic so both bands are the same statement about the same arithmetic.
+fn response_solve_growth(p: usize) -> f64 {
+    gam_linalg::roundoff::accumulation_growth(2 * p * p * p + 8 * p * p + 8 * p)
+}
+
+/// `L⁻¹·B` for a lower-triangular `L`, by forward substitution.
+fn solve_lower_triangular(lower: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+    let p = lower.nrows();
+    let mut out = b.clone();
+    for col in 0..out.ncols() {
+        for i in 0..p {
+            let mut acc = out[[i, col]];
+            for k in 0..i {
+                acc -= lower[[i, k]] * out[[k, col]];
+            }
+            out[[i, col]] = acc / lower[[i, i]];
+        }
+    }
+    out
+}
+
+/// `L⁻ᵀ·B` for a lower-triangular `L`, by back substitution.
+fn solve_lower_triangular_transposed(lower: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+    let p = lower.nrows();
+    let mut out = b.clone();
+    for col in 0..out.ncols() {
+        for i in (0..p).rev() {
+            let mut acc = out[[i, col]];
+            for k in (i + 1)..p {
+                acc -= lower[[k, i]] * out[[k, col]];
+            }
+            out[[i, col]] = acc / lower[[i, i]];
+        }
+    }
+    out
+}
+
+/// `Q(z) = q₀ + q₁z + q₂z²`, the stationarity condition of the augmented REML
+/// criterion at one `ρ` (see
+/// [`GaussianRemlRhoResponse::stationarity_quadratic_in_z`]), with the
+/// rounding band its coefficients carry.
+#[derive(Clone, Debug)]
+struct StationarityQuadratic {
+    q: [f64; 3],
+    /// Absolute-summand magnitudes of each coefficient: the scale the rounding
+    /// band is charged against.
+    magnitude: [f64; 3],
+    growth: f64,
+}
+
+impl StationarityQuadratic {
+    fn value(&self, z: f64) -> f64 {
+        self.q[0] + self.q[1] * z + self.q[2] * z * z
+    }
+
+    /// The rounding band of `value(z)`: `γ·u·Σ_k |m_k·z^k|`.
+    fn band(&self, z: f64) -> f64 {
+        self.growth
+            * gam_linalg::roundoff::UNIT_ROUNDOFF
+            * (self.magnitude[0] + self.magnitude[1] * z.abs() + self.magnitude[2] * z * z)
+    }
+
+    /// Whether `Q` has no root on `[lo, hi]`, decided with clearance: `Some(true)`
+    /// when `Q` keeps one sign at both endpoints and at its interior vertex (if
+    /// any) by more than its rounding band, `Some(false)` when it provably
+    /// changes sign, `None` when a value sits inside its own band and the
+    /// question cannot be decided on this arithmetic.
+    fn has_no_root_in(&self, lo: f64, hi: f64) -> Option<bool> {
+        let mut points = vec![lo, hi];
+        if self.q[2] != 0.0 {
+            let vertex = -0.5 * self.q[1] / self.q[2];
+            if vertex.is_finite() && vertex > lo && vertex < hi {
+                points.push(vertex);
+            }
+        }
+        let mut sign = 0.0_f64;
+        for z in points {
+            let value = self.value(z);
+            if !value.is_finite() || value.abs() <= self.band(z) {
+                return None;
+            }
+            let this_sign = value.signum();
+            if sign == 0.0 {
+                sign = this_sign;
+            } else if this_sign != sign {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 }
 
@@ -860,6 +956,8 @@ struct RemlEval {
     mu_rho_train: Array1<f64>,
     /// `∂μ̂_*/∂ρ` at the test row.
     mu_rho_test: f64,
+    /// The penalized RSS `D` the criterion's `log D` term is taken of.
+    penalized_rss: f64,
 }
 
 /// The frozen-ρ full-conformal set with its Layer-3 certificate and the
@@ -868,23 +966,22 @@ struct RemlEval {
 pub struct CertifiedFullConformal {
     /// The cheap exact set built at the frozen `ρ̂₀` (original-data optimum).
     pub frozen_set: FullConformalSet,
-    /// Whether freezing ρ̂ is accepted under the reported rho-grid
-    /// Lipschitz assumption.
+    /// Whether freezing ρ̂ is accepted on the REML branch through the anchor
+    /// (see [`GaussianRemlRhoResponse::certified_full_conformal`]).
     pub certificate: FrozenRhoCertificate,
     /// `ρ̂₀ = log λ̂₀` selected by REML on the original (un-augmented) data.
     pub rho_frozen: f64,
-    /// Conditional bound on `sup_z |ρ̂(z) − ρ̂₀|` over the finite deciding
-    /// range. Zero with `rho_probe_count == 0` means no finite range was
-    /// probed.
+    /// The wall distance `E = margin / L`: when certified, an EXCLUSIVE upper
+    /// bound on `sup_z |ρ̂(z) − ρ̂₀|` over the finite deciding range; when refused,
+    /// the excursion the margin would have tolerated. Zero when no finite
+    /// deciding range exists; `+∞` when the fitted mean does not move with ρ.
     pub rho_excursion: f64,
-    /// `max_i (|∂μ̂_i/∂ρ| + |∂μ̂_*/∂ρ|)` — the score-gap Lipschitz constant in ρ.
+    /// `L ≥ sup_ρ max_i (|∂μ̂_i/∂ρ| + |∂μ̂_*/∂ρ|)` on the deciding range — the
+    /// score-gap Lipschitz constant in ρ, bounded for every ρ at once.
     pub score_rho_lipschitz: f64,
-    /// Number of equal-spaced rho-response probes used on the finite
-    /// deciding range. Zero means no finite probe range was available.
-    pub rho_probe_count: usize,
-    /// Largest observed `|dρ̂/dz|` on the rho-response probe grid. This is a
-    /// diagnostic, not a continuous supremum proof.
-    pub observed_sup_drho_dz: f64,
+    /// `ρ̂(z_mid)`, the re-selected strength at the deciding range's midpoint
+    /// that anchors the certified branch.
+    pub branch_anchor_rho: f64,
 }
 
 impl<'a> GaussianRemlRhoResponse<'a> {
@@ -1028,6 +1125,7 @@ impl<'a> GaussianRemlRhoResponse<'a> {
             cross,
             mu_rho_train,
             mu_rho_test,
+            penalized_rss: d,
         })
     }
 
@@ -1042,9 +1140,142 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         Ok(-ev.cross / ev.hess)
     }
 
-    /// Select ρ̂ by REML: a coarse value scan over `ρ ∈ [−25, 25]` to seed,
-    /// then safeguarded Newton on `G = 0`. Deterministic (no randomness, fixed
-    /// grid), so it qualifies as the symmetric fitting map's smoothing choice.
+    /// The stationarity condition `∂V/∂ρ = 0` at a fixed `ρ`, written as the
+    /// exact quadratic in the candidate response `z` whose roots it shares.
+    ///
+    /// With `A = XᵀX + x_*x_*ᵀ + λS` the augmented penalized coefficients are
+    /// affine in `z`, `β̂(z) = a + b·z`, so the penalty `pen(z) = λ·β̂ᵀSβ̂` and
+    /// the penalized RSS `D(z) = yᵀy + z² − c(z)ᵀβ̂(z)` are quadratics in `z`, and
+    /// `∂V/∂ρ = (n+1−M₀)·pen(z)/D(z) + λ·tr(A⁻¹S) − rank(S)` vanishes exactly
+    /// where `Q(z) = (n+1−M₀)·pen(z) + (λ·tr(A⁻¹S) − rank(S))·D(z)` does
+    /// (`D > 0` on a non-degenerate fit). The level set `{z : ρ̂(z) = ρ}` is
+    /// therefore the root set of a quadratic: whether the REML branch ever
+    /// reaches a given `ρ` on a `z`-interval is a closed-form question, not one
+    /// to sample.
+    fn stationarity_quadratic_in_z(&self, rho: f64) -> Result<StationarityQuadratic, String> {
+        let p = self.p;
+        let m0 = p - self.rank_s;
+        let n_eff = self.n + 1;
+        if n_eff <= m0 {
+            return Err(format!(
+                "gaussian reml response: degrees of freedom n_eff−M₀ = {n_eff}−{m0} ≤ 0; \
+                 REML criterion undefined"
+            ));
+        }
+        let coef = (n_eff - m0) as f64;
+        let lambda = gam_problem::checked_exp_log_strength(rho)
+            .map_err(|error| format!("gaussian REML conformal response: {error}"))?;
+        let mut a_mat = self.xtx.clone();
+        for i in 0..p {
+            for j in 0..p {
+                a_mat[[i, j]] += lambda * self.s[[i, j]] + self.x_star[i] * self.x_star[j];
+            }
+        }
+        let chol = a_mat
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("gaussian reml response: A(λ) not SPD: {e:?}"))?;
+        // β̂(z) = a + b·z.
+        let a = chol.solvevec(&self.xty);
+        let b = chol.solvevec(self.x_star);
+        let sa = self.s.dot(&a);
+        let sb = self.s.dot(&b);
+        // pen(z) = λ·(aᵀSa + 2·aᵀSb·z + bᵀSb·z²).
+        let pen = [lambda * a.dot(&sa), 2.0 * lambda * a.dot(&sb), lambda * b.dot(&sb)];
+        // D(z) = (yᵀy − c₀ᵀa) − (c₀ᵀb + x_*ᵀa)·z + (1 − x_*ᵀb)·z².
+        let rss = [
+            self.yty - self.xty.dot(&a),
+            -(self.xty.dot(&b) + self.x_star.dot(&a)),
+            1.0 - self.x_star.dot(&b),
+        ];
+        let z_mat = chol.solve_mat(self.s);
+        let tr_ainv_s: f64 = (0..p).map(|i| z_mat[[i, i]]).sum();
+        let g = lambda * tr_ainv_s - self.rank_s as f64;
+        let mut q = [0.0_f64; 3];
+        let mut magnitude = [0.0_f64; 3];
+        for k in 0..3 {
+            q[k] = coef * pen[k] + g * rss[k];
+            magnitude[k] = (coef * pen[k]).abs() + (g * rss[k]).abs();
+        }
+        Ok(StationarityQuadratic {
+            q,
+            magnitude,
+            growth: response_solve_growth(p),
+        })
+    }
+
+    /// A `ρ`-independent bound on the score-gap Lipschitz constant in `ρ` over
+    /// `z ∈ [z_lo, z_hi]`: `sup |∂μ̂_i/∂ρ| + |∂μ̂_*/∂ρ|` for every training row
+    /// `i`, taken over EVERY `ρ` at once.
+    ///
+    /// In the basis `V` that diagonalises the penalty against the augmented
+    /// Gram matrix (`VᵀMV = I`, `VᵀSV = diag(s)`, `M = XᵀX + x_*x_*ᵀ`),
+    /// `∂μ̂/∂ρ = −X_aug·V·diag(λs_k/(1+λs_k)²)·Vᵀ(c₀ + x_*·z)`. Each diagonal
+    /// entry is at most `¼` for every `λ` (its maximum, at `λs_k = 1`), and
+    /// `Vᵀ(c₀ + x_*·z)` is affine in `z`, so its magnitude on an interval is
+    /// attained at an endpoint. The triangle inequality over `k` then gives a
+    /// bound that holds on the whole `ρ` line — the previous sampled maximum of
+    /// `|∂μ̂/∂ρ|` at 65 probes was neither a supremum nor a bound.
+    fn score_rho_lipschitz_sup(&self, z_lo: f64, z_hi: f64) -> Result<f64, String> {
+        let p = self.p;
+        let mut m = self.xtx.clone();
+        for i in 0..p {
+            for j in 0..p {
+                m[[i, j]] += self.x_star[i] * self.x_star[j];
+            }
+        }
+        let chol = m.cholesky(Side::Lower).map_err(|e| {
+            format!("gaussian reml response: augmented Gram matrix not SPD: {e:?}")
+        })?;
+        let lower = chol.lower_triangular();
+        // C = L⁻¹ S L⁻ᵀ, symmetric in exact arithmetic; the average of C and Cᵀ
+        // removes the rounding asymmetry the two triangular solves leave.
+        let w = solve_lower_triangular(&lower, self.s);
+        let c_raw = solve_lower_triangular(&lower, &w.t().to_owned());
+        let mut c = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                c[[i, j]] = 0.5 * (c_raw[[i, j]] + c_raw[[j, i]]);
+            }
+        }
+        let (_, u) = c.eigh(Side::Lower).map_err(|e| {
+            format!("gaussian reml response: generalized penalty eigenproblem failed: {e:?}")
+        })?;
+        let v = solve_lower_triangular_transposed(&lower, &u);
+        let xv = self.x.dot(&v);
+        let xsv = v.t().dot(self.x_star);
+        let t0 = v.t().dot(&self.xty);
+        let t1 = &xsv;
+        let envelope: Vec<f64> = (0..p)
+            .map(|k| (t0[k] + t1[k] * z_lo).abs().max((t0[k] + t1[k] * z_hi).abs()))
+            .collect();
+        let mut worst_row = 0.0_f64;
+        for i in 0..self.n {
+            let row: f64 = (0..p).map(|k| xv[[i, k]].abs() * envelope[k]).sum();
+            worst_row = worst_row.max(row);
+        }
+        let test_row: f64 = (0..p).map(|k| xsv[k].abs() * envelope[k]).sum();
+        Ok(0.25 * (worst_row + test_row))
+    }
+
+    /// The penalized RSS `D(ρ, z)` of the augmented criterion (or the training
+    /// criterion for `z = None`): the quantity whose `log` the REML criterion
+    /// takes and the denominator the stationarity quadratic clears.
+    pub fn penalized_rss(&self, rho: f64, z: Option<f64>) -> Result<f64, String> {
+        Ok(self.eval(rho, z)?.penalized_rss)
+    }
+
+    /// `(∂μ̂_i/∂ρ)_i` over the training rows and `∂μ̂_*/∂ρ` at the test row, at
+    /// one `(ρ, z)`: the pointwise sensitivities the analytic Lipschitz bound
+    /// ([`Self::score_rho_lipschitz_sup`]) dominates for every `ρ` at once.
+    pub fn mean_sensitivity_to_rho(
+        &self,
+        rho: f64,
+        z: Option<f64>,
+    ) -> Result<(Array1<f64>, f64), String> {
+        let ev = self.eval(rho, z)?;
+        Ok((ev.mu_rho_train, ev.mu_rho_test))
+    }
+
     /// The REML-selected log smoothing strength for the training response
     /// with the test response set to `z` (or the training-only criterion for
     /// `None`), found by the workspace's outer engine: one ρ coordinate with
@@ -1160,9 +1391,9 @@ impl<'a> GaussianRemlRhoResponse<'a> {
 
         // Collect the finite deciding endpoints. If there are none (set is ℝ
         // or empty), the margin has already been computed analytically. With
-        // no finite range for the rho probes, accept only the score-independent
+        // no finite range for the ρ response, accept only the score-independent
         // case where no comparison is needed; otherwise refuse instead of
-        // pretending the unbounded rho excursion was checked.
+        // pretending the unbounded ρ excursion was checked.
         let mut endpoints: Vec<f64> = Vec::new();
         for itv in &frozen_set.intervals {
             for ep in [itv.lo, itv.hi] {
@@ -1186,57 +1417,70 @@ impl<'a> GaussianRemlRhoResponse<'a> {
                 rho_frozen: rho0,
                 rho_excursion: 0.0,
                 score_rho_lipschitz: 0.0,
-                rho_probe_count: 0,
-                observed_sup_drho_dz: 0.0,
+                branch_anchor_rho: rho0,
             });
         }
         endpoints.sort_by(|a, b| a.partial_cmp(b).expect("finite endpoints"));
         let z_lo = *endpoints.first().expect("non-empty");
         let z_hi = *endpoints.last().expect("non-empty");
 
-        // Probe grid spanning the deciding range; honest ρ̂(z) and dρ̂/dz at
-        // each probe. The ρ-excursion sup is bounded by the worst observed
-        // deviation plus the mean-value Lipschitz remainder over the range.
-        let probes = 64usize;
-        let mut max_dev = 0.0_f64;
-        let mut observed_sup_drho_dz = 0.0_f64;
-        let mut lip = 0.0_f64;
-        // Lipschitz at the frozen optimum (un-augmented sensitivities).
-        let ev0 = self.eval(rho0, None)?;
-        for i in 0..self.n {
-            lip = lip.max(ev0.mu_rho_train[i].abs() + ev0.mu_rho_test.abs());
-        }
-        for k in 0..=probes {
-            let z = z_lo + (z_hi - z_lo) * (k as f64) / (probes as f64);
-            let rho_z = self.select_rho(Some(z))?;
-            max_dev = max_dev.max((rho_z - rho0).abs());
-            if let Ok(d) = self.drho_dz(rho_z, z) {
-                observed_sup_drho_dz = observed_sup_drho_dz.max(d.abs());
+        // The certificate, exactly (#2469, #2670; it replaced a 65-probe grid
+        // whose sampled maximum of |dρ̂/dz| was reported as a supremum):
+        //
+        //  1. `L` bounds `|∂μ̂_i/∂ρ| + |∂μ̂_*/∂ρ|` for every row and EVERY ρ on
+        //     `z ∈ [z_lo, z_hi]` (`score_rho_lipschitz_sup`). A deciding score
+        //     gap therefore moves by less than the margin as long as the
+        //     re-selected strength stays within `E = margin / L` of `ρ̂₀`.
+        //  2. The set `{z : ρ̂(z) = ρ}` is the root set of a quadratic
+        //     (`stationarity_quadratic_in_z`). If that quadratic has no root on
+        //     `[z_lo, z_hi]` at `ρ̂₀ + E` and at `ρ̂₀ − E`, the REML branch never
+        //     reaches either wall on the deciding range.
+        //  3. The branch is anchored inside the walls at one `z` (its midpoint;
+        //     any point serves): a continuous branch that starts strictly inside
+        //     and never touches a wall stays strictly inside, so
+        //     `sup_z |ρ̂(z) − ρ̂₀| < E` and `L · sup < margin`.
+        //
+        // The engine confines every selected ρ̂ to `[−RHO_BOUND, RHO_BOUND]`, so a
+        // wall beyond that domain cannot be reached and needs no quadratic. What
+        // the certificate is conditional on is stated by its name: the branch of
+        // REML stationary points through the anchor. A second, disconnected REML
+        // minimum is outside every frozen-ρ argument, sampled or exact.
+        let margin = frozen_set.boundary_margin;
+        let lipschitz = self.score_rho_lipschitz_sup(z_lo, z_hi)?;
+        let excursion = if lipschitz > 0.0 { margin / lipschitz } else { f64::INFINITY };
+        let z_mid = 0.5 * (z_lo + z_hi);
+        let branch_anchor_rho = self.select_rho(Some(z_mid))?;
+        let anchor_inside = (branch_anchor_rho - rho0).abs() < excursion;
+        let wall_unreached = |wall: f64| -> Result<bool, String> {
+            if wall.abs() > gam_solve::estimate::RHO_BOUND {
+                return Ok(true);
             }
-            // Lipschitz also at the re-selected optimum (scores move with ρ).
-            let evz = self.eval(rho_z, Some(z))?;
-            for i in 0..self.n {
-                lip = lip.max(evz.mu_rho_train[i].abs() + evz.mu_rho_test.abs());
+            Ok(self.stationarity_quadratic_in_z(wall)?.has_no_root_in(z_lo, z_hi) == Some(true))
+        };
+        let walls_unreached = excursion.is_finite()
+            && wall_unreached(rho0 + excursion)?
+            && wall_unreached(rho0 - excursion)?;
+        let branch_stays_inside = anchor_inside && (excursion == f64::INFINITY || walls_unreached);
+        let score_perturbation_bound = if excursion.is_finite() { lipschitz * excursion } else { 0.0 };
+        let certificate = if margin > 0.0 && branch_stays_inside {
+            FrozenRhoCertificate::Certified {
+                score_perturbation_bound,
+                boundary_margin: margin,
             }
-        }
-        // Mean-value remainder under the explicit grid assumption: between
-        // probes ρ̂ can drift by at most the observed derivative maximum times
-        // the probe spacing, provided the continuous derivative supremum does
-        // not exceed the observed maximum beyond this allowance.
-        let spacing = (z_hi - z_lo) / (probes as f64);
-        let rho_excursion = max_dev + observed_sup_drho_dz * spacing;
-        let score_perturbation_bound = lip * rho_excursion;
-        let certificate =
-            FrozenRhoCertificate::decide(score_perturbation_bound, frozen_set.boundary_margin);
+        } else {
+            FrozenRhoCertificate::Refused {
+                score_perturbation_bound,
+                boundary_margin: margin,
+            }
+        };
 
         Ok(CertifiedFullConformal {
             frozen_set,
             certificate,
             rho_frozen: rho0,
-            rho_excursion,
-            score_rho_lipschitz: lip,
-            rho_probe_count: probes + 1,
-            observed_sup_drho_dz,
+            rho_excursion: excursion,
+            score_rho_lipschitz: lipschitz,
+            branch_anchor_rho,
         })
     }
 }
@@ -2818,6 +3062,58 @@ mod tests {
                 (analytic - fd).abs() <= 1e-3 + 5e-2 * analytic.abs(),
                 "dρ̂/dz IFT vs re-selection FD mismatch at z={z}: analytic={analytic} fd={fd}"
             );
+        }
+    }
+
+    /// The stationarity quadratic is `∂V/∂ρ · D` exactly: at any `(ρ, z)`,
+    /// `Q(z)` from the closed-form coefficients equals the gradient `eval`
+    /// reports times the penalized RSS it reports, to their shared rounding
+    /// band. The certificate's wall test rests on this identity.
+    #[test]
+    fn stationarity_quadratic_is_the_gradient_times_the_penalized_rss() {
+        let (x, y, s) = gauss_reml_fixture(45, 8);
+        let x_star = cosine_row(8, 0.42);
+        let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
+        for &rho in &[-3.0_f64, 0.0, 2.5] {
+            let q = resp.stationarity_quadratic_in_z(rho).expect("quadratic");
+            for &z in &[-1.2_f64, 0.15, 0.4, 0.75, 3.0] {
+                let ev = resp.eval(rho, Some(z)).expect("eval");
+                let rss = resp.penalized_rss(rho, Some(z)).expect("rss");
+                let from_eval = ev.grad * rss;
+                let allowance = q.band(z) + ev.grad_band * rss;
+                assert!(
+                    (q.value(z) - from_eval).abs() <= allowance,
+                    "Q(z) ≠ ∂V/∂ρ·D at rho={rho} z={z}: {} vs {} (band {allowance:.3e})",
+                    q.value(z),
+                    from_eval
+                );
+            }
+        }
+    }
+
+    /// The analytic Lipschitz bound dominates every sampled `|∂μ̂_i/∂ρ| +
+    /// |∂μ̂_*/∂ρ|` on the deciding range, at strengths far from the optimum in
+    /// both directions — the positive control that it is a bound, not another
+    /// sample.
+    #[test]
+    fn score_rho_lipschitz_sup_dominates_sampled_sensitivities() {
+        let (x, y, s) = gauss_reml_fixture(45, 8);
+        let x_star = cosine_row(8, 0.42);
+        let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
+        let (z_lo, z_hi) = (-2.0_f64, 3.0_f64);
+        let bound = resp.score_rho_lipschitz_sup(z_lo, z_hi).expect("lipschitz");
+        assert!(bound.is_finite() && bound > 0.0, "bound {bound}");
+        for &rho in &[-8.0_f64, -3.0, 0.0, 2.5, 8.0] {
+            for &z in &[z_lo, 0.5 * (z_lo + z_hi), z_hi] {
+                let (mu_rho_train, mu_rho_test) =
+                    resp.mean_sensitivity_to_rho(rho, Some(z)).expect("sensitivity");
+                let sampled =
+                    mu_rho_train.iter().map(|v| v.abs()).fold(0.0_f64, f64::max) + mu_rho_test.abs();
+                assert!(
+                    sampled <= bound,
+                    "sampled sensitivity {sampled} exceeds the analytic bound {bound} at rho={rho} z={z}"
+                );
+            }
         }
     }
 
