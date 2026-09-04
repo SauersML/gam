@@ -1,5 +1,7 @@
 ## Unreleased
 
+- The explicit-ψ Jeffreys derivatives read one prepared snapshot spectrum. The reduced-information eigendecomposition is a property of `(H_info, Z_J)` and the ambient trace weights of that plus one ψ axis, but the ψ-hyper gradient rebuilt both inside its coefficient-axis loop — `axes × (1 + p)` eigendecompositions of a single matrix per gradient evaluation — and the ψψ pair callbacks rebuilt them once per PAIR. `JointJeffreysPlan::explicit_param_derivative` and `JeffreysPsiWeightCache` prepare each once, lazily, so a term an evaluation never arms still never touches the spectrum (#979).
+
 - The dense-product GPU dispatch diagnostic keeps one ring per thread instead of one process-wide `Mutex<VecDeque>`. Every `fast_ab` in the workspace passes through that seam, so on the #979 rigid marginal-slope arm at 16 threads a frame-pointer profile spent 19.5 % of the run inside `record` and 14.8 % in `lock_contended` beneath it, against 4.2 % in the Hessian accumulation it was observing; the arm's 40-minute wall carried 325 minutes of system time against 188 of user time. The recorded set is unchanged — every dispatch attempt, device-bound or not, and no ring is discarded when its thread ends (#979).
 
 - The process-wide Duchon radial profile cache stores its profiles in a static `OnceLock` array instead of leaking them, so the compile gate's ban scanner passes; a process may intern at most 64 distinct `(p, s, d)` shapes and the next one is refused rather than silently unbounded (#2670, #2735).

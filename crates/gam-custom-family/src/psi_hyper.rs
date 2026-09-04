@@ -226,6 +226,29 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     // is independent of this flag and stays folded.
     let jeffreys_info_depends_on_psi = family.joint_jeffreys_information_depends_on_psi();
 
+    // The reduced Jeffreys spectrum — `Z_Jᵀ H_info Z_J`, its eigendecomposition,
+    // the conditioning gate, the relative floor and the dominant/worst
+    // eigenvalue indices — is a property of the SNAPSHOT `(H_info, Z_J)` alone.
+    // It does not move with the ψ axis being differentiated, nor with the
+    // coefficient axis of a mixed derivative. gam#979: every explicit-ψ Jeffreys
+    // derivative below used to rebuild it from scratch, so one outer gradient
+    // paid `axes × coefficients` eigendecompositions of the reduced information
+    // for one distinct spectrum. Prepare it once here and hand the prepared plan
+    // to each derivative; the arithmetic each of them performs is unchanged.
+    let jeffreys_plan: Option<gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan> =
+        match jeffreys_hphi_ctx
+            .as_ref()
+            .filter(|_| jeffreys_info_depends_on_psi)
+        {
+            Some((z_j, h_joint)) => Some(
+                gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
+                    h_joint.view(),
+                    z_j.view(),
+                )?,
+            ),
+            None => None,
+        };
+
     // The explicit-ψ Jeffreys score and curvature use the SAME canonical
     // coefficient-axis derivatives {Hdot[e_a]}. Previously each ψ axis rebuilt
     // those p matrices once in the mixed-score loop and AGAIN while preparing
@@ -344,15 +367,8 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else {
                 None
             };
-        if let (Some((z_j, h_joint)), Some(pert_info)) =
-            (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
-        {
-            let phi_psi =
-                    gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_derivative(
-                        h_joint.view(),
-                        z_j.view(),
-                        pert_info,
-                    )?;
+        if let (Some(plan), Some(pert_info)) = (jeffreys_plan.as_ref(), firth_pert_info.as_ref()) {
+            let phi_psi = plan.explicit_param_derivative(pert_info)?;
             a -= phi_psi;
         }
         let mut g = &psi_terms.score_psi + &s_psi_beta;
@@ -390,9 +406,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else {
                 None
             };
-        if let (Some((z_j, h_joint)), Some(pert_info)) =
-            (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
-        {
+        if let (Some(plan), Some(pert_info)) = (jeffreys_plan.as_ref(), firth_pert_info.as_ref()) {
             if let (Some(base_axes), Some(pert_axes)) = (
                 jeffreys_base_axis_derivatives.as_ref(),
                 firth_pert_axis_derivatives.as_ref(),
@@ -404,17 +418,15 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                         pert_axes.len(),
                     )));
                 }
+                // The ambient trace weights depend on the snapshot spectrum and on
+                // `∂_ψH_info` — NOT on the coefficient axis. One preparation serves
+                // every axis; each axis pays only its own Frobenius contraction
+                // (gam#979: this preparation used to run once per coefficient axis).
+                let weights = plan.explicit_param_mixed_trace_weights(pert_info)?;
                 for (a_idx, (hdot_a, psi_hdot_a)) in
                     base_axes.iter().zip(pert_axes.iter()).enumerate()
                 {
-                    let phi_psi_beta_a =
-                            gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
-                                h_joint.view(),
-                                z_j.view(),
-                                pert_info,
-                                hdot_a,
-                                psi_hdot_a,
-                            )?;
+                    let phi_psi_beta_a = weights.contract(hdot_a, psi_hdot_a)?;
                     g[a_idx] -= phi_psi_beta_a;
                 }
             } else {
@@ -447,18 +459,18 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                     _ => None,
                 };
                 if let Some((hdots, psi_hdots)) = batched {
+                    let weights = plan.explicit_param_mixed_trace_weights(pert_info)?;
                     for a_idx in 0..total {
                         let phi_psi_beta_a =
-                                gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
-                                    h_joint.view(),
-                                    z_j.view(),
-                                    pert_info,
-                                    &hdots[a_idx],
-                                    &psi_hdots[a_idx],
-                                )?;
+                            weights.contract(&hdots[a_idx], &psi_hdots[a_idx])?;
                         g[a_idx] -= phi_psi_beta_a;
                     }
                 } else {
+                    // Prepared on the first axis the family actually serves, so an
+                    // evaluation where every axis declines behaves exactly as before.
+                    let mut weights: Option<
+                        gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysExplicitMixedTraceWeights,
+                    > = None;
                     for a_idx in 0..total {
                         let mut e_a = Array1::<f64>::zeros(total);
                         e_a[a_idx] = 1.0;
@@ -480,14 +492,13 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 total,
                             )?;
                         if let (Some(hdot_a), Some(psi_hdot_a)) = (hdot_a, psi_hdot_a) {
-                            let phi_psi_beta_a =
-                                gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
-                                    h_joint.view(),
-                                    z_j.view(),
-                                    pert_info,
-                                    &hdot_a,
-                                    &psi_hdot_a,
-                                )?;
+                            if weights.is_none() {
+                                weights =
+                                    Some(plan.explicit_param_mixed_trace_weights(pert_info)?);
+                            }
+                            let prepared =
+                                weights.as_ref().expect("weights prepared on this axis");
+                            let phi_psi_beta_a = prepared.contract(&hdot_a, &psi_hdot_a)?;
                             g[a_idx] -= phi_psi_beta_a;
                         }
                     }
@@ -634,6 +645,90 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// the inline construction in [`build_psi_hyper_coords`]. Returns `None` unless
 /// the family uses the joint-Jeffreys term and exposes a dense joint Hessian, so
 /// every non-Jeffreys / operator-only family is byte-unchanged.
+/// The snapshot Jeffreys spectrum together with the per-ψ-axis information
+/// derivatives `∂_{ψ_a}H_info|_β` and the ambient trace weights they induce.
+///
+/// The ψψ value second derivative `∂_{ψ_i}∂_{ψ_j}Φ` is `weights(ψ_i)` contracted
+/// with `(∂_{ψ_j}H_info, ∂_{ψ_i}∂_{ψ_j}H_info)`. Both the spectrum and the
+/// weights of a given first leg are fixed for the whole evaluation: the spectrum
+/// by `(H_info, Z_J)` and the weights additionally by `∂_{ψ_i}H_info`, none of
+/// which move with the second leg. gam#979: forming them inside the pair loop
+/// cost one reduced-information eigendecomposition per PAIR — `axes²` of them
+/// for one spectrum — which is what this cache removes. Each axis's weights are
+/// prepared on first use, so an evaluation that never reaches an axis keeps its
+/// exact previous outcome, including a stratum refusal it never provoked.
+pub struct JeffreysPsiWeightCache {
+    plan: gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan,
+    /// `∂_{ψ_a}H_info|_β` for every ψ axis, in layout order.
+    pub pert_first: Vec<Array2<f64>>,
+    weights: Vec<
+        std::sync::OnceLock<
+            gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysExplicitMixedTraceWeights,
+        >,
+    >,
+}
+
+impl JeffreysPsiWeightCache {
+    /// Prepare the snapshot spectrum once and retain the axis derivatives.
+    pub fn new(
+        z_j: &Array2<f64>,
+        h_joint: &Array2<f64>,
+        pert_first: Vec<Array2<f64>>,
+    ) -> Result<Self, CustomFamilyError> {
+        let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
+            h_joint.view(),
+            z_j.view(),
+        )?;
+        let weights = (0..pert_first.len())
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
+        Ok(Self {
+            plan,
+            pert_first,
+            weights,
+        })
+    }
+
+    /// Number of ψ axes the cache carries derivatives for.
+    #[must_use]
+    pub fn axes(&self) -> usize {
+        self.pert_first.len()
+    }
+
+    /// The ambient trace weights for first leg `axis`, prepared on first use.
+    ///
+    /// A concurrent first use recomputes rather than blocks; the result is a
+    /// pure function of the plan and the axis derivative, so either writer
+    /// stores the same weights.
+    pub fn weights_for_axis(
+        &self,
+        axis: usize,
+    ) -> Result<
+        &gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysExplicitMixedTraceWeights,
+        CustomFamilyError,
+    > {
+        let slot = self.weights.get(axis).ok_or_else(|| {
+            CustomFamilyError::trial_point(format!(
+                "Jeffreys ψ weight cache has {} axes, asked for axis {axis}",
+                self.weights.len()
+            ))
+        })?;
+        if let Some(prepared) = slot.get() {
+            return Ok(prepared);
+        }
+        let prepared = self
+            .plan
+            .explicit_param_mixed_trace_weights(&self.pert_first[axis])?;
+        if slot.set(prepared).is_err() {
+            // A concurrent first use stored the same weights first: they are a
+            // pure function of the plan and this axis's derivative, so whose
+            // copy the slot holds does not matter. Read the stored one.
+            debug_assert!(slot.get().is_some(), "a refused set means a filled slot");
+        }
+        Ok(slot.get().expect("weights stored for this axis"))
+    }
+}
+
 pub fn build_jeffreys_hphi_ctx<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     synced_states: &[ParameterBlockState],
@@ -768,7 +863,7 @@ pub fn build_contracted_psi_hook(
     // data-only — no penalty drift, matching the unpenalized Jeffreys info).
     // `None` (no Jeffreys term, or first-order terms unavailable) leaves a clean
     // / well-conditioned fit byte-unchanged.
-    let firth_ctx: Option<(Arc<Array2<f64>>, Arc<Array2<f64>>, Arc<Vec<Array2<f64>>>)> =
+    let firth_ctx: Option<Arc<JeffreysPsiWeightCache>> =
         match jeffreys_ctx {
             Some((z_j, h_joint))
                 if z_j.nrows() == total && h_joint.nrows() == total && h_joint.ncols() == total =>
@@ -808,7 +903,9 @@ pub fn build_contracted_psi_hook(
                             }
                         }
                         if ok {
-                            Some((Arc::new(z_j), Arc::new(h_joint), Arc::new(pert_first)))
+                            Some(Arc::new(JeffreysPsiWeightCache::new(
+                                &z_j, &h_joint, pert_first,
+                            )?))
                         } else {
                             None
                         }
@@ -857,7 +954,7 @@ pub fn build_contracted_psi_hook(
             // EXPLICIT Firth/Jeffreys ψψ VALUE second derivative (gam#1607):
             //   objective[i] -= ∂_{ψ_i}∂_{ψ(α)}Φ.
             // This applies to both design/penalty and family-owned axes.
-            if let Some((z_j, h_joint, pert_first)) = firth_ctx.as_ref() {
+            if let Some(jeffreys) = firth_ctx.as_ref() {
                 let pert_i_alpha = match &hessian[i] {
                     DriftDerivResult::Dense(m) => m.clone(),
                     DriftDerivResult::Operator(op) => op.mul_mat(&Array2::<f64>::eye(total)),
@@ -865,17 +962,12 @@ pub fn build_contracted_psi_hook(
                 let mut pert_alpha = Array2::<f64>::zeros((total, total));
                 for (j, &aj) in alpha_psi.iter().enumerate() {
                     if aj != 0.0 {
-                        pert_alpha.scaled_add(aj, &pert_first[j]);
+                        pert_alpha.scaled_add(aj, &jeffreys.pert_first[j]);
                     }
                 }
-                let phi_psi_psi =
-                    gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
-                        h_joint.view(),
-                        z_j.view(),
-                        &pert_first[i],
-                        &pert_alpha,
-                        &pert_i_alpha,
-                    )?;
+                let phi_psi_psi = jeffreys
+                    .weights_for_axis(i)?
+                    .contract(&pert_alpha, &pert_i_alpha)?;
                 objective[i] -= phi_psi_psi;
             }
 
@@ -1100,7 +1192,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     // `build_psi_hyper_coords` use. `None` (no Jeffreys term, or a first-order axis
     // term that can't be materialized total×total — matching the gradient term's own
     // availability gate) leaves a clean / well-conditioned fit byte-unchanged.
-    let firth_pair_ctx: Option<(Arc<Array2<f64>>, Arc<Array2<f64>>, Arc<Vec<Array2<f64>>>)> =
+    let firth_pair_ctx: Option<Arc<JeffreysPsiWeightCache>> =
         match jeffreys_ctx {
             Some((z_j, h_joint))
                 if z_j.nrows() == total && h_joint.nrows() == total && h_joint.ncols() == total =>
@@ -1165,7 +1257,9 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     }
                 }
                 if ok {
-                    Some((Arc::new(z_j), Arc::new(h_joint), Arc::new(pert_first)))
+                    Some(Arc::new(JeffreysPsiWeightCache::new(
+                        &z_j, &h_joint, pert_first,
+                    )?))
                 } else {
                     None
                 }
@@ -1345,9 +1439,9 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 // `0.0` when the conditioning gate skips the term, so a clean fit is
                 // byte-unchanged. Invalid shape/eigensystem evidence propagates through
                 // the pair callback together with workspace failures.
-                if let Some((z_j, h_joint, pert_first)) = firth_pair_ctx.as_ref()
-                    && psi_i < pert_first.len()
-                    && psi_j < pert_first.len()
+                if let Some(jeffreys) = firth_pair_ctx.as_ref()
+                    && psi_i < jeffreys.axes()
+                    && psi_j < jeffreys.axes()
                 {
                     let pert_ij_opt: Option<Array2<f64>> =
                         if b_mat.nrows() == total && b_mat.ncols() == total {
@@ -1358,19 +1452,18 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                                 .map(|op| op.mul_mat(&Array2::<f64>::eye(total)))
                         };
                     if let Some(pert_ij) = pert_ij_opt {
-                        let phi_psi_psi =
-                        gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
-                            h_joint.view(),
-                            z_j.view(),
-                            &pert_first[psi_i],
-                            &pert_first[psi_j],
-                            &pert_ij,
-                        )
-                        .map_err(|error| {
-                            format!(
-                                "typed hyper pair ({psi_i}, {psi_j}) Jeffreys second derivative failed: {error}"
-                            )
-                        })?;
+                        let phi_psi_psi = jeffreys
+                            .weights_for_axis(psi_i)
+                            .and_then(|weights| {
+                                weights
+                                    .contract(&jeffreys.pert_first[psi_j], &pert_ij)
+                                    .map_err(CustomFamilyError::from)
+                            })
+                            .map_err(|error| {
+                                format!(
+                                    "typed hyper pair ({psi_i}, {psi_j}) Jeffreys second derivative failed: {error}"
+                                )
+                            })?;
                         a -= phi_psi_psi;
                     }
                 }
