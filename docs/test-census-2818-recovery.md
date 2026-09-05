@@ -154,6 +154,20 @@ The canonicalization source on MSI differs only by four already-published
 identical. This integration run therefore supplies no execution evidence for
 those four separate unit tests.
 
+The publication's compile policy gate then caught an ignored callback state
+parameter that the member-crate integration build does not check. The fixture
+now validates the coefficient width whenever an operating point is supplied;
+the coefficient-independent row operator's explicit empty-beta request is
+also accepted. Both pins passed again: **2 passed, 0 failed, 0 ignored, 0
+filtered**, in 0.12 seconds after an 8.08-second warm build. The corrected source
+blob is `cd9b98dcd6ebd3232df6a373d0da3ca732c22e1b`; the log is
+`.buildd/identifiability-recovered-pins-width-2818.log`.
+The umbrella scanner, freshly compiled from `build.rs` blob
+`1e65d2a548b4722ff329321ff6fc8271d61180db`, also passed on that MSI worktree.
+Its source walk explicitly included the integration target. The separate
+tracked-file infrastructure and line-count checks still use the MSI index;
+the publication's CI gate supplies the exact committed-index verdict.
+
 The remaining historical inventory is still open. A successful source census,
 or the restoration of these few contracts, does not establish that all 303
 historically deleted pinned identities have been recovered or retired.

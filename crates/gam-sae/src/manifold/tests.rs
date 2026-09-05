@@ -2081,43 +2081,56 @@ pub(crate) fn threshold_gate_fixed_logit_third_derivative_is_zero_bug4() {
     // ThresholdGate mode with atom 1 UNGATED — a fixed/inert logit.
     term.assignment.mode = AssignmentMode::threshold_gate(1.0, 0.0);
     term.assignment.ungated = vec![false, true];
-    // Both atoms' logits well inside the optimization band (cutoff is −36), so a
-    // FREE logit genuinely carries a nonzero third derivative.
+    // Both atoms' logits well inside the optimization band (cutoff is −36) AND
+    // BELOW the threshold, so `1-2a > 0`: the PSD clamp #2520 put in `B` is
+    // inactive there and a FREE logit genuinely carries a nonzero third
+    // derivative on BOTH operators. Above the threshold the majorizer is a hard
+    // zero, so a fixture placed there would be asserting the fixed-logit mask on
+    // a channel that is identically zero for every logit, fixed or free.
     for row in 0..term.n_obs() {
-        term.assignment.logits[[row, 0]] = 0.5;
-        term.assignment.logits[[row, 1]] = 0.5;
+        term.assignment.logits[[row, 0]] = -0.5;
+        term.assignment.logits[[row, 1]] = -0.5;
     }
     assert!(
         term.assignment.logit_is_fixed(1) && !term.assignment.logit_is_fixed(0),
         "atom 1 must be fixed (ungated), atom 0 free"
     );
 
-    // FREE atom 0 inside the band ⇒ nonzero third derivative (fixture is live).
+    // The mask is a property of BOTH operators (#2520): `B` installs the clamped
+    // curvature and `A` the raw signed one, but a fixed logit's assembled `htt`
+    // entry is zeroed on each, so each one's theta-adjoint must be zero too.
     let threshold_strength = rho.lambda_sparse().unwrap();
-    let free = term.assignment_prior_hdiag_derivative_entry(
-        threshold_strength,
-        0,
-        0,
-        SaeLocalRowVar::Logit { atom: 0 },
-        None,
-    );
-    assert!(
-        free.abs() > 0.0,
-        "a FREE logit inside the band must carry a nonzero third derivative; got {free}"
-    );
+    for exact_a in [false, true] {
+        // FREE atom 0 inside the band => nonzero third derivative (live fixture).
+        let free = term.assignment_prior_hdiag_derivative_entry(
+            threshold_strength,
+            0,
+            0,
+            SaeLocalRowVar::Logit { atom: 0 },
+            None,
+            exact_a,
+        );
+        assert!(
+            free.abs() > 0.0,
+            "a FREE logit inside the band must carry a nonzero third derivative \
+             (exact_a={exact_a}); got {free}"
+        );
 
-    // FIXED atom 1 ⇒ the θ-adjoint third derivative MUST be exactly zero.
-    let fixed = term.assignment_prior_hdiag_derivative_entry(
-        threshold_strength,
-        0,
-        1,
-        SaeLocalRowVar::Logit { atom: 1 },
-        None,
-    );
-    assert_eq!(
-        fixed, 0.0,
-        "a FIXED (ungated) logit third derivative must be zero; got {fixed}"
-    );
+        // FIXED atom 1 => the theta-adjoint third derivative MUST be exactly zero.
+        let fixed = term.assignment_prior_hdiag_derivative_entry(
+            threshold_strength,
+            0,
+            1,
+            SaeLocalRowVar::Logit { atom: 1 },
+            None,
+            exact_a,
+        );
+        assert_eq!(
+            fixed, 0.0,
+            "a FIXED (ungated) logit third derivative must be zero \
+             (exact_a={exact_a}); got {fixed}"
+        );
+    }
 }
 
 /// #1026 — the per-atom **held-out EV attribution** that pairs with each
@@ -6553,4 +6566,3 @@ impl SaeBasisEvaluator for TestPeriodicEvaluator {
         Ok(periodic_basis(&coords.to_owned()))
     }
 }
-

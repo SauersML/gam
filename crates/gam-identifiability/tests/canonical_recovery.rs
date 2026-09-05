@@ -73,9 +73,18 @@ struct FixedTwoChannelJacobian {
 impl BlockEffectiveJacobian for FixedTwoChannelJacobian {
     fn effective_jacobian_rows(
         &self,
-        _state: &FamilyLinearizationState<'_>,
+        state: &FamilyLinearizationState<'_>,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, String> {
+        // The canonical row operator requests coefficient-independent Jacobians
+        // with an empty beta; operating-point audit calls supply actual beta.
+        if !state.beta.is_empty() && state.beta.len() != self.full.ncols() {
+            return Err(format!(
+                "fixture coefficient width {} differs from Jacobian width {}",
+                state.beta.len(),
+                self.full.ncols()
+            ));
+        }
         let end = rows.end.min(self.n);
         if rows.start > end {
             return Err("fixture row range is reversed or out of bounds".into());

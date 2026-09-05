@@ -1335,13 +1335,51 @@ fn smooth_threshold_hdiag_third_derivative_matches_central_difference_1415() {
     for row in 0..n {
         for atom in 0..k {
             let logit = logits[[row, atom]];
+            // The EXACT-`A` operator: `A` carries the raw signed curvature, so
+            // its theta-adjoint is `P'''` and this is #1415's original subject.
             let entry = term.assignment_prior_hdiag_derivative_entry(
                 sparsity,
                 row,
                 atom,
                 SaeLocalRowVar::Logit { atom },
                 None,
+                true,
             );
+            // The MAJORIZER `B` installs the PSD clamp of `P''` instead (#2520),
+            // so its theta-adjoint is a different function of the same logit, and
+            // the two must separate exactly where the clamp is active. No finite
+            // difference can adjudicate the clamped arm: the softplus seam is
+            // ~1e-8 wide in the dimensionless `1-2a`, five decades below the
+            // smallest step a f64 central difference can take here without noise
+            // swamping it. So it is pinned by the three facts that ARE exact.
+            let clamped = term.assignment_prior_hdiag_derivative_entry(
+                sparsity,
+                row,
+                atom,
+                SaeLocalRowVar::Logit { atom },
+                None,
+                false,
+            );
+            let a_here = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+            let signed = 1.0 - 2.0 * a_here;
+            if signed > 1.0e-4 {
+                // Clamp inactive: `B` IS `A` here, so must be their adjoints.
+                assert!(
+                    (clamped - entry).abs() <= 1.0e-12 * entry.abs().max(1.0),
+                    "row {row} atom {atom}: below the threshold the clamp is inactive, so                      the majorizer adjoint {clamped:e} must equal the exact {entry:e}"
+                );
+            } else if signed < -1.0e-4 {
+                // Clamp saturated: `B` carries a hard zero, so its adjoint is zero
+                // while the exact one is emphatically not.
+                assert_eq!(
+                    clamped, 0.0,
+                    "row {row} atom {atom}: above the threshold `B` installs a hard zero,                      so its theta-adjoint must be exactly zero; got {clamped:e}"
+                );
+                assert!(
+                    entry.abs() > 1.0e-6,
+                    "row {row} atom {atom}: the two operators must SEPARATE above the                      threshold, or this arm proves nothing; exact={entry:e}"
+                );
+            }
             // Independent oracle: 4th-order central difference of exact P''(ℓ).
             let h = 1.0e-3_f64;
             let fd = (-p2(logit + 2.0 * h) + 8.0 * p2(logit + h) - 8.0 * p2(logit - h)
@@ -1355,9 +1393,18 @@ fn smooth_threshold_hdiag_third_derivative_matches_central_difference_1415() {
 
             if (logit - threshold).abs() < 1e-12 {
                 saw_threshold = true;
-                // At ℓ=θ: a=1/2, s=1/4 ⇒ P'''=−λ/(8τ³); the old code gave 0.
+                // At the seam a=1/2, s=1/4, so the EXACT third derivative is
+                // -lambda/(8 tau^3); the pre-#1415 formula returned 0 there.
                 let expected = -sparsity / 8.0 * inv_tau * inv_tau * inv_tau;
                 assert_abs_diff_eq!(entry, expected, epsilon = 1e-9);
+                // And the clamped one is exactly HALF of it. At `signed = 0` the
+                // softplus contributes `C(0) = tau0*ln2` (negligible against the
+                // `2s*C'(0)` leg) and `C'(0) = 1/2`, so the seam value is the
+                // average of the hard clamp's two one-sided slopes -- which is
+                // precisely the C-1 property #2339's smoothing was derived for,
+                // and it is still strictly negative, so #1415's finding survives
+                // the majorization intact.
+                assert_abs_diff_eq!(clamped, 0.5 * expected, epsilon = 1e-9);
                 assert!(
                     entry < -1e-6,
                     "threshold third derivative must be strictly negative (old buggy \
