@@ -372,6 +372,7 @@ struct GaussianRemlBlocksProfile {
     xtwx: Array2<f64>,
     xtwy: Array1<f64>,
     nu: f64,
+    observation_measure: TermDerivs,
 }
 
 struct GaussianRemlBlocksProfileEval {
@@ -499,7 +500,8 @@ impl GaussianRemlBlocksProfile {
             * (self.nu
                 * (1.0 + (2.0 * std::f64::consts::PI * q / self.nu).ln())
                 + logdet_normal
-                - logdet_penalty);
+                - logdet_penalty)
+            + self.observation_measure.value;
         let mut gradient = Array1::<f64>::zeros(f_blocks);
         for block in 0..f_blocks {
             gradient[block] = 0.5
@@ -737,6 +739,7 @@ pub fn gaussian_reml_fit_blocks_exact(
     let profile = GaussianRemlBlocksProfile {
         domain,
         design,
+        observation_measure: gaussian_reml_observation_measure(weight.view(), 1),
         weights: weight,
         y: y_owned,
         xtwx,
@@ -920,6 +923,9 @@ pub struct GaussianRemlBackwardResult {
     pub grad_x: Array2<f64>,
     pub grad_y: Array2<f64>,
     pub grad_penalty: Array2<f64>,
+    /// Weight cotangent on the fixed positive-weight support. Excluded rows
+    /// have zero cotangent; activating one changes the likelihood's dimension
+    /// and is not a differentiable weight perturbation.
     pub grad_weights: Array1<f64>,
 }
 
@@ -999,6 +1005,9 @@ struct GaussianRemlPrepared {
     /// with weight `0` are excluded (see [`effective_observation_count`]).
     n_effective: usize,
     n_outputs: usize,
+    /// Observation-density measure, rebuilt from this fit's weights. It is not
+    /// a property of the reusable X'WX/penalty eigensystem.
+    observation_measure: TermDerivs,
 }
 
 #[derive(Clone, Copy)]
@@ -1051,6 +1060,54 @@ struct TermDerivs {
     /// same reason the derivatives are: a bound derived anywhere else is a
     /// guess about an expression nobody evaluated.
     roundoff: f64,
+}
+
+/// Density change from whitened residual coordinates back to the observed
+/// responses: `-D/2 log|W|` on the positive-weight support. Zero weights omit
+/// observations entirely, including their density measure and residual DoF.
+/// This term is constant in rho, but not in the observation weights. In
+/// particular, an unchanged X'WX does not make it reusable across fits.
+fn gaussian_reml_observation_measure(weights: ArrayView1<'_, f64>, n_outputs: usize) -> TermDerivs {
+    let mut logdet = 0.0;
+    let mut magnitude = 0.0;
+    let mut active = 0_usize;
+    for &weight in weights {
+        if weight > 0.0 {
+            let term = weight.ln();
+            logdet += term;
+            magnitude += term.abs();
+            active += 1;
+        }
+    }
+    let scale = -0.5 * n_outputs as f64;
+    TermDerivs {
+        value: scale * logdet,
+        grad: 0.0,
+        hess: 0.0,
+        roundoff: scale.abs()
+            * roundoff_growth(active.saturating_mul(2).saturating_add(2))
+            * magnitude,
+    }
+}
+
+/// Complete the weight VJP in the same observed-coordinate measure as the
+/// forward score, restricted to its fixed active support. There is no finite
+/// derivative through activation of an excluded observation: its logarithmic
+/// measure and the residual degrees of freedom both change at that boundary.
+fn finish_gaussian_reml_weight_vjp(
+    weights: ArrayView1<'_, f64>,
+    n_outputs: usize,
+    upstream_score: f64,
+    gradient: &mut Array1<f64>,
+) {
+    let scale = -0.5 * n_outputs as f64 * upstream_score;
+    for (&weight, value) in weights.iter().zip(gradient.iter_mut()) {
+        if weight > 0.0 {
+            *value += scale / weight;
+        } else {
+            *value = 0.0;
+        }
+    }
 }
 
 /// Boundary-stable kernels for one nonnegative affine mode
@@ -1514,14 +1571,16 @@ pub fn gaussian_reml_multi_shared_dispersion_closed_form(
         RHO_LOWER,
     )?;
     let eval = |rho: f64| {
-        evaluate_reml_profile(
+        let mut value = evaluate_reml_profile(
             &prepared.cache,
             pooled_ywy.view(),
             pooled_projected_rhs_squared.view(),
             d,
             shared_nu,
             rho,
-        )
+        );
+        value += prepared.observation_measure;
+        value
     };
     let rho = if prepared.cache.penalty_rank == 0 {
         init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER)
@@ -2525,7 +2584,8 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
         fitted,
         lambdas,
         log_lambdas: rhos,
-        reml_score: 0.5 * (d as f64) * logdet_term + 0.5 * scale_term,
+        reml_score: 0.5 * (d as f64) * logdet_term + 0.5 * scale_term
+            + gaussian_reml_observation_measure(weight.view(), d).value,
         edf,
     })
 }
@@ -2780,7 +2840,8 @@ pub fn gaussian_reml_free_b_score(
         edf += 1.0 / (1.0 + t);
     }
     let logdet_s = cache.logdet_penalty_positive + (cache.penalty_rank as f64) * log_lambda;
-    let mut reml_score = 0.5 * (d as f64) * (logdet_h - logdet_s);
+    let mut reml_score = 0.5 * (d as f64) * (logdet_h - logdet_s)
+        + gaussian_reml_observation_measure(weight.view(), d).value;
     let mut grad_log_lambda = 0.5 * (d as f64) * (trace_h - cache.penalty_rank as f64);
     let mut grad_coefficients = Array2::<f64>::zeros((p, d));
     let inverse_hessian = {
@@ -3092,6 +3153,7 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
             grad_penalty[[j, i]] = avg;
         }
     }
+    finish_gaussian_reml_weight_vjp(weight.view(), d, upstream_reml_score, &mut grad_weights);
     Ok(GaussianRemlBackwardResult {
         grad_x,
         grad_y,
@@ -4468,6 +4530,7 @@ fn prepare_gaussian_reml(
             projected_rhs,
             n_effective,
             n_outputs: d,
+            observation_measure: gaussian_reml_observation_measure(weight.view(), d),
         });
     }
 
@@ -4488,6 +4551,7 @@ fn prepare_gaussian_reml(
         projected_rhs,
         n_effective,
         n_outputs: d,
+        observation_measure: gaussian_reml_observation_measure(weight.view(), d),
     })
 }
 
@@ -4497,14 +4561,16 @@ impl GaussianRemlPrepared {
     }
 
     fn evaluate(&self, rho: f64) -> ObjectiveEval {
-        evaluate_reml_parts(
+        let mut value = evaluate_reml_parts(
             &self.cache,
             self.ywy.view(),
             self.projected_rhs_squared.view(),
             self.n_effective,
             self.n_outputs,
             rho,
-        )
+        );
+        value += self.observation_measure;
+        value
     }
 
     fn coefficients(&self, lambda: f64) -> Array2<f64> {
@@ -7793,6 +7859,8 @@ pub struct GaussianRemlBlocksBackwardAnalytic {
     pub grad_designs: Vec<Array2<f64>>,
     pub grad_penalties: Vec<Array2<f64>>,
     pub grad_y: Array2<f64>,
+    /// Cotangent on the fixed positive-weight support; excluded rows are zero.
+    /// Activating an excluded observation is not a differentiable perturbation.
     pub grad_weights: Array1<f64>,
 }
 
@@ -8341,6 +8409,7 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
             .sum::<f64>();
         grad_weights[row] = q_kernel * residual[row] * residual[row] + diag_zgz + y[row] * zh[row];
     }
+    finish_gaussian_reml_weight_vjp(weights, 1, grad_reml_score, &mut grad_weights);
 
     let mut grad_penalties = Vec::with_capacity(f_blocks);
     for block in 0..f_blocks {
