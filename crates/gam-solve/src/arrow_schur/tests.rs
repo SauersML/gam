@@ -5839,6 +5839,95 @@ fn evidence_beta_schur_interior_is_raw_and_newton_boundary_is_tikhonov_2308() {
     assert!((newton_log_det - 4.0_f64.ln()).abs() > 1.0);
 }
 
+/// #2822 — the Newton Tikhonov floor must leave a WELL-SEPARATED POSITIVE
+/// direction at its EXACT curvature. That is the contract
+/// `spectral_pd_floored_schur` states ("a well-separated positive direction
+/// keeps its EXACT eigenvalue, so the Newton step in the healthy β subspace is
+/// unchanged") and the whole reason the #1026 co-collapse cure is allowed to run
+/// on a converged dictionary: it may damp the collapsed subspace and nothing
+/// else.
+///
+/// The discriminating fixture is a reduced Schur whose healthy and collapsed
+/// directions have COMPARABLE magnitude — `S = diag(+5, −99)`, the `owed_1026`
+/// mixed-collapse geometry, whose healthy Newton component is exactly
+/// `Δβ_0 = 10/5 = 2`. `boundary` in the #2308 test above cannot see this defect:
+/// its collapsed entry is `−1e-12`, so the two equilibrations happen to produce
+/// the same floored operator there.
+///
+/// Before the fix, `jacobi_diagonal_scale` read the SIGNED diagonal, so `−99`
+/// missed the `S_aa > 1e-18` branch and was scaled by the substitute `1e-9`:
+/// `S̃ = diag(1, −9.9e19)`, `floor = 1e-8·9.9e19 = 9.9e11`, and the healthy
+/// direction's scaled eigenvalue of `1` was clamped up to `9.9e11`, returning
+/// `9.9e11·5 = 4.95e12` in place of `5` — the live subspace wrong by twelve
+/// orders of magnitude, and `Δβ_0 = 2.0202020202e-12` instead of `2`.
+#[test]
+fn newton_tikhonov_leaves_the_healthy_direction_exact_beside_a_large_negative_2822() {
+    let collapsed = array![[5.0_f64, 0.0], [0.0, -99.0]];
+    let floored = factor_dense_reduced_schur(
+        &collapsed,
+        ReducedSchurPolicy::NewtonTikhonov {
+            relative_floor: SPECTRAL_DEFLATION_REL_FLOOR,
+        },
+    )
+    .expect("an indefinite reduced Schur is Tikhonov-conditioned, not refused");
+    let conditioned = floored
+        .conditioned_schur
+        .as_ref()
+        .expect("the indefinite operator was conditioned");
+    assert_abs_diff_eq!(conditioned[[0, 0]], 5.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(conditioned[[0, 1]], 0.0, epsilon = 1e-12);
+    // The collapsed direction still receives the minimal positive stiffness the
+    // floor exists to give it: strictly positive, and orders below the healthy
+    // curvature rather than above it.
+    assert!(
+        conditioned[[1, 1]] > 0.0 && conditioned[[1, 1]] < 1.0e-4,
+        "the collapsed direction must be lifted to a SMALL strictly positive stiffness, got {}",
+        conditioned[[1, 1]]
+    );
+    // The returned Cholesky factor carries the same healthy curvature, so a
+    // caller's `Δβ_0` is the exact `-g_0/5` and not the floored one:
+    // `(L·Lᵀ)_00 = Σ_c L_0c²`.
+    let reconstructed_healthy: f64 = (0..2)
+        .map(|column| floored.factor[[0, column]] * floored.factor[[0, column]])
+        .sum();
+    assert_abs_diff_eq!(reconstructed_healthy, 5.0, epsilon = 1e-12);
+}
+
+/// #2822 companion control — taking the equilibration scale from `|S_aa|`
+/// instead of `S_aa` is a NO-OP on every operator that reaches the Cholesky
+/// success path, because a positive-definite matrix has no non-positive
+/// diagonal. Pin that on the badly-scaled PD operator the #2015 equilibration
+/// exists for: no conditioning happens at all, and `L·Lᵀ` reproduces the caller's
+/// original `S` to relative round-off across a 15-decade diagonal spread.
+#[test]
+fn equilibrated_cholesky_reconstructs_a_badly_scaled_pd_schur_2822() {
+    let schur = array![
+        [1.0e8_f64, 1.0e2, 0.0],
+        [1.0e2, 4.0e-4, 1.0e-6],
+        [0.0, 1.0e-6, 9.0e-8],
+    ];
+    let factored = factor_dense_reduced_schur(&schur, ReducedSchurPolicy::StrictNewton)
+        .expect("a positive-definite reduced Schur factors without conditioning");
+    assert!(
+        factored.conditioned_schur.is_none(),
+        "a positive-definite operator must not be conditioned at all"
+    );
+    for row in 0..3 {
+        for col in 0..3 {
+            let reconstructed: f64 = (0..=row.min(col))
+                .map(|c| factored.factor[[row, c]] * factored.factor[[col, c]])
+                .sum();
+            let scale = (schur[[row, row]] * schur[[col, col]]).sqrt();
+            assert!(
+                (reconstructed - schur[[row, col]]).abs() <= 1.0e-12 * scale,
+                "L·Lᵀ must reproduce S at ({row},{col}): got {reconstructed}, want {}, \
+                 scale {scale}",
+                schur[[row, col]]
+            );
+        }
+    }
+}
+
 /// #2308 — the public cache seam always rebuilds the same undamped evidence
 /// operator, so changing the Newton ridge history cannot change its value,
 /// mask, or inverse. This exercises the metadata propagation rather than only

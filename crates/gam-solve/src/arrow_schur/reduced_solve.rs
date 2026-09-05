@@ -767,19 +767,46 @@ fn spectral_qr_cholesky_factor(weighted_vt: &Array2<f64>) -> Option<Array2<f64>>
 }
 
 /// Jacobi/Van der Sluis diagonal equilibration scale for a symmetric matrix
-/// (#2015): `d_a = sqrt(schur[a,a])`, floored at `√JACOBI_DIAGONAL_PD_FLOOR` so
-/// a numerically-empty diagonal entry never divides by ~0. This is a PURE
+/// (#2015): `d_a = sqrt(|schur[a,a]|)`, floored at `√JACOBI_DIAGONAL_PD_FLOOR`
+/// so a numerically-empty diagonal entry never divides by ~0. This is a PURE
 /// numerical-conditioning aid for [`factor_dense_reduced_schur`] below — it is
 /// never returned or exposed, and it changes no value any caller of that
 /// function sees, only the accuracy of computing it.
+///
+/// #2822 — the scale is the diagonal's MAGNITUDE, not the signed entry. Van der
+/// Sluis is stated for a positive-definite matrix, where the two agree
+/// (`|S_aa| = S_aa`, and `abs` on a positive finite double is exact), so this is
+/// BIT-IDENTICAL on every matrix that reaches the Cholesky success path — a
+/// positive-definite matrix has no non-positive diagonal. It differs only on the
+/// matrices that fall through to the spectral floor, and there it is the whole
+/// point.
+///
+/// Reading the SIGNED entry made the equilibration ANTI-equilibrating on exactly
+/// the operators the floor exists for. A collapsed reduced Schur carries a
+/// NEGATIVE diagonal; `S_aa > JACOBI_DIAGONAL_PD_FLOOR` is then false, so that
+/// direction was scaled by the substitute `√1e-18 = 1e-9` — dividing an entry of
+/// magnitude `|S_aa|` by `1e-18` and AMPLIFYING it by eighteen decades instead of
+/// normalising it to unit magnitude. `spectral_pd_floored_schur` then reads
+/// `floor = relative_floor · max|λ|` off that inflated spectrum, so the floor is
+/// eighteen decades too high and clamps the HEALTHY directions with it.
+///
+/// Measured on the `owed_1026` mixed-collapse fixture `S = diag(+5, −99)`, whose
+/// healthy Newton step is exactly `Δβ_0 = −g/S = 10/5 = 2`: the signed form gave
+/// `d = (√5, 1e-9)`, `S̃ = diag(1, −9.9e19)`, `floor = 1e-8 · 9.9e19 = 9.9e11`,
+/// so the healthy `λ̃ = 1` was clamped to `9.9e11`, `S_floored,00 = 9.9e11·5 =
+/// 4.95e12` and `Δβ_0 = 2.0202020202e-12` — the live subspace wrong by twelve
+/// orders of magnitude, against a documented contract that it keeps its EXACT
+/// eigenvalue. With the magnitude, `S̃ = diag(1, −1)`, `floor = 1e-8`, the healthy
+/// direction keeps `λ̃ = 1` and `Δβ_0 = 2` exactly, while the collapsed direction
+/// still receives its minimal positive stiffness.
 fn jacobi_diagonal_scale(schur: &Array2<f64>) -> Array1<f64> {
     let n = schur.nrows();
     let floor_sqrt = JACOBI_DIAGONAL_PD_FLOOR.sqrt();
     let mut d = Array1::<f64>::zeros(n);
     for a in 0..n {
-        let diag = schur[[a, a]];
-        d[a] = if diag.is_finite() && diag > JACOBI_DIAGONAL_PD_FLOOR {
-            diag.sqrt()
+        let magnitude = schur[[a, a]].abs();
+        d[a] = if magnitude.is_finite() && magnitude > JACOBI_DIAGONAL_PD_FLOOR {
+            magnitude.sqrt()
         } else {
             floor_sqrt
         };
@@ -797,7 +824,7 @@ fn jacobi_diagonal_scale(schur: &Array2<f64>) -> Array1<f64> {
 /// PLAIN `cholesky_lower(schur)` is not designed to survive: the recursive
 /// `L_ii = sqrt(S_ii − Σ_{j<i} L_ij²)` step loses precision (or falsely
 /// refuses a genuinely PD matrix) when the diagonal spans many orders of
-/// magnitude. Equilibrate FIRST: `D = diag(d)` with `d_a = sqrt(S_aa)`
+/// magnitude. Equilibrate FIRST: `D = diag(d)` with `d_a = sqrt(|S_aa|)`
 /// ([`jacobi_diagonal_scale`] — Van der Sluis equilibration, provably within a
 /// factor of `n` of the OPTIMAL diagonal preconditioner for a symmetric
 /// matrix), factor `S̃ = D⁻¹SD⁻¹` (unit diagonal by construction) with the
