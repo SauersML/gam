@@ -199,6 +199,30 @@ pub(crate) const COST_STALL_CONVERGED_SENTINEL: &str = "OUTER_COST_STALL_CONVERG
 /// non-converged result.
 pub(crate) const ARC_INFEASIBLE_STALL_SENTINEL: &str = "OUTER_ARC_INFEASIBLE_STALL";
 
+/// Sentinel returned when the dense-ARC route reaches a point its own terminal
+/// certificate would accept, so the search stops there instead of grinding on
+/// against a threshold nothing downstream applies (#2817).
+///
+/// A REML search and the certificate that judges it must be ONE standard.
+/// `opt::Arc` stops on an absolute projected-gradient band; the certificate
+/// accepts on the Newton decrement `½·gᵀH⁻¹g` against the criterion's own
+/// resolution. Those are different tests in different units, and on a flat REML
+/// valley the band is the far stricter one: measured on a gaussian n=50 000,
+/// p=93, K=11 fit the band was `7.451e-4` while the certificate accepted at
+/// `2.173e-2` — 29× wider — so no seed could ever stop itself and all six runs
+/// burned their 200-iteration budget for a last-100 improvement of `4e-4` in a
+/// criterion of `5.3e4`. The matrix-free route was given the decrement stop in
+/// `a85b88535` (`MatrixFreeTrustRegion::with_model_decrement_tolerance`); the
+/// dense route, which is the one a low-dimensional ρ⊕η spatial or multinomial
+/// fit takes, had no equivalent and kept the defect.
+///
+/// The runner maps this sentinel to a CONVERGED result. Unlike
+/// [`ARC_INFEASIBLE_STALL_SENTINEL`] the bridge holds a synchronized analytic
+/// Hessian at this exact point and has evaluated the certificate's own rung on
+/// it; and the mandatory final analytic certificate re-derives its verdict from
+/// a fresh evaluation regardless, so this claims a STOP, never an exemption.
+pub(crate) const ARC_CURVATURE_STATIONARY_SENTINEL: &str = "OUTER_ARC_CURVATURE_STATIONARY";
+
 /// Verdict produced by folding one accepted outer iterate into
 /// [`CostStallGuard::observe`].
 pub(crate) enum CostStallVerdict {
@@ -2527,6 +2551,11 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
     /// [`CostStallGuard`] stationarity test consumes. See the matching field on
     /// [`OuterFirstOrderBridge`].
     pub(crate) cost_stall_bounds: Option<(Array1<f64>, Array1<f64>)>,
+    /// The criterion's relative resolution `outer_rel_cost_floor(config)` for
+    /// the online decrement stop, or `None` on a route that does not apply it
+    /// (which is every route with no synchronized analytic Hessian at the
+    /// evaluated point). See [`ARC_CURVATURE_STATIONARY_SENTINEL`].
+    pub(crate) curvature_stationary_floor: Option<f64>,
 }
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
@@ -2648,12 +2677,13 @@ impl OuterSecondOrderBridge<'_> {
         x: &Array1<f64>,
         cost: f64,
         gradient: &Array1<f64>,
+        hessian: Option<&Array2<f64>>,
         hessian_psd: Option<bool>,
-    ) {
+    ) -> Option<ObjectiveEvalError> {
         let bounds = self.cost_stall_bounds.clone();
         let separation_bound_stationary = {
             let Some(guard) = self.cost_stall.as_ref() else {
-                return;
+                return None;
             };
             lower_bound_outward_active_count(x, gradient, bounds.as_ref(), guard.grad_threshold)
                 >= LOWER_BOUND_SEPARATION_ACTIVE_MIN
@@ -2664,7 +2694,7 @@ impl OuterSecondOrderBridge<'_> {
         // as best-so-far. `None` (no feedback) defaults to `true`.
         let inner_converged = inner_solve_converged(self.outer_inner_cap.as_ref());
         let Some(guard) = self.cost_stall.as_mut() else {
-            return;
+            return None;
         };
         // Rail-relaxed box (#2412) — see the first-order bridge's matching
         // read. `separation_bound_stationary` above deliberately keeps the raw
@@ -2694,6 +2724,7 @@ impl OuterSecondOrderBridge<'_> {
         } else {
             guard.observe_second_order(x, cost, projected_g_norm, inner_converged, hessian_psd)
         };
+        let mut adjudicate_second_order = false;
         match verdict {
             CostStallVerdict::Continue => {}
             CostStallVerdict::StuckKeepDescending {
@@ -2742,6 +2773,7 @@ impl OuterSecondOrderBridge<'_> {
                     guard.best_value,
                 );
                 guard.defer_finite_second_order_stall();
+                adjudicate_second_order = true;
             }
             CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
                 log::warn!(
@@ -2757,8 +2789,109 @@ impl OuterSecondOrderBridge<'_> {
                     guard.best_value,
                 );
                 guard.defer_finite_second_order_stall();
+                adjudicate_second_order = true;
             }
         }
+        // The guard's own verdict is FIRST-ORDER and, on this route, deferred:
+        // only ARC holds a synchronized reduced Hessian at the point, so the
+        // guard may not halt a second-order search on a gradient reading. What
+        // it CAN do is say the criterion has stopped moving — and that is
+        // exactly the condition under which the certificate's own
+        // curvature-resolvability rung becomes the deciding test (#2817). The
+        // deferral above is unchanged; what follows is the adjudication it was
+        // always waiting for and never had.
+        if adjudicate_second_order {
+            let verdict = self.curvature_stationary_exit(x, cost, gradient, hessian, hessian_psd);
+            if verdict.is_some() {
+                return verdict;
+            }
+        }
+        None
+    }
+
+    /// The certificate's own acceptance test, applied online to the point ARC
+    /// has just evaluated (#2817).
+    ///
+    /// Returns the halt sentinel exactly when this point is one the terminal
+    /// certificate would accept on its curvature-resolvability rung. Every
+    /// input is the certificate's:
+    ///
+    /// * the reduced Hessian on the rail-relaxed free set must be PSD. That is
+    ///   the certificate's own `certificate_hessian_is_psd` gate, reached here
+    ///   through [`reduced_hessian_psd_at_point`] on a free set that is a
+    ///   SUPERSET of the certificate's, so this can never certify curvature the
+    ///   certificate would reject — and a strict saddle, where the criterion
+    ///   still has a descent direction, fails it outright;
+    /// * the Newton decrement `½·gᵀH⁻¹g` of the rail-projected gradient must be
+    ///   finite and no larger than `floor·(1 + |V|)`. This calls
+    ///   [`newton_predicted_decrease`], the same function the certificate's rung
+    ///   calls, against the same tolerance, anchored at this point's own cost
+    ///   exactly as the certificate anchors it at the certified point's;
+    /// * the point must be the best feasible iterate the trajectory has
+    ///   produced, so a trial step ARC was about to reject cannot end the run.
+    ///
+    /// It cannot stop a search that still has descent available. The decrement
+    /// is curvature-scaled rather than a gradient threshold: a residual aligned
+    /// with a near-flat Hessian direction — a linear ramp that DOES carry real
+    /// descent — inflates `gᵀH⁻¹g` and is rejected, and only a residual that is
+    /// small along the well-curved directions and nearly orthogonal to the flat
+    /// ones passes.
+    fn curvature_stationary_exit(
+        &mut self,
+        x: &Array1<f64>,
+        cost: f64,
+        gradient: &Array1<f64>,
+        hessian: Option<&Array2<f64>>,
+        hessian_psd: Option<bool>,
+    ) -> Option<ObjectiveEvalError> {
+        let floor = self.curvature_stationary_floor?;
+        if hessian_psd != Some(true) || !cost.is_finite() || !floor.is_finite() || floor <= 0.0 {
+            return None;
+        }
+        let hessian = hessian?;
+        let rail_bounds = self.cost_stall_bounds.as_ref().map(rail_relaxed_bounds);
+        let projected = project_gradient_vector(x, gradient, rail_bounds.as_ref());
+        let decrement = super::run::newton_predicted_decrease(hessian, &projected)?;
+        let tolerance = floor * (1.0 + cost.abs());
+        if !decrement.is_finite() || decrement > tolerance {
+            return None;
+        }
+        let guard = self.cost_stall.as_mut()?;
+        // The incumbent test. `observe_cost_stall` has already folded this point
+        // in, so the guard's best is the minimum over the trajectory INCLUDING
+        // this point; `cost <= best` therefore says "this point IS the
+        // incumbent" and nothing weaker. A trial the guard declined to adopt
+        // (a non-converged inner solve, say) leaves the best where it was and
+        // cannot end the run.
+        if !(cost <= guard.best_value) {
+            return None;
+        }
+        let projected_norm = projected.iter().map(|v| v * v).sum::<f64>().sqrt();
+        log::info!(
+            "[OUTER] ARC stopping at the point its own certificate accepts: \
+             Newton ½gᵀH⁻¹g={decrement:.3e} ≤ criterion resolution \
+             {tolerance:.3e} (= {floor:.3e}·(1+|V|) at |V|={cost:.6e}); reduced Hessian \
+             PSD; |Pg|={projected_norm:.3e} after {iters} accepted outer iteration(s). The \
+             absolute gradient band the solver was driven to is a different and unrelated \
+             standard (#2817).",
+            iters = guard.accepted_iters,
+        );
+        if let Ok(mut slot) = guard.exit.lock() {
+            *slot = Some(CostStallExit {
+                rho: x.clone(),
+                value: cost,
+                grad_norm: projected_norm,
+                iterations: guard.accepted_iters,
+                converged: true,
+                // No stall window fired, so no probe-noise measurement is
+                // claimed: the rung that stopped this run is the decrement.
+                noise_grad_bound: None,
+                probe_scale: None,
+            });
+        }
+        Some(ObjectiveEvalError::fatal(
+            ARC_CURVATURE_STATIONARY_SENTINEL.to_string(),
+        ))
     }
 
     /// Fold one INFEASIBLE ARC trial (non-finite cost) into the cost-stall
@@ -2911,7 +3044,15 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         // halt a second-order route. ARC must receive this exact sample so its
         // projected-gradient + reduced-Hessian gate can either certify a mode
         // or exploit negative curvature (#979).
-        self.observe_cost_stall(x, eval.cost, &eval.gradient, hessian_psd);
+        if let Some(stop) = self.observe_cost_stall(
+            x,
+            eval.cost,
+            &eval.gradient,
+            hessian.as_ref(),
+            hessian_psd,
+        ) {
+            return Err(stop);
+        }
         Ok(SecondOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -2936,12 +3077,115 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
 pub(crate) struct OuterAcceptObserver {
     /// Inner-PIRLS cap channel. `None` on routes that do not schedule the
     /// inner solve from the outer trajectory; the observer is still installed
-    /// for [`Self::accepted_steps`].
+    /// for [`Self::accepted_steps`] and [`Self::census`].
     pub(crate) feedback: Option<InnerProgressFeedback>,
+    /// Trajectory census (#2735), read by the runner after the solver returns.
+    /// `None` on routes whose summary does not report one.
+    pub(crate) census: Option<Arc<OuterStepCensus>>,
     /// Accepted-outer-step ledger shared with [`OuterFirstOrderBridge`], which
     /// drains it to decide which of its own evaluations were accepted iterates
     /// (#2613). `None` on routes with no cost-stall guard.
     pub(crate) accepted_steps: Option<Arc<AcceptedStepLedger>>,
+}
+
+/// What a trust-region trajectory actually did, counted as `opt` reported it.
+///
+/// A walk that ends on its iteration budget hands back `final_value` and `‖g‖`
+/// and nothing else, and those two cannot tell the two failures apart:
+///
+/// * a CRAWL — every step accepted, the radius never grown, each step buying a
+///   little — which is a rate problem;
+/// * a THRASH — steps rejected, the radius collapsing — which is a model
+///   problem.
+///
+/// They need opposite repairs, and #2735 spent three issue comments inferring
+/// which one it was. `opt` reports both facts per iteration through
+/// [`OptimizerObserver`], at `debug`; the test harness's diagnostic backend is
+/// fixed at `Info` in code and deliberately not configurable from the
+/// environment, so on any run made through a test they are dark. The observer
+/// is MOVED into the solver, so the counts have to leave through a shared cell
+/// exactly as the accepted-step ledger's do.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OuterStepCensusData {
+    /// Steps `opt` accepted.
+    pub(crate) accepted: usize,
+    /// Steps `opt` rejected. A run with rejections shrank its radius.
+    pub(crate) rejected: usize,
+    /// Accepted steps that sat on the trust boundary (`‖s‖ ≥ 0.99·Δ`), which is
+    /// `opt`'s own test for whether the radius — not the curvature — chose the
+    /// step length. A walk whose accepted steps are all boundary-limited is
+    /// being paced by its region.
+    pub(crate) accepted_on_boundary: usize,
+    /// Smallest and largest radius any step was taken under.
+    pub(crate) radius_min: f64,
+    pub(crate) radius_max: f64,
+    /// Summed `f_k − f_trial` over accepted steps: what the whole walk bought.
+    pub(crate) total_decrease: f64,
+}
+
+impl Default for OuterStepCensusData {
+    fn default() -> Self {
+        Self {
+            accepted: 0,
+            rejected: 0,
+            accepted_on_boundary: 0,
+            radius_min: f64::INFINITY,
+            radius_max: 0.0,
+            total_decrease: 0.0,
+        }
+    }
+}
+
+/// Shared cell the observer writes and the seed-loop runner reads once the
+/// solver has returned. See [`OuterStepCensusData`].
+#[derive(Debug, Default)]
+pub(crate) struct OuterStepCensus {
+    data: Mutex<OuterStepCensusData>,
+}
+
+impl OuterStepCensus {
+    pub(crate) fn observe(&self, info: &StepInfo, accepted: bool) {
+        let Ok(mut data) = self.data.lock() else {
+            return;
+        };
+        if accepted {
+            data.accepted += 1;
+            if info.actual_decrease.is_finite() {
+                data.total_decrease += info.actual_decrease;
+            }
+        } else {
+            data.rejected += 1;
+        }
+        if let Some(radius) = info.trust_radius.filter(|r| r.is_finite()) {
+            data.radius_min = data.radius_min.min(radius);
+            data.radius_max = data.radius_max.max(radius);
+            // `opt`'s own boundary test, reproduced rather than approximated:
+            // the same `0.99` it uses to decide whether to grow the region.
+            if accepted && info.step_norm >= 0.99 * radius {
+                data.accepted_on_boundary += 1;
+            }
+        }
+    }
+
+    /// One line for the run summary, or `None` when nothing was observed (no
+    /// step was ever taken, or no observer was installed).
+    pub(crate) fn describe(&self) -> Option<String> {
+        let data = self.data.lock().ok()?;
+        if data.accepted == 0 && data.rejected == 0 {
+            return None;
+        }
+        Some(format!(
+            "steps accepted={} rejected={} boundary_limited={}/{} radius=[{:.3e}, {:.3e}] \
+             total_decrease={:.6e}",
+            data.accepted,
+            data.rejected,
+            data.accepted_on_boundary,
+            data.accepted,
+            data.radius_min,
+            data.radius_max,
+            data.total_decrease,
+        ))
+    }
 }
 
 impl OptimizerObserver for OuterAcceptObserver {
@@ -2962,6 +3206,22 @@ impl OptimizerObserver for OuterAcceptObserver {
                 step_norm: info.step_norm,
                 actual_decrease: info.actual_decrease,
             });
+        }
+        if let Some(census) = self.census.as_ref() {
+            census.observe(info, true);
+        }
+    }
+
+    fn on_step_rejected(&mut self, info: &StepInfo) {
+        log::trace!(
+            "outer step rejected iter={} step_norm={:.3e} predicted_decrease={:.3e} actual_decrease={:.3e}",
+            info.iter,
+            info.step_norm,
+            info.predicted_decrease,
+            info.actual_decrease,
+        );
+        if let Some(census) = self.census.as_ref() {
+            census.observe(info, false);
         }
     }
 }

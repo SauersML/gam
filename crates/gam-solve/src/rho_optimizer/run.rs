@@ -1300,6 +1300,10 @@ pub enum OuterResultOrigin {
     /// ARC hit a run of infeasible probes with no synchronized Hessian, so a
     /// checkpoint was rebuilt from the stored best iterate.
     ArcInfeasibleStallCheckpoint,
+    /// ARC was stopped at a point its own terminal certificate accepts: the
+    /// Newton decrement ½gᵀH⁻¹g of the rail-projected gradient sat at or below
+    /// the criterion's resolution under a PSD reduced Hessian (#2817).
+    ArcCurvatureStationaryStop,
     /// The BFGS cost-stall guard halted the search and published its best
     /// iterate, which was rebuilt into this result.
     BfgsCostStallExit,

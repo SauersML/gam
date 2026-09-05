@@ -2348,12 +2348,17 @@ pub(crate) fn run_outer_with_plan(
                         // exact analytic Hessians; an `Unavailable`
                         // here is a routing/contract violation.
                         .with_hessian_fallback_policy(HessianFallbackPolicy::Error);
-                    if let Some(feedback) = config.outer_inner_cap.as_ref() {
-                        solver = solver.with_observer(OuterAcceptObserver {
-                            feedback: Some(feedback.clone()),
-                            accepted_steps: None,
-                        });
-                    }
+                    // Installed unconditionally now that it also carries the
+                    // trajectory census (#2735): a walk that ends on its budget
+                    // has to be able to say whether it crawled or thrashed, and
+                    // the inner-cap channel it used to be gated on is unrelated
+                    // to that question.
+                    let census = Arc::new(OuterStepCensus::default());
+                    solver = solver.with_observer(OuterAcceptObserver {
+                        feedback: config.outer_inner_cap.clone(),
+                        accepted_steps: None,
+                        census: Some(Arc::clone(&census)),
+                    });
                     if let Some(r) = sanitized_operator_trust_restart_radius(
                         config.operator_initial_trust_radius,
                     ) {
@@ -2366,7 +2371,7 @@ pub(crate) fn run_outer_with_plan(
                     let final_radius = report.diagnostics.final_trust_radius;
                     log::info!(
                         "[OUTER summary] matrix-free TR finished status={:?} in {} iters \
-                         elapsed={:.3}s final_value={:.6e} final_trust_radius={}",
+                         elapsed={:.3}s final_value={:.6e} final_trust_radius={} | {}",
                         report.status,
                         report.solution.iterations,
                         mf_elapsed,
@@ -2375,6 +2380,9 @@ pub(crate) fn run_outer_with_plan(
                             Some(r) => format!("{:.3e}", r),
                             None => "n/a".to_string(),
                         },
+                        census
+                            .describe()
+                            .unwrap_or_else(|| "no step observed".to_string()),
                     );
                     // Translate the structured report into an `OuterResult`.
                     // `operator_stop_reason` wiring (read by the gam-side
@@ -2565,6 +2573,21 @@ pub(crate) fn run_outer_with_plan(
                         last_value_grad_rho: None,
                         cost_stall: Some(cost_stall_guard),
                         cost_stall_bounds: Some((lo.clone(), hi.clone())),
+                        // #2817 — the search stops on the test that judges it.
+                        // The certificate accepts a point whose Newton
+                        // decrement ½gᵀH⁻¹g is at or below the criterion's own
+                        // resolution `rel_cost_floor·(1 + |V|)`; the dense ARC
+                        // route was driven instead to an absolute
+                        // projected-gradient band, which on a flat REML valley
+                        // is a far stricter and unrelated standard, so no seed
+                        // could stop itself and every fit ran to its iteration
+                        // cap. Handing the bridge the same floor the
+                        // certificate uses makes the stopping rule and the
+                        // acceptance rule one standard. The matrix-free route
+                        // already does this through opt's own decrement rung
+                        // (`with_model_decrement_tolerance` above); this is the
+                        // dense route's half of the same repair.
+                        curvature_stationary_floor: Some(outer_rel_cost_floor(config)),
                         },
                         Arc::clone(&last_objective_error),
                     );
@@ -2583,12 +2606,14 @@ pub(crate) fn run_outer_with_plan(
                     if let Some(sigma) = config.arc_initial_regularization {
                         optimizer = optimizer.with_initial_regularization(sigma);
                     }
-                    if let Some(feedback) = config.outer_inner_cap.as_ref() {
-                        optimizer = optimizer.with_observer(OuterAcceptObserver {
-                            feedback: Some(feedback.clone()),
-                            accepted_steps: None,
-                        });
-                    }
+                    // Same reason as the matrix-free route above: the census
+                    // is what a budget-exhausted ARC run needs to report (#2735).
+                    let arc_census = Arc::new(OuterStepCensus::default());
+                    optimizer = optimizer.with_observer(OuterAcceptObserver {
+                        feedback: config.outer_inner_cap.clone(),
+                        accepted_steps: None,
+                        census: Some(Arc::clone(&arc_census)),
+                    });
                     // On the exact-Hessian ARC route, forbid both (a)
                     // finite-difference Hessian estimation if the
                     // objective ever returns
@@ -2610,10 +2635,13 @@ pub(crate) fn run_outer_with_plan(
                         Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
                             log::warn!(
-                                "[OUTER warning] {context}: ARC hit max_iter={} at final_value={:.6e} |g|={:.3e}",
+                                "[OUTER warning] {context}: ARC hit max_iter={} at final_value={:.6e} |g|={:.3e} | {}",
                                 config.max_iter,
                                 last_solution.final_value,
                                 last_solution.final_gradient_norm.unwrap_or(f64::NAN),
+                                arc_census
+                                    .describe()
+                                    .unwrap_or_else(|| "no step observed".to_string()),
                             );
                             // Budget exhaustion (#1371): the optimizer hands back
                             // its LAST iterate, which on a flat REML valley can be
@@ -2726,6 +2754,41 @@ pub(crate) fn run_outer_with_plan(
                                 }
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(
                                     "ARC infeasible-stall sentinel fired without a published best \
+                                     iterate ({context})"
+                                ))),
+                            }
+                        }
+                        Err(ArcError::ObjectiveFailed { message })
+                            if message == ARC_CURVATURE_STATIONARY_SENTINEL =>
+                        {
+                            // #2817 — the bridge stopped ARC at a point its own
+                            // terminal certificate accepts: PSD reduced Hessian,
+                            // and a Newton decrement at or below the criterion's
+                            // resolution. Unlike the infeasible-stall sentinel
+                            // above, the bridge held a synchronized analytic
+                            // Hessian AT this point and evaluated the
+                            // certificate's rung on it, so the rebuilt result is
+                            // reported converged. The mandatory final analytic
+                            // certificate still re-derives its verdict from a
+                            // fresh evaluation, so nothing here exempts the
+                            // point from being judged.
+                            let exit = cost_stall_exit.lock().ok().and_then(|mut slot| slot.take());
+                            match exit {
+                                Some(exit) => {
+                                    let mut result = outer_result_with_gradient_norm(
+                                        exit.rho,
+                                        exit.value,
+                                        exit.iterations,
+                                        Some(exit.grad_norm),
+                                        exit.converged,
+                                        *the_plan,
+                                    );
+                                    result.origin =
+                                        OuterResultOrigin::ArcCurvatureStationaryStop;
+                                    Ok(result)
+                                }
+                                None => Err(EstimationError::RemlOptimizationFailed(format!(
+                                    "ARC curvature-stationary sentinel fired without a published \
                                      iterate ({context})"
                                 ))),
                             }
@@ -3222,6 +3285,10 @@ pub(crate) fn run_outer_with_plan(
                     optimizer = optimizer.with_observer(OuterAcceptObserver {
                         feedback: config.outer_inner_cap.clone(),
                         accepted_steps: Some(Arc::clone(&accepted_steps)),
+                        // BFGS reports no trust radius, so a region census would
+                        // be a column of `None`s; its own non-convergence
+                        // reporting is the line-search failure path.
+                        census: None,
                     });
                     let bfgs_start = std::time::Instant::now();
                     let outcome = optimizer.run();

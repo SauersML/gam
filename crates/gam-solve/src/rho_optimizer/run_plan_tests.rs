@@ -2712,6 +2712,7 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
+        curvature_stationary_floor: None,
     };
     let grad_sample = FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
     assert_eq!(grad_sample.value, 1.0);
@@ -2775,6 +2776,7 @@ fn analytic_route_unavailable_hessian_is_fatal() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
+        curvature_stationary_floor: None,
     };
     let err = SecondOrderObjective::eval_hessian(&mut bridge, &array![1.0])
         .expect_err("Analytic route must reject Unavailable Hessian, not pass None to opt");
@@ -2936,6 +2938,7 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
+        curvature_stationary_floor: None,
     };
     // Hammer eval_hessian at the lower bound — the ARC per-iterate oracle path.
     // Every finite sample, including the one that fills the stall window, must
@@ -3001,6 +3004,7 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-10.0], array![10.0])),
+        curvature_stationary_floor: None,
     };
 
     for _ in 0..5 {
@@ -3078,6 +3082,7 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
+        curvature_stationary_floor: None,
     };
     for _ in 0..(COST_STALL_WINDOW + 2) {
         let sample = SecondOrderObjective::eval_hessian(&mut bridge, &lo)
@@ -3158,6 +3163,7 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
+        curvature_stationary_floor: None,
     };
     // One feasible eval records the best; the next `COST_STALL_WINDOW` infeasible
     // evals fill the infeasible-streak window and trip the sentinel.
@@ -6023,3 +6029,10 @@ mod criterion_invariance_certificate_tests_2676;
 // curvature. Split out for the source-file length budget.
 #[path = "run_plan_stationarity_band_tests.rs"]
 mod run_plan_stationarity_band_tests;
+
+// The dense-ARC route's online stop on the test its own certificate applies:
+// the Newton decrement against the criterion's resolution, not an absolute
+// gradient band 29x tighter (#2817). Split out for the source-file length
+// budget.
+#[path = "arc_curvature_stationary_2817_tests.rs"]
+mod arc_curvature_stationary_2817_tests;
