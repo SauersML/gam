@@ -16,7 +16,7 @@
 //! ```
 //!
 //! All heavy state lives here, native-side: the warm-started block frames, the
-//! epoch's accumulated per-block MOD cross-moments (`M_g`, `P×b`), the streaming γ
+//! epoch's accumulated per-block projector moments (`M_g`, `P×b`), the streaming γ
 //! numerator/denominator, per-block usage + within-block code second moments (for
 //! the utilisation / stable-rank report), the streaming TSS/RSS moments, and the
 //! worst-reconstructed-row reservoir feeding AuxK dead-block birth proposals. A shard
@@ -30,14 +30,16 @@
 //! them and its cross-moment / γ / moment contributions are summed (all additive),
 //! so shard boundaries do not change the accumulated problem. Gamma-free data
 //! and overlap moments let the frame step use the newly fitted γ without
-//! replaying the corpus. The simultaneous polar updates minimize a quadratic
-//! upper bound derived from the selected-block count, which prevents co-fired
-//! blocks from overcorrecting against one another at fixed codes. One-shot uses
-//! sequential block updates; the streaming trajectory is different.
+//! replaying the corpus. The simultaneous polar updates majorize the tied-code
+//! reconstruction loss with supports held fixed, differentiating both the frame
+//! and its projection code. A data-derived spectral shift makes each surrogate
+//! positive semidefinite without storing a feature covariance matrix. Rerouting
+//! on the next pass can change supports and is measured separately. One-shot
+//! uses sequential block updates; the streaming trajectory is different.
 //!
 //! EV describes the pass's measured frames with their profiled γ. Proposed frames
 //! remain an uncertified checkpoint until another pass measures them. Finalize
-//! requires EV, γ and projector closure and returns the exact measured frames,
+//! requires EV, γ, projector closure and tangent stationarity and returns the exact measured frames,
 //! γ and EV; an EV coincidence alone never certifies an unmeasured proposal.
 
 use super::BlockSparseConfig;
@@ -155,7 +157,9 @@ pub struct BlockEpochStats {
     pub gamma: f32,
     /// Relative displacement from the pass's gamma to its conditional optimum.
     pub gamma_residual: f64,
-    /// Relative projector displacement to the frame update at that same gamma.
+    /// Maximum of relative projector displacement and normalized tangent
+    /// gradient at that same gamma. The gradient excludes the spectral shift,
+    /// so a conservative step cannot manufacture a stationarity certificate.
     pub frame_residual: f64,
     /// Whether EV, gamma and frame-projector residuals meet the tolerance,
     /// with no accepted or pending block birth.
@@ -198,9 +202,11 @@ pub struct BlockSparseStreamState {
     gamma: f32,
 
     // ---- accumulators reset at each end_epoch (frozen frames/γ used to fill) ----
-    second: Vec<Array2<f64>>, // gamma-free projection second moment (b×b)
-    cross: Vec<Array2<f64>>,  // gamma-free other-block reconstruction × projection (P×b)
+    second: Vec<Array2<f64>>,   // gamma-free projection second moment (b×b)
+    coupling: Vec<Array2<f64>>, // (XᵀV + VᵀX)U, V = k X P_g - total projection
     data_cross: Vec<Array2<f64>>, // data × projection (P×b)
+    data_energy: Vec<f64>,      // selected-row sum of ||x||²
+    negative_bound: Vec<f64>,   // sum of ||x|| ||v|| - xᵀv bounds negative curvature
     usage: Vec<usize>,
     alive_count: usize,
     gamma_num: f64,
@@ -305,8 +311,10 @@ impl BlockSparseStreamState {
             decoder,
             gamma: 1.0,
             second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
-            cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
+            coupling: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
             data_cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
+            data_energy: vec![0.0; g],
+            negative_bound: vec![0.0; g],
             usage: vec![0; g],
             alive_count: 0,
             gamma_num: 0.0,
@@ -379,8 +387,10 @@ impl BlockSparseStreamState {
             decoder,
             gamma: 1.0,
             second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
-            cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
+            coupling: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
             data_cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
+            data_energy: vec![0.0; g],
+            negative_bound: vec![0.0; g],
             usage: vec![0; g],
             alive_count: 0,
             gamma_num: 0.0,
@@ -518,29 +528,52 @@ impl BlockSparseStreamState {
                 }
             }
 
-            self.cross
+            self.coupling
                 .par_iter_mut()
                 .zip(self.data_cross.par_iter_mut())
                 .zip(self.second.par_iter_mut())
                 .zip(self.usage.par_iter_mut())
+                .zip(self.data_energy.par_iter_mut())
+                .zip(self.negative_bound.par_iter_mut())
                 .zip(postings.par_iter())
                 .enumerate()
                 .for_each(
-                    |(block, ((((cross, data_cross), second), usage), entries))| {
+                    |(
+                        block,
+                        ((((((coupling, data_cross), second), usage), energy), bound), entries),
+                    )| {
+                        let mut v_coordinates = vec![0.0; b];
                         for &(row, slot) in entries {
                             let w = &codes[row].projections[slot * b..(slot + 1) * b];
                             let xi = rows.row(row);
+                            v_coordinates.fill(0.0);
+                            let mut x_norm_sq = 0.0;
+                            let mut v_norm_sq = 0.0;
+                            let mut x_dot_v = 0.0;
                             for c in 0..p {
                                 let mut own = 0.0;
                                 for (axis, &weight) in w.iter().enumerate() {
                                     own += weight * self.decoder[[block * b + axis, c]] as f64;
                                 }
-                                let other = projected[row].sum[c] - own;
+                                let v = self.k as f64 * own - projected[row].sum[c];
+                                let x = xi[c] as f64;
+                                x_norm_sq += x * x;
+                                v_norm_sq += v * v;
+                                x_dot_v += x * v;
                                 for (axis, &weight) in w.iter().enumerate() {
-                                    cross[[c, axis]] += other * weight;
-                                    data_cross[[c, axis]] += xi[c] as f64 * weight;
+                                    coupling[[c, axis]] += v * weight;
+                                    data_cross[[c, axis]] += x * weight;
+                                    v_coordinates[axis] +=
+                                        self.decoder[[block * b + axis, c]] as f64 * v;
                                 }
                             }
+                            for c in 0..p {
+                                for axis in 0..b {
+                                    coupling[[c, axis]] += xi[c] as f64 * v_coordinates[axis];
+                                }
+                            }
+                            *energy += x_norm_sq;
+                            *bound += (x_norm_sq.sqrt() * v_norm_sq.sqrt() - x_dot_v).max(0.0);
                             for left in 0..b {
                                 for right in 0..b {
                                     second[[left, right]] += w[left] * w[right];
@@ -710,8 +743,8 @@ impl BlockSparseStreamState {
             // Each task owns one proposal and its moments. Pin nested faer
             // factorizations to sequential while the existing Rayon pool fans
             // out over blocks; otherwise a nested solver barrier can deadlock.
-            let outcomes: Vec<Result<(), String>> = with_faer_sequential(|| {
-                self.cross
+            let outcomes: Vec<Result<f64, String>> = with_faer_sequential(|| {
+                self.coupling
                     .par_iter_mut()
                     .zip(self.second.par_iter_mut())
                     .zip(
@@ -723,28 +756,64 @@ impl BlockSparseStreamState {
                     .map(|(gg, ((moment, second), mut proposal))| {
                         second.mapv_inplace(|value| value * gamma * gamma);
                         if self.usage[gg] == 0 {
-                            return Ok(());
+                            return Ok(0.0);
                         }
+                        // For U = Dᵀ, P = UUᵀ and fixed supports, the bound
+                        // ||Σ ΔP_g x||² <= k Σ ||ΔP_g x||² gives the surrogate
+                        // -tr(U_newᵀ H U_new), where
+                        // H = (2γ-kγ²)XᵀX + γ²(XᵀV+VᵀX).
+                        // Only H U is needed. The smallest eigenvalue of each
+                        // xvᵀ+vxᵀ is xᵀv-||x|| ||v||, so this shift makes
+                        // B=H+shift I PSD. Its trace shift is constant on the
+                        // Grassmann manifold. Polar(B U) increases tr(UᵀB U)
+                        // by maximizing its tangent linear lower bound, hence
+                        // decreases the actual tied loss at fixed supports.
+                        let data_scale = 2.0 * gamma - self.k as f64 * gamma * gamma;
+                        let shift = (-data_scale).max(0.0) * self.data_energy[gg]
+                            + gamma * gamma * self.negative_bound[gg]
+                            + ridge;
                         for rr in 0..b {
                             for c in 0..p {
-                                moment[[c, rr]] = gamma * self.data_cross[gg][[c, rr]]
-                                    - gamma * gamma * moment[[c, rr]]
-                                    + ridge * self.decoder[[gg * b + rr, c]] as f64
-                                    + (self.k - 1) as f64
-                                        * (0..b)
-                                            .map(|axis| {
-                                                self.decoder[[gg * b + axis, c]] as f64
-                                                    * second[[axis, rr]]
-                                            })
-                                            .sum::<f64>();
+                                moment[[c, rr]] = data_scale * self.data_cross[gg][[c, rr]]
+                                    + gamma * gamma * moment[[c, rr]];
                             }
                         }
-                        // ||sum_g delta_g||² <= k*sum_g ||delta_g||² majorizes
-                        // the simultaneous co-fired reconstruction change.
-                        // The (k-1)*D*second term makes the independent updates
-                        // descend in the fixed-code loss.
+                        // Certify the conditional Rayleigh gradient before
+                        // adding any spectral shift or ridge. H differs from
+                        // the conditional operator only by (k-1)γ² P C U in
+                        // its normal component. Normalize by that conditional
+                        // operator's action, making the residual independent
+                        // of the algorithm's chosen majorization curvature.
+                        let normal = Array2::from_shape_fn((b, b), |(axis, rr)| {
+                            (0..p)
+                                .map(|c| self.decoder[[gg * b + axis, c]] as f64 * moment[[c, rr]])
+                                .sum::<f64>()
+                        });
+                        let mut tangent_sq = 0.0;
+                        let mut conditional_sq = 0.0;
+                        for c in 0..p {
+                            for rr in 0..b {
+                                let mut projected = 0.0;
+                                let mut normal_correction = 0.0;
+                                for axis in 0..b {
+                                    let direction = self.decoder[[gg * b + axis, c]] as f64;
+                                    projected += direction * normal[[axis, rr]];
+                                    normal_correction += direction * second[[axis, rr]];
+                                }
+                                tangent_sq += (moment[[c, rr]] - projected).powi(2);
+                                conditional_sq += (moment[[c, rr]]
+                                    - (self.k - 1) as f64 * normal_correction)
+                                    .powi(2);
+                                moment[[c, rr]] += shift * self.decoder[[gg * b + rr, c]] as f64;
+                            }
+                        }
+                        let gradient_residual = if conditional_sq == 0.0 {
+                            0.0
+                        } else {
+                            (tangent_sq / conditional_sq).sqrt()
+                        };
                         if moment.iter().all(|&value| value == 0.0) {
-                            return Ok(());
+                            return Ok(gradient_residual);
                         }
                         let frame =
                             GrassmannFrame::polar_update(moment.view()).map_err(|error| {
@@ -760,21 +829,23 @@ impl BlockSparseStreamState {
                                 proposal[[rr, c]] = (orientation * u[[c, rr]]) as f32;
                             }
                         }
-                        Ok(())
+                        Ok(gradient_residual)
                     })
                     .collect()
             });
             // Indexed collection preserves the first failing block's identity
             // even if worker completion order changes.
+            let mut gradient_residual = 0.0_f64;
             for outcome in outcomes {
-                outcome?;
+                gradient_residual = gradient_residual.max(outcome?);
             }
             frame_residual = frame_fixed_point_residual(
                 self.decoder.view(),
                 candidate_decoder.view(),
                 self.g,
                 b,
-            );
+            )
+            .max(gradient_residual);
         }
         let ev = if tss <= 1.0e-24 {
             if self.rss <= 1.0e-24 { 1.0 } else { 0.0 }
@@ -898,12 +969,14 @@ impl BlockSparseStreamState {
         for sg in self.second.iter_mut() {
             sg.fill(0.0);
         }
-        for mg in self.cross.iter_mut() {
+        for mg in self.coupling.iter_mut() {
             mg.fill(0.0);
         }
         for moment in &mut self.data_cross {
             moment.fill(0.0);
         }
+        self.data_energy.fill(0.0);
+        self.negative_bound.fill(0.0);
         for u in self.usage.iter_mut() {
             *u = 0;
         }

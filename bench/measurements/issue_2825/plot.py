@@ -24,7 +24,7 @@ axes[0].set(xlabel="Pass", ylabel="Explained variance")
 axes[0].set_title(f'{shape["rows"]} rows · {shape["features"]} features · {shape["atoms"]} atoms', fontsize=10)
 for key, label, color in [
     ("gamma_residual", "γ residual", "#cc7722"),
-    ("frame_residual", "Frame projector residual", "#6654a3"),
+    ("frame_residual", "Frame residual", "#6654a3"),
 ]:
     axes[1].semilogy(x, [row[key] for row in epochs], "o-", label=label, color=color)
 axes[1].axhline(shape["tolerance"], color="#555555", linestyle="--", label="Required tolerance")

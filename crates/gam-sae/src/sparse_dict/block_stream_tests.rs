@@ -107,7 +107,7 @@ fn parallel_stream_moments_match_dense_reference_across_batches_and_shards() {
         [0.6, 0.0, 0.0, 0.8],
         [0.0, 0.0, 1.0, 0.0],
     ];
-    // Independent dense frozen-code algebra. All three blocks are selected on
+    // Independent dense projector algebra. All three blocks are selected on
     // nonzero rows; the zero row exercises padded slots without phantom usage.
     let weights = x.mapv(f64::from).dot(&decoder.mapv(f64::from).t());
     let total = weights.dot(&decoder.mapv(f64::from));
@@ -167,11 +167,26 @@ fn parallel_stream_moments_match_dense_reference_across_batches_and_shards() {
                                 .slice(ndarray::s![block * 2..(block + 1) * 2, ..])
                                 .mapv(f64::from),
                         );
-                        let expected_cross = (&total - &own).t().dot(&w);
+                        let v = &own * 3.0 - &total;
+                        let x64 = x.mapv(f64::from);
+                        let frame = decoder
+                            .slice(ndarray::s![block * 2..(block + 1) * 2, ..])
+                            .mapv(f64::from);
+                        let expected_coupling = (x64.t().dot(&v) + v.t().dot(&x64)).dot(&frame.t());
+                        let expected_energy = x64.iter().map(|v| v * v).sum::<f64>();
+                        let expected_bound = x64
+                            .outer_iter()
+                            .zip(v.outer_iter())
+                            .map(|(x, v)| {
+                                (x.dot(&x).sqrt() * v.dot(&v).sqrt() - x.dot(&v)).max(0.0)
+                            })
+                            .sum::<f64>();
+                        assert!((state.data_energy[block] - expected_energy).abs() < 1e-11);
+                        assert!((state.negative_bound[block] - expected_bound).abs() < 1e-11);
                         let expected_data = x.mapv(f64::from).t().dot(&w);
                         let expected_second = w.t().dot(&w);
                         for (got, expected) in [
-                            (&state.cross[block], expected_cross),
+                            (&state.coupling[block], expected_coupling),
                             (&state.data_cross[block], expected_data),
                             (&state.second[block], expected_second.clone()),
                             (
@@ -246,12 +261,12 @@ fn frame_refresh_uses_the_new_gamma_and_is_invariant_to_its_initial_value_2825()
                 assert_eq!(&stats.gamma, previous_gamma);
             }
             reference = Some((state.decoder.clone(), stats.gamma));
-            // Price the candidate with the frozen codes, independently of the
-            // stream's moment algebra. Simultaneous updates must decrease this loss.
+            // Recompute the tied codes at each candidate, independently of the
+            // stream's moments. All blocks stay selected, fixing the supports.
             let loss = |candidate: &Array2<f32>| -> f64 {
                 x.outer_iter()
                     .map(|row| {
-                        let weights: Vec<f64> = decoder
+                        let weights: Vec<f64> = candidate
                             .outer_iter()
                             .map(|direction| {
                                 direction
@@ -277,6 +292,89 @@ fn frame_refresh_uses_the_new_gamma_and_is_invariant_to_its_initial_value_2825()
                     .sum()
             };
             assert!(loss(&state.decoder) < loss(&decoder));
+        }
+    }
+}
+
+#[test]
+fn tied_frame_update_descends_on_the_frozen_code_ascent_witness_2825() {
+    let x = array![[0.4_f32, 4.0], [0.3, -3.0], [-0.3, 3.0]];
+    let mut decoder = array![[1.0_f32, -10.0], [10.0, 3.0]];
+    for mut row in decoder.outer_iter_mut() {
+        let norm = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt();
+        row.mapv_inplace(|v| (v as f64 / norm) as f32);
+    }
+    let (_, _, config) = coupled_fixture();
+    let mut state = BlockSparseStreamState::new_with_decoder(decoder.clone(), &config).unwrap();
+    let x64 = x.mapv(f64::from);
+    let loss = |frame: &Array2<f32>, gamma: f32| {
+        let d = frame.mapv(f64::from);
+        let residual = &x64 - x64.dot(&d.t()).dot(&d) * gamma as f64;
+        residual.iter().map(|v| v * v).sum::<f64>()
+    };
+    state.partial_fit(x.view()).unwrap();
+    let first = state.end_epoch().unwrap();
+    let proposal = state.decoder.clone();
+    let before = loss(&decoder, first.gamma);
+    let after = loss(&proposal, first.gamma);
+    assert!(
+        after < before,
+        "actual tied RSS ascended: {before} -> {after}"
+    );
+    state.partial_fit(x.view()).unwrap();
+    let second = state.end_epoch().unwrap();
+    let profiled_after = loss(&proposal, second.gamma);
+    assert!(profiled_after <= after + 1e-12);
+    assert!(profiled_after < before);
+}
+
+#[test]
+fn tied_projector_moments_match_actual_loss_directional_derivatives() {
+    // Exact orthonormal axes make horizontal perturbations independent of
+    // f32 frame roundoff. The blocks overlap and have rank two.
+    let decoder = array![
+        [1.0_f32, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ];
+    let x = Array2::from_shape_fn((11, 4), |(i, j)| ((i * 7 + j * 3) as f32).sin());
+    let x64 = x.mapv(f64::from);
+    let mut config = BlockSparseConfig::new(2, 2);
+    config.block_topk = 2;
+    config.aux_k = 0;
+    for gamma in [0.3, 1.4] {
+        let mut state = BlockSparseStreamState::new_with_decoder(decoder.clone(), &config).unwrap();
+        state.partial_fit(x.view()).unwrap();
+        let data_scale = 2.0 * gamma - 2.0 * gamma * gamma;
+        for block in 0..2 {
+            let d = decoder.mapv(f64::from);
+            let frame = d.slice(ndarray::s![block * 2..(block + 1) * 2, ..]);
+            let raw = Array2::from_shape_fn((2, 4), |(i, j)| ((i * 5 + j + 1) as f64).cos());
+            let tangent = &raw - raw.dot(&frame.t()).dot(&frame);
+            let moment =
+                &state.data_cross[block] * data_scale + &state.coupling[block] * (gamma * gamma);
+            let analytic = -2.0
+                * moment
+                    .iter()
+                    .zip(tangent.t().iter())
+                    .map(|(a, b)| a * b)
+                    .sum::<f64>();
+            let loss = |step: f64| {
+                let mut candidate = d.clone();
+                let perturbed = &frame.to_owned() + &tangent * step;
+                candidate
+                    .slice_mut(ndarray::s![block * 2..(block + 1) * 2, ..])
+                    .assign(&perturbed);
+                let residual = &x64 - x64.dot(&candidate.t()).dot(&candidate) * gamma;
+                residual.iter().map(|v| v * v).sum::<f64>()
+            };
+            let step = 1e-5;
+            let numerical = (loss(step) - loss(-step)) / (2.0 * step);
+            assert!(
+                (analytic - numerical).abs() < 1e-7 * (1.0 + analytic.abs()),
+                "block {block}, gamma {gamma}: analytic {analytic}, numerical {numerical}"
+            );
         }
     }
 }
@@ -322,6 +420,34 @@ fn parallel_stream_rejects_selected_duplicate_birth_using_complete_baseline() {
     assert_eq!(state.decoder, baseline);
     assert_eq!(state.last_usage, vec![0, 17]);
     assert_eq!(state.last_second[1][[0, 0]], 17.0);
+}
+
+#[test]
+fn a_large_spectral_shift_cannot_certify_a_nonstationary_frame() {
+    let (x, decoder, mut config) = coupled_fixture();
+    // Force a proposal below f32 resolution while leaving the actual tied
+    // objective unchanged. The gradient certificate must see through it.
+    config.frame_ridge = 1e20;
+    let mut first = BlockSparseStreamState::new_with_decoder(decoder.clone(), &config).unwrap();
+    first.partial_fit(x.view()).unwrap();
+    let measured = first.end_epoch().unwrap();
+    let mut state = BlockSparseStreamState::new_with_decoder(decoder.clone(), &config).unwrap();
+    state.gamma = measured.gamma;
+    state.prev_ev = measured.explained_variance;
+    state.epochs_run = 1;
+    state.partial_fit(x.view()).unwrap();
+    let stats = state.end_epoch().unwrap();
+    let displacement = crate::sparse_dict::block::frame_fixed_point_residual(
+        decoder.view(),
+        state.decoder.view(),
+        2,
+        1,
+    );
+    assert!(displacement <= config.tolerance);
+    assert!(stats.gamma_residual <= config.tolerance);
+    assert!(stats.frame_residual > config.tolerance);
+    assert!(!stats.converged);
+    assert!(state.finalize().is_err());
 }
 
 #[test]
