@@ -5851,6 +5851,13 @@ impl SaeManifoldTerm {
         diag_atom: usize,
         wrt: SaeLocalRowVar,
         ordered_beta_bernoulli_channels: Option<&OrderedBetaBernoulliHessianDiagThirdChannels>,
+        // #2520 - WHICH operator's diagonal is being differentiated. `B` carries
+        // the PSD clamp of the ThresholdGate's signed logit curvature and `A`
+        // carries the raw signed value, so the two have different theta-adjoints
+        // on the concave half. This is the same split the sibling ARD pair
+        // (`ard_majorized_hessian_derivative` / `ard_exact_hessian_derivative`)
+        // already carries, on the one prior family that never received it.
+        exact_a: bool,
     ) -> f64 {
         let SaeLocalRowVar::Logit { atom: wrt_atom } = wrt else {
             return 0.0;
@@ -5882,24 +5889,29 @@ impl SaeManifoldTerm {
                 if diag_atom != wrt_atom {
                     return 0.0;
                 }
-                let logit = self.assignment.logits[[row, diag_atom]];
-                let inv_tau = 1.0 / temperature;
-                let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
-                let slope = activation * (1.0 - activation);
-                // #991 — this row's ThresholdGate prior curvature in `htt` carries the
-                // design weight `w_row`, so its θ-derivative carries the SAME
-                // `w_row` (value/logdet/adjoint stay on one weighted branch).
+                // #991 - this row's ThresholdGate prior curvature in `htt` carries
+                // the design weight `w_row`, so its theta-derivative carries the
+                // SAME `w_row` (value/logdet/adjoint stay on one weighted branch).
                 let w_row = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
-                // #1415: P(ℓ)=λσ((ℓ−θ)/τ); P''(ℓ)=(λ/τ²)s(1−2a) so the third
-                // derivative is P'''(ℓ)=(λ/τ³)·s·(1−6a+6a²), because
-                // d/dℓ[s(1−2a)] = (1/τ)s[(1−2a)²−2s] = (1/τ)s(1−6a+6a²).
-                w_row
-                    * threshold_strength
-                    * slope
-                    * (1.0 - 6.0 * activation + 6.0 * activation * activation)
-                    * inv_tau
-                    * inv_tau
-                    * inv_tau
+                // #1415 gave `P''(l) = (lambda/tau^2) s (1-2a)` the third
+                // derivative `P'''(l) = (lambda/tau^3) s (1-6a+6a^2)`, and that is
+                // still exactly right for `A`. #2520 then made `B` install the PSD
+                // clamp of `P''` instead, so on the concave half (`1-2a < 0`,
+                // every logit the gate has switched ON) the majorizer is a hard
+                // `0` and its theta-adjoint is `0` too. Reading both derivatives
+                // off the SAME seam the value path reads is what stops the two
+                // from drifting apart again.
+                let curvature = crate::assignment::ThresholdGateLogitCurvature::eval(
+                    w_row * threshold_strength,
+                    self.assignment.logits[[row, diag_atom]],
+                    threshold,
+                    1.0 / temperature,
+                );
+                if exact_a {
+                    curvature.exact_hess_logit_derivative()
+                } else {
+                    curvature.majorized_hess_logit_derivative()
+                }
             }
             AssignmentMode::OrderedBetaBernoulli { .. } => {
                 // The assembled `htt` diagonal consumes
@@ -6648,6 +6660,7 @@ impl SaeManifoldTerm {
                                         atom,
                                         jets.vars[w],
                                         ordered_beta_bernoulli_channels.as_ref(),
+                                        exact_a,
                                     ),
                                 SaeLocalRowVar::Coord { atom, axis }
                                     if a == w && !ard_precisions[atom].is_empty() =>
@@ -7183,6 +7196,7 @@ impl SaeManifoldTerm {
                                         atom,
                                         jets.vars[w],
                                         ordered_beta_bernoulli_channels.as_ref(),
+                                        exact_a,
                                     ),
                                 SaeLocalRowVar::Coord { atom, axis }
                                     if a == w && !ard_precisions[atom].is_empty() =>

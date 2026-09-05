@@ -244,34 +244,44 @@ fn threshold_gate_sparse_operator_is_the_installed_exact_a_derivative_2500() {
         let block = operators
             .get(&sparse)
             .expect("#2500: the sparse coordinate must own a curvature operator");
-        // The exact-minus-majorizer delta has no threshold-gate part (the assembly
-        // installs the exact signed prior curvature, unmajorized), so
-        // `∂A/∂ρ_sparse` is the operator alone. Pin that rather than assume it.
+        let deflated = deflated_direction_count(&term, &cache);
+        // #2520 split the gate's signed logit curvature into a PSD clamp in `B`
+        // and a non-positive remainder in `dC`, so `dA/drho_sparse` is the
+        // operator PLUS that remainder's derivative. Both are degree-one in
+        // `lambda_sparse`, and the remainder is nonzero on exactly the logits the
+        // gate has switched ON -- which is what makes the straddling arm a
+        // different measurement from the other one, now that no ThresholdGate
+        // fixture can put a negative eigenvalue into `B` at all.
         let deltas = term
             .exact_stationarity_penalty_derivative_delta_by_flat(&rho, &cache)
             .expect("exact-minus-majorizer delta map");
-        assert!(
-            !deltas.contains_key(&sparse),
-            "#2500: ΔC carries no threshold-gate sparse part, so ∂A/∂ρ_sparse is the \
-             operator alone; a delta appearing here means this gate is comparing the \
-             wrong object"
-        );
-
-        let deflated = deflated_direction_count(&term, &cache);
+        let delta = deltas.get(&sparse);
         if straddle {
+            let mass = delta
+                .expect(
+                    "#2500: above the threshold `B` installs a hard zero, so the WHOLE of \
+                     dA/drho_sparse on those logits lives in the dC delta; its \
+                     absence is the sign error this gate was blind to",
+                )
+                .iter()
+                .fold(0.0_f64, |acc, v| acc.max(v.abs()));
             assert!(
-                deflated > 0,
-                "#2500: the straddling arm must actually exercise the spectral-deflation \
-                 stratum (the raw operator is exact without it, so a zero here would make \
-                 this arm a duplicate of the other)"
+                mass > 1.0e-3,
+                "#2500: the straddling arm must carry a MATERIAL clamped remainder, else it \
+                 is a duplicate of the below-threshold arm; max|delta| = {mass:.3e}"
             );
         } else {
-            assert_eq!(
-                deflated, 0,
-                "#2500: the below-threshold arm must be deflation-free, so it isolates the \
-                 operator from the deflation map"
+            assert!(
+                delta.is_none(),
+                "#2500: below the threshold the clamp is inactive, so `B` IS `A` on the \
+                 logit slots and the delta map must carry no sparse entry -- that \
+                 is what isolates this arm from the clamped one"
             );
         }
+        let expected = match delta {
+            Some(d) => block + d,
+            None => block.clone(),
+        };
 
         let dense_a = |r: &SaeManifoldRho| -> (Array2<f64>, usize) {
             let (_l, c) = frozen_cache(&term, &target, r);
@@ -303,7 +313,7 @@ fn threshold_gate_sparse_operator_is_the_installed_exact_a_derivative_2500() {
         for i in 0..dim {
             for j in 0..dim {
                 let fd = (a_plus[[i, j]] - a_minus[[i, j]]) / (2.0 * h);
-                let analytic = block[[i, j]];
+                let analytic = expected[[i, j]];
                 let err = (fd - analytic).abs();
                 let tol = 1.0e-7 + 1.0e-5 * analytic.abs();
                 if err / tol > worst {
@@ -810,5 +820,47 @@ fn dense_exact_a_matches_finite_difference_of_the_kkt_gradient_2330() {
             fd[worst_idx],
             directional_fd / directional,
         );
+    }
+}
+
+#[test]
+fn threshold_gate_priced_clamp_theta_diagonal_matches_finite_difference_2820() {
+    let (term, target, rho) = threshold_gate_tiny_fixture(true);
+    let (_, cache) = frozen_cache(&term, &target, &rho);
+    let derivative = term
+        .ard_concave_clamp_dt_diagonal(&rho, &cache)
+        .expect("priced-clamp theta derivative");
+    let h = 1.0e-5;
+    let mut live = 0;
+    for (row, atom, slot) in logit_slots(&term, &cache) {
+        let mut plus = term.clone();
+        let mut minus = term.clone();
+        plus.assignment.logits[[row, atom]] += h;
+        minus.assignment.logits[[row, atom]] -= h;
+        let ep = plus
+            .materialize_ard_concave_clamp_diagonal(&rho, &cache)
+            .expect("positive endpoint remainder");
+        let em = minus
+            .materialize_ard_concave_clamp_diagonal(&rho, &cache)
+            .expect("negative endpoint remainder");
+        for index in 0..derivative.len() {
+            let fd = (ep[index] - em[index]) / (2.0 * h);
+            let expected = if index == slot { derivative[slot] } else { 0.0 };
+            assert!(
+                (fd - expected).abs() <= 1.0e-9 + 1.0e-7 * expected.abs(),
+                "row={row} atom={atom} output={index}: analytic={expected:e}, fd={fd:e}"
+            );
+        }
+        live += usize::from(derivative[slot].abs() > 1.0e-3);
+    }
+    assert!(live >= term.n_obs(), "the concave logit channel must be live");
+
+    let mut fixed = term.clone();
+    fixed.assignment.ungated[0] = true;
+    let fixed_derivative = fixed
+        .ard_concave_clamp_dt_diagonal(&rho, &cache)
+        .expect("fixed-logit clamp derivative");
+    for (_, atom, slot) in logit_slots(&fixed, &cache) {
+        assert_eq!(fixed_derivative[slot], if atom == 0 { 0.0 } else { derivative[slot] });
     }
 }

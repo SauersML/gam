@@ -85,46 +85,29 @@ pub(crate) const fn sae_exact_stationarity_block_bytes(dim: usize) -> usize {
     dim.saturating_mul(dim).saturating_mul(SAE_BYTES_PER_F64)
 }
 
-/// How many `dim × dim`-scale f64 blocks the exact route holds live at once.
+/// Conservative count of named dense allocations in the exact-A route.
 ///
-/// This is an ENUMERATION of named bindings read off the allocating code, not a
-/// fitted multiplier. At the peak — the `coordinate` spectral block being built
-/// inside `materialize_exact_hessian_quotient_geometry`, the heavier of the two
-/// consumers — the following are simultaneously live:
+/// At the peak in the coordinate basin differential, these allocations can
+/// coexist. Every rectangular factor below is bounded by `dim × dim`; adding
+/// those individual bounds is conservative for every negative-subspace rank.
 ///
-///   1. `joint.operator`            — the materialized `A` (dim × dim)
-///   2. `joint.eigenvectors`        — its eigenbasis (dim × dim)
-///   3. `priced_joint_inverse`      — the priced pseudo-inverse (dim × dim)
-///   4. the `coordinate` block's own `operator` (`a_tt_block`, total_t × total_t)
-///   5. the `coordinate` block's `eigenvectors` (total_t × total_t)
-///   6. `eigh`'s own eigenvector output / LAPACK working copy of the operator
-///   7. `priced_coordinate_inverse` (dim × dim), plus its `_small` source
+///   1–5. joint operator, joint eigenvectors, joint differential, coordinate
+///        operator, coordinate eigenvectors.
+///   6–8. classified basin's negative basis, rotation, rotated basis.
+///   9–10. coordinate A differential and restricted basin inverse.
+///   11–13. complement basis, E cross block, Sylvester response.
+///   14–15. first cross-product temporary and embedded symmetric cross block.
 ///
-/// There is no longer a second branch to compare against. `a386c1e8b` (#2674)
-/// deleted the gauge-reduced path of `exact_hessian_spectral_block` entirely --
-/// it had been diagonalising `ZᵀAZ` on the complement of a declared chart-gauge
-/// orbit that the penalized objective is *not* flat along, so the deletion was
-/// the fix, not a refactor. The locals this comment used to cite as the
-/// comparable count (`reduced_operator`, `e_times_complement`, `reduced_e`,
-/// `reduced_eigenvectors`) no longer exist anywhere in that file.
-///
-/// `cluster_stable_eigh` also no longer materializes the diagonal attribution
-/// operator as a dense `dim x dim` matrix: its cluster restriction is accumulated
-/// directly from `e_diag`, so that former dense live block is genuinely absent.
-///
-/// The enumeration above is therefore the whole population, and 7 stands on it
-/// alone: it is still a LOWER bound on LAPACK's internal workspace, which
-/// `dsyevd` sizes at its own discretion.
-///
-/// Kept as an enumeration rather than a measured peak deliberately (#2724): the
-/// count is auditable against the code, where a measured number would drift
-/// silently the next time an allocation is added.
-pub(crate) const SAE_EXACT_STATIONARITY_LIVE_DIM_BLOCKS: usize = 7;
+/// The scalar value stops at basin classification and has a smaller live set.
+/// The coordinate eigensolve and final zero-border embedding also fit within
+/// this bound. Backend eigensolver/BLAS workspace remains additional to these
+/// named Rust allocations. Update this enumeration when the allocating code
+/// in `construction_exact_hessian.rs` changes.
+pub(crate) const SAE_EXACT_STATIONARITY_LIVE_DIM_BLOCKS: usize = 15;
 
 /// Resident bytes of the exact stationarity route at its peak.
 pub(crate) const fn sae_exact_stationarity_resident_bytes(dim: usize) -> usize {
-    sae_exact_stationarity_block_bytes(dim)
-        .saturating_mul(SAE_EXACT_STATIONARITY_LIVE_DIM_BLOCKS)
+    sae_exact_stationarity_block_bytes(dim).saturating_mul(SAE_EXACT_STATIONARITY_LIVE_DIM_BLOCKS)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

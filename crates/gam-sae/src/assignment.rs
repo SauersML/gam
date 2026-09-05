@@ -1681,6 +1681,8 @@ pub(crate) struct ThresholdGateLogitCurvature {
     activation: f64,
     exact: f64,
     majorized: f64,
+    exact_logit_derivative: f64,
+    majorized_logit_derivative: f64,
 }
 
 impl ThresholdGateLogitCurvature {
@@ -1694,10 +1696,33 @@ impl ThresholdGateLogitCurvature {
         // multiplies. The clamp acts on the second and scales with the first.
         let magnitude = strength * slope * inv_tau * inv_tau;
         let signed = 1.0 - 2.0 * activation;
+        // The logit derivative of BOTH curvatures, from the SAME evaluation, so
+        // no theta-adjoint can differentiate a function no route installs.
+        //
+        // Writing `C` for the dimensionless clamp
+        // ([`gam_linalg::utils::smooth_psd_clamp`] at unit prefactor) and using
+        // `da/dl = s/tau`, `ds/dl = s(1-2a)/tau`, hence
+        // `d(magnitude)/dl = strength*s*(1-2a)/tau^3` and `d(signed)/dl = -2s/tau`:
+        //
+        //   d(exact)/dl     = strength*s*(1-6a+6a^2)/tau^3        (`C` = identity)
+        //   d(majorized)/dl = strength*s/tau^3 * [(1-2a)*C(1-2a) - 2s*C'(1-2a)]
+        //
+        // The two coincide wherever the clamp is inactive (`C(x) = x`, `C' = 1`
+        // gives `(1-2a)^2 - 2s = 1-6a+6a^2` exactly); the majorized one is `0`
+        // on the deep concave half where `B` carries a hard `0`; and at the seam
+        // (`a = 1/2`) it is HALF the exact value -- the C-1 average of the hard
+        // clamp's two one-sided slopes, which is what #2339's smoothing is for.
+        let signed_clamp = gam_linalg::utils::smooth_psd_clamp(1.0, signed);
+        let signed_clamp_slope = gam_linalg::utils::smooth_psd_clamp_slope(signed);
+        let third_scale = strength * slope * inv_tau * inv_tau * inv_tau;
         Self {
             activation,
             exact: magnitude * signed,
             majorized: gam_linalg::utils::smooth_psd_clamp(magnitude, signed),
+            exact_logit_derivative: third_scale
+                * (1.0 - 6.0 * activation + 6.0 * activation * activation),
+            majorized_logit_derivative: third_scale
+                * (signed * signed_clamp - 2.0 * slope * signed_clamp_slope),
         }
     }
 
@@ -1717,6 +1742,23 @@ impl ThresholdGateLogitCurvature {
     pub(crate) fn negative_hessian_remainder(self) -> f64 {
         self.exact - self.majorized
     }
+
+    /// Logit derivative of [`Self::psd_majorizer_hess`] -- the theta-adjoint of
+    /// the curvature `B` actually installs, and the ThresholdGate twin of
+    /// `SaeManifoldTerm::ard_majorized_hessian_derivative`. It must exist
+    /// because #2520 replaced the raw signed curvature in `B` with the clamp,
+    /// which left the pre-#2520 third derivative `P'''` differentiating an
+    /// operator no route installs any more.
+    pub(crate) fn majorized_hess_logit_derivative(self) -> f64 {
+        self.majorized_logit_derivative
+    }
+
+    /// Logit derivative of the UNCLAMPED signed curvature that `A = B + dC`
+    /// carries: `P'''(l) = (lambda/tau^3)*s*(1-6a+6a^2)` (#1415).
+    pub(crate) fn exact_hess_logit_derivative(self) -> f64 {
+        self.exact_logit_derivative
+    }
+
 }
 
 /// The ΔC channel of the ThresholdGate prior: the non-positive remainder

@@ -370,24 +370,39 @@ fn sae_exact_a_theta_adjoint_gap_measure_2330_patchd() {
     }
     probes.truncate(8);
 
-    // #2330 Patch D arbiter bounds. The COORDINATE channel is the residual-curvature
-    // target of Patch D and is exact; assert it tightly. The LOGIT channel is
-    // improved from wrong-sign (baseline analytic −226 vs fd +133) to right-sign
-    // near-magnitude, but retains a known ~1.43-abs residual on the signal slot
-    // (≈1.8% at this fixture's fd≈133) from a SEPARATE base-θ-adjoint defect: the
-    // ordered-Beta–Bernoulli logit-logit second jet (∂²gate/∂ℓ²) in
-    // `row_jets_for_logdet` is still softmax-shaped. Tracked as the #2330 child
-    // issue; when it lands, tighten LOGIT_TOL to COORD_TOL. This is NOT xfail —
-    // the logit channel is asserted at its true (improved) accuracy, not skipped.
+    // This state has a narrow admitted basin: a 1e-4 coordinate perturbation
+    // can leave it, and at 1e-5 central-difference truncation was almost 1%.
+    // Verify convergence of the scalar oracle itself before comparing it with
+    // the analytic derivative. Richardson removes its leading O(h²) term.
     const COORD_TOL: f64 = 1.0e-3;
     const LOGIT_TOL: f64 = 3.0e-2;
     let mut max_coord_rel = 0.0_f64;
     let mut max_logit_rel = 0.0_f64;
-
-    for &h in &[1.0e-4_f64, 1.0e-5] {
-        for &(row, local, var) in &probes {
+    for &(row, local, var) in &probes {
+        // Logits move on the gate-temperature scale. Their response is O(1),
+        // so tiny coordinate-sized steps amplify the scalar eigensolve's
+        // rounding error. Coordinate responses here reach O(1e4), and need
+        // the smaller step to remain inside the admitted basin.
+        let coarse_step = match var {
+            SaeLocalRowVar::Logit { .. } => match term.assignment.mode {
+                AssignmentMode::OrderedBetaBernoulli { temperature, .. } => 1.0e-3 * temperature,
+                _ => unreachable!("OBB fixture"),
+            },
+            SaeLocalRowVar::Coord { .. } => 1.0e-5,
+        };
+        let mut estimates = [0.0_f64; 3];
+        for (step_index, divisor) in [1.0_f64, 2.0, 4.0].into_iter().enumerate() {
+            let h = coarse_step / divisor;
             let mut plus = term.clone();
             let mut minus = term.clone();
+            // Clone drops these lagged operands. Preserve the same frozen
+            // Newton objective whose Hessian/third derivative is contracted.
+            for endpoint in [&mut plus, &mut minus] {
+                endpoint.decoder_repulsion_gate = term.decoder_repulsion_gate.clone();
+                endpoint.barrier_coactivation_gate = term.barrier_coactivation_gate.clone();
+                endpoint.amplitude_barrier_gate = term.amplitude_barrier_gate;
+                endpoint.streaming_gates_frozen = true;
+            }
             match var {
                 SaeLocalRowVar::Logit { atom } => {
                     plus.assignment.logits[[row, atom]] += h;
@@ -403,32 +418,35 @@ fn sae_exact_a_theta_adjoint_gap_measure_2330_patchd() {
                     minus.assignment.coords[atom].set_flat(fm.view());
                 }
             }
-            let analytic = gamma.t[cache.row_offsets[row] + local];
-            match (
-                fixed_state_exact_a_logdet(plus, &target, &rho),
-                fixed_state_exact_a_logdet(minus, &target, &rho),
-            ) {
-                (Some(a), Some(b)) => {
-                    let fd = (a - b) / (2.0 * h);
-                    let abs_err = (fd - analytic).abs();
-                    let rel = abs_err / (1.0 + fd.abs().max(analytic.abs()));
-                    if h == 1.0e-5 {
-                        match var {
-                            SaeLocalRowVar::Coord { .. } => max_coord_rel = max_coord_rel.max(rel),
-                            SaeLocalRowVar::Logit { .. } => max_logit_rel = max_logit_rel.max(rel),
-                        }
-                    }
-                    eprintln!(
-                        "PATCHD_GAP h={h:.1e} row={row} local={local} var={var:?} \
-                         fd={fd:.6e} analytic={analytic:.6e} abs_err={abs_err:.3e} rel={rel:.3e}"
-                    );
-                }
-                _ => eprintln!(
-                    "PATCHD_GAP h={h:.1e} row={row} local={local} var={var:?} \
-                     perturbed A refused; analytic={analytic:.6e}"
-                ),
-            }
+            let a = fixed_state_exact_a_logdet(plus, &target, &rho)
+                .expect("every positive finite-difference endpoint must be admitted");
+            let b = fixed_state_exact_a_logdet(minus, &target, &rho)
+                .expect("every negative finite-difference endpoint must be admitted");
+            estimates[step_index] = (a - b) / (2.0 * h);
         }
+        let coarse = (4.0 * estimates[1] - estimates[0]) / 3.0;
+        let fine = (4.0 * estimates[2] - estimates[1]) / 3.0;
+        let tolerance = match var {
+            SaeLocalRowVar::Coord { .. } => COORD_TOL,
+            SaeLocalRowVar::Logit { .. } => LOGIT_TOL,
+        };
+        let oracle_error = (fine - coarse).abs() / (1.0 + fine.abs().max(coarse.abs()));
+        assert!(
+            oracle_error < tolerance,
+            "row={row} var={var:?}: scalar FD oracle has not converged: estimates={estimates:?}, Richardson error={oracle_error:e}"
+        );
+        let analytic = gamma.t[cache.row_offsets[row] + local];
+        let rel = (fine - analytic).abs() / (1.0 + fine.abs().max(analytic.abs()));
+        // Charge the oracle's remaining uncertainty to the same error budget
+        // instead of allowing it in addition to the derivative tolerance.
+        let accounted_error = rel + oracle_error;
+        match var {
+            SaeLocalRowVar::Coord { .. } => max_coord_rel = max_coord_rel.max(accounted_error),
+            SaeLocalRowVar::Logit { .. } => max_logit_rel = max_logit_rel.max(accounted_error),
+        }
+        eprintln!(
+            "PATCHD_GAP row={row} local={local} var={var:?} fd={fine:.9e} analytic={analytic:.9e} rel={rel:.3e} oracle_error={oracle_error:.3e}"
+        );
     }
     eprintln!("PATCHD_ARBITER max_coord_rel={max_coord_rel:.3e} max_logit_rel={max_logit_rel:.3e}");
     assert!(
@@ -437,9 +455,7 @@ fn sae_exact_a_theta_adjoint_gap_measure_2330_patchd() {
     );
     assert!(
         max_logit_rel < LOGIT_TOL,
-        "exact-A theta-adjoint logit channel regressed past the known residual: \
-         max_logit_rel={max_logit_rel:.3e} >= {LOGIT_TOL:.1e} (tighten once the #2330 child \
-         OBB logit-logit second-jet defect is fixed)"
+        "exact-A theta-adjoint logit channel must match FD: max_logit_rel={max_logit_rel:.3e} >= {LOGIT_TOL:.1e}"
     );
 }
 
