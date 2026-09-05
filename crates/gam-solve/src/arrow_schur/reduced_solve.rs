@@ -6755,6 +6755,37 @@ pub enum ArrowSchurError {
 
 impl ArrowSchurError {
 
+    /// Whether this refusal is a Schur complement that is merely not positive
+    /// definite — a RELOCATABLE trial point rather than a defect.
+    ///
+    /// The distinction is the caller's next move: an indefinite complement means
+    /// the point is in an indefinite basin adjacent to a PD optimum, so the trial
+    /// can be refused and the search steered, whereas a non-finite or non-square
+    /// operator is a defect no relocation fixes. gam-sae's outer ρ-search is
+    /// exactly that caller — it reads an indefinite complement as `+∞` and steers
+    /// ρ back into the PD region (#1782).
+    ///
+    /// ⚠ #2598 — this predicate exists because that caller was recovering the
+    /// same verdict by matching TWO substrings of [`Display`]'s output
+    /// (`"Schur complement Cholesky failed"` and `"not positive definite"`) on a
+    /// `String`-typed spine. The information was already a type here and was
+    /// being rendered to prose and reconstructed, across a crate boundary:
+    /// rewording either message below would have silently reclassified every
+    /// recoverable Schur refusal as a fatal defect with nothing failing. The
+    /// conjunct is preserved exactly — the discriminant carries the first
+    /// substring and `reason` carries the second — so a `SchurFactorFailed`
+    /// whose reason is a non-finite entry, a non-square operator or an
+    /// unavailable device still reports `false` and stays fatal.
+    ///
+    /// [`Display`]: std::fmt::Display
+    pub fn is_non_pd_schur_complement(&self) -> bool {
+        matches!(
+            self,
+            ArrowSchurError::SchurFactorFailed { reason }
+                if reason.contains("not positive definite")
+        )
+    }
+
     /// [`Self::is_non_pd_schur_complement`], read off a message that has already
     /// been rendered — the same verdict for a caller that no longer holds the
     /// value.

@@ -6796,3 +6796,77 @@ fn matrix_free_exact_a_prices_a_clamp_basin_before_refusing_a_saddle_2515() {
          {rational_refusal}"
     );
 }
+
+/// #2598 — the rendered-message reader and the value predicate must agree on
+/// EVERY variant, so that rewording `Display` cannot change one without the
+/// other.
+///
+/// This is the gate that makes `rendered_is_non_pd_schur_complement` safe for a
+/// cross-crate caller. gam-sae's ρ-probe classifier sees only the rendered
+/// string, and the verdict decides whether a refusal is a relocatable trial
+/// point (`+∞`, the outer search steers) or a fatal defect. Before this, that
+/// decision was two string literals sitting in another crate: rewording either
+/// message in the `Display` impl reclassified every recoverable Schur refusal
+/// as fatal, and no test anywhere would have failed. Now the reword and the
+/// reader are in one file and this test fails the moment they disagree.
+///
+/// The list below is every variant, each with a reason chosen to be adversarial
+/// for this pairing: a per-row refusal and a PCG refusal whose own reasons name
+/// a non-PD operator (both must be `false` on both sides), and a Schur refusal
+/// whose reason does not (also `false` on both sides).
+#[test]
+fn rendered_verdict_matches_the_value_verdict_for_every_variant_2598() {
+    let cases = [
+        ArrowSchurError::SchurFactorFailed {
+            reason: "non-PD pivot -2.5e-09 at index 2 (matrix is not positive definite)"
+                .to_string(),
+        },
+        ArrowSchurError::SchurFactorFailed {
+            reason: "cholesky_lower: non-finite entry at linear index 7".to_string(),
+        },
+        ArrowSchurError::SchurFactorFailed {
+            reason: "cholesky_lower: non-square 3x4".to_string(),
+        },
+        ArrowSchurError::PerRowFactorFailed {
+            row: 3,
+            reason: "non-PD pivot -1e-12 at index 0 (matrix is not positive definite)".to_string(),
+        },
+        ArrowSchurError::PerRowFactorIllConditioned {
+            row: 1,
+            kappa_estimate: 1e18,
+        },
+        ArrowSchurError::PcgFailed {
+            reason: "residual stalled while the operator is not positive definite".to_string(),
+        },
+        ArrowSchurError::UnboundedNegativeCurvature {
+            curvature: -3.5e-4,
+            direction_norm_sq: 2.0,
+        },
+        ArrowSchurError::AdaptiveCorrectionFailed {
+            reason: "no Armijo-accepted step; the operator is not positive definite".to_string(),
+        },
+    ];
+    let mut saw_recoverable = false;
+    for error in &cases {
+        let rendered = error.to_string();
+        assert_eq!(
+            ArrowSchurError::rendered_is_non_pd_schur_complement(&rendered),
+            error.is_non_pd_schur_complement(),
+            "the rendered reader and the value predicate disagree on {error:?}; \
+             rendered as {rendered:?}"
+        );
+        saw_recoverable |= error.is_non_pd_schur_complement();
+    }
+    assert!(
+        saw_recoverable,
+        "the agreement above is vacuous unless at least one case is recoverable"
+    );
+
+    // The caller wraps the rendered text in its own context before classifying,
+    // so the reader must survive that wrapping.
+    let wrapped = format!(
+        "SaeManifoldTerm::penalized_quasi_laplace_criterion: {}",
+        cases[0]
+    );
+    assert!(ArrowSchurError::rendered_is_non_pd_schur_complement(&wrapped));
+}

@@ -417,3 +417,37 @@ committed-index limitation remains for the infrastructure and line-count checks.
 The remaining historical inventory is still open. A successful source census,
 or the restoration of these few contracts, does not establish that all 303
 historically deleted pinned identities have been recovered or retired.
+
+## Boundary backoff: #2695 — a reversal, not a loss
+
+`a_clipped_step_stops_one_tolerance_short_of_the_face_2695` is absent, and it
+must stay absent. Its subject was not deleted by the sweep; it was **reversed by
+a later, documented decision**, so restoring the historical body would assert a
+contract production deliberately abandoned and would fail for the right reason
+in the wrong direction.
+
+The test asserted that a clipped step stops one `PRIMAL_FEASIBILITY_TOL` short
+of its blocking face, and that the surviving margin does not depend on the
+direction's length. `apply_feasible_step_boundary_backoff` in
+`crates/gam-models/src/marginal_slope_shared.rs` now returns the clamped ratio
+unchanged, and its own doc comment names and rejects exactly that rule:
+
+> any rule that stops the iterate short of the face — the old `0.995·α` [...]
+> and the one-tolerance retreat that replaced it (which parked the iterate at
+> scaled slack exactly `1e-8`, a hundred times outside the face tolerance) —
+> leaves the row permanently inactive.
+
+The replacement contract is stated in the same file and is live: a clipped step
+lands ON its blocking face so the row can enter the active-set working face, and
+a direction pointing into an already-active row gets `α = 0`, which the caller
+answers with a projection rather than a shorter step. Two tests beside it
+exercise the surviving rule —
+`feasible_step_fraction_refuses_a_non_finite_direction_2721` and
+`feasible_step_fraction_admits_a_sub_tolerance_drift_off_an_active_row` — and
+both carry their own positive controls. The `unit_box` fixture the historical
+test used is still present in that module, so this retirement is not a
+restorability failure.
+
+Recorded as retired, not recovered. This is a distinct category from the pins in
+the sections above: those had surviving subjects and were rebuilt; this one has
+a subject that production repudiated.
