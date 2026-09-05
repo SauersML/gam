@@ -2598,7 +2598,7 @@ pub struct ReducedSchurNegativeCurvature {
 /// # Why this is a statement about the ITERATE
 ///
 /// The lift `L` satisfies `[L(v); v]ᵀ H [L(v); v] = vᵀ S v` exactly (see
-/// [`arrow_lift_border_direction`]). So a negative `curvature` here is not a
+/// `arrow_lift_border_direction`). So a negative `curvature` here is not a
 /// property of the reduced surrogate that might vanish in the full problem: it
 /// is negative curvature of the fit's own objective at this point, and a fit
 /// reporting convergence there has converged to something that is not a local
