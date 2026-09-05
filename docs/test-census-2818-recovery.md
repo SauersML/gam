@@ -132,6 +132,28 @@ off-diagonal reconstruction to 1.11e-16 on two spectrally deflated rows. That
 block-reconstruction result is distinct from the still-pending
 deflation-adjoint sensitivity requirement.
 
+## Channel-aware canonicalization: #1590
+
+The public integration target
+`crates/gam-identifiability/tests/canonical_recovery.rs` restores two historical
+contracts through `canonicalize_for_identifiability_with_operating_scalars`,
+with no deleted canonicalization wrapper or production change.
+
+| Historical test identity | Executed replacement contract |
+| --- | --- |
+| `canonical_dead_column_callback_block_is_not_reduced_1590` | The channel-aware audit detects an identically zero column in each cause's design, while each family-owned callback retains its raw coefficient width. Nonzero coefficients lift identically; returning zeros would fail this stronger identity check. |
+| `penalty_covered_competing_risks_redundancy_canonicalises_cleanly_1590` | Two channel-aware blocks have eight coefficients but six independent likelihood directions. Canonicalization retains seven coefficients, preserves all six data directions, and pulls back each identity penalty to an identity on the retained coordinates. The remaining data-null coefficient stays identified by its penalty. Independent Gram eigendecompositions verify the raw and retained ranks. |
+
+Both tests passed on MSI: **2 passed, 0 failed, 0 ignored, 0 filtered**, in 0.13
+seconds after an 8.13-second warm integration-target build. The executed test
+blob is `79ccbc0b7204c2a0bb58ffe985ca8c1e883f622b`; the log is
+`.buildd/identifiability-recovered-pins-2818.log`. The production audit/kernel
+blobs match published main `1df6210f50aaab1f49366ac18afcf3b98fee28c2` exactly.
+The canonicalization source on MSI differs only by four already-published
+`#[cfg(test)]` #2748 gates absent from that worktree; its production code is
+identical. This integration run therefore supplies no execution evidence for
+those four separate unit tests.
+
 The remaining historical inventory is still open. A successful source census,
 or the restoration of these few contracts, does not establish that all 303
 historically deleted pinned identities have been recovered or retired.
