@@ -1023,6 +1023,33 @@ fn coordinate_partition_seed_fits_end_to_end() {
 }
 
 #[test]
+fn projector_distance_resolves_tiny_rotations_without_overlap_cancellation_2825() {
+    let current = ndarray::array![[1.0_f32, 0.0]];
+    for angle in [1.0e-5_f32, 1.0e-8, 1.0e-10] {
+        let next = ndarray::array![[1.0_f32, angle]];
+        let delta = angle as f64;
+        // Independent two-by-two ambient projector identity. The off-diagonal
+        // entries change by delta and the second diagonal by delta squared.
+        let expected =
+            ((2.0 * delta * delta + delta.powi(4)) / (1.0 + (1.0 + delta * delta).powi(2))).sqrt();
+        let measured = frame_fixed_point_residual(current.view(), next.view(), 1, 1).unwrap();
+        assert!(
+            measured > 0.0,
+            "a representable rotation must not collapse to zero"
+        );
+        assert!((measured - expected).abs() <= 32.0 * f64::EPSILON * expected);
+        let negated = next.mapv(|value| -value);
+        let gauge_changed =
+            frame_fixed_point_residual(current.view(), negated.view(), 1, 1).unwrap();
+        assert_eq!(measured, gauge_changed);
+    }
+    assert_eq!(
+        frame_fixed_point_residual(current.view(), current.view(), 1, 1).unwrap(),
+        0.0
+    );
+}
+
+#[test]
 fn tied_frame_stationarity_separates_normal_storage_error_from_tangent_signal_2825() {
     let current = ndarray::array![[0.6_f32, 0.8, 0.0]];
     let mut proposal = Array2::zeros((1, 3));

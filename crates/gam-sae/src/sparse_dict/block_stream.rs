@@ -801,7 +801,7 @@ impl BlockSparseStreamState {
                 candidate_decoder.view(),
                 self.g,
                 b,
-            )
+            )?
             .max(gradient_residual);
         }
         let ev = if tss <= 1.0e-24 {

@@ -442,7 +442,8 @@ fn a_large_spectral_shift_cannot_certify_a_nonstationary_frame() {
         state.decoder.view(),
         2,
         1,
-    );
+    )
+    .unwrap();
     assert!(displacement <= config.tolerance);
     assert!(stats.gamma_residual <= config.tolerance);
     assert!(stats.frame_residual > config.tolerance);

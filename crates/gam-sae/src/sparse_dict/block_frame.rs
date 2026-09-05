@@ -1,8 +1,62 @@
 //! Shared polar step and stationarity certificate for tied block projectors.
 
 use crate::frames::GrassmannFrame;
-use gam_linalg::faer_ndarray::FaerCholesky;
+use gam_linalg::faer_ndarray::{FaerCholesky, FaerSvd};
 use ndarray::{Array2, ArrayView2, ArrayViewMut2};
+
+/// Relative distance of the actual stored projectors, without subtracting
+/// order-one overlap traces to recover a tiny squared displacement.
+pub(super) fn stored_projector_distance(
+    current: ArrayView2<'_, f32>,
+    next: ArrayView2<'_, f32>,
+) -> Result<f64, String> {
+    if current
+        .iter()
+        .zip(next.iter())
+        .all(|(left, right)| left == right)
+    {
+        return Ok(0.0);
+    }
+    let u = current.t().mapv(f64::from);
+    let v = next.t().mapv(f64::from);
+    let gram_u = u.t().dot(&u);
+    let gram_v = v.t().dot(&v);
+    let scale = gram_u
+        .iter()
+        .chain(gram_v.iter())
+        .map(|value| value * value)
+        .sum::<f64>();
+    if scale == 0.0 {
+        return Ok(0.0);
+    }
+    // Orthogonal Procrustes changes only the gauge of V, including when the
+    // overlap is singular. It makes U'V symmetric, so the midpoint identity
+    // below has nonnegative terms in exact arithmetic.
+    let (left, _, right_t) = u
+        .t()
+        .dot(&v)
+        .svd(true, true)
+        .map_err(|error| format!("frame projector alignment: {error}"))?;
+    let left = left.ok_or("frame projector alignment omitted the left factor")?;
+    let right_t = right_t.ok_or("frame projector alignment omitted the right factor")?;
+    let aligned = v.dot(&right_t.t().dot(&left.t()));
+    let difference = &aligned - &u;
+    let midpoint = (&aligned + &u) * 0.5;
+    let gram_midpoint = midpoint.t().dot(&midpoint);
+    let gram_difference = difference.t().dot(&difference);
+    let mixed = midpoint.t().dot(&difference);
+    // VV'-UU' = SD'+DS'. Its squared Frobenius norm is
+    // 2 tr(S'S D'D) + 2 tr((S'D)^2). Compute the latter trace explicitly,
+    // retaining any roundoff skew rather than assuming exact symmetry.
+    let mut distance_sq = 0.0;
+    for i in 0..mixed.nrows() {
+        for j in 0..mixed.ncols() {
+            distance_sq += 2.0
+                * (gram_midpoint[[i, j]] * gram_difference[[j, i]] + mixed[[i, j]] * mixed[[j, i]]);
+        }
+    }
+    Ok((distance_sq.max(0.0) / scale).sqrt())
+}
 
 /// Increase the Rayleigh surrogate `tr(U' H U)` by polarizing `(H+sI)U`,
 /// where the caller supplies a shift that makes `H+sI` positive semidefinite.

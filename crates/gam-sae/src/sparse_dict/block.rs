@@ -1504,50 +1504,27 @@ fn seed_frames_by_policy(
 }
 
 /// Relative Grassmann-projector displacement between two block dictionaries.
-/// For each block this evaluates `||DᵀD-EᵀE||_F` from only `b×b` frame
-/// overlaps. The expression uses the measured projector norms rather than
-/// assuming exact floating-point orthonormality, so identical stored frames have
-/// exactly zero residual. Every term is invariant to independent `O(b)` changes
-/// of basis in either frame.
+/// Align each pair of frames before evaluating `||DᵀD-EᵀE||_F` from their
+/// difference and midpoint, using only `P×b` arrays and `b×b` contractions.
+/// This preserves tiny displacements without subtracting order-one overlap
+/// traces. Normalize by the measured projector norms; identical stored frames
+/// have exactly zero residual without assuming floating-point orthonormality.
 pub(super) fn frame_fixed_point_residual(
     previous: ArrayView2<'_, f32>,
     next: ArrayView2<'_, f32>,
     n_blocks: usize,
     b: usize,
-) -> f64 {
+) -> Result<f64, String> {
     (0..n_blocks)
         .into_par_iter()
         .map(|block| {
-            let mut previous_norm2 = 0.0_f64;
-            let mut next_norm2 = 0.0_f64;
-            let mut overlap = 0.0_f64;
-            for left_axis in 0..b {
-                for right_axis in 0..b {
-                    let mut previous_dot = 0.0_f64;
-                    let mut next_dot = 0.0_f64;
-                    let mut cross_dot = 0.0_f64;
-                    for column in 0..previous.ncols() {
-                        previous_dot += previous[[block * b + left_axis, column]] as f64
-                            * previous[[block * b + right_axis, column]] as f64;
-                        next_dot += next[[block * b + left_axis, column]] as f64
-                            * next[[block * b + right_axis, column]] as f64;
-                        cross_dot += previous[[block * b + left_axis, column]] as f64
-                            * next[[block * b + right_axis, column]] as f64;
-                    }
-                    previous_norm2 += previous_dot * previous_dot;
-                    next_norm2 += next_dot * next_dot;
-                    overlap += cross_dot * cross_dot;
-                }
-            }
-            let scale = previous_norm2 + next_norm2;
-            let distance2 = (scale - 2.0 * overlap).max(0.0);
-            if scale == 0.0 {
-                if distance2 == 0.0 { 0.0 } else { f64::INFINITY }
-            } else {
-                (distance2 / scale).sqrt()
-            }
+            super::block_frame::stored_projector_distance(
+                previous.slice(ndarray::s![block * b..(block + 1) * b, ..]),
+                next.slice(ndarray::s![block * b..(block + 1) * b, ..]),
+            )
+            .map_err(|error| format!("frame projector block {block}: {error}"))
         })
-        .reduce(|| 0.0, f64::max)
+        .try_reduce(|| 0.0_f64, |left, right| Ok(left.max(right)))
 }
 
 pub(super) fn relative_scalar_change(previous: f32, current: f32) -> f64 {
@@ -2202,7 +2179,7 @@ fn fit_block_sparse_dictionary_with_seed_inner(
         );
         gamma_residual = relative_scalar_change(state.gamma, step.next.gamma);
         frame_residual =
-            frame_fixed_point_residual(state.decoder.view(), step.next.decoder.view(), g, b)
+            frame_fixed_point_residual(state.decoder.view(), step.next.decoder.view(), g, b)?
                 .max(step.frame_stationarity);
         accepted_births = step.accepted_births;
         polar_failures = step.polar_failures;
