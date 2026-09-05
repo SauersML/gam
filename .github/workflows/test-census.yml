@@ -24,6 +24,14 @@ jobs:
           python-version: '3.12'
       - name: Verify the census detects planted losses
         run: python -m unittest discover -s scripts/tests -p test_test_census.py -v
+      - name: Positive control against the sweep this gate exists for
+        # A census that has stopped detecting anything is byte-identical to a
+        # census over a tree that lost nothing, so point the instrument at a
+        # known loss on every run: c0a21b554 and its parent, fetched by SHA.
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=2 origin c0a21b5540ce76b76f62d880addf2612246ce1ee
+          python scripts/test_census.py --positive-control
       - name: Compare immutable source inventories
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}

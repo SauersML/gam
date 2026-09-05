@@ -25,10 +25,38 @@ conditions. This is a source census, not an assertion that declarations are
 registered, compiled, or executed; compiled test listings and runtime verdicts
 are separately required to prove regression coverage.
 
-A decreased total count or missing issue-pinned identity fails the gate. The
-comparison's base commit supplies the independent baseline, so deleting both a
-test and its documentation cannot make the loss disappear. An empty source,
-test, or pin denominator is a failure even with a removal acknowledgement.
+A decreased total count, a compilation unit that lost tests, or a missing
+issue-pinned identity fails the gate. The comparison's base commit supplies the
+independent baseline, so deleting both a test and its documentation cannot make
+the loss disappear. An empty source, test, or pin denominator is a failure even
+with a removal acknowledgement.
+
+Three assertions run, because each is blind to a loss the others see.
+
+The comparison against the base names the exact identities that went missing,
+but it sees one step and its workspace totals let growth in one crate pay for
+deletion in another — the shape #2818 actually had. `unit_test_decreases`
+reports the per-crate view of the same step: `crates/<name>` for anything under
+a crate, and the top-level `tests` and `src` suites otherwise.
+
+`docs/test-census-floor.json` is a high-water mark that does not depend on which
+base the gate was handed, so a broken incremental chain cannot launder a loss.
+It records a minimum per compilation unit and a minimum per issue number, where
+an issue number is the trailing three-or-more-digit suffix a pinned test name
+carries. Grouping pins by issue rather than by name is deliberate: a test may be
+renamed while still answering for its bug, and over the 39 first-parent commits
+preceding `1c0153f19` two pin names changed while no issue group shrank.
+Lowering a floor entry is a source edit reviewers can see, and it belongs in the
+same change as the `docs/test-census-changes.json` entry that explains the loss.
+Regenerate it with `python scripts/test_census.py --head HEAD --update-floor`.
+
+`python scripts/test_census.py --positive-control` re-measures `c0a21b554`, the
+commit this gate exists for, and requires that the census still reports its
+2,290 lost tests, 300 lost pinned names and 21 units that lost tests, and still
+refuses the change without an acknowledgement. A lexer or comparison change that
+moves those numbers has to move them in `CONTROL` too, in review. The gate runs
+this control on every invocation, so a census that has quietly stopped detecting
+anything cannot report green.
 
 For an intentional removal, append one object to `docs/test-census-changes.json`
 in the same change, with these exact fields:
@@ -50,5 +78,6 @@ census does not discharge historical missing pins in #2818: those require
 individual recovery or recorded retirement, plus actual execution evidence.
 
 The census workflow runs for every main push without cancelling superseded
-commits. It also runs its planted-loss and empty-population controls. Its JSON
-artifact records both complete source inventories and the comparison subjects.
+commits. It also runs its planted-loss and empty-population controls, and the
+`c0a21b554` positive control above. Its JSON artifact records both complete
+source inventories, the floor in force, and the comparison subjects.

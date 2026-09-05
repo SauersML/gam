@@ -5,6 +5,7 @@
     "removed_pins": {
       "co_routed_frame_sweep_is_fixed_code_descent_2634": 1
     },
+    "unit_test_decreases": {},
     "reason": "The former oracle froze the signed codes while moving a tied decoder. Replace it with an oracle that recomputes the projection codes and tests the actual reconstruction objective.",
     "evidence": "co_routed_frame_sweep_is_tied_code_descent_2634 and one_shot_frame_sweep_prices_both_occurrences_of_the_tied_decoder_2825 pass on MSI. All 22 block tests and 10 streaming block tests pass in the combined 49-test run (47 passed; two unrelated exact-A tests failed). The independent f64 witness decreases tied RSS from 0.9222695679075822 to 0.22877474858944658."
   }
