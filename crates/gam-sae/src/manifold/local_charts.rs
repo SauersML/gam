@@ -78,6 +78,10 @@ use gam_linalg::faer_ndarray::FaerSvd;
 use super::AtlasOrientability;
 use super::intrinsic_seed::farthest_point_landmarks;
 
+#[cfg(test)]
+#[path = "local_chart_recovery_tests.rs"]
+mod recovered_transition_tests;
+
 /// The `d`-th captured singular value must exceed this fraction of the leading
 /// singular value for the patch to count as a genuine `d`-dimensional chart.
 /// Below it the neighborhood spans fewer than `d` directions and the local-PCA
@@ -829,7 +833,6 @@ impl LocalAtlas {
         }
         AtlasOrientability::Orientable
     }
-
 }
 
 /// Every ambient row ordered by ascending Euclidean distance to `center`, ties
@@ -1647,5 +1650,4 @@ mod tests {
         let rotation = Array2::<f64>::eye(3);
         assert!((determinant(&rotation) - 1.0).abs() < 1e-12);
     }
-
 }

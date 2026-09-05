@@ -3148,6 +3148,61 @@ mod tests {
         );
     }
 
+    /// #2818 recovery: the full-covariance production null must preserve the
+    /// original #2250 diagonal-PC contract without the deleted diagonal helper.
+    #[test]
+    fn matched_spectrum_gaussian_preserves_pc_scales_and_is_seeded_2250() {
+        let rows = 8_192;
+        let scores = Array2::from_shape_fn((rows, 3), |(row, column)| {
+            let angle = 2.0 * PI * row as f64 / rows as f64;
+            match column {
+                0 => 2.0 + 3.0 * angle.cos(),
+                1 => -1.0 + 1.5 * (2.0 * angle).sin(),
+                2 => 0.25 + 0.4 * (3.0 * angle).cos(),
+                _ => unreachable!("the fixture has exactly three principal coordinates"),
+            }
+        });
+        let first = covariance_matched_gaussian_null(scores.view(), 72).expect("PC-matched null");
+        let repeated = covariance_matched_gaussian_null(scores.view(), 72).expect("repeated null");
+        let changed =
+            covariance_matched_gaussian_null(scores.view(), 73).expect("changed-seed null");
+        assert_eq!(first, repeated, "one seed must reproduce every draw");
+        assert_ne!(first, changed, "the seed must affect the generated control");
+
+        // The Fourier grid has these exact population moments. The oracle does
+        // not reuse the generator's stable-moment or covariance factor code.
+        let means = [2.0, -1.0, 0.25];
+        let amplitudes = [3.0_f64, 1.5, 0.4];
+        let mut maximum_mean_standard_errors = 0.0_f64;
+        let mut maximum_relative_scale_error = 0.0_f64;
+        for column in 0..3 {
+            let mean = first.column(column).sum() / rows as f64;
+            let variance = first
+                .column(column)
+                .iter()
+                .map(|value| (value - mean) * (value - mean))
+                .sum::<f64>()
+                / rows as f64;
+            let expected_sd = amplitudes[column] / 2.0_f64.sqrt();
+            let mean_standard_errors =
+                (mean - means[column]).abs() * (rows as f64).sqrt() / expected_sd;
+            let relative_scale_error = (variance.sqrt() / expected_sd - 1.0).abs();
+            maximum_mean_standard_errors = maximum_mean_standard_errors.max(mean_standard_errors);
+            maximum_relative_scale_error = maximum_relative_scale_error.max(relative_scale_error);
+            assert!(
+                mean_standard_errors <= 4.0,
+                "PC {column}: mean error={mean_standard_errors} SE"
+            );
+            assert!(
+                relative_scale_error < 0.05,
+                "PC {column}: relative scale error={relative_scale_error}"
+            );
+        }
+        eprintln!(
+            "#2250 PC null: max_mean_error={maximum_mean_standard_errors:.6e} SE max_relative_scale_error={maximum_relative_scale_error:.6e}"
+        );
+    }
+
     #[test]
     fn covariance_matched_gaussian_preserves_full_second_moment_2262() {
         let rows = 16_384;

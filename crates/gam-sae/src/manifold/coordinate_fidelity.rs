@@ -60,6 +60,10 @@ use crate::chart_canonicalization::{
 
 use super::{SaeManifoldTerm, SupportMeasure};
 
+#[cfg(test)]
+#[path = "coordinate_fidelity_recovery_tests.rs"]
+mod recovered_collapse_tests;
+
 /// #2081 — the certified verdict on whether a fitted `d = 1` atom carries an
 /// honest angle/position coordinate. A downstream angle / dose-in-nats /
 /// adjacency claim keys off this: read the raw `t` only under
@@ -1971,5 +1975,4 @@ mod coordinate_fidelity_tests {
     // rejected every concentrated coordinate would pass a one-sided test while
     // destroying the `Continuous` rung.
     // ======================================================================
-
 }

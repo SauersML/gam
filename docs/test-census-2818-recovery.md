@@ -199,6 +199,79 @@ was `f899e14cf6ea6b6fe5f90910a72934c63ea7af76`, exactly the published `684f392d`
 source. No production implementation changed. The umbrella scanner passed with
 an empty report and explicit membership for the new integration target.
 
+## Coordinate collapse, seeded controls and local transitions: #2691, #2250, #2280
+
+The next batch restores eight historical identities and adds one support-aware
+negative control. All **9 tests passed** in MSI log
+`.buildd/exact-beta-third-owner-recovery.log`. The combined selection had
+**21 passes and 1 separate new Threshold derivative failure**, 22 tests in
+3.65 seconds; the full selection was not green. The umbrella scanner passed
+before the build, with explicit membership for both new test-only siblings.
+They carry file-level `#![cfg(test)]` as well as their parent module's gate so
+the lexical scanner sees their test context without following module edges.
+
+The four historical #2691 names are restored in
+`coordinate_fidelity_recovery_tests.rs`, through surviving weighted circular and
+interval classifiers with unit support masses:
+
+| Historical identity | Asserted current contract |
+| --- | --- |
+| `a_constant_coordinate_is_collapsed_not_continuous_2691` | Exact constants and the measured approximately 1e-14 coordinate spread report `Collapsed`, zero effective rank, zero anchors and the collapsed label. |
+| `a_narrow_but_resolvable_arc_is_still_continuous_2691` | A 70-point arc of width 0.12 reaches an actual occupancy model. As in the historical body, its BIC-winning rung is deliberately not prescribed by the test's name. |
+| `uniform_and_discrete_occupancy_survive_the_collapse_guard_2691` | Uniform and seven-anchor weekday-shaped support survive the collapse guard and are not indeterminate. |
+| `collapse_across_the_wrap_point_is_caught_on_the_circle_2691` | A near-full raw range occupies a collapsed circular arc, while the same points span a genuine interval support. |
+
+The new `zero_mass_outliers_do_not_hide_coordinate_collapse_2691` additionally
+asserts that zero-mass distant rows cannot hide collapse, and that assigning
+those same rows positive mass changes the extent verdict. No deleted unweighted
+classifier wrapper was reinstated.
+
+`matched_spectrum_gaussian_preserves_pc_scales_and_is_seeded_2250` is restored in
+`null_battery.rs`. The live full-covariance Gaussian generator is given the
+historical 8,192-by-3 orthogonal Fourier PC fixture. Its population means and
+standard deviations are known analytically, so the oracle does not reuse the
+generator's moment accumulation or covariance factor. Repeating the seed must
+reproduce every draw, and changing the seed must change the generated control.
+Maximum mean error was **1.440434 standard errors** and maximum relative scale
+error **0.002321333**, within the original **4-standard-error / 5%** bars. The
+deleted diagonal-only generator remains removed.
+
+Three #2280 names are restored in `local_chart_recovery_tests.rs`. Their oracle
+composes the live `ChartTransition` rotations/signs on a genuine shared-row
+triple; it does not restore deleted rotation/cocycle convenience methods.
+
+| Historical identity | Executed result and unchanged bar |
+| --- | --- |
+| `swiss_roll_charts_injective_and_cocycle_closes_2280` | 36 charts; positive lower projection stretch and captured fraction above 0.7; rotation-cocycle defect **0.1398487 < 0.5**, sign product +1. |
+| `embedded_plane_cocycle_closes_to_rounding_2280` | 24 exact-plane charts; captured fraction above 1-1e-9 and stretch within 1e-6 of unity; defect **2.874508e-16 < 1e-8**. Live affine transition composition also agrees within **2.220446e-16**, and the direct transition reproduces the observed target-chart coordinate. |
+| `sphere_charts_injective_and_orientable_2280` | 34 spherical-band charts; positive lower stretch, observed orientability and sign product +1; defect **0.7312095 < 0.75**. |
+
+The historical spherical fixture has its polar caps removed. Its local
+transition and observed-orientability evidence is not a closed-sphere homology
+or calibrated population-topology certificate. These tests also do not prove
+atlas recognition, held-out unrolling quality or MDL promotion.
+
+Three other #2280 identities remain unresolved:
+`co_collapse_flags_duplicate_charts_2280`,
+`co_collapse_thresholds_bracket_the_gate_2280`, and
+`co_collapse_spares_healthy_swiss_roll_atlas_2280`. Their
+`LocalAtlas::co_collapse_candidates` query was deleted, and no replacement has
+been verified. Because #2280 itself remains open, disappearance of that callable
+is not evidence of an intentionally retired product requirement.
+
+Executed source blobs:
+
+| Source | Blob |
+| --- | --- |
+| `coordinate_fidelity.rs` | `610f3bf531e86a0cf1191dbc3073e7fafe504166` |
+| `coordinate_fidelity_recovery_tests.rs` | `04edc62858a0520c707aaf882085f8d0cbda31bc` |
+| `null_battery.rs` | `ced61aeefa187acba048a87e70ef40d86d95384c` |
+| `local_charts.rs` | `5790dc048554626dec1313283095c1ae5aa59275` |
+| `local_chart_recovery_tests.rs` | `74ff6fdc454eddfaf6d0df8f39ece919ca2c6d90` |
+
+The three production-owner files matched published main before these test-only
+additions and formatting; no production implementation changed in this batch.
+
 ## Deflation-sensitive probe adjoint: #2712
 
 `sae_logdet_theta_adjoint_from_probes_matches_dense_on_deflated_rows_2712` is
