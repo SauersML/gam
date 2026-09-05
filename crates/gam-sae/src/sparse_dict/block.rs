@@ -514,6 +514,9 @@ pub(super) struct RowBlockCode {
     pub(super) gates: Vec<f32>,
     /// Signed within-block code `z_g = γ w_g`, `k×b` flattened row-major.
     pub(super) codes: Vec<f32>,
+    /// Gamma-free signed projections, accumulated in f64 from the stored inputs.
+    /// Streaming scalar and frame moments consume these same values.
+    pub(super) projections: Vec<f64>,
 }
 
 /// Route one minibatch `block_rows` (`B×P`) against the frames, scoring blocks a
@@ -671,17 +674,19 @@ fn code_row(
     let mut blocks = Vec::with_capacity(k);
     let mut gates = Vec::with_capacity(k);
     let mut codes = Vec::with_capacity(k * b);
+    let mut projections = Vec::with_capacity(k * b);
     for &(g, gate) in shortlist.iter().take(k) {
         blocks.push(g);
         gates.push(gate);
         let gg = g as usize;
         for r in 0..b {
             let atom = decoder.row(gg * b + r);
-            let mut wr = 0.0f32;
+            let mut wr = 0.0f64;
             for (xr, ar) in row.iter().zip(atom.iter()) {
-                wr += *xr * *ar;
+                wr += *xr as f64 * *ar as f64;
             }
-            codes.push(gamma * wr);
+            projections.push(wr);
+            codes.push((gamma as f64 * wr) as f32);
         }
     }
     while blocks.len() < k {
@@ -689,12 +694,14 @@ fn code_row(
         gates.push(0.0);
         for _ in 0..b {
             codes.push(0.0);
+            projections.push(0.0);
         }
     }
     RowBlockCode {
         blocks,
         gates,
         codes,
+        projections,
     }
 }
 

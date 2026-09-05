@@ -21,8 +21,9 @@
 //! the utilisation / stable-rank report), the streaming TSS/RSS moments, and the
 //! worst-reconstructed-row reservoir feeding AuxK dead-block birth proposals. A shard
 //! round-trips only its own rows through Python — never the `K×P` frames or any
-//! `N×K` object — so per-shard overhead is `O(shard × P)`, independent of `K` and
-//! of the corpus length.
+//! `N×K` object. The moment storage is `O(K×P)`; temporary projections and sparse
+//! block-row incidence lists use `O(B×P + B×k×b + G)` for one configured
+//! minibatch of B rows, in addition to the bounded routing score tiles.
 //!
 //! During an epoch the block frames and the shared
 //! scalar γ are FROZEN at their epoch-start values; every shard is routed against
@@ -41,14 +42,86 @@
 
 use super::BlockSparseConfig;
 use super::block::{
-    block_birth_evidence_margin, frame_fixed_point_residual, gram_schmidt_rows,
-    reconstruct_stored_code_row, relative_scalar_change, route_and_code_all, seed_frames,
-    stable_rank_symmetric,
+    RowBlockCode, block_birth_evidence_margin, frame_fixed_point_residual, gram_schmidt_rows,
+    relative_scalar_change, route_and_code_all, seed_frames, stable_rank_symmetric,
 };
 use super::residual_reservoir::ResidualReservoir;
 use super::update::{DEAD_DENOM, DecoderSolveStats};
 use crate::frames::GrassmannFrame;
-use ndarray::{Array2, ArrayView2};
+use ndarray::{Array2, ArrayView2, Axis};
+use rayon::prelude::*;
+
+/// One minibatch row's gamma-free reconstruction and scalar moments. Keeping
+/// only the sum avoids retaining a P-vector for every selected block.
+struct RowProjection {
+    sum: Vec<f64>,
+    rss: f64,
+    gamma_num: f64,
+    gamma_den: f64,
+}
+
+fn project_coded_rows(
+    rows: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    codes: &[RowBlockCode],
+    b: usize,
+    gamma: f32,
+) -> Vec<RowProjection> {
+    codes
+        .par_iter()
+        .enumerate()
+        .map(|(row, code)| {
+            let p = rows.ncols();
+            let mut sum = vec![0.0; p];
+            let mut projection = vec![0.0; p];
+            for (slot, &block) in code.blocks.iter().enumerate() {
+                if code.gates[slot] == 0.0 {
+                    continue;
+                }
+                projection.fill(0.0);
+                let w = &code.projections[slot * b..(slot + 1) * b];
+                for (axis, &weight) in w.iter().enumerate() {
+                    let atom = decoder.row(block as usize * b + axis);
+                    for (value, &direction) in projection.iter_mut().zip(atom.iter()) {
+                        *value += weight * direction as f64;
+                    }
+                }
+                for (value, contribution) in sum.iter_mut().zip(&projection) {
+                    *value += contribution;
+                }
+            }
+            let mut rss = 0.0;
+            let mut gamma_num = 0.0;
+            let mut gamma_den = 0.0;
+            for (&x, &projected) in rows.row(row).iter().zip(&sum) {
+                let residual = x as f64 - gamma as f64 * projected;
+                rss += residual * residual;
+                gamma_num += x as f64 * projected;
+                gamma_den += projected * projected;
+            }
+            RowProjection {
+                sum,
+                rss,
+                gamma_num,
+                gamma_den,
+            }
+        })
+        .collect()
+}
+
+/// Stable sparse incidence lists let one worker own each block's moments.
+/// Rows remain in input order, independent of the worker count or shard cuts.
+fn block_row_postings(codes: &[RowBlockCode], blocks: usize) -> Vec<Vec<(usize, usize)>> {
+    let mut postings = vec![Vec::new(); blocks];
+    for (row, code) in codes.iter().enumerate() {
+        for (slot, &block) in code.blocks.iter().enumerate() {
+            if code.gates[slot] != 0.0 {
+                postings[block as usize].push((row, slot));
+            }
+        }
+    }
+    postings
+}
 
 /// Per-shard summary returned by [`BlockSparseStreamState::partial_fit`].
 #[derive(Clone, Copy, Debug)]
@@ -373,160 +446,149 @@ impl BlockSparseStreamState {
         let b = self.b;
         let gamma = self.gamma;
         let aux_on = self.config.aux_k > 0;
-        let codes = route_and_code_all(
-            shard,
-            self.decoder.view(),
-            gamma,
-            self.g,
-            b,
-            self.k,
-            self.config.minibatch,
-            self.config.block_tile,
-        )?;
-        // A staged birth is evaluated against the COMPLETE pre-birth model on
-        // exactly the same shards. This shadow route is the information a true
-        // streaming transaction needs: the corpus is unavailable at end_epoch,
-        // so deciding from the residual reservoir alone would be a surrogate,
-        // not the exact training criterion.
-        let baseline_codes = match self.pending_birth.as_ref() {
-            Some(pending) => Some(route_and_code_all(
-                shard,
-                pending.baseline_decoder.view(),
-                pending.baseline_gamma,
+        let mut shard_rss = 0.0f64;
+        // Only one configured minibatch's projections and sparse incidence
+        // lists are live. Parallel workers own disjoint existing block moments;
+        // there are no per-worker K×P copies and no shard-sized score/code store.
+        for rows in shard.axis_chunks_iter(Axis(0), self.config.minibatch.max(1)) {
+            let codes = route_and_code_all(
+                rows,
+                self.decoder.view(),
+                gamma,
                 self.g,
                 b,
                 self.k,
                 self.config.minibatch,
                 self.config.block_tile,
-            )?),
-            None => None,
-        };
-        let base_index = self.row_count as u64;
-        let mut shard_rss = 0.0f64;
-        for (r, code) in codes.iter().enumerate() {
-            let xi = shard.row(r);
-            for c in 0..p {
-                let v = xi[c] as f64;
-                self.col_sum[c] += v;
-                self.col_sumsq[c] += v * v;
-            }
+            )?;
+            // Route the complete pre-birth model on these same rows before
+            // mutating moments. Birth evidence uses a true paired full pass.
+            let baseline_codes = self
+                .pending_birth
+                .as_ref()
+                .map(|pending| {
+                    route_and_code_all(
+                        rows,
+                        pending.baseline_decoder.view(),
+                        pending.baseline_gamma,
+                        self.g,
+                        b,
+                        self.k,
+                        self.config.minibatch,
+                        self.config.block_tile,
+                    )
+                })
+                .transpose()?;
+            let projected = project_coded_rows(rows, self.decoder.view(), &codes, b, gamma);
+            let postings = block_row_postings(&codes, self.g);
 
-            // Per selected block: its within-block code z (b) and its γ-free
-            // subspace contribution proj = Σ_r w_r D_g[r] (P). Accumulate x̂ = γ·Σ proj
-            // and the γ-free projection sum p_i = Σ proj (for the γ least-squares).
-            let mut sel: Vec<(usize, Vec<f64>, Vec<f64>)> = Vec::with_capacity(self.k);
-            let mut proj_sum = vec![0.0_f64; p];
-            for j in 0..code.blocks.len() {
-                if code.gates[j] == 0.0 {
-                    continue;
-                }
-                let gg = code.blocks[j] as usize;
-                let mut w = vec![0.0_f64; b];
-                for (rr, wr) in w.iter_mut().enumerate() {
-                    let atom = self.decoder.row(gg * b + rr);
-                    let mut acc = 0.0_f64;
-                    for (xc, ac) in xi.iter().zip(atom.iter()) {
-                        acc += *xc as f64 * *ac as f64;
-                    }
-                    *wr = acc;
-                }
-                let mut proj = vec![0.0_f64; p];
-                for (rr, &wr) in w.iter().enumerate() {
-                    if wr == 0.0 {
-                        continue;
-                    }
-                    let atom = self.decoder.row(gg * b + rr);
-                    for c in 0..p {
-                        proj[c] += wr * atom[c] as f64;
-                    }
-                }
-                for c in 0..p {
-                    proj_sum[c] += proj[c];
-                }
-                sel.push((gg, w, proj));
-            }
-
-            // Full residual under the frozen model + streaming RSS/reservoir.
-            let mut residual = vec![0.0f32; p];
-            let mut norm2 = 0.0f64;
-            for c in 0..p {
-                let value = xi[c] as f64 - gamma as f64 * proj_sum[c];
-                residual[c] = value as f32;
-                norm2 += value * value;
-            }
-            shard_rss += norm2;
-            if aux_on {
-                self.reservoir
-                    .offer(norm2, base_index + r as u64, residual.clone());
-            }
-
-            // Streaming γ least-squares: γ* = (Σ⟨x,p⟩)/(Σ‖p‖²).
-            for c in 0..p {
-                self.gamma_num += xi[c] as f64 * proj_sum[c];
-                self.gamma_den += proj_sum[c] * proj_sum[c];
-            }
-
-            // Gamma-free frame moments and within-block second moments. These
-            // additive statistics support the coordinated scalar update and
-            // parallel polar majorizer in end_epoch without retaining rows.
-            for (gg, w, proj) in sel.iter() {
-                let gg = *gg;
-                if self.usage[gg] == 0 {
-                    self.alive_count += 1;
-                }
-                self.usage[gg] += 1;
-                // Keep both gamma-free terms. The exact frozen-code polar
-                // moment at ANY gamma is gamma*XW - gamma²*OtherProjectionW.
-                // A moment formed using the pass's old gamma cannot be reused
-                // after fitting gamma without changing the coordinate problem.
-                let mg = &mut self.cross[gg];
-                let xg = &mut self.data_cross[gg];
-                for c in 0..p {
-                    let other = proj_sum[c] - proj[c];
-                    for (rr, &wr) in w.iter().enumerate() {
-                        mg[[c, rr]] += other * wr;
-                        xg[[c, rr]] += xi[c] as f64 * wr;
-                    }
-                }
-                let sg = &mut self.second[gg];
-                for r1 in 0..b {
-                    for r2 in 0..b {
-                        sg[[r1, r2]] += w[r1] * w[r2];
-                    }
-                }
-            }
-        }
-
-        if let (Some(pending), Some(baseline_codes)) =
-            (self.pending_birth.as_mut(), baseline_codes.as_ref())
-        {
-            for (row, code) in baseline_codes.iter().enumerate() {
-                let reconstruction =
-                    reconstruct_stored_code_row(code, pending.baseline_decoder.view(), b);
-                for column in 0..p {
-                    let residual = shard[[row, column]] - reconstruction[column];
-                    pending.baseline_rss += residual as f64 * residual as f64;
-                }
-                for (slot, &block) in code.blocks.iter().enumerate() {
-                    if code.gates[slot] == 0.0 {
-                        continue;
-                    }
-                    let block = block as usize;
-                    pending.baseline_usage[block] += 1;
-                    let z = &code.codes[slot * b..slot * b + b];
-                    for left in 0..b {
-                        for right in 0..b {
-                            pending.baseline_second[block][[left, right]] +=
-                                z[left] as f64 * z[right] as f64;
+            let columns_per_worker = p.div_ceil(rayon::current_num_threads()).max(1);
+            self.col_sum
+                .par_chunks_mut(columns_per_worker)
+                .zip(self.col_sumsq.par_chunks_mut(columns_per_worker))
+                .enumerate()
+                .for_each(|(chunk, (sums, squares))| {
+                    let first = chunk * columns_per_worker;
+                    for row in rows.outer_iter() {
+                        for (offset, (sum, square)) in
+                            sums.iter_mut().zip(squares.iter_mut()).enumerate()
+                        {
+                            let value = row[first + offset] as f64;
+                            *sum += value;
+                            *square += value * value;
                         }
                     }
+                });
+
+            for (row, projection) in projected.iter().enumerate() {
+                shard_rss += projection.rss;
+                self.rss += projection.rss;
+                self.gamma_num += projection.gamma_num;
+                self.gamma_den += projection.gamma_den;
+                if aux_on {
+                    let residual = rows
+                        .row(row)
+                        .iter()
+                        .zip(&projection.sum)
+                        .map(|(&x, &sum)| (x as f64 - gamma as f64 * sum) as f32)
+                        .collect();
+                    self.reservoir
+                        .offer(projection.rss, (self.row_count + row) as u64, residual);
                 }
             }
-            pending.baseline_rows += baseline_codes.len();
-        }
 
-        self.rss += shard_rss;
-        self.row_count += codes.len();
+            self.cross
+                .par_iter_mut()
+                .zip(self.data_cross.par_iter_mut())
+                .zip(self.second.par_iter_mut())
+                .zip(self.usage.par_iter_mut())
+                .zip(postings.par_iter())
+                .enumerate()
+                .for_each(
+                    |(block, ((((cross, data_cross), second), usage), entries))| {
+                        for &(row, slot) in entries {
+                            let w = &codes[row].projections[slot * b..(slot + 1) * b];
+                            let xi = rows.row(row);
+                            for c in 0..p {
+                                let mut own = 0.0;
+                                for (axis, &weight) in w.iter().enumerate() {
+                                    own += weight * self.decoder[[block * b + axis, c]] as f64;
+                                }
+                                let other = projected[row].sum[c] - own;
+                                for (axis, &weight) in w.iter().enumerate() {
+                                    cross[[c, axis]] += other * weight;
+                                    data_cross[[c, axis]] += xi[c] as f64 * weight;
+                                }
+                            }
+                            for left in 0..b {
+                                for right in 0..b {
+                                    second[[left, right]] += w[left] * w[right];
+                                }
+                            }
+                        }
+                        *usage += entries.len();
+                    },
+                );
+
+            if let (Some(pending), Some(baseline_codes)) =
+                (self.pending_birth.as_mut(), baseline_codes.as_ref())
+            {
+                let baseline = project_coded_rows(
+                    rows,
+                    pending.baseline_decoder.view(),
+                    baseline_codes,
+                    b,
+                    pending.baseline_gamma,
+                );
+                for projection in &baseline {
+                    pending.baseline_rss += projection.rss;
+                }
+                let baseline_postings = block_row_postings(baseline_codes, self.g);
+                pending
+                    .baseline_second
+                    .par_iter_mut()
+                    .zip(pending.baseline_usage.par_iter_mut())
+                    .zip(baseline_postings.par_iter())
+                    .for_each(|((second, usage), entries)| {
+                        for &(row, slot) in entries {
+                            let w = &baseline_codes[row].projections[slot * b..(slot + 1) * b];
+                            for left in 0..b {
+                                for right in 0..b {
+                                    second[[left, right]] += (pending.baseline_gamma as f64
+                                        * w[left])
+                                        * (pending.baseline_gamma as f64 * w[right]);
+                                }
+                            }
+                        }
+                        *usage += entries.len();
+                    });
+                pending.baseline_rows += rows.nrows();
+            }
+            self.row_count += rows.nrows();
+            // Every completed minibatch leaves coherent accumulated state,
+            // including when a later minibatch's router returns an error.
+            self.alive_count = self.usage.iter().filter(|&&count| count > 0).count();
+        }
         // Per-shard heartbeat (#2227): rows in this shard, cumulative rows, the
         // shard reconstruction RSS, live-block count, and the shard wall time. A
         // stalled shard stops advancing this line; under `RUST_LOG=info` a route
@@ -535,7 +597,7 @@ impl BlockSparseStreamState {
         log::info!(
             "[SAE block shard] rows={} total_rows={} rss={:.6e} alive_blocks={}/{} \
              shard_s={:.2}",
-            codes.len(),
+            shard.nrows(),
             self.row_count,
             shard_rss,
             self.alive_count,
@@ -543,7 +605,7 @@ impl BlockSparseStreamState {
             shard_start.elapsed().as_secs_f64(),
         );
         Ok(BlockShardStats {
-            rows: codes.len(),
+            rows: shard.nrows(),
             rss: shard_rss,
             alive_blocks: self.alive_count,
         })

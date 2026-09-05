@@ -24,6 +24,140 @@ fn coupled_fixture() -> (Array2<f32>, Array2<f32>, BlockSparseConfig) {
 }
 
 #[test]
+fn parallel_stream_moments_match_dense_reference_across_batches_and_shards() {
+    let x = Array2::from_shape_fn((17, 4), |(row, feature)| {
+        if row == 0 {
+            0.0
+        } else {
+            ((row * 7 + feature * 13) as f32 * 0.17).sin()
+        }
+    });
+    let decoder = array![
+        [1.0_f32, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.6, 0.0, 0.0, 0.8],
+        [0.0, 0.0, 1.0, 0.0],
+    ];
+    // Independent dense frozen-code algebra. All three blocks are selected on
+    // nonzero rows; the zero row exercises padded slots without phantom usage.
+    let weights = x.mapv(f64::from).dot(&decoder.mapv(f64::from).t());
+    let total = weights.dot(&decoder.mapv(f64::from));
+    let gamma = 0.37_f32;
+    let baseline_gamma = 0.61_f32;
+    let residual = x.mapv(f64::from) - &total * gamma as f64;
+    let baseline_residual = x.mapv(f64::from) - &total * baseline_gamma as f64;
+    let expected_rss = residual.iter().map(|v| v * v).sum::<f64>();
+    let expected_baseline_rss = baseline_residual.iter().map(|v| v * v).sum::<f64>();
+    for threads in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for batch in [1, 5, 17] {
+                for shard_rows in [3, 17] {
+                    let mut config = BlockSparseConfig::new(3, 2);
+                    config.block_topk = 3;
+                    config.minibatch = batch;
+                    config.aux_k = 2;
+                    let mut state =
+                        BlockSparseStreamState::new_with_decoder(decoder.clone(), &config).unwrap();
+                    state.gamma = gamma;
+                    state.pending_birth = Some(super::PendingBlockBirth {
+                        block: 0,
+                        baseline_decoder: decoder.clone(),
+                        baseline_gamma,
+                        baseline_rss: 0.0,
+                        baseline_rows: 0,
+                        baseline_usage: vec![0; 3],
+                        baseline_second: (0..3).map(|_| Array2::zeros((2, 2))).collect(),
+                    });
+                    for shard in x.axis_chunks_iter(ndarray::Axis(0), shard_rows) {
+                        state.partial_fit(shard).unwrap();
+                    }
+                    assert_eq!(state.row_count, x.nrows());
+                    assert_eq!(state.usage, vec![16; 3]);
+                    assert_eq!(state.alive_count, 3);
+                    assert!((state.rss - expected_rss).abs() < 1e-11);
+                    let num = x
+                        .iter()
+                        .zip(total.iter())
+                        .map(|(&x, &v)| x as f64 * v)
+                        .sum::<f64>();
+                    let den = total.iter().map(|v| v * v).sum::<f64>();
+                    assert!((state.gamma_num - num).abs() < 1e-11);
+                    assert!((state.gamma_den - den).abs() < 1e-11);
+                    let pending = state.pending_birth.as_ref().unwrap();
+                    assert_eq!(pending.baseline_rows, x.nrows());
+                    assert_eq!(pending.baseline_usage, state.usage);
+                    assert!((pending.baseline_rss - expected_baseline_rss).abs() < 1e-11);
+                    for block in 0..3 {
+                        let w = weights.slice(ndarray::s![.., block * 2..(block + 1) * 2]);
+                        let own = w.dot(
+                            &decoder
+                                .slice(ndarray::s![block * 2..(block + 1) * 2, ..])
+                                .mapv(f64::from),
+                        );
+                        let expected_cross = (&total - &own).t().dot(&w);
+                        let expected_data = x.mapv(f64::from).t().dot(&w);
+                        let expected_second = w.t().dot(&w);
+                        for (got, expected) in [
+                            (&state.cross[block], expected_cross),
+                            (&state.data_cross[block], expected_data),
+                            (&state.second[block], expected_second.clone()),
+                            (
+                                &pending.baseline_second[block],
+                                expected_second * (baseline_gamma as f64).powi(2),
+                            ),
+                        ] {
+                            assert!(
+                                got.iter()
+                                    .zip(expected.iter())
+                                    .all(|(a, b)| (a - b).abs() < 1e-11)
+                            );
+                        }
+                    }
+                    for feature in 0..4 {
+                        let column = x.column(feature);
+                        assert!(
+                            (state.col_sum[feature]
+                                - column.iter().map(|&v| v as f64).sum::<f64>())
+                            .abs()
+                                < 1e-11
+                        );
+                        assert!(
+                            (state.col_sumsq[feature]
+                                - column.iter().map(|&v| (v as f64).powi(2)).sum::<f64>())
+                            .abs()
+                                < 1e-11
+                        );
+                    }
+                    let mut worst: Vec<usize> = (0..x.nrows()).collect();
+                    worst.sort_by(|&a, &b| {
+                        let norm = |row| residual.row(row).iter().map(|v| v * v).sum::<f64>();
+                        norm(b).total_cmp(&norm(a)).then(a.cmp(&b))
+                    });
+                    let ranked = state.reservoir.ranked();
+                    assert_eq!(ranked.len(), 4);
+                    for (entry, &row) in ranked.iter().zip(&worst) {
+                        assert_eq!(entry.global_index, row as u64);
+                        assert!(
+                            entry
+                                .residual
+                                .iter()
+                                .zip(residual.row(row).iter())
+                                .all(|(&a, &b)| (a as f64 - b).abs() < 1e-6)
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[test]
 fn frame_refresh_uses_the_new_gamma_and_is_invariant_to_its_initial_value_2825() {
     let (x, decoder, config) = coupled_fixture();
     for orientation in [-1.0, 1.0] {
@@ -78,6 +212,49 @@ fn frame_refresh_uses_the_new_gamma_and_is_invariant_to_its_initial_value_2825()
             assert!(loss(&state.decoder) < loss(&decoder));
         }
     }
+}
+
+#[test]
+fn parallel_stream_rejects_selected_duplicate_birth_using_complete_baseline() {
+    let x = Array2::from_shape_fn(
+        (17, 2),
+        |(_, column)| if column == 0 { 1.0_f32 } else { 0.0 },
+    );
+    let baseline = array![[0.0_f32, 0.0], [1.0, 0.0]];
+    let candidate = array![[1.0_f32, 0.0], [1.0, 0.0]];
+    let mut config = BlockSparseConfig::new(2, 1);
+    config.block_topk = 1;
+    config.minibatch = 5;
+    config.aux_k = 1;
+    config.frame_ridge = 0.0;
+    let mut state = BlockSparseStreamState::new_with_decoder(candidate, &config).unwrap();
+    state.pending_birth = Some(super::PendingBlockBirth {
+        block: 0,
+        baseline_decoder: baseline.clone(),
+        baseline_gamma: 1.0,
+        baseline_rss: 0.0,
+        baseline_rows: 0,
+        baseline_usage: vec![0; 2],
+        baseline_second: (0..2).map(|_| Array2::zeros((1, 1))).collect(),
+    });
+    state.partial_fit(x.view()).unwrap();
+    assert_eq!(
+        state.usage,
+        vec![17, 0],
+        "the duplicate must win the routing tie"
+    );
+    let pending = state.pending_birth.as_ref().unwrap();
+    assert_eq!(pending.baseline_usage, vec![0, 17]);
+    assert_eq!(pending.baseline_rss, state.rss);
+    let stats = state.end_epoch().unwrap();
+    assert_eq!(stats.accepted_births, 0);
+    assert!(
+        !stats.converged,
+        "rejection requires a measured baseline pass"
+    );
+    assert_eq!(state.decoder, baseline);
+    assert_eq!(state.last_usage, vec![0, 17]);
+    assert_eq!(state.last_second[1][[0, 0]], 17.0);
 }
 
 #[test]

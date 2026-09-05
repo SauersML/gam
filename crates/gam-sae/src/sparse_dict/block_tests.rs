@@ -163,6 +163,7 @@ fn co_routed_frame_sweep_is_fixed_code_descent_2634() {
             blocks: vec![0, 1],
             gates: vec![1.0, 1.0],
             codes: vec![z0[0], z0[1], z1[0], z1[1]],
+            projections: vec![z0[0] as f64, z0[1] as f64, z1[0] as f64, z1[1] as f64],
         });
     }
     let mut decoder = make_decoder(n_blocks, b, p, 2634);

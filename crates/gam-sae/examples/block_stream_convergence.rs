@@ -80,14 +80,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..epochs {
         let pass = Instant::now();
         state.partial_fit(x.view())?;
+        let stream_seconds = pass.elapsed().as_secs_f64();
+        let refresh = Instant::now();
         let stats = state.end_epoch()?;
+        let refresh_seconds = refresh.elapsed().as_secs_f64();
         writeln!(
             output,
             "{}",
             serde_json::json!({
                 "epoch": stats.epoch, "ev": stats.explained_variance, "gamma": stats.gamma,
                 "gamma_residual": stats.gamma_residual, "frame_residual": stats.frame_residual,
-                "converged": stats.converged, "seconds": pass.elapsed().as_secs_f64()
+                "converged": stats.converged, "seconds": pass.elapsed().as_secs_f64(),
+                "stream_seconds": stream_seconds, "refresh_seconds": refresh_seconds
             })
         )?;
         output.flush()?;
