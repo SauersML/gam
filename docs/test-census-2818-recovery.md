@@ -179,6 +179,26 @@ explicit filesystem membership for both new targets; its report was empty.
 The runs use the forward-synchronized published Duchon basis implementation.
 They do not execute unrelated stale local term-collection gauge tests.
 
+## Curvature estimate support: #2687
+
+`crates/gam-geometry/tests/curvature_support_recovery.rs` restores both historical
+pins through public `profile_ci_walk`, without reinstating the removed
+`is_railed` convenience accessor:
+
+| Historical identity | Current asserted contract |
+| --- | --- |
+| `a_monotone_criterion_rails_kappa_hat_and_the_walk_declares_it_2687` | A decreasing profile reports the upper rail when the box moves to 1.389, 2.78 or 40; the mirrored increasing profile reports the lower rail. Point-estimate labels and the corresponding open CI endpoints agree. |
+| `an_interior_optimum_is_not_declared_railed_2687` | The fixed quadratic optimum -0.37 is interior in a wide box, with closed symmetric CI endpoints. Moving only the box's lower end onto the same optimum changes its provenance to the lower rail, while preserving the unconstrained upper CI endpoint. |
+
+These are inference-layer contracts for a supplied profile, not claims that an
+outer fit has correctly profiled its nuisance parameters. Both tests passed in
+**0.00 seconds**, after a **4.43-second** warm integration build. Log:
+`.buildd/curvature-support-recovery.log`; executed test source blob:
+`f6a703e9cc9277e70d063281c826d6185bd369a0`. The production curvature-estimand source
+was `f899e14cf6ea6b6fe5f90910a72934c63ea7af76`, exactly the published `684f392d`
+source. No production implementation changed. The umbrella scanner passed with
+an empty report and explicit membership for the new integration target.
+
 ## Deflation-sensitive probe adjoint: #2712
 
 `sae_logdet_theta_adjoint_from_probes_matches_dense_on_deflated_rows_2712` is
