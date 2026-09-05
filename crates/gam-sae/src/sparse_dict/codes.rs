@@ -33,8 +33,8 @@ pub fn solve_row_codes(
 ) -> SparseCode {
     assert!(s > 0, "sparse-code support width must be positive");
     assert!(
-        ridge.is_finite() && ridge >= 0.0,
-        "active-set ridge must be finite and nonnegative, got {ridge}"
+        !ridge.is_nan() && ridge >= 0.0,
+        "active-set ridge must be nonnegative, got {ridge}"
     );
     assert_eq!(
         row.len(),
@@ -49,16 +49,32 @@ pub fn solve_row_codes(
             codes: vec![0.0f32; s],
         };
     }
+    assert!(
+        active
+            .iter()
+            .take(m)
+            .all(|&(atom, _)| (atom as usize) < decoder.nrows()),
+        "active atom index is out of range"
+    );
+    // At the zero prior-variance boundary every posterior-mean code is exactly
+    // zero. Handle this analytic model before constructing an infinite Gram.
+    if ridge == f32::INFINITY {
+        return SparseCode {
+            indices: active
+                .iter()
+                .take(m)
+                .map(|&(atom, _)| atom)
+                .chain(std::iter::repeat_n(active[0].0, s - m))
+                .collect(),
+            codes: vec![0.0; s],
+        };
+    }
     let p = row.len();
     // Active Gram (m×m) and rhs (m) in f64 for a well-conditioned solve.
     let mut gram = Array2::<f64>::zeros((m, m));
     let mut rhs = Array1::<f64>::zeros(m);
     for i in 0..m {
         let ai = active[i].0 as usize;
-        assert!(
-            ai < decoder.nrows(),
-            "active atom index {ai} is out of range"
-        );
         let di = decoder.row(ai);
         let mut proj = 0.0f64;
         for c in 0..p {
@@ -141,6 +157,15 @@ fn solve_spd(gram: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
 mod tests {
     use super::*;
     use ndarray::array;
+
+    #[test]
+    fn zero_prior_variance_has_zero_codes_with_the_requested_sparse_support() {
+        let row = array![3.0_f32, -2.0];
+        let decoder = array![[1.0_f32, 0.0], [0.0, 1.0]];
+        let codes = solve_row_codes(row.view(), decoder.view(), &[(1, 2.0)], 2, f32::INFINITY);
+        assert_eq!(codes.indices, vec![1, 1]);
+        assert_eq!(codes.codes, vec![0.0, 0.0]);
+    }
 
     #[test]
     fn duplicate_selected_atoms_use_joint_minimum_norm_least_squares() {

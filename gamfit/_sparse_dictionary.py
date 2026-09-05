@@ -224,6 +224,7 @@ class SparseDictionaryFit:
             np.ascontiguousarray(x, dtype=np.float32),
             np.ascontiguousarray(self.decoder, dtype=np.float32),
             int(s),
+            code_ridge=float(self.convergence.selected_rho),
             score_mode=str(score_mode),
         )
         data = dict(payload)

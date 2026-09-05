@@ -8,9 +8,11 @@
 //! materialised) `N×K` code matrix. We accumulate `A = CᵀC` (`K×K`, but only
 //! the few entries touched by co-active atoms are non-zero) and `B = CᵀX`
 //! (`K×P`) by streaming minibatches, then solve **to the rank-charge floor**.
-//! For a clean `top_s = 1` lane `A` is diagonal and the refresh is a per-atom
-//! rescaled mean — exactly MOD / k-SVD's dictionary step. For the general
-//! `s > 1` case the coupling `A` is non-diagonal, and the co-firing graph
+//! With `top_s = 1`, the one-shot trainer profiles the scalar codes as well:
+//! each admitted cluster gets its leading scatter direction, computed through
+//! the smaller row/feature Gram. A rescaled MOD mean would take only one power
+//! iteration before paying for global routing again. For the general `s > 1`
+//! case the coupling `A` is non-diagonal, and the co-firing graph
 //! percolates at realistic scale, so connected components are diagnostics rather
 //! than a useful dense-solve decomposition. The default coupled solve is
 //! therefore matrix-free conjugate gradients: every Gram-vector product touches
@@ -146,6 +148,8 @@ pub(crate) struct SparseDictIterate {
     pub(crate) decoder: Array2<f32>,
     pub(crate) indices: Array2<u32>,
     pub(crate) codes: Array2<f32>,
+    /// EV of these exact arrays, measured before their fixed-point certificate.
+    explained_variance: f64,
     pub(crate) epochs: usize,
     pub(crate) active: usize,
     pub(crate) score_route_stats: ScoreRouteStats,
@@ -728,14 +732,43 @@ fn run_from_decoder(
         let accumulate_secs = epoch_start.elapsed().as_secs_f64();
         let sigma = residual_scale(x, &codes, decoder.view());
         let sigma_secs = epoch_start.elapsed().as_secs_f64() - accumulate_secs;
-        let (stats, _gate) = solve_decoder_with_routability_gate_recycled(
-            &mut decoder,
-            &normal_eq,
-            config.decoder_ridge as f64,
-            sigma,
-            config.score_mode,
-            decoder_recycle,
-        )?;
+        let stats = if s == 1 {
+            let gate = routability_gate_decisions(&normal_eq, sigma);
+            let mut members = vec![Vec::new(); k];
+            for (row, code) in certified_codes.iter().enumerate() {
+                members[code.indices[0] as usize].push(row);
+            }
+            decoder
+                .axis_iter_mut(Axis(0))
+                .into_par_iter()
+                .zip(members.into_par_iter())
+                .zip(gate.into_par_iter())
+                .try_for_each(|((mut direction, rows), decision)| -> Result<(), String> {
+                    if decision.refresh {
+                        let next =
+                            super::single_atom::profiled_direction(x, &rows, direction.view())?;
+                        direction.assign(&next);
+                    }
+                    Ok(())
+                })?;
+            DecoderSolveStats {
+                component_count: k,
+                max_component_size: 1,
+                cg_residual_stop: decoder_solve_relative_tolerance(),
+                cg_recycling_admitted: false,
+                ..DecoderSolveStats::default()
+            }
+        } else {
+            solve_decoder_with_routability_gate_recycled(
+                &mut decoder,
+                &normal_eq,
+                config.decoder_ridge as f64,
+                sigma,
+                config.score_mode,
+                decoder_recycle,
+            )?
+            .0
+        };
         decoder_solve_stats = stats;
         let refresh_secs = epoch_start.elapsed().as_secs_f64();
 
@@ -918,6 +951,7 @@ fn run_from_decoder(
                 decoder: certified_decoder,
                 indices,
                 codes: code_mat,
+                explained_variance: certified_ev,
                 epochs: epochs_run,
                 active: s,
                 score_route_stats,
@@ -985,6 +1019,7 @@ fn run_from_decoder(
                 decoder: best.decoder,
                 indices,
                 codes: code_mat,
+                explained_variance: best.explained_variance,
                 epochs: epochs_run,
                 active: s,
                 score_route_stats,
@@ -1118,31 +1153,20 @@ fn continue_linear_fast_kernel(
     run_from_decoder(x, &unified, decoder, decoder_recycle, fit_start)
 }
 
-/// Sufficient statistics for the linear block's ONE shared REML variance
-/// component (design gam#2232, Increment 2, plug point 4).
-///
-/// The decoder refresh is `P` independent ridge regressions `(A + ρI) D_{:,c} =
-/// B_{:,c}` (`A = CᵀC` the `K×K` code Gram, `B = CᵀX`) that SHARE the single ridge
-/// `ρ`, with an identity roughness penalty `ρ‖D‖²_F`. Reading `ρ = σ²/τ²` (noise
-/// variance over decoder prior variance) makes the refresh a Gaussian ridge whose
-/// evidence-optimal ρ is a Fellner–Schall / MacKay fixed point over exactly these
-/// aggregates.
+/// Pooled sufficient statistics for one Gaussian random-effect variance ratio.
+/// All counts refer to scalar observations and the complete smoother, so a
+/// caller cannot accidentally multiply a row-code trace by the feature count.
 #[derive(Clone, Copy, Debug)]
 pub struct LinearBlockRemlStats {
-    /// Per-column effective degrees of freedom `γ = tr(A (A + ρI)⁻¹)` of the code
-    /// Gram at the current ρ. Identical across the `P` output columns because the
-    /// ridge operator `(A + ρI)⁻¹` is column-independent, so the pooled effective
-    /// dof is `P·γ`.
-    pub gram_edof: f64,
-    /// Output dimension `P` (number of decoder columns sharing ρ).
-    pub p_cols: usize,
-    /// Decoder penalty energy `‖D‖²_F = Σ_{k,c} D_{kc}²` (identity roughness), i.e.
-    /// the roughness quadratic form of the just-refreshed decoder.
+    /// Total effective degrees of freedom, the trace of the response smoother.
+    pub effective_dof: f64,
+    /// Squared norm of the random coefficients whose prior variance is fitted.
+    /// For unit single-atom directions these are the scalar row codes.
     pub penalty_energy: f64,
     /// Reconstruction residual sum of squares `Σ_i ‖x_i − Σ_j c_{ij} d_{a_{ij}}‖²`.
     pub rss: f64,
-    /// Rows `N` (the ridge regressions have `N·P` total observations).
-    pub n_obs: usize,
+    /// Total scalar observations, including every response feature.
+    pub n_observations: usize,
 }
 
 /// One Fellner–Schall / MacKay evidence fixed-point update of the linear block's
@@ -1152,10 +1176,10 @@ pub struct LinearBlockRemlStats {
 /// point is the standard evidence recursion:
 ///
 /// ```text
-///   γ_tot = P · tr(A (A + ρI)⁻¹)                (pooled effective dof)
-///   σ̂²    = RSS / (N·P − γ_tot)                 (REML residual variance)
-///   τ̂²    = ‖D‖²_F / γ_tot                       (decoder prior variance)
-///   ρ_new = σ̂² / τ̂² = γ_tot · σ̂² / ‖D‖²_F
+///   γ     = effective_dof
+///   σ̂²    = RSS / (n_observations − γ)
+///   τ̂²    = penalty_energy / γ
+///   ρ_new = σ̂² / τ̂²
 /// ```
 ///
 /// This is the ONE shared REML variance component of the design — no per-atom
@@ -1172,8 +1196,8 @@ pub fn linear_shared_rho_fs_step(
             reason: format!("rho must be finite and positive; got {rho}"),
         });
     }
-    let gamma_tot = (stats.p_cols as f64) * stats.gram_edof;
-    let total_obs = (stats.n_obs.saturating_mul(stats.p_cols)) as f64;
+    let gamma_tot = stats.effective_dof;
+    let total_obs = stats.n_observations as f64;
     if !(gamma_tot.is_finite() && gamma_tot > 0.0 && gamma_tot < total_obs) {
         return Err(SparseDictionaryError::InvalidRemlEvidence {
             reason: format!(
@@ -1189,7 +1213,7 @@ pub fn linear_shared_rho_fs_step(
     if !(stats.penalty_energy.is_finite() && stats.penalty_energy > 0.0) {
         return Err(SparseDictionaryError::InvalidRemlEvidence {
             reason: format!(
-                "decoder penalty energy must be finite and positive; got {}",
+                "random-coefficient penalty energy must be finite and positive; got {}",
                 stats.penalty_energy
             ),
         });
@@ -1440,6 +1464,34 @@ fn linear_block_reml_stats_from_parts(
     let k = decoder.nrows();
     let n = x.nrows();
     let p = x.ncols();
+    if indices.ncols() == 1 {
+        // With a unit direction, the scalar code is the random coefficient:
+        // x_i = d_{a_i} c_i + eps_i, c_i ~ N(0, tau²), eps_i ~ N(0, sigma² I).
+        // Its posterior-mean smoother has trace ||d||²/(||d||²+rho), one per
+        // observed row. The direction's norm is constrained, so rho*||D||² is
+        // constant on its parameter space and supplies no variance evidence.
+        // Treating the K directions as P independent ridge regressions counted
+        // the wrong random effects and omitted the code energy from the update.
+        let norms: Vec<f64> = decoder
+            .outer_iter()
+            .map(|row| row.iter().map(|&v| (v as f64).powi(2)).sum())
+            .collect();
+        let gram_edof: f64 = indices
+            .column(0)
+            .iter()
+            .map(|&atom| {
+                let norm = norms[atom as usize];
+                norm / (norm + rho)
+            })
+            .sum();
+        let penalty_energy = codes.iter().map(|&c| (c as f64).powi(2)).sum();
+        return Ok(LinearBlockRemlStats {
+            effective_dof: gram_edof,
+            penalty_energy,
+            rss: reconstruction_rss_from_parts(x, decoder, indices, codes),
+            n_observations: n * p,
+        });
+    }
     let (diag, off) = code_gram_from_routing(indices, codes, k);
     let raw_gram_edof = hutchinson_gram_edof(&diag, &off, rho, k)?;
     // The true effective dof γ = tr(A(A+ρI)⁻¹) = Σ λ_i/(λ_i+ρ) is STRICTLY below
@@ -1462,11 +1514,10 @@ fn linear_block_reml_stats_from_parts(
     let penalty_energy: f64 = decoder.iter().map(|&d| (d as f64) * (d as f64)).sum();
     let rss = reconstruction_rss_from_parts(x, decoder, indices, codes);
     Ok(LinearBlockRemlStats {
-        gram_edof,
-        p_cols: p,
+        effective_dof: gram_edof * p as f64,
         penalty_energy,
         rss,
-        n_obs: n,
+        n_observations: n * p,
     })
 }
 
@@ -1516,7 +1567,38 @@ pub fn run_linear_reml_schedule(
     config: &SparseDictConfig,
 ) -> Result<SparseDictFit, SparseDictionaryError> {
     let mut decoder_recycle = DecoderRecycleSpace::new(config.n_atoms);
-    run_linear_reml_schedule_with_recycle(x, config, &mut decoder_recycle)
+    run_linear_reml_schedule_with_recycle(x, config, &mut decoder_recycle, None)
+}
+
+/// Grow a fitted dictionary's capacity while retaining its learned directions
+/// and evidence-selected ridge. New directions cover the largest remaining
+/// signed-line residuals. The complete REML schedule freshly routes and certifies
+/// the enlarged model; no codes or certificates are inherited from the prior.
+pub(crate) fn extend_linear_reml_schedule(
+    x: ArrayView2<'_, f32>,
+    config: &SparseDictConfig,
+    prior: &SparseDictFit,
+) -> Result<SparseDictFit, SparseDictionaryError> {
+    validate(x, config)?;
+    if prior.decoder.ncols() != x.ncols() || prior.decoder.nrows() >= config.n_atoms {
+        return Err(SparseDictionaryError::invalid_input(
+            "dictionary continuation requires matching features and strictly increasing capacity",
+        ));
+    }
+    let mut decoder = Array2::zeros((config.n_atoms, x.ncols()));
+    let prefix = prior.decoder.nrows();
+    decoder
+        .slice_mut(ndarray::s![..prefix, ..])
+        .assign(&prior.decoder);
+    complete_decoder_seed(x, &mut decoder, prefix);
+    unit_norm_rows(&mut decoder)?;
+    let mut recycle = DecoderRecycleSpace::new(config.n_atoms);
+    run_linear_reml_schedule_with_recycle(
+        x,
+        config,
+        &mut recycle,
+        Some((decoder, prior.convergence.selected_rho)),
+    )
 }
 
 /// [`run_linear_reml_schedule`] with the fit-scoped recycle space supplied by
@@ -1531,6 +1613,7 @@ fn run_linear_reml_schedule_with_recycle(
     x: ArrayView2<'_, f32>,
     config: &SparseDictConfig,
     decoder_recycle: &mut DecoderRecycleSpace,
+    initial: Option<(Array2<f32>, f64)>,
 ) -> Result<SparseDictFit, SparseDictionaryError> {
     validate(x, config)?;
     if config.code_ridge != config.decoder_ridge {
@@ -1581,7 +1664,14 @@ fn run_linear_reml_schedule_with_recycle(
         });
     }
     // Warm start at the caller's shared ridge; from here ρ is REML-selected.
-    let mut rho = config.decoder_ridge as f64;
+    let mut rho = initial
+        .as_ref()
+        .map_or(config.decoder_ridge as f64, |(_, rho)| *rho);
+    if !(rho.is_finite() && rho > 0.0) {
+        return Err(SparseDictionaryError::invalid_input(
+            "a non-null dictionary continuation requires a finite positive ridge",
+        ));
+    }
     // The caller's seed ridge is the interior anchor for the #2275 ρ-boundary
     // diagnosis (see the trace-failure arm below): a trace solve that fails only
     // AFTER Fellner–Schall has driven ρ STRICTLY below it is on the descent to the
@@ -1589,7 +1679,16 @@ fn run_linear_reml_schedule_with_recycle(
     let initial_ridge = rho;
     let seeded_inner_runs = 1usize;
     let mut continued_inner_runs = 0usize;
-    let mut fit = run_linear_fast_kernel(x, config, rho, decoder_recycle)?;
+    let mut fit = match initial {
+        Some((decoder, _)) => {
+            let mut unified = *config;
+            unified.code_ridge = rho as f32;
+            unified.decoder_ridge = rho as f32;
+            validate(x, &unified)?;
+            run_from_decoder(x, &unified, decoder, decoder_recycle, Instant::now())?
+        }
+        None => run_linear_fast_kernel(x, config, rho, decoder_recycle)?,
+    };
     let tol = reml_schedule_rho_log_tol(config.tolerance);
     let mut outer_iterations = 0usize;
 
@@ -1636,9 +1735,7 @@ fn run_linear_reml_schedule_with_recycle(
                 // boundary; a trace failure AT OR ABOVE the seed ridge is off the
                 // boundary (interior ρ) and remains a genuine numerical error that
                 // still propagates.
-                return schedule_fit_from_iterate(
-                    x,
-                    config,
+                return Ok(schedule_fit_from_iterate(
                     fit,
                     false,
                     rho,
@@ -1646,7 +1743,7 @@ fn run_linear_reml_schedule_with_recycle(
                     tol,
                     outer_iterations,
                     (seeded_inner_runs, continued_inner_runs),
-                );
+                ));
             }
             Err(err) => return Err(err),
         };
@@ -1661,7 +1758,7 @@ fn run_linear_reml_schedule_with_recycle(
             rho,
             rho_new,
             log_change,
-            stats.gram_edof,
+            stats.effective_dof,
             stats.rss,
             stats.penalty_energy,
             tol,
@@ -1687,9 +1784,7 @@ fn run_linear_reml_schedule_with_recycle(
             // best-effort-open inner iterate (#2275, K >> rank) yields a
             // best-effort-open schedule fit.
             let certified = fit.certified;
-            return schedule_fit_from_iterate(
-                x,
-                config,
+            return Ok(schedule_fit_from_iterate(
                 fit,
                 certified,
                 rho,
@@ -1697,7 +1792,7 @@ fn run_linear_reml_schedule_with_recycle(
                 effective_tol,
                 outer_iterations,
                 (seeded_inner_runs, continued_inner_runs),
-            );
+            ));
         }
         if outer_iterations >= REML_SCHEDULE_MAX_OUTER_ITERS {
             // Termination guarantee (#2396): a best-effort inner solve makes the FS
@@ -1707,9 +1802,7 @@ fn run_linear_reml_schedule_with_recycle(
             // honestly (open certificate), rather than looping unboundedly. A
             // CERTIFIED schedule cannot reach here — its map contracts and meets the
             // band first.
-            return schedule_fit_from_iterate(
-                x,
-                config,
+            return Ok(schedule_fit_from_iterate(
                 fit,
                 false,
                 rho,
@@ -1717,7 +1810,7 @@ fn run_linear_reml_schedule_with_recycle(
                 effective_tol,
                 outer_iterations,
                 (seeded_inner_runs, continued_inner_runs),
-            );
+            ));
         }
         rho = rho_new;
         continued_inner_runs += 1;
@@ -1731,21 +1824,10 @@ fn run_linear_reml_schedule_with_recycle(
 /// #2275 ρ-boundary best-effort return (`certified = false`, `outer_rho_residual`
 /// left open at `∞`).
 ///
-/// API honesty (#2275): the returned EV must be the EV of the returned MODEL, and
-/// the returned codes must be exactly what a caller reconstructs by routing the
-/// returned decoder at the code ridge THEY passed — which is how held-out
-/// prediction routes (see `held_out_ev`). But the inner REML runs override the
-/// code ridge with the shared variance ρ (`run_linear_fast_kernel`: one ρ drives
-/// both the code and decoder ridge, so the evidence sees a single variance), so
-/// the inner iterate's packed codes and cached EV are at ρ, not at the caller's
-/// `config.code_ridge`; the dead-atom nulling can stale them further. Re-route the
-/// codes ONCE against the returned decoder at the caller's `config.code_ridge` and
-/// report THAT model's EV, so the returned artifact is self-consistent with how it
-/// will be used. One route + one EV, at the schedule's single exit — never per
-/// epoch, so not on the hot path.
+/// Move the certified arrays and their measured EV without another solve. The
+/// caller's ridge is only an initial value: replacing the codes with codes at
+/// that starting ridge would attach this certificate to a different model.
 fn schedule_fit_from_iterate(
-    x: ArrayView2<'_, f32>,
-    config: &SparseDictConfig,
     fit: SparseDictIterate,
     certified: bool,
     selected_rho: f64,
@@ -1753,25 +1835,9 @@ fn schedule_fit_from_iterate(
     outer_tolerance: f64,
     outer_iterations: usize,
     inner_runs: (usize, usize),
-) -> Result<SparseDictFit, SparseDictionaryError> {
+) -> SparseDictFit {
     let (seeded_inner_runs, continued_inner_runs) = inner_runs;
-    let n = x.nrows();
-    let s = fit.active;
-    let scorer = TileScorer::new(s, config.score_tile);
-    let final_codes = route_and_code_all(
-        x,
-        fit.decoder.view(),
-        &scorer,
-        s,
-        config.code_ridge,
-        config.minibatch,
-        config.score_mode,
-        None,
-    )?;
-    let final_ev = explained_variance(x, &final_codes, fit.decoder.view());
-    let final_live_atoms = live_atom_count(&final_codes, config.n_atoms);
-    let (indices, codes) = pack_codes(&final_codes, n, s);
-    Ok(SparseDictFit {
+    SparseDictFit {
         convergence: SparseDictConvergence {
             inner_ev_residual: fit.inner_ev_residual,
             inner_tolerance: fit.inner_tolerance,
@@ -1786,19 +1852,19 @@ fn schedule_fit_from_iterate(
             seeded_inner_runs,
             continued_inner_runs,
             accepted_births: fit.accepted_births,
-            live_atom_high_water: fit.live_atom_high_water.max(final_live_atoms),
+            live_atom_high_water: fit.live_atom_high_water,
             support_saturated: fit.support_saturated,
             certified,
         },
         decoder: fit.decoder,
-        indices,
-        codes,
-        explained_variance: final_ev,
+        indices: fit.indices,
+        codes: fit.codes,
+        explained_variance: fit.explained_variance,
         epochs: fit.epochs,
         active: fit.active,
         score_route_stats: fit.score_route_stats,
         decoder_solve_stats: fit.decoder_solve_stats,
-    })
+    }
 }
 
 fn validate(
@@ -1854,9 +1920,15 @@ fn validate(
 /// Row-sign changes therefore leave this seed's projectors unchanged. Capacity
 /// beyond the represented rows remains dormant rather than duplicating a line.
 pub(super) fn seed_decoder(x: ArrayView2<'_, f32>, k: usize) -> Array2<f32> {
+    let mut decoder = Array2::<f32>::zeros((k, x.ncols()));
+    complete_decoder_seed(x, &mut decoder, 0);
+    decoder
+}
+
+fn complete_decoder_seed(x: ArrayView2<'_, f32>, decoder: &mut Array2<f32>, prefix: usize) {
     let n = x.nrows();
     let p = x.ncols();
-    let mut decoder = Array2::<f32>::zeros((k, p));
+    let k = decoder.nrows();
 
     // f64 reductions keep every finite f32 row energy representable.
     let norm2: Vec<f64> = x
@@ -1864,76 +1936,56 @@ pub(super) fn seed_decoder(x: ArrayView2<'_, f32>, k: usize) -> Array2<f32> {
         .into_par_iter()
         .map(|row| row.iter().map(|&v| (v as f64) * (v as f64)).sum())
         .collect();
-    // With no atoms yet, the residual is the complete row energy.
-    let mut first = 0usize;
-    let mut best = 0.0_f64;
-    for (i, &nrm) in norm2.iter().enumerate() {
-        if nrm > best {
-            best = nrm;
-            first = i;
-        }
-    }
-    if best == 0.0 {
-        return decoder;
-    }
-    decoder.row_mut(0).assign(&x.row(first));
-
     // Update only against the newly admitted line, retaining the nearest-line
     // residual across the preceding atoms. Rows are independent; ties choose
     // the lower row index in both serial and parallel reductions.
-    let mut min_dist2 = norm2.clone();
-    min_dist2[first] = 0.0;
-    let mut previous_norm2 = best;
-    for atom in 1..k.min(n) {
-        let prev = decoder.row(atom - 1);
-        let (chosen, remaining) = min_dist2
-            .par_iter_mut()
-            .enumerate()
-            .map(|(i, md)| {
-                let xi = x.row(i);
-                let mut dot = 0.0_f64;
-                for c in 0..p {
-                    dot += xi[c] as f64 * prev[c] as f64;
+    let mut min_dist2 = norm2;
+    for atom in 0..k.min(n.max(prefix)) {
+        if atom >= prefix {
+            let mut chosen = 0usize;
+            let mut remaining = 0.0_f64;
+            for (i, &distance) in min_dist2.iter().enumerate() {
+                if distance > remaining {
+                    chosen = i;
+                    remaining = distance;
                 }
-                // Evaluate the residual itself rather than subtracting two
-                // large energies. The latter can invent a positive residual
-                // even for an exact antipode and seed the same line twice.
-                let projection = dot / previous_norm2;
-                let mut d2 = 0.0_f64;
-                for c in 0..p {
-                    let residual = (-projection).mul_add(prev[c] as f64, xi[c] as f64);
-                    d2 += residual * residual;
-                }
-                if d2 < *md {
-                    *md = d2;
-                }
-                (i, *md)
-            })
-            .reduce(
-                || (usize::MAX, f64::NEG_INFINITY),
-                |a, b| {
-                    // Strictly-greater wins; on ties keep the lower index —
-                    // exactly the serial scan's first-max semantics.
-                    if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) {
-                        b
-                    } else {
-                        a
-                    }
-                },
-            );
-        if remaining == 0.0 {
-            break;
+            }
+            if remaining == 0.0 {
+                break;
+            }
+            decoder.row_mut(atom).assign(&x.row(chosen));
+            min_dist2[chosen] = 0.0;
         }
-        decoder.row_mut(atom).assign(&x.row(chosen));
-        min_dist2[chosen] = 0.0;
-        previous_norm2 = norm2[chosen];
+        let prev = decoder.row(atom);
+        let previous_norm2: f64 = prev.iter().map(|&v| (v as f64).powi(2)).sum();
+        if previous_norm2 == 0.0 {
+            continue;
+        }
+        min_dist2.par_iter_mut().enumerate().for_each(|(i, md)| {
+            let xi = x.row(i);
+            let mut dot = 0.0_f64;
+            for c in 0..p {
+                dot += xi[c] as f64 * prev[c] as f64;
+            }
+            // Evaluate the residual itself rather than subtracting two
+            // large energies. The latter can invent a positive residual
+            // even for an exact antipode and seed the same line twice.
+            let projection = dot / previous_norm2;
+            let mut d2 = 0.0_f64;
+            for c in 0..p {
+                let residual = (-projection).mul_add(prev[c] as f64, xi[c] as f64);
+                d2 += residual * residual;
+            }
+            if d2 < *md {
+                *md = d2;
+            }
+        });
     }
-    decoder
 }
 
 #[cfg(test)]
 mod seed_geometry_tests {
-    use super::seed_decoder;
+    use super::{complete_decoder_seed, seed_decoder};
     use ndarray::array;
 
     #[test]
@@ -1941,6 +1993,113 @@ mod seed_geometry_tests {
         let x = array![[4.0_f32, 0.0], [-4.0, 0.0], [0.0, 3.0], [0.0, -3.0]];
         let seed = seed_decoder(x.view(), 2);
         assert_eq!(seed, array![[4.0_f32, 0.0], [0.0, 3.0]]);
+    }
+
+    #[test]
+    fn capacity_growth_preserves_learned_directions_and_covers_the_remaining_lines() {
+        let x = ndarray::array![[4.0_f32, 0.0], [-4.0, 0.0], [0.0, 3.0], [0.0, -3.0]];
+        let mut decoder = ndarray::array![[0.6_f32, 0.8], [0.0, 0.0]];
+        let learned = decoder.row(0).to_owned();
+        complete_decoder_seed(x.view(), &mut decoder, 1);
+        assert_eq!(
+            decoder.row(0),
+            learned.view(),
+            "the fitted prefix is retained exactly"
+        );
+        assert_eq!(
+            decoder.row(1),
+            x.row(0),
+            "new capacity covers the largest remaining line residual"
+        );
+    }
+
+    #[test]
+    fn enlarged_dictionary_is_refitted_and_certified_at_its_selected_ridge() {
+        let x = ndarray::Array2::from_shape_fn((64, 3), |(i, j)| match j {
+            0 if i % 2 == 0 => 4.0_f32,
+            1 if i % 2 == 1 => 3.0_f32,
+            2 => {
+                if i % 4 < 2 {
+                    0.1_f32
+                } else {
+                    -0.1_f32
+                }
+            }
+            _ => 0.0,
+        });
+        let mut config = crate::sparse_dict::SparseDictConfig {
+            score_mode: gam_gpu::GpuPolicy::Off,
+            ..Default::default()
+        };
+        let prior = super::run_linear_reml_schedule(x.view(), &config).unwrap();
+        config.n_atoms = 2;
+        let fit = super::extend_linear_reml_schedule(x.view(), &config, &prior).unwrap();
+        assert!(fit.convergence.certified);
+        assert!(fit.explained_variance > 0.99);
+        assert!(fit.explained_variance > prior.explained_variance);
+        let scorer = super::TileScorer::new(1, config.score_tile);
+        let fresh = super::route_and_code_all(
+            x.view(),
+            fit.decoder.view(),
+            &scorer,
+            1,
+            fit.convergence.selected_rho as f32,
+            config.minibatch,
+            config.score_mode,
+            None,
+        )
+        .unwrap();
+        for (i, code) in fresh.iter().enumerate() {
+            assert_eq!(code.indices[0], fit.indices[[i, 0]]);
+            assert_eq!(code.codes[0], fit.codes[[i, 0]]);
+        }
+        assert!(
+            super::extend_linear_reml_schedule(x.view(), &config, &fit).is_err(),
+            "continuation must strictly increase capacity"
+        );
+    }
+
+    #[test]
+    fn single_atom_evidence_counts_random_codes_and_matches_marginal_variance_ratio() {
+        let n = 64usize;
+        let x = ndarray::Array2::from_shape_fn((n, 3), |(i, j)| match j {
+            0 if i % 2 == 0 => 4.0_f32,
+            1 if i % 2 == 1 => 3.0_f32,
+            2 => {
+                if i % 4 < 2 {
+                    0.1_f32
+                } else {
+                    -0.1_f32
+                }
+            }
+            _ => 0.0,
+        });
+        let decoder = array![[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        // Marginal covariance has variance sigma²+tau² along d and sigma² in
+        // each of the two orthogonal directions. Its analytic variance MLEs
+        // (also REML here: no fixed mean effects) give this independent ratio.
+        let sigma2 = (0.1_f32 as f64).powi(2) / 2.0;
+        let along_variance = (16.0 + 9.0) / 2.0;
+        let rho = sigma2 / (along_variance - sigma2);
+        let indices = ndarray::Array2::from_shape_fn((n, 1), |(i, _)| (i % 2) as u32);
+        let codes = ndarray::Array2::from_shape_fn((n, 1), |(i, _)| {
+            (x[[i, i % 2]] as f64 / (1.0 + rho)) as f32
+        });
+        let stats = super::linear_block_reml_stats_from_parts(
+            x.view(),
+            decoder.view(),
+            indices.view(),
+            codes.view(),
+            rho,
+        )
+        .unwrap();
+        assert_eq!(stats.n_observations, n * 3);
+        assert!((stats.effective_dof - n as f64 / (1.0 + rho)).abs() < 1e-10);
+        let updated = super::linear_shared_rho_fs_step(&stats, rho).unwrap();
+        assert!(
+            (updated / rho - 1.0).abs() < 4.0 * f32::EPSILON as f64,
+            "marginal optimum rho={rho}, evidence update={updated}"
+        );
     }
 
     #[test]
@@ -5190,11 +5349,10 @@ mod exact_solve_tests {
         // pooled linear-block aggregates. Pin it against a hand-computed value.
         use super::{LinearBlockRemlStats, linear_shared_rho_fs_step};
         let stats = LinearBlockRemlStats {
-            gram_edof: 2.5,
-            p_cols: 3,
+            effective_dof: 7.5,
             penalty_energy: 4.0,
             rss: 10.0,
-            n_obs: 8,
+            n_observations: 24,
         };
         // γ_tot = 3·2.5 = 7.5; resid_dof = 24 − 7.5 = 16.5; σ̂² = 10/16.5;
         // ρ_new = 7.5·σ̂²/4 = 1.1363636363636365.
@@ -5212,18 +5370,17 @@ mod exact_solve_tests {
         };
         assert!(linear_shared_rho_fs_step(&zero_energy, 7.0e-4).is_err());
         let zero_edof = LinearBlockRemlStats {
-            gram_edof: 0.0,
+            effective_dof: 0.0,
             ..stats
         };
         assert!(linear_shared_rho_fs_step(&zero_edof, 7.0e-4).is_err());
 
         // All dof consumed is invalid evidence, not a floored denominator.
         let saturated = LinearBlockRemlStats {
-            gram_edof: 100.0,
-            p_cols: 3,
+            effective_dof: 300.0,
             penalty_energy: 4.0,
             rss: 10.0,
-            n_obs: 8,
+            n_observations: 24,
         };
         assert!(linear_shared_rho_fs_step(&saturated, 1.0e-3).is_err());
     }
@@ -5565,18 +5722,18 @@ mod exact_solve_tests {
         .expect("stats");
         let ceiling = (n as f64) - 1.0 / (p as f64);
         assert!(
-            stats.gram_edof <= ceiling + 1.0e-12,
+            stats.effective_dof / p as f64 <= ceiling + 1.0e-12,
             "edof must be clamped to N less the minimal residual dof: \
              got {} vs ceiling {ceiling}",
-            stats.gram_edof
+            stats.effective_dof / p as f64
         );
         // The pooled dof is now strictly inside (0, N·P), so the FS step accepts it
         // (it would have errored on a raw overshoot > N per column).
         let total_obs = (n * p) as f64;
         assert!(
-            (stats.p_cols as f64) * stats.gram_edof < total_obs,
+            stats.effective_dof < total_obs,
             "pooled dof {} must be strictly below N·P {total_obs}",
-            (stats.p_cols as f64) * stats.gram_edof
+            stats.effective_dof
         );
         assert!(
             linear_shared_rho_fs_step(&stats, rho).is_ok(),
@@ -5618,7 +5775,7 @@ mod exact_solve_tests {
             fit.decoder.view(),
             &scorer,
             s,
-            config.code_ridge,
+            fit.convergence.selected_rho as f32,
             config.minibatch,
             config.score_mode,
             None,
@@ -5852,7 +6009,7 @@ mod decoder_recycle_latch_scope_2742_tests {
         let (x, config, k) = schedule_fixture();
         let mut recycle = latched_off(k);
 
-        let fit = run_linear_reml_schedule_with_recycle(x.view(), &config, &mut recycle)
+        let fit = run_linear_reml_schedule_with_recycle(x.view(), &config, &mut recycle, None)
             .expect("schedule fit");
 
         // Non-vacuity: the loop must actually have crossed at least one outer
@@ -5878,7 +6035,7 @@ mod decoder_recycle_latch_scope_2742_tests {
         let (x, config, k) = schedule_fixture();
         let mut recycle = DecoderRecycleSpace::new(k);
 
-        let fit = run_linear_reml_schedule_with_recycle(x.view(), &config, &mut recycle)
+        let fit = run_linear_reml_schedule_with_recycle(x.view(), &config, &mut recycle, None)
             .expect("schedule fit");
 
         assert!(
@@ -5908,7 +6065,7 @@ mod decoder_recycle_latch_scope_2742_tests {
 
         let public = run_linear_reml_schedule(x.view(), &config).expect("public schedule fit");
         let mut recycle = DecoderRecycleSpace::new(k);
-        let scoped = run_linear_reml_schedule_with_recycle(x.view(), &config, &mut recycle)
+        let scoped = run_linear_reml_schedule_with_recycle(x.view(), &config, &mut recycle, None)
             .expect("scoped schedule fit");
 
         assert_eq!(

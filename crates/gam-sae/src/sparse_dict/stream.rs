@@ -3,7 +3,7 @@
 //! The one-shot [`super::fit_sparse_dictionary`] holds the whole `N×P` corpus in
 //! memory and alternates route → refresh → revive over it. For a real corpus
 //! (`K ≈ 32_000` over tens of millions of tokens) the rows never fit at once, so
-//! this module exposes the SAME alternation as a resumable handle that a Python
+//! this module exposes an accumulated-statistic alternation as a handle that a Python
 //! loop drives one shard at a time:
 //!
 //! ```text
@@ -22,12 +22,14 @@
 //! Python — never the `K×P` decoder or any `N×K` object — so per-shard overhead
 //! is `O(shard × P)`, independent of `K` and of the corpus length.
 //!
-//! **Equivalence to one-shot.** Each epoch's pass routes every shard against the
+//! Each epoch's pass routes every shard against the
 //! current decoder `D_{k-1}` and sums their `CᵀC`/`CᵀX` contributions
 //! ([`DecoderNormalEq::accumulate`] is additive), so the assembled normal
-//! equations — and therefore the refreshed `D_k` — are exactly those of a
-//! full-batch refresh over the concatenation, up to f32 GEMM rounding. The one
-//! deliberate difference from the one-shot loop is the revival residual: one-shot
+//! equations match a full-batch MOD refresh over the concatenation, up to f32
+//! GEMM rounding. The one-shot single-atom path can additionally profile codes
+//! using the retained corpus; this streaming state retains only aggregates and
+//! takes the MOD step. The public one-shot fit also selects rho by REML.
+//! Another difference is the revival residual: one-shot
 //! reseeds dead atoms onto residuals measured under the POST-refresh decoder
 //! `D_k`, whereas the streaming pass measures them under the decoder in force
 //! during the pass, `D_{k-1}` (there is no second corpus pass to recompute them
@@ -584,10 +586,9 @@ mod stream_tests {
 
     #[test]
     fn streaming_over_shards_matches_one_shot_on_concatenation() {
-        // Streaming the row-ordered shards of a corpus must reach the same fixed
-        // point as a one-shot fit on the concatenation: the per-shard normal-eq
-        // accumulation is additive, so the refresh sequence is identical up to f32
-        // GEMM rounding.
+        // On this separated-line corpus, streaming MOD and the profiled one-shot
+        // updates must recover the same reconstruction at a shared fixed ridge.
+        // Their intermediate refresh sequences need not coincide.
         let (n, k, p) = (240usize, 6usize, 8usize);
         let x = planted(n, k, p);
         let config = SparseDictConfig {
@@ -602,14 +603,8 @@ mod stream_tests {
             score_mode: gam_gpu::GpuPolicy::Off,
         };
 
-        // Compare streaming against the LEGACY fixed-ridge batch fit: the
-        // streaming refresh (`SparseDictStreamState`) implements the same additive
-        // per-shard normal-eq accumulation as the batch `run`, NOT the outer
-        // shared-ρ REML schedule that the public `fit_sparse_dictionary` default
-        // now runs (design gam#2232 Increment 2; streaming re-points in a later
-        // increment). `run_linear_fast_kernel` at the shared default ridge IS
-        // `run` (it sets both ridges to the one shared ρ and delegates), so this
-        // is exactly the batch baseline the streaming path must reproduce.
+        // Hold rho fixed in both arms to isolate shard assembly and direction
+        // recovery. The public one-shot entry additionally fits rho by REML.
         let one_shot = run_linear_fast_kernel(
             x.view(),
             &config,
@@ -636,9 +631,7 @@ mod stream_tests {
         );
 
         let ev_stream = routed_ev(x.view(), &stream_decoder, s, &config);
-        // Same routed-EV functional on both arms: the one-shot EV is computed
-        // fresh from its returned decoder (the iterate no longer carries a
-        // cached EV -- the cache was the stale-gap defect #2023 removed).
+        // Evaluate the same fresh routed-EV functional on both returned decoders.
         let ev_one_shot = routed_ev(x.view(), &one_shot.decoder, one_shot.active, &config);
         assert!(
             (ev_stream - ev_one_shot).abs() < 1.0e-3,

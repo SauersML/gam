@@ -39,6 +39,7 @@ mod residual_reservoir;
 #[cfg(target_os = "linux")]
 mod score_router_backend;
 mod scoring;
+mod single_atom;
 #[cfg(target_os = "linux")]
 mod scoring_gpu;
 mod split_lr_fdr;
@@ -65,6 +66,7 @@ pub use split_lr_fdr::{
 };
 pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
 pub use update::{DecoderSolveStats, LinearBlockRemlStats, SparseDictionaryError, linear_shared_rho_fs_step};
+pub(crate) use update::extend_linear_reml_schedule;
 
 use ndarray::{Array2, ArrayView2};
 
@@ -90,11 +92,12 @@ pub struct SparseDictConfig {
     /// tiles of shape `minibatch × tile` are formed and discarded; the `N×K`
     /// score matrix is never materialised.
     pub score_tile: usize,
-    /// Shared ridge on the per-row active-set code solve (Tikhonov on the
-    /// `s×s` Gram). Identifies the codes when active atoms are collinear.
+    /// Initial shared ridge on the per-row active-set code solve. The one-shot
+    /// fit selects its final value by REML and records it in `selected_rho`.
     pub code_ridge: f32,
-    /// Shared ridge on the per-atom decoder refresh (method-of-optimal
-    /// -directions normal equations). Keeps a thinly-used atom well posed.
+    /// Shared starting ridge; must equal `code_ridge` for a one-shot fit.
+    /// Coupled MOD solves use it in their normal equations; a single-atom
+    /// direction is profiled on its unit sphere.
     pub decoder_ridge: f32,
     /// Relative explained-variance improvement below which training stops.
     pub tolerance: f64,
@@ -158,7 +161,7 @@ pub struct SparseDictFit {
     pub active: usize,
     /// Aggregate CPU/GPU scoring counters over every route pass in the fit.
     pub score_route_stats: ScoreRouteStats,
-    /// Decoder refresh percolation/CG certificate from the final MOD update.
+    /// Decoder refresh diagnostics from the final conditional direction update.
     pub decoder_solve_stats: DecoderSolveStats,
 }
 

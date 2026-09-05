@@ -92,5 +92,37 @@ def test_sparse_trainer_storage_is_fixed_width_not_dense():
     assert fit.explained_variance > 0.85
 
 
+def test_sparse_transform_uses_the_fitted_variance_ratio(monkeypatch):
+    from gamfit import _sparse_dictionary as sparse
+
+    certificate = sparse.SparseDictionaryConvergence(
+        inner_ev_residual=0.0, inner_tolerance=1e-6,
+        decoder_residual=0.0, decoder_tolerance=1e-6,
+        routing_residual=0.0, routing_tolerance=1e-6,
+        outer_rho_residual=0.0, outer_tolerance=1e-6,
+        selected_rho=7.5, outer_iterations=1,
+        seeded_inner_runs=1, continued_inner_runs=0,
+        accepted_births=0, live_atom_high_water=1,
+        support_saturated=True, certified=True,
+    )
+    fit = sparse.SparseDictionaryFit(
+        decoder=np.array([[1.0, 0.0]], dtype=np.float32),
+        indices=np.zeros((1, 1), dtype=np.uint32),
+        codes=np.zeros((1, 1), dtype=np.float32),
+        explained_variance=0.0, epochs=1, convergence=certificate,
+        active=1, score_route_stats={},
+    )
+
+    class NativeTransform:
+        def sparse_dictionary_transform_ffi(self, x, decoder, active, *, code_ridge, score_mode):
+            assert code_ridge == certificate.selected_rho
+            assert score_mode == "off"
+            return {"indices": fit.indices, "codes": fit.codes, "score_route_stats": {}}
+
+    monkeypatch.setattr(sparse, "rust_module", lambda: NativeTransform())
+    transformed = fit.transform([[1.0, 0.0]], score_mode="off")
+    np.testing.assert_array_equal(transformed.codes, fit.codes)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

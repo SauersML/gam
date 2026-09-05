@@ -232,7 +232,9 @@ const PROFILE_MAX_ITERS: usize = 400;
 ///
 /// The fits run in fixed ladder order (ascending `K`); each forwards the template
 /// [`SpectrometerConfig::dict`] with `n_atoms` set to the rung width and `active`
-/// forced to 1. The regression and its standard errors are computed in `f64`.
+/// forced to 1. Each larger width retains the preceding fitted directions and
+/// ridge, seeds only new capacity, then runs the complete REML schedule with
+/// fresh codes and certificates. The regression uses `f64` arithmetic.
 pub fn dimension_spectrometer(
     data: ArrayView2<'_, f32>,
     cfg: &SpectrometerConfig,
@@ -264,24 +266,36 @@ pub fn dimension_spectrometer(
     }
 
     // Build the ladder K_j = k_min · 2^j, j = 0..=n_doublings, guarding overflow.
+    // A checked shift only validates its shift count; it can still discard the
+    // high bits of k_min. Check the multiplication before allocating the ladder.
+    if cfg.n_doublings >= usize::BITS as usize {
+        return Err("dimension_spectrometer: rung width overflows usize".to_string());
+    }
     let mut widths: Vec<usize> = Vec::with_capacity(cfg.n_doublings + 1);
-    for j in 0..=cfg.n_doublings {
-        let k = cfg.k_min.checked_shl(j as u32).ok_or_else(|| {
+    let mut k = cfg.k_min;
+    widths.push(k);
+    for j in 1..=cfg.n_doublings {
+        k = k.checked_mul(2).ok_or_else(|| {
             format!("dimension_spectrometer: rung width k_min·2^{j} overflows usize")
         })?;
         widths.push(k);
     }
 
     let mut rungs: Vec<(usize, f64)> = Vec::with_capacity(widths.len());
+    let mut previous = None;
     for &k in &widths {
         let mut rung_cfg = cfg.dict;
         rung_cfg.n_atoms = k;
         // The VQ exponent −2/d is a single-atom rate; force it on every rung.
         rung_cfg.active = 1;
-        let fit = fit_sparse_dictionary(data, &rung_cfg)
-            .map_err(|e| format!("dimension_spectrometer: fit at K={k} failed: {e}"))?;
+        let fit = match previous.as_ref() {
+            Some(prior) => crate::sparse_dict::extend_linear_reml_schedule(data, &rung_cfg, prior),
+            None => fit_sparse_dictionary(data, &rung_cfg),
+        }
+        .map_err(|e| format!("dimension_spectrometer: fit at K={k} failed: {e}"))?;
         let loss = rung_loss(&fit, data);
         rungs.push((k, loss));
+        previous = Some(fit);
     }
 
     analyze_ladder(&rungs, data.nrows())
@@ -747,6 +761,20 @@ mod tests {
         );
         assert_eq!(report.stable_rung_count, report.rungs.len());
         assert!((report.d_hat - report.d_hat_full_ladder).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn overflowing_ladders_are_refused_before_allocating_or_fitting() {
+        let data = ndarray::array![[1.0_f32, 0.0]];
+        for (k_min, n_doublings) in [(usize::MAX / 2 + 1, 3), (1, usize::MAX)] {
+            let config = SpectrometerConfig {
+                k_min,
+                n_doublings,
+                dict: dict_template(),
+            };
+            let error = dimension_spectrometer(data.view(), &config).unwrap_err();
+            assert!(error.contains("overflows usize"), "{error}");
+        }
     }
 
     #[test]
