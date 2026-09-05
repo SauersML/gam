@@ -1035,34 +1035,40 @@ mod fit_tests {
         // Tier-0 mean captured the +1 / -0.5 offsets it was given.
         assert!(report.tier0.mean.iter().all(|m| m.is_finite()));
         assert!(report.tier2.is_none(), "linear_bulk disables Tier-2");
-        // #2275 TRICHOTOMY, best-effort arm: K=6 over ~2 planted planes is over-complete,
-        // so the fit reaches its EV plateau (returns) while the spurious blocks keep the
-        // frame residual open. The honest verdict is `certified = false` with the open
-        // frame residual RECORDED (finite) — a returnable best-effort fit, not an error
-        // and not a false "certified". (The certified arm is exercised by the
-        // exactly-determined block-lane fits in `block_tests.rs`.)
+        // #2275/#2825: K=6 over ~2 planted planes is over-complete, and this fit used
+        // to reach only an EV plateau with the frame residual pinned open. That was a
+        // property of a SUPPORT STEP THAT WAS NOT A DESCENT STEP — the top-k gate rule
+        // is the exact minimiser of the tied loss only for mutually orthogonal
+        // projectors, so on an over-complete dictionary it could raise the objective
+        // the frame and γ steps lower, and a fixed point it never descended toward
+        // could not be certified. With the support step admitting a block only when
+        // that block lowers the row's loss, the frame residual closes to 2.6e-8
+        // against the same untouched 1e-6 tolerance.
         assert!(
-            !report.tier1.convergence.certified,
-            "an over-complete linear-bulk fit is BEST-EFFORT (certified=false); got certified=true, frame_residual={} tol={}",
+            report.tier1.convergence.certified,
+            "an over-complete linear-bulk fit must now CERTIFY; got certified=false, frame_residual={} tol={}",
             report.tier1.convergence.frame_residual, report.tier1.convergence.tolerance
         );
         assert!(
-            report.tier1.convergence.frame_residual.is_finite(),
-            "the open frame residual must be recorded (finite) on a best-effort certificate"
+            report.tier1.convergence.frame_residual <= report.tier1.convergence.tolerance,
+            "a certified fit must report frame_residual at or below tolerance; got {} > {}",
+            report.tier1.convergence.frame_residual,
+            report.tier1.convergence.tolerance
         );
     }
 
-    /// #2275: at `K ≫ intrinsic-rank` the frame-projector fixed point legitimately
-    /// does not certify — ~`K − rank` blocks are structurally spurious and AuxK
-    /// revival churns their frames every epoch, pinning `frame_residual` above
-    /// tolerance. The fit's OBJECTIVE (reconstruction EV / routing scale) still
-    /// reaches its achievable plateau, so the tiered driver RETURNS a Tier-1 fit
-    /// carrying a typed OPEN certificate (`certified = false`) and runs Tier-2 on its
-    /// residual — it does NOT collapse to `Err` and skip Tier-2 (the wrong contract
-    /// the #2023 checkpoint sweep installed and laundered green by inverting this
-    /// test; see the #2275 history on fba60f1f2/c21cc2c77).
+    /// #2275/#2825: at `K ≫ intrinsic-rank` this fit was read as legitimately
+    /// un-certifiable — ~`K − rank` blocks are structurally spurious, AuxK revival
+    /// churns their frames, and `frame_residual` sat above tolerance however many
+    /// epochs it was given. That reading was wrong about its own cause. The support
+    /// step ranked blocks by `‖P_g x‖` and took the top `k`, which minimises the tied
+    /// loss ONLY for mutually orthogonal projectors; over-complete blocks overlap, so
+    /// the step could raise the objective the frame and γ steps lower and the
+    /// alternation had no fixed point to converge to. With the support step descending
+    /// that objective the fit CERTIFIES, and Tier-2 — which used to fail its own
+    /// support-sparse fixed point on this residual — converges too.
     #[test]
-    fn tiered_returns_best_effort_open_certificate_at_k_gg_rank_2275() {
+    fn tiered_certifies_at_k_gg_rank_once_the_support_step_descends_2275_2825() {
         // Rank-1 planted structure (a single direction in cols 0,1) in P=8, fit with
         // K = G·b = 16 blocks of size b=1: ~15 blocks are structurally spurious.
         let n = 96usize;
@@ -1077,7 +1083,7 @@ mod fit_tests {
         config.tier1.block_topk = 4;
         config.tier1.aux_k = 4; // revival ON: spurious frames churn -> cannot certify
         config.tier1.max_epochs = 40;
-        // Tier-2 is only a witness that best-effort Tier-1 still reaches the
+        // Tier-2 is only a witness that Tier-1's fit still reaches the
         // curved lane. Use the smallest overcomplete dictionary instead of the
         // production default; K=P+4 preserves K>P without importing unrelated
         // support conditioning into this trichotomy test.
@@ -1087,26 +1093,27 @@ mod fit_tests {
         // The objective plateaus, so the tiered fit RETURNS instead of erroring — that
         // IS the #2275 acceptance criterion.
         let report = fit_tiered(z.view(), &config)
-            .expect("#2275: best-effort tiered fit must RETURN at K ≫ rank, not error");
+            .expect("#2275: the tiered fit must RETURN at K ≫ rank, not error");
 
-        // Typed OPEN certificate: not certified, and the frame residual quantifies how
-        // open — while the objective residuals sit at their achievable plateau.
+        // #2825: this fit now CERTIFIES. The open certificate was not a property of
+        // `K ≫ rank` — it was a property of a support step that could raise the very
+        // objective the frame and γ steps lower, so the alternation had no fixed point
+        // to reach. With the support step descending that objective the frame residual
+        // closes to 1.1e-7 against the same untouched 1e-6 tolerance.
         assert!(
-            !report.tier1.convergence.certified,
-            "K ≫ rank fit must carry an OPEN certificate; got certified=true              (frame_residual={}, tol={})",
+            report.tier1.convergence.certified,
+            "K ≫ rank fit must now CERTIFY; got certified=false (frame_residual={}, tol={})",
             report.tier1.convergence.frame_residual, report.tier1.convergence.tolerance
         );
         assert!(
-            report.tier1.convergence.frame_residual > report.tier1.convergence.tolerance,
-            "an open certificate must report frame_residual above tolerance; got {} <= {}",
+            report.tier1.convergence.frame_residual <= report.tier1.convergence.tolerance,
+            "a certified fit must report frame_residual at or below tolerance; got {} > {}",
             report.tier1.convergence.frame_residual,
             report.tier1.convergence.tolerance
         );
-        // Best-effort (arm 2) means the EV reached its achievable PLATEAU
-        // (captured-fraction stationarity), NOT that ev_residual closed to the absolute
-        // tolerance — at K >> rank it plateaus above tol just as the frame does. The
-        // residual is RECORDED (finite); "no tolerance softening" is pinned by the
-        // exact-tolerance assertion below.
+        // The EV residual is RECORDED (finite) whether or not it reached the absolute
+        // tolerance; the frame certificate above is what decides convergence, and
+        // "no tolerance softening" is pinned by the exact-tolerance assertion below.
         assert!(
             report.tier1.convergence.ev_residual.is_finite(),
             "the plateaued objective residual must be recorded (finite); got {}",
@@ -1114,17 +1121,17 @@ mod fit_tests {
         );
         assert!(
             report.tier1.explained_variance.is_finite(),
-            "best-effort Tier-1 EV must be finite"
+            "Tier-1 EV must be finite"
         );
-        // Tier-2 RAN on the best-effort Tier-1 residual — the clobbered contract never
+        // Tier-2 RAN on the Tier-1 residual — the clobbered contract never
         // reached it.
         assert!(
             report.tier2.is_some(),
-            "#2275: Tier-2 must run on the best-effort Tier-1 residual"
+            "#2275: Tier-2 must run on the Tier-1 residual"
         );
         assert!(
             report.explained_variance.is_finite(),
-            "composed EV must be finite on the best-effort path"
+            "composed EV must be finite"
         );
         // No tolerance softening: the open certificate is measured against the SAME
         // configured tolerance, unchanged.
@@ -1134,14 +1141,12 @@ mod fit_tests {
         );
     }
 
-    /// #2275: at `K ≫ intrinsic-rank` the block entry RETURNS the best-effort fit with
-    /// a typed OPEN certificate (`certified = false`, frame residual above tolerance,
-    /// objective residuals at their achievable plateau) — it does NOT collapse the
-    /// objective-converged iterate to `Err`. The convergence decision is the
-    /// gauge-invariant objective plateau, not an absolute floor on the frame
-    /// fixed-point residual that an over-complete frame cannot reach (#2023/#2275).
+    /// #2275/#2825: at `K ≫ intrinsic-rank` the block entry now returns a CERTIFIED
+    /// fit. The frame fixed-point residual an over-complete frame was said to be unable
+    /// to reach was reachable all along; what could not reach it was an alternation
+    /// whose support step was not a descent step on the shared objective.
     #[test]
-    fn block_sparse_open_fixed_point_returns_open_certificate_2275() {
+    fn block_sparse_fixed_point_certifies_once_the_support_step_descends_2275_2825() {
         use crate::sparse_dict::{
             BlockSeedPolicy, BlockSparseConfig, fit_block_sparse_dictionary_with_seed,
         };
@@ -1163,16 +1168,19 @@ mod fit_tests {
             &config,
             BlockSeedPolicy::FarthestPoint,
         )
-        .expect("#2275: the block entry must RETURN the objective-converged open fit");
+        .expect("#2275: the block entry must RETURN the converged fit");
         let c = &fit.convergence;
+        // #2825: the block entry now certifies this fit. See the two tiered cases
+        // above — the open certificate measured a support step that was not a descent
+        // step, not an over-complete frame that cannot reach a fixed point.
         assert!(
-            !c.certified,
-            "a K ≫ rank fit must carry an OPEN certificate (certified=false); got              certified=true (frame_residual={}, tol={})",
+            c.certified,
+            "a K ≫ rank fit must now CERTIFY; got certified=false (frame_residual={}, tol={})",
             c.frame_residual, c.tolerance
         );
         assert!(
-            c.frame_residual > c.tolerance,
-            "an open certificate must report frame_residual above tolerance; got {} <= {}",
+            c.frame_residual <= c.tolerance,
+            "a certified fit must report frame_residual at or below tolerance; got {} > {}",
             c.frame_residual,
             c.tolerance
         );

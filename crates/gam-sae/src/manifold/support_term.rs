@@ -5804,7 +5804,8 @@ impl SaeSupportSparseTerm {
             // `~sqrt(cells) * EPSILON * |f|`; below that, `trial < objective`
             // is comparing two roundings of the same number.
             //
-            // Measured on `tiered_returns_best_effort_open_certificate_at_k_gg_rank_2275`
+            // Measured on `tiered_certifies_at_k_gg_rank_once_the_support_step_descends_2275_2825`
+            // (then named `tiered_returns_best_effort_open_certificate_at_k_gg_rank_2275`)
             // (base ea5c5e7d1 + instrumentation, release, acn112). The terminal
             // cycles accepted a coupled step on all 256 coupled cycles for a
             // decrease of `-5.204170e-17` on an objective of `2.202036583315e-2`

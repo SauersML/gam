@@ -137,7 +137,12 @@ pub struct BlockSparseConfig {
     pub n_blocks: usize,
     /// Block size `b`: atoms per block (the subspace dimension). Typically 2–4.
     pub block_size: usize,
-    /// Block routing budget `k`: how many blocks may fire per row (block-TopK).
+    /// Block routing budget `k`: the MOST blocks that may fire on one row. A row
+    /// fires fewer when the next candidate does not lower its tied loss, which on
+    /// an overcomplete dictionary is an ordinary outcome rather than an edge case:
+    /// the top-`k` gate ranking minimises that loss only for mutually orthogonal
+    /// projectors, and overlapping blocks make the omitted cross term decisive.
+    /// `k` is a cap, not a quota.
     pub block_topk: usize,
     /// Number of full passes over the data.
     pub max_epochs: usize,
@@ -579,9 +584,11 @@ fn orphan_gate_floor(row: ArrayView1<'_, f32>, b: usize) -> f32 {
     row_norm * projection_roundoff
 }
 
-/// Encode + route the whole corpus in minibatches. For each row: block-TopK route
-/// (`gate = ‖x D_gᵀ‖₂`), then the tied signed code `z_g = γ x D_gᵀ` for the
-/// selected blocks. Returns one [`RowBlockCode`] per row in global order.
+/// Encode + route the whole corpus in minibatches. For each row: shortlist by the
+/// gate `‖x D_gᵀ‖₂`, admit from that shortlist by descent in the tied loss (a row
+/// takes at most `k` blocks and fewer when the next one does not lower its loss),
+/// then the tied signed code `z_g = γ x D_gᵀ` for the admitted
+/// blocks. Returns one [`RowBlockCode`] per row in global order.
 pub(super) fn route_and_code_all(
     x: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
@@ -663,6 +670,61 @@ fn route_block_minibatch_dispatch(
 /// Fixed-width sparse code for one row from its `(block, gate)` shortlist: the
 /// tied signed within-block code `z_g = γ x D_gᵀ` per selected block, padded to
 /// width `k` (block 0, zero gate/code) when fewer than `k` blocks fired.
+/// Select this row's support by DESCENT IN THE TIED LOSS, and code it.
+///
+/// The gate ranking `‖P_g x‖` is the exact minimiser of
+///
+/// ```text
+/// L(S) = ‖x‖² − (2γ−γ²) Σ_{g∈S} c_g + γ² Σ_{g≠h∈S} y_g·y_h,   c_g = ‖P_g x‖², y_g = P_g x
+/// ```
+///
+/// ONLY when the selected projectors are mutually orthogonal, because that is
+/// the case in which the cross term vanishes. An overcomplete dictionary's
+/// blocks overlap by construction, the cross term is exactly what the ranking
+/// omits, and taking the top `k` unconditionally can therefore ADD a block that
+/// raises the loss. Measured on the 2048-atom fixture (a00be6eb0): a frame step
+/// lowered RSS 10606.237028 → 10300.318308 at fixed support, and re-routing
+/// returned it to 10578.837739 — 91% of the gain given back, 85 of 512 rows
+/// changing support. A support step that can raise the objective the frame and
+/// γ steps lower is not a descent step, so the alternation is not a
+/// block-coordinate descent and its frame stationarity certificate has nothing
+/// to converge to.
+///
+/// The exact incremental gain of admitting `h` to a selected set `S` is
+///
+/// ```text
+/// ΔL_h(S) = −(2γ−γ²) c_h + 2γ² (m · y_h),   m = Σ_{g∈S} y_g
+/// ```
+///
+/// so `m` is ONE `P`-vector per row and a round costs one `U_h m` per remaining
+/// candidate — about 3% on top of the routing GEMM. At `S = ∅` this is
+/// `−(2γ−γ²) c_h`: the gate ranking IS greedy round one, and the defect was
+/// reusing round one's ranking for rounds `2..k` against a residual that had
+/// already moved. Admit in greedy order and STOP when no remaining candidate
+/// lowers the loss, so `k` is the cap it was always documented to be rather
+/// than a quota.
+///
+/// Selecting against `L` MUST use the current `γ`, and the profiled criterion
+/// `(x·m_S)²/‖m_S‖²` — which is scale-free and would keep routing invariant to
+/// the scale an epoch starts from — was measured NOT to close the `K ≫ rank`
+/// certificates this rule closes. The descent has to be in the same objective
+/// the frame and γ steps descend, and that objective carries `γ`.
+///
+/// One consequence needs a guard. For `γ ≥ 2` the admission weight `2γ−γ²` is
+/// non-positive, no block lowers `L`, and every row would empty — after which
+/// `refresh_gamma` divides by a zero denominator and the fit cannot recover.
+/// THE NULL OF THIS MODEL IS `γ = 0`, not an empty support: the scale is the
+/// parameter that represents "explain nothing", so the support has to stay
+/// well-defined for the scale to be able to say it. A row therefore always
+/// keeps the single block that best explains it, and only the admissions after
+/// the first are conditional. When `2γ−γ² > 0` — every scale the fit actually
+/// visits — that first admission is the one `ΔL` would have chosen anyway, so
+/// the guard changes nothing there.
+///
+/// Every quantity is a function of the projectors `P_g`, so the rule is
+/// invariant to an `O(b)` change of basis inside any block, and it is a pure
+/// function of `(x, decoder, γ)`, so [`block_sparse_dictionary_transform`]
+/// reproduces the training support exactly.
 fn code_row(
     row: ArrayView1<'_, f32>,
     decoder: ArrayView2<'_, f32>,
@@ -671,30 +733,94 @@ fn code_row(
     k: usize,
     shortlist: &[(u32, f32)],
 ) -> RowBlockCode {
+    let p = row.len();
+    let gamma64 = gamma as f64;
+    let admission_scale = 2.0 * gamma64 - gamma64 * gamma64;
+
+    // Candidate coordinates `w_h = U_h x`, in the routed order. A zero-gate
+    // entry is an absent firing from the fixed-capacity selector, not a
+    // candidate.
+    let mut candidates: Vec<(u32, f32, Vec<f64>)> = Vec::with_capacity(shortlist.len());
+    for &(g, gate) in shortlist.iter() {
+        if gate == 0.0 {
+            continue;
+        }
+        let base = g as usize * b;
+        let mut coordinates = Vec::with_capacity(b);
+        for r in 0..b {
+            let atom = decoder.row(base + r);
+            let mut projection = 0.0f64;
+            for (value, direction) in row.iter().zip(atom.iter()) {
+                projection += *value as f64 * *direction as f64;
+            }
+            coordinates.push(projection);
+        }
+        candidates.push((g, gate, coordinates));
+    }
+
     let mut blocks = Vec::with_capacity(k);
     let mut gates = Vec::with_capacity(k);
     let mut codes = Vec::with_capacity(k * b);
     let mut projections = Vec::with_capacity(k * b);
-    for &(g, gate) in shortlist.iter().take(k) {
-        // The fixed-capacity selector also returns zero-score candidates.
-        // They are absent firings: give them the same canonical padding as an
-        // exhausted shortlist instead of retaining an arbitrary block index.
-        if gate == 0.0 {
-            continue;
-        }
-        blocks.push(g);
-        gates.push(gate);
-        let gg = g as usize;
-        for r in 0..b {
-            let atom = decoder.row(gg * b + r);
-            let mut wr = 0.0f64;
-            for (xr, ar) in row.iter().zip(atom.iter()) {
-                wr += *xr as f64 * *ar as f64;
+    // `m = Σ_{g∈S} y_g`, the γ-free reconstruction of the admitted set.
+    let mut reconstruction = vec![0.0f64; p];
+    let mut taken = vec![false; candidates.len()];
+
+    for round in 0..k {
+        // The first admission is unconditional (see the null-scale note above);
+        // every later one must lower the loss.
+        let unconditional = round == 0;
+        let mut best: Option<(usize, f64)> = None;
+        for (index, (block, _, coordinates)) in candidates.iter().enumerate() {
+            if taken[index] {
+                continue;
             }
-            projections.push(wr);
-            codes.push((gamma as f64 * wr) as f32);
+            let base = *block as usize * b;
+            let mut own = 0.0f64;
+            let mut overlap = 0.0f64;
+            for (r, &coordinate) in coordinates.iter().enumerate() {
+                own += coordinate * coordinate;
+                let atom = decoder.row(base + r);
+                let mut projected = 0.0f64;
+                for (accumulated, direction) in reconstruction.iter().zip(atom.iter()) {
+                    projected += *accumulated * *direction as f64;
+                }
+                overlap += projected * coordinate;
+            }
+            // On the first round `m = 0`, so this ranks by `−(2γ−γ²) c_h` and
+            // the unconditional pick is the strongest gate; the scale-free
+            // ordering `c_h` is used when the weight itself is non-positive.
+            let gain = if unconditional && admission_scale <= 0.0 {
+                -own
+            } else {
+                -admission_scale * own + 2.0 * gamma64 * gamma64 * overlap
+            };
+            if (unconditional || gain < 0.0)
+                && best.is_none_or(|(_, incumbent)| gain < incumbent)
+            {
+                best = Some((index, gain));
+            }
+        }
+        let Some((index, _)) = best else {
+            break; // no remaining candidate lowers this row's loss
+        };
+        taken[index] = true;
+        let (block, gate, coordinates) = &candidates[index];
+        blocks.push(*block);
+        gates.push(*gate);
+        let base = *block as usize * b;
+        for (r, &coordinate) in coordinates.iter().enumerate() {
+            projections.push(coordinate);
+            codes.push((gamma64 * coordinate) as f32);
+            if coordinate != 0.0 {
+                let atom = decoder.row(base + r);
+                for (accumulated, direction) in reconstruction.iter_mut().zip(atom.iter()) {
+                    *accumulated += coordinate * *direction as f64;
+                }
+            }
         }
     }
+
     while blocks.len() < k {
         blocks.push(0);
         gates.push(0.0);

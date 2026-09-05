@@ -12,6 +12,137 @@ use crate::sparse_dict::{
 };
 use ndarray::{Array1, Array2};
 
+/// Exact tied loss of a stored row code, independent of the fitter's own
+/// accumulation, so the assertions below price the objective and not a proxy.
+fn row_loss(
+    row: ArrayView1<'_, f32>,
+    code: &RowBlockCode,
+    decoder: ArrayView2<'_, f32>,
+    b: usize,
+) -> f64 {
+    let reconstruction = reconstruct_stored_code_row(code, decoder, b);
+    row.iter()
+        .zip(reconstruction.iter())
+        .map(|(value, fitted)| {
+            let residual = *value as f64 - *fitted as f64;
+            residual * residual
+        })
+        .sum()
+}
+
+/// #2825 — A ROW TAKES A BLOCK ONLY WHEN THAT BLOCK LOWERS ITS LOSS.
+///
+/// `k` is a cap, not a quota. Two blocks 15 degrees apart both carry a large
+/// gate against `x = (1, 0)`, so the gate ranking admits both; the second is
+/// almost the first, and at `γ = 1` admitting it moves the reconstruction from
+/// exactly `x` to `(1.933, 0.25)` — the loss rises from `0` to `0.933`. The
+/// separable ranking cannot see that, because the term it omits,
+/// `γ² Σ_{g≠h} y_g·y_h`, is the entire disagreement. This is the mechanism
+/// behind the 91% re-routing giveback measured in a00be6eb0.
+#[test]
+fn a_block_is_admitted_only_when_it_lowers_the_row_loss_2825() {
+    let theta = std::f64::consts::PI / 12.0; // 15 degrees
+    let decoder = ndarray::array![[1.0_f32, 0.0], [theta.cos() as f32, theta.sin() as f32]];
+    let x = ndarray::array![1.0_f32, 0.0];
+    let gate_one = (x[0] as f64 * decoder[[1, 0]] as f64).abs();
+    // NON-VACUITY: the overlapping block is a genuine top-k candidate.
+    assert!(
+        gate_one > 0.9,
+        "the overlapping block must rank, or nothing is being refused"
+    );
+    let shortlist = [(0u32, 1.0_f32), (1u32, gate_one as f32)];
+
+    let selected = code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist);
+    assert_eq!(selected.blocks[0], 0);
+    assert_eq!(
+        selected.gates[1], 0.0,
+        "the second slot must be canonical padding, not a firing"
+    );
+    assert_eq!(selected.codes[1], 0.0);
+    assert_eq!(selected.projections[1], 0.0);
+    assert!(row_loss(x.view(), &selected, decoder.view(), 1) <= 1.0e-12);
+
+    // The unconditional top-k support, priced the same way, is strictly worse.
+    let forced = RowBlockCode {
+        blocks: vec![0, 1],
+        gates: vec![1.0, gate_one as f32],
+        codes: vec![1.0, gate_one as f32],
+        projections: vec![1.0, gate_one],
+    };
+    let forced_loss = row_loss(x.view(), &forced, decoder.view(), 1);
+    assert!(
+        forced_loss > 0.9,
+        "the refused support must be the strictly worse one; got {forced_loss}"
+    );
+}
+
+/// The refusal above is a property of OVERLAP, not a blanket cap: orthogonal
+/// blocks that each lower the loss are all admitted, and together they
+/// reconstruct the row exactly.
+#[test]
+fn orthogonal_blocks_that_lower_the_loss_are_all_admitted_2825() {
+    let decoder = ndarray::array![[1.0_f32, 0.0], [0.0, 1.0]];
+    let x = ndarray::array![3.0_f32, 4.0];
+    let shortlist = [(1u32, 4.0_f32), (0u32, 3.0_f32)];
+    let selected = code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist);
+    let mut taken: Vec<u32> = selected
+        .blocks
+        .iter()
+        .zip(selected.gates.iter())
+        .filter_map(|(block, gate)| (*gate != 0.0).then_some(*block))
+        .collect();
+    taken.sort_unstable();
+    assert_eq!(
+        taken,
+        vec![0, 1],
+        "an orthogonal pair must still take both blocks"
+    );
+    assert!(row_loss(x.view(), &selected, decoder.view(), 1) <= 1.0e-10);
+}
+
+/// #2825 — THE NULL OF THIS MODEL IS `γ = 0`, NOT AN EMPTY SUPPORT.
+///
+/// For `γ ≥ 2` the admission weight `2γ−γ²` is non-positive and NO block lowers
+/// the loss, so an unguarded descent rule would empty every row — after which
+/// `refresh_gamma` divides by a zero denominator and the fit cannot come back.
+/// The first admission is therefore unconditional: the row keeps the single
+/// block that best explains it, the scale stays definable, and `γ = 0` remains
+/// the way to say "explain nothing". Below `γ = 2` the guard is inert, which is
+/// every scale the fit actually visits.
+#[test]
+fn a_non_descent_scale_keeps_the_support_definable_2825() {
+    let decoder = ndarray::array![[1.0_f32, 0.0], [0.0, 1.0]];
+    let x = ndarray::array![3.0_f32, 4.0];
+    let shortlist = [(1u32, 4.0_f32), (0u32, 3.0_f32)];
+    let live = |code: &RowBlockCode| -> Vec<u32> {
+        code.blocks
+            .iter()
+            .zip(code.gates.iter())
+            .filter_map(|(block, gate)| (*gate != 0.0).then_some(*block))
+            .collect()
+    };
+    // NON-VACUITY: at a descent scale this row takes both blocks.
+    assert_eq!(live(&code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist)).len(), 2);
+    for gamma in [2.0_f32, 3.5] {
+        assert!(2.0 * gamma - gamma * gamma <= 0.0, "gamma {gamma} must be non-descent");
+        let selected = code_row(x.view(), decoder.view(), gamma, 1, 2, &shortlist);
+        assert_eq!(
+            live(&selected),
+            vec![1],
+            "a non-descent scale must keep exactly the strongest block, at gamma {gamma}"
+        );
+        // A definable scale: the gamma-free projection sum is non-zero, which is
+        // the denominator `refresh_gamma` divides by.
+        let projected: f64 = selected.projections.iter().map(|w| w * w).sum();
+        assert!(projected > 0.0, "the refreshed scale must stay defined");
+    }
+    // The null is reached through the scale, and it decodes to exactly zero.
+    let null = code_row(x.view(), decoder.view(), 0.0, 1, 2, &shortlist);
+    assert_eq!(live(&null), vec![1]);
+    assert!(null.codes.iter().all(|code| *code == 0.0));
+    assert_eq!(row_loss(x.view(), &null, decoder.view(), 1), 25.0);
+}
+
 #[test]
 fn scalar_budget_constructor_preserves_topk64_exactly() {
     let config = BlockSparseConfig::from_scalar_budget(114_688, 64, 4)

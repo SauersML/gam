@@ -240,11 +240,10 @@ fn parallel_stream_moments_match_dense_reference_across_batches_and_shards() {
 }
 
 #[test]
-fn frame_refresh_uses_the_new_gamma_and_is_invariant_to_its_initial_value_2825() {
+fn frame_refresh_uses_the_new_gamma_and_descends_from_any_initial_scale_2825() {
     let (x, decoder, config) = coupled_fixture();
     for orientation in [-1.0, 1.0] {
         let decoder = decoder.mapv(|value| orientation * value);
-        let mut reference = None;
         for gamma in [0.2, 1.0, 2.0] {
             let mut state =
                 BlockSparseStreamState::new_with_decoder(decoder.clone(), &config).unwrap();
@@ -256,13 +255,20 @@ fn frame_refresh_uses_the_new_gamma_and_is_invariant_to_its_initial_value_2825()
             }
             let stats = state.end_epoch().unwrap();
             assert!(!stats.converged);
-            if let Some((previous_decoder, previous_gamma)) = &reference {
-                assert_eq!(&state.decoder, previous_decoder);
-                assert_eq!(&stats.gamma, previous_gamma);
-            }
-            reference = Some((state.decoder.clone(), stats.gamma));
+            // #2825: the epoch's frames are NO LONGER invariant to the scale it starts
+            // from, and that is the corrected behaviour rather than a regression. The
+            // support step admits a block only when it lowers `‖x − γ Σ P_g x‖²`, an
+            // objective that carries γ; the old invariance held because the top-k gate
+            // rule ignored γ entirely, which is the same blindness that let the support
+            // step raise the objective the frame and γ steps lower. The scale-free
+            // alternative was measured and does NOT close the `K ≫ rank` certificates
+            // this rule closes, so the invariance is what gives way.
+            //
+            // What every seed must still do is what this test is named for: refresh the
+            // scale and then DESCEND AT THE REFRESHED SCALE, for either gauge
+            // orientation. Both are asserted below, per seed.
             // Recompute the tied codes at each candidate, independently of the
-            // stream's moments. All blocks stay selected, fixing the supports.
+            // stream's moments, holding this epoch's support fixed.
             let loss = |candidate: &Array2<f32>| -> f64 {
                 x.outer_iter()
                     .map(|row| {
@@ -360,14 +366,60 @@ fn tied_projector_moments_match_actual_loss_directional_derivatives() {
                     .zip(tangent.t().iter())
                     .map(|(a, b)| a * b)
                     .sum::<f64>();
+            // The streamed moment is the derivative of the loss AT FIXED SUPPORT, so
+            // the numerical reference has to hold the same support. `x D' D` sums every
+            // block for every row, which was the same thing only while the router took
+            // its top `k` unconditionally; a row now declines a block that does not
+            // lower its loss (#2825), and admission boundaries are kinks this central
+            // difference would otherwise straddle. Take the support ONCE from the
+            // unperturbed frames, then re-project it at each candidate.
+            // Route at the scale the STREAM routed at, not the scale this loop prices
+            // the moments with: the accumulators were built under `state.gamma`, and a
+            // reference routed at a different scale would fix a different support.
+            let (blocks, gates, _) = crate::sparse_dict::block_sparse_dictionary_transform(
+                x.view(),
+                decoder.view(),
+                state.gamma,
+                config.block_size,
+                config.block_topk,
+                config.block_tile,
+            )
+            .expect("route the fixed support from the unperturbed frames");
             let loss = |step: f64| {
                 let mut candidate = d.clone();
                 let perturbed = &frame.to_owned() + &tangent * step;
                 candidate
                     .slice_mut(ndarray::s![block * 2..(block + 1) * 2, ..])
                     .assign(&perturbed);
-                let residual = &x64 - x64.dot(&candidate.t()).dot(&candidate) * gamma;
-                residual.iter().map(|v| v * v).sum::<f64>()
+                (0..x64.nrows())
+                    .map(|row| {
+                        let mut reconstruction = vec![0.0f64; x64.ncols()];
+                        for slot in 0..blocks.ncols() {
+                            if gates[[row, slot]] == 0.0 {
+                                continue;
+                            }
+                            let selected = blocks[[row, slot]] as usize;
+                            for axis in 0..config.block_size {
+                                let direction = candidate.row(selected * config.block_size + axis);
+                                let weight: f64 = direction
+                                    .iter()
+                                    .zip(x64.row(row).iter())
+                                    .map(|(&u, &value)| u * value)
+                                    .sum();
+                                for (accumulated, &u) in
+                                    reconstruction.iter_mut().zip(direction.iter())
+                                {
+                                    *accumulated += gamma * weight * u;
+                                }
+                            }
+                        }
+                        x64.row(row)
+                            .iter()
+                            .zip(reconstruction.iter())
+                            .map(|(value, fitted)| (value - fitted).powi(2))
+                            .sum::<f64>()
+                    })
+                    .sum::<f64>()
             };
             let step = 1e-5;
             let numerical = (loss(step) - loss(-step)) / (2.0 * step);
@@ -463,8 +515,23 @@ fn equal_ev_cannot_certify_changing_gamma_or_frames_2825() {
     state.partial_fit(x.view()).unwrap();
     let stats = state.end_epoch().unwrap();
     assert_eq!(stats.explained_variance, measured.explained_variance);
-    assert!(stats.gamma_residual > config.tolerance);
-    assert!(stats.frame_residual > config.tolerance);
+    // The contract this control exists for is the one its NAME states: an equal EV
+    // cannot certify while gamma OR the frames are still moving. Requiring BOTH to be
+    // open was incidental to a router that re-derived a different support every epoch;
+    // with the support step descending the shared objective the scale settles first, so
+    // the conjunction would pin the old churn rather than the contract. Name which
+    // residual is holding the certificate open, so a future change that closes BOTH —
+    // which WOULD make this fixture vacuous — fails here instead of passing silently.
+    let gamma_open = stats.gamma_residual > config.tolerance;
+    let frame_open = stats.frame_residual > config.tolerance;
+    assert!(
+        gamma_open || frame_open,
+        "equal EV with both residuals closed is a converged fit, not this control: \
+         gamma_residual={} frame_residual={} tol={}",
+        stats.gamma_residual,
+        stats.frame_residual,
+        config.tolerance
+    );
     assert!(!stats.converged);
     assert!(state.finalize().is_err());
 }
