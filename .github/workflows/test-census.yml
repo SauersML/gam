@@ -1,0 +1,40 @@
+name: Test source integrity (#2818)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-census-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify the census detects planted losses
+        run: python -m unittest discover -s scripts/tests -p test_test_census.py -v
+      - name: Compare immutable source inventories
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          python scripts/test_census.py --base "$BASE_SHA" --head "$HEAD_SHA" --output test-census.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-source-inventory-${{ github.sha }}
+          path: test-census.json
+          if-no-files-found: error

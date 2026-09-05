@@ -1,0 +1,3447 @@
+{
+  "issue": 2818,
+  "method": "Deleted test declarations in d484a091a and c0a21b554 unified diffs; current presence requires a parsed Rust test declaration, not prose or a helper name. Every historical identity is additionally verified by lexing its complete pre-deletion Rust source blob; historical prose/literals cannot supply an identity.",
+  "census_commit": "7f141c5f430d0bb0aac2fe9e4e35385a470b681a",
+  "census": {
+    "files": 2382,
+    "tests": 10010,
+    "pinned_names": 1326
+  },
+  "historically_removed_pins": [
+    {
+      "name": "a_bounded_curvature_has_an_empty_measured_span_2612",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/reml/jeffreys_subspace.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/reml/jeffreys_subspace.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "a_caller_requirement_survives_the_score_relative_widening_2568",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/run_plan_caller_requirement_tests_2568.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/run_plan_caller_requirement_tests_2568.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "a_caller_requirement_tightens_the_solver_band_2568",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/run_plan_caller_requirement_tests_2568.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/run_plan_caller_requirement_tests_2568.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "a_cgroup_at_its_limit_moves_neither_the_budget_nor_the_materialization_cap_2684_2702",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-runtime/src/resource.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "a_constant_coordinate_is_collapsed_not_continuous_2691",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/coordinate_fidelity.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "a_genuine_saddle_still_refuses_with_the_invariance_deflated_2676",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "a_judged_curvature_inside_the_measured_resolution_is_not_a_saddle_2748",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "a_looser_caller_requirement_never_weakens_the_engine_band_2568",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/run_plan_caller_requirement_tests_2568.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/run_plan_caller_requirement_tests_2568.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "a_mismatched_coordinate_list_is_refused_2748",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-identifiability/src/canonical.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-identifiability/src/canonical.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "a_monotone_criterion_rails_kappa_hat_and_the_walk_declares_it_2687",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-geometry/src/curvature_estimand.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "a_narrow_but_resolvable_arc_is_still_continuous_2691",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/coordinate_fidelity.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "a_perturbation_below_the_certificates_own_floor_flips_the_undeflated_verdict_2676",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "a_redundant_penalty_map_still_fits_and_certifies_2676",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/basis_smooth/smooths/curvature_certificate_penalty_invariance_2676.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "a_requested_correction_a_model_does_not_carry_is_an_error_2612",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/tests/suite/multinomial_covariance_mode_2612.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "a_spanning_warp_coordinate_is_absorbed_by_the_mean_block_2748",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-identifiability/src/canonical.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-identifiability/src/canonical.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "a_structural_coordinate_does_not_veto_another_blocks_reduction_2748",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-identifiability/src/canonical.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-identifiability/src/canonical.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "a_structural_warp_coordinate_is_never_absorbed_2748",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-identifiability/src/canonical.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-identifiability/src/canonical.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "a_three_term_redundancy_no_pair_can_see_is_certified_2676",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/penalty_invariance_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "active_softmax_dense_entropy_hessian_entry_matches_dense_block_1410",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/construction_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "active_softmax_majorizer_logit_derivative_matches_dense_1410",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/construction_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "an_absent_requirement_reproduces_the_engine_exactly_2568",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/run_plan_caller_requirement_tests_2568.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/run_plan_caller_requirement_tests_2568.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "an_interior_optimum_is_not_declared_railed_2687",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-geometry/src/curvature_estimand.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "an_unmeasured_curvature_is_not_the_same_answer_as_an_admissible_one_2561",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/model_types/result_types.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "analytically_refuted_fixed_point_continues_from_checkpoint_with_bfgs_2653",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/run_fixed_point_continuation_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "aniso_psi_duchon_gaussian_joint_gradient_matches_finite_difference_2735",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/fit_orchestration/drivers/iso_kappa_reml_gradient_fd_tests.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/fit_orchestration/drivers/iso_kappa_reml_gradient_fd_tests.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "ard_log_precision_hessian_trace_from_probes_matches_dense_on_deflated_rows_2712",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_deflated_from_probes_2712.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "arrow_linear_cofit_second_pass_is_a_noop_2023",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/cofit_arrow.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "arrow_routed_linear_tier_matches_or_beats_block_reconstruction_2023",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/cofit_arrow.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "assignment_log_strength_hessian_trace_from_probes_matches_dense_on_deflated_rows_2712",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_deflated_from_probes_2712.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "beta_gauge_quotient_value_inverse_and_gradient_are_orbit_invariant_2022",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/arrow_schur/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "binomial_location_scale_wiggle_order2_rows_match_jet_tower_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/tests_wiggle_ls.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/gamlss/tests_wiggle_ls.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "binomial_location_scalewiggle_optimum_is_budget_independent_2647",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "binomial_logit_reml_firth_on_outer_work_bounded_1575",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/glm/misc/binomial_logit_outer_work_1575.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "binomial_logit_reml_outer_cost_is_bounded_1575",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/estimate/binomial_reml_outer_cost_1575_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "binomial_logit_reml_outer_cost_is_n_independent_1575",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/estimate/binomial_reml_outer_cost_1575_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "binomial_logit_reml_outer_work_bounded_1575",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/glm/misc/binomial_logit_outer_work_1575.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "binomial_wiggle_joint_hessian_reduces_to_nonwiggle_at_zero_betaw_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "birth_reseed_sequential_deflation_separates_curved_atoms_2132",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_cocollapse_disjoint_2027.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "block_efs_step_reaches_gradient_root_2231",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_crosscoder_rho_2231.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "block_gradient_matches_central_difference_of_cost_2231",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_crosscoder_rho_2231.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "block_relevance_has_interior_stationary_minimum_2231",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_crosscoder_rho_2231.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "bms_flex_row_dense_hvp_materialization_matches_cpu_above_block_cap_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/bms/gpu/row.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "bms_rigid_nonzero_slope_offset_audit_fits_in_time_370",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/inference/misc/bms_audit_nonzero_slope_baseline_370.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "branch_guarded_dual_oracle_pins_live_softmax_channels_2156",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_logdet_adjoint_780.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "build_dense_schur_direct_refuses_oversize_border_1017",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/arrow_schur/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "canonical_dead_column_callback_block_is_not_reduced_1590",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-identifiability/src/canonical.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "canonical_flex_row_program_order2_matches_production_lowering_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/bms/cell_moment_assembly.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "canonical_flex_row_program_order2_matches_tower_and_scalar_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/bms/cell_moment_assembly.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "canonicalisation_keeps_multinomial_blocks_at_raw_width_2744",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/multinomial_reml.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "carve_classifies_bound_vs_separable_feature_pairs_975",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/sae/sae/owed_975.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "cell_moment_recurrence_jet_value_matches_numeric_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "certified_central_logdet_difference_refuses_floor_clamp_crossing_2398",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_recovery_split_780.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "co_collapse_flags_duplicate_charts_2280",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/local_charts.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "co_collapse_spares_healthy_swiss_roll_atlas_2280",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/local_charts.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "co_collapse_thresholds_bracket_the_gate_2280",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/local_charts.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "coefficient_group_labels_cannot_reclassify_base_penalties_2315",
+      "deletions": [
+        {
+          "commit": "d484a091a4d133aec6f3ed980754b6cda151d41b",
+          "source_path": "crates/gam-custom-family/src/coefficient_groups.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "collapse_across_the_wrap_point_is_caught_on_the_circle_2691",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/coordinate_fidelity.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "collapse_verdict_observable_when_reconstruction_is_bit_identical_2394",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/sae/sae/owed_1026_collapse_battery.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "competing_risks_fit_carries_smoothing_corrected_covariance_2346",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/survival/survival/competing_risks_corrected_covariance_2346.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "compiled_graph_schedule_matches_all_backends_every_width_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/marginal_slope/row_math.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "compiled_softmax_schedule_matches_generic_tower_all_channels_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/row_jet_program.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "complete_device_matches_cpu_every_channel_when_admitted_2304",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "complete_outer_gradient_deflation_contribution_is_route_independent_2712",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_deflated_from_probes_2712.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "composed_arrow_matches_or_beats_block_cofit_2023",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/cofit_arrow.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "composed_arrow_second_pass_is_a_noop_on_curved_and_framed_tiers_2397",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/cofit_arrow.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "composed_depth3_group_priors_land_on_their_own_outer_coordinate_2315",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/misc/misc/composed_config_depth3_layout_consistency_2315.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "composed_two_of_everything_depth3_layout_stays_consistent_2315",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/misc/misc/composed_config_depth3_layout_consistency_2315.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "contracted_device_matches_cpu_reduction_when_admitted_2304",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "contracted_trace_device_matches_cpu_reduction_when_admitted_2304",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "corrected_covariance_nodes_are_criterion_calibrated_2728",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/regressions/misc/corrected_covariance_sigma_node_calibration_2728.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "covariance_and_delta_method_se_are_finite_and_wellformed_1101",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/multinomial.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "criterion_lane_gap_is_exactly_the_evidence_logdet_gap_2509",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "ctn_predictive_quantiles_invert_the_models_own_transform_2600",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/regressions/predict/ctn_transform_tails_2600.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "curvature_evidence_serializes_as_the_legacy_optional_bool_2561",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/model_types/result_types.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "curved_warm_start_matches_or_beats_linear_baseline_out_of_sample_2261",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_olmo.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "dense_and_arrow_materialize_the_same_raw_exact_a_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_exact_a_bundle_2515.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "dense_torus_integrated_birth_recovery_2111",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_2111_dense_torus_acceptance.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "derived_penalty_outer_index_equals_emitted_position_across_spec_zoo_2315",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/misc/misc/derived_index_vs_emitted_layout_sweep_2315.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "device_direct_applies_beta_gauge_quotient_at_composed_cofit_shape_2660",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/arrow_schur/tests_device_gauge_2660.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "device_exhaustive_routing_cost_multiplier_2518",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/gpu_kernels/sae_encode_resident.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "dynamic_schedule_boundary_k14_matches_strongest_hand_vgh_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/marginal_slope/row_math.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "embedded_plane_cocycle_closes_to_rounding_2280",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/local_charts.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "empirical_rigid_kernel_matches_exact_implicit_solve_tower_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/bms/cell_moment_assembly.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_logdet_adjoint_780.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "exact_a_quotient_value_and_sparse_trace_share_one_classification_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_exact_a_bundle_2515.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "exact_a_route_gap_is_two_coordinates_with_two_causes_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "exact_a_route_parity_holds_across_a_deflating_rho_ladder_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_exact_a_bundle_2515.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "exact_a_route_parity_holds_on_a_deflated_cache_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_exact_a_bundle_2515.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "existence_and_intensity_are_separately_identified_1939",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_quality_amplitude_1939.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "fatal_optimizer_evaluation_retains_exact_typed_source_2658",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-problem/src/estimation_error.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "firth_accepted_for_binomial_loglog_and_cauchit_2158",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/regressions/families/estimate_external_family_and_links.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "fit_row_metric_one_shot_matches_fit_then_row_metric_2021",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_structured_residual_2021.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "fixed_assignment_strength_is_absent_from_flat_rho_layout_2253",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_rho_structural_layout_2253.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "fixed_decoder_lean_step_equals_full_step_1407",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/sae/sae/bug_hunt_1407_fixed_decoder_assembler.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "flex_factored_matches_jet2_degenerate_grids_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/bms/cell_moment_assembly.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "flex_full_outer_completes_under_budget_683",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/inference/misc/margslope_flex_large_scale_repro.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "flex_timepoint_inputs_nested_dual_matches_jet4_contraction_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "forced_streaming_admits_a_deflating_state_and_matches_dense_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_exact_a_bundle_2515.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "forced_streaming_has_a_gradient_wherever_the_dense_route_does_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_exact_a_bundle_2515.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "framed_sae_device_matvec_stage_diff_tiny_1551",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/gpu_kernels/arrow_schur.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "framed_sae_schur_matvec_matches_dense_reference_large_k_1026",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/gpu_kernels/arrow_schur.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "frozen_routing_decouples_gates_from_logit_updates_1033",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/assignment.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "frozen_routing_fixes_all_logits_and_thaw_restores_free_path_1033",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/assignment.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "frozen_routing_gates_are_rho_invariant_1033",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/assignment.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "frozen_routing_rejects_softmax_1033",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/assignment.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "frozen_state_per_coordinate_channel_fd_audit_2253",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_rho_structural_layout_2253.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "full_gradient_hessian_channel_set_matches_finite_difference_2253",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/construction_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "g_matvec_output_owners_are_bit_reproducible_on_device_2535",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/gpu_kernels/arrow_schur.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "gaussian_high_edf_scale_uses_residual_df_not_mle_1765",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/estimate/gaussian_high_edf_scale_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "gaussian_location_scale_joint_hessian_is_observed_and_psi_layers_match_matrix_fd_2387",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/tests_wiggle_ls.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "gaussian_null_size_is_calibrated_where_the_expansion_is_exact_2672",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/basis_smooth/smooths/smooth_term_lr_size_calibration.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "gaussian_observation_interval_calibrated_high_edf_1765",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/estimate/gaussian_observation_interval_calibration_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "generated_cause_specific_matches_strongest_hand_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-row-macros/tests/suite/cause_specific_codegen_perf.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-row-macros/tests/suite/cause_specific_codegen_perf.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "generated_cuda_row_kernel_matches_canonical_cpu_lowering_415",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/bms/gpu/row.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "generated_cuda_row_kernel_r33_matches_canonical_cpu_lowering_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/bms/gpu/row.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "generated_sls_vgh_matches_and_beats_inlined_strongest_hand_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-row-macros/tests/suite/sls_codegen_perf.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-row-macros/tests/suite/sls_codegen_perf.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "gershgorin_majorizer_logit_derivative_matches_fd_1419",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-terms/src/analytic_penalties/sparsity.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "gershgorin_majorizes_entropy_where_fisher_does_not_1419",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-terms/src/analytic_penalties/sparsity.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "gls_wiggle_joint_loglik_gradient_matches_finite_difference_and_legacy_does_not_2621",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/tests_wiggle_ls.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "higher_order_curve_wiggle_bundles_beat_strongest_hand_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-math/src/fast_channel.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-math/src/fast_channel.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "hybrid_collapse_verdict_accessor_reports_collapsed_slots_2394",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_collapse_prevention.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "incremental_realizer_replays_raw_duchon_spec_in_emitted_chart_2433",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/fit_orchestration/drivers/design_assembly_constraint_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "independent_compiled_schedule_matches_fixed_oracle_above_old_arity_ceiling_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/row_jet_program.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "inframe_curved_p4096_feasible_where_dense_joint_ooms_2134",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_inframe_curved_2130.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "injected_shifted_solver_preserves_value_and_derivative_authority_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/arrow_schur/rational_logdet.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "inner_kkt_gate_is_extensive_while_the_intensive_certificate_exists_2681",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "insufficient_iterations_return_error_instead_of_open_arrow_cofit_2023",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/cofit_arrow.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "insufficient_rounds_return_error_instead_of_an_open_cofit_2023",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/sparse_dict/cofit.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "intrinsic_seed_allocates_every_chart_function_2240",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/intrinsic_seed.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "iso_kappa_duchon_psi_gradient_is_certified_at_a_saturated_rho_2461",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/fit_orchestration/drivers/iso_kappa_reml_gradient_fd_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "iso_kappa_gradient_is_certified_six_e_folds_past_the_box_2461",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/fit_orchestration/drivers/iso_kappa_reml_gradient_fd_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "iso_kappa_rail_gradient_matches_fd_at_both_faces_2444",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/fit_orchestration/drivers/iso_kappa_reml_gradient_fd_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "jacobian_radial_is_stable_through_flat_and_at_d_le_1",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-geometry/src/manifolds/constant_curvature.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "jeffreys_armed_outer_gradient_matches_central_differences_2612",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/tests/suite/multinomial_jeffreys_outer_gradient_fd_2612.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "jeffreys_armed_outer_hessian_agrees_on_the_curvature_verdict_2612",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/tests/suite/multinomial_jeffreys_outer_gradient_fd_2612.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "jet_hoist_and_order1_border_beat_redundant_baselines_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/row_jet_program.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "joint_penalized_hessian_is_nonsingular_where_the_likelihood_alone_is_not_2647",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/tests_2647_gauge.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "k1_softmax_active_rho_gradient_matches_directional_fd_2253",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_rho_structural_layout_2253.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "kernel_kappa_jets_match_central_fd_1404",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/manifolds/manifolds/owed_1404.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "ladder_first_error_is_deterministic_across_dispatch_1017",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/sae/sae/owed_1017_phase0.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "ladder_parallel_matches_sequential_1017",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/sae/sae/owed_1017_phase0.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "laplace_value_and_gradient_are_route_invariant_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_exact_a_bundle_2515.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "latent_log_sigma_curvature_tracks_gradient_fd_scale_ladder_2566",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/latent/survival/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "linear_dominance_curved_fit_not_worse_than_linear_on_linear_data_1026",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/sae/sae/owed_1026_collapse_battery.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "linear_span_anchor_reaches_pca_ceiling_at_dictionary_rank_1026",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/outer_objective.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "linear_span_anchor_reaches_pca_ceiling_at_large_dictionary_rank_1026",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/outer_objective.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "literal_unlimited_cgroup_defers_to_host_available_memory_2317",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-runtime/src/resource.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "mandatory_required_gpu_workspace_consumes_device_cache_end_to_end_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/bms/gpu/row.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "manifold_outer_criterion_carries_no_soft_rho_guard_floor_2629",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/support_outer.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "matched_spectrum_gaussian_preserves_pc_scales_and_is_seeded_2250",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/null_battery.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "measure_base_moment_instantiated_order_vs_forced_four_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "measure_device_vgh_end_to_end_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gpu_kernels/survival_rowjet.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "measure_gradient_order1_vs_tower4_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/binomial/kernel.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/gamlss/binomial/kernel.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "measure_jet_eiv_input_variance_matches_fitted_surface_2225",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/measure_jet/misc/measure_jet_web_quality.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "moving_ridge_takes_no_host_rebuild_and_matches_independent_2539",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/gpu_kernels/sae_resident.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "multi_block_group_priors_follow_realized_penalty_order_2315",
+      "deletions": [
+        {
+          "commit": "d484a091a4d133aec6f3ed980754b6cda151d41b",
+          "source_path": "crates/gam-custom-family/src/coefficient_groups.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "nb_dispersion_honors_user_fixed_theta_1463",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/glm/families/owed_1463.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "nb_dispersion_is_fitted_theta_hat_not_seed_1463",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/glm/families/owed_1463.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "nb_dispersion_refuses_unfitted_scale_metadata_1463",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/glm/families/owed_1463.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "near_wall_wiggle_coordinate_keeps_cross_covariance_in_moments_2390",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/location_scale/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "nested_dual2_channels_from_channels_roundtrip_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-math/src/nested_dual.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "nested_dual2_directional_matches_tower4_contraction_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-math/src/nested_dual.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "nested_dual2_reproduces_tower4_channels_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-math/src/nested_dual.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "nested_dual2_seed_swap_symmetry_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-math/src/nested_dual.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "nested_response_moment_rule_reproduces_the_scalar_gaussian_law_2446",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/location_scale/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "no_declared_invariance_reproduces_the_pre_2676_verdicts_2676",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "noiseless_gaussian_smoothing_correction_is_a_valid_covariance_2490",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/inference/misc/uncertainty_integration.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "non_pd_schur_predicate_preserves_the_two_substring_conjunct_2598",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/arrow_schur/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "outer_criterion_prices_block_relevance_2231",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_crosscoder_rho_2231.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "outer_gradient_at_large_rho_has_a_lambda_infinity_face_2450",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/fit_orchestration/drivers/iso_kappa_reml_gradient_fd_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "outer_rho_gradient_is_k_dim_and_n_invariant_1033",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/sae/sae/owed_1033.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "overcomplete_distinct_phases_stay_silent_2132",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_cocollapse_disjoint_2027.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "overcomplete_duplicate_is_detected_past_the_k_gt_r_gate_2132",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_cocollapse_disjoint_2027.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "past_cap_designs_exhaust_their_krylov_space_inside_the_budget_2503",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/residual_cascade.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "past_cap_point_criterion_is_solve_free_but_auto_reml_needs_exact_proof_2503_2513",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/misc/misc/residual_cascade_certification.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "penalty_covered_competing_risks_redundancy_canonicalises_cleanly_1590",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-identifiability/src/audit.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "periodic_hybrid_duchon_psi_triplet_matchesfd_2372",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/src_modules/smooths/basis_radial_periodic_thinplate_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "planted_833_style_omission_is_caught_by_exact_tower_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/bms/cell_moment_assembly.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "post_seed_objective_failure_without_a_request_stays_fatal_2253_2658",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/efs_fallback_routing_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "projection_law_beats_the_moment_matched_normal_on_a_two_row_cone_2446",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/constrained_posterior.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "proportional_penalties_yield_the_exact_lambda_null_direction_2676",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/penalty_invariance_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "rank_boundary_is_not_an_empty_column_loose_bound_or_dyadic_artifact_2628",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/residual_cascade.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_rank_charge_2101.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "release_measure_binomial_q_closed_forms_vs_generic_jet_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/binomial_q_derivs.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/gamlss/binomial_q_derivs.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_binomial_q_coeffs_faa_top_vs_generic_tower_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/binomial_q_coeffs.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/gamlss/binomial_q_coeffs.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_binomial_q_order4_faa_top_vs_strongest_hand_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/binomial_q_coeffs.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "release_measure_binomial_q_tower3_prune_vs_tower4_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/binomial_q_derivs.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "release_measure_bls_wiggle_order2_rows_vs_per_column_tower_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/tests_wiggle_ls.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/gamlss/tests_wiggle_ls.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_flex_compiled_order2_vs_generic_plan_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_gaussian_joint_specialized_vs_generic_tower_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/gaussian/joint_psi.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/gamlss/gaussian/joint_psi.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_generated_bms_full_row_vs_strongest_cpu_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/bms/gpu/row.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "release_measure_generated_sls_contractions_vs_strongest_hand_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-row-macros/tests/suite/sls_codegen_perf.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-row-macros/tests/suite/sls_codegen_perf.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_multinomial_fisher_vs_strongest_hand_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/multinomial_reml.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/multinomial_reml.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_multinomial_specialized_vs_generic_tower_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/multinomial_reml.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/multinomial_reml.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_packed_widths_k1_to_k14_vs_strongest_hand_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/marginal_slope/row_math.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/survival/marginal_slope/row_math.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_rigid_bernoulli_vgh_vs_hand_chain_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/bms/gradient_paths.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/bms/gradient_paths.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_rigid_contracted_towers_vs_generic_tower_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/marginal_slope/tests.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/survival/marginal_slope/tests.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_rigid_scalar_order2_vs_strongest_hand_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/marginal_slope/row_math.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/survival/marginal_slope/row_math.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_sigma_parameter_jets_vs_strongest_hand_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/marginal_slope/eval_sigma.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/survival/marginal_slope/eval_sigma.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_sls_compiled_vs_strongest_hand_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/location_scale/row_kernel.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/survival/location_scale/row_kernel.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "release_measure_sls_wiggle_dynamic_jets_vs_padded_static_tower_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/location_scale/row_kernel.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/survival/location_scale/row_kernel.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "rendered_verdict_matches_the_value_verdict_for_every_variant_2598",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/arrow_schur/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "resident_arrow_blocks_match_materialized_tower_contraction_1017",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/gpu_kernels/resident_arrow.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "resident_arrow_curvature_channel_is_live_and_beta_block_is_linear_1017",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/gpu_kernels/resident_arrow.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "resident_arrow_device_matches_host_reduced_blocks_1017",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/gpu_kernels/resident_arrow.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "resident_arrow_hvp_matches_dense_block_product_1017",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/gpu_kernels/resident_arrow.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "resolve_external_family_fits_binomial_loglog_and_cauchit_2158",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/regressions/families/estimate_external_family_and_links.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "runtime_shaped_value_primitives_are_exact_and_skip_constant_composition_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-math/src/jet_scalar.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-math/src/jet_scalar.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "runtime_vector_row_program_matches_strongest_hand_mixed_score_vgh_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/marginal_slope/row_math.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_direct_mode_device_engages_on_gpu_1551",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/arrow_gpu/misc/owed_1551_sae_direct_device_engage.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_ift_uses_exact_stationarity_jacobian_softmax_high_residual_1418",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/regressions/misc/owed_1418.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_ift_uses_exact_stationarity_jacobian_threshold_gate_high_residual_1418",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/regressions/misc/owed_1418.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_logdet_theta_adjoint_from_probes_matches_dense_on_deflated_rows_2712",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_logdet_adjoint_780.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_logdet_theta_adjoint_from_probes_matches_dense_softmax_2080",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_logdet_adjoint_780.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-sae/src/manifold/tests_logdet_adjoint_780.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "sae_logdet_theta_adjoint_logit0_dense_trace_localization_2156",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_logdet_adjoint_780.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_logdet_theta_adjoint_matches_dense_fd_full_rank_whitening_2144",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_logdet_adjoint_780.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli_learnable_alpha_1625",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_logdet_adjoint_780.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli_low_rank_metric_2144",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_logdet_adjoint_780.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_logdet_theta_adjoint_matches_fd_on_deflated_fixture_2330",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_logdet_adjoint_780.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_outer_objective_never_advertises_finite_difference_curvature_2253",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/outer_objective.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_outer_rho_gradient_channel_decomposition_ordered_beta_bernoulli_2087",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/sae/sae/sae_outer_gradient_fd_gate.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_outer_rho_gradient_channel_decomposition_softmax_2087",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/sae/sae/sae_outer_gradient_fd_gate.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sae_row_selected_inverse_from_probes_is_the_deflated_block_2712",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_logdet_adjoint_780.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "separation_barrier_analytic_gradient_matches_central_fd_1026",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/sae/sae/owed_1026_collapse_battery.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "separation_barrier_gated_gradient_matches_fd_1625",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_collapse_prevention.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "separation_barrier_is_collapse_prevention_not_bandaid_1522",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_collapse_prevention.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sequential_deflation_gives_both_atoms_material_norm_2027",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_cocollapse_disjoint_2027.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "shared_block_diagonal_survives_dense_workspace_reclamation_2548",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/arrow_schur/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sls_generated_contracted_orders_match_specialized_and_dense_jets_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/location_scale/row_kernel.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "smooth_gershgorin_adjoint_is_continuous_across_a_zero_crossing_2339",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-terms/src/analytic_penalties/sparsity.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "smooth_gershgorin_adjoint_matches_fd_inside_the_smoothing_band_2339",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-terms/src/analytic_penalties/sparsity.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "smooth_gershgorin_is_degree_one_homogeneous_in_scale_2339",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-terms/src/analytic_penalties/sparsity.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "smooth_gershgorin_is_exactly_zero_on_an_underflowed_atom_2339",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-terms/src/analytic_penalties/sparsity.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "smooth_gershgorin_majorizes_entropy_within_the_derived_budget_2339",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-terms/src/analytic_penalties/sparsity.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "smooth_gershgorin_weighting_routes_agree_by_scale_equivariance_2339",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-terms/src/analytic_penalties/sparsity.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "softmax_beta_border_gate_derivative_matches_quad_and_fd_across_tails_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/row_jet_program.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "softmax_trace_whitening_prefold_matches_dense_adjoint_2333",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_logdet_adjoint_780.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sparse_routing_strictly_underreconstructs_dense_anchor_1026",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/outer_objective.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "spatial_aniso_joint_large_psi_dim_reserves_exact_curvature_for_terminal_mint_979",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/fit_orchestration/drivers/design_assembly_constraint_tests.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/fit_orchestration/drivers/design_assembly_constraint_tests.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "sphere_charts_injective_and_orientable_2280",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/local_charts.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "sphere_constant_curvature_and_pca_obey_their_non_euclidean_gauges_2315",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-terms/src/smooth/scale_contract.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "structural_coherence_detector_fires_on_duplicate_not_orthogonal_2082",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_cocollapse_disjoint_2027.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "support_outer_criterion_carries_no_soft_rho_guard_floor_2629",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/support_outer.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "support_parameter_certificate_survives_raw_global_refusal_2634",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/support_term.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "survival_jeffreys_contracted_trace_hook_beats_pairwise_979",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/marginal_slope/tests.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/survival/marginal_slope/tests.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "survival_ls_packed_directional_matches_dense_tower_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/location_scale/tests.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/survival/location_scale/tests.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "survival_ls_packed_directional_matches_dense_tower_high_curvature_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/location_scale/tests.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-models/src/survival/location_scale/tests.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "survival_marginal_slope_follow_up_mode_response_matches_fd_2765",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/survival/survival/survival_marginal_slope_follow_up_mode_response_fd_2765.rs"
+        }
+      ],
+      "current_test_paths": [
+        "tests/survival/survival/survival_marginal_slope_follow_up_mode_response_fd_2765.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "swiss_roll_charts_injective_and_cocycle_closes_2280",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/local_charts.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "test_logit_posterior_mean_exact_no_truncation_bias_1459",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/quadrature.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "the_custom_family_engine_carries_no_soft_rho_guard_floor_2629",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-custom-family/src/soft_rho_guard_floor_2629_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "the_gradient_floor_protects_every_direction_except_the_invariance_2676",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "the_jeffreys_term_is_live_on_this_fixture_2612",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/tests/suite/multinomial_jeffreys_outer_gradient_fd_2612.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "the_measured_resolution_can_only_admit_2748",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "the_measured_span_and_the_penalty_kernel_disagree_in_both_directions_2612",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/reml/jeffreys_subspace.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/reml/jeffreys_subspace.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "the_measured_span_is_the_directions_under_one_observation_equivalent_2612",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/reml/jeffreys_subspace.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/reml/jeffreys_subspace.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "the_metric_aware_span_survives_a_non_orthogonal_change_of_gauge_2612",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/reml/jeffreys_subspace.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/reml/jeffreys_subspace.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "the_multinomial_fit_retains_the_rho_uncertainty_correction_2612",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/tests/suite/multinomial_covariance_mode_2612.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "the_null_spectrum_reaches_the_reference_with_a_parametric_term_2672",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/basis_smooth/smooths/smooth_term_lr_reference_df_provenance_2672.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "the_outer_certificate_measures_its_own_assembly_error_2748",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "the_recorded_minimum_is_taken_on_the_judged_block_2676",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "the_same_custom_family_ladder_reads_carried_once_the_barrier_is_injected_2629",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-custom-family/src/soft_rho_guard_floor_2629_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "the_shared_tangent_criterion_carries_no_soft_rho_guard_floor_2629",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/response_geometry.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "the_storage_route_changes_how_the_basis_is_carried_not_which_basis_it_is_2684",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-terms/src/basis/zz_basis_is_capacity_determined_2684_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "the_two_moment_summary_is_exact_when_shrunk_and_one_signed_otherwise_2672",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/basis_smooth/smooths/smooth_term_lr_reference_df_provenance_2672.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "the_two_routes_to_the_null_spectrum_agree_on_real_fits_2672",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/basis_smooth/smooths/smooth_term_lr_reference_df_provenance_2672.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "the_warp_coordinate_is_structural_and_the_mean_coordinate_is_not_2748",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/gamlss/gaussian/binomial_mean_wiggle.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "third_order_forward_sensitivity_hessian_matches_finite_difference_2253",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/construction_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "third_order_self_flux_telescopes_but_third_integrand_jumps_at_c2_knot_1454",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-model-kernels/src/cubic_cell_kernel.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "threshold_gate_analytic_outer_gradient_assembles_2500",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_sparse_curvature_operator_2500.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "threshold_gate_outer_gradient_uses_the_modelled_logdet_channels_2500",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_sparse_curvature_operator_2500.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "threshold_gate_sparse_curvature_operator_is_modelled_2500",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_sparse_curvature_operator_2500.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "threshold_gate_sparse_operator_is_not_the_raw_prior_on_deflated_rows_2500",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_sparse_curvature_operator_2500.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "tied_and_fixed_base_penalties_use_optimizer_coordinate_priors_2315",
+      "deletions": [
+        {
+          "commit": "d484a091a4d133aec6f3ed980754b6cda151d41b",
+          "source_path": "crates/gam-custom-family/src/coefficient_groups.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "truncated_response_moments_beat_the_moment_matched_normal_2679",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/survival/location_scale/truncated_moments.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "two_circle_separates_at_narrow_and_wide_widths_2027",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_cocollapse_disjoint_2027.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "two_circle_whitened_k2_recovers_disjoint_signal_2027",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_cocollapse_disjoint_2027.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "two_negative_directions_still_refuse_with_one_direction_deflated_2676",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "unbiased_outer_gradient_matches_central_differences_2612",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/tests/suite/multinomial_jeffreys_outer_gradient_fd_2612.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "unbiased_outer_hessian_matches_the_gradient_jacobian_2612",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/tests/suite/multinomial_jeffreys_outer_gradient_fd_2612.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "ungated_background_resists_sparsity_pressure_gated_degrades_1026",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/outer_objective.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "ungated_linear_background_atom_reaches_pca_ceiling_and_converges_1026",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/outer_objective.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "ungated_logit_slot_carries_zero_gradient_and_curvature_1026",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/outer_objective.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "uniform_and_discrete_occupancy_survive_the_collapse_guard_2691",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/coordinate_fidelity.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "value_lane_prices_at_shared_fixed_point_2228",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_outer_quasi_laplace_probe_budget_2080.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "vector_likelihood_rejects_nonfinite_optimizer_state_without_panicking_932",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/vector_response.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_attribute_deflated_route_classification_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_exact_a_bundle_2515.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_attribute_the_broken_ladder_rung_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_exact_a_bundle_2515.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_attribute_the_broken_rung_through_production_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_exact_a_bundle_2515.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_measure_bernoulli_wide_basis_size_versus_n_2672",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/basis_smooth/smooths/smooth_term_lr_size_calibration.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_measure_deflation_correction_size_2712",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_deflated_from_probes_2712.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_measure_dense_vs_streaming_evidence_logdet_terms_2755",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/construction_exact_hessian.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_measure_exact_a_geometry_bundle_channels_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_exact_a_bundle_2515.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_measure_gaussian_reference_against_the_profiled_scale_2672",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/basis_smooth/smooths/smooth_term_lr_size_calibration.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_measure_iso_kappa_face_saturation_ladder_2425",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/fit_orchestration/drivers/iso_kappa_reml_gradient_fd_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_measure_iso_kappa_rail_gradient_fd_2425",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/fit_orchestration/drivers/iso_kappa_reml_gradient_fd_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_measure_k2_wide_p_inner_trajectory_2080",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_outer_quasi_laplace_probe_budget_2080.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_measure_rho_gradient_part_decomposition_binomial_2623",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-models/src/fit_orchestration/drivers/iso_kappa_reml_gradient_fd_tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_measure_separation_force_vs_c2_2253",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_collapse_prevention.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_measure_size_under_candidate_reference_shapes_2672",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "tests/basis_smooth/smooths/smooth_term_lr_size_calibration.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_measure_smoothness_dof_bundle_vs_deflated_2499",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    },
+    {
+      "name": "zz_planted_circle_plain_engine_stall_diagnostic_2234",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_stall_diagnostic_2234.rs"
+        }
+      ],
+      "current_test_paths": [
+        "crates/gam-sae/src/manifold/tests_stall_diagnostic_2234.rs"
+      ],
+      "status": "present_unverified"
+    },
+    {
+      "name": "zz_scan_exact_a_admitted_alpha_2515",
+      "deletions": [
+        {
+          "commit": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
+          "source_path": "crates/gam-sae/src/manifold/tests_exact_a_bundle_2515.rs"
+        }
+      ],
+      "current_test_paths": [],
+      "status": "missing_untriaged"
+    }
+  ]
+}
