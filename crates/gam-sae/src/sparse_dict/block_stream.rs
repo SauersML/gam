@@ -47,9 +47,9 @@ use super::block::{
     RowBlockCode, block_birth_evidence_margin, frame_fixed_point_residual, gram_schmidt_rows,
     relative_scalar_change, route_and_code_all, seed_frames, stable_rank_symmetric,
 };
+use super::block_frame::polar_tied_frame_step;
 use super::residual_reservoir::ResidualReservoir;
 use super::update::{DEAD_DENOM, DecoderSolveStats};
-use crate::frames::GrassmannFrame;
 use gam_linalg::faer_ndarray::with_faer_sequential;
 use ndarray::{Array2, ArrayView2, Axis};
 use rayon::prelude::*;
@@ -778,58 +778,15 @@ impl BlockSparseStreamState {
                                     + gamma * gamma * moment[[c, rr]];
                             }
                         }
-                        // Certify the conditional Rayleigh gradient before
-                        // adding any spectral shift or ridge. H differs from
-                        // the conditional operator only by (k-1)γ² P C U in
-                        // its normal component. Normalize by that conditional
-                        // operator's action, making the residual independent
-                        // of the algorithm's chosen majorization curvature.
-                        let normal = Array2::from_shape_fn((b, b), |(axis, rr)| {
-                            (0..p)
-                                .map(|c| self.decoder[[gg * b + axis, c]] as f64 * moment[[c, rr]])
-                                .sum::<f64>()
-                        });
-                        let mut tangent_sq = 0.0;
-                        let mut conditional_sq = 0.0;
-                        for c in 0..p {
-                            for rr in 0..b {
-                                let mut projected = 0.0;
-                                let mut normal_correction = 0.0;
-                                for axis in 0..b {
-                                    let direction = self.decoder[[gg * b + axis, c]] as f64;
-                                    projected += direction * normal[[axis, rr]];
-                                    normal_correction += direction * second[[axis, rr]];
-                                }
-                                tangent_sq += (moment[[c, rr]] - projected).powi(2);
-                                conditional_sq += (moment[[c, rr]]
-                                    - (self.k - 1) as f64 * normal_correction)
-                                    .powi(2);
-                                moment[[c, rr]] += shift * self.decoder[[gg * b + rr, c]] as f64;
-                            }
-                        }
-                        let gradient_residual = if conditional_sq == 0.0 {
-                            0.0
-                        } else {
-                            (tangent_sq / conditional_sq).sqrt()
-                        };
-                        if moment.iter().all(|&value| value == 0.0) {
-                            return Ok(gradient_residual);
-                        }
-                        let frame =
-                            GrassmannFrame::polar_update(moment.view()).map_err(|error| {
-                                format!("BlockSparseStream polar block {gg}: {error}")
-                            })?;
-                        let u = frame.frame();
-                        for rr in 0..b {
-                            // Restore the signed Procrustes orientation after
-                            // GrassmannFrame's column-sign canonicalization.
-                            let alignment: f64 = (0..p).map(|c| u[[c, rr]] * moment[[c, rr]]).sum();
-                            let orientation = if alignment < 0.0 { -1.0 } else { 1.0 };
-                            for c in 0..p {
-                                proposal[[rr, c]] = (orientation * u[[c, rr]]) as f32;
-                            }
-                        }
-                        Ok(gradient_residual)
+                        polar_tied_frame_step(
+                            self.decoder.slice(ndarray::s![gg * b..(gg + 1) * b, ..]),
+                            moment.view_mut(),
+                            second.view(),
+                            (self.k - 1) as f64,
+                            shift,
+                            proposal.view_mut(),
+                        )
+                        .map_err(|error| format!("BlockSparseStream polar block {gg}: {error}"))
                     })
                     .collect()
             });

@@ -142,15 +142,12 @@ fn block_router_parallel_partition_preserves_wide_dictionary_routes() {
     }
 }
 
-/// #2634 — two blocks selected on every row are the minimal witness that a
-/// stale, all-at-once (Jacobi) frame refresh is not alternating minimization.
-/// The production sweep is Gauss--Seidel and certifies the fixed-code RSS after
-/// every immediately installed Procrustes block.
+/// #2634/#2825: each conditional block step sees the immediately updated
+/// reconstruction and recomputes its tied codes when its frame changes.
 #[test]
-fn co_routed_frame_sweep_is_fixed_code_descent_2634() {
+fn co_routed_frame_sweep_is_tied_code_descent_2634() {
     let (rows, p, b, n_blocks) = (128usize, 4usize, 2usize, 2usize);
     let mut x = Array2::<f32>::zeros((rows, p));
-    let mut codes = Vec::with_capacity(rows);
     for row in 0..rows {
         let theta = row as f32 * 0.19;
         let z0 = [theta.cos(), theta.sin()];
@@ -159,22 +156,90 @@ fn co_routed_frame_sweep_is_fixed_code_descent_2634() {
         x[[row, 1]] = z0[1] + 0.35 * z1[1];
         x[[row, 2]] = 0.65 * z1[0] - 0.20 * z0[1];
         x[[row, 3]] = 0.65 * z1[1] + 0.20 * z0[0];
-        codes.push(RowBlockCode {
-            blocks: vec![0, 1],
-            gates: vec![1.0, 1.0],
-            codes: vec![z0[0], z0[1], z1[0], z1[1]],
-            projections: vec![z0[0] as f64, z0[1] as f64, z1[0] as f64, z1[1] as f64],
-        });
     }
     let mut decoder = make_decoder(n_blocks, b, p, 2634);
+    let initial = route_and_code_all(
+        x.view(),
+        decoder.view(),
+        1.0,
+        n_blocks,
+        b,
+        n_blocks,
+        rows,
+        n_blocks,
+    )
+    .expect("initial route");
+    let gamma = refresh_gamma(x.view(), &initial, decoder.view(), b);
+    let codes = route_and_code_all(
+        x.view(),
+        decoder.view(),
+        gamma,
+        n_blocks,
+        b,
+        n_blocks,
+        rows,
+        n_blocks,
+    )
+    .expect("profiled route");
     let before = reconstruction_rss(x.view(), &codes, decoder.view(), b);
-    let failures = refresh_frames(x.view(), &codes, &mut decoder, n_blocks, b, 0.0)
-        .expect("the fixed-code frame sweep is certified descent");
-    let after = reconstruction_rss(x.view(), &codes, decoder.view(), b);
-    assert_eq!(failures, 0);
+    let stationarity = refresh_frames(x.view(), &codes, &mut decoder, n_blocks, b, gamma, 0.0)
+        .expect("tied frame sweep");
+    let after_codes = route_and_code_all(
+        x.view(),
+        decoder.view(),
+        gamma,
+        n_blocks,
+        b,
+        n_blocks,
+        rows,
+        n_blocks,
+    )
+    .expect("recomputed tied codes");
+    let after = reconstruction_rss(x.view(), &after_codes, decoder.view(), b);
+    assert!(stationarity.is_finite() && stationarity > 1e-4);
     assert!(
-        after <= before,
-        "one production frame sweep must not increase fixed-code RSS: {before:.17e} -> {after:.17e}"
+        after < before,
+        "one production frame sweep must decrease tied-code RSS: {before:.17e} -> {after:.17e}"
+    );
+}
+
+#[test]
+fn one_shot_frame_sweep_prices_both_occurrences_of_the_tied_decoder_2825() {
+    let x = ndarray::array![[0.4_f32, 4.0], [0.3, -3.0], [-0.3, 3.0]];
+    let mut decoder = ndarray::array![[1.0_f32, -10.0], [10.0, 3.0]];
+    for mut row in decoder.outer_iter_mut() {
+        let norm = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt();
+        row.mapv_inplace(|value| (value as f64 / norm) as f32);
+    }
+    let initial = route_and_code_all(x.view(), decoder.view(), 1.0, 2, 1, 2, 3, 2)
+        .expect("initial tied route");
+    let gamma = refresh_gamma(x.view(), &initial, decoder.view(), 1);
+    let codes = route_and_code_all(x.view(), decoder.view(), gamma, 2, 1, 2, 3, 2)
+        .expect("profiled tied route");
+    // Independent f64 projector oracle, without the stored f32 code channel.
+    let x64 = x.mapv(f64::from);
+    let rss = |d: &Array2<f32>| {
+        let d64 = d.mapv(f64::from);
+        let prediction = x64.dot(&d64.t()).dot(&d64);
+        x64.iter()
+            .zip(prediction.iter())
+            .map(|(&value, &projected)| (value - gamma as f64 * projected).powi(2))
+            .sum::<f64>()
+    };
+    let before = rss(&decoder);
+    let stationarity = refresh_frames(x.view(), &codes, &mut decoder, 2, 1, gamma, 0.0)
+        .expect("one-shot tied update");
+    let after = rss(&decoder);
+    assert!(
+        before > 0.9 && stationarity > 1e-3,
+        "the witness must be nonstationary"
+    );
+    assert!(
+        after < before,
+        "actual tied RSS increased: {before:e} -> {after:e}"
+    );
+    eprintln!(
+        "#2825 one-shot tied RSS {before:.17e} -> {after:.17e}, stationarity={stationarity:e}"
     );
 }
 

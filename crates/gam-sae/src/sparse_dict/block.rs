@@ -39,8 +39,8 @@
 //!
 //! **Training** is alternating minimisation, mirroring [`super::update`]:
 //! encode+route every row → refresh the shared scalar `γ` in closed form → update
-//! each block frame by a method-of-optimal-directions cross-moment followed by a
-//! polar reprojection back onto the Stiefel manifold → propose residual-row births
+//! each block frame by a shifted Rayleigh step for the tied-projector objective
+//! followed by a polar reprojection → propose residual-row births
 //! for dead blocks (never PCs) → commit each only under strict full-corpus RSS
 //! improvement and a positive realised-rank evidence margin → re-encode and score
 //! EV for the stopping rule. No dense `N×K` object is ever formed: routing is
@@ -147,8 +147,8 @@ pub struct BlockSparseConfig {
     /// tiles of shape `minibatch × (block_tile·b)` are formed and discarded; the
     /// `N×K` score matrix is never materialised.
     pub block_tile: usize,
-    /// Ridge on the per-block frame cross-moment refresh (Tikhonov on the polar
-    /// step's cross-moment); keeps a thinly-used block's polar well posed.
+    /// Additional nonnegative shift in the frame's Rayleigh step. The shift
+    /// leaves the constrained objective and its stationarity certificate unchanged.
     pub frame_ridge: f64,
     /// AuxK dead-block birth-proposal budget `k_aux`: at most this many dead
     /// blocks are transactionally tested per epoch against worst-residual rows.
@@ -797,35 +797,31 @@ fn refresh_gamma(
     if den == 0.0 { 0.0 } else { (num / den) as f32 }
 }
 
-/// Refresh every block frame by a method-of-optimal-directions cross-moment
-/// followed by a polar reprojection back onto the Stiefel manifold.
+/// Sweep the actual tied-projector objective with supports held fixed.
 ///
-/// With the codes `z_{ig}` held fixed and the frame constrained orthonormal, the
-/// reconstruction loss `Σ_i ‖r_{ig} − z_{ig} D_g‖²` — where
-/// `r_{ig} = x_i − (x̂_i − z_{ig} D_g)` is the residual attributed to block `g`
-/// alone — has, up to the `‖z_{ig} D_g‖² = ‖z_{ig}‖²` term that is constant in the
-/// orthonormal gauge, the orthogonal-Procrustes solution `D_g = polar(M_g)ᵀ` with
-/// cross-moment `M_g = Σ_i r_{ig}ᵀ z_{ig}` (`P×b`). We accumulate `M_g` for every
-/// block, add a tiny ridge on its Gram for a thinly-used block, and polar it via
-/// [`GrassmannFrame::polar_update`]. Blocks that no row selected accumulate a zero
-/// `M_g` and keep their current frame in place (they may be proposed for birth
-/// separately).
+/// For one block, q is the sum of the other selected projectors applied to x.
+/// Its conditional loss is constant - tr(U' H U), with
+/// H = (2γ-γ²) Σ xx' - γ² Σ (xq'+qx'). Both occurrences of U in the
+/// tied reconstruction γ U U' x are differentiated. The shared polar step
+/// increases this Rayleigh objective after a data-derived PSD shift.
+///
+/// Install each block immediately and update the gamma-free reconstruction.
+/// Later blocks see the current projectors in deterministic Gauss--Seidel order.
+/// Storage is N×P plus one P×b action, never N×K or a P×P covariance.
 fn refresh_frames(
     x: ArrayView2<'_, f32>,
     codes: &[RowBlockCode],
     decoder: &mut Array2<f32>,
     n_blocks: usize,
     b: usize,
+    gamma: f32,
     ridge: f64,
-) -> Result<usize, String> {
+) -> Result<f64, String> {
     let p = x.ncols();
-    // A frame update is a block-coordinate minimizer only against the CURRENT
-    // reconstruction. Accumulating every cross-moment against one stale decode
-    // makes a Jacobi best response: co-routed blocks counter-rotate and can
-    // increase the very fixed-code objective this sweep claims to minimize.
-    // Keep one N×P f64 reconstruction and install each block immediately, i.e.
-    // the exact deterministic Gauss--Seidel order. No N×K workspace exists.
-    let mut reconstruction = Array2::<f64>::zeros((x.nrows(), p));
+    let gamma = gamma as f64;
+    let gamma_sq = gamma * gamma;
+    let data_scale = 2.0 * gamma - gamma_sq;
+    let mut projection_sum = Array2::<f64>::zeros((x.nrows(), p));
     let mut members = vec![Vec::<(usize, usize)>::new(); n_blocks];
     for (row, code) in codes.iter().enumerate() {
         for (slot, &block) in code.blocks.iter().enumerate() {
@@ -834,164 +830,92 @@ fn refresh_frames(
             }
             let block = block as usize;
             members[block].push((row, slot));
-            let z = &code.codes[slot * b..slot * b + b];
+            let w = &code.projections[slot * b..(slot + 1) * b];
             for c in 0..p {
-                for r in 0..b {
-                    reconstruction[[row, c]] += z[r] as f64 * decoder[[block * b + r, c]] as f64;
+                for axis in 0..b {
+                    projection_sum[[row, c]] += w[axis] * decoder[[block * b + axis, c]] as f64;
                 }
             }
         }
     }
 
-    let mut polar_failures = 0usize;
-    for g in 0..n_blocks {
-        if members[g].is_empty() {
+    let mut stationarity = 0.0_f64;
+    // No normal majorization term is needed for a sequential conditional step.
+    let normal_gram = Array2::<f64>::zeros((b, b));
+    for block in 0..n_blocks {
+        if members[block].is_empty() {
             continue;
         }
-        let mut cross_moment = Array2::<f64>::zeros((p, b));
-        for &(row, slot) in &members[g] {
-            let z = &codes[row].codes[slot * b..slot * b + b];
+        let mut action = Array2::<f64>::zeros((p, b));
+        let mut energy = 0.0;
+        let mut negative_bound = 0.0;
+        let mut other_coordinates = vec![0.0; b];
+        for &(row, slot) in &members[block] {
+            // This block has not moved yet, so its original tied projections
+            // remain valid even though earlier blocks changed projection_sum.
+            let w = &codes[row].projections[slot * b..(slot + 1) * b];
+            other_coordinates.fill(0.0);
+            let mut x_norm_sq = 0.0;
+            let mut q_norm_sq = 0.0;
+            let mut x_dot_q = 0.0;
             for c in 0..p {
-                let old_contribution = (0..b)
-                    .map(|r| z[r] as f64 * decoder[[g * b + r, c]] as f64)
+                let own = (0..b)
+                    .map(|axis| w[axis] * decoder[[block * b + axis, c]] as f64)
                     .sum::<f64>();
-                let attributed_residual =
-                    x[[row, c]] as f64 - reconstruction[[row, c]] + old_contribution;
-                for r in 0..b {
-                    cross_moment[[c, r]] += attributed_residual * z[r] as f64;
+                let q = projection_sum[[row, c]] - own;
+                let value = x[[row, c]] as f64;
+                x_norm_sq += value * value;
+                q_norm_sq += q * q;
+                x_dot_q += value * q;
+                for axis in 0..b {
+                    action[[c, axis]] += (data_scale * value - gamma_sq * q) * w[axis];
+                    other_coordinates[axis] += decoder[[block * b + axis, c]] as f64 * q;
                 }
             }
-        }
-        // Ridge the cross-moment's Gram lightly by shrinking toward the current
-        // frame: add ridge·D_gᵀ (P×b of the current orthonormal rows). This keeps
-        // a block that saw only a handful of rows well posed without disturbing a
-        // well-populated one.
-        if ridge > 0.0 {
-            for r in 0..b {
-                for c in 0..p {
-                    cross_moment[[c, r]] += ridge * decoder[[g * b + r, c]] as f64;
+            for c in 0..p {
+                for axis in 0..b {
+                    action[[c, axis]] -= gamma_sq * x[[row, c]] as f64 * other_coordinates[axis];
                 }
             }
+            energy += x_norm_sq;
+            // The lowest eigenvalue of -(xq'+qx') is -x'q-||x||||q||.
+            negative_bound += (x_norm_sq.sqrt() * q_norm_sq.sqrt() + x_dot_q).max(0.0);
         }
-        match GrassmannFrame::polar_update(cross_moment.view()) {
-            Ok(frame) => {
-                let u = frame.frame(); // P×b column-orthonormal
-                let sv = frame.gauge_singular_values();
-                let largest_sv = sv.first().copied().unwrap_or(0.0);
-                let numerical_rank_floor = largest_sv * f64::EPSILON * p.max(b) as f64;
-                let full_rank = sv.len() == b
-                    && largest_sv.is_finite()
-                    && sv
-                        .iter()
-                        .all(|&s| s.is_finite() && s > numerical_rank_floor);
-                if full_rank && u.ncols() == b {
-                    // `GrassmannFrame` canonicalizes signs for span-valued use.
-                    // Fixed signed codes require the unique Procrustes
-                    // orientation instead. For Q=polar(M), QᵀM is PSD, hence
-                    // every full-rank diagonal entry is positive; use that
-                    // invariant to undo any canonical sign flip.
-                    let mut proposed = Array2::<f32>::zeros((b, p));
-                    for r in 0..b {
-                        let alignment = (0..p)
-                            .map(|c| u[[c, r]] * cross_moment[[c, r]])
-                            .sum::<f64>();
-                        if !(alignment.is_finite() && alignment != 0.0) {
-                            return Err(format!(
-                                "frame refresh block {g} has unresolved Procrustes orientation \
-                                 at column {r}: alignment={alignment}"
-                            ));
-                        }
-                        let sign = alignment.signum();
-                        for c in 0..p {
-                            proposed[[r, c]] = (sign * u[[c, r]]) as f32;
-                        }
-                    }
+        let shift = (-data_scale).max(0.0) * energy + gamma_sq * negative_bound + ridge;
+        let mut proposal = Array2::<f32>::zeros((b, p));
+        let residual = super::block_frame::polar_tied_frame_step(
+            decoder.slice(ndarray::s![block * b..(block + 1) * b, ..]),
+            action.view_mut(),
+            normal_gram.view(),
+            0.0,
+            shift,
+            proposal.view_mut(),
+        )
+        .map_err(|error| format!("tied frame refresh block {block}: {error}"))?;
+        stationarity = stationarity.max(residual);
 
-                    // Certify descent in the exact arithmetic actually stored:
-                    // proposed is already quantized to f32, while both RSS
-                    // values and reconstruction updates are accumulated in f64.
-                    // That mixed precision is the whole subtlety — see the
-                    // allowance below, which is what the f32 side costs.
-                    let mut before_rss = 0.0_f64;
-                    let mut after_rss = 0.0_f64;
-                    // The RSS increase that f32 STORAGE OF THE DECODER can
-                    // produce on its own, accumulated alongside the RSS in the
-                    // same loop so it is the allowance for this block's actual
-                    // members and codes rather than a global constant.
-                    //
-                    // `proposed` is quantized to f32 before it is priced (see the
-                    // note above), so each new contribution carries a
-                    // representation error of up to `½ ulp` per term:
-                    // `Σ_r |z_r|·|proposed_rc|·ε32/2`. Propagating that into the
-                    // squared residual to first order gives
-                    // `2·|after_residual|·δ + δ²`, which is the smallest RSS
-                    // change this arithmetic can resolve.
-                    let mut quantization_allowance = 0.0_f64;
-                    for &(row, slot) in &members[g] {
-                        let z = &codes[row].codes[slot * b..slot * b + b];
-                        for c in 0..p {
-                            let old_contribution = (0..b)
-                                .map(|r| z[r] as f64 * decoder[[g * b + r, c]] as f64)
-                                .sum::<f64>();
-                            let new_contribution = (0..b)
-                                .map(|r| z[r] as f64 * proposed[[r, c]] as f64)
-                                .sum::<f64>();
-                            let before_residual = x[[row, c]] as f64 - reconstruction[[row, c]];
-                            let after_reconstruction =
-                                reconstruction[[row, c]] - old_contribution + new_contribution;
-                            let after_residual = x[[row, c]] as f64 - after_reconstruction;
-                            before_rss += before_residual * before_residual;
-                            after_rss += after_residual * after_residual;
-                            let delta = 0.5
-                                * f64::from(f32::EPSILON)
-                                * (0..b)
-                                    .map(|r| (z[r] as f64).abs() * (proposed[[r, c]] as f64).abs())
-                                    .sum::<f64>();
-                            quantization_allowance +=
-                                2.0 * after_residual.abs() * delta + delta * delta;
-                        }
-                    }
-                    // A quantized polar step that increases fixed-code loss by
-                    // MORE than its own quantization can explain is refused,
-                    // never silently installed. Below that, the comparison is
-                    // reading f32 storage noise: at a converged frame the
-                    // residual IS the quantization floor (measured: RSS
-                    // 2.75317344072882423e-13 -> 2.76023938652575533e-13, an
-                    // increase of 7.1e-16 on a reconstruction whose f32 storage
-                    // cannot resolve better), so a STRICT bar there refuses the
-                    // fits that converged best. The allowance is derived from
-                    // `f32::EPSILON` and this block's own codes — no tuned
-                    // constant, and it vanishes as the codes do.
-                    if after_rss > before_rss + quantization_allowance {
-                        return Err(format!(
-                            "frame refresh block {g} failed its fixed-code descent certificate: \
-                             RSS {before_rss:.17e} -> {after_rss:.17e} \
-                             (exceeds the f32 quantization allowance {quantization_allowance:.17e})"
-                        ));
-                    }
-                    for &(row, slot) in &members[g] {
-                        let z = &codes[row].codes[slot * b..slot * b + b];
-                        for c in 0..p {
-                            for r in 0..b {
-                                reconstruction[[row, c]] += z[r] as f64
-                                    * (proposed[[r, c]] as f64 - decoder[[g * b + r, c]] as f64);
-                            }
-                        }
-                    }
-                    decoder
-                        .slice_mut(ndarray::s![g * b..g * b + b, ..])
-                        .assign(&proposed);
-                } else {
-                    polar_failures += 1;
+        let mut proposed_coordinates = vec![0.0; b];
+        for &(row, slot) in &members[block] {
+            proposed_coordinates.fill(0.0);
+            for axis in 0..b {
+                for c in 0..p {
+                    proposed_coordinates[axis] += x[[row, c]] as f64 * proposal[[axis, c]] as f64;
                 }
             }
-            Err(_) => polar_failures += 1,
+            let old_coordinates = &codes[row].projections[slot * b..(slot + 1) * b];
+            for c in 0..p {
+                for axis in 0..b {
+                    projection_sum[[row, c]] += proposed_coordinates[axis]
+                        * proposal[[axis, c]] as f64
+                        - old_coordinates[axis] * decoder[[block * b + axis, c]] as f64;
+                }
+            }
         }
-        // A degenerate cross-moment (rank-deficient) leaves the block's current
-        // (already orthonormal) frame in place; birth arbitration handles a truly
-        // dead block.
+        decoder
+            .slice_mut(ndarray::s![block * b..(block + 1) * b, ..])
+            .assign(&proposal);
     }
-    Ok(polar_failures)
+    Ok(stationarity)
 }
 
 /// AuxK-style dead-block birth proposals (seed from residual ROWS, never PCs).
@@ -1644,6 +1568,7 @@ struct BlockSparseStep {
     next: BlockSparseState,
     accepted_births: usize,
     polar_failures: usize,
+    frame_stationarity: f64,
 }
 
 fn stored_code_gate(code: &RowBlockCode, slot: usize, b: usize) -> f64 {
@@ -2018,12 +1943,13 @@ fn advance_block_sparse_state(
     )?;
 
     let mut decoder = current.decoder.clone();
-    let polar_failures = refresh_frames(
+    let frame_stationarity = refresh_frames(
         x,
         &codes_for_refresh,
         &mut decoder,
         config.n_blocks,
         b,
+        gamma_for_refresh,
         config.frame_ridge,
     )?;
     let proposals = dead_block_birth_proposals(
@@ -2078,7 +2004,8 @@ fn advance_block_sparse_state(
     Ok(BlockSparseStep {
         next,
         accepted_births,
-        polar_failures,
+        polar_failures: 0,
+        frame_stationarity,
     })
 }
 
@@ -2275,7 +2202,8 @@ fn fit_block_sparse_dictionary_with_seed_inner(
         );
         gamma_residual = relative_scalar_change(state.gamma, step.next.gamma);
         frame_residual =
-            frame_fixed_point_residual(state.decoder.view(), step.next.decoder.view(), g, b);
+            frame_fixed_point_residual(state.decoder.view(), step.next.decoder.view(), g, b)
+                .max(step.frame_stationarity);
         accepted_births = step.accepted_births;
         polar_failures = step.polar_failures;
         let next_ev = step.next.explained_variance;

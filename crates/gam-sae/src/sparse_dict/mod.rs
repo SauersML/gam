@@ -28,6 +28,7 @@
 
 mod block;
 mod block_chart;
+mod block_frame;
 mod block_scoring_gpu;
 mod block_stream;
 mod code_evidence;
