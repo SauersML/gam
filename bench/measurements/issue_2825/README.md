@@ -42,3 +42,15 @@ Render either recorded trace with explicit paths:
 python plot.py qwen_prefix.jsonl qwen_prefix.png
 python plot.py qwen_2048_32passes.jsonl qwen_2048_32passes.png
 ```
+
+The corpus-free `block_tied_objective` example isolates the objective mismatch
+with three rows and two rank-one blocks. Both blocks remain selected on every
+row. Starting from normalized directions `(1, -10)` and `(10, 3)` on rows
+`(0.4, 4)`, `(0.3, -3)`, and `(-0.3, 3)`, the current update lowers fixed-code
+RSS from 0.922270 to 0.213493. Recomputing tied codes and profiling gamma raises
+RSS to 1.096363. The example prints all three losses and returns an error for
+that increase:
+
+```sh
+cargo run --locked --profile test -p gam-sae --example block_tied_objective
+```
