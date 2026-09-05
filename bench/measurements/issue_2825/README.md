@@ -26,3 +26,19 @@ and frame residuals remain above tolerance, so the diagnostic exits with a
 nonconvergence error and produces no fit artifact. The original 100,000-row,
 8,192-atom case has not been rerun. `plot.py` renders only the recorded JSON;
 it does not fit or rerun a model.
+
+`qwen_2048_32passes.jsonl` records a second trace at commit
+`c2118c6ce1082349f08ab94d106929af6a5d7647`: the same 512-row prefix, 2,048
+atoms, and 32 passes. Use diagnostic arguments `CORPUS.npy 512 2048 2 8 32`.
+EV peaks at 0.764409 on pass 21, then ends at 0.750647. The final gamma and
+frame residuals are 0.008351 and 0.708147, respectively. This trace demonstrates
+that coordinated fixed-code updates and faster iteration do not establish
+convergence after fresh routing and tied-code recomputation. No fit artifact
+was emitted.
+
+Render either recorded trace with explicit paths:
+
+```sh
+python plot.py qwen_prefix.jsonl qwen_prefix.png
+python plot.py qwen_2048_32passes.jsonl qwen_2048_32passes.png
+```
