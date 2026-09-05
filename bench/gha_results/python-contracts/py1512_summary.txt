@@ -1,14 +1,14 @@
 # python-contracts full-suite triage (#1512) — recovered summary
 
-collected            1722
-passed               1497
+collected            1725
+passed               1535
 skipped              79
-failed (diagnosed)   114
+failed (diagnosed)   79
 errored (diagnosed)  0
 CENSORED             32   (worker killed at the per-test bound;
                           the JUnit records no reason and time=0.000)
 
-faulthandler dumps in the step log: 35
+faulthandler dumps in the step log: 38
 
 ## The 32 censored tests, with the frame each was stuck in
 
@@ -36,6 +36,14 @@ it is a call that had not returned when the bound expired.
       test_structure_certificate_matches_independent_e_bh
           stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
 
+[3] tests.test_sae_manifold_determinism
+      test_sae_fit_is_deterministic_for_fixed_seed
+          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
+      test_sae_fit_random_state_changes_output
+          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
+      test_sae_fit_random_state_changes_output_topk_path
+          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
+
 [2] tests.bug_hunt_shape_constrained_fit_refuses_default_prediction_intervals_test
       test_shape_constrained_diagnose_at_its_default[monotone-increasing]
           stuck in gamfit/_model.py:331 in predict
@@ -48,28 +56,22 @@ it is a call that had not returned when the bound expired.
       test_a_score_enters_as_one_penalised_slope_surface
           stuck in gamfit/_event_history.py:439 in fit_event_history
 
-[2] tests.test_sae_manifold_determinism
-      test_sae_fit_is_deterministic_for_fixed_seed
-          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
-      test_sae_fit_random_state_changes_output_topk_path
-          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
-
 [2] tests.test_sae_manifold_oos_reencode_issue_2132
       test_oos_reencode_of_training_rows_matches_native_reconstruction
           stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
       test_selected_rho_survives_save_load_roundtrip
           stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
 
-[2] tests.test_sae_manifold_shape_band_save_load
-      test_reconstruction_and_band_are_physical_under_heterogeneous_column_scale
-          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
-      test_restored_covariance_reproduces_analytic_band
-          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
-
 [2] tests.test_sae_manifold_shape_uncertainty
-      test_more_data_tightens_the_posterior_band
+      test_band_sd_matches_analytic_phi_cov_phi_propagation
           stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
       test_posterior_shape_band_is_tighter_than_data_deviation
+          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
+
+[2] tests.test_sae_manifold_single_circle_default_795
+      test_single_circle_positive_isometry_recovers_honest_chart_span
+          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
+      test_single_circle_quickstart_converges_with_default_regularizers
           stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
 
 [2] tests.test_sae_manifold_synthetic_quality_ground_truth
@@ -94,10 +96,6 @@ it is a call that had not returned when the bound expired.
       test_pspline_single_penalty_linear_data_control
           stuck in gamfit/_api.py:1270 in fit
 
-[1] tests.test_bug_hunt_spline_scan_predict_observation_interval
-      test_scan_observation_band_strictly_wider_by_sigma2[y ~ s(x, bs="ps", degree=5, penalty_order=3, double_penalty=false)]
-          stuck in gamfit/_api.py:1270 in fit
-
 [1] tests.test_python_api
       test_survival_marginal_slope_weibull_n3000_returns_under_60s
           stuck in gamfit/_api.py:1270 in fit
@@ -106,8 +104,8 @@ it is a call that had not returned when the bound expired.
       test_heterogeneous_mixed_topology_atoms_reconstruct
           stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
 
-[1] tests.test_sae_manifold_single_circle_default_795
-      test_single_circle_positive_isometry_recovers_honest_chart_span
+[1] tests.test_sae_manifold_shape_band_save_load
+      test_reconstruction_and_band_are_physical_under_heterogeneous_column_scale
           stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
 
 [1] tests.test_sae_manifold_speed
@@ -120,8 +118,8 @@ it is a call that had not returned when the bound expired.
 
 ## Entry-point census over the censored population
 
-    23  gamfit/_sae_manifold.py:220 in sae_manifold_fit
-     4  gamfit/_api.py:1270 in fit
+    24  gamfit/_sae_manifold.py:220 in sae_manifold_fit
+     3  gamfit/_api.py:1270 in fit
      2  gamfit/_event_history.py:439 in fit_event_history
      1  (no gamfit frame)
      1  gamfit/_model.py:507 in predict_conformal
@@ -129,24 +127,24 @@ it is a call that had not returned when the bound expired.
 
 ## 20 slowest tests that DID report a duration
 
-      268.3s  tests.test_sae_manifold_certify_external_2266::test_certify_external_round_trips_a_genuinely_converged_native_fit
-      226.7s  tests.test_sae_manifold_shape_uncertainty::test_shape_uncertainty_fields_present_and_well_shaped
-      213.3s  tests.test_sae_manifold_determinism::test_sae_fit_random_state_changes_output
-      209.1s  tests.test_sae_manifold_shape_uncertainty::test_band_sd_matches_analytic_phi_cov_phi_propagation
-      151.2s  tests.test_sae_manifold_top_k_issue::test_topk_fit_uses_exact_fixed_support[1]
-      118.4s  tests.test_sae_manifold_regularizer_noops_issue_240::test_primitive_names_metadata_is_not_a_substitute_for_effect
-      115.8s  tests.test_sae_manifold_shape_band_save_load::test_on_disk_format_is_compact_per_channel_not_dense_joint
+      280.9s  tests.test_sae_manifold_shape_band_save_load::test_on_disk_format_is_compact_per_channel_not_dense_joint
+      248.0s  tests.test_sae_manifold_shape_uncertainty::test_more_data_tightens_the_posterior_band
+      242.1s  tests.test_sae_manifold_certify_external_2266::test_certify_external_round_trips_a_genuinely_converged_native_fit
+      223.3s  tests.test_sae_manifold_shape_band_save_load::test_restored_covariance_reproduces_analytic_band
+      185.3s  tests.test_sae_manifold_shape_uncertainty::test_shape_uncertainty_fields_present_and_well_shaped
+      115.3s  tests.test_sae_manifold_regularizer_noops_issue_240::test_primitive_names_metadata_is_not_a_substitute_for_effect
+      105.5s  tests.test_sae_manifold_top_k_issue::test_topk_fit_uses_exact_fixed_support[1]
        90.0s  tests.test_survival_marginal_slope_clustered_pc_808::test_survival_marginal_slope_clustered_pc_converges_808
-       71.9s  tests.test_sae_manifold_regularizer_noops_issue_240::test_decoder_feature_sparsity_groups_is_not_a_silent_noop
-       70.1s  tests.test_sae_manifold_public_api_shapes::test_per_atom_uncertainty_shape_band_shapes_are_sane
-       68.4s  tests.test_sae_manifold_regularizer_noops_issue_240::test_block_orthogonality_weight_is_not_a_silent_noop
-       68.3s  tests.test_sae_manifold_regularizer_noops_issue_240::test_decoder_feature_sparsity_groups_produces_nontrivial_gradient
-       62.3s  tests.test_sae_manifold_regularizer_noops_issue_240::test_ard_per_atom_is_not_a_silent_noop
-       62.2s  tests.test_sae_manifold_regularizer_noops_issue_240::test_isometry_weight_is_not_a_silent_noop
+       66.3s  tests.test_sae_manifold_regularizer_noops_issue_240::test_decoder_feature_sparsity_groups_produces_nontrivial_gradient
+       64.2s  tests.test_sae_manifold_regularizer_noops_issue_240::test_ard_per_atom_is_not_a_silent_noop
+       63.1s  tests.test_sae_manifold_regularizer_noops_issue_240::test_decoder_feature_sparsity_groups_is_not_a_silent_noop
+       63.0s  tests.test_sae_manifold_regularizer_noops_issue_240::test_isometry_weight_is_not_a_silent_noop
+       62.2s  tests.test_sae_manifold_top_k_issue::test_topk_payload_is_one_unprojected_model
+       61.2s  tests.test_sae_manifold_public_api_shapes::test_per_atom_uncertainty_shape_band_shapes_are_sane
        60.1s  tests.test_survival_save_load_roundtrip::test_survival_marginal_slope_save_load_predict_roundtrips
-       53.8s  tests.test_sae_manifold_top_k_issue::test_topk_payload_is_one_unprojected_model
+       57.3s  tests.test_sae_manifold_regularizer_noops_issue_240::test_block_orthogonality_weight_is_not_a_silent_noop
        45.1s  tests.test_survival_api_regressions::test_survival_marginal_slope_fit_returns
-       27.4s  tests.bug_hunt_smooth_significance_ref_df_tracks_edf_not_basis_dim_test::test_nonconverged_flat_fit_is_not_flagged_significant
-       10.1s  tests.test_sae_manifold_synthetic_quality_ground_truth::test_fit_learns_disjoint_periodic_atoms_without_inactive_leakage
-        9.5s  tests.bug_hunt_transformation_normal_generate_draws_on_latent_scale_wrong_direction_test::test_ctm_generate_conditional_mean_increases_with_covariate
+       30.2s  tests.bug_hunt_smooth_significance_ref_df_tracks_edf_not_basis_dim_test::test_nonconverged_flat_fit_is_not_flagged_significant
+       11.9s  tests.test_sae_manifold_synthetic_quality_ground_truth::test_fit_learns_disjoint_periodic_atoms_without_inactive_leakage
+        6.1s  tests.test_binomial_posterior_mean_uncertainty::test_rare_event_observation_band_is_informative
 
