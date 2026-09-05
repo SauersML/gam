@@ -141,6 +141,7 @@ fn manifold_sae_structured_metric_without_behavior_shard_is_loadable() {
     payload.fisher_factors = None;
     payload.fisher_provenance = None;
     payload.fisher_mass_residual = None;
+    payload.fisher_factor_kind = None;
     payload.metric_provenance = "WhitenedStructured".to_string();
 
     assert!(
