@@ -19,6 +19,36 @@ fn should_start_next_seed(
 /// terminated before — measured on #2569 as one cold seed re-run 17 times to
 /// the identical `|g|` after the identical 42 outer iterations. Returns the
 /// surviving cascade and how many seeds were replayed rather than re-run.
+/// The seeds this outer call has not already started and had refused.
+///
+/// #2569 built the filter and exempted slot 0, because slot 0 carries the
+/// certify-resume loop's reseed point and "the resume exists to explore it".
+/// #2748 measured what that exemption costs when the reseed does not MOVE: on
+/// the `n = 4000` matern flexible cell the outer re-dispatched from slot 0
+/// round after round — `entering seed 0 of 7 (started 0, budget 1)` every time
+/// — and the dispatch's EFS arm re-derived one identical non-converged fixed
+/// point, `final_value = 2.786987e3` to seven digits across four runs at
+/// roughly thirteen minutes each, before the cell died at its wall.
+///
+/// The exemption's own justification is what corrects it. A reseed point earns
+/// its exemption by being NEW, not by sitting at index 0; a slot-0 point that
+/// is already in this run's refusal record is not a reseed the loop has yet to
+/// explore, it is the one it already explored. So the index test is replaced by
+/// the value test the justification was always stating. A resume that genuinely
+/// moves has a slot-0 point absent from the record and is untouched, which is
+/// every case #2569 measured.
+///
+/// This is also the answer to "what may persist across `obj.reset()`", which
+/// #2748 asked as though a solver needed new memory. Nothing new does. The
+/// record consulted here already survives the reset, because it never lived in
+/// the objective: it is carried on the config by the loop that owns the reset
+/// (`OuterConfig::previously_refused_seed_points`). What was missing was not a
+/// place to remember, it was reading the memory that exists with the predicate
+/// that matches it.
+///
+/// The cascade is never emptied. If every generated seed is a recorded replay
+/// the caller's own start is kept so a plan runner still has something to
+/// enter, and the replay count reports that the round had nothing new.
 fn seeds_without_recorded_refusals(
     seeds: Vec<Array1<f64>>,
     previously_refused: &[Array1<f64>],
@@ -28,14 +58,21 @@ fn seeds_without_recorded_refusals(
     }
     let mut kept: Vec<Array1<f64>> = Vec::with_capacity(seeds.len());
     let mut replayed = 0usize;
+    let mut caller_start: Option<Array1<f64>> = None;
     for (seed_idx, seed) in seeds.into_iter().enumerate() {
-        if seed_idx > 0 && previously_refused.iter().any(|refused| refused == &seed) {
+        if previously_refused.iter().any(|refused| refused == &seed) {
+            if seed_idx == 0 {
+                caller_start = Some(seed);
+            }
             replayed += 1;
             continue;
         }
         kept.push(seed);
     }
-    (kept, replayed)
+    match caller_start {
+        Some(start) if kept.is_empty() => (vec![start], replayed.saturating_sub(1)),
+        _ => (kept, replayed),
+    }
 }
 
 /// Seed start points this plan run STARTED and whose mandatory analytic
@@ -50,6 +87,7 @@ fn seeds_without_recorded_refusals(
 fn certificate_refused_seed_points(
     seed_rejections: &[SeedRejection],
     seeds: &[Array1<f64>],
+    budget_exhausted: &[Array1<f64>],
 ) -> Vec<Array1<f64>> {
     let mut points: Vec<Array1<f64>> = Vec::new();
     for rejection in seed_rejections
@@ -62,7 +100,47 @@ fn certificate_refused_seed_points(
             points.push(seed.clone());
         }
     }
+    // #2748 — a seed whose METRIC-FREE solver exhausted its iteration budget
+    // states where the search terminated just as definitely as a refused
+    // certificate does, and the filter's own justification above ("a seed
+    // rejected at screening, domain entry or validation never reached a
+    // solver") admits it: this one reached a solver and ran it to the end.
+    // It was nonetheless recorded nowhere, because the seed loop `continue`s
+    // an exhausted iterate as "resumable work, not a fit candidate" — true,
+    // and orthogonal to whether re-entering the same point would re-derive
+    // the same exhaustion. It would; see [`budget_exhausted_replay_point`].
+    for seed in budget_exhausted {
+        if !points.contains(seed) {
+            points.push(seed.clone());
+        }
+    }
     points
+}
+
+/// The seed point of an exhausted iterate, when re-entering it would provably
+/// reproduce the exhaustion — otherwise `None`.
+///
+/// The certify-resume loop varies exactly two things across dispatches: the
+/// outer BFGS metric (`warm_start_outer_hessian`) and the operator trust radius
+/// (`operator_initial_trust_radius`). A solver that consumes neither is a
+/// function of its seed alone, so `obj.reset()` puts it back in the state it
+/// ran from and the next dispatch recomputes what the last one already has.
+/// [`Solver::Efs`] is that solver: a multiplicative fixed-point iteration with
+/// no curvature model and no trust region. #2748 measured the consequence —
+/// four dispatches of the `n = 4000` matern flexible cell, each running the
+/// fixed point to `max_iter = 200` and each returning `final_value = 2.786987e3`
+/// to seven digits, at roughly thirteen minutes apiece.
+///
+/// `Arc` and `Bfgs` DO consume the transferred metric, so their retry from the
+/// same point is a different trajectory and is deliberately not recorded here;
+/// `HybridEfs` takes safeguarded gradient steps on the ψ coordinates and is
+/// excluded for the same reason. The claim this function makes is only ever
+/// "this exact run has already been performed", never "this point is bad".
+fn budget_exhausted_replay_point(
+    solver: Solver,
+    seed: &Array1<f64>,
+) -> Option<Array1<f64>> {
+    matches!(solver, Solver::Efs).then(|| seed.clone())
 }
 
 /// Parsimonious screening has exactly two roles: the flexible slot-0 basin and
@@ -1364,13 +1442,14 @@ pub(crate) fn run_outer_with_plan(
     // already recorded. `config.previously_refused_seed_points` is non-empty
     // only on a certify-resume round, and holds seeds an earlier round started
     // and whose analytic certificate refused. The resume reseeds `initial_rho`
-    // and resets the objective; every OTHER seed in this cascade is therefore
-    // re-entered from the identical state that already refused it, and the
-    // trace shows it terminating at the identical gradient after the identical
-    // iteration count. Slot 0 is the caller's reseed point and is never
-    // dropped — the resume exists to explore it — and a seed that was never
-    // started is never in the list, so the `should_start_next_seed`
-    // fall-through keeps every rescue it could previously perform.
+    // and resets the objective, so every seed in this cascade that is already
+    // in the record is re-entered from the identical state that already refused
+    // it, and the trace shows it terminating at the identical gradient after the
+    // identical iteration count. #2748: that includes slot 0 when the reseed did
+    // not move it, which is the case a slot-0 index exemption could never see. A
+    // seed that was never started is never in the list, so the
+    // `should_start_next_seed` fall-through keeps every rescue it could
+    // previously perform.
     let generated_seed_count = seeds.len();
     let (kept_seeds, replayed_seeds) =
         seeds_without_recorded_refusals(seeds, &config.previously_refused_seed_points);
@@ -1510,6 +1589,11 @@ pub(crate) fn run_outer_with_plan(
     // while their `ObjectiveEvalError` still carries the originating typed
     // `EstimationError`; there is no parallel prose ledger to reconcile later.
     let mut seed_rejections: Vec<SeedRejection> = Vec::new();
+    // #2748 — seed points whose metric-free solver ran to its iteration budget.
+    // Kept apart from `seed_rejections` deliberately: that ledger drives the
+    // structural early exit (`uniform_structural_key`), and an exhausted
+    // iterate is not a failure of the kind that ladder counts.
+    let mut budget_exhausted_seed_points: Vec<Array1<f64>> = Vec::new();
     let layout = cap.theta_layout();
     // Number of smoothing (ρ) coordinates, used to break a near-LAML-tie toward
     // the more-penalized basin in the non-Gaussian multi-start keep-best.
@@ -3447,11 +3531,29 @@ pub(crate) fn run_outer_with_plan(
                     candidate.solver_claimed_convergence(),
                 );
                 if !candidate.solver_claimed_convergence() {
+                    // #2748 — record the point BEFORE the checkpoint consumes
+                    // the candidate. An exhausted iterate is resumable work and
+                    // not a fit candidate, which is why the cascade continues;
+                    // it is ALSO a completed deterministic run of a metric-free
+                    // solver from a known point, which is why the next dispatch
+                    // must not perform it again. Those two facts are
+                    // independent, and only the first was being kept.
+                    if let Some(point) = seeds
+                        .get(seed_idx)
+                        .and_then(|seed| budget_exhausted_replay_point(the_plan.solver, seed))
+                        && !budget_exhausted_seed_points.contains(&point)
+                    {
+                        log::info!(
+                            "[OUTER] {context}: seed {seed_idx} exhausted its {:?} budget at                              final_value={:.6e}; recording the point so a later dispatch replays                              the outcome instead of re-deriving it (#2748)",
+                            the_plan.solver,
+                            candidate.final_value,
+                        );
+                        budget_exhausted_seed_points.push(point);
+                    }
                     retain_best_outer_checkpoint(&mut best_checkpoint, candidate);
-                    // An exhausted iterate is resumable work, not a fit
-                    // candidate. Continue the declared multistart budget in
-                    // search of a stationary seed; it may never populate or
-                    // short-circuit the certified winner slot.
+                    // Continue the declared multistart budget in search of a
+                    // stationary seed; it may never populate or short-circuit
+                    // the certified winner slot.
                     continue 'seed_attempts;
                 }
                 let candidate = match CertifiedOuterCandidate::from_solver_claim(
@@ -3652,7 +3754,7 @@ pub(crate) fn run_outer_with_plan(
     if let Some(certified) = best {
         let mut result = certified.into_result();
         result.refused_seed_points =
-            certificate_refused_seed_points(&seed_rejections, &seeds);
+            certificate_refused_seed_points(&seed_rejections, &seeds, &budget_exhausted_seed_points);
         // NO mint audit here (#2359). Every candidate above was screened at
         // order three, and the winner's order-four audit is paid EXACTLY ONCE —
         // but it is paid by `run_outer`, not here.
@@ -3779,7 +3881,7 @@ pub(crate) fn run_outer_with_plan(
 
     if let Some(mut checkpoint) = best_checkpoint {
         checkpoint.refused_seed_points =
-            certificate_refused_seed_points(&seed_rejections, &seeds);
+            certificate_refused_seed_points(&seed_rejections, &seeds, &budget_exhausted_seed_points);
         return Ok(PlanRunOutcome::Exhausted(checkpoint));
     }
 

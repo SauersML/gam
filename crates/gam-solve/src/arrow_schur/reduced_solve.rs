@@ -2554,6 +2554,146 @@ pub fn reduced_schur_lambda_max<B: BatchedBlockSolver + Sync>(
     (lambda.is_finite() && lambda > 0.0).then_some(lambda)
 }
 
+/// A measured direction of negative curvature of the reduced Schur complement,
+/// carried into the FULL arrow coordinates.
+///
+/// `curvature` is the Rayleigh quotient `vᵀSv` re-measured with one extra
+/// `S·v` apply, not the Ritz value the eigensolver reported — the Ritz value
+/// is an estimate from a Krylov space, and a certificate of indefiniteness must
+/// be an evaluation of the operator itself. `border` is the unit mode `v` in
+/// the reduced (border) coordinates and `eliminated` is its exact lift
+/// `L(v)` through the arrow elimination, so `(eliminated, border)` is a
+/// displacement of the full system whose curvature is exactly `curvature`.
+#[derive(Debug, Clone)]
+pub struct ReducedSchurNegativeCurvature {
+    /// `vᵀSv < 0`, measured by an apply rather than reported by the eigensolver.
+    pub curvature: f64,
+    /// The algebraically smallest Ritz value the shifted solve certified.
+    pub ritz_eigenvalue: f64,
+    /// The shift `σ ≥ λ_max` the spectral fold used.
+    pub shift: f64,
+    /// The unit mode in reduced/border coordinates.
+    pub border: Array1<f64>,
+    /// `L(v)`: the same mode in the eliminated blocks' coordinates.
+    pub eliminated: Array1<f64>,
+}
+
+/// The reduced Schur's algebraically most-negative eigenpair, matrix-free, and
+/// the full-space displacement it lifts to — `None` when the operator resolves
+/// no negative direction.
+///
+/// # Why a shift rather than plain Lanczos
+///
+/// [`gam_linalg::lanczos::symmetric_extreme_lanczos_eigenpairs`] certifies
+/// extreme-MAGNITUDE eigenpairs. At a saddle of a penalized fit `λ_max` is the
+/// data curvature and `λ_min` is a small negative number, so the largest
+/// magnitude is the wrong end and the mode that matters is invisible to it.
+/// Running the same solver on `σI − S` fixes that exactly: the spectrum folds
+/// to `σ − λ_j ≥ 0`, its largest element is `σ − λ_min`, and largest-magnitude
+/// is now the end we want. The fold is an exact similarity on the eigenvectors
+/// — it changes which eigenvalue is extreme and nothing else — and `σ` is the
+/// `λ_max` the surrogate's spectral bracket already estimates
+/// ([`reduced_schur_lambda_max`]), so no new spectral information is needed.
+///
+/// # Why this is a statement about the ITERATE
+///
+/// The lift `L` satisfies `[L(v); v]ᵀ H [L(v); v] = vᵀ S v` exactly (see
+/// [`arrow_lift_border_direction`]). So a negative `curvature` here is not a
+/// property of the reduced surrogate that might vanish in the full problem: it
+/// is negative curvature of the fit's own objective at this point, and a fit
+/// reporting convergence there has converged to something that is not a local
+/// minimum.
+pub fn reduced_schur_negative_curvature<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    ridge_beta: f64,
+    backend: &B,
+    resident: Option<&SaeResidentReducedSchur>,
+    gpu_matvec: Option<&GpuSchurMatvec>,
+    lambda_max: f64,
+    max_steps: usize,
+    seed: u64,
+) -> Option<ReducedSchurNegativeCurvature> {
+    let k = sys.k;
+    if k == 0 || !(lambda_max.is_finite() && lambda_max > 0.0) {
+        return None;
+    }
+    let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident)
+        .with_gpu_matvec(gpu_matvec);
+    // Deterministic Rademacher start, the same stream discipline the surrogate
+    // probes and `reduced_schur_lambda_max` use: reproducible across runs and
+    // never orthogonal to the sought eigenspace by construction.
+    let mut start = vec![0.0_f64; k];
+    {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut bits: u64 = 0;
+        let mut remaining: u32 = 0;
+        for value in start.iter_mut() {
+            if remaining == 0 {
+                bits = gam_linalg::utils::splitmix64(&mut state);
+                remaining = 64;
+            }
+            *value = if bits & 1 == 1 { 1.0 } else { -1.0 };
+            bits >>= 1;
+            remaining -= 1;
+        }
+    }
+    // `σ` strictly above `λ_max` so the folded operator is positive semidefinite
+    // even when the power-iteration estimate sits a rounding below the true top.
+    let shift = lambda_max * (1.0 + 8.0 * f64::EPSILON.sqrt());
+    let options = gam_linalg::lanczos::SymmetricExtremeLanczosOptions {
+        target_rank: 1,
+        max_steps: max_steps.clamp(1, k),
+        check_every: 4,
+        relative_residual_tol: f64::EPSILON.sqrt(),
+        breakdown_tol: 0.0,
+    };
+    let mut work = Array1::<f64>::zeros(k);
+    let pairs = gam_linalg::lanczos::symmetric_extreme_lanczos_eigenpairs(
+        k,
+        &start,
+        options,
+        |x: &[f64], out: &mut [f64]| {
+            let xv = Array1::from_iter(x.iter().copied());
+            op.apply_into(&xv, &mut work);
+            for (slot, (&xi, &sv)) in out.iter_mut().zip(x.iter().zip(work.iter())) {
+                *slot = shift * xi - sv;
+            }
+            Ok(())
+        },
+    )
+    .ok()?;
+    // Largest folded eigenvalue ⇒ smallest eigenvalue of `S`.
+    let (best, &folded) = pairs
+        .eigenvalues
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))?;
+    let ritz_eigenvalue = shift - folded;
+    let mode = pairs.eigenvectors.column(best).to_owned();
+    let norm = mode.dot(&mode).sqrt();
+    if !(norm.is_finite() && norm > 0.0) {
+        return None;
+    }
+    let border = mode / norm;
+    // The certificate: an APPLY of the operator, not the eigensolver's estimate.
+    let curvature = border.dot(&op.apply_owned(&border));
+    if !(curvature.is_finite() && curvature < 0.0) {
+        return None;
+    }
+    let eliminated = arrow_lift_border_direction(sys, htt_factors, border.view(), backend);
+    if eliminated.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    Some(ReducedSchurNegativeCurvature {
+        curvature,
+        ritz_eigenvalue,
+        shift,
+        border,
+        eliminated,
+    })
+}
+
 /// Matrix-free reduced-Schur log-determinant `log|S|` via the #2080 fixed
 /// rational surrogate ([`RationalLogdetPlan`]) on the exact `schur_matvec`
 /// apply — the desync-safe companion to `slq_reduced_schur_log_det`. **The
@@ -2761,6 +2901,37 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
             shifted.scaled_add(seed_shift, probe);
             let form = probe.dot(&shifted);
             if !(form.is_finite() && form > 0.0) {
+                // #2731 — a probe proves indefiniteness but names no direction,
+                // and a direction is the only thing an escape can use. The
+                // spectrum's own most-negative mode is a shifted Lanczos away
+                // (the shift is the `λ_max` this plan already estimated), and
+                // the arrow elimination lifts it into a full-space
+                // displacement, so the refusal reports what descends rather
+                // than only that something does.
+                let escape = reduced_schur_negative_curvature(
+                    sys,
+                    htt_factors,
+                    ridge_beta,
+                    backend,
+                    resident,
+                    gpu_matvec,
+                    lambda_max,
+                    power_iters,
+                    seed,
+                )
+                .map(|found| {
+                    format!(
+                        " The spectrum's most-negative direction is vᵀSv = {:.6e} (Ritz {:.6e}                          under the fold σ = {:.6e}); the arrow elimination lifts it to a                          full-space displacement of {} eliminated coordinates, whose curvature                          is that same number by the Schur identity — so the descent direction                          is available, not merely implied.",
+                        found.curvature,
+                        found.ritz_eigenvalue,
+                        found.shift,
+                        found.eliminated.len(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    " The shifted Lanczos did not certify a negative eigenpair within its                      step budget, so the probe above is the whole of the evidence."
+                        .to_string()
+                });
                 return Err(format!(
                     "the reduced Schur is not positive definite on this bracket, so log|S| is \
                      not defined at this iterate: probe {index} gives \
@@ -2769,7 +2940,7 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
                      lower end is SPECTRAL_DEFLATION_REL_FLOOR × λ_max, not a measured \
                      eigenvalue). A converged fit reaching here has converged to a point with \
                      negative curvature in the reduced Schur, which is a statement about the \
-                     iterate, not about the surrogate."
+                     iterate, not about the surrogate.{escape}"
                 ));
             }
         }

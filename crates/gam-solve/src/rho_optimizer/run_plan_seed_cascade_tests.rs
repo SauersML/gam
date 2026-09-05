@@ -1123,17 +1123,26 @@ fn run_bfgs_projects_seed_before_seed_validation_eval() {
     );
 }
 
-/// #2569 — a seed the certify-resume loop has already started and already had
-/// refused must be REPLAYED from the record, never re-run, and the caller's own
-/// reseed point must survive that filter.
+/// #2569/#2748 — a seed the certify-resume loop has already started and already
+/// had refused must be REPLAYED from the record, never re-run; a reseed point
+/// that has NOT been recorded must survive that filter.
 ///
-/// The production defect this gates: `should_start_next_seed` lets the cascade
+/// The production defect #2569 gates: `should_start_next_seed` lets the cascade
 /// continue past `seed_budget` while nothing has certified, so every resume
 /// round re-entered the same regenerated lattice seed and re-derived the same
 /// refusal — measured at 18-48% of the wall clock on the #2569 grouped-binomial
 /// design.
+///
+/// The defect #2748 gates is the same waste one slot to the left. The filter
+/// exempted index 0 outright, so a resume whose reseed did not move re-entered
+/// the recorded point every round; each dispatch's EFS arm then ran a
+/// deterministic fixed point to `max_iter` and returned `2.786987e3` — the same
+/// value to seven digits, four times, at roughly thirteen minutes each. This
+/// pins that the exemption is now decided by the seed's VALUE (is this point
+/// already in the record?) and not by its position, which is what its own
+/// justification always said.
 #[test]
-fn a_replayed_seed_refusal_never_drops_the_reseed_point_2569() {
+fn a_replayed_seed_refusal_never_drops_an_unexplored_reseed_point_2569_2748() {
     let reseed = array![-2.0];
     let recorded = array![3.140625];
     let untried = array![7.0];
@@ -1150,14 +1159,39 @@ fn a_replayed_seed_refusal_never_drops_the_reseed_point_2569() {
          keeps every rescue it could previously perform"
     );
 
-    // Slot 0 is the resume's reseed point: recorded or not, it is what the
-    // retry exists to explore and is never dropped.
+    // #2748 — a slot-0 point ALREADY in the record is not a reseed the loop has
+    // yet to explore; it is the one it already explored. The cascade moves past
+    // it to a seed that has never run, instead of re-deriving a recorded
+    // verdict (the n=4000 matern cell paid ~13 minutes per repeat for that,
+    // four times, at a bit-identical `final_value = 2.786987e3`).
     let (kept_slot_zero, replayed_slot_zero) = seeds_without_recorded_refusals(
         vec![reseed.clone(), untried.clone()],
         std::slice::from_ref(&reseed),
     );
-    assert_eq!(replayed_slot_zero, 0);
-    assert_eq!(kept_slot_zero, vec![reseed.clone(), untried.clone()]);
+    assert_eq!(replayed_slot_zero, 1);
+    assert_eq!(kept_slot_zero, vec![untried.clone()]);
+
+    // A resume that genuinely MOVES has a slot-0 point absent from the record,
+    // and is untouched — this is the #2569 case, and the exemption it needed is
+    // supplied by the value test rather than by the index.
+    let (kept_moved, replayed_moved) = seeds_without_recorded_refusals(
+        vec![reseed.clone(), untried.clone()],
+        std::slice::from_ref(&recorded),
+    );
+    assert_eq!(replayed_moved, 0);
+    assert_eq!(kept_moved, vec![reseed.clone(), untried.clone()]);
+
+    // The cascade is never emptied: with every generated seed recorded, the
+    // caller's own start stands so a plan runner still has something to enter.
+    let (kept_all_recorded, replayed_all_recorded) = seeds_without_recorded_refusals(
+        vec![reseed.clone(), recorded.clone()],
+        &[reseed.clone(), recorded.clone()],
+    );
+    assert_eq!(kept_all_recorded, vec![reseed.clone()]);
+    assert_eq!(
+        replayed_all_recorded, 1,
+        "the kept start is not counted as replayed: it is about to run"
+    );
 
     // Nothing recorded: the cascade is returned unchanged, which is every
     // non-resume path in production.
@@ -1165,6 +1199,82 @@ fn a_replayed_seed_refusal_never_drops_the_reseed_point_2569() {
         seeds_without_recorded_refusals(vec![reseed.clone(), recorded.clone()], &[]);
     assert_eq!(replayed_identity, 0);
     assert_eq!(kept_identity, vec![reseed, recorded]);
+}
+
+/// #2748 — an exhausted iterate is recorded when, and only when, re-entering
+/// its seed would provably reproduce the exhaustion.
+///
+/// The seed loop `continue`s a solver result that made no convergence claim,
+/// on the correct ground that it is resumable work rather than a fit
+/// candidate. It kept nothing else about it. So the certify-resume loop's
+/// record — the only channel that survives `obj.reset()` — was empty for
+/// exactly the seed that had just consumed a full solver budget, and the next
+/// dispatch re-entered it: four dispatches, each running the fixed point to
+/// `max_iter = 200`, each returning `final_value = 2.786987e3` to seven
+/// digits, ~13 minutes apiece.
+///
+/// The gate is what keeps this honest. `Efs` is a multiplicative fixed point
+/// with no curvature model and no trust region, so it consumes neither of the
+/// two things the resume varies and its re-run is the same run. `Arc` and
+/// `Bfgs` consume the transferred metric and `HybridEfs` takes safeguarded
+/// gradient steps, so their retries are different trajectories and recording
+/// them would suppress work that could still succeed — which is the failure
+/// mode this must not trade for.
+#[test]
+fn only_a_metric_free_solvers_exhausted_seed_is_recorded_as_a_replay_2748() {
+    let seed = array![1.5, -0.25];
+    assert_eq!(
+        budget_exhausted_replay_point(Solver::Efs, &seed),
+        Some(seed.clone()),
+        "a fixed-point run is decided by its seed, so the next dispatch already \
+         knows what it would return"
+    );
+    for metric_carrying in [Solver::Arc, Solver::Bfgs, Solver::HybridEfs] {
+        assert_eq!(
+            budget_exhausted_replay_point(metric_carrying, &seed),
+            None,
+            "{metric_carrying:?} consumes the metric the resume varies, so its \
+             retry is a different trajectory and must stay reachable"
+        );
+    }
+}
+
+/// #2748 — the recorded exhaustion reaches the run's refusal record, which is
+/// what the next dispatch consults, and it does so WITHOUT passing through the
+/// rejection ledger that drives the structural early exit.
+#[test]
+fn a_budget_exhausted_seed_joins_the_refusal_record_2748() {
+    let exhausted = array![1.5, -0.25];
+    let certified_refusal = array![0.0, 0.0];
+    let untouched = array![9.0, 9.0];
+    let seeds = vec![
+        certified_refusal.clone(),
+        exhausted.clone(),
+        untouched.clone(),
+    ];
+    let error = EstimationError::RemlOptimizationFailed("refused".to_string());
+    let rejections = vec![SeedRejection::from_estimation_error(0, "certificate", &error)];
+
+    let points = certificate_refused_seed_points(
+        &rejections,
+        &seeds,
+        std::slice::from_ref(&exhausted),
+    );
+    assert_eq!(
+        points,
+        vec![certified_refusal, exhausted.clone()],
+        "both a refused certificate and a spent metric-free budget state where \
+         the search terminated; a seed that was never entered states nothing"
+    );
+
+    // And the consult side suppresses it even at slot 0, which is the whole
+    // point: the repeat measured on #2748 was always `entering seed 0`.
+    let (kept, replayed) = seeds_without_recorded_refusals(
+        vec![exhausted.clone(), untouched.clone()],
+        &points,
+    );
+    assert_eq!(replayed, 1);
+    assert_eq!(kept, vec![untouched]);
 }
 
 /// #2569 — only a `"certificate"` refusal states where a seed's search
@@ -1187,10 +1297,10 @@ fn only_certificate_phase_seed_refusals_are_recorded_2569() {
     ];
 
     assert_eq!(
-        certificate_refused_seed_points(&rejections, &seeds),
+        certificate_refused_seed_points(&rejections, &seeds, &[]),
         vec![array![3.140625]],
     );
-    assert!(certificate_refused_seed_points(&[], &seeds).is_empty());
+    assert!(certificate_refused_seed_points(&[], &seeds, &[]).is_empty());
 }
 
 /// #2569 end-to-end, with the positive control the claim needs: the cascade

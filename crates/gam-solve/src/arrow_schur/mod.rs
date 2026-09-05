@@ -108,6 +108,8 @@ mod solve_options;
 mod system;
 
 #[cfg(test)]
+mod negative_curvature_2731_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_device_gauge_2660;
