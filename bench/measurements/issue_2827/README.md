@@ -106,5 +106,40 @@ multiplication. It also lacks main's universal Duchon radial-profile module.
 Therefore these basis and public-fit wall measurements do not establish a
 remaining performance defect on current main. The isolated Gram/RHS
 reduction comparison above does not call the basis builder and is unaffected
-by that difference. A current-main basis replay is still required before
-another original-corpus fit benchmark.
+by that difference.
+
+After the missing published basis features were integrated forward, preserving
+the working tree's finite-length-scale checks, the same bounded 50,000-row
+probe completed with the following times (opt-level 2, four-thread setting):
+
+| Basis implementation | Cold collection | Frozen local rebuild |
+|---|---:|---:|
+| Older profiling working tree | 2.809692 s | 8.944621 s |
+| Published main kernel/profile/matrix multiplication | 1.349156 s | 0.525689 s |
+
+The replay uses log-kappa 5.686745 and produces 99 finite local design columns
+(the collection adds the intercept). Dense materialization is below two
+microseconds. This resolves the apparent eight-second basis cost as a source
+integration difference; it is not a newly discovered main performance defect.
+The old and published kernel evaluators also differ in accuracy at large
+scaled radii, so these are not an arithmetic-preservation comparison like the
+isolated Gram traversal benchmark.
+
+The public regression `six_dimensional_hybrid_design_retains_its_algebraic_tail_2827`
+passes in 0.08 seconds. For p=1, s=3, d=6, it independently checks frozen
+radial design ratios against G(rho)=32/rho^4 at distances at least 300; the
+omitted exponential remainder is below 1e-120. This covers the high-radius
+regime missed by the older fixed quadrature, without restoring that older
+implementation. The unrelated #2315 public scale-gauge gate also passes.
+The separate #2684 storage comparison also passes when replaying the same
+saved coordinate chart; cold-chart reproducibility remains unverified.
+
+Reproduce the bounded basis measurement with
+`spatial_basis_profile_2827 DATA.csv 50000 5.686745`.
+Example Git blob: `51edcd09808cf6fe02b056b1c6b2be3f964b9a3e`.
+The compiled compute-side kernel, design builder, and universal-profile blobs
+were checked against main `b133e4c`: respectively
+`7a53a8bba3ad4b570d75be89dabfbae2d9edf729`,
+`32b3054c00bf77b0c623cd0a8f7adca36f0d3fea`, and
+`0aa17aa9b1e8889f4e5464f92dd20e943afbc8fd`.
+The full-corpus interpolation certificate and completed fit remain unverified.
