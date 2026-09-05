@@ -24,6 +24,73 @@ fn coupled_fixture() -> (Array2<f32>, Array2<f32>, BlockSparseConfig) {
 }
 
 #[test]
+fn frame_proposals_and_certificates_are_identical_across_worker_counts() {
+    let mut seed = 2826_u64;
+    let mut sample = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    };
+    let x = Array2::from_shape_fn((37, 8), |_| sample());
+    let mut decoder = Array2::from_shape_fn((12, 8), |_| sample());
+    for block in 0..5 {
+        let mut frame = decoder
+            .slice(ndarray::s![block * 2..(block + 1) * 2, ..])
+            .to_owned();
+        crate::sparse_dict::block::gram_schmidt_rows(&mut frame);
+        decoder
+            .slice_mut(ndarray::s![block * 2..(block + 1) * 2, ..])
+            .assign(&frame);
+    }
+    decoder.slice_mut(ndarray::s![10.., ..]).fill(0.0);
+    let mut config = BlockSparseConfig::new(6, 2);
+    config.block_topk = 3;
+    config.minibatch = 13;
+    config.aux_k = 0;
+    let mut reference = None;
+    for workers in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap();
+        let observed = pool.install(|| {
+            let mut state =
+                BlockSparseStreamState::new_with_decoder(decoder.clone(), &config).unwrap();
+            let mut epochs = Vec::new();
+            for _ in 0..3 {
+                state.partial_fit(x.view()).unwrap();
+                let stats = state.end_epoch().unwrap();
+                assert!(
+                    state
+                        .decoder
+                        .slice(ndarray::s![10.., ..])
+                        .iter()
+                        .all(|&v| v == 0.0)
+                );
+                assert!(stats.frame_residual.is_finite());
+                epochs.push((
+                    state.decoder.clone(),
+                    stats.gamma,
+                    stats.explained_variance,
+                    stats.gamma_residual,
+                    stats.frame_residual,
+                    stats.converged,
+                    state.last_second.clone(),
+                ));
+            }
+            epochs
+        });
+        if let Some(expected) = reference.as_ref() {
+            assert_eq!(
+                &observed, expected,
+                "worker count changed the proposed model or certificate"
+            );
+        } else {
+            reference = Some(observed);
+        }
+    }
+}
+
+#[test]
 fn parallel_stream_moments_match_dense_reference_across_batches_and_shards() {
     let x = Array2::from_shape_fn((17, 4), |(row, feature)| {
         if row == 0 {

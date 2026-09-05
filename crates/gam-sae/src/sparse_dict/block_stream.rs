@@ -48,6 +48,7 @@ use super::block::{
 use super::residual_reservoir::ResidualReservoir;
 use super::update::{DEAD_DENOM, DecoderSolveStats};
 use crate::frames::GrassmannFrame;
+use gam_linalg::faer_ndarray::with_faer_sequential;
 use ndarray::{Array2, ArrayView2, Axis};
 use rayon::prelude::*;
 
@@ -702,53 +703,71 @@ impl BlockSparseStreamState {
                 return Err(format!("BlockSparseStream profiled RSS is invalid: {rss}"));
             }
             self.rss = rss.max(0.0);
-            for second in &mut self.second {
-                second.mapv_inplace(|value| value * gamma * gamma);
-            }
-
             // Form the frame proposal at the NEW gamma. Its moments use the
             // same frozen directions and routing as the scalar fit, with no
             // corpus replay and no old-gamma cross term left in the polar step.
             let ridge = self.config.frame_ridge;
-            for gg in 0..self.g {
-                if self.usage[gg] == 0 {
-                    continue;
-                }
-                for rr in 0..b {
-                    for c in 0..p {
-                        self.cross[gg][[c, rr]] = gamma * self.data_cross[gg][[c, rr]]
-                            - gamma * gamma * self.cross[gg][[c, rr]]
-                            + ridge * self.decoder[[gg * b + rr, c]] as f64
-                            + (self.k - 1) as f64
-                                * (0..b)
-                                    .map(|axis| {
-                                        self.decoder[[gg * b + axis, c]] as f64
-                                            * self.second[gg][[axis, rr]]
-                                    })
-                                    .sum::<f64>();
-                    }
-                }
-                // ||sum_g delta_g||² <= k*sum_g ||delta_g||² majorizes
-                // the simultaneous co-fired reconstruction change. The extra
-                // (k-1)*D*second term makes these independent polar updates a
-                // descent step for the fixed-code loss, rather than Jacobi
-                // best responses that can counter-rotate and increase it.
-                if self.cross[gg].iter().all(|&value| value == 0.0) {
-                    continue;
-                }
-                let frame = GrassmannFrame::polar_update(self.cross[gg].view())
-                    .map_err(|error| format!("BlockSparseStream polar block {gg}: {error}"))?;
-                let u = frame.frame();
-                for rr in 0..b {
-                    // GrassmannFrame canonicalizes each column's sign for a
-                    // span-valued caller. Restore the signed Procrustes
-                    // orientation needed by the frozen codes: Q^T M is PSD.
-                    let alignment: f64 = (0..p).map(|c| u[[c, rr]] * self.cross[gg][[c, rr]]).sum();
-                    let orientation = if alignment < 0.0 { -1.0 } else { 1.0 };
-                    for c in 0..p {
-                        candidate_decoder[[gg * b + rr, c]] = (orientation * u[[c, rr]]) as f32;
-                    }
-                }
+            // Each task owns one proposal and its moments. Pin nested faer
+            // factorizations to sequential while the existing Rayon pool fans
+            // out over blocks; otherwise a nested solver barrier can deadlock.
+            let outcomes: Vec<Result<(), String>> = with_faer_sequential(|| {
+                self.cross
+                    .par_iter_mut()
+                    .zip(self.second.par_iter_mut())
+                    .zip(
+                        candidate_decoder
+                            .axis_chunks_iter_mut(Axis(0), b)
+                            .into_par_iter(),
+                    )
+                    .enumerate()
+                    .map(|(gg, ((moment, second), mut proposal))| {
+                        second.mapv_inplace(|value| value * gamma * gamma);
+                        if self.usage[gg] == 0 {
+                            return Ok(());
+                        }
+                        for rr in 0..b {
+                            for c in 0..p {
+                                moment[[c, rr]] = gamma * self.data_cross[gg][[c, rr]]
+                                    - gamma * gamma * moment[[c, rr]]
+                                    + ridge * self.decoder[[gg * b + rr, c]] as f64
+                                    + (self.k - 1) as f64
+                                        * (0..b)
+                                            .map(|axis| {
+                                                self.decoder[[gg * b + axis, c]] as f64
+                                                    * second[[axis, rr]]
+                                            })
+                                            .sum::<f64>();
+                            }
+                        }
+                        // ||sum_g delta_g||² <= k*sum_g ||delta_g||² majorizes
+                        // the simultaneous co-fired reconstruction change.
+                        // The (k-1)*D*second term makes the independent updates
+                        // descend in the fixed-code loss.
+                        if moment.iter().all(|&value| value == 0.0) {
+                            return Ok(());
+                        }
+                        let frame =
+                            GrassmannFrame::polar_update(moment.view()).map_err(|error| {
+                                format!("BlockSparseStream polar block {gg}: {error}")
+                            })?;
+                        let u = frame.frame();
+                        for rr in 0..b {
+                            // Restore the signed Procrustes orientation after
+                            // GrassmannFrame's column-sign canonicalization.
+                            let alignment: f64 = (0..p).map(|c| u[[c, rr]] * moment[[c, rr]]).sum();
+                            let orientation = if alignment < 0.0 { -1.0 } else { 1.0 };
+                            for c in 0..p {
+                                proposal[[rr, c]] = (orientation * u[[c, rr]]) as f32;
+                            }
+                        }
+                        Ok(())
+                    })
+                    .collect()
+            });
+            // Indexed collection preserves the first failing block's identity
+            // even if worker completion order changes.
+            for outcome in outcomes {
+                outcome?;
             }
             frame_residual = frame_fixed_point_residual(
                 self.decoder.view(),

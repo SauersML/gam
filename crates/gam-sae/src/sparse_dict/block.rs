@@ -1591,39 +1591,39 @@ pub(super) fn frame_fixed_point_residual(
     n_blocks: usize,
     b: usize,
 ) -> f64 {
-    let mut maximum = 0.0_f64;
-    for block in 0..n_blocks {
-        let mut previous_norm2 = 0.0_f64;
-        let mut next_norm2 = 0.0_f64;
-        let mut overlap = 0.0_f64;
-        for left_axis in 0..b {
-            for right_axis in 0..b {
-                let mut previous_dot = 0.0_f64;
-                let mut next_dot = 0.0_f64;
-                let mut cross_dot = 0.0_f64;
-                for column in 0..previous.ncols() {
-                    previous_dot += previous[[block * b + left_axis, column]] as f64
-                        * previous[[block * b + right_axis, column]] as f64;
-                    next_dot += next[[block * b + left_axis, column]] as f64
-                        * next[[block * b + right_axis, column]] as f64;
-                    cross_dot += previous[[block * b + left_axis, column]] as f64
-                        * next[[block * b + right_axis, column]] as f64;
+    (0..n_blocks)
+        .into_par_iter()
+        .map(|block| {
+            let mut previous_norm2 = 0.0_f64;
+            let mut next_norm2 = 0.0_f64;
+            let mut overlap = 0.0_f64;
+            for left_axis in 0..b {
+                for right_axis in 0..b {
+                    let mut previous_dot = 0.0_f64;
+                    let mut next_dot = 0.0_f64;
+                    let mut cross_dot = 0.0_f64;
+                    for column in 0..previous.ncols() {
+                        previous_dot += previous[[block * b + left_axis, column]] as f64
+                            * previous[[block * b + right_axis, column]] as f64;
+                        next_dot += next[[block * b + left_axis, column]] as f64
+                            * next[[block * b + right_axis, column]] as f64;
+                        cross_dot += previous[[block * b + left_axis, column]] as f64
+                            * next[[block * b + right_axis, column]] as f64;
+                    }
+                    previous_norm2 += previous_dot * previous_dot;
+                    next_norm2 += next_dot * next_dot;
+                    overlap += cross_dot * cross_dot;
                 }
-                previous_norm2 += previous_dot * previous_dot;
-                next_norm2 += next_dot * next_dot;
-                overlap += cross_dot * cross_dot;
             }
-        }
-        let scale = previous_norm2 + next_norm2;
-        let distance2 = (scale - 2.0 * overlap).max(0.0);
-        let residual = if scale == 0.0 {
-            if distance2 == 0.0 { 0.0 } else { f64::INFINITY }
-        } else {
-            (distance2 / scale).sqrt()
-        };
-        maximum = maximum.max(residual);
-    }
-    maximum
+            let scale = previous_norm2 + next_norm2;
+            let distance2 = (scale - 2.0 * overlap).max(0.0);
+            if scale == 0.0 {
+                if distance2 == 0.0 { 0.0 } else { f64::INFINITY }
+            } else {
+                (distance2 / scale).sqrt()
+            }
+        })
+        .reduce(|| 0.0, f64::max)
 }
 
 pub(super) fn relative_scalar_change(previous: f32, current: f32) -> f64 {
