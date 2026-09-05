@@ -26,7 +26,7 @@
 
 use super::*;
 use crate::manifold::construction::ThetaAdjointDhChannel;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, s};
 
 /// A `ThresholdGate` twin of `gamma_fd_tiny_fixture`: two periodic atoms on one
 /// shared circle, K=2 free logits per row, and a target generated through the
@@ -255,6 +255,9 @@ fn threshold_gate_sparse_operator_is_the_installed_exact_a_derivative_2500() {
         let deltas = term
             .exact_stationarity_penalty_derivative_delta_by_flat(&rho, &cache)
             .expect("exact-minus-majorizer delta map");
+        let raw_derivatives = term
+            .exact_stationarity_penalty_derivatives_by_flat(&rho, &cache)
+            .expect("#2500: the raw exact-A derivative map");
         let delta = deltas.get(&sparse);
         if straddle {
             let mass = delta
@@ -278,10 +281,33 @@ fn threshold_gate_sparse_operator_is_the_installed_exact_a_derivative_2500() {
                  is what isolates this arm from the clamped one"
             );
         }
-        let expected = match delta {
+        // The partner of a finite difference of `materialize_exact_hessian_dense`
+        // is the RAW derivative map: that materializer builds `A = B_raw + ΔC`
+        // through `apply_raw_cached_arrow_hessian`, which undoes the per-row
+        // conditioning (#2515). `penalty_curvature_operators_by_flat` is the
+        // CONDITIONED tangent `DΦ[∂B_raw/∂ρ]`, which the arrow selected-inverse
+        // channels contract and which this comparison must NOT use. The two
+        // coincide wherever nothing deflates, which is this fixture — asserted
+        // rather than assumed, so a future fixture that starts deflating cannot
+        // silently re-introduce the mismatch here instead of failing in GATE 6.
+        let expected = raw_derivatives
+            .get(&sparse)
+            .expect("#2500: the sparse coordinate must own a raw curvature derivative");
+        let conditioned_pair = match delta {
             Some(d) => block + d,
             None => block.clone(),
         };
+        let conditioning_gap = expected
+            .iter()
+            .zip(conditioned_pair.iter())
+            .fold(0.0_f64, |acc, (x, y)| acc.max((x - y).abs()));
+        assert!(
+            deflated == 0 && conditioning_gap == 0.0,
+            "#2500 (straddle={straddle}): this arm is stated on the deflation-free \
+             stratum, where the raw and conditioned tangents are bit-identical; got \
+             {deflated} deflated direction(s) and a conditioning gap of \
+             {conditioning_gap:.3e}"
+        );
 
         let dense_a = |r: &SaeManifoldRho| -> (Array2<f64>, usize) {
             let (_l, c) = frozen_cache(&term, &target, r);
@@ -383,51 +409,150 @@ fn threshold_gate_dense_exact_a_sparse_logdet_trace_matches_finite_difference_25
     }
 }
 
-/// #2500 GATE 6 — the deflation map is coordinate-agnostic, so the ARD operator
-/// must pass through it too. A ρ_ard perturbation on the straddling (deflating)
-/// fixture is the same test as GATE 2 for a coordinate that has nothing to do
-/// with the assignment prior; before the map it was wrong there for the same
-/// reason, silently, and only the threshold gate made the stratum reachable.
+/// The tree's genuine SPECTRAL-DEFLATION anchor for a ROW-LOCAL curvature
+/// coordinate, built the way `tests_deflated_from_probes_2712` builds its own:
+/// the two-atom periodic term with FLAT decoders, atom 0's coordinate parked at
+/// the phase where the periodic-ARD smooth PSD clamp puts that slot's curvature
+/// exactly at the deflation floor. The production spectral-discovery installer
+/// (`ensure_row_gauge_deflation_for_quasi_laplace`) then deflates ONE direction
+/// per row, each with a RECORDED `RowDeflationSpectrum` — the Daleckii–Krein
+/// branch this gate exists to cover.
+///
+/// WHY NOT the ThresholdGate fixture this gate used to ride. #2520 split that
+/// family's signed logit curvature into a PSD clamp in `B` and a non-positive
+/// remainder in `ΔC`, and `B` is the operator the evidence factor deflates — so
+/// no ThresholdGate fixture can put a sub-floor eigenvalue into `B` any more.
+/// Measured on `1c0153f19`: `threshold_gate_tiny_fixture(true)` deflates 0 of
+/// 10 rows, and driving a whole atom's logits below the gate (−8, −16, −25, −40)
+/// does not bring the stratum back — every one of those states is refused with
+/// `IndefiniteObservedInformation { block: "joint" }` before a cache exists.
+/// Re-anchoring therefore means routing the gate onto a fixture that reaches the
+/// stratum, not moving the old fixture's knobs.
+fn deflating_ard_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    use gam_linalg::utils::{SMOOTH_PSD_CLAMP_TEMPERATURE, SPECTRAL_DEFLATION_REL_FLOOR};
+    let (mut term, target, rho) = crate::manifold::tests::small_two_atom_periodic_term();
+    let cosine = SMOOTH_PSD_CLAMP_TEMPERATURE * SPECTRAL_DEFLATION_REL_FLOOR.sqrt().ln();
+    let weak_phase = cosine.acos() / std::f64::consts::TAU;
+    let n = term.n_obs();
+    for atom in &mut term.atoms {
+        atom.decoder_coefficients_mut().fill(0.0);
+    }
+    for (atom, coords) in term.assignment.coords.iter_mut().enumerate() {
+        let phase = if atom == 0 { weak_phase } else { 0.05 };
+        coords.set_flat(Array1::from_elem(n, phase).view());
+    }
+    term.refresh_basis_from_current_coords()
+        .expect("the declared weak phase is inside the periodic chart");
+    (term, target, rho)
+}
+
+/// The evidence factor cache of [`deflating_ard_fixture`] at `rho`, taken through
+/// the SAME production spectral-discovery policy the frozen-state criterion path
+/// uses. A flat decoder supplies no decoded-derivative gauge, so the installer is
+/// what opts the system into per-row spectral discovery; nothing here mutates a
+/// cached eigenvector, matrix or tolerance.
+fn deflating_ard_cache(
+    term: &SaeManifoldTerm,
+    target: &Array2<f64>,
+    rho: &SaeManifoldRho,
+) -> ArrowFactorCache {
+    let mut assembler = term.clone();
+    let mut system = assembler
+        .assemble_arrow_schur(target.view(), rho, None)
+        .expect("cold arrow assembly at the deflating anchor");
+    SaeManifoldTerm::ensure_row_gauge_deflation_for_quasi_laplace(&mut system);
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
+    let (_delta_t, _delta_beta, cache) =
+        solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options)
+            .expect("the production spectral-discovery evidence factor");
+    cache
+}
+
+/// #2500 GATE 6 — the deflation map is coordinate-agnostic, so a ROW-LOCAL
+/// curvature coordinate that has nothing to do with the assignment prior — the
+/// periodic-ARD precision — must pass through it too.
+///
+/// The gate carries TWO arms because the operator map has two products and the
+/// tree names them separately (`raw_penalty_curvature_operators_by_flat` vs
+/// `penalty_curvature_operators_by_flat`), and #2515 made the difference
+/// observable: `materialize_exact_hessian_dense` builds `A = B_raw + ΔC` through
+/// `apply_raw_cached_arrow_hessian`, which UNDOES the per-row conditioning on
+/// every spectrally deflated row. So on the deflating stratum:
+///
+/// * ARM 1 (the numerical claim) — the derivative of the operator the dense `A`
+///   actually is, `exact_stationarity_penalty_derivatives_by_flat` (the tree's
+///   own named owner of `∂(B_raw + ΔC)/∂ρ`, documented for exactly this
+///   comparison), must equal a central difference of `materialize_exact_hessian_dense`
+///   on the t-block. This gate previously compared the CONDITIONED tangent
+///   against that same finite difference; the two coincide only where nothing
+///   deflates, which is the whole reason the mismatch was invisible while the
+///   fixture sat off the stratum.
+/// * ARM 2 (the deflation map itself) — `penalty_curvature_operators_by_flat`
+///   must ANNIHILATE each deflated direction's ρ-response, because the installed
+///   curvature there is the ρ-independent unit stiffness. Stated algebraically
+///   against the raw map rather than by finite difference: the removal is exact
+///   arithmetic, and an FD of the conditioned block cannot resolve it (the
+///   quantity removed is `1.3e-12` against a `1.2e-7` operator scale, six
+///   decades under any usable step). The ARM-2 assertion is its own positive
+///   control: a deflation-blind map leaves `vᵀ(∂B/∂ρ)v` in place, which is the
+///   value the second assertion requires to be strictly resolved.
 #[test]
 fn deflation_map_applies_to_every_row_local_curvature_coordinate_2500() {
-    let (term, target, rho) = threshold_gate_tiny_fixture(true);
-    let (_loss, cache) = frozen_cache(&term, &target, &rho);
+    let (term, target, rho) = deflating_ard_fixture();
+    let cache = deflating_ard_cache(&term, &target, &rho);
+    let spectral_rows = (0..cache.n_rows())
+        .filter(|&row| cache.deflation_row_spectra[row].is_some())
+        .count();
     assert!(
-        deflated_direction_count(&term, &cache) > 0,
-        "#2500: this gate needs the deflating stratum"
+        spectral_rows > 0 && deflated_direction_count(&term, &cache) > 0,
+        "#2500: this gate needs the deflating stratum, with a RECORDED spectrum \
+         (the Daleckii–Krein branch); got {spectral_rows} spectral row(s) and {} \
+         deflated direction(s)",
+        deflated_direction_count(&term, &cache)
     );
-    let operators = term
+
+    let coord = rho.ard_flat_index(0, 0);
+    let raw = term
+        .exact_stationarity_penalty_derivatives_by_flat(&rho, &cache)
+        .expect("#2500: the raw exact-A derivative map");
+    let conditioned = term
         .penalty_curvature_operators_by_flat(&rho, &cache)
-        .expect("operator map");
+        .expect("#2500: the conditioned operator map");
     let deltas = term
         .exact_stationarity_penalty_derivative_delta_by_flat(&rho, &cache)
         .expect("delta map");
-
-    let base = rho.to_flat();
-    let h = 1.0e-5;
-    let total_t = cache.delta_t_len();
-    let coord = rho.ard_flat_index(0, 0);
-    let block = operators
+    let expected = raw
         .get(&coord)
         .expect("#2500: the ARD coordinate must own a curvature operator");
-    let expected = match deltas.get(&coord) {
-        Some(delta) => block + delta,
-        None => block.clone(),
-    };
-    let dense_a = |flat: &Array1<f64>| -> Array2<f64> {
+    let conditioned_b = conditioned
+        .get(&coord)
+        .expect("#2500: the ARD coordinate must own a conditioned curvature operator");
+    let total_t = cache.delta_t_len();
+
+    // ── ARM 1 ───────────────────────────────────────────────────────────────
+    let base = rho.to_flat();
+    let h = 1.0e-5;
+    let base_deflated = deflated_direction_count(&term, &cache);
+    let dense_a = |flat: &Array1<f64>| -> (Array2<f64>, usize) {
         let r = rho.from_flat(flat.view()).unwrap();
-        let (_l, c) = frozen_cache(&term, &target, &r);
-        term.materialize_exact_hessian_dense(&r, target.view(), &c)
-            .expect("dense exact A")
+        let c = deflating_ard_cache(&term, &target, &r);
+        let a = term
+            .materialize_exact_hessian_dense(&r, target.view(), &c)
+            .expect("dense exact A");
+        let count = deflated_direction_count(&term, &c);
+        (a, count)
     };
     let mut plus_flat = base.clone();
     plus_flat[coord] += h;
     let mut minus_flat = base.clone();
     minus_flat[coord] -= h;
-    let a_plus = dense_a(&plus_flat);
-    let a_minus = dense_a(&minus_flat);
-    // Restrict to the t-block: the deflation map acts on the row-local latent
-    // slots, which is where the ARD operator lives.
+    let (a_plus, deflated_plus) = dense_a(&plus_flat);
+    let (a_minus, deflated_minus) = dense_a(&minus_flat);
+    assert!(
+        deflated_plus == base_deflated && deflated_minus == base_deflated,
+        "#2500: the ±h endpoints must sit on the SAME discrete deflation stratum \
+         (base={base_deflated}, +h={deflated_plus}, -h={deflated_minus})"
+    );
     let mut worst = 0.0_f64;
     let mut label = String::new();
     for i in 0..total_t {
@@ -447,7 +572,58 @@ fn deflation_map_applies_to_every_row_local_curvature_coordinate_2500() {
         "#2500: the ARD curvature operator must equal dA/drho on the t-block of a \
          deflating fixture; worst normalized error {worst:.3} at {label}"
     );
+
+    // ── ARM 2 ───────────────────────────────────────────────────────────────
+    // `∂B/∂ρ_ard` is the raw derivative minus the exact-minus-majorizer delta:
+    // the delta is `∂ΔC/∂ρ`, which the conditioning map does not touch.
+    let raw_b = match deltas.get(&coord) {
+        Some(delta) => expected - delta,
+        None => expected.clone(),
+    };
+    let scale = raw_b.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    // The tree's own resolution floor (`sae_exact_a_identifiability_floor`), so
+    // "the map had something to remove" is denominated in the operator's scale
+    // rather than in a threshold invented here.
+    let resolution = f64::EPSILON.sqrt() * scale;
+    let mut removed_rows = 0usize;
+    for row in 0..cache.n_rows() {
+        let width = cache.row_dims[row];
+        let base_index = cache.row_offsets[row];
+        let raw_block = raw_b.slice(s![
+            base_index..base_index + width,
+            base_index..base_index + width
+        ]);
+        let cond_block = conditioned_b.slice(s![
+            base_index..base_index + width,
+            base_index..base_index + width
+        ]);
+        for direction in cache.deflated_row_directions[row].iter() {
+            let raw_response = direction.dot(&raw_block.dot(direction));
+            let conditioned_response = direction.dot(&cond_block.dot(direction));
+            assert!(
+                raw_response > resolution,
+                "#2500 row {row}: the deflated direction's RAW ρ_ard response \
+                 {raw_response:.6e} is not resolved against the operator scale \
+                 {scale:.6e} (floor {resolution:.6e}), so annihilating it is not a \
+                 measurement — this arm would pass on a deflation-blind map"
+            );
+            assert!(
+                conditioned_response.abs() <= 1.0e-6 * raw_response,
+                "#2500 row {row}: the conditioned ARD operator must carry NO \
+                 ρ-response along a unit-stiffness deflated direction; raw \
+                 {raw_response:.6e}, conditioned {conditioned_response:.6e}"
+            );
+            removed_rows += 1;
+        }
+    }
+    assert!(
+        removed_rows >= cache.n_rows(),
+        "#2500: every row of this anchor deflates exactly one direction, so the \
+         map must have been exercised on all {} of them; reached {removed_rows}",
+        cache.n_rows()
+    );
 }
+
 
 /// #2500 GATE 7 — the issue's actual ask, end to end: a ThresholdGate fit whose
 /// ρ carries a sparse log-strength coordinate must be EVALUABLE by the outer
