@@ -5485,6 +5485,82 @@ mod patterned_order2_perf_tests {
         }
     }
 
+    /// #932 parity gate for the compiler-emitted contracted third/fourth
+    /// schedules. The canonical specialized and dense jets remain independent
+    /// correctness oracles; the focused `gam-row-macros` release racer carries
+    /// the honest performance gate against the family-specific handwritten
+    /// analytic schedule and these specialized jets.
+    #[test]
+    fn sls_generated_contracted_orders_match_specialized_and_dense_jets_932() {
+        use gam_math::jet_scalar::{OneSeed, TwoSeed};
+        use gam_math::jet_tower::{Tower3, Tower4};
+
+        let (p, kernel) = fixture();
+        let dir_u: [f64; SLS_ROW_K] = [0.7, -1.3, 0.4, 0.6, -0.5, 0.9, -0.2, 0.3, -0.8];
+        let dir_v: [f64; SLS_ROW_K] = [-0.4, 0.6, 1.1, -0.2, 0.8, -0.7, 0.5, -0.9, 0.1];
+
+        let one_vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| OneSeed::seed_direction(p[a], a, dir_u[a]));
+        let specialized_third = sls_row_nll(&one_vars, &kernel)
+            .expect("specialized third")
+            .contracted_third();
+        let two_vars: [TwoSeed<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| TwoSeed::seed(p[a], a, dir_u[a], dir_v[a]));
+        let specialized_fourth = sls_row_nll(&two_vars, &kernel)
+            .expect("specialized fourth")
+            .contracted_fourth();
+        let generated_third = sls_row_third_generated(&p, &kernel, &dir_u);
+        let generated_fourth = sls_row_fourth_generated(&p, &kernel, &dir_u, &dir_v);
+        let t3_vars: [Tower3<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| Tower3::variable(p[a], a));
+        let dense3 = sls_row_nll(&t3_vars, &kernel).expect("dense Tower3");
+        let t4_vars: [Tower4<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| Tower4::variable(p[a], a));
+        let dense4 = sls_row_nll(&t4_vars, &kernel).expect("dense Tower4");
+        let dense_fourth = dense4.fourth_contracted(&dir_u, &dir_v);
+        for a in 0..SLS_ROW_K {
+            for b in 0..SLS_ROW_K {
+                let mut dense_third_ab = 0.0;
+                for c in 0..SLS_ROW_K {
+                    dense_third_ab += dense3.t3[a][b][c] * dir_u[c];
+                }
+                let third_band = 1e-11
+                    * specialized_third[a][b]
+                        .abs()
+                        .max(generated_third[a][b].abs())
+                        .max(dense_third_ab.abs())
+                        .max(1.0);
+                assert!(
+                    (specialized_third[a][b] - dense_third_ab).abs() <= third_band
+                        && (generated_third[a][b] - dense_third_ab).abs() <= third_band,
+                    "third[{a}][{b}]: specialized {:+.15e}, generated {:+.15e}, dense {dense_third_ab:+.15e}",
+                    specialized_third[a][b],
+                    generated_third[a][b],
+                );
+                let fourth_band = 1e-11
+                    * specialized_fourth[a][b]
+                        .abs()
+                        .max(generated_fourth[a][b].abs())
+                        .max(dense_fourth[a][b].abs())
+                        .max(1.0);
+                assert!(
+                    (specialized_fourth[a][b] - dense_fourth[a][b]).abs() <= fourth_band
+                        && (generated_fourth[a][b] - dense_fourth[a][b]).abs() <= fourth_band,
+                    "fourth[{a}][{b}]: specialized {:+.15e}, generated {:+.15e}, dense {:+.15e}",
+                    specialized_fourth[a][b],
+                    generated_fourth[a][b],
+                    dense_fourth[a][b],
+                );
+            }
+        }
+
+        // The speed contract for these contracted orders lives in
+        // `gam-row-macros/tests/sls_codegen_perf.rs`, which races the generated
+        // schedules against both the analytic hand schedule and these
+        // specialized jets under the shared paired harness; this test is the
+        // parity oracle only.
+    }
+
     fn fixture() -> ([f64; SLS_ROW_K], SurvivalExactRowKernel) {
         (
             [0.4, -0.7, 0.2, 0.8, -0.35, 0.11, -0.25, 0.31, -0.17],

@@ -434,6 +434,59 @@ impl<const K: usize> Tower4<K> {
         self.compose_unary(ln_gamma_derivative_stack(self.v))
     }
 
+
+    /// Contract `t3` with one primary-space direction:
+    /// `out[a][b] = Σ_c t3[a][b][c] · dir[c]` — exactly the
+    /// `row_third_contracted` shape.
+    ///
+    /// The output is symmetric in `(a, b)`: `t3` is fully index-symmetric, so
+    /// `t3[a][b][c] == t3[b][a][c]` and the `Σ_c` contraction gives
+    /// `out[a][b] == out[b][a]` term-for-term, in the same `c` order. We compute
+    /// only the upper triangle `a ≤ b` (the inner contraction is unchanged and
+    /// stays contiguous/vectorisable) and mirror into the lower triangle — this
+    /// is BIT-IDENTICAL to the full `a, b ∈ 0..K` nest while doing ~2× fewer
+    /// inner contractions, with no dense scatter (the mirror is a `K × K` copy).
+    pub fn third_contracted(&self, dir: &[f64; K]) -> [[f64; K]; K] {
+        let mut out = [[0.0; K]; K];
+        for a in 0..K {
+            for b in a..K {
+                let mut acc = 0.0;
+                for c in 0..K {
+                    acc += self.t3[a][b][c] * dir[c];
+                }
+                out[a][b] = acc;
+                out[b][a] = acc;
+            }
+        }
+        out
+    }
+
+    /// Contract `t4` with two primary-space directions:
+    /// `out[a][b] = Σ_{c,d} t4[a][b][c][d] · u[c] · v[d]` — exactly the
+    /// `row_fourth_contracted` shape.
+    ///
+    /// As in [`Self::third_contracted`], the output is symmetric in `(i, j)`
+    /// (`t4[j][i][k][l] == t4[i][j][k][l]`, contracted in the same `(k, l)`
+    /// order), so the upper triangle `i ≤ j` is computed and mirrored —
+    /// BIT-IDENTICAL to the full nest, ~2× fewer inner `Σ_{k,l}` contractions,
+    /// and the inner double loop stays the original contiguous/vectorisable form.
+    pub fn fourth_contracted(&self, u: &[f64; K], w: &[f64; K]) -> [[f64; K]; K] {
+        let mut out = [[0.0; K]; K];
+        for i in 0..K {
+            for j in i..K {
+                let mut acc = 0.0;
+                for k in 0..K {
+                    for l in 0..K {
+                        acc += self.t4[i][j][k][l] * u[k] * w[l];
+                    }
+                }
+                out[i][j] = acc;
+                out[j][i] = acc;
+            }
+        }
+        out
+    }
+
 }
 
 impl<const K: usize> jet_algebra::JetAlgebra<5> for Tower4<K> {
@@ -2168,3 +2221,235 @@ mod derivative_stack_tests {
 // is untouched (contiguous, vectorisable). This is BIT-IDENTICAL to the full
 // nest, so it needs no fingerprint re-baseline; the gate is (1) bit-identity vs
 // the full reference and (2) a measured wall-clock that is not slower.
+#[cfg(test)]
+mod contraction_symmetry_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn u(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn s(&mut self) -> f64 {
+            (self.u() - 0.5) * 4.0
+        }
+    }
+
+    /// Random VALID fully-symmetric `Tower4<K>` (symmetric `h`/`t3`/`t4`).
+    fn rand_sym4<const K: usize>(r: &mut Rng) -> Tower4<K> {
+        let mut t = Tower4::<K>::zero();
+        t.v = r.s();
+        for i in 0..K {
+            t.g[i] = r.s();
+        }
+        for a in 0..K {
+            for b in a..K {
+                let v2 = r.s();
+                t.h[a][b] = v2;
+                t.h[b][a] = v2;
+                for c in b..K {
+                    let v3 = r.s();
+                    for p in perms3([a, b, c]) {
+                        t.t3[p[0]][p[1]][p[2]] = v3;
+                    }
+                    for d in c..K {
+                        let v4 = r.s();
+                        for p in perms4([a, b, c, d]) {
+                            t.t4[p[0]][p[1]][p[2]][p[3]] = v4;
+                        }
+                    }
+                }
+            }
+        }
+        t
+    }
+
+    fn perms3(idx: [usize; 3]) -> [[usize; 3]; 6] {
+        let [a, b, c] = idx;
+        [
+            [a, b, c],
+            [a, c, b],
+            [b, a, c],
+            [b, c, a],
+            [c, a, b],
+            [c, b, a],
+        ]
+    }
+    fn perms4(idx: [usize; 4]) -> [[usize; 4]; 24] {
+        let [a, b, c, d] = idx;
+        [
+            [a, b, c, d],
+            [a, b, d, c],
+            [a, c, b, d],
+            [a, c, d, b],
+            [a, d, b, c],
+            [a, d, c, b],
+            [b, a, c, d],
+            [b, a, d, c],
+            [b, c, a, d],
+            [b, c, d, a],
+            [b, d, a, c],
+            [b, d, c, a],
+            [c, a, b, d],
+            [c, a, d, b],
+            [c, b, a, d],
+            [c, b, d, a],
+            [c, d, a, b],
+            [c, d, b, a],
+            [d, a, b, c],
+            [d, a, c, b],
+            [d, b, a, c],
+            [d, b, c, a],
+            [d, c, a, b],
+            [d, c, b, a],
+        ]
+    }
+
+    /// Full-nest reference (the pre-opt `a, b ∈ 0..K` form).
+    fn third_full<const K: usize>(t: &Tower4<K>, dir: &[f64; K]) -> [[f64; K]; K] {
+        let mut out = [[0.0; K]; K];
+        for a in 0..K {
+            for b in 0..K {
+                let mut acc = 0.0;
+                for c in 0..K {
+                    acc += t.t3[a][b][c] * dir[c];
+                }
+                out[a][b] = acc;
+            }
+        }
+        out
+    }
+    fn fourth_full<const K: usize>(t: &Tower4<K>, u: &[f64; K], w: &[f64; K]) -> [[f64; K]; K] {
+        let mut out = [[0.0; K]; K];
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = 0.0;
+                for k in 0..K {
+                    for l in 0..K {
+                        acc += t.t4[i][j][k][l] * u[k] * w[l];
+                    }
+                }
+                out[i][j] = acc;
+            }
+        }
+        out
+    }
+
+    /// Returns the number of bit-equality comparisons performed (`n·K·K·2`), so
+    /// the caller can assert the intended workload actually ran: a generic
+    /// (turbofish) helper call hides its internal assertions, so the count is
+    /// surfaced and checked at the call site.
+    fn check_bit_identical<const K: usize>(seed: u64, n: usize) -> usize {
+        let mut r = Rng(seed);
+        let mut checks = 0usize;
+        for _ in 0..n {
+            let t = rand_sym4::<K>(&mut r);
+            let dir: [f64; K] = std::array::from_fn(|_| r.s());
+            let u: [f64; K] = std::array::from_fn(|_| r.s());
+            let w: [f64; K] = std::array::from_fn(|_| r.s());
+            let t3_sym = t.third_contracted(&dir);
+            let t3_full = third_full(&t, &dir);
+            let t4_sym = t.fourth_contracted(&u, &w);
+            let t4_full = fourth_full(&t, &u, &w);
+            for a in 0..K {
+                for b in 0..K {
+                    assert_eq!(
+                        t3_sym[a][b].to_bits(),
+                        t3_full[a][b].to_bits(),
+                        "third K={K} [{a}][{b}]"
+                    );
+                    assert_eq!(
+                        t4_sym[a][b].to_bits(),
+                        t4_full[a][b].to_bits(),
+                        "fourth K={K} [{a}][{b}]"
+                    );
+                    checks += 2;
+                }
+            }
+        }
+        checks
+    }
+
+    /// The output-symmetric contraction is BIT-IDENTICAL to the full nest across
+    /// `K ∈ {2,3,4,9}` (so no fingerprint re-baseline is owed — accuracy and bits
+    /// are unchanged; this is a pure speed-only optimization).
+    #[test]
+    fn contraction_symmetry_is_bit_identical_to_full_nest() {
+        let checks = check_bit_identical::<2>(0x0000_0002_C0FF_EE01, 1000)
+            + check_bit_identical::<3>(0x0000_0003_C0FF_EE01, 800)
+            + check_bit_identical::<4>(0x0000_0004_C0FF_EE01, 600)
+            + check_bit_identical::<9>(0x0000_0009_C0FF_EE01, 300);
+        // Guards against the loops silently not running (e.g. a zeroed count):
+        // 1000·2²·2 + 800·3²·2 + 600·4²·2 + 300·9²·2.
+        assert_eq!(checks, 8000 + 14400 + 19200 + 48600);
+    }
+
+    /// The output-symmetric contraction at `K = 9` does strictly fewer inner
+    /// contractions than the full nest (~2x), so it must be the faster arm.
+    /// The bit-identity test above is the correctness gate; this is the speed
+    /// contract, and it opens only in the release profile (`SpeedGate::open`
+    /// documents why -- this gate once PASSED on a quiet node and FAILED at
+    /// 1.62x on a loaded one, because its two arms were timed in separate
+    /// windows in a fixed order; the paired harness times them adjacent, in a
+    /// randomised order, and reports its own resolution).
+    #[test]
+    fn contraction_symmetry_speedup_is_reported() {
+        use crate::paired_timing::{SpeedGate, paired_interleaved};
+
+        const K: usize = 9;
+        let mut r = Rng(0xC0FF_EE99_1234_5678);
+        let towers: Vec<Tower4<K>> = (0..512).map(|_| rand_sym4::<K>(&mut r)).collect();
+        let dir: [f64; K] = std::array::from_fn(|_| r.s());
+        let u: [f64; K] = std::array::from_fn(|_| r.s());
+        let w: [f64; K] = std::array::from_fn(|_| r.s());
+
+        if cfg!(debug_assertions) {
+            return;
+        }
+        let mut gate = SpeedGate::open("CONTRACTION-SYMMETRY-932");
+        // One arm call contracts every tower once; the nudge perturbs both
+        // directions so neither contraction is loop-invariant across calls.
+        let timing = paired_interleaved(
+            15,
+            20,
+            0x9320_5E11,
+            |nudge| {
+                let mut dir = dir;
+                dir[0] += nudge;
+                let mut u = u;
+                u[0] += nudge;
+                let mut sink = 0.0f64;
+                for t in &towers {
+                    let o3 = t.third_contracted(&dir);
+                    let o4 = t.fourth_contracted(&u, &w);
+                    sink += o3[0][K - 1] + o4[0][K - 1];
+                }
+                sink
+            },
+            |nudge| {
+                let mut dir = dir;
+                dir[0] += nudge;
+                let mut u = u;
+                u[0] += nudge;
+                let mut sink = 0.0f64;
+                for t in &towers {
+                    let o3 = third_full(t, &dir);
+                    let o4 = fourth_full(t, &u, &w);
+                    sink += o3[0][K - 1] + o4[0][K - 1];
+                }
+                sink
+            },
+        );
+        gate.faster(
+            &format!("K={K} towers={}", towers.len()),
+            &timing,
+            "symmetric",
+            "full_nest",
+        );
+        gate.finish();
+    }
+}
