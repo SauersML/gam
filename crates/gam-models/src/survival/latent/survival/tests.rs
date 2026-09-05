@@ -3022,11 +3022,21 @@
     ///   row as `A`, not `Q`. So a row can be node-count-sensitive while
     ///   reporting a non-quadrature mode; do not read the tags as routing.
     ///
-    /// Prints only; never asserts a bound.
+    /// It asserts no BOUND — the tags carry no bound to assert, and the comment
+    /// above is explicit that they must not be read as routing. What it does
+    /// assert is the property the census itself depends on (#2818): every mode
+    /// the bundle returns is one of the four this legend knows, and the sweep
+    /// actually reached every cell. An unknown tag means a fifth mode arrived
+    /// and this table has been silently mis-transcribing it ever since; an
+    /// all-refused sweep prints a full table of `E` and says nothing, which is
+    /// what a fixture that stopped constructing looks like.
     #[test]
     fn zz_measure_2566_kernel_bundle_routing_by_k() {
         let quadctx = QuadratureContext::new();
         let mu = -0.15_f64;
+        let mut unknown_modes = Vec::new();
+        let mut cells = 0usize;
+        let mut resolved = 0usize;
         eprintln!(
             "#2566 routing: mode per (log_sigma, q, max_k); mu={mu}. NOTE: the tag \
              is a fidelity CLASS, not a record of which kernel ran — log_sigma=5 \
@@ -3039,6 +3049,7 @@
             for q in [-1.2_f64, -0.4, 0.5] {
                 let mut row = String::new();
                 for max_k in 0..=8usize {
+                    cells += 1;
                     match log_kernel_bundle(&quadctx, q.exp(), mu, sigma, max_k) {
                         Ok(bundle) => {
                             let tag = match format!("{:?}", bundle.mode).as_str() {
@@ -3048,10 +3059,14 @@
                                 "QuadratureFallback" => "Q",
                                 other => {
                                     eprintln!("#2566 routing: UNKNOWN mode {other}");
+                                    unknown_modes.push(format!(
+                                        "log_sigma={log_sigma} q={q} max_k={max_k} mode={other}"
+                                    ));
                                     "?"
                                 }
                             };
                             row.push_str(tag);
+                            resolved += 1;
                         }
                         Err(_) => row.push('E'),
                     }
@@ -3064,6 +3079,23 @@
         }
         eprintln!("#2566 routing: legend C=ExactClosedForm S=ExactSpecialFunction \
                    A=ControlledAsymptotic Q=QuadratureFallback E=refused");
+        assert_eq!(
+            cells,
+            8 * 3 * 9,
+            "the (log_sigma, q, max_k) census must reach every cell it prints a \
+             column for"
+        );
+        assert!(
+            unknown_modes.is_empty(),
+            "the legend claims four fidelity classes and the bundle returned \
+             another, so every row printed above has been transcribing it as `?`: \
+             {unknown_modes:?}"
+        );
+        assert!(
+            resolved > 0,
+            "every cell in the census refused, so the table is a picture of a \
+             fixture that stopped constructing, not of the bundle's routing"
+        );
     }
 
     /// #2566 diagnostic (zz_measure): the WHOLE ladder that

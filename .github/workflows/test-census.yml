@@ -50,6 +50,19 @@ jobs:
         # clean tree prints. a1d610d21 added two assertion-less probes and the
         # then-live build.rs gate reported exactly 2, so re-measure that.
         run: python scripts/assertionless_tests.py --positive-control
+      - name: Ratchet the tree against the assertion-less ledger
+        # The tree scan is now ENFORCING. It was deliberately unwired while 19
+        # tests reached no assertion, because a gate that is red the day it lands
+        # trains everyone to ignore it -- which makes it the same non-instrument
+        # as a scan nobody runs. It is wired here as a bidirectional ratchet,
+        # the shape `scripts/rustdoc_ratchet.sh` already uses for the rustdoc
+        # surface: an unrecorded offender is a regression, and a recorded test
+        # that now asserts something is a stale ledger whose line must go in the
+        # fix's own commit. The recorded set only ever shrinks, and it doubles
+        # as the scan's positive control -- every line is a known-offending
+        # input, so a scan that measured nothing reports them all as fixed and
+        # this step fails loudly rather than printing a clean tree.
+        run: python scripts/assertionless_tests.py --root . --ledger scripts/assertionless_ledger.txt
       - name: Compare immutable source inventories
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}

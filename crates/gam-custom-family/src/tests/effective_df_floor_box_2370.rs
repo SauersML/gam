@@ -256,10 +256,17 @@ fn a_caller_box_that_is_already_inverted_is_a_typed_error_2370() {
 /// helps the fit; that needs penguins. It settles that there is something real
 /// to tighten TO.
 ///
-/// zz_measure discipline: prints only, asserts nothing.
+/// The closed form is checked against the quantity it claims to invert, because
+/// a printed table that asserts nothing passes for every behaviour of the code
+/// it calls (#2818). `rho*(f) = ln γ + ln((1-f)/f)` is the ρ at which a rank-1
+/// term retains exactly the fraction `f`, so `γ/(γ + e^(ρ*)) = f` identically —
+/// the "check on the closed form" the loop below already computes and printed
+/// without reading. Finiteness of `rho*` for every `f` in (0,1) is the other
+/// claim this table exists to support, and it is asserted rather than eyeballed.
 #[test]
 fn zz_measure_2608_relative_floor_wall_movement() {
     let ceiling = EFFECTIVE_DF_CEILING;
+    let mut checked = 0usize;
     eprintln!(
         "#2608: rank-1 term, absolute floor {EFFECTIVE_DF_FLOOR} is UNREACHABLE \
          (edf_max = 1.0 exactly, attained only as lambda -> 0) => term exempt, \
@@ -276,8 +283,32 @@ fn zz_measure_2608_relative_floor_wall_movement() {
                  {:>8.4} nats   (edf there = {retained:.6})",
                 ceiling - rho_star,
             );
+            assert!(
+                rho_star.is_finite(),
+                "rho*({f}) must be finite for every f in (0,1) at gamma={gamma}; \
+                 that finiteness is the whole reason the RELATIVE floor is well \
+                 posed exactly where the absolute one is not"
+            );
+            // The identity is exact in the reals; the only slack is the roundoff
+            // of the log-exp round trip, whose absolute error enters as
+            // `eps*|rho*|` inside the exponent. The bound is that residue in
+            // roundoff units, not a number read off the output.
+            let roundoff = 64.0 * f64::EPSILON * (1.0 + rho_star.abs());
+            assert!(
+                (retained - f).abs() <= roundoff,
+                "the closed form must invert the edf it claims to: at gamma={gamma} \
+                 f={f} it retains {retained}, off by {} against a {roundoff} roundoff \
+                 allowance",
+                (retained - f).abs()
+            );
+            checked += 1;
         }
     }
+    assert_eq!(
+        checked, 16,
+        "the 4x4 (gamma, f) table must be swept in full; a loop that silently \
+         ran zero rows prints the same nothing as one that ran"
+    );
     eprintln!(
         "#2608: reading -- rho*(f) is FINITE for every f in (0,1), so the relative \
          floor is well posed exactly where the absolute one is not. Whether the \

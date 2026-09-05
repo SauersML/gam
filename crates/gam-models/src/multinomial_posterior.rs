@@ -2135,9 +2135,24 @@ mod tests {
             maximum_sparse_level: 4,
             maximum_function_evaluations: 2_000_000,
         };
-        control
-            .validate()
-            .expect("a zero absolute tolerance with a positive relative one is admissible");
+        // `.expect` is fixture plumbing, not a stated property: the point of
+        // this test is that `validate` ADMITS this control, so say it (#2818).
+        assert!(
+            control.validate().is_ok(),
+            "a zero absolute tolerance with a positive relative one is admissible, \
+             so the zero denominator it produces is a reachable state"
+        );
+        // The refusal has to be reachable too, or the clause above is admitting
+        // everything rather than admitting this.
+        let neither_positive = MultinomialPosteriorIntegrationControl {
+            relative_tolerance: 0.0,
+            ..control
+        };
+        assert!(
+            neither_positive.validate().is_err(),
+            "with both tolerances zero there is no accuracy request to meet, and \
+             `validate` requires that ONE of the two be positive"
+        );
     }
 
     #[test]

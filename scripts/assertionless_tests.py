@@ -695,6 +695,111 @@ def positive_control(repo: Path) -> int:
     return 0
 
 
+HOW_TO_FIX = (
+    "Fix by asserting the property the test was written to check. Do not add "
+    "`#[should_panic]` to dodge, and do not add a ceremonial `assert!(true)`. If a "
+    "function is a pure exploratory dump with no invariant, it is not a test: move it "
+    "to `examples/`, where `--all-targets` still compiles it but the suite stops "
+    "reporting a meaningless green for it."
+)
+
+
+def identity(rel: str, signature: str) -> str:
+    """`path::fn_name` -- the ledger key.
+
+    Deliberately NOT the line number: a test keeps its identity when the file
+    above it grows, and a ledger keyed on lines would go stale on every edit and
+    train people to regenerate it rather than read it.
+    """
+    return f"{rel}::{fn_name_on_line(signature) or '<unnamed>'}"
+
+
+def read_ledger(path: Path) -> list[str]:
+    """The recorded offenders, one `path::fn_name` per line, `#` comments kept out.
+
+    Required sorted and unique so the file has one representation: a ledger that
+    can be reordered is a ledger whose diff does not say what changed.
+    """
+    entries = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            entries.append(line)
+    if len(set(entries)) != len(entries):
+        duplicates = sorted({e for e in entries if entries.count(e) > 1})
+        raise ValueError(f"the ledger records the same test twice: {duplicates}")
+    if entries != sorted(entries):
+        raise ValueError("the ledger is not sorted; keep it in one canonical order")
+    return entries
+
+
+def check_ledger(repo: Path, ledger_path: Path) -> int:
+    """A bidirectional ratchet over the KNOWN assertion-less tests.
+
+    A gate demanding zero here would be red the day it landed -- there are 14 --
+    and a gate that is red on arrival trains everyone to ignore it, which makes
+    it the same non-instrument as the scan that was never wired at all. So it
+    compares identities against a committed ledger and fails in two directions,
+    exactly as `scripts/rustdoc_ratchet.sh` does for the rustdoc surface:
+
+      * an offender NOT in the ledger  -> regression. A new `#[test]` that
+        asserts nothing, or an existing one whose assertion was removed.
+      * a ledger entry that is now clean -> the ledger is stale. Whoever fixed
+        the test deletes its line in the fix's own commit, so the covered set
+        only ever grows and the remaining list only ever shrinks.
+
+    The second direction is also the POSITIVE CONTROL for the scan itself: every
+    ledger entry is a known-offending input run through the same detector on
+    every invocation. If the scan silently measured nothing -- wrong root, an
+    unreadable tree, a lexer that desynchronised -- those entries would come back
+    "clean" and this fails loudly, which is the difference between a green run
+    and a run that never happened.
+    """
+    try:
+        recorded = read_ledger(ledger_path)
+    except (OSError, ValueError) as error:
+        print(f"assertion-less ledger UNREADABLE: {error}", file=sys.stderr)
+        return 2
+    offenders = scan_tree(repo)
+    where = {identity(rel, sig): (rel, line) for rel, line, sig in offenders}
+    found = set(where)
+    known = set(recorded)
+    print(
+        f"scanned the tree: {len(offenders)} assertion-less #[test]s found, "
+        f"{len(recorded)} recorded in {ledger_path.name}"
+    )
+    if not recorded:
+        print(
+            "the ledger is empty, so this run had no known-offending input to prove the "
+            "detector still detects; delete the ledger and demand zero instead.",
+            file=sys.stderr,
+        )
+        return 2
+    regressions = sorted(found - known)
+    stale = sorted(known - found)
+    for name in regressions:
+        rel, line = where[name]
+        print(f"  NEW  {rel}:{line}: {name}", file=sys.stderr)
+    for name in stale:
+        print(f"  FIXED (delete this line from {ledger_path.name})  {name}", file=sys.stderr)
+    if regressions:
+        print(
+            f"\n{len(regressions)} #[test] function(s) reach no assertion and are not "
+            f"recorded. A test that reaches no assertion passes for every behaviour of "
+            f"the code it calls.\n{HOW_TO_FIX}",
+            file=sys.stderr,
+        )
+    if stale:
+        print(
+            f"\n{len(stale)} recorded test(s) now assert something. Delete their lines "
+            f"from {ledger_path.name} in the same commit as the fix -- the ledger only "
+            f"ever shrinks, and leaving a fixed test on it turns the ratchet back into a "
+            f"rubber stamp.",
+            file=sys.stderr,
+        )
+    return 1 if (regressions or stale) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".", help="repository root to scan")
@@ -702,6 +807,11 @@ def main(argv: list[str] | None = None) -> int:
         "--positive-control",
         action="store_true",
         help="re-measure the #2110 incident and verify the detector still reports it",
+    )
+    parser.add_argument(
+        "--ledger",
+        type=Path,
+        help="ratchet the tree against a committed ledger of known offenders",
     )
     args = parser.parse_args(argv)
     repo = Path(args.root).resolve()
@@ -711,6 +821,9 @@ def main(argv: list[str] | None = None) -> int:
         return control
     if args.positive_control:
         return 0
+
+    if args.ledger is not None:
+        return check_ledger(repo, args.ledger)
 
     offenders = scan_tree(repo)
     if not offenders:
@@ -723,14 +836,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     for rel, line, sig in offenders:
         print(f"  {rel}:{line}: {sig}", file=sys.stderr)
-    print(
-        "\nFix by asserting the property the test was written to check. Do not add "
-        "`#[should_panic]` to dodge, and do not add a ceremonial `assert!(true)`. If a "
-        "function is a pure exploratory dump with no invariant, it is not a test: move it "
-        "to `examples/`, where `--all-targets` still compiles it but the suite stops "
-        "reporting a meaningless green for it.",
-        file=sys.stderr,
-    )
+    print(f"\n{HOW_TO_FIX}", file=sys.stderr)
     return 1
 
 
