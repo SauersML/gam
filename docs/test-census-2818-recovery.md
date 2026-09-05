@@ -132,6 +132,53 @@ off-diagonal reconstruction to 1.11e-16 on two spectrally deflated rows. That
 block-reconstruction result is distinct from the deflation-adjoint sensitivity
 requirement verified below.
 
+## Public basis geometry and storage: #2315 and #2684
+
+`crates/gam-terms/tests/basis_scale_recovery.rs` restores
+`sphere_constant_curvature_and_pca_obey_their_non_euclidean_gauges_2315` through
+the live public builders. It checks spherical Wahba and harmonic designs and
+penalties in degrees versus radians; constant-curvature designs, penalties and
+kernel jets under coordinate scales 1e-9, 1 and 1e9; and PCA designs and penalties
+under inverse loading rescaling. Curvature rescales as inverse squared length,
+so kernel value, first curvature derivative and second curvature derivative
+carry length powers 1, 3 and 5. The live joint `constant_curvature_kernel_psi_jets`
+carrier replaces the deleted curvature-only helper. Nonzero derivative witnesses
+prevent a zero implementation from satisfying scale equivariance vacuously.
+
+The #2315 test passed in **0.02 seconds** in
+`.buildd/spatial-basis-2827-forward-tests.log`, with first/second derivative
+witnesses **0.03467601 / 0.009046658**. Source blob:
+`61e1e659788d10661315071a205035c7584bcde8`. The same Cargo invocation subsequently
+failed the initial #2684 oracle; this is an individual passing test, not a claim
+that the original combined run succeeded.
+
+`crates/gam-terms/tests/basis_storage_recovery.rs` restores
+`the_storage_route_changes_how_the_basis_is_carried_not_which_basis_it_is_2684`.
+It builds the original 300-row, 12-center pure Duchon fixture under a simulated
+6 GiB job policy, asserts actual dense versus operator storage, checks all 11
+coefficient basis actions, and compares every active penalty's source, nullity,
+shape and entries. The restrictive arm is exercised through operator actions
+without forcing its design to materialize.
+
+The initial test incorrectly compared raw coefficients from two independently
+chosen cold charts and failed at column 3 (operator -0.06297778 versus dense
+0.08153217). The data-metric radial eigensystem and final identifiability
+nullspace are fit-time coefficient charts. The corrected storage test replays
+both actual transforms from dense fit metadata into the operator build, using
+the production prediction/replay contract. No comparison tolerance changed.
+This establishes representation parity for the same basis chart; independent
+cold-chart reproducibility and output-rotation fit equivariance remain separate
+obligations and are not discharged by this test.
+
+The corrected #2684 target passed **1 test in 0.16 seconds**, after a **4.62-second**
+warm integration build. All 300-by-11 design actions agreed within
+**4.649059e-16**, and active penalty entries agreed exactly. Log:
+`.buildd/basis-storage-frozen-recovery.log`; source blob:
+`8de3fcfab0373020ad262695fb3758eeadb42abe`. The umbrella scanner passed with
+explicit filesystem membership for both new targets; its report was empty.
+The runs use the forward-synchronized published Duchon basis implementation.
+They do not execute unrelated stale local term-collection gauge tests.
+
 ## Deflation-sensitive probe adjoint: #2712
 
 `sae_logdet_theta_adjoint_from_probes_matches_dense_on_deflated_rows_2712` is
