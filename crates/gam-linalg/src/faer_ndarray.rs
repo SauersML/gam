@@ -4261,3 +4261,134 @@ mod parallelism_snapshot_2738_tests {
     }
 
 }
+
+#[cfg(test)]
+mod eigh_ordering_contract_tests {
+    use super::*;
+    use ndarray::Array2;
+
+    /// `FaerEigh::eigh` returns eigenvalues in ASCENDING order, and at least one
+    /// consumer's correctness depends on it while nothing pinned it.
+    ///
+    /// `gam-sae`'s `cluster_stable_eigh`
+    /// (`crates/gam-sae/src/manifold/construction_exact_hessian.rs`) finds each
+    /// degenerate cluster with
+    ///
+    /// ```text
+    /// while j < dim && eigs[j] == eigs[i] { j += 1; }
+    /// ```
+    ///
+    /// — a scan for a RUN of equal values, which only enumerates a cluster when
+    /// equal eigenvalues are ADJACENT. Adjacency is a consequence of sorting and
+    /// of nothing else. If the underlying driver ever returned an unsorted
+    /// spectrum, that loop would not error: it would silently see clusters of
+    /// width 1 where a cluster exists, skip the within-cluster re-diagonalisation
+    /// entirely, and return a basis that is not stable under the perturbation the
+    /// function is named for. A silent wrong answer, from a dependency upgrade,
+    /// with no test between it and the fit.
+    ///
+    /// Measured 2026-09-05 while attributing 1,383,210 `eigh` calls in one hung
+    /// SAE test: `cluster_stable_eigh` is one of the two callers the native
+    /// stacks caught in the act, reached from `terminal_exact_newton_polish` ->
+    /// `materialize_exact_stationarity_geometry` -> `exact_hessian_spectral_block`.
+    /// The other is `gam_solve::arrow_schur::factorization::row_sub_floor_null_directions`.
+    #[test]
+    fn eigh_returns_eigenvalues_in_ascending_order() {
+        fn hashed_unit(seed: u64) -> f64 {
+            let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            ((z >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        }
+
+        // Dimensions bracketing the ones the SAE fit actually asks for (1, 2, 3,
+        // 5, 6, 9, 36) plus a size where a driver could plausibly switch
+        // algorithm, and scales spanning 18 decades so the check is not made on
+        // one magnitude.
+        for &n in &[1_usize, 2, 3, 5, 6, 9, 17, 36] {
+            for seed in 0..8_u64 {
+                for &scale in &[1.0_f64, 1.0e-9, 1.0e9] {
+                    let mut m = Array2::<f64>::zeros((n, n));
+                    let mut k = seed.wrapping_mul(1_000_003).wrapping_add(n as u64);
+                    for i in 0..n {
+                        for j in 0..=i {
+                            k = k.wrapping_add(0x1234_5678);
+                            let value = hashed_unit(k) * scale;
+                            m[[i, j]] = value;
+                            m[[j, i]] = value;
+                        }
+                    }
+                    let (values, _) = m.eigh(Side::Lower).expect("eigendecomposition");
+                    assert_eq!(values.len(), n, "n={n}: one eigenvalue per dimension");
+                    for w in 1..n {
+                        assert!(
+                            values[w - 1] <= values[w],
+                            "n={n} seed={seed} scale={scale:e}: eigenvalues are NOT ascending at \
+                             index {w} ({:e} then {:e}). `cluster_stable_eigh` scans for RUNS of \
+                             equal eigenvalues and would silently stop finding degenerate clusters.",
+                            values[w - 1],
+                            values[w]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The ordering claim above is only load-bearing because equal eigenvalues
+    /// land ADJACENT. Assert that directly on a planted degeneracy rather than
+    /// inferring it from sortedness, so the property the consumer actually uses
+    /// is the property under test.
+    #[test]
+    fn equal_eigenvalues_are_returned_adjacent() {
+        // diag(2, 7, 2, 7, 2) in a rotated basis: three eigenvalues at 2 and two
+        // at 7, planted so the degeneracy is exact rather than incidental.
+        let d = ndarray::arr1(&[2.0_f64, 7.0, 2.0, 7.0, 2.0]);
+        let n = d.len();
+        // A Householder reflector Q = I - 2vv^T/(v^Tv) is orthogonal and exact
+        // enough here that Q diag(d) Q^T keeps the spectrum to round-off.
+        let v = ndarray::arr1(&[1.0_f64, -2.0, 3.0, -4.0, 5.0]);
+        let vtv: f64 = v.iter().map(|x| x * x).sum();
+        let mut q = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            q[[i, i]] = 1.0;
+        }
+        for i in 0..n {
+            for j in 0..n {
+                q[[i, j]] -= 2.0 * v[i] * v[j] / vtv;
+            }
+        }
+        let mut a = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            for j in 0..n {
+                let mut acc = 0.0;
+                for k in 0..n {
+                    acc += q[[i, k]] * d[k] * q[[j, k]];
+                }
+                a[[i, j]] = acc;
+            }
+        }
+        let (values, _) = a.eigh(Side::Lower).expect("eigendecomposition");
+        // Three near-2 then two near-7, contiguously. A tolerance is needed
+        // because the similarity transform is floating point; the ADJACENCY is
+        // what is under test, not the digits.
+        let low = values.iter().filter(|v| (**v - 2.0).abs() < 1.0e-9).count();
+        let high = values.iter().filter(|v| (**v - 7.0).abs() < 1.0e-9).count();
+        assert_eq!(low, 3, "planted multiplicity 3 at lambda=2, got {values:?}");
+        assert_eq!(high, 2, "planted multiplicity 2 at lambda=7, got {values:?}");
+        for w in 0..3 {
+            assert!(
+                (values[w] - 2.0).abs() < 1.0e-9,
+                "the three lambda=2 eigenvalues must occupy indices 0..3 contiguously, \
+                 or `cluster_stable_eigh`'s run scan splits the cluster: {values:?}"
+            );
+        }
+        for w in 3..5 {
+            assert!(
+                (values[w] - 7.0).abs() < 1.0e-9,
+                "the two lambda=7 eigenvalues must occupy indices 3..5 contiguously: {values:?}"
+            );
+        }
+    }
+}
