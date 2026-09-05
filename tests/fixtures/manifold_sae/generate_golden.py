@@ -195,6 +195,7 @@ def build_payload() -> dict[str, Any]:
         "coordinate_fidelity": {
             "atoms": [{"atom": 0, "verdict": "arclength_honest"}]
         },
+        "decoder_embeddedness": None,
         "topology_persistence": {
             "atoms": [{"atom": 0, "betti": [1, 1], "contested": False}]
         },

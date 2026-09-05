@@ -546,6 +546,7 @@
       ]
     ]
   ],
+  "decoder_embeddedness": null,
   "diagnostics": {
     "atom_trust": [
       0.6,
