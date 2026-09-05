@@ -16,9 +16,7 @@
 //!   X(ψ) = Σ_{d=0}^{D} X_d · T_d(ψ̃),     ψ̃ = affine map of ψ to [−1, 1],
 //! ```
 //!
-//! with n×k coefficient slabs `X_d` computed ONCE from D+1 exact design
-//! evaluations at Chebyshev nodes (a first-kind DCT). The design coefficients
-//! certify analyticity, while the shipped runtime series is fit directly to the
+//! The runtime series is fit directly to the
 //! exact node sufficient statistics `G(ψ_i)=X(ψ_i)ᵀ W X(ψ_i)` and
 //! `c(ψ_i)=X(ψ_i)ᵀ W z`. Interpolating the sufficient statistics directly avoids
 //! the extra product-truncation residual from forming `Σ_d,e X_dᵀWX_e T_dT_e`,
@@ -38,12 +36,13 @@
 //! ## Certification, not approximation-by-fiat
 //!
 //! Same discipline as [`gam_terms::basis::radial_profile`]: [`PsiGramTensor::build`]
-//! returns `None` (callers keep the exact per-trial path) unless BOTH
-//! 1. the Chebyshev coefficient tail of the EXPANDED DESIGN decays below
-//!    [`PSI_GRAM_CERT_RTOL`] of the design scale (geometric-decay certificate
-//!    for analytic interpolands, with node-count escalation), and
-//! 2. deterministic off-node spot checks of the ASSEMBLED Gram against an
-//!    exactly rebuilt Gram agree to [`PSI_GRAM_SPOT_RTOL`].
+//! returns an error unless BOTH
+//! 1. the Chebyshev coefficient tails of the Gram and RHS reach their DCT-I
+//!    accumulation floor, subject to the [`PSI_GRAM_CERT_RTOL`] ceiling, and
+//! 2. deterministic off-node spot checks of the assembled Gram AND RHS against
+//!    exact rebuilt statistics agree to [`PSI_GRAM_SPOT_RTOL`].
+//! Nested Lobatto refinement reuses every prior node's sufficient statistics.
+//! At most one n-row design is resident while sampling.
 //!
 //! Trials outside `[psi_lo, psi_hi]` are the caller's signal to fall back to
 //! the exact path ([`PsiGramTensor::contains`]).
@@ -68,24 +67,13 @@ pub const PSI_GRAM_CERT_RTOL: f64 = 1.0e-9;
 /// Relative agreement required at the off-node Gram spot checks.
 pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-10;
 
-/// Node-count escalation ladder for the expansion build (degree = nodes − 1).
-///
-/// The top rung sizes to WIDE trial windows: Chebyshev coefficients of the
-/// Matérn-type channels decay like Bessel `I_d(σ)` with `σ ≈ s_max·halfwidth`
-/// (s = κr), which only drops below the 1e-12 tail tolerance for `d ≳ 2σ` —
-/// e.g. σ ≈ 9 (s_max ≈ 8, ±1.1 window) needs degree ≳ 40, so 33 nodes refuse
-/// and 65 certify. Node counts stay trivially cheap (one design eval each).
-///
-/// On the WIDE STANDARDIZED geometry default 1-D fits use (#1215) the tail
-/// decays cleanly but GEOMETRICALLY-slowly: measured per-column worst tail rel
-/// is ~3.2e-8 at m=33 and ~2.3e-11 at m=65 (a clean ~1300×/doubling decay, NOT a
-/// floor). The old 65-node acceptance was fine for the cost lane but not for the
-/// beta-hat soundness gate: the inner penalized solve `β̂ = (G+λS)⁻¹r`
-/// amplifies Gram residuals by the radial-kernel conditioning, especially after
-/// the production skip was relaxed to cross a reduced-basis rotation. Start at
-/// 513 nodes so the production gate no longer accepts the shallower tensors that
-/// pass the Gram spot check but still move the weakly-penalized beta solve.
-pub const PSI_GRAM_NODE_LADDER: [usize; 1] = [513];
+/// Nested Chebyshev–Lobatto node counts (degree = nodes − 1).
+/// Refinement evaluates only the new odd-index nodes; retained samples contain
+/// k-space sufficient statistics, never a copy of the n-row design. A rung is
+/// accepted only after its series tail reaches its floating-point accumulation
+/// floor and exact off-node Gram/RHS checks pass. The former fixed 513-node
+/// build paid for the largest degree even on a low-degree interpoland (#2827).
+pub const PSI_GRAM_NODE_LADDER: [usize; 6] = [17, 33, 65, 129, 257, 513];
 
 /// Number of deterministic off-node spot-check ψ values.
 pub const PSI_GRAM_SPOT_POINTS: usize = 3;
@@ -460,7 +448,7 @@ impl PsiGramTensor {
     /// `eval_design(psi)` must return the EXACT n×k design at `psi` (the same
     /// builder the per-trial path uses — exactness of the expansion is judged
     /// against it). `weights` are the fixed observation weights, `z` the fixed
-    /// weighted-response target (e.g. `y − offset`). Returns `None` when the
+    /// weighted-response target (e.g. `y − offset`). Returns an error when the
     /// window is degenerate, any evaluation fails/has non-finite entries, or
     /// no ladder rung certifies — callers then keep the exact per-trial path.
     pub fn build(
@@ -470,18 +458,24 @@ impl PsiGramTensor {
         psi_lo: f64,
         psi_hi: f64,
     ) -> Result<Self, String> {
-        if !(psi_lo.is_finite() && psi_hi.is_finite()) || psi_hi <= psi_lo {
+        if !(psi_lo.is_finite() && psi_hi.is_finite()) || psi_hi <= psi_lo
+            || !(psi_hi - psi_lo).is_finite() {
             return Err(format!(
-                "ψ window must be finite with psi_hi > psi_lo (got [{psi_lo}, {psi_hi}])"
+                "ψ window must have finite endpoints and finite positive width (got [{psi_lo}, {psi_hi}])"
             ));
         }
         // Track the largest rung that produced a candidate but failed to
         // certify (tail or off-node spot check). If the whole ladder is
         // exhausted without an accepted candidate this drives a reason that
-        // distinguishes "not analytic enough in ψ" from "evaluation failed".
+        // distinguishes unresolved interpolation accuracy from failed evaluation.
         let mut last_uncertified: Option<usize> = None;
+        let mut node_statistics = std::collections::BTreeMap::new();
+        let mut dimensions = None;
         for &m in PSI_GRAM_NODE_LADDER.iter() {
-            match Self::build_at(&mut eval_design, weights, z, psi_lo, psi_hi, m) {
+            match Self::build_at(
+                &mut eval_design, weights, z, psi_lo, psi_hi, m,
+                &mut node_statistics, &mut dimensions,
+            ) {
                 // An exact evaluation failed or was non-finite somewhere in
                 // the window — no larger rung can fix that, so abort with the
                 // underlying reason rather than swallowing it as a bare refusal.
@@ -498,9 +492,13 @@ impl PsiGramTensor {
                     continue;
                 }
                 BuildOutcome::Candidate(mut candidate) => {
-                    if candidate.spot_check(&mut eval_design, weights) {
+                    if candidate.spot_check(&mut eval_design, weights, z) {
                         candidate.grad_psi_lo = psi_lo;
                         candidate.grad_psi_hi = psi_hi;
+                        log::info!(
+                            "ψ-Gram tensor certified: nodes={m} exact_node_realizations={} window=[{psi_lo:.6}, {psi_hi:.6}]",
+                            node_statistics.len(),
+                        );
                         return Ok(candidate);
                     }
                     // The assembled Gram disagreed with an exact off-node
@@ -514,8 +512,8 @@ impl PsiGramTensor {
         Err(match last_uncertified {
             Some(m) => format!(
                 "Chebyshev series did not certify within the node ladder (reached rung \
-                 m={m}, top rung {top_rung}): the design is not analytic enough in ψ over \
-                 [{psi_lo}, {psi_hi}] (a kink or non-finite curvature), so the n-free \
+                 m={m}, top rung {top_rung}): the coefficient tail or exact off-node \
+                 statistics remained unresolved over [{psi_lo}, {psi_hi}], so the n-free \
                  tensor is refused and the exact per-trial path must be used"
             ),
             None => "empty Chebyshev node ladder".to_string(),
@@ -529,6 +527,8 @@ impl PsiGramTensor {
         psi_lo: f64,
         psi_hi: f64,
         m: usize,
+        node_statistics: &mut std::collections::BTreeMap<usize, (Array2<f64>, Array1<f64>)>,
+        dimensions: &mut Option<(usize, usize)>,
     ) -> BuildOutcome {
         // #1033 (sufficient-statistic build): the one-time pass must ITSELF be a
         // sufficient-statistic reduction — it may touch the n data rows once, but
@@ -561,6 +561,11 @@ impl PsiGramTensor {
         let mut zt_w_z = 0.0_f64;
         let mut zt_w_z_comp = 0.0_f64;
         for ((slot, &w), &zv) in wz.iter_mut().zip(weights.iter()).zip(z.iter()) {
+            if !w.is_finite() || w < 0.0 || !zv.is_finite() {
+                return BuildOutcome::EvalFailed(
+                    "weights must be finite and nonnegative; responses must be finite".to_string(),
+                );
+            }
             *slot = w * zv;
             let add = w * zv * zv;
             let y = add - zt_w_z_comp;
@@ -568,13 +573,29 @@ impl PsiGramTensor {
             zt_w_z_comp = (t - zt_w_z) - y;
             zt_w_z = t;
         }
+        if !zt_w_z.is_finite() || wz.iter().any(|v| !v.is_finite()) {
+            return BuildOutcome::EvalFailed(
+                "weighted response statistics are non-finite".to_string(),
+            );
+        }
 
-        let mut dims: Option<(usize, usize)> = None;
+        let degree = m - 1;
+        let largest_degree = PSI_GRAM_NODE_LADDER[PSI_GRAM_NODE_LADDER.len() - 1] - 1;
         for (i, x_slot) in nodes_x.iter_mut().enumerate() {
-            let x = (std::f64::consts::PI * (2 * i + 1) as f64 / (2 * m) as f64).cos();
+            let node_key = i * (largest_degree / degree);
+            // Form repeated nodes with identical arithmetic at every rung.
+            let x = (std::f64::consts::PI * node_key as f64 / largest_degree as f64).cos();
             *x_slot = x;
-            let psi = 0.5 * (psi_lo + psi_hi) + 0.5 * (psi_hi - psi_lo) * x;
+            let psi = 0.5 * psi_lo + 0.5 * psi_hi + 0.5 * (psi_hi - psi_lo) * x;
+            if !psi.is_finite() {
+                return BuildOutcome::EvalFailed("mapped Chebyshev node is non-finite".to_string());
+            }
             node_psis[i] = psi;
+            if let Some((gram, rhs)) = node_statistics.get(&node_key) {
+                node_grams.push(gram.clone());
+                node_rhs.push(rhs.clone());
+                continue;
+            }
             let design = match eval_design(psi) {
                 Ok(design) => design,
                 Err(why) => {
@@ -589,7 +610,7 @@ impl PsiGramTensor {
                 ));
             }
             let (dn, dk) = design.dim();
-            match dims {
+            match *dimensions {
                 None => {
                     if weights.len() != dn || z.len() != dn || dn == 0 || dk == 0 {
                         return BuildOutcome::EvalFailed(format!(
@@ -598,7 +619,7 @@ impl PsiGramTensor {
                             z.len()
                         ));
                     }
-                    dims = Some((dn, dk));
+                    *dimensions = Some((dn, dk));
                 }
                 Some((n0, k0)) => {
                     if (dn, dk) != (n0, k0) {
@@ -613,10 +634,16 @@ impl PsiGramTensor {
             // RHS uses the prebuilt `wz = W z` (same factoring as the exact
             // streamed path) so the retained series is bit-faithful to it.
             let (node_gram, node_rh) = weighted_gram_and_rhs(&design, weights, &wz);
+            if node_gram.iter().chain(node_rh.iter()).any(|v| !v.is_finite()) {
+                return BuildOutcome::EvalFailed(format!(
+                    "weighted design statistics at node ψ={psi:.6} are non-finite"
+                ));
+            }
+            node_statistics.insert(node_key, (node_gram.clone(), node_rh.clone()));
             node_grams.push(node_gram);
             node_rhs.push(node_rh);
         }
-        let (_n, k) = dims.expect("node ladder rung m≥1 yields at least one design");
+        let (_n, k) = dimensions.expect("node ladder rung m≥1 yields at least one design");
 
         // #1216 amplitude normalization: recover the per-column log-amplitude
         // envelope `α_j(ψ) = exp(p_j ψ + c_j)` from the node Grams' diagonals
@@ -637,19 +664,36 @@ impl PsiGramTensor {
             let alpha: Vec<f64> = (0..k)
                 .map(|j| (col_amp_slope[j] * psi + col_amp_intercept[j]).exp())
                 .collect();
+            if alpha.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+                return BuildOutcome::EvalFailed(format!(
+                    "column normalization at node ψ={psi:.6} is not finite and positive"
+                ));
+            }
             let g = &mut node_grams[i];
             for a in 0..k {
                 for b in 0..k {
-                    g[[a, b]] /= alpha[a] * alpha[b];
+                    let amplitude = alpha[a] * alpha[b];
+                    if !amplitude.is_finite() || amplitude <= 0.0 {
+                        return BuildOutcome::EvalFailed(format!(
+                            "Gram normalization at node ψ={psi:.6} is not finite and positive"
+                        ));
+                    }
+                    g[[a, b]] /= amplitude;
                 }
             }
             let r = &mut node_rhs[i];
             for a in 0..k {
                 r[a] /= alpha[a];
             }
+            if g.iter().chain(r.iter()).any(|v| !v.is_finite()) {
+                return BuildOutcome::EvalFailed(format!(
+                    "normalized statistics at node ψ={psi:.6} are non-finite"
+                ));
+            }
         }
 
-        // First-kind discrete orthogonality of the Chebyshev nodes.
+        // DCT-I orthogonality: endpoint nodes and endpoint coefficients carry
+        // half weight. This is the Lobatto transform, including its top mode.
         let t_at_nodes: Vec<Vec<f64>> = nodes_x.iter().map(|&x| cheb_t(x, m)).collect();
         let mut gram: Vec<Array2<f64>> = (0..m).map(|_| Array2::<f64>::zeros((k, k))).collect();
         let mut gram_comp: Vec<Array2<f64>> =
@@ -657,15 +701,22 @@ impl PsiGramTensor {
         let mut rhs: Vec<Array1<f64>> = (0..m).map(|_| Array1::<f64>::zeros(k)).collect();
         let mut rhs_comp: Vec<Array1<f64>> = (0..m).map(|_| Array1::<f64>::zeros(k)).collect();
         for d in 0..m {
-            let gamma = if d == 0 { 1.0 } else { 2.0 };
+            let gamma = if d == 0 || d == degree { 1.0 } else { 2.0 };
             for i in 0..m {
-                let wgt = gamma / m as f64 * t_at_nodes[i][d];
+                let endpoint_weight = if i == 0 || i == degree { 0.5 } else { 1.0 };
+                let wgt = gamma / degree as f64 * endpoint_weight * t_at_nodes[i][d];
                 kahan_scaled_add_array2(&mut gram[d], &mut gram_comp[d], wgt, &node_grams[i]);
                 kahan_scaled_add_array1(&mut rhs[d], &mut rhs_comp[d], wgt, &node_rhs[i]);
             }
         }
         drop(node_grams);
         drop(node_rhs);
+        if gram.iter().flat_map(|slab| slab.iter())
+            .chain(rhs.iter().flat_map(|slab| slab.iter())).any(|v| !v.is_finite()) {
+            return BuildOutcome::EvalFailed(
+                "Chebyshev statistic coefficients are non-finite".to_string(),
+            );
+        }
 
         // Tail-decay certificate, now in k-SPACE on the RETAINED Gram/RHS series
         // rather than the discarded design slabs.
@@ -679,9 +730,8 @@ impl PsiGramTensor {
         // Gram (and RHS) coefficient slabs must fall below [`PSI_GRAM_CERT_RTOL`]
         // × series scale.
         //
-        // #1216: on the WIDE STANDARDIZED geometry default 1-D fits use (#1215)
-        // the tail decays cleanly but GEOMETRICALLY-SLOWLY, so the m=513 top rung
-        // is sized to drive the residual far below the bar. The certificate stays
+        // On wide windows the tail can decay slowly, so refinement continues
+        // until the coefficient residual reaches the arithmetic floor. It stays
         // a necessary pre-filter; accuracy is authoritatively enforced by the
         // off-node `spot_check` (`PSI_GRAM_SPOT_RTOL`, assembled Gram vs an exact
         // rebuild). A genuinely non-analytic design (a true kink) floors ORDERS
@@ -696,8 +746,14 @@ impl PsiGramTensor {
         let tail_start = m - (m / 4).max(1);
         // A zero-scale Gram or RHS has a zero bound: only an exactly zero tail
         // passes, which is what a relative certificate on nothing should say.
-        let gram_bound = PSI_GRAM_CERT_RTOL * gram_scale;
-        let rhs_bound = PSI_GRAM_CERT_RTOL * rhs_scale;
+        // A weakly penalized solve can amplify an otherwise acceptable 1e-9
+        // interpolation residual. Refine until the unresolved tail is at the
+        // transform's own accumulation floor, rather than mandating a degree.
+        let accumulation_floor = (m as f64 * f64::EPSILON)
+            / (1.0 - m as f64 * f64::EPSILON);
+        let tail_rtol = PSI_GRAM_CERT_RTOL.min(accumulation_floor);
+        let gram_bound = tail_rtol * gram_scale;
+        let rhs_bound = tail_rtol * rhs_scale;
         for d in tail_start..m {
             if gram[d].iter().any(|&v| v.abs() > gram_bound)
                 || rhs[d].iter().any(|&v| v.abs() > rhs_bound)
@@ -722,12 +778,13 @@ impl PsiGramTensor {
         })
     }
 
-    /// Off-node certification: the ASSEMBLED Gram must reproduce the exactly
-    /// rebuilt Gram at deterministic interior ψ values.
+    /// Off-node certification: the assembled Gram and RHS must reproduce their
+    /// exact statistics at deterministic interior ψ values.
     fn spot_check(
         &self,
         eval_design: &mut impl FnMut(f64) -> Result<Array2<f64>, String>,
         weights: ArrayView1<'_, f64>,
+        z: ArrayView1<'_, f64>,
     ) -> bool {
         for s in 0..PSI_GRAM_SPOT_POINTS {
             // Golden-ratio low-discrepancy interior points — never the nodes.
@@ -736,14 +793,28 @@ impl PsiGramTensor {
             let Ok(design) = eval_design(psi) else {
                 return false;
             };
-            let zero_rhs = Array1::<f64>::zeros(design.nrows());
-            let (exact, _) = weighted_gram_and_rhs(&design, weights, &zero_rhs);
+            if design.nrows() != weights.len() || design.ncols() != self.k
+                || design.iter().any(|v| !v.is_finite()) {
+                return false;
+            }
+            let wz = &weights * &z;
+            let (exact, exact_rhs) = weighted_gram_and_rhs(&design, weights, &wz);
             let assembled = self.gram_at(psi);
+            let assembled_rhs = self.rhs_at(psi);
+            if exact.iter().chain(exact_rhs.iter()).chain(assembled.iter())
+                .chain(assembled_rhs.iter()).any(|v| !v.is_finite()) {
+                return false;
+            }
             let scale = exact.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
             for (a, b) in assembled.iter().zip(exact.iter()) {
                 if (a - b).abs() > PSI_GRAM_SPOT_RTOL * scale {
                     return false;
                 }
+            }
+            let rhs_scale = exact_rhs.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            if assembled_rhs.iter().zip(exact_rhs.iter())
+                .any(|(a, b)| (a - b).abs() > PSI_GRAM_SPOT_RTOL * rhs_scale) {
+                return false;
             }
         }
         true
@@ -1415,6 +1486,153 @@ impl PsiGramTensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_weighted_statistics_are_refused_2827() {
+        for (weight, response) in [
+            (f64::NAN, 1.0), (f64::INFINITY, 1.0), (-1.0, 1.0),
+            (1.0, f64::NAN), (1.0, f64::INFINITY),
+            (f64::MAX, 2.0), (1.0, f64::MAX),
+        ] {
+            let weights = Array1::from_vec(vec![weight]);
+            let z = Array1::from_vec(vec![response]);
+            let mut calls = 0;
+            assert!(PsiGramTensor::build(
+                |_| { calls += 1; Ok(Array2::ones((1, 1))) },
+                weights.view(), z.view(), -1.0, 1.0,
+            ).is_err(), "invalid weight={weight}, response={response} certified");
+            assert_eq!(calls, 0, "invalid response statistics must fail before realizing a design");
+        }
+        let weights = Array1::ones(1);
+        let z = Array1::zeros(1);
+        assert!(PsiGramTensor::build(
+            |_| Ok(Array2::from_elem((1, 1), 1e200)),
+            weights.view(), z.view(), -1.0, 1.0,
+        ).is_err(), "finite design entries can still overflow the weighted Gram");
+    }
+
+    #[test]
+    fn zero_statistics_and_signed_responses_remain_valid_2827() {
+        let z = Array1::from_vec(vec![-3.0]);
+        for (weight, entry) in [(0.0, 2.0), (1.0, 0.0)] {
+            let weights = Array1::from_vec(vec![weight]);
+            let tensor = PsiGramTensor::build(
+                |_| Ok(Array2::from_elem((1, 1), entry)),
+                weights.view(), z.view(), -1.0, 1.0,
+            ).expect("finite zero statistics must certify");
+            assert_eq!(tensor.gram_at(0.2)[[0, 0]], 0.0);
+            assert_eq!(tensor.rhs_at(0.2)[0], 0.0);
+            assert_eq!(tensor.zt_w_z, 9.0 * weight);
+        }
+        let weights = Array1::ones(1);
+        let tensor = PsiGramTensor::build(
+            |_| Ok(Array2::ones((1, 1))),
+            weights.view(), z.view(), -1.0, 1.0,
+        ).expect("negative responses are valid");
+        assert!((tensor.rhs_at(0.2)[0] + 3.0).abs() < 1e-13);
+    }
+
+    #[test]
+    fn spot_certificate_refuses_nonfinite_exact_or_assembled_statistics_2827() {
+        let weights = Array1::ones(1);
+        let z = Array1::ones(1);
+        let mut exact = |_| Ok(Array2::ones((1, 1)));
+        let mut tensor = PsiGramTensor::build(
+            &mut exact, weights.view(), z.view(), -1.0, 1.0,
+        ).unwrap();
+        let gram0 = tensor.gram[0][[0, 0]];
+        let rhs0 = tensor.rhs[0][0];
+        for bad in [f64::NAN, f64::INFINITY] {
+            tensor.gram[0][[0, 0]] = bad;
+            assert!(!tensor.spot_check(&mut exact, weights.view(), z.view()));
+            tensor.gram[0][[0, 0]] = gram0;
+            tensor.rhs[0][0] = bad;
+            assert!(!tensor.spot_check(&mut exact, weights.view(), z.view()));
+            tensor.rhs[0][0] = rhs0;
+        }
+        assert!(!tensor.spot_check(
+            &mut |_| Ok(Array2::from_elem((1, 1), 1e200)),
+            weights.view(), z.view(),
+        ), "finite off-node designs must not certify overflowing exact statistics");
+        tensor.col_amp_intercept[0] = 710.0;
+        assert!(!tensor.spot_check(&mut exact, weights.view(), z.view()),
+            "finite coefficients must not certify overflowing reconstruction");
+    }
+
+    #[test]
+    fn closed_window_endpoints_must_be_defined_2827() {
+        let weights = Array1::ones(1);
+        let z = Array1::ones(1);
+        assert!(PsiGramTensor::build(
+            |psi| {
+                if psi == -1.0 || psi == 1.0 {
+                    Err("undefined at a declared endpoint".to_string())
+                } else {
+                    Ok(Array2::ones((1, 1)))
+                }
+            }, weights.view(), z.view(), -1.0, 1.0,
+        ).is_err());
+    }
+
+    #[test]
+    fn low_degree_statistics_do_not_pay_for_513_designs_2827() {
+        let weights = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+        let z = Array1::from_vec(vec![0.3, -0.2, 0.7]);
+        let mut calls = 0;
+        let tensor = PsiGramTensor::build(
+            |psi| {
+                calls += 1;
+                Ok(Array2::from_shape_fn((3, 2), |(i, j)| {
+                    (1.0 + i as f64 + j as f64) * ((j as f64 + 1.0) * psi).exp()
+                }))
+            },
+            weights.view(), z.view(), -2.0, 2.0,
+        ).expect("normalized power columns are constant statistics");
+        // Log-amplitude recovery and the transform can require one refinement
+        // to resolve their own rounding tail even for an exact power column.
+        assert!(tensor.n_coeff <= 33, "low-degree statistics need only the first two rungs");
+        assert_eq!(calls, tensor.n_coeff + PSI_GRAM_SPOT_POINTS);
+        for psi in [-2.0, -0.73, 0.0, 1.21, 2.0] {
+            let g = tensor.gram_at(psi);
+            let dg = tensor.dgram_dpsi(psi);
+            let r = tensor.rhs_at(psi);
+            let dr = tensor.drhs_dpsi(psi);
+            for a in 0..2 {
+                let exact_r = (0..3).map(|i| weights[i] * z[i]
+                    * (1.0 + i as f64 + a as f64) * ((a + 1) as f64 * psi).exp()).sum::<f64>();
+                assert!((r[a] - exact_r).abs() <= 1e-11 * exact_r.abs().max(1.0));
+                assert!((dr[a] - (a + 1) as f64 * exact_r).abs() <= 1e-10 * exact_r.abs().max(1.0));
+                for b in 0..2 {
+                    let exact_g = (0..3).map(|i| weights[i]
+                        * (1.0 + i as f64 + a as f64) * (1.0 + i as f64 + b as f64)
+                        * ((a + b + 2) as f64 * psi).exp()).sum::<f64>();
+                    assert!((g[[a, b]] - exact_g).abs() <= 1e-11 * exact_g.abs().max(1.0));
+                    assert!((dg[[a, b]] - (a + b + 2) as f64 * exact_g).abs() <= 1e-10 * exact_g.abs().max(1.0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_refinement_reuses_exact_node_statistics_2827() {
+        let weights = Array1::ones(24);
+        let z = Array1::from_shape_fn(24, |i| (i as f64 * 0.31).sin());
+        let mut evaluations = std::collections::BTreeMap::<u64, usize>::new();
+        let tensor = PsiGramTensor::build(
+            |psi| {
+                *evaluations.entry(psi.to_bits()).or_default() += 1;
+                synth_design(psi, 24, 4)
+            },
+            weights.view(), z.view(), -1.1, 1.1,
+        ).expect("analytic radial statistics certify after refinement");
+        assert!(tensor.n_coeff > 17, "fixture must exercise refinement");
+        let largest_degree = PSI_GRAM_NODE_LADDER[PSI_GRAM_NODE_LADDER.len() - 1] - 1;
+        for i in 0..tensor.n_coeff {
+            let node_key = i * (largest_degree / (tensor.n_coeff - 1));
+            let psi = 1.1 * (std::f64::consts::PI * node_key as f64 / largest_degree as f64).cos();
+            assert_eq!(evaluations.get(&psi.to_bits()), Some(&1), "node {i} was rebuilt");
+        }
+    }
 
     /// Analytic Matérn-shaped synthetic design: entries g(e^{u_ij + ψ}) with
     /// g(s) = (1 + s)·exp(−s) (the ν = 3/2 Matérn shape) plus a ψ-free power

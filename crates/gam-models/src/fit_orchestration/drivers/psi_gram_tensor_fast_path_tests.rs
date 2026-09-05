@@ -175,11 +175,14 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // Tensor evaluator with the certified Gram tensor attached over the window.
     let mut tensor_eval = make_eval();
     let mut tensor_cache = make_cache();
+    let mut tensor_realizations = 0usize;
+    let tensor_build_started = std::time::Instant::now();
     let attached = {
         let mut build_cache = make_cache();
         let theta_probe_base = theta0.clone();
         tensor_eval.build_and_set_psi_gram_tensor(
             |psi| {
+                tensor_realizations += 1;
                 let mut theta_probe = theta_probe_base.clone();
                 theta_probe[rho_dim] = psi;
                 build_cache
@@ -196,6 +199,14 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     assert!(
         attached,
         "tensor must certify on this fixture for a non-vacuous gate"
+    );
+    eprintln!(
+        "[2827-real-duchon] n={n} columns={} tensor_realizations={tensor_realizations} build_seconds={:.6}",
+        frozen_design.design.ncols(), tensor_build_started.elapsed().as_secs_f64(),
+    );
+    assert!(
+        tensor_realizations < 513,
+        "the standardized Duchon fixture must certify before the former fixed 513-node build"
     );
     // #1033 penalty lane: enable the EXACT n-free penalty re-key so the
     // fast-path skip can rebuild S(ψ) from the frozen basis geometry. Without it

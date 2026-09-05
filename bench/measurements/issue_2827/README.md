@@ -26,15 +26,30 @@ Reproduce the extraction and plot with NumPy and Matplotlib:
 python plot.py INPUT.log setup_vs_optimizer.png setup_vs_optimizer.csv
 ```
 
-The candidate adaptive repair (not yet published) uses nested Lobatto nodes and retains only exact Gram/RHS
+The adaptive repair uses nested Lobatto nodes and retains only exact Gram/RHS
 samples. It requires coefficient tails to reach their floating-point
 accumulation floor and checks both statistics against exact off-node rebuilds.
-The 12 tensor tests pass, including analytic derivative, ridge-penalized solve,
-profile curvature, nonanalytic refusal, and sample reuse checks. The exact-power
+The 16 tensor tests pass, including analytic derivative, ridge-penalized solve,
+profile curvature, nonanalytic refusal, sample reuse, and finite-statistic
+certification checks. Non-finite weighted inputs, statistics, normalization,
+coefficients, and reconstructed spot values are refused; signed responses and
+finite zero statistics remain valid. The exact-power
 test uses 33 node realizations plus three checks, compared with the original
-513 plus three. Real standardized-Duchon fit validation remains pending; these
-primitive results do not yet establish the original fixture's repaired fit
-time or objective.
+513 plus three.
 
-Tested candidate `psi_gram_tensor.rs` Git blob:
-`3f9a9494131c13ce568f4329c902355ee3bb2480`.
+The production standardized-Duchon integration gate (600 rows, 11 columns)
+certifies at 129 nodes plus three checks: 132 design realizations instead of
+516. Tensor construction takes 1.799842 seconds; the complete test takes 2.53
+seconds. Its unchanged coefficient checks against an independently streamed
+solve pass with zero error. Both moved probes rotate the reduced basis, so the
+existing projector witness requires exact streamed evaluation there. This
+checks preservation of that routing safeguard; it does not measure tensor
+approximation error on an admitted moved-coordinate fast path.
+
+The original 50,000-row fixture's repaired fit time and objective remain
+unverified. These smaller gates are not an end-to-end reproduction of it.
+
+The 16-test finite-guard source `psi_gram_tensor.rs` Git blob is
+`6043c2ee4f8d9ca811feb504593e495e83cd78f2`.
+The 600-row integration measurement used the preceding adaptive source blob
+`3f9a9494131c13ce568f4329c902355ee3bb2480`, before the explicit finite-value guards.
