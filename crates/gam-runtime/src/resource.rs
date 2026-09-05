@@ -1426,6 +1426,37 @@ mod resource_policy_tests {
             6 * 1024 * 1024 * 1024
         );
     }
+
+    #[test]
+    fn literal_unlimited_cgroup_defers_to_host_available_memory_2317() {
+        let availability = MemoryAvailability::from_observation(
+            2_430_926_848,
+            4_000_000_000,
+            CgroupMemoryObservation::V2Unbounded {
+                cgroup_path: "/fixture/leaf".into(),
+                inspected_levels: 3,
+            },
+        );
+        assert_eq!(availability.available_bytes(), 2_430_926_848);
+        assert_eq!(availability.capacity_bytes(), 4_000_000_000);
+        assert_eq!(availability.limiting_source, MemoryAvailabilitySource::Host);
+        assert!(format!("{availability}").contains("unbounded cgroup-v2"));
+        let governor = MemoryGovernor::with_detected_availability(availability);
+        assert_eq!(governor.remaining_bytes(), 3_000_000_000);
+        assert_eq!(governor.single_materialization_cap_bytes(), 3_000_000_000);
+        // Exercise the actual ledger. A literal unlimited controller delegates
+        // to the finite host; it does not authorize unbounded reservations.
+        let reservation = governor
+            .try_reserve(3_000_000_000, "host budget")
+            .unwrap();
+        assert_eq!(governor.remaining_bytes(), 0);
+        assert!(matches!(
+            governor.try_reserve(1, "one byte beyond the host budget"),
+            Err(MemoryReservationError::BudgetExceeded { .. })
+        ));
+        drop(reservation);
+        assert_eq!(governor.remaining_bytes(), 3_000_000_000);
+    }
 }
 
 /// gam#2702: a reservation verdict is a function of the request and this
@@ -1474,6 +1505,55 @@ mod governor_budget_is_capacity_determined_2702_tests {
             JOB_LIMIT_BYTES,
             charged,
         )
+    }
+
+    #[test]
+    fn a_cgroup_at_its_limit_moves_neither_the_budget_nor_the_materialization_cap_2684_2702() {
+        const LIMIT: u64 = 6 * 1024 * 1024 * 1024;
+        const DESIGN_BYTES: usize = 300 * 12 * 8;
+        let budget = LIMIT as usize / 4 * 3;
+        // The incident reading had 53,248 bytes available in a 6 GiB job.
+        // Also cover a fully charged job and an idle one: only availability
+        // changes. These reserve ledger entries, never actual GiB allocations.
+        for charged in [0, LIMIT - 53_248, LIMIT] {
+            let availability = crate::test_support::simulated_cgroup_memory_environment(
+                HOST_AVAILABLE_BYTES,
+                HOST_TOTAL_BYTES,
+                LIMIT,
+                charged,
+            );
+            assert_eq!(availability.available_bytes(), LIMIT - charged);
+            assert_eq!(availability.capacity_bytes(), LIMIT);
+            let governor = MemoryGovernor::with_detected_availability(availability);
+            assert_eq!(governor.remaining_bytes(), budget);
+            assert_eq!(governor.single_materialization_cap_bytes(), budget);
+            assert!(governor.single_materialization_cap_bytes() > DESIGN_BYTES);
+            assert!(matches!(
+                governor.try_reserve(8 << 30, "larger than the job"),
+                Err(MemoryReservationError::BudgetExceeded { .. })
+            ));
+            let chunk = governor
+                .try_reserve_dense_f64_copies(64, 1, 2, "coefficient-SE solve chunk")
+                .expect("the incident's 1,024-byte chunk fits at every ambient load");
+            assert_eq!(chunk.bytes(), 1_024);
+            assert_eq!(governor.remaining_bytes(), budget - 1_024);
+            assert_eq!(governor.single_materialization_cap_bytes(), budget);
+            drop(chunk);
+            assert_eq!(governor.remaining_bytes(), budget);
+        }
+        // A governor that always grants requests must fail this control.
+        let tiny = crate::test_support::simulated_cgroup_memory_environment(
+            HOST_AVAILABLE_BYTES,
+            HOST_TOTAL_BYTES,
+            1_024,
+            0,
+        );
+        let governor = MemoryGovernor::with_detected_availability(tiny);
+        assert_eq!(governor.single_materialization_cap_bytes(), 768);
+        assert!(matches!(
+            governor.try_reserve(DESIGN_BYTES, "300 by 12 design"),
+            Err(MemoryReservationError::BudgetExceeded { .. })
+        ));
     }
 
     #[test]

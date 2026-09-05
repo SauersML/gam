@@ -172,3 +172,120 @@ fn row_selected_inverse_from_probes_matches_dense_on_spectrally_deflated_rows_27
     );
 }
 
+/// #2818 restores the #2080 probe-contraction contract on the production
+/// selected inverse. This is an algebraic identity at one fixed state; it
+/// requires neither a fitted maximum nor a search for a convenient inner solve.
+/// This fixture keeps every periodic ARD coordinate in its strictly convex
+/// quarter, so the row factors must remain undeflated. The cold state's null
+/// rows above do not distinguish the adjoint from its deflation-blind version:
+/// null-direction curvature and its contracted derivative both vanish there.
+/// Full-basis probe parity instead resolves the actual nonzero Schur-inverse
+/// contribution. The separate historical #2712 deflation-ADJOINT pin still
+/// requires a derivative-sensitive deflated fixture.
+#[test]
+fn sae_logdet_theta_adjoint_from_probes_matches_dense_softmax_2080() {
+    use crate::manifold::construction::ThetaAdjointDhChannel;
+
+    let (mut term, target, rho) = small_two_atom_periodic_term();
+    let n = term.n_obs();
+    for (atom, coords) in term.assignment.coords.iter_mut().enumerate() {
+        let phases = Array1::from_shape_fn(n, |row| 0.02 + 0.02 * row as f64 + 0.01 * atom as f64);
+        assert!(
+            phases
+                .iter()
+                .all(|&phase| (std::f64::consts::TAU * phase).cos() > 0.5)
+        );
+        coords.set_flat(phases.view());
+    }
+    term.refresh_basis_from_current_coords()
+        .expect("refresh the production basis at the convex phases");
+    let system = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
+    let (_, _, cache) = solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options).unwrap();
+    assert!(
+        cache.deflated_row_directions.iter().all(Vec::is_empty),
+        "the positive-curvature fixture must actually exercise the undeflated regime"
+    );
+    assert!(cache.k > 0, "Schur inverse folds require a nonempty border");
+    let (probes, inverse_probes) = full_basis_bundle(&cache);
+    let solver = DeflatedArrowSolver::plain(&cache);
+    let inverse = term
+        .materialize_joint_inverse(&cache, &solver)
+        .expect("the live selected-inverse operator materializes on this tiny fixture");
+    let dense = term
+        .logdet_theta_adjoint_dense(
+            &rho,
+            &cache,
+            &inverse,
+            ThetaAdjointDhChannel::All,
+            false,
+            false,
+            None,
+        )
+        .expect("deflation-aware dense majorizer adjoint");
+    let from_probes = term
+        .logdet_theta_adjoint_from_probes(
+            &rho,
+            &cache,
+            &probes,
+            &inverse_probes,
+            EvidenceOperator::Majorizer,
+            None,
+        )
+        .expect("full-basis probe adjoint");
+    let zero_inverse_probes: Vec<_> = probes
+        .iter()
+        .map(|probe| Array1::zeros(probe.len()))
+        .collect();
+    let border_blind = term
+        .logdet_theta_adjoint_from_probes(
+            &rho,
+            &cache,
+            &probes,
+            &zero_inverse_probes,
+            EvidenceOperator::Majorizer,
+            None,
+        )
+        .expect("counterfactual with the Schur inverse contribution removed");
+    assert_eq!(dense.t.len(), from_probes.t.len());
+    assert_eq!(dense.beta.len(), from_probes.beta.len());
+    assert_eq!(dense.t.len(), border_blind.t.len());
+    assert_eq!(dense.beta.len(), border_blind.beta.len());
+
+    let mut magnitude = 0.0_f64;
+    let mut parity_error = 0.0_f64;
+    let mut separation = 0.0_f64;
+    for ((reference, probe), counterfactual) in dense
+        .t
+        .iter()
+        .chain(dense.beta.iter())
+        .zip(from_probes.t.iter().chain(from_probes.beta.iter()))
+        .zip(border_blind.t.iter().chain(border_blind.beta.iter()))
+    {
+        assert!(reference.is_finite() && probe.is_finite() && counterfactual.is_finite());
+        magnitude = magnitude.max(reference.abs());
+        parity_error = parity_error.max((reference - probe).abs());
+        separation = separation.max((reference - counterfactual).abs());
+        assert!(
+            (reference - probe).abs() <= 1e-10 * (1.0 + reference.abs()),
+            "dense={reference} probes={probe}"
+        );
+    }
+    eprintln!(
+        "#2080 undeflated softmax adjoint: magnitude={magnitude:.6e} parity_error={parity_error:.6e} Schur_inverse_separation={separation:.6e}"
+    );
+    assert!(
+        magnitude > 1e-6,
+        "zero adjoints cannot establish this identity"
+    );
+    assert!(
+        separation > 1e-10 * (1.0 + magnitude),
+        "the accepted error bar must reject a Schur-inverse-blind contraction"
+    );
+    assert!(
+        parity_error * 1e3 <= separation,
+        "probe parity must resolve the Schur inverse contribution by three orders of magnitude"
+    );
+}

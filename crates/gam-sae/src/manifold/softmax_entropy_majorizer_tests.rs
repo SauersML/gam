@@ -2,7 +2,8 @@
 //! wrappers were deleted. The subjects here are the live assembly leafs.
 
 use super::*;
-use gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty;
+use gam_terms::analytic_penalties::{AnalyticPenalty, SoftmaxAssignmentSparsityPenalty};
+use ndarray::Array1;
 
 fn probabilities(logits: &[f64], inv_tau: f64) -> Vec<f64> {
     let maximum = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -15,6 +16,111 @@ fn probabilities(logits: &[f64], inv_tau: f64) -> Vec<f64> {
         *value /= total;
     }
     values
+}
+
+#[test]
+fn active_softmax_dense_entropy_hessian_entry_matches_dense_block_1410() {
+    let k = 48;
+    let temperature = 1.3_f64;
+    let scale = 0.9_f64;
+    let penalty = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
+    let rho = Array1::from_elem(1, (scale * temperature * temperature).ln());
+    let mut largest_reference = 0.0_f64;
+    let mut largest_error = 0.0_f64;
+    for fixture in 0..3 {
+        let logits = Array1::from_shape_fn(k, |axis| match fixture {
+            0 => (0.17 * axis as f64).sin(),
+            1 => 0.01,
+            _ if axis + 1 == k => -800.0 * temperature,
+            _ => 3.0 * (0.31 * axis as f64).sin(),
+        });
+        let a = probabilities(logits.as_slice().unwrap(), 1.0 / temperature);
+        let mean = softmax_majorizer_log_mean(&a);
+        // The deleted dense helper shared this leaf's formula. Reconstructing
+        // its columns through the live public HVP gives an independent oracle.
+        for column in 0..k {
+            let mut direction = Array1::zeros(k);
+            direction[column] = 1.0;
+            let reference = penalty.hvp(logits.view(), rho.view(), direction.view());
+            for atom in 0..k {
+                let actual = softmax_dense_entropy_hessian_entry(&a, atom, column, mean, scale);
+                let error = (actual - reference[atom]).abs();
+                assert!(actual.is_finite() && reference[atom].is_finite());
+                assert!(
+                    error <= 2e-13 * (1.0 + reference[atom].abs()),
+                    "fixture={fixture} atom={atom} column={column}: leaf={actual} HVP={}",
+                    reference[atom]
+                );
+                largest_reference = largest_reference.max(reference[atom].abs());
+                largest_error = largest_error.max(error);
+            }
+        }
+    }
+    assert!(
+        largest_reference > 1e-3,
+        "a zero Hessian cannot satisfy the oracle"
+    );
+    eprintln!(
+        "#1410 active Hessian versus HVP: max_error={largest_error:.6e} max_reference={largest_reference:.6e}"
+    );
+}
+
+#[test]
+fn active_softmax_majorizer_logit_derivative_matches_dense_1410() {
+    let k = 40;
+    let temperature = 0.7_f64;
+    let scale = 1.1_f64;
+    let penalty = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
+    let mut largest_reference = 0.0_f64;
+    let mut largest_error = 0.0_f64;
+    for fixture in 0..3 {
+        let logits: Vec<f64> = (0..k)
+            .map(|axis| match fixture {
+                0 => (0.23 * axis as f64).sin(),
+                1 => 0.02,
+                _ if axis + 1 == k => -800.0 * temperature,
+                _ => 2.0 * (0.37 * axis as f64).sin(),
+            })
+            .collect();
+        let a = probabilities(&logits, 1.0 / temperature);
+        let mean = softmax_majorizer_log_mean(&a);
+        for w in [0, k / 2, k - 1] {
+            let mut plus = logits.clone();
+            let mut minus = logits.clone();
+            plus[w] += 1e-6;
+            minus[w] -= 1e-6;
+            // This is the owning library's public dense value operator,
+            // independently differenced, not the deleted derivative wrapper.
+            let dp = penalty.row_psd_majorizer(&plus, scale);
+            let dm = penalty.row_psd_majorizer(&minus, scale);
+            for atom in 0..k {
+                let actual = active_softmax_majorizer_logit_derivative_entry(
+                    &a,
+                    atom,
+                    w,
+                    mean,
+                    scale,
+                    1.0 / temperature,
+                );
+                let reference = (dp[[atom, atom]] - dm[[atom, atom]]) / (plus[w] - minus[w]);
+                assert!(actual.is_finite() && reference.is_finite());
+                let error = (actual - reference).abs();
+                assert!(
+                    error <= 1e-6 * (1.0 + reference.abs()),
+                    "fixture={fixture} atom={atom} logit={w}: leaf={actual} public FD={reference}"
+                );
+                largest_reference = largest_reference.max(reference.abs());
+                largest_error = largest_error.max(error);
+            }
+        }
+    }
+    assert!(
+        largest_reference > 1e-3,
+        "a zero derivative cannot satisfy the oracle"
+    );
+    eprintln!(
+        "#1410 active adjoint versus public radius FD: max_error={largest_error:.6e} max_reference={largest_reference:.6e}"
+    );
 }
 
 fn isolated_crossing() -> ([f64; 3], f64, f64) {

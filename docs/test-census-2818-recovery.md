@@ -51,14 +51,86 @@ that the entire selection passed. The executed source Git blob identities are
 and `64f96e2407713cab8914f2b3a353490c1f88adbc` for the sibling test file. Evidence
 is recorded in MSI's `.buildd/exact-a-block-majorizer-combined.log`.
 
-Two other historical #1410 identities compared active entries bit-for-bit to
-the deleted dense convenience methods:
-`active_softmax_dense_entropy_hessian_entry_matches_dense_block_1410` and
-`active_softmax_majorizer_logit_derivative_matches_dense_1410`. Those wrappers
-shared the same expressions as the active entries. Their original comparison
-cannot establish an independent oracle for the surviving implementation.
-Independent HVP/finite-difference replacements still need explicit registration
-and execution evidence before these two inventory entries are discharged.
+## Active assembly entries: #1410
+
+Two historical #1410 identities compared active entries bit-for-bit to the
+deleted dense convenience methods, which shared the same expressions. Both
+names are now restored with independent oracles in the same SAE sibling target:
+
+| Historical test identity | Executed replacement contract |
+| --- | --- |
+| `active_softmax_dense_entropy_hessian_entry_matches_dense_block_1410` | Reconstruct the dense Hessian from the public entropy HVP, then compare every active entry. Three 48-atom fixtures cover varied, uniform, and underflowed probabilities. Maximum error 1.387779e-17, maximum reference 0.08343182, against the 2e-13 roundoff allowance. |
+| `active_softmax_majorizer_logit_derivative_matches_dense_1410` | Compare the active analytic adjoint to finite differences of the public dense majorizer value, covering every atom and three logit probes on each of three 40-atom fixtures. Maximum error 1.514916e-10, maximum reference 0.3798330, against the 1e-6 finite-difference allowance. |
+
+Both comparisons require nonzero reference values. The HVP calculation does
+not share the leaf's entry expression; the derivative oracle does not restore
+the deleted derivative wrapper. Bit-for-bit identity between duplicate
+expressions has been replaced by the underlying live operator contract, with
+roundoff/finite-difference allowances appropriate to independent arithmetic.
+
+All seven SAE sibling tests executed successfully with source blob
+`921394d1e849da5c4b778c6c573217600869b7cb`, including the five previous derivative
+tests. The combined command ran 21 tests in 3.54 seconds: 19 passed and two
+failed, including an unverified #2080 fixture premise. This is evidence for the
+seven named passing tests, not an all-green combined suite. The log is
+`.buildd/exact-a-obb-majorizer-adjoint.log` on MSI.
+
+## Resource governor: #2317, #2684, and #2702
+
+Both historical resource-governor pins are restored in
+`crates/gam-runtime/src/resource.rs`, using the observation constructor and
+reservation ledger that production uses. No removed observation fixture or
+budget accessor is reintroduced.
+
+| Historical test identity | Executed replacement contract |
+| --- | --- |
+| `literal_unlimited_cgroup_defers_to_host_available_memory_2317` | An unbounded controller preserves host availability and capacity, including typed provenance. Reserving the exact 3 GB host budget succeeds, one further byte is refused, and dropping the reservation restores the budget. An unbounded controller does not make host capacity unbounded. |
+| `a_cgroup_at_its_limit_moves_neither_the_budget_nor_the_materialization_cap_2684_2702` | A 6 GiB controller is observed idle, 53,248 bytes below its limit, and fully charged. Its 4.5 GiB budget and materialization ceiling stay fixed while observed availability changes. The actual 1,024-byte coefficient-SE reservation succeeds and releases at each load; an 8 GiB request is refused. A 1,024-byte controller retains a 768-byte cap and refuses the 28,800-byte design. |
+
+The tests reserve ledger entries, not actual gigabytes of memory. Both executed
+successfully on MSI: **2 passed, 0 failed, 0 ignored, 99 filtered**, in 0.00
+seconds after an 18.39-second build. The executed source blob is
+`987091257b1c47cb3cde144297882e16b1c87a36`; the log is
+`.buildd/runtime-recovered-pins-2818.log`. A fresh governor's actual remaining
+budget replaces the deleted convenience accessor, and admission/refusal
+assertions independently exercise that budget instead of merely restating the
+derivation.
+
+## Full-basis probe adjoint: #2080
+
+`sae_logdet_theta_adjoint_from_probes_matches_dense_softmax_2080` is restored in
+`crates/gam-sae/src/manifold/tests_deflated_from_probes_2712.rs`. It compares the
+production dense adjoint, using the materialized joint selected inverse, to the
+production probe adjoint with a complete deterministic basis of reduced-Schur
+probes. Both contract the same majorizer operator. No iterative inner solve,
+deleted dense wrapper, or stochastic convergence assumption is needed for this
+algebraic identity at a fixed state.
+
+The fixture explicitly places periodic coordinates in the positive-curvature
+quarter of their ARD prior and refreshes the production basis. It then asserts
+that the actual factor has no deflated row directions. The historical #2080
+gate admitted this undeflated regime; the separate historical #2712 deflated
+adjoint gate remains pending. The existing cold state's two spectrally deflated
+rows did not resolve that latter contract: its deflation-aware and blind
+adjoints differed by only 3.552714e-15. Merely counting those rows would have
+claimed coverage of a derivative the fixture could not distinguish.
+
+The restored #2080 pin passed with adjoint magnitude **14.29163** and maximum
+dense/probe error **2.664535e-15**, retaining the tighter 1e-10 comparison bar.
+Removing the Schur-inverse contribution produces a **0.6203322** discrepancy;
+the test requires this counterfactual to separate by more than its error bar
+and by at least 1,000 times the actual parity error. This ensures the inverse
+probe contractions make a measurable contribution.
+
+The final combined selection passed **2 tests, 0 failed, 0 ignored**, in 2.16
+seconds, including this pin and the separate ordered-Beta--Bernoulli adjoint
+gate. The executed source blob is
+`ed719024f987eb3dbdf54afb7078c715dd83906d`; the MSI log is
+`.buildd/exact-a-obb-scalar-and-2080.log`. The existing #2712 selected-inverse
+reconstruction test also passed in the preceding selection, resolving
+off-diagonal reconstruction to 1.11e-16 on two spectrally deflated rows. That
+block-reconstruction result is distinct from the still-pending
+deflation-adjoint sensitivity requirement.
 
 The remaining historical inventory is still open. A successful source census,
 or the restoration of these few contracts, does not establish that all 303
