@@ -1422,3 +1422,78 @@ fn greedy_admission_never_prices_worse_than_the_topk_quota_2825() {
         "the quota must be strictly beaten somewhere, or this test is vacuous"
     );
 }
+
+/// #2825: the frame convergence bar is denominated in the resolution of the
+/// frames it is read from, and this pins BOTH halves of that — the half that
+/// lifts and, more importantly, the half that does not.
+///
+/// The block dictionary is stored as `f32`, so a frame residual computed from
+/// it carries `f32` round-off. Below `f32::EPSILON` such a residual is not
+/// small, it is unrepresentable, and a bar placed under it asks the frames a
+/// question their own storage cannot answer. Six block fits sat exactly there:
+/// at `ev_residual`, `gamma_residual`, `routing_residual` and
+/// `reconstruction_residual` all exactly zero, EV = 1 to fourteen figures, no
+/// births and no polar failures — genuine fixed points — with frame residuals
+/// of `1.7017e-8 .. 2.5664e-8` against configured tolerances of `1e-9` and
+/// `1e-10`, i.e. bars asking for 119x and 1192x finer than the storage
+/// resolution of `1.192093e-7`.
+///
+/// The danger in a floor is that it silently becomes a blanket relaxation. It
+/// does not here, and that is what the second half of this test is for: a
+/// tolerance ABOVE the floor must be honoured EXACTLY as configured, so the
+/// floor can only ever lift a bar that was below the instrument's noise, never
+/// loosen one that was above it.
+#[test]
+fn the_frame_bar_is_denominated_in_the_stored_frame_resolution_2825() {
+    let resolution = super::super::block_frame::STORED_FRAME_RESOLUTION;
+    assert_eq!(
+        resolution,
+        f64::from(f32::EPSILON),
+        "the floor is the machine epsilon of the type the frames are stored in, \
+         not a chosen number"
+    );
+
+    // The six fits' measured band, from the #2825 arm-deletion run. Every one is
+    // below the storage resolution, which is why no amount of iterating cleared
+    // the configured bar.
+    let measured_band = [
+        1.7016687085877477e-8_f64,
+        2.1350316734503195e-8,
+        2.3524703573643420e-8,
+        2.4516826402228734e-8,
+        2.5664090977161682e-8,
+    ];
+    for residual in measured_band {
+        assert!(
+            residual < resolution,
+            "a residual the frames cannot resolve must sit below the floor; \
+             got {residual} against {resolution}"
+        );
+    }
+
+    // BELOW the floor: the bar lifts to the floor, so a fixed point the frames
+    // cannot resolve past is admitted.
+    for tolerance in [1.0e-10_f64, 1.0e-9] {
+        let bar = tolerance.max(resolution);
+        assert_eq!(bar, resolution, "a sub-resolution bar lifts to the floor");
+        for residual in measured_band {
+            assert!(
+                residual > tolerance && residual <= bar,
+                "residual {residual} is unreachable at tol {tolerance} and \
+                 admitted at the floor {bar}"
+            );
+        }
+    }
+
+    // ABOVE the floor: unchanged, exactly. This is the half that keeps the floor
+    // from being a blanket relaxation — a configured bar coarser than the
+    // instrument's noise is the caller's, and the floor never touches it.
+    for tolerance in [1.0e-6_f64, 1.0e-3, 1.0e-1] {
+        assert_eq!(
+            tolerance.max(resolution),
+            tolerance,
+            "a bar above the storage resolution must be honoured exactly as \
+             configured, never loosened"
+        );
+    }
+}

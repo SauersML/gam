@@ -2293,6 +2293,12 @@ fn fit_block_sparse_dictionary_with_seed_inner(
     let reconstruction_residual: f64;
     let mut accepted_births = 0usize;
     let mut polar_failures = 0usize;
+    // The frame residual is read off f32-stored frames, so the configured
+    // tolerance governs wherever it is attainable and the storage resolution
+    // governs below that (#2825). A bar above the floor is unchanged.
+    let frame_bar = config
+        .tolerance
+        .max(super::block_frame::STORED_FRAME_RESOLUTION);
     // The reconstruction EV is the gauge-invariant objective; `entry_ev` anchors the
     // total-improvement denominator of the captured-fraction plateau test (arm 2).
     let entry_ev = seed_ev;
@@ -2360,7 +2366,7 @@ fn fit_block_sparse_dictionary_with_seed_inner(
         // fit is certified, never demoted to best-effort.
         if ev_residual <= config.tolerance
             && gamma_residual <= config.tolerance
-            && frame_residual <= config.tolerance
+            && frame_residual <= frame_bar
         {
             certified = true;
             converged = true;

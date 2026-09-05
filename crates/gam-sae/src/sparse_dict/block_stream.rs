@@ -826,7 +826,11 @@ impl BlockSparseStreamState {
             && accepted_births == 0
             && improve.abs() <= self.config.tolerance
             && gamma_residual <= self.config.tolerance
-            && frame_residual <= self.config.tolerance
+            && frame_residual
+                <= self
+                    .config
+                    .tolerance
+                    .max(super::block_frame::STORED_FRAME_RESOLUTION)
             && self.epochs_run > 0;
         // Certify the frames actually measured in this pass, together with
         // their profiled gamma. A frame proposal needs the next pass before
