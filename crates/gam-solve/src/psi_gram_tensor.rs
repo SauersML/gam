@@ -376,19 +376,34 @@ fn weighted_gram_and_rhs(
     // algebraic additivity under replicated rows without relying on BLAS dot's
     // implementation-dependent reduction tree.
     for ((row, &w), &wz_i) in design.outer_iter().zip(weights.iter()).zip(wz.iter()) {
-        for a in 0..k {
-            let xa = row[a];
+        for (a, ((&xa, rhs_slot), rhs_correction)) in row
+            .iter()
+            .zip(rhs.iter_mut())
+            .zip(rhs_comp.iter_mut())
+            .enumerate()
+        {
+            let y_rhs = xa * wz_i - *rhs_correction;
+            let t_rhs = *rhs_slot + y_rhs;
+            *rhs_correction = (t_rhs - *rhs_slot) - y_rhs;
+            *rhs_slot = t_rhs;
 
-            let y_rhs = xa * wz_i - rhs_comp[a];
-            let t_rhs = rhs[a] + y_rhs;
-            rhs_comp[a] = (t_rhs - rhs[a]) - y_rhs;
-            rhs[a] = t_rhs;
-
-            for b in a..k {
-                let y = xa * w * row[b] - gram_comp[[a, b]];
-                let t = gram[[a, b]] + y;
-                gram_comp[[a, b]] = (t - gram[[a, b]]) - y;
-                gram[[a, b]] = t;
+            // Preserve the compensated row summation exactly, but traverse
+            // each output row once instead of repeating multidimensional
+            // bounds and stride arithmetic for every matrix entry. Entries
+            // along b are independent and can be vectorized together.
+            let weighted_xa = xa * w;
+            let mut gram_row = gram.slice_mut(ndarray::s![a, a..]);
+            let mut correction_row = gram_comp.slice_mut(ndarray::s![a, a..]);
+            let design_tail = row.slice(ndarray::s![a..]);
+            for ((slot, correction), &xb) in gram_row
+                .iter_mut()
+                .zip(correction_row.iter_mut())
+                .zip(design_tail.iter())
+            {
+                let y = weighted_xa * xb - *correction;
+                let t = *slot + y;
+                *correction = (t - *slot) - y;
+                *slot = t;
             }
         }
     }
@@ -458,8 +473,10 @@ impl PsiGramTensor {
         psi_lo: f64,
         psi_hi: f64,
     ) -> Result<Self, String> {
-        if !(psi_lo.is_finite() && psi_hi.is_finite()) || psi_hi <= psi_lo
-            || !(psi_hi - psi_lo).is_finite() {
+        if !(psi_lo.is_finite() && psi_hi.is_finite())
+            || psi_hi <= psi_lo
+            || !(psi_hi - psi_lo).is_finite()
+        {
             return Err(format!(
                 "ψ window must have finite endpoints and finite positive width (got [{psi_lo}, {psi_hi}])"
             ));
@@ -473,8 +490,14 @@ impl PsiGramTensor {
         let mut dimensions = None;
         for &m in PSI_GRAM_NODE_LADDER.iter() {
             match Self::build_at(
-                &mut eval_design, weights, z, psi_lo, psi_hi, m,
-                &mut node_statistics, &mut dimensions,
+                &mut eval_design,
+                weights,
+                z,
+                psi_lo,
+                psi_hi,
+                m,
+                &mut node_statistics,
+                &mut dimensions,
             ) {
                 // An exact evaluation failed or was non-finite somewhere in
                 // the window — no larger rung can fix that, so abort with the
@@ -634,7 +657,11 @@ impl PsiGramTensor {
             // RHS uses the prebuilt `wz = W z` (same factoring as the exact
             // streamed path) so the retained series is bit-faithful to it.
             let (node_gram, node_rh) = weighted_gram_and_rhs(&design, weights, &wz);
-            if node_gram.iter().chain(node_rh.iter()).any(|v| !v.is_finite()) {
+            if node_gram
+                .iter()
+                .chain(node_rh.iter())
+                .any(|v| !v.is_finite())
+            {
                 return BuildOutcome::EvalFailed(format!(
                     "weighted design statistics at node ψ={psi:.6} are non-finite"
                 ));
@@ -711,8 +738,12 @@ impl PsiGramTensor {
         }
         drop(node_grams);
         drop(node_rhs);
-        if gram.iter().flat_map(|slab| slab.iter())
-            .chain(rhs.iter().flat_map(|slab| slab.iter())).any(|v| !v.is_finite()) {
+        if gram
+            .iter()
+            .flat_map(|slab| slab.iter())
+            .chain(rhs.iter().flat_map(|slab| slab.iter()))
+            .any(|v| !v.is_finite())
+        {
             return BuildOutcome::EvalFailed(
                 "Chebyshev statistic coefficients are non-finite".to_string(),
             );
@@ -749,8 +780,7 @@ impl PsiGramTensor {
         // A weakly penalized solve can amplify an otherwise acceptable 1e-9
         // interpolation residual. Refine until the unresolved tail is at the
         // transform's own accumulation floor, rather than mandating a degree.
-        let accumulation_floor = (m as f64 * f64::EPSILON)
-            / (1.0 - m as f64 * f64::EPSILON);
+        let accumulation_floor = (m as f64 * f64::EPSILON) / (1.0 - m as f64 * f64::EPSILON);
         let tail_rtol = PSI_GRAM_CERT_RTOL.min(accumulation_floor);
         let gram_bound = tail_rtol * gram_scale;
         let rhs_bound = tail_rtol * rhs_scale;
@@ -793,16 +823,23 @@ impl PsiGramTensor {
             let Ok(design) = eval_design(psi) else {
                 return false;
             };
-            if design.nrows() != weights.len() || design.ncols() != self.k
-                || design.iter().any(|v| !v.is_finite()) {
+            if design.nrows() != weights.len()
+                || design.ncols() != self.k
+                || design.iter().any(|v| !v.is_finite())
+            {
                 return false;
             }
             let wz = &weights * &z;
             let (exact, exact_rhs) = weighted_gram_and_rhs(&design, weights, &wz);
             let assembled = self.gram_at(psi);
             let assembled_rhs = self.rhs_at(psi);
-            if exact.iter().chain(exact_rhs.iter()).chain(assembled.iter())
-                .chain(assembled_rhs.iter()).any(|v| !v.is_finite()) {
+            if exact
+                .iter()
+                .chain(exact_rhs.iter())
+                .chain(assembled.iter())
+                .chain(assembled_rhs.iter())
+                .any(|v| !v.is_finite())
+            {
                 return false;
             }
             let scale = exact.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
@@ -812,8 +849,11 @@ impl PsiGramTensor {
                 }
             }
             let rhs_scale = exact_rhs.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-            if assembled_rhs.iter().zip(exact_rhs.iter())
-                .any(|(a, b)| (a - b).abs() > PSI_GRAM_SPOT_RTOL * rhs_scale) {
+            if assembled_rhs
+                .iter()
+                .zip(exact_rhs.iter())
+                .any(|(a, b)| (a - b).abs() > PSI_GRAM_SPOT_RTOL * rhs_scale)
+            {
                 return false;
             }
         }
@@ -1036,11 +1076,7 @@ impl PsiGramTensor {
     /// numerically degenerate cluster). `None` for an off-window ψ, a rank
     /// mismatch, or an eigendecomp failure. `Some(0.0)` for an equal-ψ pair, which
     /// is trivially and exactly sound. Purely k-space (O(k³)) — independent of n.
-    pub fn reduced_basis_subspace_distance_bound(
-        &self,
-        psi_ref: f64,
-        psi_new: f64,
-    ) -> Option<f64> {
+    pub fn reduced_basis_subspace_distance_bound(&self, psi_ref: f64, psi_new: f64) -> Option<f64> {
         if !(self.contains(psi_ref) && self.contains(psi_new)) {
             return None;
         }
@@ -1488,27 +1524,118 @@ mod tests {
     use super::*;
 
     #[test]
+    fn iterator_reduction_preserves_compensated_bits_across_layouts_2827() {
+        use ndarray::ShapeBuilder;
+
+        // Independent execution of the historical indexed recurrence is the
+        // reference for this loop-layout optimization: row order, product
+        // association, and compensation must all remain bit-identical.
+        fn indexed_reference(
+            design: &Array2<f64>,
+            weights: &Array1<f64>,
+            wz: &Array1<f64>,
+        ) -> (Array2<f64>, Array1<f64>) {
+            let k = design.ncols();
+            let mut gram = Array2::<f64>::zeros((k, k));
+            let mut compensation = Array2::<f64>::zeros((k, k));
+            let mut rhs = Array1::<f64>::zeros(k);
+            let mut rhs_compensation = Array1::<f64>::zeros(k);
+            for i in 0..design.nrows() {
+                for a in 0..k {
+                    let xa = design[[i, a]];
+                    let y = xa * wz[i] - rhs_compensation[a];
+                    let sum = rhs[a] + y;
+                    rhs_compensation[a] = (sum - rhs[a]) - y;
+                    rhs[a] = sum;
+                    for b in a..k {
+                        let y = xa * weights[i] * design[[i, b]] - compensation[[a, b]];
+                        let sum = gram[[a, b]] + y;
+                        compensation[[a, b]] = (sum - gram[[a, b]]) - y;
+                        gram[[a, b]] = sum;
+                    }
+                }
+            }
+            for a in 0..k {
+                for b in 0..a {
+                    gram[[a, b]] = gram[[b, a]];
+                }
+            }
+            (gram, rhs)
+        }
+
+        let entry = |(i, j): (usize, usize)| {
+            let scale = if (i + j) % 3 == 0 { 1e8 } else { 1e-3 };
+            scale * ((i * 7 + j * 11) as f64 * 0.13).sin()
+        };
+        let standard = Array2::from_shape_fn((257, 11), entry);
+        let column_major = Array2::from_shape_fn((257, 11).f(), entry);
+        let reversed = standard.clone().slice_move(ndarray::s![..;-1, ..;-1]);
+        let weights = Array1::from_shape_fn(257, |i| 0.25 + (i % 7) as f64 / 7.0);
+        let wz = Array1::from_shape_fn(257, |i| weights[i] * (i as f64 * 0.17).cos());
+        for design in [&standard, &column_major, &reversed] {
+            let (gram, rhs) = weighted_gram_and_rhs(design, weights.view(), &wz);
+            let (reference_gram, reference_rhs) = indexed_reference(design, &weights, &wz);
+            for (actual, expected) in gram
+                .iter()
+                .chain(rhs.iter())
+                .zip(reference_gram.iter().chain(reference_rhs.iter()))
+            {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "compensated statistic changed for strides {:?}",
+                    design.strides()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn invalid_weighted_statistics_are_refused_2827() {
         for (weight, response) in [
-            (f64::NAN, 1.0), (f64::INFINITY, 1.0), (-1.0, 1.0),
-            (1.0, f64::NAN), (1.0, f64::INFINITY),
-            (f64::MAX, 2.0), (1.0, f64::MAX),
+            (f64::NAN, 1.0),
+            (f64::INFINITY, 1.0),
+            (-1.0, 1.0),
+            (1.0, f64::NAN),
+            (1.0, f64::INFINITY),
+            (f64::MAX, 2.0),
+            (1.0, f64::MAX),
         ] {
             let weights = Array1::from_vec(vec![weight]);
             let z = Array1::from_vec(vec![response]);
             let mut calls = 0;
-            assert!(PsiGramTensor::build(
-                |_| { calls += 1; Ok(Array2::ones((1, 1))) },
-                weights.view(), z.view(), -1.0, 1.0,
-            ).is_err(), "invalid weight={weight}, response={response} certified");
-            assert_eq!(calls, 0, "invalid response statistics must fail before realizing a design");
+            assert!(
+                PsiGramTensor::build(
+                    |_| {
+                        calls += 1;
+                        Ok(Array2::ones((1, 1)))
+                    },
+                    weights.view(),
+                    z.view(),
+                    -1.0,
+                    1.0,
+                )
+                .is_err(),
+                "invalid weight={weight}, response={response} certified"
+            );
+            assert_eq!(
+                calls, 0,
+                "invalid response statistics must fail before realizing a design"
+            );
         }
         let weights = Array1::ones(1);
         let z = Array1::zeros(1);
-        assert!(PsiGramTensor::build(
-            |_| Ok(Array2::from_elem((1, 1), 1e200)),
-            weights.view(), z.view(), -1.0, 1.0,
-        ).is_err(), "finite design entries can still overflow the weighted Gram");
+        assert!(
+            PsiGramTensor::build(
+                |_| Ok(Array2::from_elem((1, 1), 1e200)),
+                weights.view(),
+                z.view(),
+                -1.0,
+                1.0,
+            )
+            .is_err(),
+            "finite design entries can still overflow the weighted Gram"
+        );
     }
 
     #[test]
@@ -1518,8 +1645,12 @@ mod tests {
             let weights = Array1::from_vec(vec![weight]);
             let tensor = PsiGramTensor::build(
                 |_| Ok(Array2::from_elem((1, 1), entry)),
-                weights.view(), z.view(), -1.0, 1.0,
-            ).expect("finite zero statistics must certify");
+                weights.view(),
+                z.view(),
+                -1.0,
+                1.0,
+            )
+            .expect("finite zero statistics must certify");
             assert_eq!(tensor.gram_at(0.2)[[0, 0]], 0.0);
             assert_eq!(tensor.rhs_at(0.2)[0], 0.0);
             assert_eq!(tensor.zt_w_z, 9.0 * weight);
@@ -1527,8 +1658,12 @@ mod tests {
         let weights = Array1::ones(1);
         let tensor = PsiGramTensor::build(
             |_| Ok(Array2::ones((1, 1))),
-            weights.view(), z.view(), -1.0, 1.0,
-        ).expect("negative responses are valid");
+            weights.view(),
+            z.view(),
+            -1.0,
+            1.0,
+        )
+        .expect("negative responses are valid");
         assert!((tensor.rhs_at(0.2)[0] + 3.0).abs() < 1e-13);
     }
 
@@ -1537,9 +1672,8 @@ mod tests {
         let weights = Array1::ones(1);
         let z = Array1::ones(1);
         let mut exact = |_| Ok(Array2::ones((1, 1)));
-        let mut tensor = PsiGramTensor::build(
-            &mut exact, weights.view(), z.view(), -1.0, 1.0,
-        ).unwrap();
+        let mut tensor =
+            PsiGramTensor::build(&mut exact, weights.view(), z.view(), -1.0, 1.0).unwrap();
         let gram0 = tensor.gram[0][[0, 0]];
         let rhs0 = tensor.rhs[0][0];
         for bad in [f64::NAN, f64::INFINITY] {
@@ -1550,28 +1684,41 @@ mod tests {
             assert!(!tensor.spot_check(&mut exact, weights.view(), z.view()));
             tensor.rhs[0][0] = rhs0;
         }
-        assert!(!tensor.spot_check(
-            &mut |_| Ok(Array2::from_elem((1, 1), 1e200)),
-            weights.view(), z.view(),
-        ), "finite off-node designs must not certify overflowing exact statistics");
+        assert!(
+            !tensor.spot_check(
+                &mut |_| Ok(Array2::from_elem((1, 1), 1e200)),
+                weights.view(),
+                z.view(),
+            ),
+            "finite off-node designs must not certify overflowing exact statistics"
+        );
         tensor.col_amp_intercept[0] = 710.0;
-        assert!(!tensor.spot_check(&mut exact, weights.view(), z.view()),
-            "finite coefficients must not certify overflowing reconstruction");
+        assert!(
+            !tensor.spot_check(&mut exact, weights.view(), z.view()),
+            "finite coefficients must not certify overflowing reconstruction"
+        );
     }
 
     #[test]
     fn closed_window_endpoints_must_be_defined_2827() {
         let weights = Array1::ones(1);
         let z = Array1::ones(1);
-        assert!(PsiGramTensor::build(
-            |psi| {
-                if psi == -1.0 || psi == 1.0 {
-                    Err("undefined at a declared endpoint".to_string())
-                } else {
-                    Ok(Array2::ones((1, 1)))
-                }
-            }, weights.view(), z.view(), -1.0, 1.0,
-        ).is_err());
+        assert!(
+            PsiGramTensor::build(
+                |psi| {
+                    if psi == -1.0 || psi == 1.0 {
+                        Err("undefined at a declared endpoint".to_string())
+                    } else {
+                        Ok(Array2::ones((1, 1)))
+                    }
+                },
+                weights.view(),
+                z.view(),
+                -1.0,
+                1.0,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1586,11 +1733,18 @@ mod tests {
                     (1.0 + i as f64 + j as f64) * ((j as f64 + 1.0) * psi).exp()
                 }))
             },
-            weights.view(), z.view(), -2.0, 2.0,
-        ).expect("normalized power columns are constant statistics");
+            weights.view(),
+            z.view(),
+            -2.0,
+            2.0,
+        )
+        .expect("normalized power columns are constant statistics");
         // Log-amplitude recovery and the transform can require one refinement
         // to resolve their own rounding tail even for an exact power column.
-        assert!(tensor.n_coeff <= 33, "low-degree statistics need only the first two rungs");
+        assert!(
+            tensor.n_coeff <= 33,
+            "low-degree statistics need only the first two rungs"
+        );
         assert_eq!(calls, tensor.n_coeff + PSI_GRAM_SPOT_POINTS);
         for psi in [-2.0, -0.73, 0.0, 1.21, 2.0] {
             let g = tensor.gram_at(psi);
@@ -1598,16 +1752,30 @@ mod tests {
             let r = tensor.rhs_at(psi);
             let dr = tensor.drhs_dpsi(psi);
             for a in 0..2 {
-                let exact_r = (0..3).map(|i| weights[i] * z[i]
-                    * (1.0 + i as f64 + a as f64) * ((a + 1) as f64 * psi).exp()).sum::<f64>();
+                let exact_r = (0..3)
+                    .map(|i| {
+                        weights[i]
+                            * z[i]
+                            * (1.0 + i as f64 + a as f64)
+                            * ((a + 1) as f64 * psi).exp()
+                    })
+                    .sum::<f64>();
                 assert!((r[a] - exact_r).abs() <= 1e-11 * exact_r.abs().max(1.0));
                 assert!((dr[a] - (a + 1) as f64 * exact_r).abs() <= 1e-10 * exact_r.abs().max(1.0));
                 for b in 0..2 {
-                    let exact_g = (0..3).map(|i| weights[i]
-                        * (1.0 + i as f64 + a as f64) * (1.0 + i as f64 + b as f64)
-                        * ((a + b + 2) as f64 * psi).exp()).sum::<f64>();
+                    let exact_g = (0..3)
+                        .map(|i| {
+                            weights[i]
+                                * (1.0 + i as f64 + a as f64)
+                                * (1.0 + i as f64 + b as f64)
+                                * ((a + b + 2) as f64 * psi).exp()
+                        })
+                        .sum::<f64>();
                     assert!((g[[a, b]] - exact_g).abs() <= 1e-11 * exact_g.abs().max(1.0));
-                    assert!((dg[[a, b]] - (a + b + 2) as f64 * exact_g).abs() <= 1e-10 * exact_g.abs().max(1.0));
+                    assert!(
+                        (dg[[a, b]] - (a + b + 2) as f64 * exact_g).abs()
+                            <= 1e-10 * exact_g.abs().max(1.0)
+                    );
                 }
             }
         }
@@ -1623,14 +1791,22 @@ mod tests {
                 *evaluations.entry(psi.to_bits()).or_default() += 1;
                 synth_design(psi, 24, 4)
             },
-            weights.view(), z.view(), -1.1, 1.1,
-        ).expect("analytic radial statistics certify after refinement");
+            weights.view(),
+            z.view(),
+            -1.1,
+            1.1,
+        )
+        .expect("analytic radial statistics certify after refinement");
         assert!(tensor.n_coeff > 17, "fixture must exercise refinement");
         let largest_degree = PSI_GRAM_NODE_LADDER[PSI_GRAM_NODE_LADDER.len() - 1] - 1;
         for i in 0..tensor.n_coeff {
             let node_key = i * (largest_degree / (tensor.n_coeff - 1));
             let psi = 1.1 * (std::f64::consts::PI * node_key as f64 / largest_degree as f64).cos();
-            assert_eq!(evaluations.get(&psi.to_bits()), Some(&1), "node {i} was rebuilt");
+            assert_eq!(
+                evaluations.get(&psi.to_bits()),
+                Some(&1),
+                "node {i} was rebuilt"
+            );
         }
     }
 
@@ -1759,7 +1935,13 @@ mod tests {
         design.t().dot(&wd)
     }
 
-    fn exact_duchon_rhs(psi: f64, n: usize, k: usize, w: &Array1<f64>, z: &Array1<f64>) -> Array1<f64> {
+    fn exact_duchon_rhs(
+        psi: f64,
+        n: usize,
+        k: usize,
+        w: &Array1<f64>,
+        z: &Array1<f64>,
+    ) -> Array1<f64> {
         let design = synth_duchon_design(psi, n, k).unwrap();
         let mut wz = Array1::<f64>::zeros(n);
         for ((slot, &wi), &zi) in wz.iter_mut().zip(w.iter()).zip(z.iter()) {
@@ -1812,7 +1994,10 @@ mod tests {
         let mut graded = 0usize;
 
         for &psi in &[-1.1, -0.63, 0.0, 0.41, 0.97] {
-            assert!(tensor.contains(psi), "psi={psi} must be in the value window");
+            assert!(
+                tensor.contains(psi),
+                "psi={psi} must be in the value window"
+            );
             if !tensor.contains_for_gradient(psi - h) || !tensor.contains_for_gradient(psi + h) {
                 continue;
             }
@@ -1820,12 +2005,18 @@ mod tests {
 
             // VALUE: both channels, against the exact streamed statistics.
             let exact_g = exact_duchon_gram(psi, n, k, &w);
-            let gscale = exact_g.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1e-300);
+            let gscale = exact_g
+                .iter()
+                .fold(0.0_f64, |a, &v| a.max(v.abs()))
+                .max(1e-300);
             for (a, b) in tensor.gram_at(psi).iter().zip(exact_g.iter()) {
                 worst_gram_rel = worst_gram_rel.max((a - b).abs() / gscale);
             }
             let exact_r = exact_duchon_rhs(psi, n, k, &w, &z);
-            let rscale = exact_r.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1e-300);
+            let rscale = exact_r
+                .iter()
+                .fold(0.0_f64, |a, &v| a.max(v.abs()))
+                .max(1e-300);
             for (a, b) in tensor.rhs_at(psi).iter().zip(exact_r.iter()) {
                 worst_rhs_rel = worst_rhs_rel.max((a - b).abs() / rscale);
             }
@@ -1860,8 +2051,14 @@ mod tests {
             "the certified gradient sub-window admitted only {graded} probes; this gate \
              would be reporting on almost nothing"
         );
-        assert!(worst_gram_rel <= 1e-9, "gram value: {worst_gram_rel:.3e} > 1e-9");
-        assert!(worst_rhs_rel <= 1e-9, "rhs value: {worst_rhs_rel:.3e} > 1e-9");
+        assert!(
+            worst_gram_rel <= 1e-9,
+            "gram value: {worst_gram_rel:.3e} > 1e-9"
+        );
+        assert!(
+            worst_rhs_rel <= 1e-9,
+            "rhs value: {worst_rhs_rel:.3e} > 1e-9"
+        );
         assert!(
             worst_dgram_rel <= 1e-5,
             "dgram/dpsi vs FD of the exact Duchon gram: {worst_dgram_rel:.3e} > 1e-5"

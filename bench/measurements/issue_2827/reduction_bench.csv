@@ -1,0 +1,5 @@
+variant,rows,columns,node_reductions,seconds,source_blob,profile,rayon_threads
+indexed,1000,100,1,0.168793763,6043c2ee4f8d9ca811feb504593e495e83cd78f2,test-opt2,4
+iterators,1000,100,1,0.034628370,4e9a540e0a81ca4632b088e4ac79bd7d8984229c,test-opt2,4
+indexed,50000,100,1,6.817967383,6043c2ee4f8d9ca811feb504593e495e83cd78f2,test-opt2,4
+iterators,50000,100,1,1.697394328,4e9a540e0a81ca4632b088e4ac79bd7d8984229c,test-opt2,4

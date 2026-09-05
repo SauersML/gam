@@ -53,3 +53,44 @@ The 16-test finite-guard source `psi_gram_tensor.rs` Git blob is
 `6043c2ee4f8d9ca811feb504593e495e83cd78f2`.
 The 600-row integration measurement used the preceding adaptive source blob
 `3f9a9494131c13ce568f4329c902355ee3bb2480`, before the explicit finite-value guards.
+
+## Compensated reduction cost
+
+The node reduction retains its compensated row summation but traverses the
+upper Gram rows with iterators instead of repeatedly indexing two-dimensional
+arrays. All 17 tensor tests pass. The added comparison against the historical
+indexed recurrence is bit-identical for row-major, column-major, and reversed
+layouts; the earlier value and derivative measurements are unchanged.
+
+![Matched node-reduction timings](reduction_bench.png)
+
+`reduction_bench.csv` records single bounded measurements with the same warmed
+opt-level-2 test profile and four-thread setting. The deterministic synthetic
+matrix has 100 columns. One 50,000-row node reduction falls from 6.817967 to
+1.697394 seconds; at 1,000 rows it falls from 0.168794 to 0.034628 seconds.
+These are measurements of the node reduction, including finite-value checks
+and cache insertion, with design construction excluded. They are not full
+tensor or fit timings and do not establish an opt-level-3 speedup.
+
+Reproduce one reduction through the public builder with
+`psi_gram_reduction_profile_2827 ROWS COLUMNS`. The example deliberately refuses
+its second realizer callback after the first statistic has been computed; it
+does not return a tensor or fit. Its source Git blob is
+`f147ffd58b907a8a70fab4f94c21c40d702e1122`. The indexed source is `6043c2e` above;
+the iterator source, tested by all 17 gates, is
+`4e9a540e0a81ca4632b088e4ac79bd7d8984229c`.
+The publication snapshots differ only by formatting: tensor
+`66c5352d4fbb3534b5b995beae90f815fb58dba3`, example
+`94df76feb9068fa1f62d22cf9df30869259f8602`.
+
+Generate this plot with `python plot_reduction.py reduction_bench.csv reduction_bench.png`.
+
+The original-corpus CSV profiling binary also contained unpublished rho-domain
+API changes. Its post-setup optimizer numbers are working-tree diagnostics,
+not current-main fit benchmarks. The full 50,000-row setup probe was stopped
+after five node realizations because each took approximately 16 seconds in
+that validation build; no full-corpus tensor certificate was obtained. The
+log label `smooth basis rebuild` times only `replace_term_realization`, after
+the actual local basis build, so its 0.17–0.22 seconds must not be mistaken for
+the whole basis-construction cost. The remaining local basis cost still needs
+an isolated measurement before another full-corpus run.
