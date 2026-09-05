@@ -201,6 +201,34 @@ The freshly sourced umbrella scanner also passed on the MSI worktree with the
 new integration target present; the same committed-index limitation described
 above applies to its infrastructure and line-count checks.
 
+## Typed optimizer failures: #2658
+
+`crates/gam-problem/tests/error_source_recovery.rs` restores
+`fatal_optimizer_evaluation_retains_exact_typed_source_2658` through the public
+`OuterObjectiveErrorSource` enum and its live typed downcast. It preserves the
+optimizer producer's fatal verdict, original context, and every recorded
+inner-solve field: 17 cycles, residual 3.5, tolerance 0.25 and dimensions
+4/3/1. A second outer orchestration wrapper must retain that original boundary
+and its optimizer source. The deleted `objective_error` convenience accessor
+is not reintroduced.
+
+The verified MSI run executed **1 passed, 0 failed, 0 ignored, 0 filtered**, in
+0.00 seconds after a 4.50-second warm target build. The executed source blob is
+`498d6279aa768e1b5b655e36b44cd3d82c6d17ee`; the log is
+`.buildd/typed-error-recovered-pin-2818.log`. An earlier stdin upload was consumed
+by the wrapper's node-selection command and produced an empty test target;
+its zero-test run was rejected as evidence. Standard file transfer, actual
+compute-source hashes and the explicit one-test count establish this result.
+
+The exercised error-boundary implementation matches published main
+`b87e911ca431a9318cb0968bff0904e7809ea043`. The MSI custom-family error source has
+an unrelated, preexisting missing terminal-reason variant; the tested
+`InnerSolveNotConverged` fields are identical. This pin supplies no
+coverage of that separate terminal-reason variant.
+The umbrella scanner also passed with the actual nonempty integration target
+present. Its filesystem source walk includes the target; the previously noted
+committed-index limitation remains for the infrastructure and line-count checks.
+
 The remaining historical inventory is still open. A successful source census,
 or the restoration of these few contracts, does not establish that all 303
 historically deleted pinned identities have been recovered or retired.
