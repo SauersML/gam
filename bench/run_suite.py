@@ -199,7 +199,7 @@ def _prediction_column_array(prediction: typing.Any, column: str) -> np.ndarray:
         if column not in columns:
             raise RuntimeError(f"gamfit prediction table has no {column!r} column")
         return np.asarray(prediction[column], dtype=float).reshape(-1)
-    if column != "mean":
+    if column != "posterior_mean":
         raise RuntimeError(
             f"array-like gamfit prediction cannot expose diagnostic column {column!r}"
         )
@@ -209,7 +209,7 @@ def _prediction_column_array(prediction: typing.Any, column: str) -> np.ndarray:
 def _prediction_mean_array(prediction: typing.Any) -> np.ndarray:
     """Extract the response mean from any public gamfit prediction container."""
 
-    return _prediction_column_array(prediction, "mean")
+    return _prediction_column_array(prediction, "posterior_mean")
 
 
 def _nested_payload_values(value: typing.Any, key: str) -> list[typing.Any]:
@@ -1745,7 +1745,7 @@ def run_rust_scenario_cv(
                 if not np.array_equal(diagnostic_mean, pred, equal_nan=True):
                     raise RuntimeError("untimed diagnostic prediction changed its response mean")
                 linear_predictor = _prediction_column_array(
-                    diagnostic_prediction, "linear_predictor"
+                    diagnostic_prediction, "linear_predictor_plugin"
                 )
                 affine_design = model.design_matrix(test_df)
                 diagnostic_design = np.asarray(affine_design.matrix, dtype=float)
@@ -2122,7 +2122,7 @@ def _run_rust_gamlss_scenario_cv_variant(
             _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])
 
             if family == "binomial":
-                # For binomial location-scale models, the Rust predictor's "mean"
+                # For binomial location-scale models, the Rust predictor's "posterior_mean"
                 # column is already the final event probability implied by the
                 # joint threshold/log-sigma model. Proper scoring rules are
                 # therefore evaluated on this probability, not on a separate
@@ -2342,7 +2342,7 @@ def run_rust_gamlss_marginal_slope_cv(
                     "error": (err.strip() or out.strip() or "rust gamlss marginal-slope predict failed"),
                 }
             pred_df = pd.read_csv(pred_path)
-            if "mean" not in pred_df.columns:
+            if "posterior_mean" not in pred_df.columns:
                 return {
                     "contender": contender_name,
                     "scenario_name": scenario_name,
@@ -2351,9 +2351,9 @@ def run_rust_gamlss_marginal_slope_cv(
                     "n_train": int(len(fold.train_idx)),
                     "n_test": int(len(fold.test_idx)),
                     "n_folds": int(len(folds)),
-                    "error": "rust gamlss marginal-slope prediction output missing 'mean' column",
+                    "error": "rust gamlss marginal-slope prediction output missing 'posterior_mean' column",
                 }
-            pred = pred_df["mean"].to_numpy(dtype=float)
+            pred = pred_df["posterior_mean"].to_numpy(dtype=float)
             y_test = test_df[ds["target"]].to_numpy(dtype=float)
             y_train = train_df[ds["target"]].to_numpy(dtype=float)
             _append_supervised_plot_fold(plot_payload, test_df, pred, ds["target"])

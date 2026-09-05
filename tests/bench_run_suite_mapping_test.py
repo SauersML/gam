@@ -115,6 +115,24 @@ def _main_patches(
 
 
 class RunSuiteMappingTests(unittest.TestCase):
+    def test_prediction_contract_uses_posterior_mean_in_every_container(self) -> None:
+        np = _RUN_SUITE.np
+        expected = np.array([0.2, 0.7])
+        prediction = {
+            "posterior_mean": expected,
+            "mean_plugin": [0.01, 0.99],
+            "linear_predictor_plugin": [-4.6, 4.6],
+        }
+        for container in (prediction, _RUN_SUITE.pd.DataFrame(prediction), expected):
+            with self.subTest(container=type(container).__name__):
+                np.testing.assert_array_equal(_RUN_SUITE._prediction_mean_array(container), expected)
+        np.testing.assert_array_equal(
+            _RUN_SUITE._prediction_column_array(prediction, "linear_predictor_plugin"),
+            [-4.6, 4.6],
+        )
+        with self.assertRaisesRegex(RuntimeError, "posterior_mean"):
+            _RUN_SUITE._prediction_mean_array({"mean": expected})
+
     def test_terminal_output_sanitizer_removes_cursor_controls_across_chunks(self) -> None:
         sanitizer = _RUN_SUITE._TerminalOutputSanitizer()
         text = (
@@ -556,7 +574,7 @@ class RunSuiteMappingTests(unittest.TestCase):
 
             def predict(self, data: typing.Any, **_kwargs: typing.Any) -> dict[str, list[float]]:
                 values = [1.5] * len(data)
-                return {"mean": values, "linear_predictor": values}
+                return {"posterior_mean": values, "linear_predictor_plugin": values}
 
             def design_matrix(self, data: typing.Any) -> SimpleNamespace:
                 return SimpleNamespace(
@@ -623,7 +641,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                 Path(path).write_text("{}")
 
             def predict(self, _data: typing.Any, **_kwargs: typing.Any) -> dict[str, list[float]]:
-                return {"mean": [1.5, 1.5], "sigma": [1.25, 1.25]}
+                return {"posterior_mean": [1.5, 1.5], "sigma": [1.25, 1.25]}
 
         def _fit(*args: typing.Any, **kwargs: typing.Any) -> _FakeModel:
             fit_calls.append((args, kwargs))
