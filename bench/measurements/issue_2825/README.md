@@ -7,17 +7,18 @@ The raw activation data are not included. These are training diagnostics on a
 small prefix, not held-out quality results or a matched old/new comparison.
 
 Run on MSI acn112 with four Rayon workers, the existing q2 build cache, and
-shared-disk storage:
+shared-disk storage. For reproduction, replace `WARM_TARGET` and `CORPUS.npy`
+with the existing warm target and activation artifact paths, and configure
+`TMPDIR` to use shared disk storage before building:
 
 ```sh
-TMPDIR=/projects/standard/hsiehph/sauer354/gam-indexed-main/.buildd/test-data \
-  RAYON_NUM_THREADS=4 cargo build --locked -j4 --profile test \
+RAYON_NUM_THREADS=4 cargo build --locked -j4 --profile test \
   --config 'profile.test.package.gam-sae.codegen-units=16' \
-  --target-dir /scratch.global/sauer354/q2-target \
+  --target-dir WARM_TARGET \
   -p gam-sae --example block_stream_convergence
 RAYON_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
-  /scratch.global/sauer354/q2-target/debug/examples/block_stream_convergence \
-  /scratch.global/sauer354/a5acts/train.npy 512 256 2 8 12
+  WARM_TARGET/debug/examples/block_stream_convergence \
+  CORPUS.npy 512 256 2 8 12
 ```
 
 EV increases on all 12 recorded passes, from 0.467463 to 0.717002. Both gamma
