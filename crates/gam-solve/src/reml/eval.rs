@@ -1090,6 +1090,7 @@ impl<'a> RemlState<'a> {
         dispersion_phi: f64,
         finalgrad_norm: f64,
         outer_gradient: &Array1<f64>,
+        outer_hessian: Option<&Array2<f64>>,
         caller_measured_hessian_error: &[gam_linalg::curvature_resolution::MeasuredHessianError],
     ) -> Result<SmoothingCorrectionOutcome, EstimationError> {
         use SmoothingCorrectionFallbackSeverity::{NumericalFailure, Routine};
@@ -1101,6 +1102,7 @@ impl<'a> RemlState<'a> {
             final_lambdas,
             final_fit,
             outer_gradient,
+            outer_hessian,
             caller_measured_hessian_error,
         );
         let first_order_correction = first_order.correction.clone();
@@ -3000,6 +3002,10 @@ mod smoothing_correction_outcome_tests {
                     dispersion_phi,
                     finalgrad_norm,
                     &finalgrad,
+                    // This harness has no outer solver behind it, so there is no
+                    // second assembly of the rho-Hessian to compare against: an
+                    // absent measurement, not a zero (#2748).
+                    None,
                     &[],
                 )
                 .expect("smoothing correction evaluation");

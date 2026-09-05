@@ -1769,6 +1769,33 @@ pub(crate) fn certificate_hessian_is_psd(hessian: &Array2<f64>) -> Option<bool> 
 /// `measured_resolution` is that measurement. `0.0` reproduces the historical
 /// shift bit for bit, and since the two are combined by `max` this can only
 /// ever admit a point the previous rule refused — never refuse one it admitted.
+/// The shift the certificate's definiteness verdict is ACTUALLY taken at, and
+/// the single owner of that number (#2748).
+///
+/// It is the larger of the measured `‖δH‖₂` and the arithmetic shift
+/// `√ε·max(max|H_ii|, 1)`. The second is what decides whenever no identity
+/// could be measured, and it is not small: on a ρ-Hessian whose largest
+/// diagonal is under 1 it is a flat `√ε = 1.49e-8`.
+///
+/// It is `pub(crate)` and separate because the verdict travels. The
+/// smoothing-correction re-judges the same direction at the same point against
+/// a resolution built from its own eigensolver's backward error — `2.19e-16` on
+/// the measured #2748 `geo_disease` k=12 cell — and refused a direction the
+/// certificate had cleared at `1.49e-8`, eight orders wider. A verdict and the
+/// standard it was taken at have to travel together, or the second layer
+/// applies a strictly stronger test than the first and the fit dies between
+/// them.
+pub(crate) fn certificate_curvature_shift(hessian: &Array2<f64>, measured_resolution: f64) -> f64 {
+    let n = hessian.nrows();
+    let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
+    let arithmetic_shift = f64::EPSILON.sqrt() * max_diag.max(1.0);
+    if measured_resolution.is_finite() && measured_resolution > arithmetic_shift {
+        measured_resolution
+    } else {
+        arithmetic_shift
+    }
+}
+
 pub(crate) fn certificate_hessian_is_psd_at_resolution(
     hessian: &Array2<f64>,
     measured_resolution: f64,
@@ -1777,13 +1804,7 @@ pub(crate) fn certificate_hessian_is_psd_at_resolution(
     if n == 0 || hessian.ncols() != n || hessian.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
-    let arithmetic_shift = f64::EPSILON.sqrt() * max_diag.max(1.0);
-    let shift = if measured_resolution.is_finite() && measured_resolution > arithmetic_shift {
-        measured_resolution
-    } else {
-        arithmetic_shift
-    };
+    let shift = certificate_curvature_shift(hessian, measured_resolution);
     let mut chol = hessian.clone();
     for j in 0..n {
         chol[[j, j]] += shift;
@@ -2135,13 +2156,17 @@ pub(crate) fn interior_curvature_floor_clearance(
             .iter()
             .fold(f64::INFINITY, |acc, v| acc.min(*v))
     };
+    let measured_resolution =
+        measured_outer_curvature_resolution(hessian, excluded, gradient, invariance);
     Some(CurvatureFloorClearance {
         interior_min_eigenvalue,
         gradient_floor,
         floored_min_eigenvalue,
-        measured_resolution: measured_outer_curvature_resolution(
-            hessian, excluded, gradient, invariance,
-        ),
+        measured_resolution,
+        // The shift the verdict was decided at, from the SAME owner the PSD
+        // test calls and on the SAME block it tested, so the number recorded
+        // and the number applied cannot drift apart (#2748).
+        decided_at_resolution: certificate_curvature_shift(&floored_block, measured_resolution),
         cleared,
     })
 }

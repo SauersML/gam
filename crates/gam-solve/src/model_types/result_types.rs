@@ -948,6 +948,26 @@ pub struct CurvatureFloorClearance {
     /// historical `√ε·max(1, max|H_ii|)` arithmetic shift is what decided.
     #[serde(default)]
     pub measured_resolution: f64,
+    /// The shift the verdict was ACTUALLY decided at (#2748): the larger of
+    /// [`Self::measured_resolution`] and the arithmetic shift
+    /// `sqrt(eps)*max(max|H_ii|, 1)`.
+    ///
+    /// [`Self::measured_resolution`] is `0.0` whenever no identity could be
+    /// taken, and on a ρ-Hessian whose largest diagonal is under 1 the shift
+    /// that then decides is a flat `1.49e-8` — eight orders above the
+    /// eigensolver backward error a second layer would derive for itself.
+    /// Recording `0.0` for "the arithmetic shift decided" is the same defect
+    /// [`Self::floored_min_eigenvalue`] exists to fix one field earlier: the
+    /// quantity the decision was taken against was not on the record.
+    ///
+    /// Measured on gam#2748's `geo_disease` k=12 cell: `lambda_min(H+diag|g|)`
+    /// `= -1.129942e-8` cleared at `1.490116e-8`, and the smoothing correction
+    /// then refused the same direction at `2.191651e-16`.
+    ///
+    /// `#[serde(default)]` so a certificate serialized before this field
+    /// existed still deserializes; those carry no measurement here.
+    #[serde(default)]
+    pub decided_at_resolution: f64,
     /// Whether `H + diag(|g|)` is positive semidefinite on that sub-block.
     pub cleared: bool,
 }
@@ -1499,8 +1519,28 @@ impl OuterCriterionCertificate {
             None => "stationary".to_string(),
             Some(refusal) => refusal.to_string(),
         };
+        // A `psd=false` that was nonetheless admitted was admitted BY the
+        // gradient-residue floor, and the numbers that admitted it are already
+        // on the certificate — they were simply never rendered (#2748). A line
+        // reading `hessian_psd=NO ... → stationary` is unreadable without them,
+        // and the downstream smoothing correction re-judges the same direction
+        // and prints its OWN full ledger when it refuses; with both rendered the
+        // two standards can be compared in one log instead of inferred from two.
+        let curvature_detail = match (self.curvature, self.curvature_floor) {
+            (CurvatureEvidence::Measured { psd: false }, Some(clearance)) => format!(
+                " (cleared={} λ_min(H)={:.6e} λ_min(H+diag|g|)={:.6e} max_k|g_k|={:.6e} \
+                 measured_resolution={:.6e} decided_at={:.6e})",
+                clearance.cleared,
+                clearance.interior_min_eigenvalue,
+                clearance.floored_min_eigenvalue,
+                clearance.gradient_floor,
+                clearance.measured_resolution,
+                clearance.decided_at_resolution,
+            ),
+            _ => String::new(),
+        };
         format!(
-            "{stationarity} hessian_psd={} curvature_source={curvature_source} railed={} → {verdict}",
+            "{stationarity} hessian_psd={}{curvature_detail} curvature_source={curvature_source} railed={} → {verdict}",
             self.curvature, railed,
         )
     }

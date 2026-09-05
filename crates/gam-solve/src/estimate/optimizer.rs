@@ -3008,6 +3008,48 @@ where
         // stays unscaled.
         if beta_covariance_unscaled.is_some() {
             let no_outer_gradient = Array1::<f64>::zeros(0);
+            // #2748 -- THE RESOLUTION THE CERTIFICATE'S VERDICT WAS TAKEN AT.
+            //
+            // When the certificate admits a `psd = false` it does so by its
+            // gradient-residue floor, and the definiteness test behind that
+            // clearance is taken at a SHIFT: the larger of the measured
+            // `‖δH‖₂` and the arithmetic `√ε·max(max|H_ii|, 1)`. The second is
+            // what decides whenever no identity could be measured, and on a
+            // ρ-Hessian whose largest diagonal is under 1 it is a flat
+            // `1.490116e-8`.
+            //
+            // `invert_identified_rho_hessian` is about to re-judge the SAME
+            // direction at the SAME point, and derives its own resolution from
+            // its eigensolver's backward error -- `2.191651e-16` on the
+            // measured `geo_disease` k=12 cell, eight orders tighter. It then
+            // refused a direction (`λ_min(H+diag|g|) = -1.129942e-8`) the
+            // certificate had cleared, and the fit died between the two layers
+            // with "this is a genuine contradiction". It is not a contradiction;
+            // it is two standards. A verdict and the standard it was taken at
+            // have to travel together.
+            //
+            // Only a clearance that actually CLEARED contributes: a refusal
+            // carries no admission for this site to honour.
+            //
+            // Narrow on purpose: only a certificate whose curvature evidence is
+            // a MEASURED `psd = false` had a negative direction to admit, and
+            // only then is its clearance load-bearing. A fit whose Hessian is
+            // PSD outright cleared nothing, so it publishes nothing and this
+            // site's resolution is bit-unchanged — the widening reaches exactly
+            // the fits where the two layers can disagree, and no others.
+            let certificate_clearance_resolution = outer_result
+                .criterion_certificate
+                .as_ref()
+                .filter(|certificate| {
+                    matches!(
+                        certificate.curvature,
+                        crate::rho_optimizer::CurvatureEvidence::Measured { psd: false }
+                    )
+                })
+                .and_then(|certificate| certificate.curvature_floor)
+                .filter(|clearance| clearance.cleared)
+                .map(|clearance| clearance.decided_at_resolution)
+                .filter(|value| value.is_finite() && *value > 0.0);
             let measured_hessian_error: Vec<
                 gam_linalg::curvature_resolution::MeasuredHessianError,
             > = outer_result
@@ -3023,6 +3065,17 @@ where
                     )]
                 })
                 .unwrap_or_default();
+            let measured_hessian_error: Vec<
+                gam_linalg::curvature_resolution::MeasuredHessianError,
+            > = measured_hessian_error
+                .into_iter()
+                .chain(certificate_clearance_resolution.map(|value| {
+                    gam_linalg::curvature_resolution::MeasuredHessianError::new(
+                        "outer-certificate curvature-verdict shift (the resolution its own PSD                          test cleared this direction at)",
+                        value,
+                    )
+                }))
+                .collect();
             let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
                 &final_rho,
                 &lambdas,
@@ -3039,6 +3092,16 @@ where
                     .final_gradient
                     .as_ref()
                     .unwrap_or(&no_outer_gradient),
+                // #2748: the rho-Hessian the CERTIFICATE judged, so the
+                // correction can measure how far its own fresh assembly of the
+                // same object at the same point is from it. The gate inside
+                // re-judges a direction the certificate has already cleared;
+                // two assemblies of one mixed-partial object must agree, and
+                // the amount by which they do not is a measured component of
+                // the resolution that re-judgement is entitled to spend. Absent
+                // on a solver that tracks no Hessian, which is an absent
+                // measurement rather than a zero.
+                outer_result.final_hessian.as_ref(),
                 // #2748: the outer certificate does not only accept or refuse
                 // this point -- when it disputes a negative curvature it
                 // EVALUATES the criterion along that direction, and the

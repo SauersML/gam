@@ -1452,6 +1452,7 @@ pub(crate) fn compute_smoothing_correction(
     lambdas: &Array1<f64>,
     final_fit: &pirls::PirlsResult,
     outer_gradient: &Array1<f64>,
+    outer_hessian: Option<&Array2<f64>>,
     caller_measured_hessian_error: &[gam_linalg::curvature_resolution::MeasuredHessianError],
 ) -> SmoothingCorrectionComputation {
     use gam_linalg::faer_ndarray::FaerCholesky;
@@ -1712,6 +1713,62 @@ pub(crate) fn compute_smoothing_correction(
     //
     // Absent when the gradient cannot be re-evaluated, or when the outer
     // gradient was not supplied at all: an absent measurement stays absent.
+    // The FOURTH exactly-zero identity available here, and the one that measures
+    // the pair of ASSEMBLIES rather than either half (#2748).
+    //
+    // The outer certificate judged a ρ-Hessian at this ρ, from its own
+    // evaluation bundle, and accepted the point. `hessian_rho` was just
+    // assembled HERE, from a fresh bundle at the same ρ. Two assemblies of one
+    // mixed-partial object at one argument must return the same matrix — it is
+    // the same function of the same argument, exactly as for the gradient
+    // above — so whatever separates them is the inconsistency between the two
+    // assemblies. And that inconsistency is precisely the currency this site
+    // then spends: the gate below re-judges a direction the certificate has
+    // already cleared, so its resolution has to include how far the two
+    // assemblies of the judged matrix can be apart.
+    //
+    // Without it the gate judges against an eigensolver's backward error, which
+    // bounds the DECOMPOSITION and says nothing about the ASSEMBLY. Measured on
+    // #2748's `geo_disease` k=12 cell: the certificate reports `hessian_psd=NO`
+    // and returns `stationary` (its gradient-residue floor cleared the negative
+    // direction), and this site refuses the same point at
+    // `σ = −2.571e-4` against a bar of `2.571e-4` — an excess of order `1e-8`
+    // in a resolution ledger whose every other component measured exactly zero.
+    //
+    // The spectral norm is exact rather than bounded: both matrices are
+    // symmetric and `n_rho` is small, so the difference's largest-magnitude
+    // eigenvalue is a decomposition, not an estimate. An absent or
+    // differently-shaped outer Hessian yields an absent measurement, never a
+    // zero — the same discipline the gradient identity above follows.
+    let assembly_reevaluation_defect = outer_hessian
+        .filter(|outer| outer.nrows() == n_rho && outer.ncols() == n_rho)
+        .and_then(|outer| {
+            use faer::Side;
+            use gam_linalg::faer_ndarray::FaerEigh;
+            let mut difference = Array2::<f64>::zeros((n_rho, n_rho));
+            for i in 0..n_rho {
+                for j in 0..n_rho {
+                    difference[[i, j]] = 0.5
+                        * ((hessian_rho[[i, j]] - outer[[i, j]])
+                            + (hessian_rho[[j, i]] - outer[[j, i]]));
+                }
+            }
+            if difference.iter().any(|value| !value.is_finite()) {
+                return None;
+            }
+            difference
+                .eigh(Side::Lower)
+                .ok()
+                .map(|(values, _)| values.iter().fold(0.0_f64, |worst, v| worst.max(v.abs())))
+        })
+        .filter(|value| value.is_finite());
+    if let Some(defect) = assembly_reevaluation_defect {
+        log::info!(
+            "[RHO-HESSIAN] outer-vs-correction re-assembly defect ‖H_correction − H_outer‖₂ = {defect:.6e} \
+             (n_rho={n_rho}); this is a measured component of the curvature resolution the \
+             definiteness gate below judges against (#2748)"
+        );
+    }
     let gradient_reevaluation_defect = (!outer_gradient.is_empty())
         .then(|| reml_state.compute_gradient(final_rho).ok())
         .flatten()
@@ -1737,6 +1794,14 @@ pub(crate) fn compute_smoothing_correction(
                     "rho-Hessian symmetrization defect |(H - H')/2|_2",
                     symmetrization_defect,
                 )];
+            if let Some(defect) = assembly_reevaluation_defect {
+                components.push(
+                    gam_linalg::curvature_resolution::MeasuredHessianError::new(
+                        "outer-vs-correction rho-Hessian re-assembly defect |H_correction - H_outer|_2",
+                        defect,
+                    ),
+                );
+            }
             if let Some(defect) = gradient_reevaluation_defect {
                 components.push(
                     gam_linalg::curvature_resolution::MeasuredHessianError::new(

@@ -5599,6 +5599,9 @@ fn strict_curvature_requirement_does_not_reinterpret_floor_clearance_as_psd() {
             // non-negative.
             floored_min_eigenvalue: 0.05,
             measured_resolution: 0.0,
+            // With no measured identity the arithmetic shift decides; the
+            // fixture's deciding eigenvalue is well clear of it either way.
+            decided_at_resolution: f64::EPSILON.sqrt(),
             cleared: true,
         }),
     };
