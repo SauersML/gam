@@ -1,7 +1,27 @@
 name: Doctest census (#2732)
 
-# `cargo test --doc` runs in NO CI job (#2732). This is the measurement that has
-# to happen before any gate exists, and it is deliberately not a gate itself.
+# STALE HEADER CORRECTED 2026-09-05. This file used to open with "`cargo test
+# --doc` runs in NO CI job (#2732)", in the present tense, and that stopped
+# being true when the gate landed: `cross-check.yml`'s `doctest-gate` job runs
+# `scripts/doctest_gate.sh` (one `--workspace` pass) on every push, and it is
+# green. Reading this header at face value cost a dispatched 1h39m re-measure of
+# an already-gated, already-green surface before anyone checked `cross-check.yml`.
+# A comment that describes the world before a fix, written in the present tense,
+# is indistinguishable from a live finding.
+#
+# `scripts/doctest_red_crates.txt` is empty ON PURPOSE and is not an oversight:
+# the census (run 30696464338, 24 crates, 1h39m) found 25 failing doctests in
+# four crates, all one defect -- an indented ASCII-math block in a `///` comment
+# that rustdoc compiles as Rust -- and fixing 25 blocks was cheaper than carrying
+# a ledger for them. An empty ledger is not a ratchet, so the ratchet mode in
+# `scripts/doctest_ratchet.sh` is retained and unused. `scripts/doctest_ratchet.sh`
+# says all of this; this file did not, and this file is the one a reader opens
+# first because it is the one with `--census` in its name.
+#
+# WHAT THIS FILE IS STILL FOR: per-crate ATTRIBUTION, on `workflow_dispatch`
+# only. The gate answers "is the surface green"; it cannot say WHICH crate went
+# red, and at ~1h39m that attribution is a triage cost rather than a push cost.
+# Dispatch it when the gate goes red, not to find out whether it is.
 #
 # It exists separately from the rustdoc ratchet because they are different
 # commands over different surfaces -- `cargo doc --no-deps` generates docs,
