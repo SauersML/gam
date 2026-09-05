@@ -1,8 +1,11 @@
 //! Measure streamed gamma/frame convergence on a bounded prefix of an NPY corpus.
 //! Usage: block_stream_convergence corpus.npy rows atoms block_size topk epochs
 
-use gam_sae::sparse_dict::{BlockSparseConfig, BlockSparseStreamState};
-use ndarray::Array2;
+use gam_sae::sparse_dict::{
+    BlockSparseConfig, BlockSparseStreamState, block_sparse_dictionary_transform,
+};
+use ndarray::{Array2, ArrayView2};
+use rayon::prelude::*;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
@@ -11,6 +14,127 @@ use std::time::Instant;
 mod f16;
 #[path = "support/npy_header.rs"]
 mod npy_header;
+
+// Independently price the last proposal with the old and freshly chosen
+// supports. This separates frame descent from a discontinuity at a top-k tie.
+fn audit_proposal(
+    x: ArrayView2<'_, f32>,
+    before: ArrayView2<'_, f32>,
+    after: ArrayView2<'_, f32>,
+    gamma: f32,
+    config: &BlockSparseConfig,
+) -> Result<serde_json::Value, String> {
+    let b = config.block_size;
+    let route = |decoder| {
+        block_sparse_dictionary_transform(x, decoder, 1.0, b, config.block_topk, config.block_tile)
+    };
+    let (old_blocks, old_gates, _) = route(before)?;
+    let (new_blocks, new_gates, _) = route(after)?;
+    let row_stats: Vec<_> = (0..x.nrows())
+        .into_par_iter()
+        .map(|row| {
+            let project =
+                |decoder: ArrayView2<'_, f32>, blocks: &Array2<u32>, gates: &Array2<f32>| {
+                    let mut total = vec![0.0_f64; x.ncols()];
+                    for slot in 0..blocks.ncols() {
+                        if gates[[row, slot]] == 0.0 {
+                            continue;
+                        }
+                        let block = blocks[[row, slot]] as usize;
+                        for axis in 0..b {
+                            let direction = decoder.row(block * b + axis);
+                            let weight: f64 = direction
+                                .iter()
+                                .zip(x.row(row).iter())
+                                .map(|(&u, &v)| u as f64 * v as f64)
+                                .sum();
+                            for (out, &u) in total.iter_mut().zip(direction.iter()) {
+                                *out += weight * u as f64;
+                            }
+                        }
+                    }
+                    total
+                };
+            let old = project(before, &old_blocks, &old_gates);
+            let fixed = project(after, &old_blocks, &old_gates);
+            let fresh = project(after, &new_blocks, &new_gates);
+            let loss = |total: &[f64]| {
+                x.row(row)
+                    .iter()
+                    .zip(total)
+                    .map(|(&v, &p)| (v as f64 - gamma as f64 * p).powi(2))
+                    .sum::<f64>()
+            };
+            let mut old_support: Vec<_> = old_blocks
+                .row(row)
+                .iter()
+                .zip(old_gates.row(row).iter())
+                .filter_map(|(&block, &gate)| (gate != 0.0).then_some(block))
+                .collect();
+            let mut new_support: Vec<_> = new_blocks
+                .row(row)
+                .iter()
+                .zip(new_gates.row(row).iter())
+                .filter_map(|(&block, &gate)| (gate != 0.0).then_some(block))
+                .collect();
+            old_support.sort_unstable();
+            new_support.sort_unstable();
+            (
+                loss(&old),
+                loss(&fixed),
+                loss(&fresh),
+                usize::from(old_support != new_support),
+            )
+        })
+        .collect();
+    let frame_stats: Vec<_> = (0..config.n_blocks)
+        .into_par_iter()
+        .map(|block| {
+            let old = before
+                .slice(ndarray::s![block * b..(block + 1) * b, ..])
+                .mapv(f64::from);
+            let new = after
+                .slice(ndarray::s![block * b..(block + 1) * b, ..])
+                .mapv(f64::from);
+            let old_gram = old.dot(&old.t());
+            let new_gram = new.dot(&new.t());
+            let cross = old.dot(&new.t());
+            let squared = |a: &Array2<f64>| a.iter().map(|v| v * v).sum::<f64>();
+            let scale = squared(&old_gram) + squared(&new_gram);
+            let displacement = if scale == 0.0 {
+                0.0
+            } else {
+                ((scale - 2.0 * squared(&cross)).max(0.0) / scale).sqrt()
+            };
+            (block, displacement, old_gram, new_gram)
+        })
+        .collect();
+    let worst = frame_stats
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap();
+    let usage = (0..old_blocks.nrows())
+        .map(|row| {
+            (0..old_blocks.ncols())
+                .filter(|&slot| {
+                    old_gates[[row, slot]] != 0.0 && old_blocks[[row, slot]] as usize == worst.0
+                })
+                .count()
+        })
+        .sum::<usize>();
+    Ok(serde_json::json!({
+        "old_support_old_frames_rss": row_stats.iter().map(|v| v.0).sum::<f64>(),
+        "old_support_proposed_frames_rss": row_stats.iter().map(|v| v.1).sum::<f64>(),
+        "fresh_support_proposed_frames_rss": row_stats.iter().map(|v| v.2).sum::<f64>(),
+        "rows_changing_support": row_stats.iter().map(|v| v.3).sum::<usize>(),
+        "worst_projector_block": worst.0,
+        "worst_projector_residual": worst.1,
+        "worst_projector_block_usage": usage,
+        "worst_projector_old_gram": worst.2,
+        "worst_projector_new_gram": worst.3,
+        "gamma": gamma
+    }))
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -77,7 +201,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     )?;
     output.flush()?;
-    for _ in 0..epochs {
+    for epoch_index in 0..epochs {
+        let previous = (epoch_index + 1 == epochs).then(|| state.decoder().to_owned());
         let pass = Instant::now();
         state.partial_fit(x.view())?;
         let stream_seconds = pass.elapsed().as_secs_f64();
@@ -95,6 +220,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         )?;
         output.flush()?;
+        if let Some(previous) = previous {
+            let started = Instant::now();
+            let audit = audit_proposal(
+                x.view(),
+                previous.view(),
+                state.decoder(),
+                stats.gamma,
+                &config,
+            )?;
+            writeln!(
+                output,
+                "{}",
+                serde_json::json!({
+                    "proposal_audit": audit, "audit_seconds": started.elapsed().as_secs_f64()
+                })
+            )?;
+            output.flush()?;
+        }
         if stats.converged {
             let fit = state.finalize()?;
             writeln!(

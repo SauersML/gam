@@ -95,3 +95,26 @@ speedup. The original production shape and GPU utilization remain unverified.
 ```sh
 python plot.py qwen_2048_tied_32passes.jsonl qwen_2048_tied_32passes.png
 ```
+
+The convergence example also audits its final proposed frames, independently
+of the streaming moment algebra. It routes both the measured and proposed
+frames through the public transform, then recomputes f64 tied projections with
+the old and fresh supports at the same measured gamma. This audit runs after
+the timed pass and does not produce a fit artifact.
+
+`qwen_2048_support_audit.json` records the proposal after pass 32 of the same
+2,048-atom fixture:
+
+| Frames and supports, gamma fixed at 0.329039127 | RSS |
+|---|---:|
+| Measured frames, measured supports | 10606.237028 |
+| Proposed frames, measured supports | 10300.318308 |
+| Proposed frames, fresh top-k supports | 10578.837739 |
+
+85 of 512 rows change support. Rerouting gives back about 91% of the fixed-support
+improvement in this proposal. The largest projector displacement is 0.386485
+at block 491, which is selected on four rows; both its measured and proposed
+frame Grams are close to the identity. This identifies a significant routing
+cost and rules out gross loss of orthonormality for that block. It does not
+establish an asymptotic cycle or resolve the remaining convergence failure.
+The independent audit takes 0.189 seconds on the recorded four-worker CPU run.
