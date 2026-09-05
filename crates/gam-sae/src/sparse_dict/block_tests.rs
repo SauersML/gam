@@ -1021,3 +1021,24 @@ fn coordinate_partition_seed_fits_end_to_end() {
     assert_eq!(recon.dim(), (x.nrows(), p));
     assert!(recon.iter().map(|v| v * v).sum::<f32>() > 0.0);
 }
+
+#[test]
+fn tied_frame_stationarity_separates_normal_storage_error_from_tangent_signal_2825() {
+    let current = ndarray::array![[0.6_f32, 0.8, 0.0]];
+    let mut proposal = Array2::zeros((1, 3));
+    let second = Array2::zeros((1, 1));
+    for tangent in [0.0, 0.25] {
+        let mut action = ndarray::array![[1.8_f64], [2.4], [tangent]];
+        // Use the actual stored frame for an exactly normal action. Its norm
+        // differs from one after f32 serialization, which must not create a
+        // spurious tangent component.
+        action[[0, 0]] = 3.0 * current[[0, 0]] as f64;
+        action[[1, 0]] = 3.0 * current[[0, 1]] as f64;
+        let scale = action.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let measured = super::super::block_frame::polar_tied_frame_step(
+            current.view(), action.view_mut(), second.view(), 0.0, 1.0e30,
+            proposal.view_mut(),
+        ).unwrap();
+        assert!((measured - tangent / scale).abs() <= 16.0 * f64::EPSILON);
+    }
+}

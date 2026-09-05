@@ -1,6 +1,7 @@
 //! Shared polar step and stationarity certificate for tied block projectors.
 
 use crate::frames::GrassmannFrame;
+use gam_linalg::faer_ndarray::FaerCholesky;
 use ndarray::{Array2, ArrayView2, ArrayViewMut2};
 
 /// Increase the Rayleigh surrogate `tr(U' H U)` by polarizing `(H+sI)U`,
@@ -22,11 +23,29 @@ pub(super) fn polar_tied_frame_step(
     mut proposal: ArrayViewMut2<'_, f32>,
 ) -> Result<f64, String> {
     let (b, p) = current.dim();
-    let normal = Array2::from_shape_fn((b, b), |(axis, column)| {
+    if action.iter().all(|&value| value == 0.0) {
+        proposal.assign(&current);
+        return Ok(0.0);
+    }
+    let gram = Array2::from_shape_fn((b, b), |(axis, column)| {
+        (0..p)
+            .map(|feature| current[[axis, feature]] as f64 * current[[column, feature]] as f64)
+            .sum::<f64>()
+    });
+    let normal_rhs = Array2::from_shape_fn((b, b), |(axis, column)| {
         (0..p)
             .map(|feature| current[[axis, feature]] as f64 * action[[feature, column]])
             .sum::<f64>()
     });
+    // The stored f32 frame is only approximately orthonormal. UU' is therefore
+    // not its orthogonal projector: it leaks an O(u32) normal component into
+    // the purported tangent gradient even when the represented subspace is
+    // exactly invariant. Solve the tiny Gram system to apply U(U'U)^-1 U'.
+    // This removes normal leakage algebraically, without subtracting a tolerance.
+    let normal = gram
+        .cholesky(faer::Side::Lower)
+        .map_err(|error| format!("tied frame projector Gram factorization: {error}"))?
+        .solve_mat(&normal_rhs);
     let mut tangent_sq = 0.0;
     let mut conditional_sq = 0.0;
     for feature in 0..p {
