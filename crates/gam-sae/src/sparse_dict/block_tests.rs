@@ -68,6 +68,80 @@ fn make_decoder(n_blocks: usize, b: usize, p: usize, seed: u64) -> Array2<f32> {
     d
 }
 
+#[test]
+fn threaded_block_router_matches_scalar_oracle_on_strided_rows_and_tile_tails() {
+    let mut seed = 2826;
+    let storage = Array2::from_shape_fn((38, 62), |_| lcg(&mut seed));
+    let decoder_storage = Array2::from_shape_fn((34, 62), |_| lcg(&mut seed));
+    let decoder = decoder_storage.slice(ndarray::s![.., ..;2]);
+    for threads in [1, 2, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("bounded routing test pool");
+        pool.install(|| {
+            for rows in [0, 1, 19] {
+                let x = storage.slice(ndarray::s![..rows * 2;2, ..;2]);
+                let expected = crate::sparse_dict::block_scoring_gpu::route_blocks_cpu(
+                    x, decoder, 17, 2, 5,
+                );
+                for tile in [1, 5, 64] {
+                    let actual = route_block_minibatch(x, decoder, 17, 2, 5, tile);
+                    assert_eq!(actual.len(), expected.len());
+                    for (got, want) in actual.iter().zip(&expected) {
+                        assert_eq!(got.len(), want.len());
+                        for (&(block, gate), &(expected_block, expected_gate)) in got.iter().zip(want) {
+                            assert_eq!(block, expected_block, "threads={threads}, tile={tile}");
+                            assert!(
+                                (gate - expected_gate).abs() <= 32.0 * f32::EPSILON * expected_gate,
+                                "gate={gate}, expected={expected_gate}, threads={threads}, tile={tile}"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn block_router_parallel_partition_preserves_wide_dictionary_routes() {
+    let mut seed = 2826;
+    let rows = Array2::from_shape_fn((512, 2560), |_| lcg(&mut seed));
+    let decoder = Array2::from_shape_fn((2048, 2560), |_| lcg(&mut seed));
+    let mut reference: Option<Vec<Vec<(u32, f32)>>> = None;
+    for threads in [4, 1, 1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("bounded wide routing test pool");
+        let started = std::time::Instant::now();
+        let actual =
+            pool.install(|| route_block_minibatch(rows.view(), decoder.view(), 1024, 2, 8, 256));
+        eprintln!(
+            "block router: threads={threads}, seconds={:.6}",
+            started.elapsed().as_secs_f64()
+        );
+        assert_eq!(actual.len(), rows.nrows());
+        for shortlist in &actual {
+            assert_eq!(shortlist.len(), 8);
+        }
+        if let Some(expected) = reference.as_ref() {
+            for (got, want) in actual.iter().zip(expected) {
+                for (&(block, gate), &(expected_block, expected_gate)) in got.iter().zip(want) {
+                    assert_eq!(block, expected_block, "threads={threads}");
+                    assert!(
+                        (gate - expected_gate).abs() <= 32.0 * f32::EPSILON * expected_gate,
+                        "gate={gate}, expected={expected_gate}, threads={threads}"
+                    );
+                }
+            }
+        } else {
+            reference = Some(actual);
+        }
+    }
+}
+
 /// #2634 — two blocks selected on every row are the minimal witness that a
 /// stale, all-at-once (Jacobi) frame refresh is not alternating minimization.
 /// The production sweep is Gauss--Seidel and certifies the fixed-code RSS after

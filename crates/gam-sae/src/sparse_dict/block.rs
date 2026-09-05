@@ -351,7 +351,6 @@ impl BlockSparseFit {
         }
         out
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -533,27 +532,34 @@ pub(super) fn route_block_minibatch(
     let nb = block_rows.nrows();
     let mut selectors: Vec<TopSSelector> = (0..nb).map(|_| TopSSelector::new(k)).collect();
     let tile = block_tile.max(1);
-    let mut g0 = 0usize;
-    while g0 < n_blocks {
-        let g1 = (g0 + tile).min(n_blocks);
-        // Atom rows [g0·b, g1·b): a (tile·b)×P slab. Score block = B×(tile·b).
-        let atom_lo = g0 * b;
-        let atom_hi = g1 * b;
-        let slab = decoder.slice(ndarray::s![atom_lo..atom_hi, ..]);
-        let scores = block_rows.dot(&slab.t()); // B × ((g1-g0)·b)
-        for (row_idx, srow) in scores.axis_iter(Axis(0)).enumerate() {
-            for (local_g, g) in (g0..g1).enumerate() {
-                let base = local_g * b;
-                let mut e = 0.0f32;
-                for r in 0..b {
-                    let v = srow[base + r];
-                    e += v * v;
+    // ndarray's f32 GEMM is sequential in this workspace. Partition independent
+    // rows across the existing Rayon pool, keeping each selector with its row
+    // through every block tile. Concurrent score slabs still total at most
+    // B × (block_tile·b), and no nested worker pool or full B×K scores are needed.
+    let rows_per_worker = nb.div_ceil(rayon::current_num_threads()).max(1);
+    selectors
+        .par_chunks_mut(rows_per_worker)
+        .enumerate()
+        .for_each(|(chunk, row_selectors)| {
+            let row_lo = chunk * rows_per_worker;
+            let rows = block_rows.slice(ndarray::s![row_lo..row_lo + row_selectors.len(), ..]);
+            for g0 in (0..n_blocks).step_by(tile) {
+                let g1 = (g0 + tile).min(n_blocks);
+                let slab = decoder.slice(ndarray::s![g0 * b..g1 * b, ..]);
+                let scores = rows.dot(&slab.t());
+                for (selector, srow) in row_selectors.iter_mut().zip(scores.axis_iter(Axis(0))) {
+                    for (local_g, g) in (g0..g1).enumerate() {
+                        let base = local_g * b;
+                        let mut e = 0.0f32;
+                        for r in 0..b {
+                            let v = srow[base + r];
+                            e += v * v;
+                        }
+                        selector.offer(g as u32, e.sqrt());
+                    }
                 }
-                selectors[row_idx].offer(g as u32, e.sqrt());
             }
-        }
-        g0 = g1;
-    }
+        });
     selectors.into_iter().map(TopSSelector::finish).collect()
 }
 
@@ -824,8 +830,7 @@ fn refresh_frames(
             let z = &code.codes[slot * b..slot * b + b];
             for c in 0..p {
                 for r in 0..b {
-                    reconstruction[[row, c]] +=
-                        z[r] as f64 * decoder[[block * b + r, c]] as f64;
+                    reconstruction[[row, c]] += z[r] as f64 * decoder[[block * b + r, c]] as f64;
                 }
             }
         }
@@ -962,8 +967,7 @@ fn refresh_frames(
                         for c in 0..p {
                             for r in 0..b {
                                 reconstruction[[row, c]] += z[r] as f64
-                                    * (proposed[[r, c]] as f64
-                                        - decoder[[g * b + r, c]] as f64);
+                                    * (proposed[[r, c]] as f64 - decoder[[g * b + r, c]] as f64);
                             }
                         }
                     }
