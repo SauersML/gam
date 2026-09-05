@@ -168,6 +168,39 @@ Its source walk explicitly included the integration target. The separate
 tracked-file infrastructure and line-count checks still use the MSI index;
 the publication's CI gate supplies the exact committed-index verdict.
 
+## Nested derivative algebra: #932
+
+The public integration target `crates/gam-math/tests/nested_dual_recovery.rs`
+recovers four contracts without adding a production constructor or test-only
+trait bridge. A single smooth program is evaluated through the live `JetField`
+implementations of nested second-order `Dual2` and the dense fourth-order
+`Tower4`; their derivative propagation orders are independent.
+
+| Historical test identity | Executed replacement contract |
+| --- | --- |
+| `nested_dual2_reproduces_tower4_channels_932` | All nine represented channels agree with the dense tower at four points: value, both first derivatives, three second derivatives, two mixed third derivatives and the mixed fourth derivative. |
+| `nested_dual2_directional_matches_tower4_contraction_932` | Independently seeded arbitrary directions agree with explicit contractions of the tower's first, second and fourth derivative tensors at three points. |
+| `nested_dual2_seed_swap_symmetry_932` | Swapping inner and outer seeds preserves all nine channels under their corresponding index permutation, extending the historical four-channel check. |
+| `nested_dual2_channels_from_channels_roundtrip_932` | The deleted `from_channels` convenience constructor has no surviving API contract. `nested_dual2_channels_follow_polynomial_derivative_order_932` instead evaluates a polynomial whose analytic derivatives are exactly 1 through 9 in the documented channel order. This checks layout and repeated-derivative factorials independently of a getter/setter roundtrip. |
+
+All four tests passed on MSI: **4 passed, 0 failed, 0 ignored, 0 filtered**, in
+0.00 seconds after a 4.08-second warm integration build. The nine-channel maximum
+relative error was **3.718561e-16**, with mixed fourth-derivative magnitude
+**2.665960**. Directional contraction error was **2.220446e-16**, with fourth-order
+contribution **0.7515526**. Both fourth-order witnesses must exceed 0.1, and the
+comparison bar remains 1e-12. The polynomial channels equal `[1,2,3,4,5,6,7,8,9]`
+exactly. Executed source blob: `3672204465bfbec56340c0e5eceaad39c35875b4`;
+log: `.buildd/nested-dual-recovered-pins-2818.log`.
+
+The exercised `nested_dual.rs`, `jet_tower.rs` and `Tower4`'s `JetField`
+implementation match published main `90c4a32a04e3845d310fba9cb7b134e3ff4e21e8`.
+The MSI `jet_scalar.rs` also contains unrelated, preexisting differences in
+runtime weighted-composition methods; this target provides no verification of
+those separate methods or their tests.
+The freshly sourced umbrella scanner also passed on the MSI worktree with the
+new integration target present; the same committed-index limitation described
+above applies to its infrastructure and line-count checks.
+
 The remaining historical inventory is still open. A successful source census,
 or the restoration of these few contracts, does not establish that all 303
 historically deleted pinned identities have been recovered or retired.
