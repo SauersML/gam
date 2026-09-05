@@ -94,3 +94,17 @@ log label `smooth basis rebuild` times only `replace_term_realization`, after
 the actual local basis build, so its 0.17–0.22 seconds must not be mistaken for
 the whole basis-construction cost. The remaining local basis cost still needs
 an isolated measurement before another full-corpus run.
+
+The subsequent public basis-only probe measured the frozen local builder on
+the original 50,000 rows: 8.944621 seconds at log-kappa 5.686745, compared with
+2.809692 seconds for the cold collection at length scale 1. Dense
+materialization took less than two microseconds. This identifies the missing
+time inside that profiling working tree, but a source audit then found a
+second provenance difference: its basis implementation predates main's
+`9d822df1d` bound hybrid-kernel evaluator and `c50687375` chunked matrix
+multiplication. It also lacks main's universal Duchon radial-profile module.
+Therefore these basis and public-fit wall measurements do not establish a
+remaining performance defect on current main. The isolated Gram/RHS
+reduction comparison above does not call the basis builder and is unaffected
+by that difference. A current-main basis replay is still required before
+another original-corpus fit benchmark.
