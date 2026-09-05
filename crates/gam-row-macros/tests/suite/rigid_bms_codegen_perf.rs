@@ -88,7 +88,7 @@ struct Row {
     direction_v: [f64; 2],
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated(row: Row) -> Channels {
     let (value, gradient, hessian, []) = generated_rigid_bms_order2(
         row.marginal_eta,
@@ -106,7 +106,7 @@ fn generated(row: Row) -> Channels {
     (value, gradient, hessian)
 }
 
-#[inline(never)]
+#[inline(always)]
 fn strongest_hand(row: Row) -> Channels {
     let observed_slope = row.probit_scale * row.slope;
     let scale = (1.0 + observed_slope * observed_slope).sqrt();
@@ -134,14 +134,13 @@ fn strongest_hand(row: Row) -> Channels {
             ],
             [
                 cross,
-                outer_second * eta_slope * eta_slope
-                    + outer_first * row.marginal[0] * scale_second,
+                outer_second * eta_slope * eta_slope + outer_first * row.marginal[0] * scale_second,
             ],
         ],
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated_third(row: Row) -> [[f64; 2]; 2] {
     generated_rigid_bms_third_contracted(
         row.marginal_eta,
@@ -159,7 +158,7 @@ fn generated_third(row: Row) -> [[f64; 2]; 2] {
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated_fourth(row: Row) -> [[f64; 2]; 2] {
     generated_rigid_bms_fourth_contracted(
         row.marginal_eta,
@@ -178,7 +177,7 @@ fn generated_fourth(row: Row) -> [[f64; 2]; 2] {
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated_third_full(row: Row) -> [[[f64; 2]; 2]; 2] {
     generated_rigid_bms_third_full(
         row.marginal_eta,
@@ -195,7 +194,7 @@ fn generated_third_full(row: Row) -> [[[f64; 2]; 2]; 2] {
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated_fourth_full(row: Row) -> [[[[f64; 2]; 2]; 2]; 2] {
     generated_rigid_bms_fourth_full(
         row.marginal_eta,
@@ -254,7 +253,7 @@ fn contract2(derivative: &[f64; 3], left: [f64; 2], right: [f64; 2]) -> f64 {
         + derivative[2] * left[1] * right[1]
 }
 
-#[inline(never)]
+#[inline(always)]
 fn strongest_hand_third(row: Row) -> [[f64; 2]; 2] {
     let (outer, d1, d2, d3, _) = margin_chain(row);
     let margin_u = dot2(d1, row.direction_u);
@@ -274,7 +273,7 @@ fn strongest_hand_third(row: Row) -> [[f64; 2]; 2] {
     })
 }
 
-#[inline(never)]
+#[inline(always)]
 fn strongest_hand_fourth(row: Row) -> [[f64; 2]; 2] {
     let (outer, d1, d2, d3, d4) = margin_chain(row);
     let margin_u = dot2(d1, row.direction_u);
@@ -327,7 +326,7 @@ fn strongest_hand_fourth(row: Row) -> [[f64; 2]; 2] {
     })
 }
 
-#[inline(never)]
+#[inline(always)]
 fn strongest_hand_third_full(row: Row) -> [[[f64; 2]; 2]; 2] {
     let (outer, d1, d2, d3, _) = margin_chain(row);
     std::array::from_fn(|a| {
@@ -341,7 +340,7 @@ fn strongest_hand_third_full(row: Row) -> [[[f64; 2]; 2]; 2] {
     })
 }
 
-#[inline(never)]
+#[inline(always)]
 fn strongest_hand_fourth_full(row: Row) -> [[[[f64; 2]; 2]; 2]; 2] {
     let (outer, d1, d2, d3, d4) = margin_chain(row);
     std::array::from_fn(|a| {
@@ -470,11 +469,7 @@ fn matrix_pass(rows: &[Row], nudge: f64, evaluate: impl Fn(Row) -> [[f64; 2]; 2]
     fold
 }
 
-fn third_full_pass(
-    rows: &[Row],
-    nudge: f64,
-    evaluate: impl Fn(Row) -> [[[f64; 2]; 2]; 2],
-) -> f64 {
+fn third_full_pass(rows: &[Row], nudge: f64, evaluate: impl Fn(Row) -> [[[f64; 2]; 2]; 2]) -> f64 {
     let mut fold = 0.0;
     for row in rows {
         let mut perturbed = *row;

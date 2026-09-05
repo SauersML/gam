@@ -2087,20 +2087,6 @@ pub(super) fn rigid_standard_normal_fourth_full(
     ))
 }
 
-/// Combined uncontracted THIRD **and** FOURTH primary tensors for one rigid
-/// standard-normal row, read off a SINGLE shared `Tower4<2>` jet.
-///
-/// `rigid_standard_normal_third_full` (→ `.t3`) and
-/// `rigid_standard_normal_fourth_full` (→ `.t4`) each build a full
-/// `rigid_standard_normal_tower` and discard the OTHER tensor — so a consumer
-/// that needs both for the same `(row, β)` point (the outer Jeffreys/REML
-/// derivative path warms both the `rigid_third_full` and `rigid_fourth_full`
-/// caches in the same fit; see the paired `rigid_{third,fourth}_full_cached`
-/// warm-up) pays the per-row Mills-ratio transcendental
-/// (`signed_probit_neglog_unary_stack`, ~88% of the per-row scalar cost) TWICE
-/// where ONCE suffices. The two tensors are the `.t3` / `.t4` channels of the
-/// same tower, so this builder evaluates that tower ONCE and returns both.
-///
 /// Contract a symmetric 4-tensor on its last two indices with two
 /// primary-space directions `u = (u_eta, u_g)` and `v = (v_eta, v_g)`,
 /// producing the symmetric 2×2 matrix the outer-Hessian pipeline expects:
@@ -2345,16 +2331,12 @@ mod jet_tower_oracle_tests {
     //!
     //! The production rigid standard-normal row kernel
     //! ([`rigid_standard_normal_row_kernel`] / `_third_full` / `_fourth_full`)
-    //! reads value/grad/Hessian/third/fourth straight off ONE
-    //! `rigid_standard_normal_tower` `Tower4<2>` — the strongest #932 form,
-    //! where the production kernel literally *is* the single-expression jet.
-    //! What was missing (unlike the two survival `RowKernel` families, which
-    //! already carry `verify_kernel_channels` oracles) is an INDEPENDENT
-    //! cross-check that this production tower is correct. This module adds it:
+    //! evaluates schedules compiled from one row expression. The generic
+    //! `Tower4<2>` lowering supplies an independent arithmetic cross-check:
     //!
-    //! * an independent [`RowProgram<2>`] that writes the row NLL
+    //! * a generic [`RowProgram<2>`] that evaluates the row NLL
     //!   `ℓ = −w·logΦ((2y−1)·η)`, `η = q·√(1+(s·g)²) + s·g·z` ONCE over generic
-    //!   generic jet arithmetic (a different composition order than the fused
+    //!   jet arithmetic (a different composition order than the fused
     //!   production `signed` jet → exercises the Leibniz/Faà-di-Bruno layer
     //!   where the #736 cross-block sign-flip bug genus lives), and
     //! * a special-function-independent central-FD witness of the value channel
@@ -2364,7 +2346,7 @@ mod jet_tower_oracle_tests {
 
     use super::*;
 
-    use crate::bms::test_support::{rigid_standard_normal_tower};
+    use crate::bms::test_support::rigid_standard_normal_tower;
 
     #[test]
     fn signed_probit_stack_preserves_extreme_tail_derivatives_and_weight_sign() {
@@ -2389,71 +2371,34 @@ mod jet_tower_oracle_tests {
         assert_eq!(left[4], -0.0);
     }
 
-    /// #932 combined third+fourth primary tensors read off ONE shared
-    /// `rigid_standard_normal_tower` jet (the redundancy-free form of the
-    /// separate `_third_full` / `_fourth_full` builds, bit-identical to them).
-    /// Lives in this `#[cfg(test)]` module — its only consumers are the
-    /// bit-identity checks below — so it is not a production `src` item with no
-    /// production caller (production reads the separate builders) and is not dead
-    /// code in the non-test lib build.
-    fn rigid_standard_normal_third_and_fourth_full(
-        marginal: BernoulliMarginalLinkMap,
-        g: f64,
-        z: f64,
-        y: f64,
-        w: f64,
-        probit_scale: f64,
-    ) -> Result<([[[f64; 2]; 2]; 2], [[[[f64; 2]; 2]; 2]; 2]), String> {
-        let tower = rigid_standard_normal_tower(marginal, g, z, y, w, probit_scale)?;
-        Ok((tower.t3, tower.t4))
+    /// Independent floating-point schedules need numerical agreement, not bit
+    /// equality. Scale by one near zero to allow cancellation, and otherwise
+    /// by the channel magnitude. Reject non-finite values explicitly.
+    fn oracle_channel_error(actual: f64, expected: f64) -> f64 {
+        if !actual.is_finite() || !expected.is_finite() {
+            return f64::INFINITY;
+        }
+        (actual - expected).abs() / actual.abs().max(expected.abs()).max(1.0)
     }
 
-    /// The production row programs must reproduce the independent `Tower4<2>`
-    /// jet oracle.
-    ///
-    /// This test asserted BITWISE equality on the premise — true when #932 wrote
-    /// it — that `rigid_standard_normal_third_full` and
-    /// `rigid_standard_normal_fourth_full` each built a
-    /// `rigid_standard_normal_tower` themselves, so the combined builder could
-    /// only ever be a redundancy elimination over identical arithmetic. That
-    /// premise is gone. BOTH single-tensor builders now evaluate generated row
-    /// schedules (`rigid_standard_normal_program_{third,fourth}_full`) and do
-    /// not build a tower at all, while
-    /// `rigid_standard_normal_third_and_fourth_full` here is a TEST-ONLY oracle
-    /// reading `Tower4`. Two different evaluation schedules for one expression
-    /// are not a bitwise-equal pair, and the t4 half does in fact differ by one
-    /// ULP (`-0.10729419447530505` against `-0.10729419447530503`). The t3 half
-    /// still matches bitwise, but that is a coincidence of its schedule rather
-    /// than a contract, so pinning it as one would only make the next schedule
-    /// change look like a defect.
-    ///
-    /// What IS a contract — and what this pins — is that the generated
-    /// production lowering agrees with the independent exact jet oracle to a few
-    /// ULP. A real defect in a schedule (a dropped term, a wrong coefficient, a
-    /// mis-symmetrized index) moves an entry by orders of magnitude, not by an
-    /// ULP, so the bound below still catches one; the failure message reports
-    /// the offending entry and its observed deviation, so drift is legible
-    /// rather than merely red (gam#979).
+    /// Compare every tensor entry, including every symmetric permutation, to
+    /// the generic Taylor algebra. The compiler groups symmetric coefficients
+    /// before extraction; Tower4 applies Leibniz products in tensor order.
     #[test]
-    fn rigid_third_and_fourth_full_match_the_tower_oracle() {
-        // Two schedules for one expression agree to a handful of ULP. The
-        // observed worst case across this fixture is a single ULP; the bound sits
-        // four orders of magnitude above that, so ordinary schedule churn is not
-        // a failure, and still ~11 orders below the smallest departure that could
-        // plausibly be called a defect.
-        const ORACLE_SCHEDULE_TOL: f64 = 1e-13;
+    fn rigid_full_tower_matches_independent_algebra_932() {
+        const TOLERANCE: f64 = 32.0 * f64::EPSILON;
+        let mut worst_error = 0.0_f64;
         let eta = [0.3_f64, -0.7, 0.05, 0.9, -1.2, 2.1, -2.4];
         let g = [0.2_f64, -0.5, 0.35, -0.15, 0.6, 0.45, -0.55];
         let z = [0.4_f64, -1.1, 0.0, 0.7, -0.3, 1.6, -1.4];
         let y = [1.0_f64, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
         let w = [1.0_f64, 0.8, 1.3, 0.9, 1.1, 0.7, 1.4];
+        // This calibrated family supports only a probit marginal link.
+        let link = gam_problem::StandardLink::Probit;
         for &probit_scale in &[1.0_f64, 0.8] {
             for r in 0..eta.len() {
-                let marginal = bernoulli_marginal_link_map(
-                    &InverseLink::Standard(gam_problem::StandardLink::Probit),
-                    eta[r],
-                )
-                .expect("link map");
+                let marginal = bernoulli_marginal_link_map(&InverseLink::Standard(link), eta[r])
+                    .expect("link map");
                 let t3_sep = rigid_standard_normal_third_full(
                     marginal,
                     g[r],
@@ -2472,7 +2417,10 @@ mod jet_tower_oracle_tests {
                     probit_scale,
                 )
                 .expect("separate fourth");
-                let (t3_comb, t4_comb) = rigid_standard_normal_third_and_fourth_full(
+                let tower =
+                    rigid_standard_normal_tower(marginal, g[r], z[r], y[r], w[r], probit_scale)
+                        .expect("independent tower");
+                let (value, gradient, hessian) = rigid_standard_normal_row_kernel(
                     marginal,
                     g[r],
                     z[r],
@@ -2480,42 +2428,56 @@ mod jet_tower_oracle_tests {
                     w[r],
                     probit_scale,
                 )
-                .expect("combined third+fourth");
-                // Agreement between two evaluation schedules for the same
-                // expression, on a scale that does not blow up as an entry
-                // approaches zero.
-                let deviation = |lhs: f64, rhs: f64| -> f64 {
-                    (lhs - rhs).abs() / (1.0 + lhs.abs().max(rhs.abs()))
+                .expect("generated value/gradient/Hessian");
+                let mut check = |actual, expected, channel: String| {
+                    let error = oracle_channel_error(actual, expected);
+                    worst_error = worst_error.max(error);
+                    assert!(
+                        error <= TOLERANCE,
+                        "{channel} link {link:?} row {r} scale {probit_scale}: generated={actual:.17e} \
+                         tower={expected:.17e}, scaled error={error:.3e}, bound={TOLERANCE:.3e}"
+                    );
                 };
+                check(value, tower.v, "value".to_owned());
                 for a in 0..2 {
+                    check(gradient[a], tower.g[a], format!("gradient[{a}]"));
                     for b in 0..2 {
+                        check(hessian[a][b], tower.h[a][b], format!("hessian[{a}][{b}]"));
                         for c in 0..2 {
-                            let dev3 = deviation(t3_comb[a][b][c], t3_sep[a][b][c]);
-                            assert!(
-                                dev3 < ORACLE_SCHEDULE_TOL,
-                                "t3[{a}][{b}][{c}] row {r} scale {probit_scale}: generated \
-                                 schedule departs from the Tower4 oracle: program={}, \
-                                 oracle={}, deviation={dev3:.3e} (bound \
-                                 {ORACLE_SCHEDULE_TOL:.1e})",
+                            check(
                                 t3_sep[a][b][c],
-                                t3_comb[a][b][c],
+                                tower.t3[a][b][c],
+                                format!("t3[{a}][{b}][{c}]"),
                             );
                             for d in 0..2 {
-                                let dev4 = deviation(t4_comb[a][b][c][d], t4_sep[a][b][c][d]);
-                                assert!(
-                                    dev4 < ORACLE_SCHEDULE_TOL,
-                                    "t4[{a}][{b}][{c}][{d}] row {r} scale {probit_scale}: \
-                                     generated schedule departs from the Tower4 oracle: \
-                                     program={}, oracle={}, deviation={dev4:.3e} (bound \
-                                     {ORACLE_SCHEDULE_TOL:.1e})",
+                                check(
                                     t4_sep[a][b][c][d],
-                                    t4_comb[a][b][c][d],
+                                    tower.t4[a][b][c][d],
+                                    format!("t4[{a}][{b}][{c}][{d}]"),
                                 );
                             }
                         }
                     }
                 }
             }
+        }
+        eprintln!(
+            "RIGID-TENSOR-ORACLE-932 worst_scaled_error={worst_error:.3e} bound={TOLERANCE:.3e}"
+        );
+    }
+
+    #[test]
+    fn tensor_oracle_rejects_wrong_channels_and_nonfinite_values_932() {
+        let tolerance = 32.0 * f64::EPSILON;
+        for (actual, expected) in [
+            (f64::NAN, f64::NAN),
+            (f64::INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, 0.0),
+            (1.0, -1.0),
+            (0.0, 1.0e-8),
+            (1.0 + 1.0e-8, 1.0),
+        ] {
+            assert!(oracle_channel_error(actual, expected) > tolerance);
         }
     }
 

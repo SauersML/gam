@@ -5136,7 +5136,7 @@ mod patterned_order2_perf_tests {
         let entry_exp = (-p[7]).exp();
         let exit_exp = (-p[6]).exp();
 
-        let mut value = kernel.w * kernel.log_s0;
+        let u0_value = kernel.w * kernel.log_s0;
         let u0_first = -kernel.w * kernel.r0;
         let u0_second = -kernel.w * kernel.dr0;
 
@@ -5155,6 +5155,19 @@ mod patterned_order2_perf_tests {
         // a finite zero, so a weight-gated schedule is not one production could
         // ship and its saving is the guard it is missing
         // (`the_hand_carries_productions_activity_contract_932`).
+        //
+        // The ENTRY term is on that contract too, and was the one term still
+        // composed unconditionally: an UNTRUNCATED row carries an exactly zero
+        // `u0` stack with a nonzero weight, and its entry index jet overflows
+        // whenever `exp(-eta_ls_entry)` does. Production skips the term; a hand
+        // that composes it forms the same `0 * inf`
+        // (`every_inactive_sls_term_skips_overflowing_index_channels_932`).
+        let u0_active = u0_value != 0.0 || u0_first != 0.0 || u0_second != 0.0;
+        let mut value = 0.0;
+        if u0_active {
+            value += u0_value;
+        }
+
         let mut u1_value = 0.0;
         let mut u1_first = 0.0;
         let mut u1_second = 0.0;
@@ -5195,9 +5208,11 @@ mod patterned_order2_perf_tests {
         let g8 = exit_exp * p[3];
 
         let mut gradient = [0.0; SLS_ROW_K];
-        gradient[0] = u0_first;
-        gradient[4] = u0_first * u0_g4;
-        gradient[7] = u0_first * u0_g7;
+        if u0_active {
+            gradient[0] = u0_first;
+            gradient[4] = u0_first * u0_g4;
+            gradient[7] = u0_first * u0_g7;
+        }
         if u1_active {
             gradient[1] += u1_first;
             gradient[3] += u1_first * u1_g3;
@@ -5222,12 +5237,14 @@ mod patterned_order2_perf_tests {
             }};
         }
 
-        symmetric!(0, 0, u0_second);
-        symmetric!(0, 4, u0_second * u0_g4);
-        symmetric!(0, 7, u0_second * u0_g7);
-        symmetric!(4, 4, u0_second * u0_g4 * u0_g4);
-        symmetric!(4, 7, u0_second * u0_g4 * u0_g7 + u0_first * entry_exp);
-        symmetric!(7, 7, u0_second * u0_g7 * u0_g7 - u0_first * u0_g7);
+        if u0_active {
+            symmetric!(0, 0, u0_second);
+            symmetric!(0, 4, u0_second * u0_g4);
+            symmetric!(0, 7, u0_second * u0_g7);
+            symmetric!(4, 4, u0_second * u0_g4 * u0_g4);
+            symmetric!(4, 7, u0_second * u0_g4 * u0_g7 + u0_first * entry_exp);
+            symmetric!(7, 7, u0_second * u0_g7 * u0_g7 - u0_first * u0_g7);
+        }
 
         if u1_active {
             symmetric!(1, 1, u1_second);
@@ -5508,6 +5525,73 @@ mod patterned_order2_perf_tests {
             std::array::from_fn(|axis| Order2::variable(p[axis], axis));
         let out = sls_row_nll(&vars, kernel).expect("dense row NLL");
         out.into_channels()
+    }
+
+    #[test]
+    fn every_inactive_sls_term_skips_overflowing_index_channels_932() {
+        for term in ["entry", "exit", "event"] {
+            let (mut p, mut kernel) = fixture();
+            assert!(kernel.w > 0.0);
+            match term {
+                "entry" => {
+                    kernel.log_s0 = 0.0;
+                    kernel.r0 = 0.0;
+                    kernel.dr0 = 0.0;
+                    kernel.ddr0 = 0.0;
+                    kernel.dddr0 = 0.0;
+                    p[4] = p[4].abs();
+                    p[7] = -1000.0;
+                    assert!((-p[7]).exp().is_infinite());
+                    assert_eq!(p[0] - p[4] * (-p[7]).exp(), f64::NEG_INFINITY);
+                }
+                "exit" => {
+                    kernel.d = 0.0;
+                    kernel.log_s1 = 0.0;
+                    kernel.r1 = 0.0;
+                    kernel.dr1 = 0.0;
+                    kernel.ddr1 = 0.0;
+                    kernel.dddr1 = 0.0;
+                    p[6] = -1000.0;
+                    assert!((-p[6]).exp().is_infinite());
+                    assert!(sls_outer_plan::<3>(&kernel).u1.is_some());
+                }
+                "event" => {
+                    kernel.log_g = 0.0;
+                    kernel.d_log_g = 0.0;
+                    kernel.d2_log_g = 0.0;
+                    kernel.d3_log_g = 0.0;
+                    kernel.d4_log_g = 0.0;
+                    p[8] = f64::INFINITY;
+                    assert!(sls_outer_plan::<3>(&kernel).g.is_some());
+                }
+                _ => unreachable!(),
+            }
+            let expected = dense(&fixture().0, &kernel);
+            for (name, actual) in [
+                ("generated", sls_row_vgh_generated(&p, &kernel)),
+                ("hand", sls_row_vgh_fused(&p, &kernel)),
+                ("tower", dense(&p, &kernel)),
+            ] {
+                let check = |actual: f64, expected: f64, channel: &str| {
+                    let tolerance = 32.0 * f64::EPSILON * expected.abs().max(1.0);
+                    assert!(
+                        actual.is_finite() && (actual - expected).abs() <= tolerance,
+                        "{term} {name} {channel}: {actual} != {expected}"
+                    );
+                };
+                check(actual.0, expected.0, "value");
+                for i in 0..SLS_ROW_K {
+                    check(actual.1[i], expected.1[i], &format!("gradient[{i}]"));
+                    for j in 0..SLS_ROW_K {
+                        check(
+                            actual.2[i][j],
+                            expected.2[i][j],
+                            &format!("hessian[{i}][{j}]"),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn patterned(

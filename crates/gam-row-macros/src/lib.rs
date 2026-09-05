@@ -16,12 +16,12 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Literal, Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{
-    BinOp, Expr, ExprBinary, ExprGroup, ExprLit, ExprParen, ExprPath, ExprUnary, Lit,
-    Result, Token, UnOp, Visibility, braced, bracketed, parenthesized, parse_macro_input,
+    BinOp, Expr, ExprBinary, ExprGroup, ExprLit, ExprParen, ExprPath, ExprUnary, Lit, Result,
+    Token, UnOp, Visibility, braced, bracketed, parenthesized, parse_macro_input,
 };
 
 mod row_program;
@@ -269,6 +269,18 @@ impl Graph {
         if let (Some(left), Some(right)) = (self.constant_value(left), self.constant_value(right)) {
             return self.constant(left + right);
         }
+        if let (Node::Neg(left), Node::Neg(right)) =
+            (self.nodes[left].clone(), self.nodes[right].clone())
+        {
+            let sum = self.add(left, right);
+            return self.neg(sum);
+        }
+        if let Node::Neg(value) = self.nodes[left] {
+            return self.sub(right, value);
+        }
+        if let Node::Neg(value) = self.nodes[right] {
+            return self.sub(left, value);
+        }
         if let Node::Sub(value, removed) = self.nodes[left]
             && removed == right
         {
@@ -317,6 +329,22 @@ impl Graph {
         }
         if self.constant_value(right) == Some(-1.0) {
             return self.neg(left);
+        }
+        // Give negative coefficients the same sign representation as unary
+        // negation, so shared signed channels cancel their signs exactly.
+        if let Some(coefficient) = self.constant_value(left)
+            && coefficient < 0.0
+        {
+            let magnitude = self.constant(-coefficient);
+            let product = self.mul(magnitude, right);
+            return self.neg(product);
+        }
+        if let Some(coefficient) = self.constant_value(right)
+            && coefficient < 0.0
+        {
+            let magnitude = self.constant(-coefficient);
+            let product = self.mul(left, magnitude);
+            return self.neg(product);
         }
         if let Node::Neg(inner) = self.nodes[left] {
             let product = self.mul(inner, right);
@@ -809,16 +837,18 @@ impl Graph {
         result
     }
 
-    /// Every at-zero channel of one lowering as a Horner schedule, all over
-    /// ONE parameter order, chosen to minimise the multiply count of the
-    /// whole lowering.
+    /// Lower the at-zero channels together, counting shared work across the
+    /// entire output. Start with the best common Horner order, then improve
+    /// individual channels against that shared graph: one parameter order can
+    /// prevent otherwise compatible products from being shared by different
+    /// channels.
     ///
     /// Horner's rule is per channel, and which products two channels share
     /// depends on the variable order: with the observation weight outermost
     /// every channel ends in its own `w * (...)`, while an order that nests
     /// the weight inside lets `w * r`, `w * q` and `w * k` be one node each
     /// (the hand kernel of the Gaussian joint row names exactly those). The
-    /// order is not a heuristic: every order of the parameters is emitted on
+    /// initial order is exhaustive: every order of the parameters is emitted on
     /// a scratch copy of the graph and the one with the fewest distinct
     /// multiplies (then the fewest additions, then the declaration order)
     /// is kept. At most 720 orders for six parameters; a lowering with more
@@ -830,16 +860,265 @@ impl Graph {
             .map(|&id| self.polynomial(id, parameter_count, &mut memo))
             .collect::<Vec<_>>();
         let order = self.horner_order(&polynomials, parameter_count);
-        ids.iter()
+        let mut roots = ids
+            .iter()
             .zip(&polynomials)
             .map(|(&id, polynomial)| match polynomial {
                 Some(polynomial) => self.polynomial_horner(polynomial, &order),
                 None => id,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if parameter_count <= 6 {
+            self.extract_shared_monomials(&polynomials, &mut roots, parameter_count);
+            loop {
+                let mut improved = false;
+                for (index, polynomial) in polynomials.iter().enumerate() {
+                    let Some(polynomial) = polynomial else {
+                        continue;
+                    };
+                    // Symmetric duplicate channels must keep one shared root.
+                    if polynomials[..index]
+                        .iter()
+                        .any(|other| other.as_ref() == Some(polynomial))
+                    {
+                        continue;
+                    }
+                    let copies = polynomials
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, other)| {
+                            (other.as_ref() == Some(polynomial)).then_some(slot)
+                        })
+                        .collect::<Vec<_>>();
+                    let mut best_cost = self.polynomial_schedule_cost(&roots);
+                    let maximum_depth = best_cost.2;
+                    let mut best_root = roots[index];
+                    let mut expressions = vec![(None, polynomial.clone())];
+                    // An output can itself be a useful common subexpression.
+                    // For example, a scale Hessian contains its scale gradient
+                    // plus a lower-degree correction. Expanding both into
+                    // separate Horner trees would discard that shared work.
+                    for (other_index, other) in polynomials.iter().enumerate() {
+                        let Some(other) = other else {
+                            continue;
+                        };
+                        if other == polynomial {
+                            continue;
+                        }
+                        let Some((leading_powers, leading_coefficient)) = other.iter().next()
+                        else {
+                            continue;
+                        };
+                        for (powers, coefficient) in polynomial {
+                            let Some(shift) = powers
+                                .iter()
+                                .zip(leading_powers)
+                                .map(|(power, leading)| power.checked_sub(*leading))
+                                .collect::<Option<Vec<_>>>()
+                            else {
+                                continue;
+                            };
+                            let scale = coefficient / leading_coefficient;
+                            if !scale.is_finite() {
+                                continue;
+                            }
+                            let mut remainder = polynomial.clone();
+                            let mut exact_subset = true;
+                            for (other_powers, other_coefficient) in other {
+                                let shifted = other_powers
+                                    .iter()
+                                    .zip(&shift)
+                                    .map(|(power, shift)| power + shift)
+                                    .collect::<Vec<_>>();
+                                if remainder.get(&shifted).copied()
+                                    != Some(scale * other_coefficient)
+                                {
+                                    exact_subset = false;
+                                    break;
+                                }
+                                remainder.remove(&shifted);
+                            }
+                            if exact_subset {
+                                let multiplier =
+                                    [(shift, scale)].into_iter().collect::<Polynomial>();
+                                expressions
+                                    .push((Some((roots[other_index], multiplier)), remainder));
+                            }
+                        }
+                    }
+                    let mut candidate_order = (0..parameter_count).collect::<Vec<_>>();
+                    loop {
+                        for (shared, remainder) in &expressions {
+                            let remainder = self.polynomial_horner(remainder, &candidate_order);
+                            let candidate = match shared {
+                                Some((shared, multiplier)) => {
+                                    let multiplier =
+                                        self.polynomial_horner(multiplier, &candidate_order);
+                                    let product = self.mul(*shared, multiplier);
+                                    self.add(product, remainder)
+                                }
+                                None => remainder,
+                            };
+                            let mut candidate_roots = roots.clone();
+                            for &slot in &copies {
+                                candidate_roots[slot] = candidate;
+                            }
+                            let cost = self.polynomial_schedule_cost(&candidate_roots);
+                            if cost < best_cost && cost.2 <= maximum_depth {
+                                best_cost = cost;
+                                best_root = candidate;
+                            }
+                        }
+                        if !next_permutation(&mut candidate_order) {
+                            break;
+                        }
+                    }
+                    if best_root != roots[index] {
+                        for &slot in &copies {
+                            roots[slot] = best_root;
+                        }
+                        improved = true;
+                    }
+                }
+                // Every accepted replacement strictly lowers the tuple of
+                // nonnegative integer costs, so this reaches a fixed point.
+                if !improved {
+                    break;
+                }
+            }
+        }
+        roots
     }
 
-    fn horner_order(&self, polynomials: &[Option<Polynomial>], parameter_count: usize) -> Vec<usize> {
+    /// Introduce common products in all affected outputs together. A product
+    /// such as w*q can cost one extra operation in the first rewritten output
+    /// and save two in the next; independent channel improvements cannot cross
+    /// that barrier. Monomial gcds expose those joint factoring opportunities.
+    fn extract_shared_monomials(
+        &mut self,
+        polynomials: &[Option<Polynomial>],
+        roots: &mut Vec<usize>,
+        parameter_count: usize,
+    ) {
+        let terms = polynomials
+            .iter()
+            .flatten()
+            .flat_map(|polynomial| polynomial.keys())
+            .collect::<Vec<_>>();
+        let mut factors = BTreeSet::new();
+        for (index, left) in terms.iter().enumerate() {
+            for right in &terms[index + 1..] {
+                let factor = left
+                    .iter()
+                    .zip(*right)
+                    .map(|(a, b)| (*a).min(*b))
+                    .collect::<Vec<_>>();
+                if factor.iter().sum::<usize>() >= 2 {
+                    factors.insert(factor);
+                }
+            }
+        }
+        loop {
+            let initial_cost = self.polynomial_schedule_cost(roots);
+            let mut best_cost = initial_cost;
+            let mut best_roots = roots.clone();
+            for factor in &factors {
+                let split = polynomials
+                    .iter()
+                    .map(|polynomial| {
+                        polynomial.as_ref().map(|polynomial| {
+                            let mut quotient = Polynomial::new();
+                            let mut remainder = Polynomial::new();
+                            for (powers, coefficient) in polynomial {
+                                if let Some(powers) = powers
+                                    .iter()
+                                    .zip(factor)
+                                    .map(|(power, factor)| power.checked_sub(*factor))
+                                    .collect::<Option<Vec<_>>>()
+                                {
+                                    quotient.insert(powers, *coefficient);
+                                } else {
+                                    remainder.insert(powers.clone(), *coefficient);
+                                }
+                            }
+                            (quotient, remainder)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let factor_polynomial = [(factor.clone(), 1.0)].into_iter().collect::<Polynomial>();
+                let mut order = (0..parameter_count).collect::<Vec<_>>();
+                loop {
+                    let shared = self.polynomial_horner(&factor_polynomial, &order);
+                    let mut candidate = roots.clone();
+                    for (slot, split) in split.iter().enumerate() {
+                        let Some((quotient, remainder)) = split else {
+                            continue;
+                        };
+                        if quotient.is_empty() {
+                            continue;
+                        }
+                        let quotient = self.polynomial_horner(quotient, &order);
+                        let remainder = self.polynomial_horner(remainder, &order);
+                        let product = self.mul(shared, quotient);
+                        candidate[slot] = self.add(product, remainder);
+                    }
+                    let cost = self.polynomial_schedule_cost(&candidate);
+                    if cost < best_cost && cost.2 <= initial_cost.2 {
+                        best_cost = cost;
+                        best_roots = candidate;
+                    }
+                    if !next_permutation(&mut order) {
+                        break;
+                    }
+                }
+            }
+            if best_cost == initial_cost {
+                break;
+            }
+            *roots = best_roots;
+        }
+    }
+
+    /// Sharing is useful only when it does not lengthen the longest serial
+    /// arithmetic chain. Negation is a sign bit operation, not an arithmetic
+    /// dependency stage. Total output depth breaks otherwise equal choices.
+    fn polynomial_schedule_cost(&self, roots: &[usize]) -> (usize, usize, usize, usize) {
+        fn depth(graph: &Graph, id: usize, memo: &mut HashMap<usize, usize>) -> usize {
+            if let Some(&depth) = memo.get(&id) {
+                return depth;
+            }
+            let result = if is_leaf(graph, id) {
+                0
+            } else {
+                let inputs = children(graph, id)
+                    .into_iter()
+                    .map(|child| depth(graph, child, memo))
+                    .max()
+                    .unwrap_or(0);
+                inputs + usize::from(!matches!(graph.nodes[id], Node::Neg(_)))
+            };
+            memo.insert(id, result);
+            result
+        }
+        let mut memo = HashMap::new();
+        let depths = roots
+            .iter()
+            .map(|&id| depth(self, id, &mut memo))
+            .collect::<Vec<_>>();
+        let (multiplies, additions) = self.operation_count(roots);
+        (
+            multiplies,
+            additions,
+            depths.iter().copied().max().unwrap_or(0),
+            depths.iter().sum(),
+        )
+    }
+
+    fn horner_order(
+        &self,
+        polynomials: &[Option<Polynomial>],
+        parameter_count: usize,
+    ) -> Vec<usize> {
         let declaration = (0..parameter_count).collect::<Vec<_>>();
         if parameter_count > 6 || polynomials.iter().all(Option::is_none) {
             return declaration;
@@ -891,8 +1170,7 @@ impl Graph {
                 | Node::Ln(value)
                 | Node::Sqrt(value)
                 | Node::Recip(value) => stack.push(value),
-                Node::Select(activity, when_true, when_false) => {
-                    stack.push(activity);
+                Node::Select(_, when_true, when_false) => {
                     stack.push(when_true);
                     stack.push(when_false);
                 }
@@ -997,8 +1275,20 @@ impl Graph {
                 while end < factors.len() && factors[end] == factor {
                     end += 1;
                 }
-                let power = self.positive_integer_power(factor, end - cursor);
-                term = self.mul(term, power);
+                let exponent = end - cursor;
+                if exponent % 2 == 0 && !self.is_one(term) {
+                    // Keep the coefficient in the product instead of forming
+                    // the full unweighted square first. For finite c and h,
+                    // (c*h)*h avoids the spurious overflow/underflow of
+                    // c*(h*h), at the same multiplication count. The half
+                    // power remains interned and shared across channels.
+                    let half = self.positive_integer_power(factor, exponent / 2);
+                    term = self.mul(term, half);
+                    term = self.mul(term, half);
+                } else {
+                    let power = self.positive_integer_power(factor, exponent);
+                    term = self.mul(term, power);
+                }
                 cursor = end;
             }
             sum = self.add(sum, term);
@@ -1175,7 +1465,10 @@ fn graph_expression(
                 ));
             }
             let argument = graph_expression(&call.args[0], primaries, constants, graph)?;
-            let node = match row_program::bare_call_name(call, "row_atom unary calls")?.to_string().as_str() {
+            let node = match row_program::bare_call_name(call, "row_atom unary calls")?
+                .to_string()
+                .as_str()
+            {
                 "exp" => graph.exp(argument),
                 "ln" => graph.ln(argument),
                 "sqrt" => graph.sqrt(argument),
@@ -1447,6 +1740,37 @@ impl<'a> Scheduler<'a> {
         for &root in roots {
             self.survey(root);
         }
+        // A divide independent of a transcendental call can overlap that
+        // call's instruction stream. In particular, schedule the derivative
+        // reciprocal before ln(value), rather than serializing it afterward.
+        // Survey stops at activity gates, so this never hoists guarded work
+        // out of the lexical branch in which it is valid.
+        fn call_free(graph: &Graph, id: usize, memo: &mut HashMap<usize, bool>) -> bool {
+            if let Some(&result) = memo.get(&id) {
+                return result;
+            }
+            let result = !matches!(
+                graph.nodes[id],
+                Node::Exp(_) | Node::Ln(_) | Node::Select(..)
+            ) && children(graph, id)
+                .into_iter()
+                .all(|child| call_free(graph, child, memo));
+            memo.insert(id, result);
+            result
+        }
+        let mut divisions = self
+            .unconditional
+            .iter()
+            .copied()
+            .filter(|&id| matches!(self.graph.nodes[id], Node::Div(..) | Node::Recip(_)))
+            .collect::<Vec<_>>();
+        divisions.sort_unstable();
+        let mut memo = HashMap::new();
+        for id in divisions {
+            if call_free(self.graph, id, &mut memo) {
+                self.visit(id)?;
+            }
+        }
         for &root in roots {
             self.visit(root)?;
         }
@@ -1565,16 +1889,23 @@ impl<'a> Scheduler<'a> {
             true_roots.push(when_true);
             false_roots.push(when_false);
         }
-        let true_definitions =
-            Scheduler::new(self.graph, self.primaries, self.constants, self.defined.clone())
-                .run(&true_roots)?;
-        let false_definitions =
-            Scheduler::new(self.graph, self.primaries, self.constants, self.defined.clone())
-                .run(&false_roots)?;
+        let true_definitions = Scheduler::new(
+            self.graph,
+            self.primaries,
+            self.constants,
+            self.defined.clone(),
+        )
+        .run(&true_roots)?;
+        let false_definitions = Scheduler::new(
+            self.graph,
+            self.primaries,
+            self.constants,
+            self.defined.clone(),
+        )
+        .run(&false_roots)?;
         let reference = |id| node_reference(id, self.graph, self.primaries, self.constants);
         let true_values: Vec<TokenStream2> = true_roots.iter().map(|&id| reference(id)).collect();
-        let false_values: Vec<TokenStream2> =
-            false_roots.iter().map(|&id| reference(id)).collect();
+        let false_values: Vec<TokenStream2> = false_roots.iter().map(|&id| reference(id)).collect();
         let names: Vec<Ident> = members
             .iter()
             .map(|select| format_ident!("__row_atom_{select}"))
@@ -1739,7 +2070,27 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
                 .collect::<Vec<_>>();
             (value, gradient, hessian)
         } else {
-            (value, gradient.clone(), hessian.clone())
+            // The Hessian must expose the same weighted products as the
+            // gradient. For example, w*r*r shares w*r with d[-w ln(x)]/dx;
+            // retaining w*(r*r) computes an extra multiply for the pair.
+            let hessian = hessian
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|&id| {
+                            // Keep an outer sign outside its gate, so value, gradient
+                            // and Hessian can still share one selected contribution.
+                            if let Node::Neg(value) = graph.nodes[id] {
+                                let value = graph.normalize_ring(value);
+                                graph.neg(value)
+                            } else {
+                                graph.normalize_ring(id)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            (value, gradient.clone(), hessian)
         };
         let mut packed_hessian = Vec::with_capacity(dimension * (dimension + 1) / 2);
         for (row, channels) in hessian.iter().enumerate() {
@@ -1831,7 +2182,12 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
             }
         }
         if at_zero {
-            let flat = channels.iter().flatten().flatten().copied().collect::<Vec<_>>();
+            let flat = channels
+                .iter()
+                .flatten()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
             let normalized = graph.normalize_polynomials(&flat, constants.len());
             let mut next = normalized.into_iter();
             for derivative in channels.iter_mut().flatten().flatten() {
@@ -2059,6 +2415,17 @@ pub fn row_program(input: TokenStream) -> TokenStream {
 mod row_atom_tests {
     use super::RowAtomInput;
 
+    #[test]
+    fn activity_parameters_are_not_arithmetic_graph_nodes() {
+        let mut graph = super::Graph::new();
+        let x = graph.intern(super::Node::Variable(0));
+        let square = graph.mul(x, x);
+        let zero = graph.constant(0.0);
+        // Parameter numbering is independent of graph-node numbering.
+        let selected = graph.select(100, square, zero);
+        assert_eq!(graph.polynomial_schedule_cost(&[selected]), (1, 0, 2, 2));
+    }
+
     /// The activity-gate schedule the cause-specific row was measured into
     /// (#932): every gate on one activity is ONE `if` block per lowering, the
     /// work shared by that activity's channels (the reciprocal of the spline
@@ -2096,11 +2463,11 @@ mod row_atom_tests {
         assert!(!expanded.contains("-0.0"), "{expanded}");
     }
 
-    /// The at-zero lowering of the Gaussian joint row (#932): one Horner
-    /// order for every channel, chosen for the fewest multiplies, so the
+    /// The at-zero lowering of the Gaussian joint row (#932) shares products
+    /// across the entire output, so the
     /// residual's square is one shared node and the weight's products are
     /// shared the way the hand kernel names them. The strongest hand
-    /// schedule of this row uses 17 multiplies; the lowering may not use
+    /// schedule of this row uses 16 multiplies; the lowering may not use
     /// more.
     #[test]
     fn at_zero_lowering_shares_powers_and_does_not_exceed_the_hand_multiply_count() {
@@ -2127,8 +2494,11 @@ mod row_atom_tests {
             .count();
         assert_eq!(squares, 1, "{body}");
         let multiplies = body.matches(" * ").count();
-        assert!(multiplies <= 17, "{multiplies} multiplies:\n{body}");
-        assert!(!body.contains("* - 1.0"), "a coefficient of -1 is a sign:\n{body}");
+        assert!(multiplies <= 16, "{multiplies} multiplies:\n{body}");
+        assert!(
+            !body.contains("* - 1.0"),
+            "a coefficient of -1 is a sign:\n{body}"
+        );
     }
 
     /// A contracted third or fourth derivative is returned as a literal with

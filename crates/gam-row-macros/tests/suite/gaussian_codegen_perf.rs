@@ -32,7 +32,7 @@ struct Row {
     direction_v: [f64; 2],
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated_order2(row: Row) -> Channels {
     let atom =
         generated_gaussian_order2_at_zero(row.weight, row.residual, row.inv_sigma, row.kappa);
@@ -47,7 +47,7 @@ fn generated_order2(row: Row) -> Channels {
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated_third(row: Row) -> [[f64; 2]; 2] {
     generated_gaussian_third_contracted_at_zero(
         row.weight,
@@ -58,7 +58,7 @@ fn generated_third(row: Row) -> [[f64; 2]; 2] {
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated_fourth(row: Row) -> [[f64; 2]; 2] {
     generated_gaussian_fourth_contracted_at_zero(
         row.weight,
@@ -70,7 +70,7 @@ fn generated_fourth(row: Row) -> [[f64; 2]; 2] {
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn hand_order2(row: Row) -> Channels {
     let w = row.weight;
     let r = row.residual;
@@ -89,7 +89,7 @@ fn hand_order2(row: Row) -> Channels {
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn hand_third(row: Row) -> [[f64; 2]; 2] {
     let w = row.weight;
     let r = row.residual;
@@ -110,7 +110,7 @@ fn hand_third(row: Row) -> [[f64; 2]; 2] {
     ]
 }
 
-#[inline(never)]
+#[inline(always)]
 fn hand_fourth(row: Row) -> [[f64; 2]; 2] {
     let w = row.weight;
     let r = row.residual;

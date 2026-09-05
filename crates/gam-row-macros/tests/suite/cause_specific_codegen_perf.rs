@@ -1,5 +1,5 @@
-use gam_row_macros::row_atom;
 use gam_math::paired_timing::{SpeedGate, paired_interleaved};
+use gam_row_macros::row_atom;
 
 row_atom! {
     fn generated_cause_specific [order2, third, fourth](
@@ -31,7 +31,7 @@ pub struct Row {
     direction_v: [f64; 3],
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated_order2(row: Row) -> Channels {
     let atom = generated_cause_specific_order2(
         row.eta_exit,
@@ -49,7 +49,7 @@ fn generated_order2(row: Row) -> Channels {
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated_third(row: Row) -> [[f64; 3]; 3] {
     generated_cause_specific_third_contracted(
         row.eta_exit,
@@ -62,7 +62,7 @@ fn generated_third(row: Row) -> [[f64; 3]; 3] {
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated_fourth(row: Row) -> [[f64; 3]; 3] {
     generated_cause_specific_fourth_contracted(
         row.eta_exit,
@@ -92,7 +92,7 @@ fn hand_coefficients(row: Row) -> (f64, f64, f64, f64) {
     (exit, entry, weighted_event, inverse_derivative)
 }
 
-#[inline(never)]
+#[inline(always)]
 fn hand_order2(row: Row) -> Channels {
     let (exit, entry, weighted_event, inverse_derivative) = hand_coefficients(row);
     let derivative_gradient = -weighted_event * inverse_derivative;
@@ -113,7 +113,7 @@ fn hand_order2(row: Row) -> Channels {
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn hand_third(row: Row) -> [[f64; 3]; 3] {
     let (exit, entry, weighted_event, inverse_derivative) = hand_coefficients(row);
     let inverse_squared = inverse_derivative * inverse_derivative;
@@ -125,7 +125,7 @@ fn hand_third(row: Row) -> [[f64; 3]; 3] {
     ]
 }
 
-#[inline(never)]
+#[inline(always)]
 fn hand_fourth(row: Row) -> [[f64; 3]; 3] {
     let (exit, entry, weighted_event, inverse_derivative) = hand_coefficients(row);
     let inverse_squared = inverse_derivative * inverse_derivative;
@@ -170,7 +170,7 @@ fn rows() -> Vec<Row> {
 fn close(got: f64, want: f64) {
     let tolerance = 2e-12 * got.abs().max(want.abs()).max(1.0);
     assert!(
-        (got - want).abs() <= tolerance,
+        got.is_finite() && want.is_finite() && (got - want).abs() <= tolerance,
         "{got:+.16e} vs {want:+.16e}"
     );
 }
@@ -189,6 +189,70 @@ fn assert_matrix(got: [[f64; 3]; 3], want: [[f64; 3]; 3]) {
     for axis in 0..3 {
         for other in 0..3 {
             close(got[axis][other], want[axis][other]);
+        }
+    }
+}
+
+#[test]
+fn scaled_fourth_derivative_preserves_finite_weighted_result_932() {
+    // d^4[-w ln(x)]/dx^4 = 6w/x^4 is representable in both cases, although
+    // the unweighted x^-4 overflows in one and underflows in the other.
+    for (weight, derivative, expected) in
+        [(1.0e-200, 1.0e-100, 6.0e200), (1.0e200, 1.0e100, 6.0e-200)]
+    {
+        let row = Row {
+            derivative,
+            weight,
+            event: true,
+            direction_u: [0.0, 0.0, 1.0],
+            direction_v: [0.0, 0.0, 1.0],
+            ..rows()[0]
+        };
+        let actual = generated_fourth(row)[2][2];
+        assert!(
+            actual.is_finite() && actual > 0.0,
+            "representable weighted fourth derivative became {actual}"
+        );
+        // Relative comparison also detects a tiny nonzero result lost to zero.
+        close(actual / expected, 1.0);
+        close(hand_fourth(row)[2][2] / expected, 1.0);
+    }
+}
+
+#[test]
+fn inactive_products_skip_invalid_factors_932() {
+    let reference = Row {
+        entry_active: false,
+        event: false,
+        ..rows()[0]
+    };
+    for derivative in [0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let row = Row {
+            eta_entry: f64::NAN,
+            derivative,
+            ..reference
+        };
+        assert_channels(generated_order2(row), hand_order2(reference));
+        assert_matrix(generated_third(row), hand_third(reference));
+        assert_matrix(generated_fourth(row), hand_fourth(reference));
+    }
+    // The other row contribution may be invalid for these weights; the
+    // inactive entry and event channels must nevertheless be exact zeros.
+    for weight in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+        let row = Row {
+            weight,
+            eta_entry: f64::NAN,
+            derivative: 0.0,
+            ..reference
+        };
+        let (_, gradient, hessian) = generated_order2(row);
+        let third = generated_third(row);
+        let fourth = generated_fourth(row);
+        for axis in [1, 2] {
+            close(gradient[axis], 0.0);
+            close(hessian[axis][axis], 0.0);
+            close(third[axis][axis], 0.0);
+            close(fourth[axis][axis], 0.0);
         }
     }
 }
@@ -243,28 +307,10 @@ fn generated_cause_specific_matches_strongest_hand_932() {
     // arms are timed adjacent within each repetition and the per-repetition
     // ratios are kept, so the pairing survives all the way to the statistic.
     //
-    // CONTRACT: every channel is `not_slower`, and the reason is written here
-    // so it cannot be mistaken for a widened bar. The third and fourth
-    // channels won by 1.5-1.8% (unanimous) on EPYC Milan and the fourth was a
-    // dead tie on the GitHub runner (`median_ratio=0.9994`, `wins=0.47`): the
-    // generated contractions and the hand ones do the same work, and which
-    // one a given core schedules a hair faster is not a property of the
-    // compiler. A strict `faster` on such a cell is a coin flip per host.
-    //
-    // The order-2 deficit this gate kept red was three real compiler defects,
-    // each found in the release disassembly and each fixed in `row_atom!` --
-    // the reciprocal of the spline derivative scheduled once per channel (two
-    // `divsd` against the hand's one), an inactive-branch zero spelled two
-    // ways (`-0.0`/`0.0`, two identical `phi`s spilled twice), and negations
-    // pushed through gates that had nothing to cancel (six sign flips against
-    // the hand's two). With those fixed the generated kernel is 70
-    // instructions against the hand's 78 and the paired measurement is a tie
-    // (`median_ratio=1.0007`, `wins=0.60`, `resolution=0.0025`). Two kernels
-    // that do the same work by construction cannot be ordered by a strict
-    // `<`; the honest contract is "not slower beyond the measurement's own
-    // resolution", which is what `not_slower` asserts, and it is the
-    // instruction count above -- not a tolerance -- that says the compiler
-    // left nothing on the table.
+    // CONTRACT: every channel is not_slower. Both arms inline into the same
+    // consuming row loop, as the generated production lowering does. Forcing
+    // an outlined wrapper also times its aggregate return and call boundary;
+    // it prevents the analytic opponent from using its strongest schedule.
     if cfg!(debug_assertions) {
         return;
     }

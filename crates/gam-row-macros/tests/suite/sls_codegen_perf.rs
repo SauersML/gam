@@ -215,75 +215,31 @@ fn presence(slot: Option<[f64; 5]>) -> [f64; 5] {
     slot.unwrap_or([0.0; 5])
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated(p: &[f64; K], kernel: &Kernel) -> Channels {
     let plan = outer_plan_order2(kernel);
     let u1 = presence(plan.u1);
     let g = presence(plan.g);
     let (value, gradient, hessian, []) = generated_sls_order2(
-        p[0],
-        p[1],
-        p[2],
-        p[3],
-        p[4],
-        p[5],
-        p[6],
-        p[7],
-        p[8],
-        plan.u0[0],
-        plan.u0[1],
-        plan.u0[2],
-        plan.u0[3],
-        plan.u0[4],
-        u1[0],
-        u1[1],
-        u1[2],
-        u1[3],
-        u1[4],
-        g[0],
-        g[1],
-        g[2],
-        g[3],
-        g[4],
+        p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], plan.u0[0], plan.u0[1], plan.u0[2],
+        plan.u0[3], plan.u0[4], u1[0], u1[1], u1[2], u1[3], u1[4], g[0], g[1], g[2], g[3], g[4],
     );
     (value, gradient, hessian)
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated_third(p: &[f64; K], kernel: &Kernel, direction: &[f64; K]) -> [[f64; K]; K] {
     let plan = outer_plan(kernel);
     let u1 = presence(plan.u1);
     let g = presence(plan.g);
     generated_sls_third_contracted(
-        p[0],
-        p[1],
-        p[2],
-        p[3],
-        p[4],
-        p[5],
-        p[6],
-        p[7],
-        p[8],
-        plan.u0[0],
-        plan.u0[1],
-        plan.u0[2],
-        plan.u0[3],
-        plan.u0[4],
-        u1[0],
-        u1[1],
-        u1[2],
-        u1[3],
-        u1[4],
-        g[0],
-        g[1],
-        g[2],
-        g[3],
-        g[4],
+        p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], plan.u0[0], plan.u0[1], plan.u0[2],
+        plan.u0[3], plan.u0[4], u1[0], u1[1], u1[2], u1[3], u1[4], g[0], g[1], g[2], g[3], g[4],
         direction,
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn generated_fourth(
     p: &[f64; K],
     kernel: &Kernel,
@@ -323,7 +279,7 @@ fn generated_fourth(
     )
 }
 
-#[inline(never)]
+#[inline(always)]
 fn jet_third(p: &[f64; K], kernel: &Kernel, direction: &[f64; K]) -> [[f64; K]; K] {
     use gam_math::jet_scalar::OneSeed;
 
@@ -333,35 +289,14 @@ fn jet_third(p: &[f64; K], kernel: &Kernel, direction: &[f64; K]) -> [[f64; K]; 
     let vars: [OneSeed<K>; K] =
         std::array::from_fn(|axis| OneSeed::seed_direction(p[axis], axis, direction[axis]));
     let (value, []) = generated_sls(
-        &vars[0],
-        &vars[1],
-        &vars[2],
-        &vars[3],
-        &vars[4],
-        &vars[5],
-        &vars[6],
-        &vars[7],
-        &vars[8],
-        plan.u0[0],
-        plan.u0[1],
-        plan.u0[2],
-        plan.u0[3],
-        plan.u0[4],
-        u1[0],
-        u1[1],
-        u1[2],
-        u1[3],
-        u1[4],
-        g[0],
-        g[1],
-        g[2],
-        g[3],
-        g[4],
+        &vars[0], &vars[1], &vars[2], &vars[3], &vars[4], &vars[5], &vars[6], &vars[7], &vars[8],
+        plan.u0[0], plan.u0[1], plan.u0[2], plan.u0[3], plan.u0[4], u1[0], u1[1], u1[2], u1[3],
+        u1[4], g[0], g[1], g[2], g[3], g[4],
     );
     value.contracted_third()
 }
 
-#[inline(never)]
+#[inline(always)]
 fn jet_fourth(
     p: &[f64; K],
     kernel: &Kernel,
@@ -377,30 +312,9 @@ fn jet_fourth(
         TwoSeed::seed(p[axis], axis, direction_u[axis], direction_v[axis])
     });
     let (value, []) = generated_sls(
-        &vars[0],
-        &vars[1],
-        &vars[2],
-        &vars[3],
-        &vars[4],
-        &vars[5],
-        &vars[6],
-        &vars[7],
-        &vars[8],
-        plan.u0[0],
-        plan.u0[1],
-        plan.u0[2],
-        plan.u0[3],
-        plan.u0[4],
-        u1[0],
-        u1[1],
-        u1[2],
-        u1[3],
-        u1[4],
-        g[0],
-        g[1],
-        g[2],
-        g[3],
-        g[4],
+        &vars[0], &vars[1], &vars[2], &vars[3], &vars[4], &vars[5], &vars[6], &vars[7], &vars[8],
+        plan.u0[0], plan.u0[1], plan.u0[2], plan.u0[3], plan.u0[4], u1[0], u1[1], u1[2], u1[3],
+        u1[4], g[0], g[1], g[2], g[3], g[4],
     );
     value.contracted_fourth()
 }
@@ -558,7 +472,7 @@ fn hand_analytic_term<const ORDER: usize, const N: usize>(
     }
 }
 
-#[inline(never)]
+#[inline(always)]
 fn hand_analytic_contracted<const ORDER: usize>(
     p: &[f64; K],
     kernel: &Kernel,
@@ -577,22 +491,22 @@ fn hand_analytic_contracted<const ORDER: usize>(
             plan.u0,
             (direction_u, direction_v),
             (
-            |axis| match axis {
-                0 => 1.0,
-                4 => -exponential,
-                7 => product,
-                _ => 0.0,
-            },
-            |a, b| match [a.min(b), a.max(b)] {
-                [4, 7] => exponential,
-                [7, 7] => -product,
-                _ => 0.0,
-            },
+                |axis| match axis {
+                    0 => 1.0,
+                    4 => -exponential,
+                    7 => product,
+                    _ => 0.0,
+                },
+                |a, b| match [a.min(b), a.max(b)] {
+                    [4, 7] => exponential,
+                    [7, 7] => -product,
+                    _ => 0.0,
+                },
             ),
             (
-            &[([1, 2, 2], -exponential), ([2, 2, 2], product)],
-            &[([1, 2, 2, 2], exponential), ([2, 2, 2, 2], -product)],
-            )
+                &[([1, 2, 2], -exponential), ([2, 2, 2], product)],
+                &[([1, 2, 2, 2], exponential), ([2, 2, 2, 2], -product)],
+            ),
         );
     }
 
@@ -605,22 +519,22 @@ fn hand_analytic_contracted<const ORDER: usize>(
             stack,
             (direction_u, direction_v),
             (
-            |axis| match axis {
-                1 => 1.0,
-                3 => -exponential,
-                6 => product,
-                _ => 0.0,
-            },
-            |a, b| match [a.min(b), a.max(b)] {
-                [3, 6] => exponential,
-                [6, 6] => -product,
-                _ => 0.0,
-            },
+                |axis| match axis {
+                    1 => 1.0,
+                    3 => -exponential,
+                    6 => product,
+                    _ => 0.0,
+                },
+                |a, b| match [a.min(b), a.max(b)] {
+                    [3, 6] => exponential,
+                    [6, 6] => -product,
+                    _ => 0.0,
+                },
             ),
             (
-            &[([1, 2, 2], -exponential), ([2, 2, 2], product)],
-            &[([1, 2, 2, 2], exponential), ([2, 2, 2, 2], -product)],
-            )
+                &[([1, 2, 2], -exponential), ([2, 2, 2], product)],
+                &[([1, 2, 2, 2], exponential), ([2, 2, 2, 2], -product)],
+            ),
         );
     }
 
@@ -634,39 +548,39 @@ fn hand_analytic_contracted<const ORDER: usize>(
             stack,
             (direction_u, direction_v),
             (
-            |axis| match axis {
-                2 => 1.0,
-                3 => exponential * p[8],
-                5 => -exponential,
-                6 => -product,
-                8 => exponential * p[3],
-                _ => 0.0,
-            },
-            |a, b| match [a.min(b), a.max(b)] {
-                [3, 6] => -exponential * p[8],
-                [3, 8] => exponential,
-                [5, 6] => exponential,
-                [6, 6] => product,
-                [6, 8] => -exponential * p[3],
-                _ => 0.0,
-            },
+                |axis| match axis {
+                    2 => 1.0,
+                    3 => exponential * p[8],
+                    5 => -exponential,
+                    6 => -product,
+                    8 => exponential * p[3],
+                    _ => 0.0,
+                },
+                |a, b| match [a.min(b), a.max(b)] {
+                    [3, 6] => -exponential * p[8],
+                    [3, 8] => exponential,
+                    [5, 6] => exponential,
+                    [6, 6] => product,
+                    [6, 8] => -exponential * p[3],
+                    _ => 0.0,
+                },
             ),
             (
-            &[
-                ([1, 3, 3], exponential * p[8]),
-                ([1, 3, 4], -exponential),
-                ([2, 3, 3], -exponential),
-                ([3, 3, 3], -product),
-                ([3, 3, 4], exponential * p[3]),
-            ],
-            &[
-                ([1, 3, 3, 3], -exponential * p[8]),
-                ([1, 3, 3, 4], exponential),
-                ([2, 3, 3, 3], exponential),
-                ([3, 3, 3, 3], product),
-                ([3, 3, 3, 4], -exponential * p[3]),
-            ],
-            )
+                &[
+                    ([1, 3, 3], exponential * p[8]),
+                    ([1, 3, 4], -exponential),
+                    ([2, 3, 3], -exponential),
+                    ([3, 3, 3], -product),
+                    ([3, 3, 4], exponential * p[3]),
+                ],
+                &[
+                    ([1, 3, 3, 3], -exponential * p[8]),
+                    ([1, 3, 3, 4], exponential),
+                    ([2, 3, 3, 3], exponential),
+                    ([3, 3, 3, 3], product),
+                    ([3, 3, 3, 4], -exponential * p[3]),
+                ],
+            ),
         );
     }
 
@@ -676,23 +590,23 @@ fn hand_analytic_contracted<const ORDER: usize>(
 /// The strongest hand order-2 kernel for the same row.
 ///
 /// It is the retired production fused schedule (`sls_row_vgh_fused`): the
-/// two exponentials first, when nothing is live, the entry term
-/// unconditional, the exit and event terms behind their plan slots, every
-/// channel written once. It consumes the same `outer_plan_order2` plan the
-/// generated arm consumes, through the same `Option` discriminants, so the
-/// paired timing compares the two kernels and not two planners, and it
+/// two exponentials first, when nothing is live, and every term gated on its
+/// supplied coefficient stack. It consumes the same `outer_plan_order2` plan
+/// and activity predicates as the generated arm, so the paired timing
+/// compares two kernels with the same contract, and it
 /// inspects no composition point: the stacks are supplied, as production's
 /// are. (An earlier hand arm rebuilt the stacks inline and never
 /// materialised the plan; it was stronger than the production hand kernel,
 /// which shares the planner, and the deficit it measured was the plan's
 /// round trip through the stack.)
-#[inline(never)]
+#[inline(always)]
 fn hand(p: &[f64; K], kernel: &Kernel) -> Channels {
     let plan = outer_plan_order2(kernel);
     let entry_exp = (-p[7]).exp();
     let exit_exp = (-p[6]).exp();
 
     let [u0_value, u0_first, u0_second, _, _] = plan.u0;
+    let u0_active = plan.u0.iter().any(|entry| *entry != 0.0);
     let mut value = u0_value;
 
     // THE SAME CONTRACT AS THE GENERATED PROGRAM. `generated_sls_order2` gates
@@ -705,17 +619,20 @@ fn hand(p: &[f64; K], kernel: &Kernel) -> Channels {
     // there returns NaN where the program returns a finite zero, so it is not a
     // schedule the program could be replaced by, and its saving is the guard it
     // is missing (`the_hand_carries_the_generated_programs_activity_contract_932`).
-    let u1_stack = plan.u1.unwrap_or([0.0; 5]);
-    let u1_active = u1_stack.iter().any(|entry| *entry != 0.0);
-    let [u1_value, u1_first, u1_second, _, _] = u1_stack;
+    // The ENTRY term above carries the same contract, for the same reason: an
+    // untruncated row's `u0` stack is exactly zero while its index jet can
+    // overflow (`every_inactive_sls_term_skips_overflowing_index_channels_932`).
+    let u1 = presence(plan.u1);
+    let u1_active = u1.iter().any(|entry| *entry != 0.0);
+    let [u1_value, u1_first, u1_second, _, _] = u1;
     if u1_active {
         value += u1_value;
     }
 
     let inner = p[3] * p[8] - p[5];
-    let g_stack = plan.g.unwrap_or([0.0; 5]);
-    let g_active = g_stack.iter().any(|entry| *entry != 0.0);
-    let [g_value, g_first, g_second, _, _] = g_stack;
+    let event = presence(plan.g);
+    let g_active = event.iter().any(|entry| *entry != 0.0);
+    let [g_value, g_first, g_second, _, _] = event;
     if g_active {
         value += g_value;
     }
@@ -730,9 +647,11 @@ fn hand(p: &[f64; K], kernel: &Kernel) -> Channels {
     let g8 = exit_exp * p[3];
 
     let mut gradient = [0.0; K];
-    gradient[0] = u0_first;
-    gradient[4] = u0_first * u0_g4;
-    gradient[7] = u0_first * u0_g7;
+    if u0_active {
+        gradient[0] = u0_first;
+        gradient[4] = u0_first * u0_g4;
+        gradient[7] = u0_first * u0_g7;
+    }
     if u1_active {
         gradient[1] = u1_first;
         gradient[3] = u1_first * u1_g3;
@@ -757,12 +676,14 @@ fn hand(p: &[f64; K], kernel: &Kernel) -> Channels {
         }};
     }
 
-    symmetric!(0, 0, u0_second);
-    symmetric!(0, 4, u0_second * u0_g4);
-    symmetric!(0, 7, u0_second * u0_g7);
-    symmetric!(4, 4, u0_second * u0_g4 * u0_g4);
-    symmetric!(4, 7, u0_second * u0_g4 * u0_g7 + u0_first * entry_exp);
-    symmetric!(7, 7, u0_second * u0_g7 * u0_g7 - u0_first * u0_g7);
+    if u0_active {
+        symmetric!(0, 0, u0_second);
+        symmetric!(0, 4, u0_second * u0_g4);
+        symmetric!(0, 7, u0_second * u0_g7);
+        symmetric!(4, 4, u0_second * u0_g4 * u0_g4);
+        symmetric!(4, 7, u0_second * u0_g4 * u0_g7 + u0_first * entry_exp);
+        symmetric!(7, 7, u0_second * u0_g7 * u0_g7 - u0_first * u0_g7);
+    }
 
     if u1_active {
         symmetric!(1, 1, u1_second);
@@ -873,6 +794,42 @@ fn assert_close(got: Channels, want: Channels) {
         for j in 0..K {
             close(got.2[i][j], want.2[i][j]);
         }
+    }
+}
+
+#[test]
+fn every_inactive_sls_term_skips_overflowing_index_channels_932() {
+    for term in ["entry", "exit", "event"] {
+        let (mut p, mut kernel) = fixture();
+        assert!(kernel.w > 0.0);
+        match term {
+            "entry" => {
+                kernel.u0 = [0.0; 5];
+                p[4] = p[4].abs();
+                p[7] = -1000.0;
+                assert!((-p[7]).exp().is_infinite());
+                assert_eq!(p[0] - p[4] * (-p[7]).exp(), f64::NEG_INFINITY);
+            }
+            "exit" => {
+                kernel.d = 0.0;
+                kernel.censored_u1 = [0.0; 5];
+                p[6] = -1000.0;
+                assert!((-p[6]).exp().is_infinite());
+                assert!(outer_plan_order2(&kernel).u1.is_some());
+            }
+            "event" => {
+                kernel.event_g = [0.0; 5];
+                p[8] = f64::INFINITY;
+                assert!(outer_plan_order2(&kernel).g.is_some());
+            }
+            _ => unreachable!(),
+        }
+        let actual = generated(&p, &kernel);
+        // This comparator rejects non-finite channels, including NaN == NaN.
+        // All 91 value/gradient/Hessian channels are checked, not only the
+        // coordinates on which the original zero-stack bug was observed.
+        assert_close(hand(&p, &kernel), actual);
+        assert_close(actual, generated(&fixture().0, &kernel));
     }
 }
 
