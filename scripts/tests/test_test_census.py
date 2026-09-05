@@ -110,8 +110,41 @@ class TestCensus(unittest.TestCase):
     def test_units_group_by_crate_and_by_top_level_suite_2818(self):
         self.assertEqual(census.unit("crates/gam-sae/src/manifold/mod.rs"), "crates/gam-sae")
         self.assertEqual(census.unit("crates/gam-sae/tests/atlas.rs"), "crates/gam-sae")
-        self.assertEqual(census.unit("tests/gam_sae.rs"), "tests")
         self.assertEqual(census.unit("src/lib.rs"), "src")
+
+    def test_the_tests_tree_is_split_by_integration_binary_2818(self):
+        """`tests` was ONE unit of 2,619 — larger than any crate. A unit that is
+        itself an aggregate nets inside itself, which is the same defect the
+        per-crate split fixed one level up."""
+        self.assertEqual(census.unit("tests/regressions/predict/dispersion.rs"), "tests/regressions")
+        self.assertEqual(census.unit("tests/sae/main.rs"), "tests/sae")
+        self.assertEqual(census.unit("tests/common/mod.rs"), "tests/common")
+        # Both spellings of one binary are one unit, or moving a suite from a
+        # single file into a directory would read as a whole unit disappearing.
+        self.assertEqual(census.unit("tests/measure_jet_ctn_range_screen_2754.rs"),
+                         "tests/measure_jet_ctn_range_screen_2754")
+        self.assertEqual(census.unit("tests/measure_jet_ctn_range_screen_2754/main.rs"),
+                         "tests/measure_jet_ctn_range_screen_2754")
+
+    def test_a_deletion_inside_tests_is_no_longer_paid_for_by_growth_beside_it_2818(self):
+        """The netting the split exists to kill, as a before/after on one input.
+
+        Three tests leave `tests/regressions` and three arrive in `tests/sae`.
+        Under one lumped `tests` unit the floor does not move and the loss is
+        invisible; under the split the shortfall is named.
+        """
+        floor = {"generated_from": "mark",
+                 "units": {"tests/regressions": 506, "tests/sae": 126},
+                 "issues": {"2818": 1}}
+        measured = snapshot(632, {"pinned_2818": 1},
+                            {"tests/regressions": 503, "tests/sae": 129}, {"2818": 1})
+
+        with self.assertRaisesRegex(ValueError, r"tests/regressions.*506.*503"):
+            census.check_floor(measured, floor)
+
+        lumped_floor = {"generated_from": "mark", "units": {"tests": 632}, "issues": {"2818": 1}}
+        lumped = snapshot(632, {"pinned_2818": 1}, {"tests": 632}, {"2818": 1})
+        self.assertEqual(census.check_floor(lumped, lumped_floor), {})
 
 
 def snapshot(tests, pins, units=None, issues=None):

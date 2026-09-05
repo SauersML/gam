@@ -31,8 +31,15 @@ RAW = re.compile(r'(?:b|c)?r(#{0,255})"')
 LEDGER = "docs/test-census-changes.json"
 FLOOR = "docs/test-census-floor.json"
 # The commit whose 2,290 deleted tests this gate was built to make visible.
+#
+# `units_losing_tests` was 21 while the whole `tests` tree was one unit. Split by
+# integration binary it is 38 — 20 `crates/*` and 18 `tests/*`, with the same
+# 2,290 and the same 300 pin names either way, which is how you can see that the
+# split changed the partition and nothing else. The number is larger because the
+# sweep hit 18 integration binaries independently and the old unit reported that
+# as one entry losing 546.
 CONTROL = {"head": "c0a21b5540ce76b76f62d880addf2612246ce1ee",
-           "test_count_decrease": 2290, "removed_pin_names": 300, "units_losing_tests": 21}
+           "test_count_decrease": 2290, "removed_pin_names": 300, "units_losing_tests": 38}
 
 
 def tokens(source):
@@ -135,9 +142,26 @@ def unit(path):
 
     Workspace totals net a deletion in one crate against unrelated growth in
     another, which is exactly the shape of a sweep aimed at one subsystem.
+
+    The same netting survives inside any unit that is itself an aggregate, and
+    the top-level `tests` tree was the largest one: 2,619 tests over 1,069 files
+    behind a single floor entry, more than any crate. So it is split by its
+    first path component too. That boundary is not arbitrary — each
+    `tests/<name>/main.rs` is the crate root of its own integration binary
+    (`gam::regressions`, `gam::sae`, `gam::quality`, ... — 18 of them), which is
+    the unit a failure is already attributed to; the three subtrees with no
+    `main.rs` (`common`, `src_modules`, `test_support`) are shared module trees
+    and get their own entries for the same reason. `tests/<name>.rs` is the
+    single-file spelling of the same binary, so the extension is dropped and
+    both spellings land on one unit.
     """
     head, _, rest = path.partition("/")
-    return f"{head}/{rest.split('/')[0]}" if head == "crates" and rest else head
+    if not rest or head not in ("crates", "tests"):
+        return head
+    first = rest.split("/")[0]
+    if head == "tests" and first.endswith(".rs"):
+        first = first[: -len(".rs")]
+    return f"{head}/{first}"
 
 
 def issue_numbers(name):
