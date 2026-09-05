@@ -1355,96 +1355,158 @@ impl BernoulliMarginalSlopeFamily {
             weighted_rows.len(),
             |index_range| -> Result<_, String> {
                 let mut acc = make_acc();
-                for wr in &weighted_rows[index_range] {
-                    let row = wr.index;
-                    let w = wr.weight;
-                    let row_ctx = Self::row_ctx(cache, row);
-                    let (f_pi, f_pipi_base) = self
-                        .compute_row_primary_gradient_hessian_reusing_cache(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                            cache,
-                        )?;
-                    for (axis_idx, axis) in axes.iter().enumerate() {
-                        // Single psi-map row materialization shared by `dir` and
-                        // `psi_row`; the prior code paths each issued an
-                        // independent `psi_map.row_vector(row)` call for the
-                        // same (row, axis) which doubled the per-row operator
-                        // dispatch cost for joint-spatial Hessian builds.
-                        let psi_local = axis
-                            .psi_map
-                            .row_vector(row)
-                            .map_err(|e| format!("bernoulli psi map row {row}: {e}"))?;
-                        let dir_idx = if axis.block_idx == 0 {
-                            primary.q
-                        } else {
-                            primary.slope
-                        };
-                        let mut dir = Array1::<f64>::zeros(primary.total);
-                        dir[dir_idx] = psi_local.dot(&block_states[axis.block_idx].beta);
-                        // `f_pipi_base` is the row's primary Hessian and is
-                        // shared by every ψ axis: the only per-axis change made
-                        // to it is the uniform `w` scale, and `w ≡ 1.0` on the
-                        // contiguous unit-weight row set the large-scale fit
-                        // actually runs on. The clone therefore allocated and
-                        // copied a whole primary Hessian once per (row, axis) —
-                        // `axis_count × n` times per ψ-hyper build, 32 × 326k
-                        // here — to hand back a bit-identical matrix. Borrow it
-                        // unscaled and materialize a scaled copy only on the
-                        // genuinely weighted path (gam#979).
-                        let f_pipi_scaled;
-                        let f_pipi = if w != 1.0 {
-                            let mut scaled = f_pipi_base.clone();
-                            scaled.mapv_inplace(|v| v * w);
-                            f_pipi_scaled = scaled;
-                            &f_pipi_scaled
-                        } else {
-                            &f_pipi_base
-                        };
-                        let mut third = self.row_primary_third_contracted(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            &dir,
-                        )?;
-                        let psi_row = BlockPsiRow {
-                            block_idx: axis.block_idx,
-                            range: if axis.block_idx == 0 {
-                                slices.marginal.clone()
-                            } else {
-                                slices.slope.clone()
-                            },
-                            local_vec: psi_local,
-                        };
-                        // Unscaled, exactly as before: the original computed
-                        // this product before applying `w` to `f_pipi`.
-                        let mut f_pipi_dir = f_pipi_base.dot(&dir);
-                        if w != 1.0 {
-                            third.mapv_inplace(|v| v * w);
-                            f_pipi_dir.mapv_inplace(|v| v * w);
+                // Hoist the ψ design rows for a block of rows, per axis.
+                //
+                // `psi_map.row_vector` is a SINGLE-row request, and on the
+                // operator-backed maps this arm uses it is not a cheap one:
+                // it builds a one-row chunk — an allocation, a kernel
+                // evaluation, and a projection-correction GEMM with `m = 1`,
+                // which is nearly all packing overhead — then copies row 0 back
+                // out. The loop below wants one per (row, axis), i.e.
+                // `axis_count × n` of them per ψ-hyper build. Asking each axis
+                // for the whole block instead runs the same rows through the
+                // same kernel at a shape the GEMM can actually use (gam#979).
+                //
+                // Blocked, so the hoisted rows stay bounded no matter how the
+                // fold sizes the range it hands us.
+                const PSI_ROW_BLOCK: usize = 512;
+                for block in weighted_rows[index_range].chunks(PSI_ROW_BLOCK) {
+                    // The hoist is only valid when the block's rows ARE the
+                    // contiguous span `start..start + len`: an outer-score
+                    // subsample hands this fold an arbitrary row set, and there
+                    // the per-row request stays the only correct read.
+                    let contiguous_start = block.first().map(|wr| wr.index).filter(|start| {
+                        block
+                            .iter()
+                            .enumerate()
+                            .all(|(offset, wr)| wr.index == start + offset)
+                    });
+                    let hoisted_psi: Option<Vec<Array2<f64>>> = match contiguous_start {
+                        Some(start) => {
+                            let mut per_axis = Vec::with_capacity(k);
+                            for axis in axes.iter() {
+                                per_axis.push(
+                                    axis.psi_map
+                                        .row_chunk(start..start + block.len())
+                                        .map_err(|e| {
+                                            format!("bernoulli psi map row block {start}: {e}")
+                                        })?,
+                                );
+                            }
+                            Some(per_axis)
                         }
-                        let slot = &mut acc[axis_idx];
-                        slot.0 += w * f_pi.dot(&dir);
-                        slot.1
-                            .slice_mut(s![psi_row.range.clone()])
-                            .scaled_add(w * f_pi[axis.idx_primary], &psi_row.local_vec);
-                        slot.1 +=
-                            &self.pullback_primary_vector(row, slices, primary, &f_pipi_dir)?;
+                        None => None,
+                    };
+                    for (block_offset, wr) in block.iter().enumerate() {
+                        let row = wr.index;
+                        let w = wr.weight;
+                        let row_ctx = Self::row_ctx(cache, row);
+                        let (f_pi, f_pipi_base) = self
+                            .compute_row_primary_gradient_hessian_reusing_cache(
+                                row,
+                                block_states,
+                                primary,
+                                row_ctx,
+                                cache,
+                            )?;
+                        for (axis_idx, axis) in axes.iter().enumerate() {
+                            // Single psi-map row materialization shared by `dir` and
+                            // `psi_row`; the prior code paths each issued an
+                            // independent `psi_map.row_vector(row)` call for the
+                            // same (row, axis) which doubled the per-row operator
+                            // dispatch cost for joint-spatial Hessian builds.
+                            let psi_local = match hoisted_psi.as_ref() {
+                                Some(per_axis) => per_axis[axis_idx].row(block_offset).to_owned(),
+                                None => axis
+                                    .psi_map
+                                    .row_vector(row)
+                                    .map_err(|e| format!("bernoulli psi map row {row}: {e}"))?,
+                            };
+                            let dir_idx = if axis.block_idx == 0 {
+                                primary.q
+                            } else {
+                                primary.slope
+                            };
+                            let mut dir = Array1::<f64>::zeros(primary.total);
+                            dir[dir_idx] = psi_local.dot(&block_states[axis.block_idx].beta);
+                            // `f_pipi_base` is the row's primary Hessian and is
+                            // shared by every ψ axis: the only per-axis change made
+                            // to it is the uniform `w` scale, and `w ≡ 1.0` on the
+                            // contiguous unit-weight row set the large-scale fit
+                            // actually runs on. The clone therefore allocated and
+                            // copied a whole primary Hessian once per (row, axis) —
+                            // `axis_count × n` times per ψ-hyper build, 32 × 326k
+                            // here — to hand back a bit-identical matrix. Borrow it
+                            // unscaled and materialize a scaled copy only on the
+                            // genuinely weighted path (gam#979).
+                            let f_pipi_scaled;
+                            let f_pipi = if w != 1.0 {
+                                let mut scaled = f_pipi_base.clone();
+                                scaled.mapv_inplace(|v| v * w);
+                                f_pipi_scaled = scaled;
+                                &f_pipi_scaled
+                            } else {
+                                &f_pipi_base
+                            };
+                            let mut third = self.row_primary_third_contracted(
+                                row,
+                                block_states,
+                                cache,
+                                row_ctx,
+                                &dir,
+                            )?;
+                            let psi_row = BlockPsiRow {
+                                block_idx: axis.block_idx,
+                                range: if axis.block_idx == 0 {
+                                    slices.marginal.clone()
+                                } else {
+                                    slices.slope.clone()
+                                },
+                                local_vec: psi_local,
+                            };
+                            // Unscaled, exactly as before: the original computed
+                            // this product before applying `w` to `f_pipi`.
+                            let mut f_pipi_dir = f_pipi_base.dot(&dir);
+                            if w != 1.0 {
+                                third.mapv_inplace(|v| v * w);
+                                f_pipi_dir.mapv_inplace(|v| v * w);
+                            }
+                            let slot = &mut acc[axis_idx];
+                            slot.0 += w * f_pi.dot(&dir);
+                            slot.1
+                                .slice_mut(s![psi_row.range.clone()])
+                                .scaled_add(w * f_pi[axis.idx_primary], &psi_row.local_vec);
+                            // `pullback_primary_vector` allocates an
+                            // `Array1(slices.total)`, fills it, returns it, and
+                            // this `+=` folds it in and drops it — once per
+                            // (row, axis). The allocation-free sibling adds the
+                            // same contributions straight into the accumulator.
+                            // Bit-identical: the marginal / slope / h / w target
+                            // slices are DISJOINT, so every index takes exactly
+                            // one contribution either way (`slot.1[i] + c_i`,
+                            // one rounding), and this still runs after the ψ
+                            // `scaled_add` above, so the per-index accumulation
+                            // order is unchanged (gam#979).
+                            self.pullback_primary_vector_add_into(
+                                row,
+                                slices,
+                                primary,
+                                &f_pipi_dir,
+                                &mut slot.1,
+                            )?;
 
-                        let right_primary = f_pipi.row(axis.idx_primary);
-                        slot.2.add_rank1_psi_cross(
-                            self,
-                            row,
-                            slices,
-                            primary,
-                            axis.block_idx,
-                            &psi_row.local_vec,
-                            right_primary,
-                        )?;
-                        slot.2.add_pullback(self, row, slices, primary, &third);
+                            let right_primary = f_pipi.row(axis.idx_primary);
+                            slot.2.add_rank1_psi_cross(
+                                self,
+                                row,
+                                slices,
+                                primary,
+                                axis.block_idx,
+                                &psi_row.local_vec,
+                                right_primary,
+                            )?;
+                            slot.2.add_pullback(self, row, slices, primary, &third);
+                        }
                     }
                 }
                 Ok(acc)
