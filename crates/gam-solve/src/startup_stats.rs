@@ -595,6 +595,84 @@ pub(crate) fn structural_diagnosis_hint(key: &StructuralKey) -> String {
     }
 }
 
+/// One line naming the stage that actually failed, when the counters say it
+/// unambiguously.
+///
+/// The headline of this refusal is "no candidate seeds passed outer startup
+/// validation", which points a reader at seed GENERATION. That is often not
+/// where the failure is, and the counters printed directly beneath it say so —
+/// but only if the reader knows to divide them.
+///
+/// MEASURED 2026-09-05, `bench/gha_results/python-contracts/py1512_junit.xml`
+/// (CI run 33941725421): six of the eight tests carrying this refusal report
+///
+///     generated=13, screened=13, exact_validated=13, solver_started=0
+///     rejected_by_kkt=0, rejected_by_domain=13, rejected_by_nonconvergence=0,
+///     rejected_by_budget=0, rejected_other=0
+///     all 13 seeds, phase=validation:
+///         "outer eval failed: objective returned a non-finite cost"
+///
+/// Every seed was generated, screened AND exact-validated, and the objective
+/// then returned a non-finite cost at all thirteen. Nothing about seeding
+/// failed. Reading that took someone an hour of auditing seed generation
+/// because the headline named the stage that REPORTED the failure rather than
+/// the stage that CAUSED it.
+///
+/// This is deliberately conservative: it speaks only when the evidence is
+/// unambiguous — every seed survived to the same stage, no seed reached the
+/// solver, every rejection fell in ONE category, and every per-seed reason is
+/// the SAME string. Any heterogeneity and it says nothing, because a summary
+/// that guesses is worse than a summary that is absent.
+fn uniform_failure_attribution(stats: &StartupStats, rejections: &[SeedRejection]) -> Option<String> {
+    if stats.generated == 0 || stats.solver_started > 0 {
+        return None;
+    }
+    // Exactly one non-empty rejection category, holding every rejection.
+    let categories: [(&str, usize); 5] = [
+        ("KKT", stats.rejected_by_kkt),
+        ("domain", stats.rejected_by_domain),
+        ("non-convergence", stats.rejected_by_nonconvergence),
+        ("budget", stats.rejected_by_budget),
+        ("other", stats.rejected_other),
+    ];
+    let mut only: Option<(&str, usize)> = None;
+    for (name, count) in categories {
+        if count == 0 {
+            continue;
+        }
+        if only.is_some() {
+            return None;
+        }
+        only = Some((name, count));
+    }
+    let (category, count) = only?;
+    if count != stats.total_rejected() {
+        return None;
+    }
+    // Every per-seed reason identical, and every seed accounted for.
+    let first = rejections.first()?;
+    let reason = first.failure.message();
+    if rejections.len() != count
+        || rejections.iter().any(|r| r.failure.message() != reason)
+    {
+        return None;
+    }
+    // How far the seeds got before the uniform rejection.
+    let reached = if stats.exact_validated == stats.generated {
+        "generated, screened and exact-validated"
+    } else if stats.screened == stats.generated {
+        "generated and screened"
+    } else {
+        "generated"
+    };
+    Some(format!(
+        "attribution: this is NOT a seeding failure. All {} candidate seeds were {}, \
+         none reached the solver, and all {count} were rejected in the {category} phase for \
+         the SAME reason: {reason}. Look there, not at seed generation.",
+        stats.generated, reached,
+    ))
+}
+
 /// Format the structured "no candidate seeds passed outer startup
 /// validation" payload. Returns a single multi-line `String` because
 /// `EstimationError::RemlOptimizationFailed` carries a single message
@@ -630,6 +708,9 @@ pub(crate) fn format_no_seeds_passed(
         stats.total_rejected(),
     )
     .expect("writing to String cannot fail");
+    if let Some(attribution) = uniform_failure_attribution(stats, rejections) {
+        writeln!(&mut out, "  {attribution}").expect("writing to String cannot fail");
+    }
     if let Some(key) = structural {
         writeln!(
             &mut out,
@@ -1392,4 +1473,100 @@ mod tests {
             "other@<unquantified>"
         );
     }
+
+    /// A uniform, unambiguous failure must be attributed away from seeding.
+    ///
+    /// Reproduces the exact shape measured in
+    /// `bench/gha_results/python-contracts/py1512_junit.xml` (CI run
+    /// 33941725421) for the six `test_sae_manifold_regularizer_noops_issue_240`
+    /// tests: 13 generated, 13 screened, 13 exact-validated, 0 reaching the
+    /// solver, all 13 rejected in the domain phase with one identical reason.
+    #[test]
+    fn a_uniform_non_seeding_failure_is_attributed_to_the_stage_that_caused_it() {
+        let reason = "outer eval failed: objective returned a non-finite cost";
+        let rejections: Vec<SeedRejection> = (0..13)
+            .map(|i| {
+                SeedRejection::from_message(i, "validation", reason.to_string())
+            })
+            .collect();
+        let stats = StartupStats::from_rejections(13, 13, 13, 0, &rejections);
+        assert_eq!(
+            stats.rejected_by_domain, 13,
+            "fixture must place every rejection in one category"
+        );
+
+        let rendered = format_no_seeds_passed("SAE manifold", &stats, &rejections, None, "");
+        assert!(
+            rendered.contains("NOT a seeding failure"),
+            "a run where every seed was exact-validated and none reached the solver must say so \
+             instead of leaving the reader with a headline that names seed generation:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("generated, screened and exact-validated"),
+            "the attribution must say HOW FAR the seeds got, not merely that seeding is innocent:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(reason),
+            "the attribution must carry the shared reason so the reader has the next question \
+             without scrolling:\n{rendered}"
+        );
+    }
+
+    /// Silence is the correct output when the evidence is mixed. A summary that
+    /// guesses is worse than one that is absent, and every one of these cases
+    /// is a real shape the seed loop produces.
+    #[test]
+    fn a_mixed_failure_is_not_attributed_at_all() {
+        let uniform = "outer eval failed: objective returned a non-finite cost";
+
+        // (a) Two different reasons in the same category.
+        let mixed_reasons = vec![
+            SeedRejection::from_message(0, "validation", uniform.to_string()),
+            SeedRejection::from_message(1, "validation", "a different refusal".to_string()),
+        ];
+        let stats = StartupStats::from_rejections(2, 2, 2, 0, &mixed_reasons);
+        let rendered = format_no_seeds_passed("ctx", &stats, &mixed_reasons, None, "");
+        assert!(
+            !rendered.contains("NOT a seeding failure"),
+            "two distinct reasons is not one cause; the attribution must stay silent:\n{rendered}"
+        );
+
+        // (b) A seed DID reach the solver, so seeding is not exonerated.
+        let started = vec![SeedRejection::from_message(0, "validation", uniform.to_string())];
+        let stats = StartupStats::from_rejections(2, 2, 2, 1, &started);
+        let rendered = format_no_seeds_passed("ctx", &stats, &started, None, "");
+        assert!(
+            !rendered.contains("NOT a seeding failure"),
+            "solver_started > 0 means the pipeline did reach the solver:\n{rendered}"
+        );
+
+        // (c) No rejections recorded at all: nothing to attribute.
+        let stats = StartupStats::from_rejections(3, 3, 3, 0, &[]);
+        let rendered = format_no_seeds_passed("ctx", &stats, &[], None, "");
+        assert!(
+            !rendered.contains("NOT a seeding failure"),
+            "an empty rejection list carries no evidence:\n{rendered}"
+        );
+    }
+
+    /// The counters and the per-seed list must agree before anything is
+    /// concluded from them: a truncated rejection list beside a larger count is
+    /// exactly the shape that would let a summary generalise from a prefix.
+    #[test]
+    fn a_rejection_list_shorter_than_its_count_is_not_attributed() {
+        let reason = "outer eval failed: objective returned a non-finite cost";
+        let all: Vec<SeedRejection> = (0..5)
+            .map(|i| SeedRejection::from_message(i, "validation", reason.to_string()))
+            .collect();
+        let stats = StartupStats::from_rejections(5, 5, 5, 0, &all);
+        assert_eq!(stats.total_rejected(), 5);
+
+        // Same stats, but only the first two rejections survived to the render.
+        let rendered = format_no_seeds_passed("ctx", &stats, &all[..2], None, "");
+        assert!(
+            !rendered.contains("NOT a seeding failure"),
+            "2 listed reasons cannot establish that all 5 shared one cause:\n{rendered}"
+        );
+    }
+
 }
