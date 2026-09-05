@@ -1250,3 +1250,175 @@ fn tied_frame_stationarity_separates_normal_storage_error_from_tangent_signal_28
         assert!((measured - tangent / scale).abs() <= 16.0 * f64::EPSILON);
     }
 }
+/// The tied loss `L(S) = ‖x − γ Σ_{g∈S} P_g x‖²` a support actually prices,
+/// computed in f64 straight from the projectors — independent of anything
+/// `code_row` accumulates, so it can adjudicate the selection rather than
+/// restate it.
+fn tied_loss_of_support(
+    row: &[f64],
+    decoder: ArrayView2<'_, f32>,
+    blocks: &[usize],
+    gamma: f64,
+    b: usize,
+) -> f64 {
+    let p = row.len();
+    let mut reconstruction = vec![0.0_f64; p];
+    for &block in blocks {
+        for axis in 0..b {
+            let atom = decoder.row(block * b + axis);
+            let mut projection = 0.0_f64;
+            for (value, &direction) in row.iter().zip(atom.iter()) {
+                projection += value * direction as f64;
+            }
+            for (out, &direction) in reconstruction.iter_mut().zip(atom.iter()) {
+                *out += projection * direction as f64;
+            }
+        }
+    }
+    row.iter()
+        .zip(reconstruction.iter())
+        .map(|(&observed, &fitted)| {
+            let residual = observed - gamma * fitted;
+            residual * residual
+        })
+        .sum()
+}
+
+/// The blocks a row actually admitted, in slot order, skipping canonical padding.
+fn admitted_blocks_of(code: &RowBlockCode) -> Vec<usize> {
+    code.blocks
+        .iter()
+        .enumerate()
+        .filter(|&(slot, _)| code.gates[slot] != 0.0)
+        .map(|(_, &block)| block as usize)
+        .collect()
+}
+
+/// #2825 as a PROPERTY, over an ensemble rather than a hand-built row.
+/// `8aa65d500` pins the admission rule with three examples — one overlapping
+/// pair refused, one orthogonal pair admitted, one non-descent scale kept
+/// definable. Each is exact and each is a single row. This asserts the two
+/// things that have to hold on every row of an over-complete dictionary, over a
+/// deterministic ensemble of 8 blocks of `b = 2` in `P = 6` (so `K = 16 > P` and
+/// the projectors overlap by construction), 64 rows at four scales:
+///
+/// 1. **The stopping rule is a local minimum.** At the returned support, every
+///    refused candidate must price at least as much as the support without it.
+///    That is a theorem about the rule, not a fact about the data, and it is
+///    recomputed here from the projectors — never from anything `code_row`
+///    accumulated, so the check cannot restate the thing it is checking.
+/// 2. **The admitted support never prices worse than the top-`k` quota** it
+///    replaces, measured on this ensemble.
+///
+/// Both scales below are inside `(0, 2)`, where the admission weight `2γ−γ²` is
+/// positive, so the unconditional first admission that `8aa65d500` uses to keep
+/// the scale definable at `γ ≥ 2` is inert here and the rule under test is the
+/// conditional one throughout.
+///
+/// Two positive controls keep it from passing vacuously: the quota must actually
+/// be reduced somewhere (or nothing is being refused), and it must be strictly
+/// beaten somewhere (or the inequality is trivially satisfied by an unchanged
+/// rule).
+#[test]
+fn greedy_admission_never_prices_worse_than_the_topk_quota_2825() {
+    let p = 6usize;
+    let b = 2usize;
+    let n_blocks = 8usize; // K = 16 > P: over-complete, so the projectors overlap
+    let k = 4usize;
+    let mut decoder = Array2::<f32>::zeros((n_blocks * b, p));
+    let mut state = 0x2825_u64;
+    let mut next = || {
+        state = splitmix64_block(state);
+        ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    };
+    for block in 0..n_blocks {
+        let mut frame = Array2::<f32>::zeros((b, p));
+        for axis in 0..b {
+            for column in 0..p {
+                frame[[axis, column]] = next() as f32;
+            }
+        }
+        orthonormalize_block(&mut frame);
+        decoder
+            .slice_mut(ndarray::s![block * b..(block + 1) * b, ..])
+            .assign(&frame);
+    }
+
+    let mut stuck = 0usize;
+    let mut strictly_better = 0usize;
+    let mut worse = 0usize;
+    let mut refused_rows = 0usize;
+    let rows = 64usize;
+    for _ in 0..rows {
+        let mut row = Array1::<f32>::zeros(p);
+        for column in 0..p {
+            row[column] = next() as f32;
+        }
+        let exact: Vec<f64> = row.iter().map(|&value| value as f64).collect();
+        let projections = block_projections_row(row.view(), decoder.view(), n_blocks, b);
+        let gates = block_gates(projections.view());
+        let shortlist = route_row_blocks(&gates, k);
+        for &gamma in &[0.4_f32, 0.8, 1.0, 1.3] {
+            let code = code_row(row.view(), decoder.view(), gamma, b, k, &shortlist);
+            let admitted = admitted_blocks_of(&code);
+            let quota: Vec<usize> = shortlist
+                .iter()
+                .filter(|&&(_, gate)| gate != 0.0)
+                .map(|&(block, _)| block as usize)
+                .collect();
+            if admitted.len() < quota.len() {
+                refused_rows += 1;
+            }
+            // The stopping condition is a THEOREM about the returned support, not a
+            // property of this ensemble: every refused candidate must price at least
+            // as much as the support without it. Recomputed here from the projectors,
+            // never from anything `code_row` accumulated.
+            let taken = tied_loss_of_support(&exact, decoder.view(), &admitted, gamma as f64, b);
+            for &block in quota.iter() {
+                if admitted.contains(&block) {
+                    continue;
+                }
+                let mut widened = admitted.clone();
+                widened.push(block);
+                let widened_loss =
+                    tied_loss_of_support(&exact, decoder.view(), &widened, gamma as f64, b);
+                let slack = 64.0 * f64::EPSILON * widened_loss.max(taken).max(1.0e-12);
+                if widened_loss + slack < taken {
+                    stuck += 1;
+                }
+            }
+            let quota_loss = tied_loss_of_support(&exact, decoder.view(), &quota, gamma as f64, b);
+            // The projections are f64 accumulations of f32 inputs; a support the
+            // rule declined by an amount below that resolution may measure as a
+            // wash either way. Anything beyond it is a real ordering.
+            let resolution = 64.0 * f64::EPSILON * quota_loss.max(taken).max(1.0e-12);
+            if taken > quota_loss + resolution {
+                worse += 1;
+            }
+            if taken + resolution < quota_loss {
+                strictly_better += 1;
+            }
+        }
+    }
+    assert_eq!(
+        stuck, 0,
+        "the returned support must be a local minimum against single additions: no \
+         refused candidate may have a negative gain at it"
+    );
+    assert_eq!(
+        worse, 0,
+        "measured over this ensemble, the admitted support never priced worse than the \
+         top-k quota it replaces"
+    );
+    // Positive control: on an over-complete dictionary the quota DOES lose, so a
+    // rule that silently degenerated back to `take(k)` would fail here rather
+    // than pass the inequality vacuously.
+    assert!(
+        refused_rows > 0,
+        "the fixture must exercise refusals; the quota was never reduced"
+    );
+    assert!(
+        strictly_better > 0,
+        "the quota must be strictly beaten somewhere, or this test is vacuous"
+    );
+}
