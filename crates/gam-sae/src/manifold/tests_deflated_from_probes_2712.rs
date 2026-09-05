@@ -83,6 +83,122 @@ fn full_basis_bundle(cache: &ArrowFactorCache) -> (Vec<Array1<f64>>, Vec<Array1<
     (probes, sinv)
 }
 
+/// A positive but unresolved ARD curvature has a resolved derivative inside
+/// the smooth clamp tail. This exercises spectral conditioning without relying
+/// on an indefinite fit or on a structurally null direction with zero derivative.
+#[test]
+fn sae_logdet_theta_adjoint_from_probes_matches_dense_on_deflated_rows_2712() {
+    use crate::manifold::construction::ThetaAdjointDhChannel;
+    use gam_linalg::utils::{SMOOTH_PSD_CLAMP_TEMPERATURE, SPECTRAL_DEFLATION_REL_FLOOR};
+
+    let (mut term, target, rho) = small_two_atom_periodic_term();
+    let cosine = SMOOTH_PSD_CLAMP_TEMPERATURE * SPECTRAL_DEFLATION_REL_FLOOR.sqrt().ln();
+    let weak_phase = cosine.acos() / std::f64::consts::TAU;
+    let n = term.n_obs();
+    for atom in &mut term.atoms {
+        atom.decoder_coefficients_mut().fill(0.0);
+    }
+    for (atom, coords) in term.assignment.coords.iter_mut().enumerate() {
+        let phase = if atom == 0 { weak_phase } else { 0.05 };
+        coords.set_flat(Array1::from_elem(n, phase).view());
+    }
+    term.refresh_basis_from_current_coords().unwrap();
+    let mut system = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
+    // A flat decoder supplies no decoded-derivative gauge. Use the evidence
+    // factorization's production spectral-discovery policy, just as its frozen
+    // state path does. This algebraic comparison does not accept a fitted state.
+    SaeManifoldTerm::ensure_row_gauge_deflation_for_quasi_laplace(&mut system);
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
+    let (_, _, cache) = solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options).unwrap();
+    let spectral_rows = cache
+        .deflation_row_spectra
+        .iter()
+        .filter(|row| row.is_some())
+        .count();
+    assert!(
+        spectral_rows > 0 && cache.k > 0,
+        "the production evidence factor must deflate and retain a border: \
+         spectral_rows={spectral_rows}, border={}, directions={:?}",
+        cache.k,
+        cache
+            .deflated_row_directions
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>()
+    );
+    let (probes, inverse_probes) = full_basis_bundle(&cache);
+    let solver = DeflatedArrowSolver::plain(&cache);
+    let inverse = term.materialize_joint_inverse(&cache, &solver).unwrap();
+    let dense = term
+        .logdet_theta_adjoint_dense(
+            &rho,
+            &cache,
+            &inverse,
+            ThetaAdjointDhChannel::All,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    let blind = term
+        .logdet_theta_adjoint_dense(
+            &rho,
+            &cache,
+            &inverse,
+            ThetaAdjointDhChannel::All,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+    let probe = term
+        .logdet_theta_adjoint_from_probes(
+            &rho,
+            &cache,
+            &probes,
+            &inverse_probes,
+            EvidenceOperator::Majorizer,
+            None,
+        )
+        .unwrap();
+    assert_eq!(dense.t.len(), probe.t.len());
+    assert_eq!(dense.beta.len(), probe.beta.len());
+    assert_eq!(dense.t.len(), blind.t.len());
+    assert_eq!(dense.beta.len(), blind.beta.len());
+    let mut magnitude = 0.0_f64;
+    let mut parity_error = 0.0_f64;
+    let mut separation = 0.0_f64;
+    for ((reference, actual), counterfactual) in dense
+        .t
+        .iter()
+        .chain(dense.beta.iter())
+        .zip(probe.t.iter().chain(probe.beta.iter()))
+        .zip(blind.t.iter().chain(blind.beta.iter()))
+    {
+        assert!(reference.is_finite() && actual.is_finite() && counterfactual.is_finite());
+        magnitude = magnitude.max(reference.abs());
+        parity_error = parity_error.max((reference - actual).abs());
+        separation = separation.max((reference - counterfactual).abs());
+        assert!(
+            (reference - actual).abs() <= 1e-10 * (1.0 + reference.abs()),
+            "dense={reference} probes={actual}"
+        );
+    }
+    eprintln!(
+        "#2712 weak-positive ARD deflation: spectral_rows={spectral_rows} magnitude={magnitude:.6e} parity_error={parity_error:.6e} DK_separation={separation:.6e}"
+    );
+    assert!(
+        separation > 1e-10 * (1.0 + magnitude),
+        "the DK contribution must exceed the comparison allowance"
+    );
+    assert!(
+        separation > 1000.0 * parity_error,
+        "the fixture must distinguish omission of the DK correction"
+    );
+}
+
 /// The reconstruction identity on a SPECTRALLY deflated row, including the
 /// off-diagonal entries the Daleckii–Krein rotation term reads.
 ///

@@ -110,7 +110,7 @@ The fixture explicitly places periodic coordinates in the positive-curvature
 quarter of their ARD prior and refreshes the production basis. It then asserts
 that the actual factor has no deflated row directions. The historical #2080
 gate admitted this undeflated regime; the separate historical #2712 deflated
-adjoint gate remains pending. The existing cold state's two spectrally deflated
+adjoint gate is verified below on a derivative-sensitive fixture. The existing cold state's two spectrally deflated
 rows did not resolve that latter contract: its deflation-aware and blind
 adjoints differed by only 3.552714e-15. Merely counting those rows would have
 claimed coverage of a derivative the fixture could not distinguish.
@@ -129,8 +129,53 @@ gate. The executed source blob is
 `.buildd/exact-a-obb-scalar-and-2080.log`. The existing #2712 selected-inverse
 reconstruction test also passed in the preceding selection, resolving
 off-diagonal reconstruction to 1.11e-16 on two spectrally deflated rows. That
-block-reconstruction result is distinct from the still-pending
-deflation-adjoint sensitivity requirement.
+block-reconstruction result is distinct from the deflation-adjoint sensitivity
+requirement verified below.
+
+## Deflation-sensitive probe adjoint: #2712
+
+`sae_logdet_theta_adjoint_from_probes_matches_dense_on_deflated_rows_2712` is
+restored in `crates/gam-sae/src/manifold/tests_deflated_from_probes_2712.rs`.
+It checks the production majorizer adjoint at a fixed state, with a genuine
+spectrally conditioned factor and an independently constructed complete basis
+of Schur probes. The fixture's weak positive periodic ARD curvature lies inside
+the smooth-clamp tail: its value is below the spectral floor while its coordinate
+derivative remains resolved. The phase is derived from the production clamp
+temperature and spectral floor, without a parameter search or cache mutation.
+
+Zero decoded tangents intentionally isolate that prior contribution. They also
+produce no decoded-derivative gauge, which initially left spectral discovery
+disabled in the direct test. The corrected fixture uses
+`ensure_row_gauge_deflation_for_quasi_laplace`, the same production installer
+used before frozen-state evidence factorization. This is an algebraic comparison
+of a conditioned majorizer; it does not certify a fitted state or an exact-A
+maximum.
+
+The final test passed on **5 spectrally deflated rows**, with adjoint magnitude
+**3.033522**, maximum dense/probe error **1.776357e-15**, and discrepancy
+**5.654301e-4** when the dense route omits the Daleckii--Krein correction. The
+1e-10 comparison bar is unchanged. The counterfactual must separate by more
+than that bar and by more than 1,000 times the actual parity error, so agreement
+cannot pass on the cold fixture's previously unresolved correction.
+
+All **3 tests in the module passed** in the combined MSI selection: the new
+deflation-adjoint pin, the #2080 undeflated pin and the existing off-diagonal
+selected-inverse reconstruction pin. The whole selection had **38 passes and
+7 separate block-solver failures**, 45 tests in 0.62 seconds, so it was not an
+all-green repository run. Executed source blob:
+`241a79fde98e1afe620e8519c99f327e06d8f207`; log:
+`.buildd/exact-beta-prepared-block-2712.log`. The umbrella scanner also passed
+with this source present. The new adjoint witness resolves the weak ARD
+conditioning contribution; it does not replace separate outer-gradient,
+assignment-strength trace or off-diagonal spectral-rotation contracts.
+
+The historical `zz_measure_deflation_correction_size_2712` was a diagnostic,
+explicitly reporting rather than asserting correction size. It printed NaNs
+when either adjoint evaluation failed. Its test-acceptance purpose is replaced
+by the asserted non-vacuity control above, so the print-only experiment is not
+reinstated as a passing regression gate. Its old three-fixture measurements
+remain historical observations; this recovery makes no new execution claim
+about those removed fixtures.
 
 ## Channel-aware canonicalization: #1590
 
