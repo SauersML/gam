@@ -32,6 +32,16 @@ jobs:
           set -euo pipefail
           git fetch --no-tags --depth=2 origin c0a21b5540ce76b76f62d880addf2612246ce1ee
           python scripts/test_census.py --positive-control
+      - name: Fetch the #2110 positive-control blob
+        # `actions/checkout` fetches depth 2, so a1d610d21 is not in the clone.
+        # This runs BEFORE the unit tests, not beside them: the detector's own
+        # positive-control case reads that blob, and it FAILS rather than skips
+        # when the blob is unreachable -- a gate whose control cannot run has not
+        # passed. Fetching inside the later step left the earlier one to fail on
+        # a missing object (d9ed281b8).
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin a1d610d212a2ba5f2b4c2097260c814bdc45d579
       - name: Verify the assertion-less-test detector
         run: python -m unittest discover -s scripts/tests -p test_assertionless_tests.py -v
       - name: Positive control against the #2110 incident
@@ -39,10 +49,7 @@ jobs:
         # a detector that has stopped detecting anything prints exactly what a
         # clean tree prints. a1d610d21 added two assertion-less probes and the
         # then-live build.rs gate reported exactly 2, so re-measure that.
-        run: |
-          set -euo pipefail
-          git fetch --no-tags --depth=1 origin a1d610d212a2ba5f2b4c2097260c814bdc45d579
-          python scripts/assertionless_tests.py --positive-control
+        run: python scripts/assertionless_tests.py --positive-control
       - name: Compare immutable source inventories
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
