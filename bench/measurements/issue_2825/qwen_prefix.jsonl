@@ -1,0 +1,13 @@
+{"atoms":256,"block_size":2,"features":2560,"rows":512,"seed_seconds":1.046729806,"tolerance":1e-6,"topk":8}
+{"converged":false,"epoch":1,"ev":0.46746337531364457,"frame_residual":0.2712510114873016,"gamma":0.23427006602287292,"gamma_residual":0.7657299339771271,"seconds":0.643523236}
+{"converged":false,"epoch":2,"ev":0.5528237523937714,"frame_residual":0.16765110141074627,"gamma":0.2661030888557434,"gamma_residual":0.1196266566079863,"seconds":0.630945286}
+{"converged":false,"epoch":3,"ev":0.5984797841007082,"frame_residual":0.12486961518063086,"gamma":0.29596400260925293,"gamma_residual":0.10089373535380063,"seconds":0.630805733}
+{"converged":false,"epoch":4,"ev":0.6282292691908564,"frame_residual":0.10066870777949376,"gamma":0.32276254892349243,"gamma_residual":0.0830286735670557,"seconds":0.626137973}
+{"converged":false,"epoch":5,"ev":0.6489121387832822,"frame_residual":0.08515116825045109,"gamma":0.3467055559158325,"gamma_residual":0.06905861929179058,"seconds":0.624319604}
+{"converged":false,"epoch":6,"ev":0.6649439951755132,"frame_residual":0.07742836362673029,"gamma":0.36851033568382263,"gamma_residual":0.0591700629713093,"seconds":0.624529619}
+{"converged":false,"epoch":7,"ev":0.6782539990506318,"frame_residual":0.07177581827353226,"gamma":0.3884110450744629,"gamma_residual":0.05123620876132671,"seconds":0.630770528}
+{"converged":false,"epoch":8,"ev":0.6879188403574005,"frame_residual":0.07178248868502085,"gamma":0.4063355326652527,"gamma_residual":0.044112528070628626,"seconds":0.626896961}
+{"converged":false,"epoch":9,"ev":0.6971771108341163,"frame_residual":0.05863010625281494,"gamma":0.4234684109687805,"gamma_residual":0.04045845654539489,"seconds":0.633345881}
+{"converged":false,"epoch":10,"ev":0.7045986270432325,"frame_residual":0.05856688523448532,"gamma":0.43926143646240234,"gamma_residual":0.03595358978200126,"seconds":0.628250958}
+{"converged":false,"epoch":11,"ev":0.7112757712540116,"frame_residual":0.05813810438569108,"gamma":0.4540419578552246,"gamma_residual":0.03255320601347413,"seconds":0.632853095}
+{"converged":false,"epoch":12,"ev":0.7170018994315834,"frame_residual":0.05214205024106705,"gamma":0.46789997816085815,"gamma_residual":0.029617484403620407,"seconds":0.627429663}

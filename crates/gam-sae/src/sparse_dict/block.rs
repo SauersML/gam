@@ -1574,7 +1574,7 @@ fn seed_frames_by_policy(
 /// assuming exact floating-point orthonormality, so identical stored frames have
 /// exactly zero residual. Every term is invariant to independent `O(b)` changes
 /// of basis in either frame.
-fn frame_fixed_point_residual(
+pub(super) fn frame_fixed_point_residual(
     previous: ArrayView2<'_, f32>,
     next: ArrayView2<'_, f32>,
     n_blocks: usize,
@@ -1615,7 +1615,7 @@ fn frame_fixed_point_residual(
     maximum
 }
 
-fn relative_scalar_change(previous: f32, current: f32) -> f64 {
+pub(super) fn relative_scalar_change(previous: f32, current: f32) -> f64 {
     let previous = previous as f64;
     let current = current as f64;
     (current - previous).abs() / previous.abs().max(current.abs()).max(f64::MIN_POSITIVE)

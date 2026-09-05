@@ -1075,6 +1075,7 @@ class BlockSparseDictStream:
         """Close the epoch: refresh γ + block frames and advance the exact
         residual-row birth transaction. Returns
         ``{explained_variance, accepted_births, birth_pending, dead, gamma,
+        gamma_residual, frame_residual,
         converged, epoch}``."""
         return dict(self._handle.end_epoch())
 

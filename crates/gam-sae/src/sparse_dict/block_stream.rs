@@ -3,7 +3,7 @@
 //! The one-shot [`super::fit_block_sparse_dictionary`] holds the whole `N×P`
 //! corpus in memory and alternates route → γ-refresh → frame-refresh → revive over
 //! it. For a real corpus (a 30M-row residual-stream harvest) the rows never fit at
-//! once, so this module exposes the SAME alternation as a resumable handle a Python
+//! once, so this module exposes an accumulated-moment alternation as a resumable handle a Python
 //! loop drives one shard at a time — mirroring [`super::SparseDictStreamState`]:
 //!
 //! ```text
@@ -24,33 +24,31 @@
 //! `N×K` object — so per-shard overhead is `O(shard × P)`, independent of `K` and
 //! of the corpus length.
 //!
-//! **Equivalence to one-shot.** During an epoch the block frames and the shared
+//! During an epoch the block frames and the shared
 //! scalar γ are FROZEN at their epoch-start values; every shard is routed against
 //! them and its cross-moment / γ / moment contributions are summed (all additive),
-//! so the assembled `M_g` and (num, den) — and therefore the refreshed frames and
-//! γ — are exactly those of a full-batch refresh over the concatenation, up to f32
-//! rounding. The per-block frame step is an EXACT polar (orthogonal-Procrustes)
-//! update of `M_g`, the same one the one-shot lane runs — a block is a small `b×b`
-//! orthonormal frame, so this is exact and cheap (the matrix-free CG-default solver
-//! serves the atom/dict lane, whose co-firing graph percolates). As with the atom
-//! lane, proposal residuals are
-//! measured under the decoder in force during the pass (the pre-refresh frames),
-//! the only deliberate difference from one-shot; the two coincide once the
-//! dictionary is populated and birth arbitration goes quiescent. Streaming even removes the
-//! one-shot loop's slight γ mixing (it uses a single frozen γ for both the code and
-//! the reconstruction throughout the epoch), so its per-epoch step is internally
-//! consistent.
+//! so shard boundaries do not change the accumulated problem. Gamma-free data
+//! and overlap moments let the frame step use the newly fitted γ without
+//! replaying the corpus. The simultaneous polar updates minimize a quadratic
+//! upper bound derived from the selected-block count, which prevents co-fired
+//! blocks from overcorrecting against one another at fixed codes. One-shot uses
+//! sequential block updates; the streaming trajectory is different.
+//!
+//! EV describes the pass's measured frames with their profiled γ. Proposed frames
+//! remain an uncertified checkpoint until another pass measures them. Finalize
+//! requires EV, γ and projector closure and returns the exact measured frames,
+//! γ and EV; an EV coincidence alone never certifies an unmeasured proposal.
 
 use super::BlockSparseConfig;
 use super::block::{
-    block_birth_evidence_margin, gram_schmidt_rows, reconstruct_stored_code_row,
-    route_and_code_all, seed_frames, stable_rank_symmetric,
+    block_birth_evidence_margin, frame_fixed_point_residual, gram_schmidt_rows,
+    reconstruct_stored_code_row, relative_scalar_change, route_and_code_all, seed_frames,
+    stable_rank_symmetric,
 };
 use super::residual_reservoir::ResidualReservoir;
 use super::update::{DEAD_DENOM, DecoderSolveStats};
 use crate::frames::GrassmannFrame;
 use ndarray::{Array2, ArrayView2};
-
 
 /// Per-shard summary returned by [`BlockSparseStreamState::partial_fit`].
 #[derive(Clone, Copy, Debug)]
@@ -69,7 +67,7 @@ pub struct BlockShardStats {
 #[derive(Clone, Copy, Debug)]
 pub struct BlockEpochStats {
     /// Explained variance `1 − RSS/TSS` of the frames routed against this epoch
-    /// (the pre-refresh frames), from the streamed TSS/RSS moments.
+    /// with their profiled gamma, from the streamed TSS/RSS moments.
     pub explained_variance: f64,
     /// Residual-row block births accepted after a complete candidate-vs-baseline
     /// streaming pass proved strict RSS improvement.
@@ -81,8 +79,12 @@ pub struct BlockEpochStats {
     pub dead: usize,
     /// Refreshed shared tied scalar γ after this epoch.
     pub gamma: f32,
-    /// Whether the EV-improvement tolerance was met with no accepted or pending
-    /// block birth.
+    /// Relative displacement from the pass's gamma to its conditional optimum.
+    pub gamma_residual: f64,
+    /// Relative projector displacement to the frame update at that same gamma.
+    pub frame_residual: f64,
+    /// Whether EV, gamma and frame-projector residuals meet the tolerance,
+    /// with no accepted or pending block birth.
     pub converged: bool,
     /// Epochs completed so far (this one inclusive).
     pub epoch: usize,
@@ -122,8 +124,9 @@ pub struct BlockSparseStreamState {
     gamma: f32,
 
     // ---- accumulators reset at each end_epoch (frozen frames/γ used to fill) ----
-    second: Vec<Array2<f64>>, // per-block within-block code 2nd moment (b×b)
-    cross: Vec<Array2<f64>>,  // per-block MOD cross-moment M_g (P×b), refreshed by a polar step
+    second: Vec<Array2<f64>>, // gamma-free projection second moment (b×b)
+    cross: Vec<Array2<f64>>,  // gamma-free other-block reconstruction × projection (P×b)
+    data_cross: Vec<Array2<f64>>, // data × projection (P×b)
     usage: Vec<usize>,
     alive_count: usize,
     gamma_num: f64,
@@ -138,6 +141,8 @@ pub struct BlockSparseStreamState {
     prev_ev: f64,
     last_ev: f64,
     last_ev_residual: f64,
+    last_gamma_residual: f64,
+    last_frame_residual: f64,
     epochs_run: usize,
     last_accepted_births: usize,
     converged: bool,
@@ -227,6 +232,7 @@ impl BlockSparseStreamState {
             gamma: 1.0,
             second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
             cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
+            data_cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
             usage: vec![0; g],
             alive_count: 0,
             gamma_num: 0.0,
@@ -239,6 +245,8 @@ impl BlockSparseStreamState {
             prev_ev: f64::NEG_INFINITY,
             last_ev: f64::NEG_INFINITY,
             last_ev_residual: f64::INFINITY,
+            last_gamma_residual: f64::INFINITY,
+            last_frame_residual: f64::INFINITY,
             epochs_run: 0,
             last_accepted_births: 0,
             converged: false,
@@ -298,6 +306,7 @@ impl BlockSparseStreamState {
             gamma: 1.0,
             second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
             cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
+            data_cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
             usage: vec![0; g],
             alive_count: 0,
             gamma_num: 0.0,
@@ -310,6 +319,8 @@ impl BlockSparseStreamState {
             prev_ev: f64::NEG_INFINITY,
             last_ev: f64::NEG_INFINITY,
             last_ev_residual: f64::INFINITY,
+            last_gamma_residual: f64::INFINITY,
+            last_frame_residual: f64::INFINITY,
             epochs_run: 0,
             last_accepted_births: 0,
             converged: false,
@@ -348,6 +359,8 @@ impl BlockSparseStreamState {
         if !shard.iter().all(|v| v.is_finite()) {
             return Err("BlockSparseStream.partial_fit shard must be finite".to_string());
         }
+        // A new nonempty pass has no convergence evidence until it closes.
+        self.converged = false;
 
         // Per-shard wall-clock start (#2227). The block lane processes one shard
         // per `partial_fit`; the epoch-level telemetry only lands at `end_epoch`,
@@ -401,47 +414,45 @@ impl BlockSparseStreamState {
             // Per selected block: its within-block code z (b) and its γ-free
             // subspace contribution proj = Σ_r w_r D_g[r] (P). Accumulate x̂ = γ·Σ proj
             // and the γ-free projection sum p_i = Σ proj (for the γ least-squares).
-            let mut sel: Vec<(usize, Vec<f32>, Vec<f32>)> = Vec::with_capacity(self.k);
-            let mut xhat = vec![0.0f32; p];
-            let mut proj_sum = vec![0.0f32; p];
+            let mut sel: Vec<(usize, Vec<f64>, Vec<f64>)> = Vec::with_capacity(self.k);
+            let mut proj_sum = vec![0.0_f64; p];
             for j in 0..code.blocks.len() {
                 if code.gates[j] == 0.0 {
                     continue;
                 }
                 let gg = code.blocks[j] as usize;
-                let mut w = vec![0.0f32; b];
+                let mut w = vec![0.0_f64; b];
                 for (rr, wr) in w.iter_mut().enumerate() {
                     let atom = self.decoder.row(gg * b + rr);
-                    let mut acc = 0.0f32;
+                    let mut acc = 0.0_f64;
                     for (xc, ac) in xi.iter().zip(atom.iter()) {
-                        acc += *xc * *ac;
+                        acc += *xc as f64 * *ac as f64;
                     }
                     *wr = acc;
                 }
-                let mut proj = vec![0.0f32; p];
+                let mut proj = vec![0.0_f64; p];
                 for (rr, &wr) in w.iter().enumerate() {
                     if wr == 0.0 {
                         continue;
                     }
                     let atom = self.decoder.row(gg * b + rr);
                     for c in 0..p {
-                        proj[c] += wr * atom[c];
+                        proj[c] += wr * atom[c] as f64;
                     }
                 }
                 for c in 0..p {
-                    xhat[c] += gamma * proj[c];
                     proj_sum[c] += proj[c];
                 }
-                let z: Vec<f32> = w.iter().map(|v| gamma * v).collect();
-                sel.push((gg, z, proj));
+                sel.push((gg, w, proj));
             }
 
             // Full residual under the frozen model + streaming RSS/reservoir.
             let mut residual = vec![0.0f32; p];
             let mut norm2 = 0.0f64;
             for c in 0..p {
-                residual[c] = xi[c] - xhat[c];
-                norm2 += residual[c] as f64 * residual[c] as f64;
+                let value = xi[c] as f64 - gamma as f64 * proj_sum[c];
+                residual[c] = value as f32;
+                norm2 += value * value;
             }
             shard_rss += norm2;
             if aux_on {
@@ -451,37 +462,36 @@ impl BlockSparseStreamState {
 
             // Streaming γ least-squares: γ* = (Σ⟨x,p⟩)/(Σ‖p‖²).
             for c in 0..p {
-                self.gamma_num += xi[c] as f64 * proj_sum[c] as f64;
-                self.gamma_den += proj_sum[c] as f64 * proj_sum[c] as f64;
+                self.gamma_num += xi[c] as f64 * proj_sum[c];
+                self.gamma_den += proj_sum[c] * proj_sum[c];
             }
 
-            // Per-block MOD cross-moment M_g += r_ig ⊗ z (P×b) and the within-block
-            // code 2nd moment for the stable-rank report. The block lane's frames
-            // are small b×b orthonormal blocks, so the refresh is an EXACT polar
-            // (orthogonal-Procrustes) step over M_g in `end_epoch` — the same update
-            // the one-shot lane uses (block.rs `refresh_frames`), which the streamed
-            // shards reproduce exactly because M_g / γ / moments are all additive.
-            // (The atom/dict lane's percolating co-firing graph is where the
-            // matrix-free CG-default solver lives; a block frame is small and exact.)
-            for (gg, z, proj) in sel.iter() {
+            // Gamma-free frame moments and within-block second moments. These
+            // additive statistics support the coordinated scalar update and
+            // parallel polar majorizer in end_epoch without retaining rows.
+            for (gg, w, proj) in sel.iter() {
                 let gg = *gg;
                 if self.usage[gg] == 0 {
                     self.alive_count += 1;
                 }
                 self.usage[gg] += 1;
-                // r_ig = full residual with THIS block's own contribution added back
-                // (leave-one-block-out), so the polar step sees the target subspace.
+                // Keep both gamma-free terms. The exact frozen-code polar
+                // moment at ANY gamma is gamma*XW - gamma²*OtherProjectionW.
+                // A moment formed using the pass's old gamma cannot be reused
+                // after fitting gamma without changing the coordinate problem.
                 let mg = &mut self.cross[gg];
+                let xg = &mut self.data_cross[gg];
                 for c in 0..p {
-                    let r_ig_c = residual[c] as f64 + (gamma * proj[c]) as f64;
-                    for (rr, &zr) in z.iter().enumerate() {
-                        mg[[c, rr]] += r_ig_c * zr as f64;
+                    let other = proj_sum[c] - proj[c];
+                    for (rr, &wr) in w.iter().enumerate() {
+                        mg[[c, rr]] += other * wr;
+                        xg[[c, rr]] += xi[c] as f64 * wr;
                     }
                 }
                 let sg = &mut self.second[gg];
                 for r1 in 0..b {
                     for r2 in 0..b {
-                        sg[[r1, r2]] += z[r1] as f64 * z[r2] as f64;
+                        sg[[r1, r2]] += w[r1] * w[r2];
                     }
                 }
             }
@@ -582,7 +592,7 @@ impl BlockSparseStreamState {
                 improvement_rss,
                 self.rss,
                 self.usage[pending.block],
-                &self.second[pending.block],
+                &self.second[pending.block].mapv(|value| value * (self.gamma as f64).powi(2)),
                 self.decoder.view(),
                 self.row_count,
                 self.p,
@@ -601,52 +611,95 @@ impl BlockSparseStreamState {
             }
         }
 
-        let ev = if tss <= 1.0e-24 {
-            if self.rss <= 1.0e-24 { 1.0 } else { 0.0 }
-        } else {
-            1.0 - self.rss / tss
-        };
-
+        let previous_gamma = self.gamma;
+        let mut candidate_decoder = self.decoder.clone();
+        let mut gamma_residual = f64::INFINITY;
+        let mut frame_residual = f64::INFINITY;
         if !rejected_birth {
             // (γ) closed-form shared scalar from the accumulated least-squares.
-            self.gamma = if self.gamma_den <= 1.0e-24 {
-                self.gamma
+            self.gamma = if self.gamma_den == 0.0 {
+                0.0
             } else {
                 (self.gamma_num / self.gamma_den) as f32
             };
+            if !self.gamma.is_finite() || self.gamma < 0.0 {
+                return Err("BlockSparseStream gamma optimum is not finite and nonnegative".into());
+            }
+            gamma_residual = relative_scalar_change(previous_gamma, self.gamma);
+            // Evaluate the scalar quadratic around the accurately accumulated
+            // pass residual, rather than subtracting nearly equal total energies.
+            let old = previous_gamma as f64;
+            let gamma = self.gamma as f64;
+            let correction =
+                (gamma - old) * ((gamma + old) * self.gamma_den - 2.0 * self.gamma_num);
+            let rss = self.rss + correction;
+            let resolution = f64::EPSILON
+                * (self.row_count * p) as f64
+                * (self.rss.abs() + correction.abs() + self.col_sumsq.iter().sum::<f64>());
+            if !rss.is_finite() || rss < -resolution {
+                return Err(format!("BlockSparseStream profiled RSS is invalid: {rss}"));
+            }
+            self.rss = rss.max(0.0);
+            for second in &mut self.second {
+                second.mapv_inplace(|value| value * gamma * gamma);
+            }
 
-            // (frames) EXACT polar refresh of every block that fired this epoch,
-            // over its accumulated cross-moment `M_g` (P×b). These accumulators
-            // belong to the candidate model when a birth was pending and to the
-            // ordinary live model otherwise. A rejected candidate never reaches
-            // this mutation point.
+            // Form the frame proposal at the NEW gamma. Its moments use the
+            // same frozen directions and routing as the scalar fit, with no
+            // corpus replay and no old-gamma cross term left in the polar step.
             let ridge = self.config.frame_ridge;
             for gg in 0..self.g {
                 if self.usage[gg] == 0 {
                     continue;
                 }
-                if ridge > 0.0 {
-                    for rr in 0..b {
-                        for c in 0..p {
-                            self.cross[gg][[c, rr]] +=
-                                ridge * self.decoder[[gg * b + rr, c]] as f64;
-                        }
+                for rr in 0..b {
+                    for c in 0..p {
+                        self.cross[gg][[c, rr]] = gamma * self.data_cross[gg][[c, rr]]
+                            - gamma * gamma * self.cross[gg][[c, rr]]
+                            + ridge * self.decoder[[gg * b + rr, c]] as f64
+                            + (self.k - 1) as f64
+                                * (0..b)
+                                    .map(|axis| {
+                                        self.decoder[[gg * b + axis, c]] as f64
+                                            * self.second[gg][[axis, rr]]
+                                    })
+                                    .sum::<f64>();
                     }
                 }
-                if let Ok(frame) = GrassmannFrame::polar_update(self.cross[gg].view()) {
-                    let u = frame.frame(); // P×b column-orthonormal
-                    let sv = frame.gauge_singular_values();
-                    let full_rank = sv.len() == b && sv.iter().all(|&s| s > 1.0e-9);
-                    if full_rank && u.ncols() == b {
-                        for rr in 0..b {
-                            for c in 0..p {
-                                self.decoder[[gg * b + rr, c]] = u[[c, rr]] as f32;
-                            }
-                        }
+                // ||sum_g delta_g||² <= k*sum_g ||delta_g||² majorizes
+                // the simultaneous co-fired reconstruction change. The extra
+                // (k-1)*D*second term makes these independent polar updates a
+                // descent step for the fixed-code loss, rather than Jacobi
+                // best responses that can counter-rotate and increase it.
+                if self.cross[gg].iter().all(|&value| value == 0.0) {
+                    continue;
+                }
+                let frame = GrassmannFrame::polar_update(self.cross[gg].view())
+                    .map_err(|error| format!("BlockSparseStream polar block {gg}: {error}"))?;
+                let u = frame.frame();
+                for rr in 0..b {
+                    // GrassmannFrame canonicalizes each column's sign for a
+                    // span-valued caller. Restore the signed Procrustes
+                    // orientation needed by the frozen codes: Q^T M is PSD.
+                    let alignment: f64 = (0..p).map(|c| u[[c, rr]] * self.cross[gg][[c, rr]]).sum();
+                    let orientation = if alignment < 0.0 { -1.0 } else { 1.0 };
+                    for c in 0..p {
+                        candidate_decoder[[gg * b + rr, c]] = (orientation * u[[c, rr]]) as f32;
                     }
                 }
             }
+            frame_residual = frame_fixed_point_residual(
+                self.decoder.view(),
+                candidate_decoder.view(),
+                self.g,
+                b,
+            );
         }
+        let ev = if tss <= 1.0e-24 {
+            if self.rss <= 1.0e-24 { 1.0 } else { 0.0 }
+        } else {
+            1.0 - self.rss / tss
+        };
         // The block lane's exact polar frames carry no matrix-free CG/percolation
         // certificate (that solver serves the atom/dict lane); report a default.
         let decoder_solve_stats = DecoderSolveStats::default();
@@ -660,23 +713,26 @@ impl BlockSparseStreamState {
         }
 
         let improve = ev - self.prev_ev;
-        // A rejected birth is deliberately quiescent for this close: if the
-        // restored baseline is on an EV plateau it may certify immediately. An
-        // ordinary or accepted-birth pass can stage ONE next proposal; serial
-        // transactions avoid O(aux_k) shadow routers at K~10^4.
-        let birth_pending = if rejected_birth {
-            false
-        } else {
-            self.stage_birth_proposal()
-        };
-        let converged = accepted_births == 0
-            && !birth_pending
+        let stationary = !rejected_birth
+            && accepted_births == 0
             && improve.abs() <= self.config.tolerance
+            && gamma_residual <= self.config.tolerance
+            && frame_residual <= self.config.tolerance
             && self.epochs_run > 0;
+        // Certify the frames actually measured in this pass, together with
+        // their profiled gamma. A frame proposal needs the next pass before
+        // it has either an EV or a gamma certificate of its own.
+        if !stationary && !rejected_birth {
+            self.decoder = candidate_decoder;
+        }
+        let birth_pending = !rejected_birth && self.stage_birth_proposal();
+        let converged = stationary && !birth_pending;
 
         self.prev_ev = ev;
         self.last_ev = ev;
         self.last_ev_residual = improve.abs();
+        self.last_gamma_residual = gamma_residual;
+        self.last_frame_residual = frame_residual;
         self.last_accepted_births = accepted_births;
         self.converged = converged;
         self.last_decoder_solve_stats = decoder_solve_stats;
@@ -698,6 +754,8 @@ impl BlockSparseStreamState {
             birth_pending,
             dead,
             gamma: self.gamma,
+            gamma_residual,
+            frame_residual,
             converged,
             epoch,
             decoder_solve_stats,
@@ -762,6 +820,9 @@ impl BlockSparseStreamState {
         for mg in self.cross.iter_mut() {
             mg.fill(0.0);
         }
+        for moment in &mut self.data_cross {
+            moment.fill(0.0);
+        }
         for u in self.usage.iter_mut() {
             *u = 0;
         }
@@ -790,12 +851,15 @@ impl BlockSparseStreamState {
         if !self.converged || self.pending_birth.is_some() {
             return Err(format!(
                 "BlockSparseStream.finalize: streaming fit has not converged after {} epoch(s) \
-                 (last EV {:.6e}, EV residual {:.3e} vs tolerance {:.3e}, {} accepted block \
+                 (last EV {:.6e}, EV residual {:.3e}, gamma residual {:.3e}, frame residual {:.3e} \
+                 vs tolerance {:.3e}, {} accepted block \
                  birth(s) in the last epoch, birth pending={}); the stream state is a resumable \
                  checkpoint, not a model — run more epochs until end_epoch reports convergence",
                 self.epochs_run,
                 self.last_ev,
                 self.last_ev_residual,
+                self.last_gamma_residual,
+                self.last_frame_residual,
                 self.config.tolerance,
                 self.last_accepted_births,
                 self.pending_birth.is_some(),
@@ -925,7 +989,7 @@ pub struct BlockSparseStreamArtifact {
     pub block_stable_rank: Vec<f32>,
     /// Epochs closed.
     pub epochs: usize,
-    /// EV of the final epoch's pass (pre-refresh frames of the last epoch).
+    /// EV of these exact frames and gamma on the final epoch's corpus.
     pub explained_variance: f64,
     /// Solve certificate placeholder (default/zeroed): the block lane refreshes its
     /// small `b×b` frames by an exact polar step, not the matrix-free CG/percolation

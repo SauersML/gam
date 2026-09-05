@@ -6883,6 +6883,7 @@ impl BlockSparseDictStream {
     /// Refresh γ + block frames from the epoch's accumulators and advance the
     /// exact residual-row birth transaction. Returns
     /// `{explained_variance, accepted_births, birth_pending, dead, gamma,
+    /// gamma_residual, frame_residual,
     /// converged, epoch}`.
     fn end_epoch(&mut self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let stats = py
@@ -6894,6 +6895,8 @@ impl BlockSparseDictStream {
         out.set_item("birth_pending", stats.birth_pending)?;
         out.set_item("dead", stats.dead)?;
         out.set_item("gamma", stats.gamma)?;
+        out.set_item("gamma_residual", stats.gamma_residual)?;
+        out.set_item("frame_residual", stats.frame_residual)?;
         out.set_item("converged", stats.converged)?;
         out.set_item("epoch", stats.epoch)?;
         Ok(out.unbind())
