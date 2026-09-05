@@ -1,6 +1,6 @@
 Running 100 trials
-  Seed start:        694435016 [auto]
-  Replay this run:   --seed-start 694435016
+  Seed start:        1980204154 [auto]
+  Replay this run:   --seed-start 1980204154
   Scenario source:   /home/runner/work/gam/gam/bench/scenarios.json
   Filters: family=all model=all basis=all
   Gamfit timeout:    60s
@@ -11,3 +11,24 @@ Running 100 trials
   Metadata: /home/runner/work/gam/gam/bench/fuzz_results.meta.json
 
 Skipped 2 trial(s) above scenario cost cap 200000; max skipped cost=3950000
+  [  1/100] papuan_oce4_matern_k6          bino/gam/mater auc:gamfit=0.8397 auc:mgcv=0.8379 gap=-0.0019 n=  6000 p=  4 [ok]  gamfit=358.2s mgcv=2.1s
+  [  2/100] papuan_oce4_matern_k12         bino/gam/mater auc:gamfit=0.8464 auc:mgcv=0.8440 gap=-0.0024 n=  6000 p=  4 [ok]  gamfit=249.3s mgcv=2.6s
+  [  3/100] papuan_oce4_matern_k24         bino/gam/mater auc:gamfit=0.8516 auc:mgcv=0.8440 gap=-0.0076 n=  6000 p=  4 [ok]  gamfit=628.8s mgcv=2.5s
+  [  4/100] papuan_oce4_psperpc_k6         bino/gam/ps    auc:gamfit=0.8387 auc:mgcv=0.8389 gap=+0.0002 n=  6000 p=  4 [ok]  gamfit=11.4s mgcv=6.3s
+  [  5/100] papuan_oce4_psperpc_k12        bino/gam/ps    auc:gamfit=0.8387 auc:mgcv=0.8390 gap=+0.0002 n=  6000 p=  4 [ok]  gamfit=383.8s mgcv=3.2s
+  [  6/100] papuan_oce4_psperpc_k24        bino/gam/ps    auc:gamfit=0.8385 auc:mgcv=0.8386 gap=+0.0001 n=  6000 p=  4 [ok]  gamfit=153.7s mgcv=5.2s
+  [  7/100] geo_subpop16_tp_k6             bino/gam/tps   auc:gamfit=0.6240 auc:mgcv=  ERR gap= N/A  n=   960 p= 16 [no-verdict:mgcv_error]  gamfit=1.5s mgcv=0.0s(to-failure)
+    -- MGCV FAILURE --
+    error: r_mgcv fit failed: negative length vectors are not allowed
+  [  8/100] geo_subpop16_tp_k12            bino/gam/tps   auc:gamfit=0.6244 auc:mgcv=  ERR gap= N/A  n=   960 p= 16 [no-verdict:mgcv_error]  gamfit=1.0s mgcv=0.0s(to-failure)
+    -- MGCV FAILURE --
+    error: r_mgcv fit failed: negative length vectors are not allowed
+  [  9/100] geo_subpop16_tp_k24            bino/gam/tps   auc:gamfit=0.6049 auc:mgcv=  ERR gap= N/A  n=   960 p= 16 [no-verdict:mgcv_error]  gamfit=1.4s mgcv=0.0s(to-failure)
+    -- MGCV FAILURE --
+    error: r_mgcv fit failed: negative length vectors are not allowed
+  [ 10/100] geo_subpop16_duchon_k6         bino/gam/ducho auc:gamfit=0.5826 auc:mgcv=0.5826 gap=+0.0000 n=   960 p= 16 [ok]  gamfit=0.3s mgcv=0.8s
+  [ 11/100] geo_subpop16_duchon_k12        bino/gam/ducho auc:gamfit=0.5809 auc:mgcv=0.5938 gap=+0.0129 n=   960 p= 16 [ok]  gamfit=1.0s mgcv=0.8s
+  [ 12/100] geo_subpop16_duchon_k24        bino/gam/ducho auc:gamfit=0.6264 auc:mgcv=0.6238 gap=-0.0025 n=   960 p= 16 [ok]  gamfit=4.1s mgcv=0.8s
+  [ 13/100] geo_subpop16_matern_k6         bino/gam/mater auc:gamfit=0.6395 auc:mgcv=0.5678 gap=-0.0717 n=   960 p= 16 [ok]  gamfit=46.3s mgcv=0.8s
+  [ 14/100] geo_subpop16_matern_k12        bino/gam/mater auc:gamfit=0.5867 auc:mgcv=0.5678 gap=-0.0189 n=   960 p= 16 [ok]  gamfit=12.9s mgcv=0.8s
+  [ 15/100] geo_subpop16_matern_k24        bino/gam/mater auc:gamfit=0.5924 auc:mgcv=0.6262 gap=+0.0338 n=   960 p= 16 [ok]  gamfit=7.8s mgcv=0.8s
