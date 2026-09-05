@@ -676,6 +676,12 @@ fn code_row(
     let mut codes = Vec::with_capacity(k * b);
     let mut projections = Vec::with_capacity(k * b);
     for &(g, gate) in shortlist.iter().take(k) {
+        // The fixed-capacity selector also returns zero-score candidates.
+        // They are absent firings: give them the same canonical padding as an
+        // exhausted shortlist instead of retaining an arbitrary block index.
+        if gate == 0.0 {
+            continue;
+        }
         blocks.push(g);
         gates.push(gate);
         let gg = g as usize;
@@ -2377,22 +2383,7 @@ fn fit_block_sparse_dictionary_with_seed_inner(
         Vec::new()
     };
 
-    // Pack the fixed-width sparse routing. The gate is recomputed as the group
-    // ℓ₂ `‖z_g‖₂ = γ·‖x D_gᵀ‖₂` under the FINAL γ + frames (the codes were last
-    // encoded before the final γ refresh); the signed within-block codes come
-    // straight from that last encode.
-    let mut blocks = Array2::<u32>::zeros((n, k));
-    let mut gates = Array2::<f32>::zeros((n, k));
-    let mut code_arr = Array3::<f32>::zeros((n, k, b));
-    for (i, code) in codes.iter().enumerate() {
-        for j in 0..k {
-            blocks[[i, j]] = code.blocks[j];
-            for r in 0..b {
-                code_arr[[i, j, r]] = code.codes[j * b + r];
-            }
-        }
-    }
-    recompute_gates(x, decoder.view(), &blocks, gamma, b, &mut gates);
+    let (blocks, gates, code_arr) = pack_block_codes(&codes, k, b);
 
     Ok(BlockSparseFit {
         decoder,
@@ -2438,37 +2429,27 @@ pub fn fit_block_sparse_dictionary_with_seed(
     fit_block_sparse_dictionary_with_seed_inner(x, config, seed_policy)
 }
 
-/// Overwrite `gates[i,j] = γ·‖x_i D_{g}ᵀ‖₂` for the packed routing, so the stored
-/// gate is exactly the presence signal `‖z_g‖₂` under the FINAL `γ` and frames
-/// (the codes were last encoded before the final γ refresh; the gate is defined
-/// as the group ℓ₂ of the current signed code).
-fn recompute_gates(
-    x: ArrayView2<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
-    blocks: &Array2<u32>,
-    gamma: f32,
+/// Pack the same sparse state for fitting and transformation. Presence is the
+/// norm of the actual stored code; padding stays zero even when block 0 is live.
+fn pack_block_codes(
+    codes: &[RowBlockCode],
+    k: usize,
     b: usize,
-    gates: &mut Array2<f32>,
-) {
-    let (n, k) = blocks.dim();
-    for i in 0..n {
-        let xi = x.row(i);
+) -> (Array2<u32>, Array2<f32>, Array3<f32>) {
+    let n = codes.len();
+    let mut blocks = Array2::<u32>::zeros((n, k));
+    let mut gates = Array2::<f32>::zeros((n, k));
+    let mut code_arr = Array3::<f32>::zeros((n, k, b));
+    for (i, code) in codes.iter().enumerate() {
         for j in 0..k {
-            let g = blocks[[i, j]] as usize;
-            let mut e = 0.0f32;
+            blocks[[i, j]] = code.blocks[j];
+            gates[[i, j]] = stored_code_gate(code, j, b) as f32;
             for r in 0..b {
-                let atom = decoder.row(g * b + r);
-                let mut wr = 0.0f32;
-                for (xr, ar) in xi.iter().zip(atom.iter()) {
-                    wr += *xr * *ar;
-                }
-                e += wr * wr;
+                code_arr[[i, j, r]] = code.codes[j * b + r];
             }
-            // Padded slots (block 0 with zero true gate) resolve to 0 only when the
-            // projection is genuinely zero; a real block-0 selection keeps its gate.
-            gates[[i, j]] = gamma.abs() * e.sqrt();
         }
     }
+    (blocks, gates, code_arr)
 }
 
 /// Out-of-sample block encode: route held-out rows `x` (`M×P`) against frozen
@@ -2514,21 +2495,7 @@ pub fn block_sparse_dictionary_transform(
     let minibatch = 4096usize;
     let codes = route_and_code_all(x, decoder, gamma, g, b, k, minibatch, block_tile.max(1))?;
 
-    let m = x.nrows();
-    let mut blocks = Array2::<u32>::zeros((m, k));
-    let mut gates = Array2::<f32>::zeros((m, k));
-    let mut code_arr = Array3::<f32>::zeros((m, k, b));
-    for (i, code) in codes.iter().enumerate() {
-        for j in 0..k {
-            blocks[[i, j]] = code.blocks[j];
-            // Presence gate under the tied scalar: γ·‖w_g‖₂ = ‖z_g‖₂.
-            gates[[i, j]] = gamma.abs() * code.gates[j];
-            for r in 0..b {
-                code_arr[[i, j, r]] = code.codes[j * b + r];
-            }
-        }
-    }
-    Ok((blocks, gates, code_arr))
+    Ok(pack_block_codes(&codes, k, b))
 }
 
 /// Dense reconstruction from fixed-width block routing.

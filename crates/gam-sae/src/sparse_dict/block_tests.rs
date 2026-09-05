@@ -1023,6 +1023,56 @@ fn coordinate_partition_seed_fits_end_to_end() {
 }
 
 #[test]
+fn packed_block_gates_use_stored_codes_and_preserve_padding_2825() {
+    let decoder = ndarray::array![[1.0_f32, 0.0], [0.0, 1.0]];
+    let row = ndarray::array![3.0_f32, 4.0];
+    let code = code_row(row.view(), decoder.view(), 0.7, 1, 2, &[(0, 3.0)]);
+    let (blocks, gates, codes) = pack_block_codes(&[code], 2, 1);
+    assert_eq!(blocks[[0, 0]], 0);
+    assert_eq!(blocks[[0, 1]], 0);
+    assert_eq!(gates[[0, 0]].to_bits(), codes[[0, 0, 0]].abs().to_bits());
+    assert!(gates[[0, 0]] > 0.0);
+    assert_eq!(gates[[0, 1]], 0.0);
+    assert_eq!(codes[[0, 1, 0]], 0.0);
+}
+
+#[test]
+fn fitted_block_padding_agrees_with_the_public_transform_2825() {
+    let seed = coordinate_partition_frames(2, 1, 2);
+    assert_eq!(seed.row(0).dot(&seed.row(1)), 0.0);
+    let x = Array2::from_shape_fn((2, 2), |(row, column)| {
+        (if row == 0 { 3.0 } else { -3.0 }) * seed[[0, column]]
+    });
+    let mut config = BlockSparseConfig::new(2, 1);
+    config.block_topk = 2;
+    let fit = fit_block_sparse_dictionary_with_seed(
+        x.view(),
+        &config,
+        BlockSeedPolicy::CoordinatePartition,
+    )
+    .expect("the unused orthogonal block is quiescent on this rank-one corpus");
+    let (blocks, gates, codes) = block_sparse_dictionary_transform(
+        x.view(),
+        fit.decoder.view(),
+        fit.gamma,
+        1,
+        2,
+        config.block_tile,
+    )
+    .unwrap();
+    assert_eq!(fit.blocks, blocks);
+    assert_eq!(fit.gates, gates);
+    assert_eq!(fit.codes, codes);
+    for row in 0..x.nrows() {
+        assert_eq!(fit.blocks[[row, 0]], 0);
+        assert_eq!(fit.blocks[[row, 1]], 0);
+        assert_eq!(fit.gates[[row, 0]], 3.0);
+        assert_eq!(fit.gates[[row, 1]], 0.0);
+        assert_eq!(fit.codes[[row, 1, 0]], 0.0);
+    }
+}
+
+#[test]
 fn projector_distance_resolves_tiny_rotations_without_overlap_cancellation_2825() {
     let current = ndarray::array![[1.0_f32, 0.0]];
     for angle in [1.0e-5_f32, 1.0e-8, 1.0e-10] {
