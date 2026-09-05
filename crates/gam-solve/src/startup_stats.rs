@@ -606,11 +606,13 @@ pub(crate) fn structural_diagnosis_hint(key: &StructuralKey) -> String {
 /// MEASURED 2026-09-05, `bench/gha_results/python-contracts/py1512_junit.xml`
 /// (CI run 33941725421): six of the eight tests carrying this refusal report
 ///
-///     generated=13, screened=13, exact_validated=13, solver_started=0
-///     rejected_by_kkt=0, rejected_by_domain=13, rejected_by_nonconvergence=0,
-///     rejected_by_budget=0, rejected_other=0
-///     all 13 seeds, phase=validation:
-///         "outer eval failed: objective returned a non-finite cost"
+/// ```text
+/// generated=13, screened=13, exact_validated=13, solver_started=0
+/// rejected_by_kkt=0, rejected_by_domain=13, rejected_by_nonconvergence=0,
+/// rejected_by_budget=0, rejected_other=0
+/// all 13 seeds, phase=validation:
+///     "outer eval failed: objective returned a non-finite cost"
+/// ```
 ///
 /// Every seed was generated, screened AND exact-validated, and the objective
 /// then returned a non-finite cost at all thirteen. Nothing about seeding
