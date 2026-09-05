@@ -6,6 +6,10 @@
 // they keep the SAME module scope (`use super::*`), visibility, and the debug
 // oracles that pin them to the dense library routines.
 
+#[cfg(test)]
+#[path = "softmax_entropy_majorizer_tests.rs"]
+mod recovered_majorizer_tests;
+
 #[inline]
 fn softmax_entropy_log_plus_one(probability: f64) -> f64 {
     if probability > 0.0 {
