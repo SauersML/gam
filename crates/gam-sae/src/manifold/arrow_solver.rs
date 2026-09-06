@@ -673,6 +673,42 @@ pub(crate) fn apply_raw_cached_arrow_hessian(
     v_beta: ArrayView1<'_, f64>,
 ) -> Result<SaeArrowVector, String> {
     let mut out = apply_cached_arrow_hessian(cache, v_t, v_beta)?;
+    add_raw_row_deflation_correction(cache, v_t, out.t.view_mut(), "apply_raw_cached_arrow_hessian")?;
+    Ok(out)
+}
+
+/// The `Phi(B_raw) -> B_raw` row-local correction, on its own.
+///
+/// `out_t += Σ_rows U diag(lambda_raw - lambda_conditioned) U^T v_row`, i.e. the
+/// second half of [`apply_raw_cached_arrow_hessian`]. Gauge-only pins carry no
+/// raw spectrum and are skipped: they are structural quotient directions, not a
+/// numerical conditioning of the objective.
+///
+/// #2828 item 2 — this is a free function because it has TWO callers that used
+/// to disagree. `apply_raw_cached_arrow_hessian` needs `cache.schur_factor`, a
+/// dense `K x K` Cholesky the wide-border path never builds, so the matrix-free
+/// exact-stationarity solve reaches its `B` through
+/// `matrix_free_arrow_operator_apply` instead — which applies the CONDITIONED row
+/// factor and so was building `Phi(B_raw) + delta_C`, the operator this file's
+/// own doc names as the mistake. The border half of both applies is already raw
+/// (its Schur term and the `H_bt Phi(B_tt)^-1 H_tb` restoration share one
+/// conditioned factor and cancel algebraically), so applying this to the `t`
+/// block is the whole of the difference.
+pub(crate) fn add_raw_row_deflation_correction(
+    cache: &ArrowFactorCache,
+    v_t: ArrayView1<'_, f64>,
+    mut out_t: ndarray::ArrayViewMut1<'_, f64>,
+    context: &str,
+) -> Result<(), String> {
+    let total_t = cache.delta_t_len();
+    if v_t.len() != total_t || out_t.len() != total_t {
+        return Err(format!(
+            "{context}: raw-deflation correction shapes (v={}, out={}) != cache t dimension \
+             {total_t}",
+            v_t.len(),
+            out_t.len(),
+        ));
+    }
     for row in 0..cache.n_rows() {
         let Some(spectrum) = cache
             .deflation_row_spectra
@@ -687,7 +723,7 @@ pub(crate) fn apply_raw_cached_arrow_hessian(
             || spectrum.cond_evals.len() != q
         {
             return Err(format!(
-                "apply_raw_cached_arrow_hessian: row {row} has dimension {q}, but its \
+                "{context}: row {row} has dimension {q}, but its \
                  spectral carrier is {:?} with {} raw and {} conditioned eigenvalues",
                 spectrum.evecs.dim(),
                 spectrum.raw_evals.len(),
@@ -704,11 +740,11 @@ pub(crate) fn apply_raw_cached_arrow_hessian(
             }),
         );
         let correction = spectrum.evecs.dot(&correction_coefficients);
-        out.t
+        out_t
             .slice_mut(s![base..base + q])
             .scaled_add(1.0, &correction);
     }
-    Ok(out)
+    Ok(())
 }
 
 pub(crate) fn cholesky_factor_apply(

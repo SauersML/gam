@@ -1882,6 +1882,69 @@ impl SaeManifoldTerm {
             .solve_stationarity(rhs)
     }
 
+    /// #2828 item 2 / #2515 — the matrix-free apply of the SAME exact
+    /// stationarity Hessian `A = B_raw + ΔC` the dense route materializes.
+    ///
+    /// The wide-border path reaches its majorizer through
+    /// [`matrix_free_arrow_operator_apply`], which applies the CONDITIONED row
+    /// factor — `Φ(B_raw)`, in which every spectrally deflated per-row direction
+    /// is pinned to UNIT curvature so its `log 1 = 0` is ρ-independent. That
+    /// pinning is a solve / log-determinant policy, not part of the objective
+    /// Hessian, and adding `ΔC` on top of it builds `Φ(B_raw) + ΔC` — the
+    /// operator [`apply_raw_cached_arrow_hessian`]'s own doc names as the
+    /// mistake, and precisely what this seam built until #2828.
+    ///
+    /// The difference is not a tolerance. Measured at the #2330 Patch-D
+    /// converged mode, where the exact `A` carries six eigenvalues near `2.7e-8`
+    /// against a spectral norm of `3.0e1`:
+    ///
+    /// * the two operators differed by `1.0` in ABSOLUTE terms on the pinned
+    ///   columns (`Φ(B_raw)` reads 1 where `B_raw` reads `1.7e-7`);
+    /// * on a right-hand side aligned with the smallest eigendirection the dense
+    ///   route returned the true `A⁻¹` response (`‖x‖ = 3.69e7`, relative
+    ///   residual `4.6e-9`) while this route returned `‖x‖ = 8.9e2` whose
+    ///   residual was `‖Ax − rhs‖ = ‖rhs‖` — no residual reduction at all;
+    /// * and it was SILENT, because the `μ` deflation detector inspects the
+    ///   SOLUTION, and a solution that never acquired the near-null component
+    ///   has none to detect: it read `μ = 0.99` and accepted.
+    ///
+    /// [`Self::solve_exact_stationarity`] cannot be reused here, and neither can
+    /// `apply_raw_cached_arrow_hessian`: both need `cache.schur_factor`, the
+    /// dense `K × K` Cholesky the wide-border path does not build. What CAN be
+    /// reused is the row-local `Φ(B_raw) → B_raw` correction
+    /// ([`add_raw_row_deflation_correction`]), and that is the entire
+    /// difference — the border half of both applies is already raw, because its
+    /// Schur term and its `H_βt Φ(B_tt)⁻¹ H_tβ` restoration share one conditioned
+    /// factor and cancel algebraically.
+    pub(crate) fn apply_exact_hessian_matrix_free(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        system: &ArrowSchurSystem,
+        vector: &SaeArrowVector,
+    ) -> Result<SaeArrowVector, String> {
+        let (base_t, base_beta) = matrix_free_arrow_operator_apply(
+            system,
+            cache,
+            vector.t.view(),
+            vector.beta.view(),
+        )
+        .map_err(|error| format!("matrix-free evidence operator: {error}"))?;
+        let correction = self.apply_exact_hessian_minus_b(rho, target, cache, vector)?;
+        let mut out = SaeArrowVector {
+            t: &base_t + &correction.t,
+            beta: &base_beta + &correction.beta,
+        };
+        add_raw_row_deflation_correction(
+            cache,
+            vector.t.view(),
+            out.t.view_mut(),
+            "apply_exact_hessian_matrix_free",
+        )?;
+        Ok(out)
+    }
+
     /// Matrix-free exact-stationarity sibling used by the wide-border penalized quasi-Laplace
     /// assignment-strength residual. `system` is the reassembled undamped
     /// bordered operator at the converged inner state; `cache` supplies the same
@@ -1901,6 +1964,10 @@ impl SaeManifoldTerm {
         system: &ArrowSchurSystem,
         rhs: &SaeArrowVector,
     ) -> Result<SaeArrowVector, String> {
+        // `B` — the CONDITIONED evidence majorizer `Phi(B_raw)`. This is the
+        // metric, and it is the right one: it is what `ArrowMetric::Joint` uses
+        // on the dense route, and what the criterion's `½log|B|` and the `mu`
+        // deflation predicate are denominated in.
         let apply_b = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
             let (t, beta) = matrix_free_arrow_operator_apply(
                 system,
@@ -1912,12 +1979,7 @@ impl SaeManifoldTerm {
             Ok(SaeArrowVector { t, beta })
         };
         let apply_a = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
-            let base = apply_b(vector)?;
-            let correction = self.apply_exact_hessian_minus_b(rho, target, cache, vector)?;
-            Ok(SaeArrowVector {
-                t: &base.t + &correction.t,
-                beta: &base.beta + &correction.beta,
-            })
+            self.apply_exact_hessian_matrix_free(rho, target, cache, system, vector)
         };
         // #2674 — the Krylov sequence runs on the SAME operator the dense route
         // now diagonalizes: the full `A`, with no analytic chart orbit deleted
@@ -6789,6 +6851,172 @@ mod tests_route_forced_classification_2673 {
     use gam_solve::arrow_schur::{ArrowSolveOptions, solve_arrow_newton_step_with_options};
     use ndarray::{Array1, Array2, array};
     use std::sync::Arc;
+
+    /// #2828 item 2 — the matrix-free exact-`A` apply IS the dense one, and the
+    /// two exact-stationarity solves agree on a right-hand side aimed straight
+    /// at the classification band.
+    ///
+    /// `route_forced_stationarity_classification_agrees_2673` below reports the
+    /// same comparison but does not assert it, and says why: its fixture "sits
+    /// `2.8e7` bands away from any classification boundary, so it exercises the
+    /// routes, not the predicate". #2828 item 2 is about a state that is IN the
+    /// band, so this gate anchors on the #2330 Patch-D converged mode, whose
+    /// exact `A` carries a cluster of eigenvalues at `2.7e-8` — a factor of 1.8
+    /// above their own `√ε·vᵀBv` floor, i.e. inside the band by any reading —
+    /// against a spectral norm of `3.0e1`. The band membership is ASSERTED, so
+    /// the gate cannot quietly become the far-from-the-boundary one it replaces.
+    ///
+    /// What it caught: the matrix-free route reaches its majorizer through
+    /// `matrix_free_arrow_operator_apply`, which applies the CONDITIONED row
+    /// factor, so it was building `Φ(B_raw) + ΔC` rather than `B_raw + ΔC`. On
+    /// the pinned columns the two operators differed by 1.0 in absolute terms,
+    /// and on a right-hand side aligned with the smallest eigendirection the
+    /// matrix-free "solution" had `‖Ax − rhs‖ = ‖rhs‖` — no residual reduction —
+    /// while the `μ` deflation detector read 0.99 and accepted it, because it
+    /// inspects the solution and that solution had no near-null component to
+    /// detect. See [`SaeManifoldTerm::apply_exact_hessian_matrix_free`].
+    #[test]
+    fn matrix_free_exact_a_matches_the_dense_operator_and_solve_in_the_band_2828() {
+        use crate::manifold::tests_logdet_adjoint_780::obb_patchd_fixture;
+        let (mut term, target, rho) = obb_patchd_fixture(0.0, -6.0);
+        term.penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            200,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
+        .expect("the Patch-D fixture must converge to its own mode");
+        // Reassemble the undamped system at the converged state and factor it,
+        // exactly as the matrix-free route's own caller does.
+        let system = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .expect("undamped arrow-Schur assembly at the converged mode");
+        let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
+        let (_delta_t, _delta_beta, cache) =
+            solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options)
+                .expect("undamped factor cache");
+        let total_t = cache.delta_t_len();
+        let k = cache.k;
+        let dim = total_t + k;
+        let dense = term
+            .materialize_exact_hessian_dense(&rho, target.view(), &cache)
+            .expect("dense exact A at the converged mode");
+        let (eigenvalues, eigenvectors) = dense.eigh(Side::Lower).expect("dense exact-A spectrum");
+        let spectral_norm = eigenvalues
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+
+        // The gate is only about the classification band, so prove the fixture
+        // is in it: the smallest direction must sit within a decade of its own
+        // floor. Far above and this is the #2673 test; below and the dense route
+        // would deflate it and there would be nothing to compare.
+        let smallest = eigenvectors.column(0);
+        let metric = ArrowMetric::Joint(&cache)
+            .quadratic_form(smallest)
+            .expect("B quadratic form of the smallest direction");
+        let floor = sae_exact_a_direction_floor(dim, spectral_norm, metric);
+        let ratio = eigenvalues[0].abs() / floor;
+        assert!(
+            (1.0..10.0).contains(&ratio),
+            "#2828 item 2: this gate is stated ON the classification band; the smallest \
+             exact-A direction is {:.6e} against a floor of {floor:.6e} (ratio {ratio:.4}, \
+             vBv={metric:.6e}, ||A||={spectral_norm:.6e})",
+            eigenvalues[0]
+        );
+
+        // (1) the OPERATORS, column by column.
+        let mut worst_column = 0.0_f64;
+        let mut worst_at = 0usize;
+        for column in 0..dim {
+            let mut unit = Array1::<f64>::zeros(dim);
+            unit[column] = 1.0;
+            let probe = SaeArrowVector {
+                t: unit.slice(s![..total_t]).to_owned(),
+                beta: unit.slice(s![total_t..]).to_owned(),
+            };
+            let applied = term
+                .apply_exact_hessian_matrix_free(&rho, target.view(), &cache, &system, &probe)
+                .expect("matrix-free exact-A apply");
+            for row in 0..dim {
+                let value = if row < total_t {
+                    applied.t[row]
+                } else {
+                    applied.beta[row - total_t]
+                };
+                let error = (value - dense[[row, column]]).abs();
+                if error > worst_column {
+                    worst_column = error;
+                    worst_at = column;
+                }
+            }
+        }
+        assert!(
+            worst_column <= 1.0e-10 * spectral_norm,
+            "#2828 item 2: the matrix-free exact-A apply is not the dense operator. Worst \
+             column error {worst_column:.6e} at column {worst_at} against a spectral norm of \
+             {spectral_norm:.6e}. Adding `ΔC` to the CONDITIONED `Φ(B_raw)` pins every \
+             spectrally deflated direction to unit curvature, so the two routes' `A⁻¹` \
+             responses differ by the whole `1/λ` of that direction."
+        );
+
+        // (2) the SOLVES, on a right-hand side aimed at the band. A rhs that
+        // missed the near-null directions would leave the two routes nothing to
+        // classify differently — which is exactly why #2673's report is not
+        // evidence about the predicate.
+        let resolved = eigenvectors.column(dim - 1).to_owned();
+        for (label, flat) in [
+            ("null-only", smallest.to_owned()),
+            ("null+resolved", &smallest.to_owned() + &resolved),
+        ] {
+            let rhs = SaeArrowVector {
+                t: flat.slice(s![..total_t]).to_owned(),
+                beta: flat.slice(s![total_t..]).to_owned(),
+            };
+            let dense_solution = term
+                .solve_exact_stationarity(&rho, target.view(), &cache, &rhs)
+                .unwrap_or_else(|error| panic!("{label}: dense stationarity solve: {error}"));
+            let free_solution = term
+                .solve_exact_stationarity_matrix_free(&rho, target.view(), &cache, &system, &rhs)
+                .unwrap_or_else(|error| {
+                    panic!("{label}: matrix-free stationarity solve: {error}")
+                });
+            let flatten = |x: &SaeArrowVector| -> Array1<f64> {
+                let mut out = Array1::<f64>::zeros(dim);
+                out.slice_mut(s![..total_t]).assign(&x.t);
+                out.slice_mut(s![total_t..]).assign(&x.beta);
+                out
+            };
+            let norm = |x: &Array1<f64>| x.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let dense_flat = flatten(&dense_solution);
+            let free_flat = flatten(&free_solution);
+            let rhs_norm = norm(&flat);
+            // Both must actually SOLVE. The defect this gate was written for was
+            // silent precisely because the matrix-free route returned a finite
+            // vector that reduced no residual at all.
+            for (who, solution) in [("dense", &dense_flat), ("matrix-free", &free_flat)] {
+                let residual = norm(&(&dense.dot(solution) - &flat));
+                assert!(
+                    residual <= 1.0e-6 * rhs_norm,
+                    "#2828 item 2 ({label}): the {who} route returned a vector with \
+                     ||A x − rhs|| = {residual:.6e} against ||rhs|| = {rhs_norm:.6e}. A \
+                     residual at the scale of the right-hand side is not a solution."
+                );
+            }
+            let scale = norm(&dense_flat).max(norm(&free_flat));
+            let difference = norm(&(&dense_flat - &free_flat));
+            assert!(
+                difference <= 1.0e-6 * scale,
+                "#2828 item 2 ({label}): the dense and matrix-free exact-stationarity solves \
+                 disagree by {difference:.6e} against a solution scale of {scale:.6e}. The \
+                 IFT adjoint `a = A⁺Γ` would then depend on which route the working-set \
+                 predicate picked — i.e. on ambient free memory."
+            );
+        }
+    }
 
     /// #2673 — FORCE both classification routes on ONE state and compare.
     ///
