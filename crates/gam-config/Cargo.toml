@@ -1,6 +1,6 @@
 [package]
 name = "gam-config"
-version = "0.3.154"
+version = "0.3.155"
 edition = "2024"
 rust-version = "1.97"
 description = "Canonical multi-front-end parsing and normalization for gam FitConfig"
@@ -10,11 +10,11 @@ license = "AGPL-3.0-or-later"
 warnings = "deny"
 
 [dependencies]
-gam-problem = { path = "../gam-problem", version = "=0.3.154" }
-gam-solve = { path = "../gam-solve", version = "=0.3.154" }
-gam-models = { path = "../gam-models", version = "=0.3.154" }
-gam-gpu = { path = "../gam-gpu", version = "=0.3.154" }
-gam-inference = { path = "../gam-inference", version = "=0.3.154" }
+gam-problem = { path = "../gam-problem", version = "=0.3.155" }
+gam-solve = { path = "../gam-solve", version = "=0.3.155" }
+gam-models = { path = "../gam-models", version = "=0.3.155" }
+gam-gpu = { path = "../gam-gpu", version = "=0.3.155" }
+gam-inference = { path = "../gam-inference", version = "=0.3.155" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
