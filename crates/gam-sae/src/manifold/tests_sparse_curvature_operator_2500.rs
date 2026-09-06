@@ -1148,3 +1148,4 @@ fn threshold_gate_priced_clamp_theta_diagonal_matches_finite_difference_2820() {
         assert_eq!(fixed_derivative[slot], if atom == 0 { 0.0 } else { derivative[slot] });
     }
 }
+

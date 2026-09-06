@@ -1577,7 +1577,161 @@ impl SaeManifoldTerm {
                 }
             }
         }
+
+        // (5) #2828 — the β-tier decoder priors' exact-minus-majorizer curvature.
+        // Until this leg existed `ΔC` had NO β block at all, so `A_ββ` was
+        // whatever PSD majorizer the assembly installed (the repulsion's
+        // Gauss-Newton block, the amplitude barrier's isotropic ridge, the
+        // separation barrier's `|M|` coupling and `lev` ridge) rather than the
+        // second derivative of the objective `assemble_arrow_schur` gradients —
+        // the whole of the #2330 disagreement, and one-directional: a majorizer
+        // only ever OVER-claims curvature, which is exactly how an
+        // `IndefiniteObservedInformation` refusal can fire on a mode that is not
+        // a saddle.
+        //
+        // The remainder is derived in the full-`B` decoder layout because that is
+        // where the priors live and where the assembly writes them (BEFORE the
+        // frame transform). Under an engaged frame the border coordinate is the
+        // factored `C`, and `B = ΦC` with `Φ = blkdiag(I_M ⊗ U_k)`, `U_kᵀU_k = I`,
+        // so the correct factored operator is the congruence `Φᵀ ΔC_ββ Φ` — lift
+        // the direction, apply, project back. That is the same sandwich
+        // `add_factored_repulsion_curvature` applies to the majorizer this
+        // subtracts, so the two stay in one coordinate system.
+        if cache.k > 0 {
+            let beta_dim = self.beta_dim();
+            let projection = crate::frames::FrameProjection::new(self);
+            let framed = self.last_frames_active && cache.k == self.factored_border_dim();
+            if framed {
+                let lifted = projection.lift_border_vec(v.beta.view());
+                let delta = self.decoder_prior_exact_minus_majorizer_beta_hvp(1.0, lifted.view())?;
+                let projected = projection.project_border_vec(delta.view());
+                for (index, &value) in projected.iter().enumerate() {
+                    out.beta[index] += value;
+                }
+            } else if cache.k == beta_dim {
+                let delta = self.decoder_prior_exact_minus_majorizer_beta_hvp(1.0, v.beta.view())?;
+                for (index, &value) in delta.iter().enumerate() {
+                    out.beta[index] += value;
+                }
+            } else {
+                return Err(format!(
+                    "apply_exact_hessian_minus_b: border width {} is neither the full-B \
+                     beta_dim {beta_dim} nor the factored border dim {}, so the beta-tier \
+                     decoder-prior curvature correction has no coordinate system to be \
+                     expressed in",
+                    cache.k,
+                    self.factored_border_dim(),
+                ));
+            }
+        }
         Ok(out)
+    }
+
+    /// #2828 — the border block of `E = B − A`, restricted to the β-tier decoder
+    /// priors' MAJORIZATION artefact: `E_ββ = (installed PSD majorizer) − (exact
+    /// prior Hessian)`, i.e. exactly the negation of the β leg
+    /// [`Self::apply_exact_hessian_minus_b`] now adds to `A`. Dense `k × k` in the
+    /// cache's own border coordinates (factored when a frame is engaged), `None`
+    /// when no β-tier prior is live and the block is identically zero.
+    ///
+    /// This is the border sibling of [`Self::materialize_ard_concave_clamp_diagonal`]
+    /// and it exists for the same reason. Before #2828 the exact `A` silently
+    /// carried the assembly's β majorizers, so `A` and `B` agreed there and the
+    /// pricing had nothing to attribute. Making `A_ββ` exact makes it genuinely
+    /// indefinite wherever a decoder prior is nonconvex — measured on
+    /// `threshold_gate_tiny_fixture(false)`: 14 negative eigenvalues, nine of them
+    /// O(1)–O(10), against 5 small ones before. Every one of those nine is a known
+    /// bounded majorization gap, not a saddle of the objective, and this is the
+    /// operator that says so: `A + E` restores the majorizer on exactly the β
+    /// block, so `vᵀ(A+E)v` is `vᵀBv` there and the
+    /// `IndefiniteObservedInformation` refusal keeps meaning "not attributable".
+    ///
+    /// Cost is `k` applies of the closed-form remainder — the same order as the
+    /// `k` border probes [`Self::materialize_exact_hessian_dense`] already pays on
+    /// this route, and strictly smaller than the `dim × dim` block it is priced
+    /// beside.
+    pub(crate) fn decoder_prior_majorizer_gap_border(
+        &self,
+        cache: &ArrowFactorCache,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let k = cache.k;
+        if k == 0 {
+            return Ok(None);
+        }
+        let beta_dim = self.beta_dim();
+        let projection = crate::frames::FrameProjection::new(self);
+        let framed = self.last_frames_active && k == self.factored_border_dim();
+        if !framed && k != beta_dim {
+            return Err(format!(
+                "decoder_prior_majorizer_gap_border: border width {k} is neither the \
+                 full-B beta_dim {beta_dim} nor the factored border dim {}",
+                self.factored_border_dim(),
+            ));
+        }
+        let mut gap = Array2::<f64>::zeros((k, k));
+        let mut unit = Array1::<f64>::zeros(k);
+        for col in 0..k {
+            unit.fill(0.0);
+            unit[col] = 1.0;
+            let column = if framed {
+                let lifted = projection.lift_border_vec(unit.view());
+                let delta = self.decoder_prior_exact_minus_majorizer_beta_hvp(1.0, lifted.view())?;
+                projection.project_border_vec(delta.view())
+            } else {
+                self.decoder_prior_exact_minus_majorizer_beta_hvp(1.0, unit.view())?
+            };
+            // `E = B − A` and the β leg of `A − B` is `column`, so `E` is its
+            // negation.
+            for row in 0..k {
+                gap[[row, col]] = -column[row];
+            }
+        }
+        if gap.iter().all(|&value| value == 0.0) {
+            return Ok(None);
+        }
+        // The remainder is a difference of two symmetric operators; symmetrize the
+        // probe assembly so the basin quadratic forms below cannot pick up an
+        // asymmetric round-off residue.
+        for row in 0..k {
+            for col in (row + 1)..k {
+                let average = 0.5 * (gap[[row, col]] + gap[[col, row]]);
+                gap[[row, col]] = average;
+                gap[[col, row]] = average;
+            }
+        }
+        Ok(Some(gap))
+    }
+
+    /// #2828 — `Σ_{r,c} e_beta[r,c]·left[total_t+r]·right[total_t+c]`, the border
+    /// block's contribution to a quadratic form in the `(t, β)` layout. `0` when
+    /// the block is absent or the vectors carry no border rows (the
+    /// coordinate-only spectral block).
+    fn dropped_curvature_border_form(
+        e_beta: Option<&Array2<f64>>,
+        total_t: usize,
+        left: ArrayView1<'_, f64>,
+        right: ArrayView1<'_, f64>,
+    ) -> f64 {
+        let Some(block) = e_beta else {
+            return 0.0;
+        };
+        let k = block.nrows();
+        if left.len() < total_t + k || right.len() < total_t + k {
+            return 0.0;
+        }
+        let mut acc = 0.0_f64;
+        for row in 0..k {
+            let scale = left[total_t + row];
+            if scale == 0.0 {
+                continue;
+            }
+            let mut inner = 0.0_f64;
+            for col in 0..k {
+                inner += block[[row, col]] * right[total_t + col];
+            }
+            acc += scale * inner;
+        }
+        acc
     }
 
     /// #2336 — the diagonal of `E = B − A` restricted to the ARD periodic
@@ -4341,18 +4495,28 @@ impl SaeManifoldTerm {
         let total_t = cache.delta_t_len();
         let a = self.materialize_exact_hessian_dense(rho, target, cache)?;
         let e_diag = self.materialize_ard_concave_clamp_diagonal(rho, cache)?;
+        // #2828 — the border half of `E = B − A`. The COORDINATE block carries no
+        // border rows, so it is priced without it.
+        let e_beta = self.decoder_prior_majorizer_gap_border(cache)?;
         let coordinate_operator = a.slice(s![..total_t, ..total_t]).to_owned();
-        let joint =
-            Self::exact_hessian_spectral_block(a, &e_diag, total_t, ArrowMetric::Joint(cache))?;
+        let joint = Self::exact_hessian_spectral_block(
+            a,
+            &e_diag,
+            e_beta.as_ref(),
+            total_t,
+            ArrowMetric::Joint(cache),
+        )?;
         let coordinate = Self::exact_hessian_spectral_block(
             coordinate_operator,
             &e_diag,
+            None,
             total_t,
             ArrowMetric::Coordinate(cache),
         )?;
         let joint_pricing = Self::classify_exact_hessian_basin(
             &joint,
             &e_diag,
+            e_beta.as_ref(),
             total_t,
             |v| ArrowMetric::Joint(cache).quadratic_form(v),
             "joint",
@@ -4360,6 +4524,7 @@ impl SaeManifoldTerm {
         let coordinate_pricing = Self::classify_exact_hessian_basin(
             &coordinate,
             &e_diag,
+            None,
             total_t,
             |v| ArrowMetric::Coordinate(cache).quadratic_form(v),
             "coordinate",
@@ -4393,6 +4558,7 @@ impl SaeManifoldTerm {
     fn exact_hessian_spectral_block(
         operator: Array2<f64>,
         e_diag: &Array1<f64>,
+        e_beta: Option<&Array2<f64>>,
         total_t: usize,
         metric: ArrowMetric<'_>,
     ) -> Result<ExactHessianSpectralBlock, String> {
@@ -4406,7 +4572,8 @@ impl SaeManifoldTerm {
         }
         // #2267 — the other half of the split; see `materialize_exact_hessian_dense`.
         let eigh_started = std::time::Instant::now();
-        let (eigenvalues, eigenvectors) = Self::cluster_stable_eigh(&operator, e_diag, total_t)?;
+        let (eigenvalues, eigenvectors) =
+            Self::cluster_stable_eigh(&operator, e_diag, e_beta, total_t)?;
         let eigh_elapsed = eigh_started.elapsed();
         log::info!(
             "[SAE-EXACT-DENSE] eigendecomposition DONE: dim={dimension}, {:.3} s",
@@ -4467,6 +4634,7 @@ impl SaeManifoldTerm {
     fn classify_exact_hessian_basin(
         block: &ExactHessianSpectralBlock,
         e_diag: &Array1<f64>,
+        e_beta: Option<&Array2<f64>>,
         total_t: usize,
         metric: impl Fn(ArrayView1<'_, f64>) -> Result<f64, String>,
         label: &'static str,
@@ -4515,6 +4683,21 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        if e_beta.is_some() {
+            // #2828 — the β-tier decoder priors' majorization gap. Dense on the
+            // border block, so unlike the coordinate clamps it cannot be folded
+            // in as a diagonal weight.
+            for i in 0..q {
+                for j in 0..q {
+                    basin[[i, j]] += Self::dropped_curvature_border_form(
+                        e_beta,
+                        total_t,
+                        basis.column(i),
+                        basis.column(j),
+                    );
+                }
+            }
+        }
         for (i, &index) in negative.iter().enumerate() {
             basin[[i, i]] += block.eigenvalues[index];
         }
@@ -4530,7 +4713,15 @@ impl SaeManifoldTerm {
                 .iter()
                 .take(total_t)
                 .map(|x| x.abs())
-                .fold(0.0_f64, f64::max);
+                .fold(0.0_f64, f64::max)
+            + e_beta.map_or(0.0, |gap| {
+                // The border block is dense, so its arithmetic scale is a row sum
+                // (the induced ∞-norm), not a single entry: a cancellation in `C`
+                // can be as large as the whole row.
+                (0..gap.nrows())
+                    .map(|row| (0..gap.ncols()).map(|col| gap[[row, col]].abs()).sum::<f64>())
+                    .fold(0.0_f64, f64::max)
+            });
         let mut inverse_values = Array1::<f64>::zeros(q);
         for (i, &mu) in basin_values.iter().enumerate() {
             let vector = basin_vectors.column(i);
@@ -4569,17 +4760,20 @@ impl SaeManifoldTerm {
     fn price_exact_hessian_block(
         block: &ExactHessianSpectralBlock,
         e_diag: &Array1<f64>,
+        e_beta: Option<&Array2<f64>>,
         total_t: usize,
         metric: impl Fn(ArrayView1<'_, f64>) -> Result<f64, String>,
         label: &'static str,
     ) -> Result<ExactHessianPricing, SaeCriterionError> {
-        let basin = Self::classify_exact_hessian_basin(block, e_diag, total_t, metric, label)?;
-        Self::exact_hessian_basin_differential(block, e_diag, total_t, &basin)
+        let basin =
+            Self::classify_exact_hessian_basin(block, e_diag, e_beta, total_t, metric, label)?;
+        Self::exact_hessian_basin_differential(block, e_diag, e_beta, total_t, &basin)
     }
 
     fn exact_hessian_basin_differential(
         block: &ExactHessianSpectralBlock,
         e_diag: &Array1<f64>,
+        e_beta: Option<&Array2<f64>>,
         total_t: usize,
         basin: &ExactHessianBasin,
     ) -> Result<ExactHessianPricing, SaeCriterionError> {
@@ -4636,6 +4830,22 @@ impl SaeManifoldTerm {
                     }
                 }
             }
+            if e_beta.is_some() {
+                // #2828 — `E` now has a border block, so the negative
+                // projector's first-order response to it is part of `∂value/∂A`
+                // too. Omitting it here would leave the value consistent and the
+                // gradient not.
+                for i in 0..q {
+                    for j in 0..complement.len() {
+                        e_cross[[i, j]] += Self::dropped_curvature_border_form(
+                            e_beta,
+                            total_t,
+                            basis.column(i),
+                            other.column(j),
+                        );
+                    }
+                }
+            }
             let mut response = basin_inverse.dot(&e_cross);
             for (i, &negative_index) in negative.iter().enumerate() {
                 for (j, &other_index) in complement.iter().enumerate() {
@@ -4674,7 +4884,14 @@ impl SaeManifoldTerm {
         let total_t = cache.delta_t_len();
         let a = self.materialize_exact_hessian_dense(rho, target, cache)?;
         let e_diag = self.materialize_ard_concave_clamp_diagonal(rho, cache)?;
-        Self::exact_hessian_spectral_block(a, &e_diag, total_t, ArrowMetric::Joint(cache))
+        let e_beta = self.decoder_prior_majorizer_gap_border(cache)?;
+        Self::exact_hessian_spectral_block(
+            a,
+            &e_diag,
+            e_beta.as_ref(),
+            total_t,
+            ArrowMetric::Joint(cache),
+        )
     }
 
     /// #2330 Phase-2/#2653 — one coherent quotient geometry for the exact-A
@@ -4695,12 +4912,19 @@ impl SaeManifoldTerm {
         let dim = sae_exact_stationarity_dim(total_t, cache.k);
         let a = self.materialize_exact_hessian_dense(rho, target, cache)?;
         let e_diag = self.materialize_ard_concave_clamp_diagonal(rho, cache)?;
+        let e_beta = self.decoder_prior_majorizer_gap_border(cache)?;
         let a_tt_block = a.slice(s![..total_t, ..total_t]).to_owned();
-        let joint =
-            Self::exact_hessian_spectral_block(a, &e_diag, total_t, ArrowMetric::Joint(cache))?;
+        let joint = Self::exact_hessian_spectral_block(
+            a,
+            &e_diag,
+            e_beta.as_ref(),
+            total_t,
+            ArrowMetric::Joint(cache),
+        )?;
         let joint_pricing = Self::price_exact_hessian_block(
             &joint,
             &e_diag,
+            e_beta.as_ref(),
             total_t,
             |v| ArrowMetric::Joint(cache).quadratic_form(v),
             "joint",
@@ -4709,12 +4933,14 @@ impl SaeManifoldTerm {
         let coordinate = Self::exact_hessian_spectral_block(
             a_tt_block,
             &e_diag,
+            None,
             total_t,
             ArrowMetric::Coordinate(cache),
         )?;
         let mut coordinate_pricing = Self::price_exact_hessian_block(
             &coordinate,
             &e_diag,
+            None,
             total_t,
             |v| ArrowMetric::Coordinate(cache).quadratic_form(v),
             "coordinate",
@@ -4980,6 +5206,7 @@ impl SaeManifoldTerm {
     pub(crate) fn cluster_stable_eigh(
         m: &Array2<f64>,
         e_diag: &Array1<f64>,
+        e_beta: Option<&Array2<f64>>,
         total_t: usize,
     ) -> Result<(Array1<f64>, Array2<f64>), String> {
         if m.nrows() != m.ncols() || total_t > m.nrows() || e_diag.len() < total_t {
@@ -5001,15 +5228,16 @@ impl SaeManifoldTerm {
             }
             let width = j - i;
             if width > 1 {
-                // `E` is diagonal on the first `total_t` coordinate rows and
-                // identically zero on the beta border.  Its restriction to this
-                // cluster is therefore
+                // `E` is diagonal on the first `total_t` coordinate rows.  Its
+                // restriction to this cluster is therefore
                 //
-                //     E_c[a,b] = sum_r e_diag[r] V[r,i+a] V[r,i+b].
+                //     E_c[a,b] = sum_r e_diag[r] V[r,i+a] V[r,i+b]
                 //
-                // Accumulate one weighted row outer product at a time.  Besides
-                // reading the actual representation rather than manufacturing a
-                // dense matrix of zeros, this changes the work from
+                // plus, since #2828, the border block's own dense contribution
+                // (the β-tier decoder priors' majorization gap).  Accumulate one
+                // weighted row outer product at a time.  Besides reading the
+                // actual representation rather than manufacturing a dense matrix
+                // of zeros, this changes the coordinate half of the work from
                 // O(width^2 * dim^2) to O(width^2 * total_t).  Keeping `b` as the
                 // inner loop walks both the cluster row and `ec` contiguously.
                 let mut ec = Array2::<f64>::zeros((width, width));
@@ -5032,6 +5260,18 @@ impl SaeManifoldTerm {
                 for a in 0..width {
                     for b in (a + 1)..width {
                         ec[[b, a]] = ec[[a, b]];
+                    }
+                }
+                if e_beta.is_some() {
+                    for a in 0..width {
+                        for b in 0..width {
+                            ec[[a, b]] += Self::dropped_curvature_border_form(
+                                e_beta,
+                                total_t,
+                                vecs.column(i + a),
+                                vecs.column(i + b),
+                            );
+                        }
                     }
                 }
                 let (_ec_eigs, rot) = ec
@@ -5891,12 +6131,18 @@ mod test_support {
         let basin = super::SaeManifoldTerm::classify_exact_hessian_basin(
             &block,
             e,
+            None,
             e.len(),
             |v| Ok(v.dot(&v)),
             "fixture",
         )?;
-        let differential =
-            super::SaeManifoldTerm::exact_hessian_basin_differential(&block, e, e.len(), &basin)?;
+        let differential = super::SaeManifoldTerm::exact_hessian_basin_differential(
+            &block,
+            e,
+            None,
+            e.len(),
+            &basin,
+        )?;
         Ok(PricedFixture {
             log_det: basin.log_det,
             a_derivative: differential.a_derivative,
@@ -5926,14 +6172,16 @@ mod test_support {
             let basin = super::SaeManifoldTerm::classify_exact_hessian_basin(
                 &block,
                 &e,
+                None,
                 2,
                 |v| Ok(v.dot(&v)),
                 "rotated fixture",
             )
             .expect("same negative subspace");
-            let priced =
-                super::SaeManifoldTerm::exact_hessian_basin_differential(&block, &e, 2, &basin)
-                    .expect("same negative-subspace differential");
+            let priced = super::SaeManifoldTerm::exact_hessian_basin_differential(
+                &block, &e, None, 2, &basin,
+            )
+            .expect("same negative-subspace differential");
             assert!((basin.log_det - 3.0_f64.ln()).abs() <= 1.0e-12);
             let inverse = ndarray::arr2(&[[1.0, 0.0], [0.0, 1.0 / 3.0]]);
             assert!(
@@ -6050,6 +6298,7 @@ mod test_support {
                 .slice(s![..cache.delta_t_len(), ..cache.delta_t_len()])
                 .to_owned(),
             &base_e,
+            None,
             cache.delta_t_len(),
             super::ArrowMetric::Coordinate(&cache),
         )
