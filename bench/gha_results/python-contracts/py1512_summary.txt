@@ -1,16 +1,16 @@
 # python-contracts full-suite triage (#1512) — recovered summary
 
-collected            1734
-passed               1534
+collected            1799
+passed               1555
 skipped              79
-failed (diagnosed)   82
+failed (diagnosed)   133
 errored (diagnosed)  0
-CENSORED             39   (worker killed at the per-test bound;
+CENSORED             32   (worker killed at the per-test bound;
                           the JUnit records no reason and time=0.000)
 
-faulthandler dumps in the step log: 44
+faulthandler dumps in the step log: 36
 
-## The 39 censored tests, with the frame each was stuck in
+## The 32 censored tests, with the frame each was stuck in
 
 Recovered from the faulthandler dumps, which fire before the kill and
 write straight to fd 2. A test listed here is NOT a crashed interpreter:
@@ -36,45 +36,23 @@ it is a call that had not returned when the bound expired.
       test_structure_certificate_matches_independent_e_bh
           stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
 
-[3] tests.test_sae_manifold_determinism
-      test_sae_fit_is_deterministic_for_fixed_seed
-          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
-      test_sae_fit_random_state_changes_output
-          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
-      test_sae_fit_random_state_changes_output_topk_path
-          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
-
-[3] tests.test_sae_manifold_shape_uncertainty
-      test_band_sd_matches_analytic_phi_cov_phi_propagation
-          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
-      test_more_data_tightens_the_posterior_band
-          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
-      test_posterior_shape_band_is_tighter_than_data_deviation
-          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
-
 [2] tests.bug_hunt_shape_constrained_fit_refuses_default_prediction_intervals_test
       test_shape_constrained_diagnose_at_its_default[monotone-increasing]
           stuck in gamfit/_model.py:331 in predict
       test_shape_constrained_split_conformal[monotone-increasing]
           stuck in gamfit/_model.py:507 in predict_conformal
 
-[2] tests.test_bug_hunt_2026_tweedie_estimated_power_conditional_coverage
-      test_bare_tweedie_low_mean_coverage_is_near_nominal_on_p_neq_1p5_data
-          stuck in gamfit/_api.py:1270 in fit
-      test_estimated_power_strictly_beats_pinned_1p5_in_low_mean_stratum
-          stuck in gamfit/_api.py:1270 in fit
-
-[2] tests.test_bug_hunt_tweedie_observation_interval_equal_tailed
-      test_tweedie_observation_interval_is_equal_tailed_not_symmetric
-          stuck in gamfit/_api.py:1270 in fit
-      test_tweedie_observation_upper_edge_is_above_the_symmetric_band
-          stuck in gamfit/_api.py:1270 in fit
-
 [2] tests.test_event_history_score_slope
       test_a_ctn_calibrated_score_composes_in_front_of_the_fit
           stuck in gamfit/_event_history.py:439 in fit_event_history
       test_a_score_enters_as_one_penalised_slope_surface
           stuck in gamfit/_event_history.py:439 in fit_event_history
+
+[2] tests.test_sae_manifold_determinism
+      test_sae_fit_is_deterministic_for_fixed_seed
+          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
+      test_sae_fit_random_state_changes_output_topk_path
+          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
 
 [2] tests.test_sae_manifold_oos_reencode_issue_2132
       test_oos_reencode_of_training_rows_matches_native_reconstruction
@@ -86,6 +64,12 @@ it is a call that had not returned when the bound expired.
       test_on_disk_format_is_compact_per_channel_not_dense_joint
           stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
       test_reconstruction_and_band_are_physical_under_heterogeneous_column_scale
+          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
+
+[2] tests.test_sae_manifold_shape_uncertainty
+      test_band_sd_matches_analytic_phi_cov_phi_propagation
+          stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
+      test_posterior_shape_band_is_tighter_than_data_deviation
           stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
 
 [2] tests.test_sae_manifold_single_circle_default_795
@@ -100,10 +84,6 @@ it is a call that had not returned when the bound expired.
 
 [1] tests.bug_hunt_double_penalty_inflates_edf_instead_of_shrinking_test
       test_bspline_double_penalty_does_not_inflate_linear_edf
-          stuck in gamfit/_api.py:1270 in fit
-
-[1] tests.bug_hunt_gamma_dispersion_location_scale_unpredictable_test
-      test_negbin_dispersion_location_scale_is_predictable
           stuck in gamfit/_api.py:1270 in fit
 
 [1] tests.bug_hunt_sae_fit_avg_active_atoms_structurally_zero_test
@@ -131,7 +111,7 @@ it is a call that had not returned when the bound expired.
           stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
 
 [1] tests.test_sae_manifold_synthetic_quality_ground_truth
-      test_fit_oos_quality_matches_training_on_planted_oracle_distribution
+      test_isometry_on_circle_recovers_planted_geometry_normalized_reference
           stuck in gamfit/_sae_manifold.py:220 in sae_manifold_fit
 
 [1] tests.test_sae_manifold_top_k_issue
@@ -140,8 +120,8 @@ it is a call that had not returned when the bound expired.
 
 ## Entry-point census over the censored population
 
-    25  gamfit/_sae_manifold.py:220 in sae_manifold_fit
-     9  gamfit/_api.py:1270 in fit
+    23  gamfit/_sae_manifold.py:220 in sae_manifold_fit
+     4  gamfit/_api.py:1270 in fit
      2  gamfit/_event_history.py:439 in fit_event_history
      1  (no gamfit frame)
      1  gamfit/_model.py:507 in predict_conformal
@@ -149,24 +129,24 @@ it is a call that had not returned when the bound expired.
 
 ## 20 slowest tests that DID report a duration
 
-      247.8s  tests.test_sae_manifold_shape_band_save_load::test_restored_covariance_reproduces_analytic_band
-      241.5s  tests.test_sae_manifold_certify_external_2266::test_certify_external_round_trips_a_genuinely_converged_native_fit
-      196.9s  tests.test_sae_manifold_shape_uncertainty::test_shape_uncertainty_fields_present_and_well_shaped
-      161.7s  tests.test_sae_manifold_top_k_issue::test_topk_fit_uses_exact_fixed_support[1]
-      157.4s  tests.test_sae_manifold_public_api_shapes::test_per_atom_uncertainty_shape_band_shapes_are_sane
-      127.5s  tests.test_sae_manifold_regularizer_noops_issue_240::test_primitive_names_metadata_is_not_a_substitute_for_effect
-      120.6s  tests.test_sae_manifold_synthetic_quality_ground_truth::test_isometry_on_circle_recovers_planted_geometry_normalized_reference
+      293.8s  tests.test_sae_manifold_synthetic_quality_ground_truth::test_fit_oos_quality_matches_training_on_planted_oracle_distribution
+      270.1s  tests.test_sae_manifold_determinism::test_sae_fit_random_state_changes_output
+      255.5s  tests.test_sae_manifold_certify_external_2266::test_certify_external_round_trips_a_genuinely_converged_native_fit
+      228.1s  tests.test_sae_manifold_shape_band_save_load::test_restored_covariance_reproduces_analytic_band
+      145.5s  tests.test_sae_manifold_public_api_shapes::test_per_atom_uncertainty_shape_band_shapes_are_sane
+      141.1s  tests.test_sae_manifold_shape_uncertainty::test_more_data_tightens_the_posterior_band
+      140.8s  tests.test_sae_manifold_shape_uncertainty::test_shape_uncertainty_fields_present_and_well_shaped
+      118.0s  tests.test_sae_manifold_regularizer_noops_issue_240::test_primitive_names_metadata_is_not_a_substitute_for_effect
+      102.4s  tests.test_sae_manifold_top_k_issue::test_topk_fit_uses_exact_fixed_support[1]
        90.0s  tests.test_survival_marginal_slope_clustered_pc_808::test_survival_marginal_slope_clustered_pc_converges_808
-       71.5s  tests.test_sae_manifold_top_k_issue::test_topk_payload_is_one_unprojected_model
-       65.0s  tests.test_sae_manifold_regularizer_noops_issue_240::test_ard_per_atom_is_not_a_silent_noop
-       61.6s  tests.test_sae_manifold_regularizer_noops_issue_240::test_decoder_feature_sparsity_groups_produces_nontrivial_gradient
-       61.5s  tests.test_sae_manifold_regularizer_noops_issue_240::test_isometry_weight_is_not_a_silent_noop
+       64.6s  tests.test_sae_manifold_regularizer_noops_issue_240::test_block_orthogonality_weight_is_not_a_silent_noop
+       63.5s  tests.test_sae_manifold_regularizer_noops_issue_240::test_decoder_feature_sparsity_groups_produces_nontrivial_gradient
+       63.3s  tests.test_sae_manifold_regularizer_noops_issue_240::test_decoder_feature_sparsity_groups_is_not_a_silent_noop
+       62.4s  tests.test_sae_manifold_regularizer_noops_issue_240::test_isometry_weight_is_not_a_silent_noop
+       60.1s  tests.test_sae_manifold_regularizer_noops_issue_240::test_ard_per_atom_is_not_a_silent_noop
        60.1s  tests.test_survival_save_load_roundtrip::test_survival_marginal_slope_save_load_predict_roundtrips
-       58.6s  tests.test_sae_manifold_regularizer_noops_issue_240::test_block_orthogonality_weight_is_not_a_silent_noop
-       55.4s  tests.test_sae_manifold_regularizer_noops_issue_240::test_decoder_feature_sparsity_groups_is_not_a_silent_noop
+       56.0s  tests.test_sae_manifold_top_k_issue::test_topk_payload_is_one_unprojected_model
        45.1s  tests.test_survival_api_regressions::test_survival_marginal_slope_fit_returns
-       41.0s  tests.bug_hunt_smooth_significance_ref_df_tracks_edf_not_basis_dim_test::test_nonconverged_flat_fit_is_not_flagged_significant
-       19.0s  tests.test_binomial_posterior_mean_uncertainty::test_rare_event_observation_band_is_informative
-       18.9s  tests.bug_hunt_convex_concave_smooth_collapses_to_flat_at_moderate_snr_test::test_concave_smooth_recovers_clean_concave_signal
-       15.5s  tests.bug_hunt_flexible_link_predict_deviance_matches_fit_2141_test::test_flexible_link_predict_deviance_matches_fit_2141
+       43.6s  tests.bug_hunt_firth_binomial_with_two_smooths_stalls_far_from_stationarity_test::test_firth_binomial_two_smooths_fits_and_recovers_the_probability_surface[9]
+       36.0s  tests.bug_hunt_firth_binomial_with_two_smooths_stalls_far_from_stationarity_test::test_firth_does_not_make_a_fittable_binomial_gam_unfittable[9]
 
