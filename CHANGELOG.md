@@ -309,6 +309,37 @@
   docs describe the algorithm that exists: adaptive quadrature with a
   refinement certificate, not "exact".
 
+## v0.3.154 — gam 0.3.154 / gamfit 0.1.264 (2026-09-02)
+
+The first release since `v0.3.153` (2026-08-30), three days later, and two
+pieces of work carry it. Event histories become a family of their own: marked
+counting processes with smooth covariate and time effects per mark and a
+per-subject latent chain marginalised exactly by adaptive Gauss-Hermite
+filtering, a baseline that is the population-average intensity whatever the
+loadings, observed risk scores entering as penalised varying-coefficient
+surfaces, and forecasts at three tiers — population, score-only,
+history-conditioned. And the cone-truncated posterior's moment cubature is
+integrated in the Gibson-Glasbey-Elston order, tilted at Botev's exact saddle
+point by Newton on the analytic stationarity system, and stopped on the
+replicate standard error of eight shifted lattices, so the #979 preprocessor no
+longer converges and then refuses at a face it could not integrate.
+
+Around them: every live family's row log-likelihood is written once and its
+whole derivative tower derived from it, with 27 wall-clock gates asserting the
+compiled rows beat the hand kernels on every push (#932); a continuous `by=`
+smooth keeps its constant; explicit `k`, `BSpline(knots=K)` and periodic bases
+build the dimensions they name; a NaN penalty trace is refused instead of read
+as saturation; and the AIC ratio is called an evidence ratio, not a Bayes
+factor.
+
+Every workspace crate carries content changes this cycle, so all 24 move to
+0.3.154 together and `gam-pyffi`/`gamfit` to 0.1.264.
+
+The wheel matrix for this release failed on a transient GitHub Actions cache
+egress limit (`ServerBusy` from every `sccache --start-server`), so `gamfit`
+0.1.264 was built but never reached PyPI; its contents ship in the next
+`gamfit` release.
+
 - **A continuous `by=` smooth keeps its constant, and event-history forecasts
   have a population tier (#2805).** `s(x, by=z)` with a continuous `z` is the
   varying coefficient `f(x)·z`, whose constant direction is `z` itself and
@@ -439,15 +470,6 @@
   (`gam_linalg::anderson`) with the scalar relaxed step as the first-pass and
   post-reset fallback and the map's own residual norm as the safeguard. The
   n=1000 cell mints in 44 s (was a 290 s refusal); n=500 in 42 s (was 48 s).
-- **The composed-warp degree floor is the measured `C¹` degree, 4 (#2695).**
-  The floor had been raised to 5 on the reading that `∇Φ` consumes a
-  piecewise-constant `I⁗` at degree 4. Its own non-vacuity arm refused on MSI:
-  driving the production Jeffreys gradient across an event-row knot crossing,
-  the gap shrinks 99.5× for a 100× smaller straddle at degree 4 (and ≈100× at
-  5 and 6) and only 1.02× at degree 3. The required continuous basis order is
-  therefore 3, the floor is degree 4 again, the negative control measures
-  degree 3, and the ladder that produced the table (`knot_ladder_2695`) ships
-  as a fixture that prints it on every run.
 
 - **The composed-warp degree floor is the measured `C¹` degree, 4 (#2695).**
   The floor had been raised to 5 on the reading that `∇Φ` consumes a
