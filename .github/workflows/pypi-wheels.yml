@@ -71,12 +71,12 @@ env:
   # this workflow runs only at release time. A hit-count floor is therefore
   # unsatisfiable on the first dispatch of any release: run 33654645604
   # (v0.3.154) refused macOS, musllinux and Windows at `hits 0` with `errors 0`,
-  # `gamfit` 0.1.264 was never uploaded, and the only reason 0.1.260 shipped is
-  # that eight dispatches were fired within two hours on 2026-07-26 until one
-  # landed on a still-warm cache. A cold wheel is slow, not wrong; a wheel that
-  # bypassed the wrapper is the misconfiguration worth refusing, and compile
-  # requests measure that directly instead of by proxy. A cold run still writes
-  # its objects back, so it seeds the next release.
+  # that release's wheel was never uploaded, and the only reason its predecessor
+  # shipped is that eight dispatches were fired within two hours on 2026-07-26
+  # until one landed on a still-warm cache. A cold wheel is slow, not wrong; a
+  # wheel that bypassed the wrapper is the misconfiguration worth refusing, and
+  # compile requests measure that directly instead of by proxy. A cold run
+  # still writes its objects back, so it seeds the next release.
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
