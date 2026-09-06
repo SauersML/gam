@@ -161,6 +161,32 @@ impl SeparationBarrierEdgePlan {
     }
 }
 
+/// #2828 — one atom's AMPLITUDE-barrier scalars at a fixed decoder state, so the
+/// per-apply path never re-derives them. `energy` is `u = ‖B_k‖²_F`,
+/// `gradient_coefficient` is `2φ(u)` and `radial_curvature` is `P″(s)`; the
+/// exact Hessian is `2φ·I + ((prr − 2φ)/u)·b bᵀ` and the installed majorizer is
+/// `prr·I`. An atom on which the barrier abstains carries no entry at all, which
+/// is what keeps value, gradient, majorizer and remainder abstaining together.
+pub(crate) struct PreparedAmplitudeBarrierAtom {
+    pub(crate) atom: usize,
+    pub(crate) offset: usize,
+    pub(crate) basis_size: usize,
+    pub(crate) energy: f64,
+    pub(crate) gradient_coefficient: f64,
+    pub(crate) radial_curvature: f64,
+}
+
+/// #2828 — the state-dependent half of the β-tier decoder priors' curvature,
+/// prepared once and shared by every apply of one materialization or one Krylov
+/// solve. See [`SaeManifoldTerm::prepare_decoder_prior_beta_curvature`].
+pub(crate) struct PreparedDecoderPriorBetaCurvature {
+    pub(crate) beta_dim: usize,
+    pub(crate) penalty_scale: f64,
+    pub(crate) repulsion: Option<(DecoderIncoherencePenalty, Array1<f64>)>,
+    pub(crate) amplitude: Vec<PreparedAmplitudeBarrierAtom>,
+    pub(crate) separation: Vec<SeparationBarrierComponentPlan>,
+}
+
 /// #2828 — one co-firing component's separation-barrier plan: the edges, their
 /// carriers, and BOTH overlap-space couplings (`penalty_scale·M`, the exact
 /// Hessian, and `penalty_scale·|M|`, the shipped PSD majorizer).
@@ -1511,8 +1537,9 @@ impl SaeManifoldTerm {
     ///
     /// [`Self::add_sae_separation_barrier`] consumes the plan to write the
     /// gradient and the majorizer into the system;
-    /// [`Self::separation_barrier_beta_hvp_pair`] consumes the SAME plan to
-    /// apply the exact-minus-majorizer remainder that `A = B + ΔC` needs. Sharing one producer is what keeps the two from drifting: the
+    /// [`Self::separation_barrier_beta_hvp_pair_prepared`] consumes the SAME
+    /// plan to apply the exact-minus-majorizer remainder that `A = B + ΔC`
+    /// needs. Sharing one producer is what keeps the two from drifting: the
     /// remainder is defined against the object that was actually installed, not
     /// against a re-derivation of it.
     pub(crate) fn separation_barrier_plan(
@@ -1816,8 +1843,8 @@ impl SaeManifoldTerm {
     ///
     /// #2828 — the two curvature approximations this installs (`|M|` for `M`,
     /// and the `lev` ridge for `α_e·∂²o_e/∂B²`) are exactly what
-    /// [`Self::separation_barrier_beta_hvp_pair`] separates for the exact
-    /// stationarity Hessian `A`. Both read one
+    /// [`Self::separation_barrier_beta_hvp_pair_prepared`] separates for the
+    /// exact stationarity Hessian `A`. Both read one
     /// [`Self::separation_barrier_plan`].
     pub(crate) fn add_sae_separation_barrier(
         &self,
@@ -2015,18 +2042,95 @@ impl SaeManifoldTerm {
     ///   `(prr − g_coef)·(b(bᵀv)/u − v)` — zero along the radius `b` (where the
     ///   ridge IS exact) and `−(prr − g_coef)·v` on every tangential direction.
     /// * SEPARATION BARRIER (#1522/#1610/#2731). See
-    ///   [`Self::separation_barrier_beta_hvp_pair`].
+    ///   [`Self::separation_barrier_beta_hvp_pair_prepared`].
     ///
     /// The smoothness Gram `λ S ⊗ I`, the data-fit β Gram (β enters the
     /// reconstruction linearly, so Gauss–Newton IS exact there), and the ARD
     /// prior (a t-tier object) need no remainder.
-    pub(crate) fn decoder_prior_exact_minus_majorizer_beta_hvp(
+    /// #2828 — the β-tier remainder `exact − majorizer`, against a plan
+    /// prepared once for this decoder state. Every apply inside one
+    /// materialization or one Krylov solve shares it.
+    pub(crate) fn decoder_prior_exact_minus_majorizer_beta_hvp_prepared(
         &self,
-        penalty_scale: f64,
+        prepared: &PreparedDecoderPriorBetaCurvature,
         v: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, String> {
-        let (exact, majorizer) = self.decoder_prior_beta_hvp_pair(penalty_scale, v)?;
+        let (exact, majorizer) = self.decoder_prior_beta_hvp_pair_prepared(prepared, v)?;
         Ok(&exact - &majorizer)
+    }
+
+    /// #2828 — everything about the β-tier decoder priors' curvature that depends
+    /// on the DECODER STATE and not on the direction it is applied to: the frozen
+    /// repulsion penalty and its flattened target, the per-atom amplitude-barrier
+    /// scalars, and the separation barrier's per-component plan.
+    ///
+    /// This split is not an optimisation detail, it is what a matrix-free
+    /// operator is: `A·v` is applied once per Krylov step and once per column of
+    /// a materialization, while the plan behind it is a property of the state.
+    /// The separation plan alone walks the co-firing pairs, forms a cross-Gram
+    /// and two self-Grams per edge, and eigendecomposes each component's `F` —
+    /// the seam #2731 measured at 86% of the curved tier's wall clock when it ran
+    /// ONCE per assembly. Measured on a 10-atom, `p = 16`, `n = 60` fixture with
+    /// every pair near-collinear (45 engaged repulsion pairs, `beta_dim = 480`):
+    /// one `apply_exact_hessian_minus_b` is 15.19 ms and rebuilding this plan
+    /// inside it costs 2.79 ms of that, so hoisting it out is a third of the
+    /// apply at a shape where `ne` is still tiny.
+    ///
+    /// A prepared plan is valid for exactly the state it was built from. It
+    /// carries no proof of that — the callers hold `&self` across the applies
+    /// they share it with, which is the proof.
+    pub(crate) fn prepare_decoder_prior_beta_curvature(
+        &self,
+        penalty_scale: f64,
+    ) -> PreparedDecoderPriorBetaCurvature {
+        let beta_dim = self.beta_dim();
+        if penalty_scale == 0.0 {
+            return PreparedDecoderPriorBetaCurvature {
+                beta_dim,
+                penalty_scale,
+                repulsion: None,
+                amplitude: Vec::new(),
+                separation: Vec::new(),
+            };
+        }
+        let repulsion = self
+            .live_decoder_repulsion_penalty()
+            .map(|per_fit| (per_fit, self.flatten_beta()));
+        let mut amplitude = Vec::new();
+        if let Some(floor2) = self.amplitude_barrier_gate {
+            let mu = SAE_AMPLITUDE_BARRIER_STRENGTH;
+            let p = self.output_dim();
+            let offsets = self.beta_offsets();
+            for (atom_idx, atom) in self.atoms.iter().enumerate() {
+                let b = atom.decoder_coefficients();
+                let m = b.nrows();
+                if m == 0 || b.ncols() != p {
+                    continue;
+                }
+                let u = b.iter().map(|value| value * value).sum::<f64>();
+                let Some((_value, g_coef, prr)) = Self::amplitude_barrier_scalars(u, floor2, mu)
+                else {
+                    // The barrier abstains for this atom in value, gradient AND
+                    // curvature, so it gets no entry at all.
+                    continue;
+                };
+                amplitude.push(PreparedAmplitudeBarrierAtom {
+                    atom: atom_idx,
+                    offset: offsets[atom_idx],
+                    basis_size: m,
+                    energy: u,
+                    gradient_coefficient: g_coef,
+                    radial_curvature: prr,
+                });
+            }
+        }
+        PreparedDecoderPriorBetaCurvature {
+            beta_dim,
+            penalty_scale,
+            repulsion,
+            amplitude,
+            separation: self.separation_barrier_plan(penalty_scale, true),
+        }
     }
 
     /// #2828 — the β-tier decoder priors' curvature BOTH ways: the exact
@@ -2049,7 +2153,7 @@ impl SaeManifoldTerm {
     ///   ((prr − g_coef)/u)·b(bᵀv)` — the ridge is exact along the radius `b`
     ///   and over-claims by `prr − g_coef` on every tangential direction.
     /// * SEPARATION BARRIER (#1522/#1610/#2731). See
-    ///   [`Self::separation_barrier_beta_hvp_pair`].
+    ///   [`Self::separation_barrier_beta_hvp_pair_prepared`].
     ///
     /// The smoothness Gram `λ S ⊗ I`, the data-fit β Gram (β enters the
     /// reconstruction linearly, so Gauss–Newton IS exact there), and the ARD
@@ -2059,22 +2163,35 @@ impl SaeManifoldTerm {
         penalty_scale: f64,
         v: ArrayView1<'_, f64>,
     ) -> Result<(Array1<f64>, Array1<f64>), String> {
+        let prepared = self.prepare_decoder_prior_beta_curvature(penalty_scale);
+        self.decoder_prior_beta_hvp_pair_prepared(&prepared, v)
+    }
+
+    /// [`Self::decoder_prior_beta_hvp_pair`] against a plan prepared once for
+    /// this decoder state ([`Self::prepare_decoder_prior_beta_curvature`]).
+    pub(crate) fn decoder_prior_beta_hvp_pair_prepared(
+        &self,
+        prepared: &PreparedDecoderPriorBetaCurvature,
+        v: ArrayView1<'_, f64>,
+    ) -> Result<(Array1<f64>, Array1<f64>), String> {
         let beta_dim = self.beta_dim();
-        if v.len() != beta_dim {
+        if v.len() != beta_dim || prepared.beta_dim != beta_dim {
             return Err(format!(
-                "decoder_prior_beta_hvp_pair: direction length {} != beta_dim {beta_dim}",
+                "decoder_prior_beta_hvp_pair: direction length {} and prepared width {} must \
+                 both be beta_dim {beta_dim}",
                 v.len(),
+                prepared.beta_dim,
             ));
         }
+        let penalty_scale = prepared.penalty_scale;
         let mut exact = Array1::<f64>::zeros(beta_dim);
         let mut majorizer = Array1::<f64>::zeros(beta_dim);
         if penalty_scale == 0.0 {
             return Ok((exact, majorizer));
         }
         // (a) decoder repulsion.
-        if let Some(per_fit) = self.live_decoder_repulsion_penalty() {
+        if let Some((per_fit, target_beta)) = prepared.repulsion.as_ref() {
             use gam_terms::analytic_penalties::AnalyticPenalty;
-            let target_beta = self.flatten_beta();
             let rho_local = Array1::<f64>::zeros(0);
             let hv = per_fit.hvp(target_beta.view(), rho_local.view(), v);
             let mv = per_fit.psd_majorizer_hvp(target_beta.view(), rho_local.view(), v);
@@ -2084,48 +2201,37 @@ impl SaeManifoldTerm {
             }
         }
         // (b) amplitude barrier.
-        if let Some(floor2) = self.amplitude_barrier_gate {
-            let mu = SAE_AMPLITUDE_BARRIER_STRENGTH;
-            let p = self.output_dim();
-            let offsets = self.beta_offsets();
-            for (atom_idx, atom) in self.atoms.iter().enumerate() {
-                let b = atom.decoder_coefficients();
-                let m = b.nrows();
-                if m == 0 || b.ncols() != p {
-                    continue;
+        let p = self.output_dim();
+        for entry in &prepared.amplitude {
+            let b = self.atoms[entry.atom].decoder_coefficients();
+            let m = entry.basis_size;
+            let off = entry.offset;
+            let mut radial = 0.0_f64;
+            for a in 0..m {
+                for o in 0..p {
+                    radial += b[[a, o]] * v[off + a * p + o];
                 }
-                let u = b.iter().map(|value| value * value).sum::<f64>();
-                let Some((_value, g_coef, prr)) = Self::amplitude_barrier_scalars(u, floor2, mu)
-                else {
-                    // The barrier abstains for this atom in value, gradient AND
-                    // curvature, so neither side gets a term.
-                    continue;
-                };
-                let off = offsets[atom_idx];
-                let mut radial = 0.0_f64;
-                for a in 0..m {
-                    for o in 0..p {
-                        radial += b[[a, o]] * v[off + a * p + o];
-                    }
-                }
-                let tangential = penalty_scale * (prr - g_coef) / u;
-                let ridge = penalty_scale * prr;
-                for a in 0..m {
-                    for o in 0..p {
-                        let idx = off + a * p + o;
-                        exact[idx] +=
-                            penalty_scale * g_coef * v[idx] + tangential * b[[a, o]] * radial;
-                        // `add_sae_amplitude_barrier` writes the ridge only when
-                        // it is strictly positive; mirror that exactly.
-                        if ridge > 0.0 {
-                            majorizer[idx] += ridge * v[idx];
-                        }
+            }
+            let tangential =
+                penalty_scale * (entry.radial_curvature - entry.gradient_coefficient)
+                    / entry.energy;
+            let ridge = penalty_scale * entry.radial_curvature;
+            for a in 0..m {
+                for o in 0..p {
+                    let idx = off + a * p + o;
+                    exact[idx] += penalty_scale * entry.gradient_coefficient * v[idx]
+                        + tangential * b[[a, o]] * radial;
+                    // `add_sae_amplitude_barrier` writes the ridge only when it
+                    // is strictly positive; mirror that exactly.
+                    if ridge > 0.0 {
+                        majorizer[idx] += ridge * v[idx];
                     }
                 }
             }
         }
         // (c) separation barrier.
-        let (sep_exact, sep_majorizer) = self.separation_barrier_beta_hvp_pair(penalty_scale, v);
+        let (sep_exact, sep_majorizer) =
+            self.separation_barrier_beta_hvp_pair_prepared(&prepared.separation, v);
         for idx in 0..beta_dim {
             exact[idx] += sep_exact[idx];
             majorizer[idx] += sep_majorizer[idx];
@@ -2169,9 +2275,11 @@ impl SaeManifoldTerm {
     /// doc calls "the remaining indefinite `Σ_e (∂P/∂o_e)·∂²o_e/∂B²` part": PSD
     /// below `o = ½` and genuinely negative above it, which is precisely why the
     /// inner solve must not see it and the exact `A` must.
-    pub(crate) fn separation_barrier_beta_hvp_pair(
+    /// #2828 — the SEPARATION barrier's β curvature BOTH ways, against plans built once for
+    /// this decoder state.
+    pub(crate) fn separation_barrier_beta_hvp_pair_prepared(
         &self,
-        penalty_scale: f64,
+        plans: &[SeparationBarrierComponentPlan],
         v: ArrayView1<'_, f64>,
     ) -> (Array1<f64>, Array1<f64>) {
         let p = self.output_dim();
@@ -2179,7 +2287,7 @@ impl SaeManifoldTerm {
         let beta_dim = self.beta_dim();
         let mut exact = Array1::<f64>::zeros(beta_dim);
         let mut majorizer = Array1::<f64>::zeros(beta_dim);
-        for plan in self.separation_barrier_plan(penalty_scale, true) {
+        for plan in plans {
             // (1) the overlap-space couplings, contracted through the carriers.
             let ne = plan.carriers.len();
             if ne > 0 {

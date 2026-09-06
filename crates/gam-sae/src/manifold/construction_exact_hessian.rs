@@ -1205,6 +1205,27 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         v: &SaeArrowVector,
     ) -> Result<SaeArrowVector, String> {
+        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
+        self.apply_exact_hessian_minus_b_prepared(rho, target, cache, v, &prepared)
+    }
+
+    /// [`Self::apply_exact_hessian_minus_b`] against a β-tier decoder-prior plan
+    /// prepared once for this state.
+    ///
+    /// #2828 — the β leg's plan is a property of the DECODER STATE, not of the
+    /// direction, so a caller that applies `ΔC` many times at one state (a dense
+    /// materialization's `slots + k` probes, a Krylov solve's iterations) builds
+    /// it once here instead of once per apply. Measured on a 10-atom, `p = 16`,
+    /// `n = 60` fixture with every pair near-collinear: 2.79 ms of a 15.19 ms
+    /// apply.
+    pub(crate) fn apply_exact_hessian_minus_b_prepared(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        v: &SaeArrowVector,
+        prepared: &PreparedDecoderPriorBetaCurvature,
+    ) -> Result<SaeArrowVector, String> {
         self.assignment.validate_rho_domain(rho)?;
         let p = self.output_dim();
         let n = self.n_obs();
@@ -1603,13 +1624,15 @@ impl SaeManifoldTerm {
             let framed = self.last_frames_active && cache.k == self.factored_border_dim();
             if framed {
                 let lifted = projection.lift_border_vec(v.beta.view());
-                let delta = self.decoder_prior_exact_minus_majorizer_beta_hvp(1.0, lifted.view())?;
+                let delta = self
+                    .decoder_prior_exact_minus_majorizer_beta_hvp_prepared(prepared, lifted.view())?;
                 let projected = projection.project_border_vec(delta.view());
                 for (index, &value) in projected.iter().enumerate() {
                     out.beta[index] += value;
                 }
             } else if cache.k == beta_dim {
-                let delta = self.decoder_prior_exact_minus_majorizer_beta_hvp(1.0, v.beta.view())?;
+                let delta = self
+                    .decoder_prior_exact_minus_majorizer_beta_hvp_prepared(prepared, v.beta.view())?;
                 for (index, &value) in delta.iter().enumerate() {
                     out.beta[index] += value;
                 }
@@ -1670,15 +1693,19 @@ impl SaeManifoldTerm {
         }
         let mut gap = Array2::<f64>::zeros((k, k));
         let mut unit = Array1::<f64>::zeros(k);
+        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
         for col in 0..k {
             unit.fill(0.0);
             unit[col] = 1.0;
             let column = if framed {
                 let lifted = projection.lift_border_vec(unit.view());
-                let delta = self.decoder_prior_exact_minus_majorizer_beta_hvp(1.0, lifted.view())?;
+                let delta = self.decoder_prior_exact_minus_majorizer_beta_hvp_prepared(
+                    &prepared,
+                    lifted.view(),
+                )?;
                 projection.project_border_vec(delta.view())
             } else {
-                self.decoder_prior_exact_minus_majorizer_beta_hvp(1.0, unit.view())?
+                self.decoder_prior_exact_minus_majorizer_beta_hvp_prepared(&prepared, unit.view())?
             };
             // `E = B − A` and the β leg of `A − B` is `column`, so `E` is its
             // negation.
@@ -1846,6 +1873,19 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         v: &SaeArrowVector,
     ) -> Result<SaeArrowVector, String> {
+        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
+        self.apply_exact_hessian_prepared(rho, target, cache, v, &prepared)
+    }
+
+    /// [`Self::apply_exact_hessian`] against a β-tier plan prepared once.
+    fn apply_exact_hessian_prepared(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        v: &SaeArrowVector,
+        prepared: &PreparedDecoderPriorBetaCurvature,
+    ) -> Result<SaeArrowVector, String> {
         // #2515 — the cache factors the conditioned evidence majorizer
         // `Phi(B_raw)`.  That conditioning is a solve/log-determinant policy, not
         // part of the objective Hessian.  Adding ΔC to it would build
@@ -1853,7 +1893,7 @@ impl SaeManifoldTerm {
         // builds `Phi(B_raw + ΔC)`.  Recover B_raw first so both routes classify
         // the one statistical operator `A_raw = B_raw + ΔC`.
         let b_v = apply_raw_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
-        let dc_v = self.apply_exact_hessian_minus_b(rho, target, cache, v)?;
+        let dc_v = self.apply_exact_hessian_minus_b_prepared(rho, target, cache, v, prepared)?;
         Ok(SaeArrowVector {
             t: &b_v.t + &dc_v.t,
             beta: &b_v.beta + &dc_v.beta,
@@ -1924,6 +1964,22 @@ impl SaeManifoldTerm {
         system: &ArrowSchurSystem,
         vector: &SaeArrowVector,
     ) -> Result<SaeArrowVector, String> {
+        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
+        self.apply_exact_hessian_matrix_free_prepared(rho, target, cache, system, vector, &prepared)
+    }
+
+    /// [`Self::apply_exact_hessian_matrix_free`] against a β-tier plan prepared
+    /// once — the form the Krylov solve installs, so the plan is built once per
+    /// solve rather than once per iteration.
+    pub(crate) fn apply_exact_hessian_matrix_free_prepared(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        system: &ArrowSchurSystem,
+        vector: &SaeArrowVector,
+        prepared: &PreparedDecoderPriorBetaCurvature,
+    ) -> Result<SaeArrowVector, String> {
         let (base_t, base_beta) = matrix_free_arrow_operator_apply(
             system,
             cache,
@@ -1931,7 +1987,8 @@ impl SaeManifoldTerm {
             vector.beta.view(),
         )
         .map_err(|error| format!("matrix-free evidence operator: {error}"))?;
-        let correction = self.apply_exact_hessian_minus_b(rho, target, cache, vector)?;
+        let correction =
+            self.apply_exact_hessian_minus_b_prepared(rho, target, cache, vector, prepared)?;
         let mut out = SaeArrowVector {
             t: &base_t + &correction.t,
             beta: &base_beta + &correction.beta,
@@ -1978,8 +2035,12 @@ impl SaeManifoldTerm {
             .map_err(|error| format!("matrix-free evidence operator: {error}"))?;
             Ok(SaeArrowVector { t, beta })
         };
+        // #2828 — one plan for the whole Krylov solve, not one per iteration.
+        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
         let apply_a = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
-            self.apply_exact_hessian_matrix_free(rho, target, cache, system, vector)
+            self.apply_exact_hessian_matrix_free_prepared(
+                rho, target, cache, system, vector, &prepared,
+            )
         };
         // #2674 — the Krylov sequence runs on the SAME operator the dense route
         // now diagonalizes: the full `A`, with no analytic chart orbit deleted
@@ -5159,6 +5220,8 @@ impl SaeManifoldTerm {
             sae_exact_stationarity_block_bytes(dim) as f64 / (1024.0 * 1024.0),
         );
         let build_started = std::time::Instant::now();
+        // #2828 — one β-tier decoder-prior plan for all `slots + k` probes.
+        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
         let mut a = Array2::<f64>::zeros((dim, dim));
         let mut unit = SaeArrowVector {
             t: Array1::<f64>::zeros(total_t),
@@ -5172,7 +5235,7 @@ impl SaeManifoldTerm {
                     unit.t[start + slot] = 1.0;
                 }
             }
-            let mut av = self.apply_exact_hessian(rho, target, cache, &unit)?;
+            let mut av = self.apply_exact_hessian_prepared(rho, target, cache, &unit, &prepared)?;
             for (coefficient, carrier) in &mass_carriers {
                 let projection = carrier
                     .iter()
@@ -5203,7 +5266,7 @@ impl SaeManifoldTerm {
         for j in 0..k {
             unit.beta.fill(0.0);
             unit.beta[j] = 1.0;
-            let av = self.apply_exact_hessian(rho, target, cache, &unit)?;
+            let av = self.apply_exact_hessian_prepared(rho, target, cache, &unit, &prepared)?;
             let col = total_t + j;
             for i in 0..total_t {
                 a[[i, col]] = av.t[i];
@@ -7248,6 +7311,10 @@ mod column_loop_oracle_tests {
             // be denominated in whichever half dominates, so the split is the
             // prerequisite for the guard, not decoration.
             let build_started = std::time::Instant::now();
+            // #2828 — one β-tier decoder-prior plan for all `dim` columns, so
+            // this oracle and the probe assembly it checks pay the same per-apply
+            // cost and their timings stay comparable.
+            let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
             let mut a = Array2::<f64>::zeros((dim, dim));
             let mut unit = SaeArrowVector {
                 t: Array1::<f64>::zeros(total_t),
@@ -7259,7 +7326,7 @@ mod column_loop_oracle_tests {
                 } else {
                     unit.beta[col - total_t] = 1.0;
                 }
-                let av = self.apply_exact_hessian(rho, target, cache, &unit)?;
+                let av = self.apply_exact_hessian_prepared(rho, target, cache, &unit, &prepared)?;
                 if col < total_t {
                     unit.t[col] = 0.0;
                 } else {
