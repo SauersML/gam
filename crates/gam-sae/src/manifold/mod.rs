@@ -303,6 +303,8 @@ mod tests_collateral_e2_2234;
 mod tests_collateral_noncyclic_2234;
 
 #[cfg(test)]
+mod tests_beta_prior_curvature_2828;
+#[cfg(test)]
 mod tests_edf_census_bounds_2502;
 #[cfg(test)]
 mod tests_indefinite_a_refusal_2336;

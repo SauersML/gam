@@ -2170,6 +2170,16 @@ impl SaeManifoldTerm {
             if beta_penalty_assembly.dense_written {
                 ops.push(Arc::new(DensePenaltyOp(sys.hbb.clone())));
             }
+            // #1026/#2828 — the frozen-gate repulsion's PSD majorizer. On this
+            // lane `add_sae_decoder_repulsion` applied only the GRADIENT and
+            // marked `deferred_factored`, a mark that until now was consumed on
+            // the FRAMED lane alone (#1610), so the curvature was silently
+            // dropped here while its gradient was kept.
+            if beta_penalty_assembly.deferred_factored {
+                if let Some(op) = self.decoder_repulsion_majorizer_carrier_op(penalty_scale) {
+                    ops.push(Arc::new(op));
+                }
+            }
             // #1038/#2731 — the barrier's exact Gauss–Newton curvature, full-`B`
             // layout (no frame projection on the non-frames path). Already CPU (no
             // device data installed on the whitening path), so no extra fallback
@@ -2228,13 +2238,19 @@ impl SaeManifoldTerm {
                     }
                 })
                 .collect();
-            // #1038 — the device SAE PCG kernel folds only the per-atom scalar smooth
-            // blocks and the `G ⊗ I_p` data Gram; it cannot represent the barrier's
-            // cross-atom curvature. When that curvature fires (a co-collapsing
-            // dictionary), skip the device install so the solve falls back to the CPU
-            // reduced-Schur matvec, which routes `H_ββ` through the composite op below
-            // (the carrier included). Healthy fits install none and keep the device PCG.
-            if sep_curvature.is_empty() {
+            // #1038/#2828 — the device SAE PCG kernel folds only the per-atom scalar
+            // smooth blocks and the `G ⊗ I_p` data Gram; it cannot represent the
+            // barrier's cross-atom curvature, nor the repulsion's. When either fires
+            // (a co-collapsing / near-collinear dictionary), skip the device install so
+            // the solve falls back to the CPU reduced-Schur matvec, which routes `H_ββ`
+            // through the composite op below (both carriers included). Healthy fits
+            // install neither and keep the device PCG.
+            let repulsion_carrier = if beta_penalty_assembly.deferred_factored {
+                self.decoder_repulsion_majorizer_carrier_op(penalty_scale)
+            } else {
+                None
+            };
+            if sep_curvature.is_empty() && repulsion_carrier.is_none() {
                 self.install_device_sae_pcg_data(
                     &mut sys,
                     DeviceSaePcgData {
@@ -2257,6 +2273,13 @@ impl SaeManifoldTerm {
             }));
             if beta_penalty_assembly.dense_written {
                 ops.push(Arc::new(DensePenaltyOp(sys.hbb.clone())));
+            }
+            // #1026/#2828 — see the whitened lane above: the repulsion's PSD
+            // majorizer, carried matrix-free because this lane builds no dense
+            // `hbb`. Built above the device gate so the two cannot disagree about
+            // whether it fired.
+            if let Some(op) = repulsion_carrier {
+                ops.push(Arc::new(op));
             }
             // #1038/#2731 — barrier's exact Gauss–Newton curvature (full-`B`, no
             // projection).
