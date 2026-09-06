@@ -59,9 +59,24 @@ env:
   # rustc invocation, so does not invalidate Swatinem/rust-cache keys.
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   # The wheel matrix is a publication boundary, so every compiled wheel must
-  # prove real reuse from the shared content-addressed compiler cache. Merely
-  # enabling a cache is not evidence: each job zeroes its counters immediately
-  # before compilation and refuses publication when the measured hit count is zero.
+  # prove it was compiled THROUGH the shared content-addressed compiler cache:
+  # each job zeroes its counters immediately before compilation and refuses
+  # publication unless the receipt shows rustc reached sccache and the backend
+  # reported no errors.
+  #
+  # It does NOT require a nonzero hit count, and the difference cost a release.
+  # `release-pypi` is a dedicated profile (fat LTO, one CGU, stripped) that
+  # nothing else in this repo compiles, so its objects are shared with no other
+  # workflow, and the Actions cache evicts entries unused for seven days while
+  # this workflow runs only at release time. A hit-count floor is therefore
+  # unsatisfiable on the first dispatch of any release: run 33654645604
+  # (v0.3.154) refused macOS, musllinux and Windows at `hits 0` with `errors 0`,
+  # `gamfit` 0.1.264 was never uploaded, and the only reason 0.1.260 shipped is
+  # that eight dispatches were fired within two hours on 2026-07-26 until one
+  # landed on a still-warm cache. A cold wheel is slow, not wrong; a wheel that
+  # bypassed the wrapper is the misconfiguration worth refusing, and compile
+  # requests measure that directly instead of by proxy. A cold run still writes
+  # its objects back, so it seeds the next release.
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
@@ -155,9 +170,26 @@ jobs:
             # maturin-action runs this definition in the same container shell
             # that later invokes maturin. The function therefore brackets the
             # real compiler invocation with target-local counters and turns a
-            # zero-hit build into a hard refusal before any artifact upload.
+            # build that bypassed the cache into a hard refusal before any
+            # artifact upload.
             maturin() {
-              sccache --start-server
+              # Measured 2026-09-02 (run 33654645604): the Actions cache
+              # answered `503 ServerBusy: Egress is over the account limit`,
+              # `sccache --start-server` failed outright, and `fail-fast` took
+              # the rest of the release matrix with it. opendal classifies that
+              # response as retryable, so the start gets a bounded schedule
+              # before any compilation begins; a backend still unreachable
+              # after it is fatal, exactly as before.
+              local attempt started=0
+              for attempt in 1 2 3 4 5; do
+                if sccache --start-server; then started=1; break; fi
+                echo "sccache --start-server failed (attempt ${attempt}/5)."
+                if (( attempt < 5 )); then sleep $(( attempt * 20 )); fi
+              done
+              if (( started == 0 )); then
+                echo "::error::sccache could not reach the shared cache backend after 5 attempts; refusing a wheel build with no compiler cache."
+                return 1
+              fi
               # maturin-action exports RUSTC_WRAPPER in its Node process, but
               # Docker receives an empty value on this route. Bind Cargo to the
               # executable that was just installed inside this container.
@@ -165,28 +197,36 @@ jobs:
               sccache --zero-stats
               local status=0
               command maturin "$@" || status=$?
-              local stats hits misses errors
+              local stats requests hits misses errors
               stats=$(sccache --show-stats)
               printf '%s\n' "$stats"
+              # `Compile requests` counts every rustc invocation sccache
+              # brokered. `Compile requests executed` is a separate, longer
+              # line, so the exact field count pins the one meant here.
+              requests=$(awk 'NF == 3 && $1 == "Compile" && $2 == "requests" { print $3; exit }' <<< "$stats")
               hits=$(awk '$1 == "Cache" && $2 == "hits" { print $3; exit }' <<< "$stats")
               misses=$(awk '$1 == "Cache" && $2 == "misses" { print $3; exit }' <<< "$stats")
               errors=$(awk '$1 == "Cache" && ($2 == "errors" || $2 == "read" || $2 == "write") { total += $NF } END { print total + 0 }' <<< "$stats")
               if (( status != 0 )); then
                 return "$status"
               fi
-              if [[ ! "${hits:-}" =~ ^[0-9]+$ || ! "${misses:-}" =~ ^[0-9]+$ || ! "${errors:-}" =~ ^[0-9]+$ ]]; then
+              if [[ ! "${requests:-}" =~ ^[0-9]+$ || ! "${hits:-}" =~ ^[0-9]+$ || ! "${misses:-}" =~ ^[0-9]+$ || ! "${errors:-}" =~ ^[0-9]+$ ]]; then
                 echo "::error::Could not parse the complete in-container sccache receipt; refusing an unmeasured wheel build."
                 return 1
               fi
-              if (( hits == 0 )); then
-                echo "::error::Wheel target reused zero compiler objects; refusing a cold publication build."
+              if (( requests == 0 )); then
+                echo "::error::rustc never reached sccache (0 compile requests): RUSTC_WRAPPER is not bound, so this wheel was compiled outside the shared cache and nothing about it was measured."
                 return 1
               fi
               if (( errors != 0 )); then
                 echo "::error::Wheel target reported ${errors} cache error(s); refusing an incomplete warm-cache receipt."
                 return 1
               fi
-              echo "Measured warm wheel build: hits=${hits}, misses=${misses}, cache errors=0."
+              if (( hits == 0 )); then
+                echo "::notice::Cold wheel target: ${requests} compile request(s) went through sccache, ${misses} miss(es) written back, 0 reused. Correct but slow; this run seeds the cache for the next release."
+              else
+                echo "Measured warm wheel build: requests=${requests}, hits=${hits}, misses=${misses}, cache errors=0."
+              fi
             }
       - uses: actions/upload-artifact@v4
         with:
@@ -237,9 +277,26 @@ jobs:
             # maturin-action runs this definition in the same container shell
             # that later invokes maturin. The function therefore brackets the
             # real compiler invocation with target-local counters and turns a
-            # zero-hit build into a hard refusal before any artifact upload.
+            # build that bypassed the cache into a hard refusal before any
+            # artifact upload.
             maturin() {
-              sccache --start-server
+              # Measured 2026-09-02 (run 33654645604): the Actions cache
+              # answered `503 ServerBusy: Egress is over the account limit`,
+              # `sccache --start-server` failed outright, and `fail-fast` took
+              # the rest of the release matrix with it. opendal classifies that
+              # response as retryable, so the start gets a bounded schedule
+              # before any compilation begins; a backend still unreachable
+              # after it is fatal, exactly as before.
+              local attempt started=0
+              for attempt in 1 2 3 4 5; do
+                if sccache --start-server; then started=1; break; fi
+                echo "sccache --start-server failed (attempt ${attempt}/5)."
+                if (( attempt < 5 )); then sleep $(( attempt * 20 )); fi
+              done
+              if (( started == 0 )); then
+                echo "::error::sccache could not reach the shared cache backend after 5 attempts; refusing a wheel build with no compiler cache."
+                return 1
+              fi
               # maturin-action exports RUSTC_WRAPPER in its Node process, but
               # Docker receives an empty value on this route. Bind Cargo to the
               # executable that was just installed inside this container.
@@ -247,28 +304,36 @@ jobs:
               sccache --zero-stats
               local status=0
               command maturin "$@" || status=$?
-              local stats hits misses errors
+              local stats requests hits misses errors
               stats=$(sccache --show-stats)
               printf '%s\n' "$stats"
+              # `Compile requests` counts every rustc invocation sccache
+              # brokered. `Compile requests executed` is a separate, longer
+              # line, so the exact field count pins the one meant here.
+              requests=$(awk 'NF == 3 && $1 == "Compile" && $2 == "requests" { print $3; exit }' <<< "$stats")
               hits=$(awk '$1 == "Cache" && $2 == "hits" { print $3; exit }' <<< "$stats")
               misses=$(awk '$1 == "Cache" && $2 == "misses" { print $3; exit }' <<< "$stats")
               errors=$(awk '$1 == "Cache" && ($2 == "errors" || $2 == "read" || $2 == "write") { total += $NF } END { print total + 0 }' <<< "$stats")
               if (( status != 0 )); then
                 return "$status"
               fi
-              if [[ ! "${hits:-}" =~ ^[0-9]+$ || ! "${misses:-}" =~ ^[0-9]+$ || ! "${errors:-}" =~ ^[0-9]+$ ]]; then
+              if [[ ! "${requests:-}" =~ ^[0-9]+$ || ! "${hits:-}" =~ ^[0-9]+$ || ! "${misses:-}" =~ ^[0-9]+$ || ! "${errors:-}" =~ ^[0-9]+$ ]]; then
                 echo "::error::Could not parse the complete in-container sccache receipt; refusing an unmeasured wheel build."
                 return 1
               fi
-              if (( hits == 0 )); then
-                echo "::error::Wheel target reused zero compiler objects; refusing a cold publication build."
+              if (( requests == 0 )); then
+                echo "::error::rustc never reached sccache (0 compile requests): RUSTC_WRAPPER is not bound, so this wheel was compiled outside the shared cache and nothing about it was measured."
                 return 1
               fi
               if (( errors != 0 )); then
                 echo "::error::Wheel target reported ${errors} cache error(s); refusing an incomplete warm-cache receipt."
                 return 1
               fi
-              echo "Measured warm wheel build: hits=${hits}, misses=${misses}, cache errors=0."
+              if (( hits == 0 )); then
+                echo "::notice::Cold wheel target: ${requests} compile request(s) went through sccache, ${misses} miss(es) written back, 0 reused. Correct but slow; this run seeds the cache for the next release."
+              else
+                echo "Measured warm wheel build: requests=${requests}, hits=${hits}, misses=${misses}, cache errors=0."
+              fi
             }
       - uses: actions/upload-artifact@v4
         with:
@@ -301,7 +366,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sccache --start-server
+          # Same bounded retry as the container jobs: the Actions cache answers
+          # a retryable 503 under egress pressure and a single attempt turned
+          # that into a lost release on 2026-09-02.
+          started=0
+          for attempt in 1 2 3 4 5; do
+            if sccache --start-server; then started=1; break; fi
+            echo "sccache --start-server failed (attempt ${attempt}/5)."
+            if (( attempt < 5 )); then sleep $(( attempt * 20 )); fi
+          done
+          if (( started == 0 )); then
+            echo "::error::sccache could not reach the shared cache backend after 5 attempts; refusing a wheel build with no compiler cache."
+            exit 1
+          fi
           echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
           sccache --show-stats
           sccache --zero-stats
@@ -324,22 +401,30 @@ jobs:
           set -euo pipefail
           stats=$(sccache --show-stats)
           printf '%s\n' "$stats"
+          # `Compile requests` counts every rustc invocation sccache brokered.
+          # `Compile requests executed` is a separate, longer line, so the exact
+          # field count pins the one meant here.
+          requests=$(awk 'NF == 3 && $1 == "Compile" && $2 == "requests" { print $3; exit }' <<< "$stats")
           hits=$(awk '$1 == "Cache" && $2 == "hits" { print $3; exit }' <<< "$stats")
           misses=$(awk '$1 == "Cache" && $2 == "misses" { print $3; exit }' <<< "$stats")
           errors=$(awk '$1 == "Cache" && ($2 == "errors" || $2 == "read" || $2 == "write") { total += $NF } END { print total + 0 }' <<< "$stats")
-          if [[ ! "${hits:-}" =~ ^[0-9]+$ || ! "${misses:-}" =~ ^[0-9]+$ || ! "${errors:-}" =~ ^[0-9]+$ ]]; then
+          if [[ ! "${requests:-}" =~ ^[0-9]+$ || ! "${hits:-}" =~ ^[0-9]+$ || ! "${misses:-}" =~ ^[0-9]+$ || ! "${errors:-}" =~ ^[0-9]+$ ]]; then
             echo "::error::Could not parse the complete sccache receipt; refusing an unmeasured wheel build."
             exit 1
           fi
-          if (( hits == 0 )); then
-            echo "::error::Wheel target reused zero compiler objects; refusing a cold publication build."
+          if (( requests == 0 )); then
+            echo "::error::rustc never reached sccache (0 compile requests): RUSTC_WRAPPER is not bound, so this wheel was compiled outside the shared cache and nothing about it was measured."
             exit 1
           fi
           if (( errors != 0 )); then
             echo "::error::Wheel target reported ${errors} cache error(s); refusing an incomplete warm-cache receipt."
             exit 1
           fi
-          echo "Measured warm wheel build: hits=${hits}, misses=${misses}, cache errors=0."
+          if (( hits == 0 )); then
+            echo "::notice::Cold wheel target: ${requests} compile request(s) went through sccache, ${misses} miss(es) written back, 0 reused. Correct but slow; this run seeds the cache for the next release."
+          else
+            echo "Measured warm wheel build: requests=${requests}, hits=${hits}, misses=${misses}, cache errors=0."
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.platform.target }}
@@ -369,8 +454,17 @@ jobs:
       - name: Require reachable shared compiler cache
         shell: pwsh
         run: |
-          sccache --start-server
-          if ($LASTEXITCODE -ne 0) { throw 'Shared sccache backend is unreachable; refusing a cold wheel build.' }
+          # Same bounded retry as the other lanes: the Actions cache answers a
+          # retryable 503 under egress pressure and a single attempt turned that
+          # into a lost release on 2026-09-02.
+          $started = $false
+          foreach ($attempt in 1..5) {
+            sccache --start-server
+            if ($LASTEXITCODE -eq 0) { $started = $true; break }
+            Write-Host "sccache --start-server failed (attempt $attempt/5)."
+            if ($attempt -lt 5) { Start-Sleep -Seconds ($attempt * 20) }
+          }
+          if (-not $started) { throw 'sccache could not reach the shared cache backend after 5 attempts; refusing a wheel build with no compiler cache.' }
           "RUSTC_WRAPPER=sccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           sccache --show-stats
           sccache --zero-stats
@@ -392,18 +486,27 @@ jobs:
         run: |
           $stats = (sccache --show-stats | Out-String)
           Write-Host $stats
+          # `Compile requests` counts every rustc invocation sccache brokered.
+          # `Compile requests executed` is a separate, longer line, and the
+          # anchored `\s+(\d+)\s*$` refuses to match it.
+          $requestMatch = [regex]::Match($stats, '(?m)^Compile requests\s+(\d+)\s*$')
           $hitMatch = [regex]::Match($stats, '(?m)^Cache hits\s+(\d+)\s*$')
           $missMatch = [regex]::Match($stats, '(?m)^Cache misses\s+(\d+)\s*$')
           $errorMatches = [regex]::Matches($stats, '(?m)^Cache (?:read |write )?errors\s+(\d+)\s*$')
-          if (-not $hitMatch.Success -or -not $missMatch.Success -or $errorMatches.Count -ne 3) {
+          if (-not $requestMatch.Success -or -not $hitMatch.Success -or -not $missMatch.Success -or $errorMatches.Count -ne 3) {
             throw 'Could not parse the complete sccache receipt; refusing an unmeasured wheel build.'
           }
+          $requests = [int]$requestMatch.Groups[1].Value
           $hits = [int]$hitMatch.Groups[1].Value
           $misses = [int]$missMatch.Groups[1].Value
           $errors = ($errorMatches | ForEach-Object { [int]$_.Groups[1].Value } | Measure-Object -Sum).Sum
-          if ($hits -eq 0) { throw 'Wheel target reused zero compiler objects; refusing a cold publication build.' }
+          if ($requests -eq 0) { throw 'rustc never reached sccache (0 compile requests): RUSTC_WRAPPER is not bound, so this wheel was compiled outside the shared cache and nothing about it was measured.' }
           if ($errors -ne 0) { throw "Wheel target reported $errors cache error(s); refusing an incomplete warm-cache receipt." }
-          Write-Host "Measured warm wheel build: hits=$hits, misses=$misses, cache errors=0."
+          if ($hits -eq 0) {
+            Write-Host "::notice::Cold wheel target: $requests compile request(s) went through sccache, $misses miss(es) written back, 0 reused. Correct but slow; this run seeds the cache for the next release."
+          } else {
+            Write-Host "Measured warm wheel build: requests=$requests, hits=$hits, misses=$misses, cache errors=0."
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-${{ matrix.target }}
