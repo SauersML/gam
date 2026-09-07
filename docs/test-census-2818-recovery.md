@@ -418,36 +418,87 @@ The remaining historical inventory is still open. A successful source census,
 or the restoration of these few contracts, does not establish that all 303
 historically deleted pinned identities have been recovered or retired.
 
-## Boundary backoff: #2695 — a reversal, not a loss
+## Boundary backoff: the #2695 contract was deliberately retired
 
-`a_clipped_step_stops_one_tolerance_short_of_the_face_2695` is absent, and it
-must stay absent. Its subject was not deleted by the sweep; it was **reversed by
-a later, documented decision**, so restoring the historical body would assert a
-contract production deliberately abandoned and would fail for the right reason
-in the wrong direction.
+The upstream retirement decision for
+`a_clipped_step_stops_one_tolerance_short_of_the_face_2695` remains in force.
+That test required a clipped step to stop one `PRIMAL_FEASIBILITY_TOL` before
+its blocking face, independently of the direction's length. Production later
+rejected that behavior: the retreat left the row outside the tighter active-face
+tolerance, preventing it from entering the working face.
 
-The test asserted that a clipped step stops one `PRIMAL_FEASIBILITY_TOL` short
-of its blocking face, and that the surviving margin does not depend on the
-direction's length. `apply_feasible_step_boundary_backoff` in
-`crates/gam-models/src/marginal_slope_shared.rs` now returns the clamped ratio
-unchanged, and its own doc comment names and rejects exactly that rule:
+The current `apply_feasible_step_boundary_backoff` in
+`crates/gam-models/src/marginal_slope_shared.rs` returns the clamped step ratio
+without a retreat. A clipped step lands on its blocking face; a direction that
+pushes out through an already-active row receives a zero feasible fraction and
+requires a projected direction, rather than another shortened step. The module
+documents both the former fractional retreat and the one-tolerance retreat as
+rejected policies.
 
-> any rule that stops the iterate short of the face — the old `0.995·α` [...]
-> and the one-tolerance retreat that replaced it (which parked the iterate at
-> scaled slack exactly `1e-8`, a hundred times outside the face tolerance) —
-> leaves the row permanently inactive.
-
-The replacement contract is stated in the same file and is live: a clipped step
-lands ON its blocking face so the row can enter the active-set working face, and
-a direction pointing into an already-active row gets `α = 0`, which the caller
-answers with a projection rather than a shorter step. Two tests beside it
-exercise the surviving rule —
+The surviving checks
 `feasible_step_fraction_refuses_a_non_finite_direction_2721` and
-`feasible_step_fraction_admits_a_sub_tolerance_drift_off_an_active_row` — and
-both carry their own positive controls. The `unit_box` fixture the historical
-test used is still present in that module, so this retirement is not a
-restorability failure.
+`feasible_step_fraction_admits_a_sub_tolerance_drift_off_an_active_row` exercise
+the current behavior with positive controls. The old `unit_box` fixture remains
+available, so the missing historical test is not explained by a missing helper.
+Its status is **retired**, not recovered: reintroducing its original assertion
+would require the obsolete acceptance rule to return. This preserves the
+explicit semantic retirement previously recorded on main.
 
-Recorded as retired, not recovered. This is a distinct category from the pins in
-the sections above: those had surviving subjects and were rebuilt; this one has
-a subject that production repudiated.
+## Current acceptance recovery: September 7
+
+A fresh MSI source walk of `crates`, `tests`, and `src` used the census's Rust
+lexer on the current working tree. After adding the four structural-coordinate
+pins and the Trace consumer pin below, **243 of the 303 historical identities
+were absent across 106 historical source paths**. The earlier count of 248
+predated these five declarations. This is a working-source observation, not an
+immutable commit census or evidence that those declarations executed.
+
+| Historical contract | Current production acceptance seam | Evidence and remaining work |
+| --- | --- | --- |
+| Four structural-coordinate #2748 pins in canonicalization | External `gam-identifiability` integration target `structural_coordinates_2748` calls `canonicalize_for_identifiability_with_operating_scalars`, with declared spanning/structural coordinates. | **4 passed.** Tests check priority-directed dimension reduction, structural coefficient preservation, independent reduction of another block, and refusal of a wrong-length coordinate list. |
+| Four measured-span #2612 pins | External `gam-solve` target `measured_span_2612` calls `under_identified_subspace_in_metric` with explicit identity or congruent shear metrics. | **4 passed in 0.022 seconds**, after a 3.70-second warm build. Tests check the strict one-observation boundary, empty bounded span, disagreement with the penalty kernel in both directions, and physical-span preservation under both signs of a nonorthogonal shear. A wrong-metric control must change the selected dimension. |
+| `softmax_trace_whitening_prefold_matches_dense_adjoint_2333` and the four later deflation-fold checks | `construction_row_jet_logdet_channels::tests_trace_whitening_2333` exercises the live Trace consumer and production deflation contraction. | **5 passed in 0.05 seconds.** The first consumer run correctly failed its branch-activation assertion because the cold fixture had no spectral deflation. The revised state has one exactly saturated softmax row, which supplies a genuine null logit direction; the other rows retain both live atoms. The consumer records one spectrally deflated row. |
+| `fully_degenerate_cluster_diagonalizes_direct_e_diag_2267`, `nearly_degenerate_distinct_spectrum_preserves_eigenpairs_2515` | `exact_pencil::pencil_tests`, reached through production pencil pricing. | The original helper-only tests moved to determinant/gradient and eigenpair checks on the actual production pencil. The obsolete `cluster_stable_eigh` helper was removed. These are explicit contract moves, not disappearance based on private symbol reachability. |
+| Five historical cofit #2023 pins | Active `tiered::fit_tiered` versus the former `cofit_arrow` and `sparse_dict::cofit` bridges. | **Unresolved.** The old modules retain configuration/report types but no callable producer. Nearby tiered-fit tests do not by themselves establish the former no-op fixed-point, quality comparison, or insufficient-round refusal contracts. |
+| Three co-collapse #2280 pins | `LocalAtlas` patch geometry and topology readout. | **Unresolved.** Transition-composition tests do not replace duplicate-chart detection. The current topology investigation separately compares the full membership nerve against transition-backed edges and localizes actual H1 representatives. |
+| Solved-mode response #2765 and terminal exact-curvature scheduling #979 | Current survival marginal-slope mode response and spatial outer driver. | **Unresolved.** A doc-comment-only historical test file is not coverage; local Hessian derivatives do not establish a fitted mode's response, and an outer-Hessian check does not establish terminal scheduling. |
+
+The four Trace fold checks passed within a **12-test run: 10 passed, 2 failed**,
+in **0.187 seconds**, logged at
+`bench/measurements/issue_triage_20260907/sae-focused.log`. The other failure was
+the separately tracked #2825 epoch-quality acceptance. This run used the current
+MSI working source, including preexisting and newly authored changes; it does
+not certify a published commit or the failing Trace consumer. The fold checks
+span every symmetric derivative basis direction, require a nonzero correction,
+and cover gauge-only, unit-deflated, floor-clamped, and degenerate split spectra.
+
+The subsequent fresh Trace binary passed all five tests on one CPU. The dense
+joint-versus-Trace maximum gap was **2.55440113505756e-12** and the coordinate
+gap **3.979039320256561e-13**, against adjoint magnitude **199.93419830762554**.
+Both use the unchanged `1e-12 * (1 + magnitude)` bar; repeated joint results
+must be bit-identical. Log: `bench/measurements/issue_triage_20260907/trace-cached.log`.
+The fresh SAE test build used 16 code-generation units and eight assigned CPUs,
+finishing in 79 seconds; reusable nextest metadata allows subsequent tests to
+run from that executable without recompilation.
+
+The four measured-span checks are recorded in
+`bench/measurements/issue_triage_20260907/measured-span-focused.log`, with executed
+test-source SHA-256
+`5255905baa6554012eec8cbed4343b6a8106c34a09d64e0fbe21cd299d4ee35b`.
+The structural-coordinate source SHA-256 is
+`474f2d6431035e3d24d4b8d0c083504f6677cbaa5cba4a958b3cf2588bf87ecf`;
+its four passes occur in `bench/measurements/issue_triage_20260907/public-api-focused.log`.
+That six-test run also had one public API fixture failure: its expected
+unridged least-squares coefficients omitted the solver's declared fixed
+stabilization ridge. The corrected public API target uses already standardized,
+orthogonal columns and checks the exact equations
+`(6 + 1e-8) beta = [12, 18]` at a stricter `1e-12` bar. Both of its tests then
+passed in `bench/measurements/issue_triage_20260907/public-api-final.log`.
+
+The largest still-unmapped numerical groups include twelve historical exact-A
+#2515 checks, eight logdet-adjoint #2156/#2144/#2330/#2712 checks, seven curved
+co-collapse #2027/#2132/#2082 checks, and nine outer-curvature invariance
+#2676/#2748 checks. Their recorded historical names remain in
+`test-census-2818-inventory.json`. A nearby test or closed issue is insufficient
+to retire any of them: each requires a comparison of the exercised current
+criterion, derivative, or acceptance decision and an executed replacement.
