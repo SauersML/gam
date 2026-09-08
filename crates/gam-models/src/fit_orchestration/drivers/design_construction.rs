@@ -17,11 +17,16 @@ pub fn build_term_collection_designs_joint(
         .map(|spec| spec.smooth_terms.clone())
         .collect::<Vec<_>>();
     let planned_blocks = plan_joint_spatial_centers_for_term_blocks(data, &smooth_blocks)?;
+    let policy = gam_runtime::resource::ResourcePolicy::default_library();
     let mut out = Vec::with_capacity(specs.len());
     for (spec, planned_terms) in specs.iter().zip(planned_blocks.into_iter()) {
         let mut planned_spec = spec.clone();
         planned_spec.smooth_terms = planned_terms;
-        out.push(build_term_collection_design_inner(data, &planned_spec)?);
+        out.push(build_planned_term_collection_design_inner_with_policy(
+            data,
+            &planned_spec,
+            &policy,
+        )?);
     }
     Ok(out)
 }
