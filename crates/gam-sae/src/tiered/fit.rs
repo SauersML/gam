@@ -79,9 +79,10 @@ pub enum TieredSeedPolicy {
 }
 
 impl TieredSeedPolicy {
-    /// Resolve to a concrete [`BlockSeedPolicy`] for a corpus of `n` rows and the
-    /// Tier-1 block geometry (`G` blocks of size `b` in `ℝ^P`).
-    fn resolve(self, _n: usize, _p: usize, _config: &BlockSparseConfig) -> BlockSeedPolicy {
+    /// Resolve to a concrete [`BlockSeedPolicy`]. Since #2023 the choice no
+    /// longer depends on the corpus size or the block geometry: `Auto` is the
+    /// data-row seed at every width.
+    fn resolve(self) -> BlockSeedPolicy {
         match self {
             TieredSeedPolicy::Auto => BlockSeedPolicy::DataRows,
             TieredSeedPolicy::FarthestPoint => BlockSeedPolicy::FarthestPoint,
@@ -402,7 +403,7 @@ pub fn fit_linear_peel(
     // skips the serial O(N·P·K) farthest-point pass (the large-K entry, #2023).
     let seed_policy = config
         .tier1_seed
-        .resolve(r0_f32.nrows(), r0_f32.ncols(), &config.tier1);
+        .resolve();
     let tier1 = fit_block_sparse_dictionary_with_seed(r0_f32.view(), &config.tier1, seed_policy)?;
 
     let (n_obs, output_dim) = r0.dim();
@@ -1341,12 +1342,12 @@ mod fit_tests {
     fn auto_seed_is_scalable_and_data_placed_at_every_width_2023() {
         let small = TieredFitConfig::linear_bulk(8, 2);
         assert_eq!(
-            small.tier1_seed.resolve(240, 16, &small.tier1),
+            small.tier1_seed.resolve(),
             BlockSeedPolicy::DataRows
         );
         let large = TieredFitConfig::linear_bulk(2_500, 4);
         assert_eq!(
-            large.tier1_seed.resolve(100_000, 64, &large.tier1),
+            large.tier1_seed.resolve(),
             BlockSeedPolicy::DataRows,
             "large-K tiered fit must remain data-placed"
         );
@@ -1354,12 +1355,12 @@ mod fit_tests {
         let mut forced = TieredFitConfig::linear_bulk(2_500, 4);
         forced.tier1_seed = TieredSeedPolicy::FarthestPoint;
         assert_eq!(
-            forced.tier1_seed.resolve(100_000, 64, &forced.tier1),
+            forced.tier1_seed.resolve(),
             BlockSeedPolicy::FarthestPoint
         );
         forced.tier1_seed = TieredSeedPolicy::CoordinatePartition;
         assert_eq!(
-            forced.tier1_seed.resolve(240, 16, &forced.tier1),
+            forced.tier1_seed.resolve(),
             BlockSeedPolicy::CoordinatePartition
         );
     }
