@@ -102,6 +102,22 @@ fail-fast = false
 failure-output = "immediate-final"
 success-output = "never"
 
+# The #1082 acceptance population retains the original issue's 360-second
+# per-test limit. Run serially so competing test processes do not contaminate
+# the wall-clock measurement; the individual fit may still use its Rayon pool.
+[profile.issue-1082]
+default-filter = 'test(/quality_vs_(inla_tensor_product_spde|mgcv_poisson_badhealth_doctor_visits|mgcv_tensor_te_2d_(negbin|gaussian|poisson)|mgcv_torus_tensor_cc_cc|mgcv_nottem_cyclic|pygam_pspline|pygam_poisson_2d_shape|vgam_multinomial_smooth_by_factor|scoringrules_pit_gaussian_location_scale|mgcv_confidence_interval_gaussian_(coverage_90|logistic_link)|mgcv_gaulss_tensor|lifelines_competing_risks_cif|lifelines_cox_like_marginal|synthetic_frailty_hazard_multiplier_likelihood|vgam_beta_logistic_link_parameterization)::/) or test(/(perf_1082_outer_loop_repro|owed_1082_reml)::/) or binary(quality_multinomial_penguins_2612)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+test-threads = 1
+fail-fast = false
+status-level = "pass"
+final-status-level = "all"
+success-output = "final"
+failure-output = "immediate-final"
+
+[profile.issue-1082.junit]
+path = "issue-1082.xml"
+
 # #1082: the two high-frequency 2D tensor recovery probes
 # (`hifreq_tensor_k8`/`hifreq_tensor_k10` in the `quality` binary) fit a
 # `te(theta, h, bc=['periodic','natural'], k=2k+4)` of coefficient dimension
