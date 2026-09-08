@@ -1970,7 +1970,7 @@ pub fn steer_rows_unit_speed(
     let mut step = Array1::<f64>::zeros(1);
     for (out_row, &row) in rows.iter().enumerate() {
         step[0] = raw_steps[out_row];
-        let field = model.steer_rows(atom_k, &[row], step.view())?;
+        let field = model.steer_rows_raw(atom_k, &[row], step.view())?;
         for c in 0..p {
             delta[[out_row, c]] = field[[0, c]];
         }
