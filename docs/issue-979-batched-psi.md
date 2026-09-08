@@ -38,3 +38,21 @@ All three final checks pass in 0.92 seconds. The warm model test build took
 
 The issue remains open pending completed larger binary and survival fits,
 remaining derivative publication, and full performance and interface validation.
+
+## Full-fit follow-up
+
+The rebuilt example (warm build 2m29s) ran `repro979_margslope 1500 12 1`
+under a 30-second diagnostic cap. Spatial gradient assembly now takes
+`0.062s` in representative late evaluations, versus `0.395–0.409s` in the
+previous trace. Complete value-and-gradient evaluations take `0.229–0.261s`,
+versus `0.663–0.692s` previously. These are trace comparisons, not paired
+complete-fit timings.
+
+The fit still exits at the diagnostic cap (`124`). It reaches outer evaluation
+39, with gradient norm `2.222e-2`; the subsequent dense outer-Hessian evaluation
+takes `3.519s` (the containing criterion call takes `3.917s`). This identifies
+the next remaining cost rather than establishing convergence. Warm inner solves
+at that point converge in two cycles, with residual `6.538e-11`.
+
+Log: `codex979-batched-binary1500-c12.log` in the same MSI log directory.
+The diagnostic process terminated and no owned build or fit remains running.
