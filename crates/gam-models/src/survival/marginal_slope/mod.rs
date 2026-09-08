@@ -150,6 +150,8 @@ mod psi_terms;
 mod psi_terms_fd_tests;
 mod pullback;
 pub(crate) mod row_kernel;
+mod information_third;
+mod information_third_dynamic;
 mod row_math;
 pub(crate) mod slope_geometry;
 mod spec;

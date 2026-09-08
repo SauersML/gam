@@ -163,10 +163,7 @@ fn beta_ascending_series(x: f64, a: f64, b: f64) -> Option<(f64, f64)> {
 /// implementation receives a representable argument and remains the canonical
 /// general evaluator.
 fn regularized_beta_lower_from_log_x(log_x: f64, a: f64, b: f64) -> f64 {
-    if !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0)
-        || log_x.is_nan()
-        || log_x > 0.0
-    {
+    if !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) || log_x.is_nan() || log_x > 0.0 {
         return f64::NAN;
     }
     if log_x == 0.0 {
@@ -303,10 +300,7 @@ pub fn normal_two_sided_probability(z: f64) -> f64 {
 /// `NaN`; infinite statistics map to the exact limiting probability zero.
 pub fn student_t_two_sided_probability(t: f64, degrees_of_freedom: f64) -> f64 {
     let half_df = 0.5 * degrees_of_freedom;
-    if t.is_nan()
-        || !(degrees_of_freedom.is_finite()
-            && degrees_of_freedom > 0.0
-            && half_df > 0.0)
+    if t.is_nan() || !(degrees_of_freedom.is_finite() && degrees_of_freedom > 0.0 && half_df > 0.0)
     {
         return f64::NAN;
     }
@@ -327,9 +321,7 @@ pub fn chi_square_sf(statistic: f64, degrees_of_freedom: f64) -> f64 {
     let half_df = 0.5 * degrees_of_freedom;
     if statistic.is_nan()
         || statistic < 0.0
-        || !(degrees_of_freedom.is_finite()
-            && degrees_of_freedom > 0.0
-            && half_df > 0.0)
+        || !(degrees_of_freedom.is_finite() && degrees_of_freedom > 0.0 && half_df > 0.0)
     {
         return f64::NAN;
     }
@@ -647,11 +639,7 @@ fn imhof_amplitude_bound(terms: &[WeightedChiSquareTerm], u: f64) -> Option<f64>
 /// rate is a small truncation point, which is the cheap end.
 pub const IMHOF_MAX_PANELS: usize = 1 << 21;
 
-fn imhof_survival(
-    terms: &[WeightedChiSquareTerm],
-    statistic: f64,
-    tolerance: f64,
-) -> (f64, f64) {
+fn imhof_survival(terms: &[WeightedChiSquareTerm], statistic: f64, tolerance: f64) -> (f64, f64) {
     // A panel has to resolve the WHOLE phase, not just the `−xu/2` half. The
     // total phase rate is bounded by `|θ'(u)| = |φ'(u) − x/2| ≤ (Σ h_j|w_j| +
     // |x|)/2` — `|φ'|` is largest at the origin, where it is `½ Σ h_j|w_j|` —
@@ -696,8 +684,7 @@ fn imhof_survival(
         // Whichever is available and smaller is the certified accuracy.
         bound = imhof_amplitude_bound(terms, lower).unwrap_or(f64::INFINITY);
         if statistic > 0.0 && imhof_phase_slack(terms, lower) <= 0.25 * statistic {
-            let oscillatory =
-                16.0 / (statistic * lower * imhof_log_rho(terms, lower).exp());
+            let oscillatory = 16.0 / (statistic * lower * imhof_log_rho(terms, lower).exp());
             bound = bound.min(oscillatory);
         }
         if bound <= tolerance {
@@ -743,8 +730,8 @@ pub fn fisher_snedecor_sf(
         return 0.0;
     }
 
-    let log_ratio = numerator_degrees_of_freedom.ln() + statistic.ln()
-        - denominator_degrees_of_freedom.ln();
+    let log_ratio =
+        numerator_degrees_of_freedom.ln() + statistic.ln() - denominator_degrees_of_freedom.ln();
     let log_x = log_reciprocal_one_plus_exp(log_ratio);
     regularized_beta_lower_from_log_x(log_x, beta_a, beta_b)
 }
@@ -878,8 +865,7 @@ pub fn exact_binary64_sum_sign(
 
         let mut word = shift / 64;
         let offset = shift % 64;
-        let (low_sum, low_carry) =
-            accumulator[word].overflowing_add(significand << offset);
+        let (low_sum, low_carry) = accumulator[word].overflowing_add(significand << offset);
         accumulator[word] = low_sum;
         word += 1;
 
@@ -1030,8 +1016,7 @@ pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
     // decides from the operation count, rather than from a fitted threshold,
     // whether the linear-domain residual has a trustworthy sign and magnitude.
     // Below the bound, retain the input-log separation in the log-domain branch.
-    let direct_error_bound =
-        (finite_term_count as f64 + 2.0) * f64::EPSILON * absolute_scaled_sum;
+    let direct_error_bound = (finite_term_count as f64 + 2.0) * f64::EPSILON * absolute_scaled_sum;
     if signed_scaled_sum.abs() > direct_error_bound {
         return (
             common_max + signed_scaled_sum.abs().ln(),
@@ -1382,6 +1367,67 @@ fn normal_logcdf_derivatives_right_tail(x: f64) -> [f64; 5] {
         &[-1.0, -1.0, -1.0, -1.0],
     );
     [log_cdf, first, second, third, fourth]
+}
+
+/// Value and five derivatives of `log Φ`, including the fifth-order information
+/// drift needed by a Jeffreys-augmented outer Hessian. The existing order-four
+/// hot path does not pay for the additional derivative.
+pub fn normal_logcdf_derivatives_through_fifth(x: f64) -> [f64; 6] {
+    let d = normal_logcdf_derivatives(x);
+    let fifth = if x.is_nan() {
+        f64::NAN
+    } else if x.is_infinite() {
+        0.0
+    } else if x <= LEFT_CONTINUED_FRACTION_SWITCH {
+        // Carry q'''' through the same positive Laplace continued fraction.
+        // Differentiating λ=-x+q(-x) four times leaves q''''; recovering it
+        // from λ's recurrence would cancel its entire deep-tail signal.
+        let t = -x;
+        let mut q = [0.0_f64; 5];
+        // At the worst endpoint t=4 the same 64 levels as the order-four
+        // path leave 1.94e-17 relative truncation error in q'''' (100-digit
+        // reference); deeper in the tail convergence is faster.
+        for n in (1..=64).rev() {
+            let inverse = (t + q[0]).recip();
+            let value = f64::from(n) * inverse;
+            let a = (1.0 + q[1]) * inverse;
+            let b = q[2] * inverse;
+            let c = q[3] * inverse;
+            let e = q[4] * inverse;
+            q = [
+                value,
+                -value * a,
+                value * (2.0 * a * a - b),
+                value * (-6.0 * a * a * a + 6.0 * a * b - c),
+                value * (24.0 * a.powi(4) - 36.0 * a * a * b + 6.0 * b * b + 8.0 * a * c - e),
+            ];
+        }
+        q[4]
+    } else if x >= 8.0 {
+        // Hermite/Mills polynomial in signed log magnitude: the leading
+        // x^4 φ(x) can still be representable when φ itself underflows.
+        let log_lambda = -0.5 * x * x - 0.5 * (2.0 * std::f64::consts::PI).ln() - d[0];
+        let log_x = x.ln();
+        let inverse_x2 = x.recip().powi(2);
+        signed_exp_sum(
+            &[
+                4.0 * log_x + (-6.0 * inverse_x2 + 3.0 * inverse_x2.powi(2)).ln_1p() + log_lambda,
+                15.0_f64.ln()
+                    + 3.0 * log_x
+                    + (-(5.0 / 3.0) * inverse_x2).ln_1p()
+                    + 2.0 * log_lambda,
+                50.0_f64.ln() + 2.0 * log_x + (-0.4 * inverse_x2).ln_1p() + 3.0 * log_lambda,
+                60.0_f64.ln() + log_x + 4.0 * log_lambda,
+                24.0_f64.ln() + 5.0 * log_lambda,
+            ],
+            &[1.0; 5],
+        )
+    } else {
+        // λ'=-xλ-λ²; its third derivative gives λ'''' without a new
+        // special-function evaluation.
+        -(x + 2.0 * d[1]) * d[4] - 3.0 * d[3] - 6.0 * d[2] * d[3]
+    };
+    [d[0], d[1], d[2], d[3], d[4], fifth]
 }
 
 #[inline]
@@ -1772,10 +1818,7 @@ mod tests {
         assert!(chi_square_sf(1.0, 0.0).is_nan());
 
         assert_eq!(fisher_snedecor_sf(0.0, 3.0, 20.0), 1.0);
-        assert_eq!(
-            fisher_snedecor_sf(f64::INFINITY, 3.0, 20.0),
-            0.0
-        );
+        assert_eq!(fisher_snedecor_sf(f64::INFINITY, 3.0, 20.0), 0.0);
         assert!(fisher_snedecor_sf(-1.0, 3.0, 20.0).is_nan());
         assert!(fisher_snedecor_sf(1.0, 0.0, 20.0).is_nan());
         assert!(fisher_snedecor_sf(1.0, 3.0, 0.0).is_nan());
@@ -2326,12 +2369,7 @@ mod tests {
         let half_upper_ulp_at_one = 2.0_f64.powi(-53);
         let least_subnormal = f64::from_bits(1);
         assert_eq!(
-            exact_binary64_sum_sign([
-                1.0,
-                half_upper_ulp_at_one,
-                -1.0,
-                -half_upper_ulp_at_one,
-            ]),
+            exact_binary64_sum_sign([1.0, half_upper_ulp_at_one, -1.0, -half_upper_ulp_at_one,]),
             Ok(std::cmp::Ordering::Equal),
             "an exact rounding midpoint must compare equal"
         );
@@ -2370,9 +2408,7 @@ mod tests {
             Err(ExactBinary64SumSignError::NonFiniteTerm { index: 1 }),
         );
         assert_eq!(
-            exact_binary64_sum_sign(
-                std::iter::repeat_n(1.0, EXACT_BINARY64_SUM_MAX_TERMS + 1)
-            ),
+            exact_binary64_sum_sign(std::iter::repeat_n(1.0, EXACT_BINARY64_SUM_MAX_TERMS + 1)),
             Err(ExactBinary64SumSignError::TermCapacityExceeded {
                 maximum: EXACT_BINARY64_SUM_MAX_TERMS,
             }),
@@ -2648,6 +2684,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn normal_logcdf_fifth_matches_fourth_derivative() {
+        for x in [
+            -100.0_f64, -20.0, -8.0, -4.1, -2.0, 0.0, 2.0, 7.9, 8.1, 20.0,
+        ] {
+            let h = 1.0e-4;
+            let left = normal_logcdf_derivatives(x - h)[4];
+            let right = normal_logcdf_derivatives(x + h)[4];
+            let fd = (right - left) / (2.0 * h);
+            let exact = normal_logcdf_derivatives_through_fifth(x)[5];
+            let relative = (fd - exact).abs() / exact.abs().max(1.0e-300);
+            assert!(
+                relative < 3.0e-5,
+                "x={x}: fifth={exact:e} fd={fd:e} relative={relative:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_logcdf_fifth_matches_high_precision_reference_979() {
+        // mpmath 1.3, 100 decimal digits, independently differentiating
+        // log(erfc(-x/sqrt(2))/2) five times on MSI. Includes both tails and
+        // both sign changes of the fifth derivative.
+        for (x, reference) in [
+            (-100.0, 2.3928167627876771971e-9_f64),
+            (-20.0, 6.9685881515844515659e-6),
+            (-8.0, 4.8206401646485407099e-4),
+            (-4.0, 6.2527728381299791162e-3),
+            (-2.0, 2.9098988655348833645e-2),
+            (0.0, -4.4376884626178209889e-3),
+            (2.0, -3.1091902195183746598e-2),
+            (8.0, 1.8769187075339757456e-11),
+            (20.0, 8.7011802472146515797e-83),
+        ] {
+            let actual = normal_logcdf_derivatives_through_fifth(x)[5];
+            let relative = (actual - reference).abs() / reference.abs();
+            assert!(
+                relative < 2.0e-10,
+                "x={x}: fifth={actual:e}, reference={reference:e}, relative={relative:e}"
+            );
+        }
+        // At x=38.6 the density has underflowed, but x^4*phi(x) has not.
+        // A 400-digit reference verifies the signed-log tail calculation keeps
+        // the fifth derivative representable (allow four subnormal ulps).
+        let actual = normal_logcdf_derivatives_through_fifth(38.6)[5];
+        let reference = 2.5398281413501576417e-318;
+        assert!(actual > 0.0);
+        assert!((actual - reference).abs() <= 4.0 * f64::from_bits(1));
     }
 
     /// Absolute-accuracy pin of the full `ln Φ(x)` derivative tower against an
@@ -3129,5 +3215,4 @@ mod signed_weighted_chi_square_tests {
         }
         println!("worst discretization error against the fine-panel reference: {worst:.3e}");
     }
-
 }

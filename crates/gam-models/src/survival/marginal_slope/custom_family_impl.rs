@@ -323,8 +323,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             }));
         }
         in_slope_frame!(self, P, Frame, {
-            let kern =
-                SurvivalMarginalSlopeRowKernel::<P, Frame>::new(self.clone(), block_states.to_vec());
+            let kern = SurvivalMarginalSlopeRowKernel::<P, Frame>::new(
+                self.clone(),
+                block_states.to_vec(),
+            );
             let rows = crate::row_kernel::RowSet::All;
             let cache = build_row_kernel_cache(&kern, &rows)?;
             Ok(Some(ExactNewtonJointGradientEvaluation {
@@ -359,10 +361,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                     self.clone(),
                     block_states.to_vec(),
                 );
-                Ok(Some(
-                    Arc::new(RowKernelHessianWorkspace::new(kern)?)
-                        as Arc<dyn ExactNewtonJointHessianWorkspace>,
-                ))
+                Ok(Some(Arc::new(RowKernelHessianWorkspace::new(kern)?)
+                    as Arc<dyn ExactNewtonJointHessianWorkspace>))
             });
         }
         Ok(Some(Arc::new(
@@ -401,8 +401,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                     block_states.to_vec(),
                 );
                 let rows = crate::row_kernel::row_set_from_options(options, self.n);
-                Ok(Some(Arc::new(RowKernelHessianWorkspace::with_rows(kern, rows)?)
-                    as Arc<dyn ExactNewtonJointHessianWorkspace>))
+                Ok(Some(
+                    Arc::new(RowKernelHessianWorkspace::with_rows(kern, rows)?)
+                        as Arc<dyn ExactNewtonJointHessianWorkspace>,
+                ))
             });
         }
         // Flex / timewiggle path. This workspace is constructed by the INNER
@@ -458,10 +460,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         !self.per_z_slope_active() && parameter_block_specs_match_rows(specs, self.n)
     }
 
-    fn inner_joint_workspace_log_likelihood_available(
-        &self,
-        specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // Exact twin of the gradient capability above. The first trust attempt
         // may read the workspace's cached scalar likelihood for its acceptance
         // test and retain the same workspace for the post-accept gradient.
@@ -511,8 +510,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         }
         let sl = d_beta_flat.as_slice().ok_or("non-contiguous d_beta")?;
         in_slope_frame!(self, P, Frame, {
-            let kern =
-                SurvivalMarginalSlopeRowKernel::<P, Frame>::new(self.clone(), block_states.to_vec());
+            let kern = SurvivalMarginalSlopeRowKernel::<P, Frame>::new(
+                self.clone(),
+                block_states.to_vec(),
+            );
             crate::row_kernel::row_kernel_directional_derivative(
                 &kern,
                 &crate::row_kernel::RowSet::All,
@@ -561,8 +562,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         let su = d_beta_u_flat.as_slice().ok_or("non-contiguous d_beta_u")?;
         let sv = d_beta_v_flat.as_slice().ok_or("non-contiguous d_beta_v")?;
         in_slope_frame!(self, P, Frame, {
-            let kern =
-                SurvivalMarginalSlopeRowKernel::<P, Frame>::new(self.clone(), block_states.to_vec());
+            let kern = SurvivalMarginalSlopeRowKernel::<P, Frame>::new(
+                self.clone(),
+                block_states.to_vec(),
+            );
             crate::row_kernel::row_kernel_second_directional_derivative(
                 &kern,
                 &crate::row_kernel::RowSet::All,
@@ -719,6 +722,35 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         Ok(Some(axes))
     }
 
+    fn joint_jeffreys_information_third_directional_all_axes_with_specs(
+        &self,
+        states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        u: &Array1<f64>,
+        v: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != states.len() {
+            return Err("survival third information derivative block count mismatch".into());
+        }
+        if self.per_z_slope_active()
+            || self.effective_flex_active(states)?
+            || self.flex_timewiggle_active()
+        {
+            return Ok(None);
+        }
+        in_slope_frame!(self, P, Frame, {
+            let kernel =
+                SurvivalMarginalSlopeRowKernel::<P, Frame>::new(self.clone(), states.to_vec());
+            kernel
+                .third_information_all_axes(
+                    u.as_slice()
+                        .ok_or("non-contiguous third information direction u")?,
+                    v.as_slice()
+                        .ok_or("non-contiguous third information direction v")?,
+                )
+                .map(Some)
+        })
+    }
 
     /// gam#979 wide-p Jeffreys completion: `∇²_β tr(W · H(β))` for a
     /// caller-supplied full-joint trace weight `W`, in ONE `O(n · p_block²)`
@@ -752,8 +784,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             return Ok(None);
         }
         in_slope_frame!(self, P, Frame, {
-            let kern =
-                SurvivalMarginalSlopeRowKernel::<P, Frame>::new(self.clone(), block_states.to_vec());
+            let kern = SurvivalMarginalSlopeRowKernel::<P, Frame>::new(
+                self.clone(),
+                block_states.to_vec(),
+            );
             kern.contracted_trace_hessian(weight).map(Some)
         })
     }
@@ -870,12 +904,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         // every other axis (log-sigma, baseline) and the flex frames keep the
         // per-axis sweep the batched path declines with `None`.
         if self.family_hyper_role(hyper_layout, psi_index)?.is_none()
-            && let Some(axes) = self.psi_hessian_directional_derivatives_all_beta_axes_with_options(
-                block_states,
-                hyper_layout.design_derivative_blocks(),
-                psi_index,
-                &BlockwiseFitOptions::default(),
-            )?
+            && let Some(axes) = self
+                .psi_hessian_directional_derivatives_all_beta_axes_with_options(
+                    block_states,
+                    hyper_layout.design_derivative_blocks(),
+                    psi_index,
+                    &BlockwiseFitOptions::default(),
+                )?
         {
             return Ok(Some(axes));
         }
