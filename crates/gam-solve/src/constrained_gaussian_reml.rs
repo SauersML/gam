@@ -23,10 +23,10 @@ use crate::gaussian_reml::{
     GaussianRemlBackwardResult, gaussian_reml_multi_closed_form_with_cache,
 };
 use faer::Side;
-use gam_linalg::matrix::symmetrize_in_place;
 use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, default_rrqr_rank_alpha, rrqr_nullspace_basis, rrqr_with_permutation,
 };
+use gam_linalg::matrix::symmetrize_in_place;
 use gam_problem::LinearInequalityConstraints;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use opt::{Bfgs, Bounds, FirstOrderSample, FusedObjective, GradientTolerance, ObjectiveEvalError};
@@ -95,10 +95,17 @@ struct AffineFaceProfile {
     weights: Array1<f64>,
     face: ActiveFace,
     beta_particular: Array2<f64>,
-    tangent_gram: Array2<f64>,
     tangent_penalty: Array2<f64>,
     tangent_rhs_data: Array2<f64>,
     tangent_penalty_particular: Array2<f64>,
+    /// Columns `G^{-1/2} U`, where `U` diagonalizes the Gram-whitened
+    /// tangent penalty.  Keeping the solve in these coordinates avoids ever
+    /// forming `G + lambda S`, which loses definiteness when `S` is singular
+    /// and `lambda` is large.
+    tangent_solve_basis: Array2<f64>,
+    tangent_penalty_eigenvalues: Array1<f64>,
+    tangent_gram_logdet: f64,
+    penalty_root: Array2<f64>,
     penalty_rank: usize,
     penalty_logdet: f64,
     residual_df: f64,
@@ -404,9 +411,13 @@ impl AffineFaceProfile {
         let weighted_base_response = &base_response * &weights.view().insert_axis(Axis(1));
         let tangent_rhs_data = tangent_design.t().dot(&weighted_base_response);
         let tangent_penalty_particular = face.z.t().dot(&penalty).dot(&beta_particular);
+        let (tangent_solve_basis, tangent_penalty_eigenvalues, tangent_gram_logdet) =
+            whitened_tangent_geometry(&tangent_gram, &tangent_penalty)?;
         let penalty_geometry = tangent_penalty_geometry(&tangent_penalty)?;
         let penalty_rank = penalty_geometry.rank;
         let penalty_logdet = penalty_geometry.logdet;
+        let penalty_root =
+            positive_semidefinite_root(penalty, "constrained Gaussian REML penalty")?;
         let n_effective = weights.iter().filter(|&&value| value > 0.0).count();
         let penalty_nullity = face.z.ncols().saturating_sub(penalty_rank);
         if n_effective <= penalty_nullity {
@@ -421,10 +432,13 @@ impl AffineFaceProfile {
             weights: weights.to_owned(),
             face,
             beta_particular,
-            tangent_gram,
             tangent_penalty,
             tangent_rhs_data,
             tangent_penalty_particular,
+            tangent_solve_basis,
+            tangent_penalty_eigenvalues,
+            tangent_gram_logdet,
+            penalty_root,
             penalty_rank,
             penalty_logdet,
             residual_df: (n_effective - penalty_nullity) as f64,
@@ -438,14 +452,22 @@ impl AffineFaceProfile {
         let (gamma, inverse, logdet_h) = if tangent_dim == 0 {
             (Array2::zeros((0, 1)), Array2::zeros((0, 0)), 0.0)
         } else {
-            let hessian = &self.tangent_gram + &(self.tangent_penalty.clone() * lambda);
-            let factor = hessian
-                .cholesky(Side::Lower)
-                .map_err(EstimationError::LinearSystemSolveFailed)?;
             let rhs = &self.tangent_rhs_data - &(self.tangent_penalty_particular.clone() * lambda);
-            let gamma = factor.solve_mat(&rhs);
-            let inverse = factor.solve_mat(&Array2::<f64>::eye(tangent_dim));
-            let logdet_h = 2.0 * factor.diag().iter().map(|value| value.ln()).sum::<f64>();
+            let denominators = self
+                .tangent_penalty_eigenvalues
+                .mapv(|value| 1.0 + lambda * value);
+            let scaled_basis = &self.tangent_solve_basis
+                * &denominators
+                    .mapv(|value| value.recip())
+                    .insert_axis(Axis(0));
+            let inverse = scaled_basis.dot(&self.tangent_solve_basis.t());
+            let gamma = inverse.dot(&rhs);
+            let logdet_h = self.tangent_gram_logdet
+                + self
+                    .tangent_penalty_eigenvalues
+                    .iter()
+                    .map(|value| (lambda * value).ln_1p())
+                    .sum::<f64>();
             (gamma, inverse, logdet_h)
         };
         let beta = &self.beta_particular + &self.face.z.dot(&gamma);
@@ -454,7 +476,11 @@ impl AffineFaceProfile {
         let weighted_rss =
             (&residual * &residual * &self.weights.view().insert_axis(Axis(1))).sum();
         let penalty_beta = self.penalty.dot(&beta);
-        let energy = (&beta * &penalty_beta).sum();
+        // S is semidefinite, so beta' S beta is mathematically a squared
+        // norm.  Computing that norm from the classified spectral root keeps
+        // null-space cancellation from manufacturing negative energy.
+        let rooted_beta = self.penalty_root.dot(&beta);
+        let energy = (&rooted_beta * &rooted_beta).sum();
         let penalized_deviance = weighted_rss + lambda * energy;
         if !penalized_deviance.is_finite() || penalized_deviance <= 0.0 {
             crate::bail_invalid_estim!(
@@ -550,6 +576,122 @@ fn tangent_penalty_geometry(
         logdet,
         pseudoinverse: scaled_eigenvectors.dot(&eigenvectors.t()),
     })
+}
+
+fn tangent_penalty_geometry_from_eigenvalues(
+    eigenvalues: ArrayView1<'_, f64>,
+    context: &str,
+) -> Result<TangentPenaltyGeometry, EstimationError> {
+    let scale = eigenvalues
+        .iter()
+        .fold(0.0_f64, |maximum, &value| maximum.max(value.abs()));
+    let tolerance =
+        default_rrqr_rank_alpha() * f64::EPSILON * eigenvalues.len().max(1) as f64 * scale;
+    let mut rank = 0;
+    let mut logdet = 0.0;
+    for (index, &value) in eigenvalues.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(EstimationError::PenaltySpectrumNonFinite {
+                context: context.to_string(),
+                index,
+                value,
+            });
+        }
+        if value < -tolerance {
+            return Err(EstimationError::PenaltySpectrumIndefinite {
+                context: context.to_string(),
+                index,
+                value,
+                tolerance,
+                scale,
+            });
+        }
+        if value > tolerance {
+            rank += 1;
+            logdet += value.ln();
+        }
+    }
+    Ok(TangentPenaltyGeometry {
+        rank,
+        logdet,
+        pseudoinverse: Array2::zeros((eigenvalues.len(), eigenvalues.len())),
+    })
+}
+
+fn whitened_tangent_geometry(
+    gram: &Array2<f64>,
+    penalty: &Array2<f64>,
+) -> Result<(Array2<f64>, Array1<f64>, f64), EstimationError> {
+    if gram.is_empty() {
+        return Ok((Array2::zeros(gram.dim()), Array1::zeros(0), 0.0));
+    }
+    let (gram_values, gram_vectors) = gram
+        .eigh(Side::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
+    if gram_values
+        .iter()
+        .any(|&value| !value.is_finite() || value <= 0.0)
+    {
+        crate::bail_invalid_estim!(
+            "constrained Gaussian REML tangent data Gram must be positive definite"
+        );
+    }
+    let inverse_sqrt = gram_values.mapv(|value| value.sqrt().recip());
+    let gram_inverse_root = &gram_vectors * &inverse_sqrt.insert_axis(Axis(0));
+    let whitened_penalty = gram_inverse_root.t().dot(penalty).dot(&gram_inverse_root);
+    let (mut penalty_values, penalty_vectors) = whitened_penalty
+        .eigh(Side::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
+    let classification = tangent_penalty_geometry_from_eigenvalues(
+        penalty_values.view(),
+        "constrained Gaussian REML whitened tangent penalty",
+    )?;
+    let scale = penalty_values
+        .iter()
+        .fold(0.0_f64, |maximum, &value| maximum.max(value.abs()));
+    let tolerance =
+        default_rrqr_rank_alpha() * f64::EPSILON * penalty_values.len().max(1) as f64 * scale;
+    for value in &mut penalty_values {
+        if *value <= tolerance {
+            *value = 0.0;
+        }
+    }
+    debug_assert_eq!(
+        classification.rank,
+        penalty_values.iter().filter(|&&value| value > 0.0).count()
+    );
+    let basis = gram_inverse_root.dot(&penalty_vectors);
+    let gram_logdet = gram_values.iter().map(|value| value.ln()).sum();
+    Ok((basis, penalty_values, gram_logdet))
+}
+
+fn positive_semidefinite_root(
+    penalty: ArrayView2<'_, f64>,
+    context: &str,
+) -> Result<Array2<f64>, EstimationError> {
+    if penalty.is_empty() {
+        return Ok(Array2::zeros(penalty.dim()));
+    }
+    let (mut values, vectors) = penalty
+        .eigh(Side::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
+    let classification = tangent_penalty_geometry_from_eigenvalues(values.view(), context)?;
+    let scale = values
+        .iter()
+        .fold(0.0_f64, |maximum, &value| maximum.max(value.abs()));
+    let tolerance = default_rrqr_rank_alpha() * f64::EPSILON * values.len().max(1) as f64 * scale;
+    for value in &mut values {
+        *value = if *value > tolerance {
+            value.sqrt()
+        } else {
+            0.0
+        };
+    }
+    debug_assert_eq!(
+        classification.rank,
+        values.iter().filter(|&&v| v > 0.0).count()
+    );
+    Ok(&vectors.t() * &values.insert_axis(Axis(1)))
 }
 
 fn optimize_affine_face(
@@ -1353,6 +1495,35 @@ mod tests {
             let numerical = (scalar_loss(&fit_fixture(&plus)) - scalar_loss(&fit_fixture(&minus)))
                 / (2.0 * step);
             assert_fd(backward.grad_weights[row], numerical, "grad_weights");
+        }
+    }
+
+    #[test]
+    fn rank_deficient_affine_profile_stays_finite_at_large_log_strength_2831() {
+        let mut fixture = affine_fixture();
+        let direction = array![1.0, -0.7, 0.35];
+        fixture.penalty = direction
+            .view()
+            .insert_axis(Axis(1))
+            .dot(&direction.view().insert_axis(Axis(0)));
+        let profile = AffineFaceProfile::new(
+            fixture.x.view(),
+            fixture.y.view(),
+            fixture.penalty.view(),
+            fixture.weights.view(),
+            &fixture.constraints,
+            array![0_u64].view(),
+        )
+        .expect("rank-deficient affine profile");
+
+        for rho in [30.0, 35.0] {
+            let evaluation = profile
+                .evaluate(rho)
+                .unwrap_or_else(|error| panic!("rho={rho} must remain evaluable: {error}"));
+            assert!(evaluation.score.is_finite());
+            assert!(evaluation.rho_gradient.is_finite());
+            assert!(evaluation.rho_curvature.is_finite());
+            assert!((evaluation.beta[[2, 0]] - 0.1).abs() <= 1.0e-10);
         }
     }
 
