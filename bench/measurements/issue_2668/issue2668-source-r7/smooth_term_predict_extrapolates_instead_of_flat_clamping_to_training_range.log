@@ -1,0 +1,6 @@
+
+running 1 test
+test smooths::smooth_term_predict_flat_clamped_outside_training_range::smooth_term_predict_extrapolates_instead_of_flat_clamping_to_training_range ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 0.48s
+

@@ -288,3 +288,24 @@ the dependency graph when a small probe changes. Use it only while the target
 directory is idle: a later attempted baseline compilation overlapped r7 and
 correctly failed when Cargo removed the old library before linking. That
 attempt produced no test result and is excluded from the proof above.
+
+## Final r7 verification (2026-09-08)
+
+The completed r7 inventory has **24 passes, four failures, and two 60-second
+timeouts**. All 30 original test identities are present, and the executable
+SHA-256 remained `33645bfe107f0a34a0f55a16ece9bf7c1750d284ffce1b1f5847674a3950b237`
+throughout the run. Raw logs, inventory, and results are retained under
+`bench/measurements/issue_2668/issue2668-source-r7/`.
+
+The terminal-face correction passes its focused analytic quadratic test, but
+does not resolve the original concave inference failure: that still reports
+two iterations and gradient norm 2.293496e-7. The other failures are the two
+SAE ARD criterion contracts and irrelevant-covariate double-penalty EDF. NB
+dispersion covariance and survival location-scale EDF still exceed 60 seconds.
+NB generated/predicted variance agreement passes in 36.50 seconds.
+
+The determinant-conditioning idea remains an unverified hypothesis. No
+dispersion determinant policy change is included: the inner cached determinant
+and outer derivative convention need to be examined together before changing
+either. No additional build or experiment is running from this task; the
+runner terminated its timed-out process groups. Issue #2668 remains open.

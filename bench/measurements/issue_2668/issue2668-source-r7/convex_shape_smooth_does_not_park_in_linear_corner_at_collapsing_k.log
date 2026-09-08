@@ -1,0 +1,7 @@
+
+running 1 test
+test smooths::convex_shape_smooth_parks_in_linear_corner_1654::convex_shape_smooth_does_not_park_in_linear_corner_at_collapsing_k ... [#1654] seed=7 k=20 sigma=0.4 convex fit: rmse=0.0390 curv_rms=11.1829
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 3.18s
+

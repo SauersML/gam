@@ -1,0 +1,15 @@
+
+running 1 test
+test smooths::double_penalty_shrinks_irrelevant_covariate_1266::default_double_penalty_shrinks_irrelevant_covariate_edf_below_one ... 
+thread 'smooths::double_penalty_shrinks_irrelevant_covariate_1266::default_double_penalty_shrinks_irrelevant_covariate_edf_below_one' (2209013) panicked at tests/regressions/smooths/double_penalty_shrinks_irrelevant_covariate_1266.rs:127:5:
+default double penalty failed to shrink the irrelevant covariate s(z) (mgcv select=TRUE): mean z edf=2.030541 (must be < 1.0), values=[1.1197906016778179, 3.3209128219101567, 1.9677228713160806, 2.5545313158306118, 1.1897461182869467]; supported mean x edf=8.636143, x values=[8.62848742209902, 8.571069050048218, 8.69652963844358, 8.623208185677273, 8.661421185196115]; fitted rho=[x bend, x null, z bend, z null] by seed=[[3.535279329179162, -3.4038522812794025, 20.74976341269738, 4.027162858714082], [3.569525903428311, -3.444557599977236, 7.755743013317689, 15.08966111105029], [3.467352844462342, -3.4274671110865995, 9.734848659708446, 15.074341930163525], [3.5078120491627764, -3.458918194109947, 8.832989805369618, 14.799841508238844], [3.5540574739154525, -3.4719310286606775, 11.27323179638318, 14.509910503738064]]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    smooths::double_penalty_shrinks_irrelevant_covariate_1266::default_double_penalty_shrinks_irrelevant_covariate_edf_below_one
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 506 filtered out; finished in 1.33s
+
