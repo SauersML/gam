@@ -212,3 +212,15 @@ and a 150-second build cap. It completed in 129.93 seconds. The exact compiler
 arguments are saved in `.buildd/issue932-wide-direct-argv.json`. Earlier Cargo
 attempts rebuilt dependency variants and hit development caps; those attempts
 are not passing evidence. No local build or numerical execution was used.
+
+The follow-up non-affine convergence audit found that `f64::max` silently
+discarded NaN moments before the reduced maximum-error finite check. A corrupted
+coarse moment could therefore certify convergence. The new corruption witness
+failed on the original implementation at moment zero, then passed after adding
+per-moment finite checks. It checks NaN and both infinities in each of the 33
+coarse/fine slots, including matching corrupted pairs, while retaining positive
+controls for finite and exact-zero agreement. All **90** kernel tests passed on
+MSI after the repair. The warm direct-rustc build took 9.64 seconds at opt-level
+2 with four pinned CPUs; tests took 0.15 seconds on one CPU. Logs:
+`.buildd/issue932-ladder-before.log` and `.buildd/issue932-ladder-after.log`.
+These are correctness results; no speed conclusion is drawn from this build.

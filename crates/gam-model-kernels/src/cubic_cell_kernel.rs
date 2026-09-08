@@ -3400,6 +3400,11 @@ fn non_affine_ladder_converged(coarse: &CellMomentVec, fine: &CellMomentVec) -> 
     let mut scale = 0.0_f64;
     let mut err = 0.0_f64;
     for (&c, &f) in coarse.iter().zip(fine.iter()) {
+        // f64::max discards a NaN operand, so checking only the reduced
+        // maxima would silently certify a corrupted moment vector.
+        if !(c.is_finite() && f.is_finite()) {
+            return false;
+        }
         scale = scale.max(f.abs());
         err = err.max((c - f).abs());
     }
@@ -6281,6 +6286,32 @@ mod tests {
                 z.powi(degree as i32) * (-cell.q(z)).exp()
             });
             assert!((state.moments[degree] - target).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn nonaffine_ladder_rejects_nonfinite_moments_932() {
+        let finite: CellMomentVec = (0..=32).map(|k| 1.0 / (k + 1) as f64).collect();
+        assert!(non_affine_ladder_converged(&finite, &finite));
+        let zero = smallvec![0.0; finite.len()];
+        assert!(non_affine_ladder_converged(&zero, &zero));
+        for slot in 0..finite.len() {
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut corrupted = finite.clone();
+                corrupted[slot] = invalid;
+                assert!(
+                    !non_affine_ladder_converged(&corrupted, &finite),
+                    "coarse moment {slot}={invalid} must not certify convergence"
+                );
+                assert!(
+                    !non_affine_ladder_converged(&finite, &corrupted),
+                    "fine moment {slot}={invalid} must not certify convergence"
+                );
+                assert!(
+                    !non_affine_ladder_converged(&corrupted, &corrupted),
+                    "matching nonfinite moments at {slot} must not certify convergence"
+                );
+            }
         }
     }
 
