@@ -24,6 +24,13 @@ jobs:
           python-version: '3.12'
       - name: Verify the census detects planted losses
         run: python -m unittest discover -s scripts/tests -p test_test_census.py -v
+      - name: Verify public API removals are source-graph decisions
+        run: python -m unittest discover -s scripts/tests -p test_public_api_census.py -v
+      - name: Positive control against the public-function sweep
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=2 origin d484a091a4d133aec6f3ed980754b6cda151d41b
+          python scripts/public_api_census.py --positive-control
       - name: Positive control against the sweep this gate exists for
         # A census that has stopped detecting anything is byte-identical to a
         # census over a tree that lost nothing, so point the instrument at a
@@ -71,9 +78,12 @@ jobs:
           set -euo pipefail
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           python scripts/test_census.py --base "$BASE_SHA" --head "$HEAD_SHA" --output test-census.json
+          python scripts/public_api_census.py --base "$BASE_SHA" --head "$HEAD_SHA" --output public-api-census.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-source-inventory-${{ github.sha }}
-          path: test-census.json
+          path: |
+            test-census.json
+            public-api-census.json
           if-no-files-found: error
