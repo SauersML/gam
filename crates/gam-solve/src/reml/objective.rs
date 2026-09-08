@@ -2,6 +2,46 @@ use super::*;
 
 use gam_terms::construction::PenaltyFrame;
 
+/// The fitted Hessian is identified by the union of the likelihood span and
+/// the penalty span. Row normalization removes smoothing strength before rank
+/// revelation: a large λ must never erase another block's data curvature.
+pub(super) fn firth_penalized_structural_rank(
+    likelihood_basis: &Array2<f64>,
+    penalty_root: &Array2<f64>,
+) -> Result<usize, EstimationError> {
+    use gam_linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
+    let p = likelihood_basis.nrows();
+    if penalty_root.ncols() != p {
+        crate::bail_invalid_estim!(
+            "Firth likelihood and penalty spans use different coefficient frames"
+        );
+    }
+    let mut root = Array2::<f64>::zeros((likelihood_basis.ncols() + penalty_root.nrows(), p));
+    root.slice_mut(ndarray::s![..likelihood_basis.ncols(), ..])
+        .assign(&likelihood_basis.t());
+    root.slice_mut(ndarray::s![likelihood_basis.ncols().., ..])
+        .assign(penalty_root);
+    // The likelihood basis may have been projected onto an active face: its
+    // zero rows must retain their roundoff scale, not be normalized into
+    // fictitious directions. Only the λ-scaled penalty rows need rescaling.
+    for mut row in root
+        .slice_mut(ndarray::s![likelihood_basis.ncols().., ..])
+        .rows_mut()
+    {
+        let scale = row
+            .iter()
+            .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+        if scale > 0.0 {
+            row.mapv_inplace(|value| value / scale);
+            let norm = row.dot(&row).sqrt();
+            row.mapv_inplace(|value| value / norm);
+        }
+    }
+    rrqr_with_permutation(&root, default_rrqr_rank_alpha())
+        .map(|factor| factor.rank)
+        .map_err(EstimationError::LinearSystemSolveFailed)
+}
+
 impl<'a> RemlState<'a> {
     /// Compute the scalar outer objective value used by the planner-selected
     /// outer optimizer.
@@ -1327,62 +1367,31 @@ impl<'a> RemlState<'a> {
             )
         };
 
-        // When Firth bias reduction is active, the design column space may be
-        // rank-deficient (e.g. aliased covariates).  The PIRLS penalized Hessian
-        // H_total = X'WX + S − H_φ then inherits that rank deficiency on any
-        // direction that is simultaneously null for X'WX, S, AND H_φ.  Under
-        // `Smooth`, the small eigenvalues of H_total get a soft ε-floor that
-        // leaks a spurious non-zero gradient contribution through the null
-        // direction; both `log|H|` and its derivatives then count a direction
-        // that carries no actual curvature.  Switching to `HardPseudo` masks
-        // those `σ_j ≤ ε` eigenpairs consistently across `logdet`,
-        // `trace_logdet_*`, and `H⁻¹` solves, so log|H|, its ρ-gradient, and
-        // its ρ-Hessian all see the same reduced active subspace.
-        //
-        // Rationale: the Firth/Jeffreys penalty, the penalized score equation,
-        // and therefore dβ̂/dρ all live on the identifiable subspace (matching
-        // `firth_op.q_basis`); extending the logdet kernel to the null space
-        // is both unphysical and inconsistent with the analytic subspace
-        // derivatives.
+        // Firth uses the exact pseudodeterminant on the union of likelihood
+        // and penalty spans. Its rank must be determined BEFORE λ scales the
+        // Hessian: a relative Hessian cutoff deletes identifiable weaker
+        // smooth blocks and leaves the spurious −rank(S_k)/2 score (#2835).
+        // HardPseudo here marks the intrinsic-logdet assembly contract; the
+        // operator below receives the structural rank and uses exact kernels.
         let hessian_mode = if bundle.firth_dense_operator.is_some() {
             PseudoLogdetMode::HardPseudo
         } else {
             PseudoLogdetMode::Smooth
         };
-        let firth_structural_rank = if hessian_mode == PseudoLogdetMode::HardPseudo {
-            let design = bundle
-                .firth_dense_operator
-                .as_ref()
-                .expect("HardPseudo is selected only for a Firth operator")
-                .x_dense
-                .clone();
-            let penalties: Vec<Array2<f64>> = self
-                .canonical_penalties
-                .iter()
-                .map(|penalty| {
-                    let mut full = Array2::<f64>::zeros((penalty.total_dim, penalty.total_dim));
-                    full.slice_mut(ndarray::s![
-                        penalty.col_range.clone(),
-                        penalty.col_range.clone()
-                    ])
-                    .assign(&penalty.local);
-                    if let Some(z) = free_basis_opt.as_ref() {
-                        Self::projectwith_basis(&full, z)
-                    } else {
-                        full
-                    }
-                })
-                .collect();
-            Some(
-                DenseSpectralOperator::structural_rank_from_spans(&design, &penalties).map_err(
-                    |error| {
-                        EstimationError::InvalidInput(format!("Firth structural span: {error}"))
-                    },
-                )?,
-            )
-        } else {
-            None
-        };
+        let structural_rank = bundle
+            .firth_dense_operator
+            .as_ref()
+            .map(|firth| {
+                let likelihood_basis = free_basis_opt
+                    .as_ref()
+                    .map_or_else(|| firth.q_basis.clone(), |z| z.t().dot(&firth.q_basis));
+                if ridge_passport.delta() > 0.0 {
+                    Ok(h_for_operator.nrows())
+                } else {
+                    firth_penalized_structural_rank(&likelihood_basis, e_for_logdet.as_ref())
+                }
+            })
+            .transpose()?;
 
         let c_nontrivial = pirls_result.solve_c_nontrivial;
 
@@ -1430,10 +1439,9 @@ impl<'a> RemlState<'a> {
             ) {
                 Ok(chol_op) => std::sync::Arc::new(chol_op),
                 Err(_) => std::sync::Arc::new(
-                    DenseSpectralOperator::from_symmetric_with_mode_and_structural_rank(
+                    DenseSpectralOperator::from_symmetric_with_mode(
                         h_for_operator.as_ref(),
                         hessian_mode,
-                        firth_structural_rank,
                     )
                     .map_err(|e| {
                         EstimationError::InvalidInput(format!(
@@ -1444,11 +1452,17 @@ impl<'a> RemlState<'a> {
             }
         } else {
             std::sync::Arc::new(
-                DenseSpectralOperator::from_symmetric_with_mode_and_structural_rank(
-                    h_for_operator.as_ref(),
-                    hessian_mode,
-                    firth_structural_rank,
-                )
+                if let Some(rank) = structural_rank {
+                    DenseSpectralOperator::from_symmetric_with_structural_rank(
+                        h_for_operator.as_ref(),
+                        rank,
+                    )
+                } else {
+                    DenseSpectralOperator::from_symmetric_with_mode(
+                        h_for_operator.as_ref(),
+                        hessian_mode,
+                    )
+                }
                 .map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "DenseSpectralOperator from PIRLS Hessian: {e}"
@@ -1828,12 +1842,8 @@ impl<'a> RemlState<'a> {
             );
         }
 
-        // Match `build_dense_assembly`: under Firth bias-reduction the penalized
-        // Hessian `X'WX + S − H_φ` inherits the Jeffreys-identifiable subspace,
-        // and `Smooth` would leak a spurious gradient contribution through the
-        // null directions.  Keep `log|H|`, its gradient, its cross-traces, and
-        // `H⁻¹` solves consistent on the same reduced active subspace by using
-        // `HardPseudo` whenever a Firth operator is in play.
+        // Match the transformed assembly's structural-rank Firth operator.
+        // A strong penalty changes curvature, never coefficient identifiability.
         let hessian_mode = if bundle.firth_dense_operator.is_some()
             || bundle.firth_dense_operator_original.is_some()
         {
@@ -1841,39 +1851,32 @@ impl<'a> RemlState<'a> {
         } else {
             PseudoLogdetMode::Smooth
         };
-        let firth_structural_rank = if hessian_mode == PseudoLogdetMode::HardPseudo {
-            let design = bundle
-                .firth_dense_operator_original
-                .as_ref()
-                .or(bundle.firth_dense_operator.as_ref())
-                .expect("HardPseudo is selected only for a Firth operator")
-                .x_dense
-                .clone();
-            let penalties: Vec<Array2<f64>> = self
-                .canonical_penalties
-                .iter()
-                .map(|penalty| {
-                    let mut full = Array2::<f64>::zeros((penalty.total_dim, penalty.total_dim));
-                    full.slice_mut(ndarray::s![
-                        penalty.col_range.clone(),
-                        penalty.col_range.clone()
-                    ])
-                    .assign(&penalty.local);
-                    full
-                })
-                .collect();
-            Some(
-                DenseSpectralOperator::structural_rank_from_spans(&design, &penalties).map_err(
-                    |error| {
-                        EstimationError::InvalidInput(format!("Firth structural span: {error}"))
-                    },
-                )?,
-            )
+        let structural_rank = if let Some(firth) = bundle.firth_dense_operator_original.as_ref() {
+            let root_original = pirls_result
+                .reparam_result
+                .e_transformed
+                .dot(&pirls_result.reparam_result.qs.t());
+            Some(if ridge_passport.delta() > 0.0 {
+                h_total_original.nrows()
+            } else {
+                firth_penalized_structural_rank(&firth.q_basis, &root_original)?
+            })
+        } else if let Some(firth) = bundle.firth_dense_operator.as_ref() {
+            let qs = &pirls_result.reparam_result.qs;
+            let root_original = pirls_result.reparam_result.e_transformed.dot(&qs.t());
+            Some(if ridge_passport.delta() > 0.0 {
+                h_total_original.nrows()
+            } else {
+                firth_penalized_structural_rank(&qs.dot(&firth.q_basis), &root_original)?
+            })
         } else {
             None
         };
         let c_nontrivial = pirls_result.solve_c_nontrivial;
 
+        // Same Cholesky fast path as `build_dense_assembly`: for ValueOnly
+        // evaluations with `Smooth` mode (no Firth and no beta-dependent
+        // Hessian drift), LLT replaces eigh.
         // `build_dense_original_assembly` is only called when there is no
         // active constraint free-basis, so the no-hard-constraints condition
         // is always satisfied here.
@@ -1898,11 +1901,14 @@ impl<'a> RemlState<'a> {
         let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = {
             use super::reml_outer_engine::HessianFactorization as _;
             let build_spectral = || -> Result<DenseSpectralOperator, EstimationError> {
-                let mut op = DenseSpectralOperator::from_symmetric_with_mode_and_structural_rank(
-                    &h_total_original,
-                    hessian_mode,
-                    firth_structural_rank,
-                )
+                let mut op = if let Some(rank) = structural_rank {
+                    DenseSpectralOperator::from_symmetric_with_structural_rank(
+                        &h_total_original,
+                        rank,
+                    )
+                } else {
+                    DenseSpectralOperator::from_symmetric_with_mode(&h_total_original, hessian_mode)
+                }
                 .map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "DenseSpectralOperator from original-basis PIRLS Hessian: {e}"

@@ -62,54 +62,6 @@ pub struct DenseSpectralOperator {
 }
 
 impl DenseSpectralOperator {
-    /// Rank of the union of a likelihood design span and unscaled penalty
-    /// spans.  Each source is normalized before addition, so the answer cannot
-    /// depend on a smoothing strength or on arbitrary units of one component.
-    pub(crate) fn structural_rank_from_spans(
-        design: &Array2<f64>,
-        penalties: &[Array2<f64>],
-    ) -> Result<usize, String> {
-        let p = design.ncols();
-        let mut span_gram = gam_linalg::faer_ndarray::fast_atb(design, design);
-        let design_scale = span_gram
-            .iter()
-            .map(|value| value * value)
-            .sum::<f64>()
-            .sqrt();
-        if design_scale > 0.0 {
-            span_gram.mapv_inplace(|value| value / design_scale);
-        }
-        for penalty in penalties {
-            if penalty.dim() != (p, p) {
-                return Err(format!(
-                    "structural span penalty is {}x{}, expected {p}x{p}",
-                    penalty.nrows(),
-                    penalty.ncols()
-                ));
-            }
-            let scale = penalty
-                .iter()
-                .map(|value| value * value)
-                .sum::<f64>()
-                .sqrt();
-            if scale > 0.0 {
-                span_gram.scaled_add(scale.recip(), penalty);
-            }
-        }
-        gam_linalg::matrix::symmetrize_in_place(&mut span_gram);
-        let (eigenvalues, _) = span_gram
-            .eigh(faer::Side::Lower)
-            .map_err(|error| format!("structural-span eigendecomposition failed: {error}"))?;
-        let largest = eigenvalues
-            .iter()
-            .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-        let threshold = (p.max(1) as f64) * f64::EPSILON * largest;
-        Ok(eigenvalues
-            .iter()
-            .filter(|&&value| value > threshold)
-            .count())
-    }
-
     /// Create from a symmetric matrix (may be indefinite or singular).
     ///
     /// The eigendecomposition is computed once. Eigenvalues are smoothly
@@ -131,19 +83,20 @@ impl DenseSpectralOperator {
         h: &Array2<f64>,
         mode: PseudoLogdetMode,
     ) -> Result<Self, String> {
-        Self::from_symmetric_with_mode_and_structural_rank(h, mode, None)
+        Self::from_symmetric_with_rank_policy(h, mode, None)
     }
 
-    /// Build a spectral factorization whose hard-pseudo rank is fixed by the
-    /// model's unscaled likelihood/penalty spans, rather than by the condition
-    /// number of the already-scaled Hessian.
-    ///
-    /// A smoothing strength is allowed to change eigenvalue magnitudes, but it
-    /// cannot change which coefficient directions exist in the Laplace
-    /// integral.  In particular, a `1e13` penalty must not make a second,
-    /// unit-strength smooth look structurally null merely because its Hessian
-    /// eigenvalue is less than `1e-5` of the largest one (#2835).
-    pub(crate) fn from_symmetric_with_mode_and_structural_rank(
+    /// Exact pseudodeterminant on a structurally identified coefficient span.
+    /// Rank is supplied by the unscaled design and penalty roots, never by
+    /// comparing unrelated smoothing strengths in the penalized Hessian.
+    pub(crate) fn from_symmetric_with_structural_rank(
+        h: &Array2<f64>,
+        rank: usize,
+    ) -> Result<Self, String> {
+        Self::from_symmetric_with_rank_policy(h, PseudoLogdetMode::PositiveDefinite, Some(rank))
+    }
+
+    fn from_symmetric_with_rank_policy(
         h: &Array2<f64>,
         mode: PseudoLogdetMode,
         structural_rank: Option<usize>,
@@ -166,6 +119,37 @@ impl DenseSpectralOperator {
             .eigh(Side::Lower)
             .map_err(|e| format!("Eigendecomposition failed: {e}"))?;
 
+        let structural_mask = if let Some(rank) = structural_rank {
+            if rank > n {
+                return Err(format!(
+                    "Hessian structural rank {rank} exceeds dimension {n}"
+                ));
+            }
+            let mut indices: Vec<usize> = (0..n).collect();
+            indices.sort_by(|&a, &b| eigenvalues[b].total_cmp(&eigenvalues[a]));
+            let mut mask = vec![false; n];
+            for index in indices.into_iter().take(rank) {
+                mask[index] = true;
+            }
+            // Structural aliases account only for roundoff-sized eigenvalues.
+            // A negative saddle direction must not be discarded in favor of a
+            // tiny positive numerical alias when selecting the retained rank.
+            let spectral_scale = eigenvalues
+                .iter()
+                .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+            let backward_error = 64.0 * n.max(1) as f64 * f64::EPSILON * spectral_scale;
+            for (index, &value) in eigenvalues.iter().enumerate() {
+                if !mask[index] && value.abs() > backward_error {
+                    return Err(format!(
+                        "Hessian excluded structural alias has resolved curvature {value:.6e} (eigenvalue backward error {backward_error:.6e})"
+                    ));
+                }
+            }
+            Some(mask)
+        } else {
+            None
+        };
+
         // A Laplace approximation is defined at a local mode, whose observed
         // penalized Hessian is positive definite on the fitted coefficient
         // space. Do not turn a saddle into a different objective by discarding
@@ -173,6 +157,9 @@ impl DenseSpectralOperator {
         // direction out of the implicit mode response.
         if mode == PseudoLogdetMode::PositiveDefinite {
             for (index, &sigma) in eigenvalues.iter().enumerate() {
+                if structural_mask.as_ref().is_some_and(|mask| !mask[index]) {
+                    continue;
+                }
                 if !sigma.is_finite() || sigma <= 0.0 {
                     return Err(format!(
                         "positive-definite Hessian required for Laplace evaluation: \
@@ -222,37 +209,16 @@ impl DenseSpectralOperator {
         // Well-conditioned Hessians are unaffected: their `σ_min` sits within a
         // few orders of `σ_max` (≫ the relative floor), so every eigenpair stays
         // active and the mask is byte-identical to the pre-#2358 absolute-ε mask.
-        let active: Vec<bool> = match mode {
+        let active: Vec<bool> = structural_mask.unwrap_or_else(|| match mode {
             PseudoLogdetMode::Smooth | PseudoLogdetMode::PositiveDefinite => {
                 vec![true; n]
             }
             PseudoLogdetMode::HardPseudo => {
                 let sigma_max = eigenvalues.iter().fold(0.0_f64, |acc, &s| acc.max(s.abs()));
                 let floor = epsilon.max(HARD_PSEUDO_RELATIVE_FLOOR * sigma_max);
-                let mut active: Vec<bool> = eigenvalues.iter().map(|&s| s > floor).collect();
-                if let Some(rank) = structural_rank {
-                    let wanted = rank.min(n);
-                    let already = active.iter().filter(|&&keep| keep).count();
-                    if already < wanted {
-                        // `eigh` returns ascending eigenvalues.  Restore the
-                        // largest positive modes until the scale-independent
-                        // span rank is represented; exact structural aliases
-                        // remain inactive.
-                        let mut remaining = wanted - already;
-                        for index in (0..n).rev() {
-                            if remaining == 0 {
-                                break;
-                            }
-                            if !active[index] && eigenvalues[index] > 0.0 {
-                                active[index] = true;
-                                remaining -= 1;
-                            }
-                        }
-                    }
-                }
-                active
+                eigenvalues.iter().map(|&s| s > floor).collect()
             }
-        };
+        });
 
         // Apply smooth regularization to all eigenvalues (even inactive ones:
         // `reg_eigenvalues[j]` is still consulted by `trace_hinv_product`

@@ -12,14 +12,13 @@ use super::*;
 fn firth_hard_pseudo_rank_is_invariant_to_competing_smoothing_strengths() {
     let design = array![[1.0, 0.0, 0.0]];
     let weak_penalty = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
-    let alias = Array2::<f64>::zeros((3, 3));
-    let structural_rank =
-        DenseSpectralOperator::structural_rank_from_spans(&design, &[weak_penalty.clone(), alias])
-            .expect("structural span rank");
-    assert_eq!(
-        structural_rank, 2,
-        "a true structural alias must remain absent"
-    );
+    let penalty_root = array![[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
+    let structural_rank = super::super::objective::firth_penalized_structural_rank(
+        &design.t().to_owned(),
+        &penalty_root,
+    )
+    .expect("structural span rank");
+    assert_eq!(structural_rank, 2, "a true structural alias must remain absent");
 
     for dominant_strength in [1.0, 1.0e8, 1.0e13] {
         let h = array![
@@ -27,16 +26,13 @@ fn firth_hard_pseudo_rank_is_invariant_to_competing_smoothing_strengths() {
             [0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0]
         ];
-        let op = DenseSpectralOperator::from_symmetric_with_mode_and_structural_rank(
-            &h,
-            PseudoLogdetMode::HardPseudo,
-            Some(structural_rank),
-        )
-        .expect("hard-pseudo factorization");
+        let op = DenseSpectralOperator::from_symmetric_with_structural_rank(&h, structural_rank)
+            .expect("hard-pseudo factorization");
         assert_eq!(op.active_rank(), 2);
         assert_relative_eq!(op.trace_hinv_product(&weak_penalty), 1.0, epsilon = 1e-12);
     }
 }
+
 use crate::estimate::smooth_floor_dp;
 use crate::estimate::smoothing_correction::DP_FLOOR;
 use approx::assert_relative_eq;
@@ -2878,6 +2874,32 @@ pub(crate) fn test_dense_spectral_operator_simple() {
     assert!((sol[1] - 0.2).abs() < 1e-12);
 
     assert_eq!(sol.len(), 2);
+}
+
+#[test]
+fn structural_firth_rank_preserves_weaker_smooth_trace() {
+    // An intercept, two independently penalized smooth directions, and an
+    // actual structural alias. Increasing the first λ cannot remove the
+    // second block from the Laplace integral or its mode response.
+    let second_lambda = 1e4;
+    for first_lambda in [1.0, 1e8, 1e13] {
+        let h = Array2::from_diag(&array![3.0, 2.0 + first_lambda, 5.0 + second_lambda, 0.0]);
+        let op = DenseSpectralOperator::from_symmetric_with_structural_rank(&h, 3).unwrap();
+        let second_drift = Array2::from_diag(&array![0.0, 0.0, second_lambda, 0.0]);
+        let expected = second_lambda / (5.0 + second_lambda);
+        assert!((op.trace_logdet_gradient(&second_drift) - expected).abs() < 1e-12);
+        assert!(
+            (op.solve(&array![0.0, 0.0, 1.0, 0.0])[2] - 1.0 / (5.0 + second_lambda)).abs() < 1e-15
+        );
+        assert_eq!(op.solve(&array![0.0, 0.0, 0.0, 1.0])[3], 0.0);
+        let expected_logdet =
+            3.0_f64.ln() + (2.0_f64 + first_lambda).ln() + (5.0_f64 + second_lambda).ln();
+        assert!((op.logdet() - expected_logdet).abs() < 1e-12);
+    }
+    let saddle_with_alias = Array2::from_diag(&array![-1.0, 1e-17, 2.0]);
+    assert!(
+        DenseSpectralOperator::from_symmetric_with_structural_rank(&saddle_with_alias, 2).is_err()
+    );
 }
 
 #[test]
