@@ -5,10 +5,6 @@ use crate::model_types::SmoothingCorrectionMethod;
 use gam_linalg::matrix::symmetrize_in_place;
 use std::sync::atomic::Ordering;
 
-// Inset from RHO_BOUND when scaling a sigma-point step so the inner PIRLS
-// fit at a sigma point is strictly interior to the box constraint
-// (the box edge is unreachable by IRLS without barrier intervention).
-pub(crate) const AUTO_CUBATURE_RHO_CLAMP_INSET: f64 = 1e-8;
 // Skip cubature when the first-order rho-Hessian inverse already shows
 // negligible posterior variance on rho (max diag < this threshold) and
 // neither boundary contact nor large outer-gradient flags fired.
@@ -217,7 +213,8 @@ pub(crate) fn device_pirls_stage3_ready() -> Result<bool, gam_gpu::gpu_error::Gp
 /// Both branches return per-sigma `(A_m, b_m)` pairs that the downstream
 /// [`accumulate_sigma_cubature_total_covariance`] consumes without knowing
 /// which executor produced them; that's the contract
-/// `cubature_linear_exactness_recovers_jvjt` pins to f64 round-off.
+/// `gaussian_cubature_integrates_quadratic_conditional_covariance_and_linear_mean_1561`
+/// pins to f64 round-off.
 ///
 /// Magic by default: no flags. When [`device_pirls_stage3_ready`] returns
 /// `true` the GPU branch fires for every cubature batch where the problem
@@ -390,7 +387,7 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
 /// site in [`RemlState::compute_smoothing_correction_auto`] before P3
 /// introduced the dispatch boundary; the math is bit-identical and
 /// continues to be the parity oracle pinned by
-/// [`sigma_cubature_accumulation_tests::cubature_linear_exactness_recovers_jvjt`].
+/// `gaussian_cubature_integrates_quadratic_conditional_covariance_and_linear_mean_1561`.
 ///
 /// Stateless inner PIRLS (`execute_pirls_stateless_for_cubature`) performs
 /// no PIRLS-cache lookup/insert, no warm-start read/write, no LM-lambda
@@ -459,80 +456,62 @@ pub(crate) fn sigma_cubature_evaluate_cpu_rayon(
     rows.into_iter().collect()
 }
 
-/// One atom of the positive discrete measure used for rho marginalisation.
-pub(crate) struct WeightedSigmaPoint {
-    pub result: SigmaPointResult,
-    pub weight: f64,
-}
-
-/// Accumulate the sigma-point cubature total covariance `V̂_p`.
-///
-/// Math. The estimand is the law of total covariance for the
-/// smoothing-parameter-marginalised posterior,
-///
-/// ```text
-///     V_p = E_ρ[Cov(β|ρ)] + Cov_ρ[β̂(ρ)] = φ̂·E_ρ[H(ρ)⁻¹] + Cov_ρ[β̂(ρ)].
-/// ```
-///
-/// Every point holds `(H(ρ)⁻¹, β̂(ρ))` and a nonnegative mass (the
-/// inverse-Hessian blocks already carry `φ̂`). Both terms are expectations
-/// under that same normalized discrete measure:
-///
-/// ```text
-///     φ̂·Ê_ρ[H(ρ)⁻¹] = Σ_m w_m A_m
-///     Ĉov_ρ[β̂]      = Σ_m w_m (b_m − b̄)(b_m − b̄)ᵀ + Σ_k f_k f_kᵀ.
-/// ```
-///
-/// `fallback_columns` carries the first-order column of every ACTIVE direction
-/// that was not upgraded, so the assembled correction covers the same subspace
-/// the first-order correction does and the cubature is a strict upgrade rather
-/// than a differently-truncated estimate (#2728).
-///
-/// The result is PSD by construction: a mean of PSD inverse-Hessian blocks plus
-/// a sum of rank-one Grams. Since the caller forms the additive correction as
-/// `total − φ̂·H(ρ̂)⁻¹`, the corrected covariance `Vb + correction` telescopes
-/// back to this PSD matrix.
+/// Law of total covariance under one positive cubature measure.
+/// Both the conditional covariance and the centered coefficient covariance
+/// consume exactly the same nodes and normalized weights. Residual columns
+/// describe the independent linear response in directions not integrated.
 pub(crate) fn accumulate_sigma_cubature_total_covariance(
-    points: &[WeightedSigmaPoint],
-    fallback_columns: &[Array1<f64>],
+    points: &[SigmaPointResult],
+    weights: &[f64],
+    residual_columns: &[Array1<f64>],
     p: usize,
-) -> Option<Array2<f64>> {
-    let mass: f64 = points.iter().map(|point| point.weight).sum();
+) -> Result<Array2<f64>, EstimationError> {
+    let mass: f64 = weights.iter().sum();
     if points.is_empty()
+        || points.len() != weights.len()
+        || weights.iter().any(|w| !w.is_finite() || *w < 0.0)
         || !mass.is_finite()
         || mass <= 0.0
         || points
             .iter()
-            .any(|point| !point.weight.is_finite() || point.weight < 0.0)
+            .any(|(a, b)| a.dim() != (p, p) || b.len() != p)
+        || residual_columns.iter().any(|b| b.len() != p)
     {
-        return None;
-        }
+        return Err(EstimationError::TrialPointRefused {
+            reason: "smoothing cubature requires finite positive mass and matching covariance dimensions".into(),
+        });
+    }
+    // Center relative to an existing node to retain small covariance when all
+    // coefficient means share a large offset.
+    let anchor = &points[0].1;
+    let mut mean_delta = Array1::<f64>::zeros(p);
+    for ((_, beta), weight) in points.iter().zip(weights) {
+        mean_delta.scaled_add(*weight / mass, &(beta - anchor));
+    }
     let mut total = Array2::<f64>::zeros((p, p));
-    let mut mean = Array1::<f64>::zeros(p);
-    for point in points {
-        let weight = point.weight / mass;
-        total.scaled_add(weight, &point.result.0);
-        mean.scaled_add(weight, &point.result.1);
-    }
-    let accumulate_gram = |column: &Array1<f64>, total: &mut Array2<f64>| {
+    for ((cov, beta), weight) in points.iter().zip(weights) {
+        let w = *weight / mass;
+        total.scaled_add(w, cov);
+        let centered = beta - anchor - &mean_delta;
         for row in 0..p {
-            let scaled = column[row];
-            if scaled == 0.0 {
-                continue;
-            }
             for col in 0..p {
-                total[[row, col]] += scaled * column[col];
+                total[[row, col]] += w * centered[row] * centered[col];
             }
         }
-    };
-    for point in points {
-        let centered = (&point.result.1 - &mean).mapv(|value| value * (point.weight / mass).sqrt());
-        accumulate_gram(&centered, &mut total);
     }
-    for column in fallback_columns {
-        accumulate_gram(column, &mut total);
+    for column in residual_columns {
+        for row in 0..p {
+            for col in 0..p {
+                total[[row, col]] += column[row] * column[col];
+            }
+        }
     }
-    Some(total)
+    if total.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::TrialPointRefused {
+            reason: "smoothing cubature produced a nonfinite total covariance".into(),
+        });
+    }
+    Ok(total)
 }
 
 /// Criterion level a one-sigma sigma-point node sits at.
@@ -575,10 +554,21 @@ const PROFILE_SIGMA_ACCEPT_FACTOR: f64 = 1.5;
 /// silently trusted.
 const PROFILE_SIGMA_MAX_EVALS: usize = 12;
 
-/// A sigma-point node whose position was calibrated against the criterion.
+/// A calibration or cubature node with geometric and criterion provenance.
 pub(crate) struct CalibratedSigmaNode {
+    /// The node itself: a displacement from the mode during calibration,
+    /// or from the calibrated proposal center during positive cubature.
+    pub rho: Array1<f64>,
     /// Step length actually taken along `direction`.
     pub step: f64,
+    /// Step length requested by the quadratic model at this node radius.
+    pub wald_step: f64,
+    /// `V(node) − V(ρ̂)` at the returned step.
+    pub achieved_rise: f64,
+    /// Criterion evaluations this node's calibration spent.
+    pub evaluations: usize,
+    /// The proposal's calibration ran into the rho box before the target rise.
+    pub box_limited: bool,
 }
 
 /// Largest `t ≥ 0` keeping `rho + t·direction` inside the ρ box on every
@@ -589,11 +579,14 @@ pub(crate) struct CalibratedSigmaNode {
 /// eigendirection it was supposed to sample. Scaling the whole step instead
 /// keeps the node on its own direction, so the two-point rule stays a rule
 /// about that eigendirection.
-fn sigma_step_to_rho_box(rho: &Array1<f64>, direction: &Array1<f64>) -> f64 {
-    let lo = -RHO_BOUND + AUTO_CUBATURE_RHO_CLAMP_INSET;
-    let hi = RHO_BOUND - AUTO_CUBATURE_RHO_CLAMP_INSET;
+fn sigma_step_to_rho_domain(
+    rho: &Array1<f64>, direction: &Array1<f64>,
+    bounds: &(Array1<f64>, Array1<f64>),
+) -> f64 {
     let mut limit = f64::INFINITY;
-    for (centre, component) in rho.iter().zip(direction.iter()) {
+    for (index, (centre, component)) in rho.iter().zip(direction.iter()).enumerate() {
+        let lo = bounds.0[index];
+        let hi = bounds.1[index];
         if *component > 0.0 {
             limit = limit.min((hi - centre) / component);
         } else if *component < 0.0 {
@@ -641,8 +634,9 @@ impl<'a> RemlState<'a> {
         centre_cost: f64,
         direction: &Array1<f64>,
         wald_step: f64,
+        bounds: &(Array1<f64>, Array1<f64>),
     ) -> Result<CalibratedSigmaNode, EstimationError> {
-        let box_limit = sigma_step_to_rho_box(rho_hat, direction);
+        let box_limit = sigma_step_to_rho_domain(rho_hat, direction, bounds);
         let at = |step: f64| -> Array1<f64> {
             let mut point = rho_hat.clone();
             point
@@ -651,12 +645,19 @@ impl<'a> RemlState<'a> {
                 .for_each(|(coordinate, component)| *coordinate += step * component);
             point
         };
-        let centre_node = CalibratedSigmaNode { step: 0.0 };
+        let centre_node = |evaluations: usize| CalibratedSigmaNode {
+            rho: rho_hat.clone(),
+            step: 0.0,
+            wald_step,
+            achieved_rise: 0.0,
+            evaluations,
+            box_limited: true,
+        };
         if !wald_step.is_finite() || wald_step <= 0.0 || box_limit <= 0.0 {
             // Either the direction has no resolvable width, or ρ̂ already sits
             // on the box face along it. Both mean the node is the centre and
             // this side of the chord is zero-length.
-            return Ok(centre_node);
+            return Ok(centre_node(0));
         }
 
         let target = PROFILE_SIGMA_RISE;
@@ -700,7 +701,12 @@ impl<'a> RemlState<'a> {
                     // own λ range along this direction. The box face IS the
                     // node; nothing further out exists to sample.
                     return Ok(CalibratedSigmaNode {
+                        rho: at(step),
                         step,
+                        wald_step,
+                        achieved_rise: rise,
+                        evaluations,
+                        box_limited: true,
                     });
                 }
                 lo = step;
@@ -755,9 +761,14 @@ impl<'a> RemlState<'a> {
         if closeness(rise) < closeness(best.1) {
             best = (step, rise);
         }
-        let (step, _) = if accepts(rise) { (step, rise) } else { best };
+        let (step, rise) = if accepts(rise) { (step, rise) } else { best };
         Ok(CalibratedSigmaNode {
+            rho: at(step),
             step,
+            wald_step,
+            achieved_rise: rise,
+            evaluations,
+            box_limited: step >= box_limit,
         })
     }
 }
@@ -1183,9 +1194,10 @@ impl<'a> RemlState<'a> {
                     .into(),
             ));
         }
-        let near_boundary = final_rho
-            .iter()
-            .any(|&v| (RHO_BOUND - v.abs()) <= AUTO_CUBATURE_BOUNDARY_MARGIN);
+        let rho_domain = self.resolvability_rho_domain();
+        let near_boundary = final_rho.iter().enumerate().any(|(k, &value)| {
+            (value-rho_domain.0[k]).min(rho_domain.1[k]-value) <= AUTO_CUBATURE_BOUNDARY_MARGIN
+        });
         let grad_norm = if finalgrad_norm.is_finite() {
             finalgrad_norm
         } else {
@@ -1314,155 +1326,101 @@ impl<'a> RemlState<'a> {
             );
         }
 
-        // Place each node where the criterion says one sigma is, not where the
-        // curvature guessed it was.
-        //
-        // The rule this branch implements is a symmetric two-point quadrature
-        // for `ρ ~ N(ρ̂, V_ρ)`: put the node one posterior sd out and read the
-        // integrand there. `σ_j^{-1/2}` is the sd the QUADRATIC model of the
-        // criterion implies, and by construction the quadratic model predicts
-        // the criterion to rise by exactly `PROFILE_SIGMA_RISE` at that node.
-        // That prediction is checkable — one criterion evaluation — and where
-        // it fails, the node, not the prediction, is what has to move.
-        //
-        // #2728 is the failure: at `λ = 7.2e-9` the ρ-curvature is ~0 by the
-        // chain-rule identity `H_ρ = diag(λ)H_λdiag(λ) + diag(g_ρ)` rather
-        // than because the profile is flat, so `σ^{-1/2} = 308` in log-λ and
-        // the node landed at `ΔV = 3309` — posterior weight `e^-3309` — while
-        // carrying weight ½. Calibrating to the criterion also lets the two
-        // sides differ, which that fixture needs and a `±` step cannot express:
-        // the profile there is flat downwards and a cliff upwards.
-        // A failure here must NOT propagate: cubature is an upgrade over a
-        // correction that is already computed and already correct, and #2601
-        // records what happens when a failure to refine the *uncertainty* is
-        // allowed to destroy a converged point estimate.
-        let centre_cost = match self.compute_rho_posterior_cost_uncharged(final_rho) {
-            Ok(cost) if cost.is_finite() => cost,
-            Ok(_) => {
-                return self.finalize_smoothing_outcome(first_order_numerical(
-                    first_order_correction,
-                    "outer criterion is not finite at the converged rho".into(),
-                ));
-            }
-            Err(error) => {
-                return self.finalize_smoothing_outcome(first_order_numerical(
-                    first_order_correction,
-                    format!("outer criterion unavailable at the converged rho: {error}").into(),
-                ));
-            }
-        };
-        let mut nodes: Vec<CalibratedSigmaNode> = Vec::with_capacity(2 * rank);
+        // Calibrate a Gaussian proposal using the paired one-sigma rays.
+        // Calibration only chooses proposal geometry; it never assigns mass.
+        // The actual quadrature then uses spherical Gaussian nodes at sqrt(r),
+        // and importance weights from the posterior density. Its two covariance
+        // terms therefore integrate the same positive probability measure.
+        let centre_cost = self.compute_rho_posterior_cost_uncharged(final_rho)?;
+        if !centre_cost.is_finite() {
+            return Err(EstimationError::TrialPointRefused {
+                reason: "smoothing cubature criterion is nonfinite at the fitted rho".into(),
+            });
+        }
+        let mut proposal_center = final_rho.clone();
+        let mut proposal_axes = Vec::with_capacity(rank);
         for &index in &upgraded {
             let axis = spectrum.eigenvectors.column(index).to_owned();
             let wald_step = spectrum.eigenvalues[index].sqrt().recip();
-            for sign in [1.0_f64, -1.0_f64] {
-                let direction = axis.mapv(|value| value * sign);
-                match self.calibrate_sigma_node(final_rho, centre_cost, &direction, wald_step) {
-                    Ok(node) => nodes.push(node),
-                    Err(error) => {
-                        return self.finalize_smoothing_outcome(first_order_numerical(
-                            first_order_correction,
-                            format!("sigma-node calibration failed: {error}").into(),
-                        ));
-                    }
-                }
+            let plus = self.calibrate_sigma_node(final_rho, centre_cost, &axis, wald_step, &rho_domain)?;
+            let minus = self.calibrate_sigma_node(final_rho, centre_cost, &(-&axis), wald_step, &rho_domain)?;
+            let width = 0.5 * (plus.step + minus.step);
+            if !width.is_finite() || width <= 0.0 {
+                return Err(EstimationError::TrialPointRefused {
+                    reason: "smoothing cubature proposal has no positive width".into(),
+                });
             }
-        }
-        // The calibrated rays describe a local Gaussian proposal.  They are
-        // not themselves a probability rule: assigning 1/(2r) to one-sigma
-        // axis nodes has covariance V/r, while the old chord accumulator
-        // silently used V.  Build one coherent spherical rule instead.  The
-        // midpoint and half-span of each asymmetric ray pair define the
-        // proposal mean and scale; its 2r atoms lie at radius sqrt(r), hence
-        // all have the same proposal density.
-        let mut proposal_mean = final_rho.clone();
-        let mut proposal_axes: Vec<Array1<f64>> = Vec::with_capacity(rank);
-        for (pair_index, &spectrum_index) in upgraded.iter().enumerate() {
-            let plus = &nodes[2 * pair_index];
-            let minus = &nodes[2 * pair_index + 1];
-            let axis = spectrum.eigenvectors.column(spectrum_index).to_owned();
-            proposal_mean.scaled_add(0.5 * (plus.step - minus.step), &axis);
-            proposal_axes.push(axis.mapv(|value| value * 0.5 * (plus.step + minus.step)));
-        }
-        let radius = (rank as f64).sqrt();
-        let mut sigma_points = Vec::with_capacity(2 * rank);
-        for axis in &proposal_axes {
-            sigma_points.push(&proposal_mean + &axis.mapv(|value| radius * value));
-            sigma_points.push(&proposal_mean - &axis.mapv(|value| radius * value));
-        }
-        // Unreachable: `rank >= 1` ensures at least two sigma points
-        // (one positive, one negative) per eigenvector. Treat as a
-        // NumericalFailure guard so any future regression surfaces.
-        if sigma_points.is_empty() {
-            return self.finalize_smoothing_outcome(first_order_numerical(
-                first_order_correction,
-                "empty sigma-point set (unreachable guard)".into(),
+            // The average of the calibrated endpoints lies inside the convex
+            // domain. Summing chord offsets can put the centre outside it.
+            proposal_center.scaled_add(0.5 * (plus.step - minus.step) / rank as f64, &axis);
+            proposal_axes.push((
+                axis,
+                width,
+                wald_step,
+                plus.evaluations + minus.evaluations,
+                plus.box_limited || minus.box_limited,
             ));
         }
-        let mut proposal_rises = Vec::with_capacity(sigma_points.len());
-        for point in &sigma_points {
-            match self.compute_rho_posterior_cost_uncharged(point) {
-                Ok(cost) if cost.is_finite() => proposal_rises.push(cost - centre_cost),
-                Ok(_) => {
-                    return self.finalize_smoothing_outcome(first_order_numerical(
-                        first_order_correction,
-                        "spherical sigma-point criterion is not finite".into(),
-                    ));
-                }
-                Err(error) => {
-                    return self.finalize_smoothing_outcome(first_order_numerical(
-                        first_order_correction,
-                        format!("spherical sigma-point criterion unavailable: {error}").into(),
-                    ));
-                }
+        let radius = (rank as f64).sqrt();
+        // A spherical r-dimensional Gaussian rule uses radius sqrt(r), not
+        // the unit radius of its calibration rays. Fit the entire proposal
+        // ellipsoid inside the numerical domain with ONE common scale. This
+        // preserves paired nodes, their equal Gaussian proposal densities,
+        // and the positive importance measure used for both covariance terms.
+        let mut proposal_scale = 1.0_f64;
+        for (axis, width, _, _, _) in &proposal_axes {
+            for sign in [1.0, -1.0] {
+                let limit = sigma_step_to_rho_domain(&proposal_center, &(axis*sign), &rho_domain);
+                proposal_scale = proposal_scale.min(limit / (radius*width));
             }
         }
-        let min_rise = proposal_rises.iter().copied().fold(f64::INFINITY, f64::min);
-        let importance_weights: Vec<f64> = proposal_rises
-            .iter()
-            .map(|rise| (min_rise - rise).exp())
-            .collect();
-
-        // Dispatch the sigma-point evaluation to whichever executor is
-        // currently the best fit for this build/runtime. See
-        // [`sigma_cubature_dispatch`] for the auto-selection rule and
-        // for the documented one-line swap site that flips to the GPU
-        // stream-pool path once `pirls-row-v3` Stage 3 and `bms-flex-v3`
-        // Phase 5 land the device-resident inner PIRLS the GPU
-        // executor needs.
-        // A sigma point is an OFF-TRAJECTORY rho: `final_rho ± sqrt(rank·λ_k)·v_k`
-        // in log-smoothing units, and that offset is largest exactly when the
-        // rho posterior is broad — which is the case cubature exists FOR. The
-        // inner solve there is a genuinely different problem from the fitted
-        // one, and for a shape-constrained fit it can be an intractable one (a
-        // cold-started active-set QP at λ many decades from the optimum).
-        //
-        // Every other way this function can fail — the rho-Hessian refusing
-        // inversion, the eigendecomposition failing, the ridge metadata being
-        // invalid, the assembled covariance going non-finite — degrades to the
-        // first-order correction with a recorded reason and severity, because
-        // cubature is an UPGRADE over a correction that is already computed and
-        // already correct. This one call propagated instead, so a failure to
-        // refine the *uncertainty* destroyed a point estimate that had already
-        // converged and certified: `gamfit.fit(frame, "y ~ s(x)",
-        // constraints={"s(x)": "convex"})` returned `Parameter constraint
-        // violation: KKT residuals exceed tolerance` for a fit whose own inner
-        // solves all reached ‖g‖ ≈ 1e-13 (#2601).
-        //
-        // Fall back on the same contract as every sibling branch. The severity
-        // is `NumericalFailure`, not `Routine` — this is a numerical failure of
-        // the upgrade, it increments the failure counter, and it logs at WARN
-        // with the propagated error, so it is recorded rather than silent.
-        let point_results = match sigma_cubature_dispatch(self, &sigma_points, Some(final_fit)) {
-            Ok(results) => results,
-            Err(error) => {
-                return self.finalize_smoothing_outcome(first_order_numerical(
-                    first_order_correction,
-                    format!("sigma-point inner solve failed at an off-trajectory rho: {error}")
-                        .into(),
-                ));
+        if proposal_scale < 1.0 { proposal_scale = proposal_scale.next_down(); }
+        if !(proposal_scale.is_finite() && proposal_scale > 0.0) {
+            return Err(EstimationError::TrialPointRefused {
+                reason: "smoothing cubature has no positive-width proposal in the resolved domain".into(),
+            });
+        }
+        let mut nodes = Vec::with_capacity(2 * rank);
+        for (axis, width, wald_step, evaluations, box_limited) in proposal_axes {
+            for sign in [1.0, -1.0] {
+                let direction = &axis * sign;
+                let step = radius * width * proposal_scale;
+                if step > sigma_step_to_rho_domain(&proposal_center, &direction, &rho_domain) {
+                    return Err(EstimationError::TrialPointRefused {
+                        reason: "smoothing cubature proposal failed its domain containment check".into(),
+                    });
+                }
+                let rho = &proposal_center + &direction * step;
+                let achieved_rise = self.compute_rho_posterior_cost_uncharged(&rho)? - centre_cost;
+                if !achieved_rise.is_finite() {
+                    return Err(EstimationError::TrialPointRefused {
+                        reason: "positive smoothing cubature node has nonfinite target density"
+                            .into(),
+                    });
+                }
+                nodes.push(CalibratedSigmaNode {
+                    rho,
+                    step,
+                    wald_step: radius * wald_step,
+                    achieved_rise,
+                    evaluations: evaluations + 1,
+                    box_limited,
+                });
             }
-        };
+        }
+        // The Gaussian proposal density is equal at every spherical node.
+        // Its constant cancels from the normalized importance weights. Shift
+        // log weights before exponentiating so no high-density node overflows.
+        let minimum_rise = nodes
+            .iter()
+            .map(|node| node.achieved_rise)
+            .fold(f64::INFINITY, f64::min);
+        let node_weights: Vec<f64> = nodes
+            .iter()
+            .map(|node| (minimum_rise - node.achieved_rise).exp())
+            .collect();
+        let sigma_points: Vec<Array1<f64>> = nodes.iter().map(|node| node.rho.clone()).collect();
+        let point_results = sigma_cubature_dispatch(self, &sigma_points, Some(final_fit))?;
 
         // Dispersion scaling of the curvature (conditional-covariance) term.
         //
@@ -1483,15 +1441,15 @@ impl<'a> RemlState<'a> {
         // estimate.rs builds `Vb = φ̂·H_opt⁻¹` and adds the first-order
         // `J·V_ρ·Jᵀ` (itself ∝ c², dispersion-free) directly. Applying φ̂ a
         // second time anywhere would make the curvature block scale as c⁴ (#582).
-        let scaled_pairs: Vec<SigmaPointResult> = point_results
+        let scaled_points: Vec<SigmaPointResult> = point_results
             .into_iter()
             .map(|(cov_point, beta_point)| (cov_point.mapv(|v| dispersion_phi * v), beta_point))
             .collect();
-        if scaled_pairs.len() != nodes.len() {
-            return self.finalize_smoothing_outcome(first_order_numerical(
-                first_order_correction,
-                "sigma-point executor returned a different number of results than nodes".into(),
-            ));
+        if scaled_points.len() != nodes.len() {
+            return Err(EstimationError::TrialPointRefused {
+                reason: "sigma-point executor returned a different number of results than nodes"
+                    .into(),
+            });
         }
         // Per-node attribution. The two terms of the law of total covariance
         // behave very differently off the optimum: `Cov_ρ[β̂]` is bounded by the
@@ -1500,27 +1458,30 @@ impl<'a> RemlState<'a> {
         // where the node was ASKED to sit and where the criterion actually put
         // it — is what makes a wide `Vp` attributable after the fact (#2728).
         if log::log_enabled!(log::Level::Info) {
-            for (index, (cov_point, _)) in scaled_pairs.iter().enumerate() {
+            let mass: f64 = node_weights.iter().sum();
+            for (index, (cov_point, _)) in scaled_points.iter().enumerate() {
+                let node = &nodes[index];
                 log::info!(
-                    "[sigma-cubature] node={index} ΔV={:.6e} \
+                    "[sigma-cubature] node={index} step={:.4e} wald_step={:.4e} ΔV={:.6e} \
+                     posterior_weight={:.6e} evals={} box_limited={} \
                      tr(φ̂·H(ρ)⁻¹)={:.6e} tr(φ̂·H(ρ̂)⁻¹)={:.6e}",
-                    proposal_rises[index],
+                    node.step,
+                    node.wald_step,
+                    node.achieved_rise,
+                    node_weights[index] / mass,
+                    node.evaluations,
+                    node.box_limited,
                     cov_point.diag().iter().sum::<f64>(),
                     dispersion_phi * base_cov.diag().iter().sum::<f64>(),
                 );
             }
         }
-        let weighted_points: Vec<WeightedSigmaPoint> = scaled_pairs
-            .into_iter()
-            .zip(importance_weights)
-            .map(|(result, weight)| WeightedSigmaPoint { result, weight })
-            .collect();
         // Every ACTIVE direction that was not upgraded keeps the first-order
         // column `Qs·J·u_k/√σ_k` it would have contributed to `J·V_ρ·Jᵀ`, so
         // the cubature covers the same subspace the first-order correction
         // does. Without this the truncation would silently SHRINK the
         // correction relative to the term it is supposed to upgrade.
-        let fallback_columns: Vec<Array1<f64>> = ranked[rank..]
+        let residual_columns: Vec<Array1<f64>> = ranked[rank..]
             .iter()
             .map(|&(index, _)| {
                 let scale = spectrum.eigenvalues[index].sqrt().recip();
@@ -1530,20 +1491,12 @@ impl<'a> RemlState<'a> {
                     .mapv(|value| value * scale)
             })
             .collect();
-        let Some(mut total_cov) =
-            accumulate_sigma_cubature_total_covariance(&weighted_points, &fallback_columns, p)
-        else {
-            return self.finalize_smoothing_outcome(first_order_numerical(
-                first_order_correction,
-                "spherical cubature produced empty, signed, or non-finite mass".into(),
-            ));
-        };
-        if !total_cov.iter().all(|v| v.is_finite()) {
-            return self.finalize_smoothing_outcome(first_order_numerical(
-                first_order_correction,
-                "assembled total covariance contains non-finite entries".into(),
-            ));
-        }
+        let mut total_cov = accumulate_sigma_cubature_total_covariance(
+            &scaled_points,
+            &node_weights,
+            &residual_columns,
+            p,
+        )?;
         symmetrize_in_place(&mut total_cov);
 
         // `total_cov = φ̂·E_ρ[H(ρ)⁻¹] + Cov_ρ[β̂]`. The consumer adds this
@@ -1568,9 +1521,9 @@ impl<'a> RemlState<'a> {
         // unevaluable does not silently become the maximum; a run in which
         // EVERY node was unevaluable reports `-inf`, which is as visibly wrong
         // as it should be.
-        let max_node_criterion_rise = proposal_rises
+        let max_node_criterion_rise = nodes
             .iter()
-            .copied()
+            .map(|node| node.achieved_rise)
             .fold(f64::NEG_INFINITY, f64::max);
         self.finalize_smoothing_outcome(SmoothingCorrectionOutcome::Cubature {
             correction: corr,
@@ -1607,7 +1560,7 @@ impl<'a> RemlState<'a> {
                 log::info!(
                     "[smoothing-correction] branch={} rank={} points={} near_boundary={} \
                      grad_norm={:.3e} max_rho_var={:.3e} max_node_criterion_rise={:.3e} \
-                     (target {PROFILE_SIGMA_RISE})",
+                     (proposal calibration rise {PROFILE_SIGMA_RISE})",
                     branch_label,
                     rank,
                     n_points,
@@ -1672,107 +1625,124 @@ impl<'a> RemlState<'a> {
 
 #[cfg(test)]
 mod sigma_cubature_accumulation_tests {
-    use super::{WeightedSigmaPoint, accumulate_sigma_cubature_total_covariance};
+    use super::{SigmaPointResult, accumulate_sigma_cubature_total_covariance};
     use ndarray::{Array1, Array2, array};
 
-    fn atom(a: Array2<f64>, b: Array1<f64>, weight: f64) -> WeightedSigmaPoint {
-        WeightedSigmaPoint {
-            result: (a, b),
-            weight,
+    fn close(actual: &Array2<f64>, expected: &Array2<f64>) {
+        let error = (actual - expected)
+            .iter()
+            .fold(0.0_f64, |m, x| m.max(x.abs()));
+        assert!(
+            error < 2e-12,
+            "error={error}, actual={actual:?}, expected={expected:?}"
+        );
+    }
+
+    #[test]
+    fn gaussian_cubature_integrates_quadratic_conditional_covariance_and_linear_mean_1561() {
+        // Independent analytic Gaussian moments: E[rho_i²]=variance_i and
+        // Cov(J rho)=J diag(variance) Jᵀ. A varying conditional covariance
+        // detects the old missing-rank term that constant-A tests cannot see.
+        let variances = [0.25_f64, 0.49, 0.81];
+        let j = array![[1.0, 2.0, -0.3], [-0.5, 0.2, 1.0]];
+        let a0 = array![[2.0, 0.2], [0.2, 1.0]];
+        let mut expected = a0.clone();
+        let mut points = Vec::new();
+        for k in 0..3 {
+            let b = Array2::from_diag(&array![k as f64 + 1.0, 0.5 * (k as f64 + 1.0)]);
+            expected.scaled_add(variances[k], &b);
+            let column = j.column(k);
+            for row in 0..2 {
+                for col in 0..2 {
+                    expected[[row, col]] += variances[k] * column[row] * column[col];
+                }
+            }
+            for sign in [-1.0, 1.0] {
+                let radius = sign * (3.0 * variances[k]).sqrt();
+                points.push((
+                    &a0 + &b * (radius * radius),
+                    &array![4.0, -2.0] + &column * radius,
+                ));
             }
         }
-    fn covariance(points: &[WeightedSigmaPoint], fallback: &[Array1<f64>]) -> Array2<f64> {
-        accumulate_sigma_cubature_total_covariance(points, fallback, 2).expect("positive measure")
-        }
-    fn close(a: &Array2<f64>, b: &Array2<f64>) {
-        let error = a
+        let actual =
+            accumulate_sigma_cubature_total_covariance(&points, &[1.0; 6], &[], 2).unwrap();
+        close(&actual, &expected);
+    }
+
+    #[test]
+    fn positive_weighted_covariance_uses_the_same_measure_for_both_terms_1561() {
+        let points = vec![(array![[1.0]], array![0.0]), (array![[3.0]], array![2.0])];
+        // E[A]=2.5; E[beta]=1.5; Var(beta)=.75.
+        close(
+            &accumulate_sigma_cubature_total_covariance(&points, &[1.0, 3.0], &[], 1).unwrap(),
+            &array![[3.25]],
+        );
+    }
+
+    #[test]
+    fn cubature_between_direction_mean_motion_is_not_lost_1561() {
+        let points: Vec<SigmaPointResult> = [0.0, 2.0, 4.0, 6.0]
+            .into_iter()
+            .map(|b| (array![[1.0]], array![b]))
+            .collect();
+        // The pair centers differ. Pair chords alone discard their variance.
+        close(
+            &accumulate_sigma_cubature_total_covariance(&points, &[1.0; 4], &[], 1).unwrap(),
+            &array![[6.0]],
+        );
+    }
+
+    #[test]
+    fn splitting_cubature_mass_and_permuting_nodes_preserves_the_distribution_1561() {
+        let points = vec![(array![[1.0]], array![-1.0]), (array![[2.0]], array![3.0])];
+        let expected =
+            accumulate_sigma_cubature_total_covariance(&points, &[2.0, 1.0], &[], 1).unwrap();
+        let split = vec![points[1].clone(), points[0].clone(), points[0].clone()];
+        close(
+            &accumulate_sigma_cubature_total_covariance(&split, &[1.0, 1.0, 1.0], &[], 1).unwrap(),
+            &expected,
+        );
+    }
+
+    #[test]
+    fn cubature_translation_and_response_scale_follow_total_covariance_1561() {
+        let points = vec![(array![[1.0]], array![-1.0]), (array![[2.0]], array![3.0])];
+        let original =
+            accumulate_sigma_cubature_total_covariance(&points, &[2.0, 1.0], &[], 1).unwrap();
+        let shifted: Vec<_> = points
             .iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f64::max);
-        assert!(error < 1e-12, "max error {error:e}: {a:?} != {b:?}");
-    }
-
-    #[test]
-    fn varying_conditional_covariance_and_linear_mean_use_the_same_measure() {
-        let points = vec![
-            atom(array![[1., 0.], [0., 2.]], array![-1., 0.], 0.25),
-            atom(array![[3., 0.], [0., 4.]], array![1., 0.], 0.75),
-        ];
-        close(&covariance(&points, &[]), &array![[3.25, 0.], [0., 3.5]]);
-    }
-
-    #[test]
-    fn asymmetric_weights_center_the_coefficient_covariance() {
-        let points = vec![
-            atom(Array2::eye(2), array![0., 0.], 1.),
-            atom(Array2::eye(2), array![3., 0.], 2.),
-        ];
-        close(&covariance(&points, &[]), &array![[3., 0.], [0., 1.]]);
-    }
-
-    #[test]
-    fn variation_between_axis_pair_means_is_not_discarded() {
-        let points = vec![
-            atom(Array2::zeros((2, 2)), array![-2., 0.], 1.),
-            atom(Array2::zeros((2, 2)), array![0., 0.], 1.),
-            atom(Array2::zeros((2, 2)), array![2., 0.], 1.),
-            atom(Array2::zeros((2, 2)), array![4., 0.], 1.),
-        ];
-        close(&covariance(&points, &[]), &array![[5., 0.], [0., 0.]]);
-    }
-
-    #[test]
-    fn splitting_an_atom_does_not_change_the_measure() {
-        let a = array![[2., 0.], [0., 3.]];
-        let original = vec![atom(a.clone(), array![1., -1.], 1.)];
-        let split = vec![
-            atom(a.clone(), array![1., -1.], 0.4),
-            atom(a, array![1., -1.], 0.6),
-        ];
-        close(&covariance(&original, &[]), &covariance(&split, &[]));
-    }
-
-    #[test]
-    fn translation_and_response_scaling_obey_covariance_laws() {
-        let base = vec![
-            atom(Array2::zeros((2, 2)), array![-1., 2.], 1.),
-            atom(Array2::zeros((2, 2)), array![3., -2.], 1.),
-        ];
-        let shifted_scaled: Vec<_> = base
-            .iter()
-            .map(|p| {
-                atom(
-                    Array2::zeros((2, 2)),
-                    p.result.1.mapv(|x| 3. * x + 7.),
-                    p.weight,
-                )
-            })
+            .map(|(a, b)| (a * 9.0, b * 3.0 + 1e10))
             .collect();
         close(
-            &covariance(&shifted_scaled, &[]),
-            &covariance(&base, &[]).mapv(|x| 9. * x),
+            &accumulate_sigma_cubature_total_covariance(&shifted, &[2.0, 1.0], &[], 1).unwrap(),
+            &(original * 9.0),
         );
     }
 
     #[test]
-    fn independent_residual_directions_remain_first_order_gaussian() {
-        let fallback = vec![array![2., -1.]];
-        let points = vec![atom(Array2::eye(2), array![0., 0.], 1.)];
+    fn cubature_residual_linear_subspace_is_independent_of_integrated_subspace_1561() {
+        let points = vec![
+            (Array2::eye(2), array![1.0, 0.0]),
+            (Array2::eye(2), array![-1.0, 0.0]),
+        ];
+        let residual = vec![array![0.0, 2.0]];
         close(
-            &covariance(&points, &fallback),
-            &array![[5., -2.], [-2., 2.]],
+            &accumulate_sigma_cubature_total_covariance(&points, &[1.0, 1.0], &residual, 2)
+                .unwrap(),
+            &array![[2.0, 0.0], [0.0, 5.0]],
         );
     }
 
     #[test]
-    fn signed_empty_and_non_finite_mass_are_refused() {
-        assert!(accumulate_sigma_cubature_total_covariance(&[], &[], 2).is_none());
-        for weight in [-1., f64::NAN, f64::INFINITY] {
-            let points = vec![atom(Array2::eye(2), array![0., 0.], weight)];
-            assert!(accumulate_sigma_cubature_total_covariance(&points, &[], 2).is_none());
-                    }
-                }
+    fn cubature_refuses_signed_or_empty_mass_1561() {
+        let points = vec![
+            (array![[1.0]], Array1::zeros(1)),
+            (array![[1.0]], Array1::zeros(1)),
+        ];
+        assert!(accumulate_sigma_cubature_total_covariance(&points, &[2.0, -1.0], &[], 1).is_err());
+        assert!(accumulate_sigma_cubature_total_covariance(&points, &[0.0, 0.0], &[], 1).is_err());
+    }
 }
 
 #[cfg(test)]
