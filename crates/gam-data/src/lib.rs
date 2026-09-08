@@ -220,9 +220,10 @@ pub enum DataError {
 impl DataError {
     /// Attach the source file to errors produced while loading a table.
     ///
-    /// Column lookup errors already identify the offending column and expose
-    /// structured fields to the Python boundary, so they deliberately remain
-    /// unchanged. All other ingest failures need the file identity as well.
+    /// Column lookup and degenerate-column errors already identify the
+    /// offending column and expose structured fields to the Python boundary,
+    /// so they deliberately remain unchanged. All other ingest failures need
+    /// the file identity as well.
     #[must_use]
     fn with_source_path(self, path: &Path) -> Self {
         let qualify = |reason: String| {
@@ -239,6 +240,7 @@ impl DataError {
             Self::EmptyInput { reason } => Self::EmptyInput { reason: qualify(reason) },
             Self::InvalidValue { reason } => Self::InvalidValue { reason: qualify(reason) },
             column @ Self::ColumnNotFound { .. } => column,
+            degenerate @ Self::DegenerateColumn { .. } => degenerate,
         }
     }
 
