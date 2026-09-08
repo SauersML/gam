@@ -64,7 +64,7 @@ struct ResidualMerits {
 struct AcceptedTerminalResidualStep {
     damping: f64,
     trial_merits: ResidualMerits,
-    predicted_quotient_decrease: f64,
+    predicted_objective_decrease: f64,
     step: DampedResidualStep,
     system: Option<ArrowSchurSystem>,
 }
@@ -462,16 +462,14 @@ impl SaeManifoldTerm {
             let mut grams = self.empty_decoder_gram_accumulator();
             self.accumulate_decoder_gram(&mut grams)?;
             let n_eff = self.per_atom_effective_sample_size();
-            let residual_energy =
-                self.residual_energy_for_vanishing(residual.view())?;
+            let residual_energy = self.residual_energy_for_vanishing(residual.view())?;
             match self.vanished_atoms_from_signal_upper_bound(
                 &grams,
                 &n_eff,
                 residual_energy.mean_square(),
             )? {
                 VanishedAtomsProof::Certified {
-                    atoms: Some(atoms),
-                    ..
+                    atoms: Some(atoms), ..
                 } => return Err(SaeCriterionError::VanishedAtoms(atoms)),
                 VanishedAtomsProof::Certified { atoms: None, .. } => {}
                 VanishedAtomsProof::Unavailable { reason } => {
@@ -693,7 +691,7 @@ impl SaeManifoldTerm {
     /// (`exact_observed_information_log_dets`), streaming prices the Arrow–Schur
     /// majorizer `B` (`streaming_exact_arrow_log_det`). The #847 bit-identity
     /// claim held for `B` against `B` and does not survive that migration.
-     /// Freeze the collapse-prevention gates for one criterion evaluation,
+    /// Freeze the collapse-prevention gates for one criterion evaluation,
     /// returning whether they were ALREADY frozen so the caller can restore.
     ///
     /// One place, because the set has to be the same set. Before #2515 the freeze
@@ -721,7 +719,7 @@ impl SaeManifoldTerm {
         gates_were_frozen
     }
 
-   pub(crate) fn converge_inner_for_undamped_logdet(
+    pub(crate) fn converge_inner_for_undamped_logdet(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -877,9 +875,7 @@ impl SaeManifoldTerm {
         // moves beyond floating-point resolution, so it admits every useful
         // ninth-or-later rescue while a repeated plateau still terminates.
         let mut stall_polish_progress =
-            super::stall_polish_progress::StallPolishProgressCertificate::new(
-                f64::EPSILON.sqrt(),
-            );
+            super::stall_polish_progress::StallPolishProgressCertificate::new(f64::EPSILON.sqrt());
         const CERTIFICATE_ESCALATION_PROGRESS: f64 = 0.7;
         const CERTIFICATE_ESCALATION_ANTI_RUNAWAY_CAP: usize = 8;
         // #1051 — objective-stagnation convergence. On an ill-conditioned
@@ -1458,8 +1454,7 @@ impl SaeManifoldTerm {
                             final_db.view(),
                         )
                         .max(0.0);
-                        let excursion_cert =
-                            0.5 * newton_decrement_sq / final_objective_scale;
+                        let excursion_cert = 0.5 * newton_decrement_sq / final_objective_scale;
                         // #2228 — the acceptance verdict keys on the BEST-SEEN
                         // certificate, not the excursion the polish left. The
                         // band is UNCHANGED; a best-seen plateau ABOVE it is a
@@ -1467,12 +1462,9 @@ impl SaeManifoldTerm {
                         // seen ‖g‖. When best-seen clears the band we certify
                         // THERE (restore + re-factor) — the continuation is
                         // over, so nothing consumes the restore.
-                        let best_clears = best_seen
-                            .as_ref()
-                            .is_some_and(|(c, _, _)| {
-                                *c < excursion_cert
-                                    && *c <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
-                            });
+                        let best_clears = best_seen.as_ref().is_some_and(|(c, _, _)| {
+                            *c < excursion_cert && *c <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
+                        });
                         if best_clears {
                             let (best_cert, best_g, best_state) =
                                 best_seen.as_ref().expect("best_clears gated on Some");
@@ -1501,9 +1493,7 @@ impl SaeManifoldTerm {
                             // excursion so state + final_cache stay consistent,
                             // then fall through to the honest refusal below.
                             self.restore_mutable_state(&excursion)?;
-                        } else if excursion_cert
-                            <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
-                        {
+                        } else if excursion_cert <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL {
                             log::debug!(
                                 "SAE inner final-gate decrement acceptance: ‖g‖={grad_norm:.6e} \
                                  (tol {grad_tolerance:.6e}) λ²={newton_decrement_sq:.6e} \
@@ -2128,23 +2118,19 @@ impl SaeManifoldTerm {
     /// already-aggregated L2 norm would retain a spurious `sqrt(K)` dependence;
     /// the max of individually scaled components is intensive in both `n` and
     /// `K`.
-    pub fn system_scaled_grad_max(
-        sys: &ArrowSchurSystem,
-    ) -> Result<f64, SaeInnerKktScaleError> {
+    pub fn system_scaled_grad_max(sys: &ArrowSchurSystem) -> Result<f64, SaeInnerKktScaleError> {
         let mut scaled_max = 0.0_f64;
         for (row_index, row) in sys.rows.iter().enumerate() {
             let gradient_len = row.gt.len();
             let (curvature_rows, curvature_cols) = row.htt.dim();
             let block = SaeInnerKktScaleBlock::CoordinateRow { row: row_index };
             if (curvature_rows, curvature_cols) != (gradient_len, gradient_len) {
-                return Err(
-                    SaeInnerKktScaleError::GradientCurvatureShapeMismatch {
-                        block,
-                        gradient_len,
-                        curvature_rows,
-                        curvature_cols,
-                    },
-                );
+                return Err(SaeInnerKktScaleError::GradientCurvatureShapeMismatch {
+                    block,
+                    gradient_len,
+                    curvature_rows,
+                    curvature_cols,
+                });
             }
             for component in 0..gradient_len {
                 let gradient = row.gt[component];
@@ -2185,14 +2171,12 @@ impl SaeManifoldTerm {
         let block = SaeInnerKktScaleBlock::SharedDecoder;
         let diagonal = sys.shared_block_diagonal();
         if sys.gb.len() != sys.k || diagonal.len() != sys.k {
-            return Err(
-                SaeInnerKktScaleError::GradientCurvatureShapeMismatch {
-                    block,
-                    gradient_len: sys.gb.len(),
-                    curvature_rows: diagonal.len(),
-                    curvature_cols: diagonal.len(),
-                },
-            );
+            return Err(SaeInnerKktScaleError::GradientCurvatureShapeMismatch {
+                block,
+                gradient_len: sys.gb.len(),
+                curvature_rows: diagonal.len(),
+                curvature_cols: diagonal.len(),
+            });
         }
         for component in 0..sys.k {
             let gradient = sys.gb[component];
@@ -2204,10 +2188,7 @@ impl SaeManifoldTerm {
                 });
             }
             let curvature = diagonal[component];
-            if !curvature.is_finite()
-                || curvature < 0.0
-                || (curvature == 0.0 && gradient != 0.0)
-            {
+            if !curvature.is_finite() || curvature < 0.0 || (curvature == 0.0 && gradient != 0.0) {
                 return Err(SaeInnerKktScaleError::InvalidCurvature {
                     block,
                     component,
@@ -2316,7 +2297,9 @@ impl SaeManifoldTerm {
         let q = self.assignment.row_block_dim();
         let dense_len = n.saturating_mul(q);
         let border_dim = self.factored_border_dim();
-        if system.rows.len() != n || system.row_offsets.len() != n + 1 || system.gb.len() != border_dim
+        if system.rows.len() != n
+            || system.row_offsets.len() != n + 1
+            || system.gb.len() != border_dim
         {
             return "orbit=unresolved(non-dense layout)".to_string();
         }
@@ -2465,7 +2448,8 @@ impl SaeManifoldTerm {
                         alpha,
                     )
                     .is_ok();
-                if applied && let Ok(trial) = self.penalized_objective_total(target, rho, registry, 1.0)
+                if applied
+                    && let Ok(trial) = self.penalized_objective_total(target, rho, registry, 1.0)
                 {
                     if (alpha - 1.0e-6).abs() < 1.0e-18 && trial.is_finite() {
                         finite_difference = (trial - base_objective) / alpha;
@@ -2608,113 +2592,22 @@ impl SaeManifoldTerm {
     /// locally quadratic and closes the same gap in O(10) steps, making the
     /// strict KKT contract REACHABLE instead of loosened.
     ///
-    /// # One merit, and it is the one the gate reads
+    /// # Objective-globalized spectral step
     ///
-    /// This phase solves `g(θ) = 0`, and the gate that judges it is a bound on
-    /// `‖g‖` (raw or gauge-quotient). So the merit here is `½‖g‖²` and nothing
-    /// else. It is a function of the STATE, not of any operator evaluated at the
-    /// state, which is what makes a comparison across two states mean something.
+    /// The KKT residual remains the convergence certificate, but it cannot be
+    /// the globalization currency: on a negative eigenmode of the exact Hessian,
+    /// objective descent increases `||g||`.  The old `(A^2 + nu) delta = -A g`
+    /// path therefore rejected the very move that left the saddle and made an
+    /// entire outer-rho neighborhood look infeasible (#2080/#2228).
     ///
-    /// The `#2762` defect was that the acceptance test compared
-    /// `gᵀB(θ₊)⁻¹g(θ₊)` — the trial state's decrement in the MAJORIZER metric —
-    /// against `gᵀA⁺g` at the pre-state, in the EXACT-Hessian metric. Same
-    /// bilinear form, two different operators, measured 67x apart on the
-    /// witness; every step passed it, `‖g‖` rose 15x–107x per accepted step, and
-    /// 482 consecutive steps were accepted after the baseline was made
-    /// self-consistent, because `gᵀB(θ)⁻¹g(θ)` can fall while `‖g‖` rises
-    /// whenever `B` stiffens.
-    ///
-    /// # Why the step is damped, and why that is the actual root cause
-    ///
-    /// Fixing the merit alone does not converge this phase, and the measurement
-    /// says why. At the `#2015` witness — `‖g‖ = 1.23e-4`, the WHOLE residual
-    /// inside the retained range — the undamped step is `‖Δ‖ = 0.44`, its full
-    /// application drives the merit `7.5e-9 → 6.1e0`, and an Armijo test on
-    /// `½‖g‖²` first passes at `α = 4.9e-4`, buying 0.03%. The step's LENGTH is
-    /// set entirely by the near-null eigendirections of `A`; the residual is
-    /// carried by the well-conditioned ones. No scalar step length separates
-    /// them — shrinking the step to keep the flat direction inside the model
-    /// shrinks the useful directions by the same factor.
-    ///
-    /// Damping does separate them. `A` is already materialized and
-    /// diagonalized here, so the whole Levenberg–Marquardt path
-    /// [`ExactHessianSpectralBlock::damped_residual_step`] is available in
-    /// closed form at one diagonal pass per point — including the modeled
-    /// residual this caller prices in its quotient merit. On the same witness
-    /// `ν = 5.7e-7` gives `‖Δ‖ = 4.6e-4`, drives
-    /// the merit `7.5e-9 → 6.2e-11` (`‖g‖ 1.23e-4 → 1.11e-5`, past a `7.1e-5`
-    /// tolerance in ONE step) at a measured/predicted ratio of `0.9992`.
-    ///
-    /// # The ladder, and why every number in it is derived
-    ///
-    /// * The first trial is `ν = 0` — the undamped step this phase has always
-    ///   taken — so the quadratic tail near a well-conditioned root is
-    ///   unchanged, and a state that never needed damping never pays for it.
-    /// * The ladder then runs from `λ_min²` to `λ_max²` over the RETAINED
-    ///   spectrum by [`opt::constants::RIDGE_GROWTH`]: below `λ_min²` a damping
-    ///   cannot move the flattest resolved direction, above `λ_max²` it has
-    ///   already flattened every direction there is.
-    /// * The accepted damping is CARRIED to the next step (divided by the same
-    ///   growth, and snapped back to `0` once it falls under `λ_min²`), so a
-    ///   converging tail walks back to the pure Newton step by itself.
-    /// * A trial is accepted when its MEASURED merit reduction is at least the
-    ///   shared Armijo fraction [`SAE_MANIFOLD_ARMIJO_C1`] of the reduction its
-    ///   own closed-form model predicted, with the shared round-off cushion.
-    ///   Model-predicted reduction is monotonically decreasing along the ladder,
-    ///   so a ladder that falls under the round-off floor
-    ///   [`SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR`] × merit is exhausted —
-    ///   that is a proof of termination, not a cap.
-    ///
-    /// Consequences worth stating as properties:
-    ///
-    /// * every accepted step STRICTLY decreases the quantity the refusal is
-    ///   denominated in, so this phase can no longer leave the state worse than
-    ///   it found it — which is what it measurably did on both `#2762` witnesses;
-    /// * the merit is monotone across steps by construction, so no
-    ///   cross-iteration contraction bail is needed and none is kept;
-    /// * a trial costs ONE assembly. It used to cost an assembly plus a full
-    ///   arrow factorization, because the merit it evaluated needed one.
-    ///
-    /// Indefiniteness of `A` needs no special handling: `Δ(ν)` solves
-    /// `(A² + ν)Δ = −Ag`, whose operator is positive semidefinite for every
-    /// symmetric `A`, so a resolved negative mode is descended, not reflected.
-    /// Every internal failure degrades to `Ok(false)` (fall through to the
-    /// historical stall accounting), never to a new error class, and a rejected
-    /// trial restores the snapshot bit-for-bit.
-    ///
-    /// Returns `Ok(true)` when at least one step was committed (the caller
-    /// re-enters the refine loop, whose existing raw/quotient KKT gate +
-    /// idempotence certificate remain the SOLE acceptance authority — this
-    /// phase mints nothing).
-    /// A residual measured in the two currencies the inner gate speaks: the
-    /// gauge-QUOTIENT merit `½‖Π⊥null r‖²` — which is what
-    /// [`Self::quasi_laplace_kkt_stationary`] is a bound on, since the quotient
-    /// norm is clamped at or below the raw one — and the AMBIENT merit `½‖r‖²`.
-    ///
-    /// Returned together because the polish accepts on the first and holds the
-    /// second as an invariant: a step may not buy quotient progress by pumping
-    /// residual into the gauge orbit, which is the only way a projected norm can
-    /// fall without the residual falling.
-    fn residual_merits(
-        &self,
-        residual: &SaeArrowVector,
-        penalized_gram_scale: &[f64],
-    ) -> ResidualMerits {
-        let ambient_norm_sq =
-            residual.t.dot(&residual.t) + residual.beta.dot(&residual.beta);
-        let quotient_norm_sq = self
-            .quotient_gradient_norm_sq(
-                residual.t.view(),
-                residual.beta.view(),
-                ambient_norm_sq,
-                penalized_gram_scale,
-            )
-            .unwrap_or(ambient_norm_sq);
-        ResidualMerits {
-            quotient: 0.5 * quotient_norm_sq,
-            ambient: 0.5 * ambient_norm_sq,
-        }
-    }
+    /// The step now uses the absolute spectral Hessian,
+    /// `delta_i = -g_i / (|lambda_i| + sqrt(nu))`.  Thus `g^T delta < 0` on every
+    /// retained mode, irrespective of curvature sign, while it is ordinary
+    /// Newton on a positive-definite basin.  The existing derived damping ladder
+    /// controls its radius, and Armijo acceptance is measured against the actual
+    /// penalized objective.  Rejected trials restore the snapshot bit-for-bit.
+    /// No KKT tolerance changes: only the converged refine-loop gate can mint a
+    /// fit.
 
     fn terminal_exact_newton_polish(
         &mut self,
@@ -2881,15 +2774,16 @@ impl SaeManifoldTerm {
             // own units — the same relative floor the majorized Armijo lane
             // applies to its directional decrease. A prediction below it is
             // f64 noise in the quadratic model, not a step worth measuring.
+            let pre_objective = self.penalized_objective_total(target, rho_fixed, registry, 1.0)?;
             let predicted_floor =
-                SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR * pre_merits.quotient;
+                SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR * (1.0 + pre_objective.abs());
             let snapshot = self.snapshot_mutable_state();
             let backtrack_started = std::time::Instant::now();
             let mut trials = 0usize;
             let mut accepted: Option<AcceptedTerminalResidualStep> = None;
             let mut nu = damping;
             loop {
-                let damped = match geometry.damped_residual_step(&residual, nu) {
+                let damped = match geometry.damped_objective_step(&residual, nu) {
                     Ok(damped) => damped,
                     Err(err) => {
                         log::debug!(
@@ -2898,11 +2792,10 @@ impl SaeManifoldTerm {
                         break;
                     }
                 };
-                let model_merits = self.residual_merits(&damped.model_residual, lambda_smooth);
-                let predicted_quotient_decrease =
-                    pre_merits.quotient - model_merits.quotient;
-                if !(predicted_quotient_decrease.is_finite()
-                    && predicted_quotient_decrease > predicted_floor)
+                let predicted_objective_decrease =
+                    -(residual.t.dot(&damped.step.t) + residual.beta.dot(&damped.step.beta));
+                if !(predicted_objective_decrease.is_finite()
+                    && predicted_objective_decrease > predicted_floor)
                 {
                     // The model's predicted reduction decreases monotonically in
                     // ν, so no larger damping on this ladder can clear the floor
@@ -2910,10 +2803,8 @@ impl SaeManifoldTerm {
                     // stated reason rather than at a trial count.
                     log::debug!(
                         "terminal Newton: damping ladder exhausted at ν={nu:.6e} — predicted \
-                         quotient-merit reduction {predicted_quotient_decrease:.6e} is under the \
-                         round-off floor {predicted_floor:.6e} (quotient merit \
-                         {:.6e})",
-                        pre_merits.quotient,
+                         objective decrease {predicted_objective_decrease:.6e} is under the \
+                         round-off floor {predicted_floor:.6e}",
                     );
                     break;
                 }
@@ -2955,24 +2846,21 @@ impl SaeManifoldTerm {
                         None,
                     )
                 };
-                let sufficient = SAE_MANIFOLD_ARMIJO_C1 * predicted_quotient_decrease;
-                // Acceptance: a measured reduction of the GATE's currency worth
-                // at least the shared Armijo fraction of what this step's own
-                // model predicted. Invariant, not a second currency: the ambient
-                // residual may not GROW, so quotient progress can never be
-                // bought by pumping residual into the gauge orbit — which is the
-                // only way a projected norm falls while the residual does not.
-                if trial_merits.quotient.is_finite()
-                    && trial_merits.ambient.is_finite()
-                    && pre_merits.quotient - trial_merits.quotient
-                        >= sufficient - opt::armijo_roundoff_cushion(pre_merits.quotient)
-                    && trial_merits.ambient
-                        <= pre_merits.ambient + opt::armijo_roundoff_cushion(pre_merits.ambient)
+                let trial_objective = self
+                    .penalized_objective_total(target, rho_fixed, registry, 1.0)
+                    .unwrap_or(f64::INFINITY);
+                let sufficient = SAE_MANIFOLD_ARMIJO_C1 * predicted_objective_decrease;
+                // Acceptance is Armijo descent in the scalar objective. The residual is
+                // deliberately not constrained here: at negative curvature, genuine
+                // objective descent can and generally does increase its norm.
+                if trial_objective.is_finite()
+                    && pre_objective - trial_objective
+                        >= sufficient - opt::armijo_roundoff_cushion(pre_objective)
                 {
                     accepted = Some(AcceptedTerminalResidualStep {
                         damping: nu,
                         trial_merits,
-                        predicted_quotient_decrease,
+                        predicted_objective_decrease,
                         step: damped,
                         system: trial_system,
                     });
@@ -3010,8 +2898,8 @@ impl SaeManifoldTerm {
             let Some(accepted) = accepted else {
                 log::debug!(
                     "terminal Newton bail: no damping on [{smallest_damping:.6e}, \
-                     {largest_damping:.6e}] bought a sufficient measured decrease of the \
-                     residual merit at ‖g‖={grad_norm:.6e} ({trials} trial(s))"
+                     {largest_damping:.6e}] bought sufficient Armijo decrease of the \
+                     penalized objective at ‖g‖={grad_norm:.6e} ({trials} trial(s))"
                 );
                 break;
             };
@@ -3045,11 +2933,7 @@ impl SaeManifoldTerm {
                 let after_sq = Self::system_grad_norm_sq(system);
                 let after_gate =
                     self.quotient_gradient_norm_from_system(system, after_sq, lambda_smooth);
-                if Self::quasi_laplace_kkt_stationary(
-                    after_sq.sqrt(),
-                    after_gate,
-                    grad_tolerance,
-                ) {
+                if Self::quasi_laplace_kkt_stationary(after_sq.sqrt(), after_gate, grad_tolerance) {
                     // The step landed in the band. Say so without paying for the
                     // next loop top's assembly to rediscover it.
                     log::debug!(
@@ -3114,11 +2998,11 @@ impl SaeManifoldTerm {
                  {grad_tolerance:.6e}",
                 pre_merits.quotient,
                 accepted.trial_merits.quotient,
-                accepted.predicted_quotient_decrease,
+                accepted.predicted_objective_decrease,
                 pre_merits.quotient - accepted.trial_merits.quotient,
-                if accepted.predicted_quotient_decrease > 0.0 {
+                if accepted.predicted_objective_decrease > 0.0 {
                     (pre_merits.quotient - accepted.trial_merits.quotient)
-                        / accepted.predicted_quotient_decrease
+                        / accepted.predicted_objective_decrease
                 } else {
                     f64::NAN
                 },
@@ -3921,16 +3805,14 @@ impl SaeManifoldTerm {
             // spectral classifications of `A` and `A_tt`, so their difference is
             // `log|S_A|` only where neither PD floor deflates a direction.)
             let residual = self.reconstruction_residual(target, rho)?;
-            let residual_energy =
-                self.residual_energy_for_vanishing(residual.view())?;
+            let residual_energy = self.residual_energy_for_vanishing(residual.view())?;
             match self.vanished_atoms_from_signal_upper_bound(
                 &ri.grams,
                 &ri.n_eff,
                 residual_energy.mean_square(),
             )? {
                 VanishedAtomsProof::Certified {
-                    atoms: Some(atoms),
-                    ..
+                    atoms: Some(atoms), ..
                 } => return Err(SaeCriterionError::VanishedAtoms(atoms)),
                 VanishedAtomsProof::Certified { atoms: None, .. } => {}
                 VanishedAtomsProof::Unavailable { reason } => {
@@ -4053,8 +3935,7 @@ impl SaeManifoldTerm {
                 row_dims.len()
             ));
         }
-        let delta =
-            self.assemble_exact_hessian_minus_b_rows(rho, target, &row_dims, border_dim)?;
+        let delta = self.assemble_exact_hessian_minus_b_rows(rho, target, &row_dims, border_dim)?;
         if delta.len() != majorizer.rows.len() {
             return Err(format!(
                 "SaeManifoldTerm::exact_a_evidence_system: assembled {} exact-A correction rows \
@@ -4071,22 +3952,21 @@ impl SaeManifoldTerm {
         // conditioning, from the same row layout as ΔC.
         let clamp = self.materialize_ard_concave_clamp_diagonal_for_rows(rho, &row_dims)?;
         let mut clamp_base = 0usize;
-        let classification_rows: std::sync::Arc<
-            [gam_solve::arrow_schur::ExactAClassificationRow],
-        > = delta
-            .into_iter()
-            .zip(row_dims.iter().copied())
-            .map(|(block, q)| {
-                let clamp_diag = clamp.slice(s![clamp_base..clamp_base + q]).to_owned();
-                clamp_base += q;
-                gam_solve::arrow_schur::ExactAClassificationRow {
-                    delta_tt: block.tt,
-                    delta_tbeta: block.tbeta,
-                    clamp_diag,
-                }
-            })
-            .collect::<Vec<_>>()
-            .into();
+        let classification_rows: std::sync::Arc<[gam_solve::arrow_schur::ExactAClassificationRow]> =
+            delta
+                .into_iter()
+                .zip(row_dims.iter().copied())
+                .map(|(block, q)| {
+                    let clamp_diag = clamp.slice(s![clamp_base..clamp_base + q]).to_owned();
+                    clamp_base += q;
+                    gam_solve::arrow_schur::ExactAClassificationRow {
+                        delta_tt: block.tt,
+                        delta_tbeta: block.tbeta,
+                        clamp_diag,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into();
         let border = self.border_channels_for_border_dim(border_dim)?;
         let classification_indices: std::sync::Arc<[usize]> = border
             .iter()
@@ -4122,12 +4002,11 @@ impl SaeManifoldTerm {
             majorizer.htbeta_transpose_matvec.clone(),
         ) {
             (None, _) => {
-                for (row_idx, (row, block)) in
-                    system
-                        .rows
-                        .iter_mut()
-                        .zip(classification_rows.iter())
-                        .enumerate()
+                for (row_idx, (row, block)) in system
+                    .rows
+                    .iter_mut()
+                    .zip(classification_rows.iter())
+                    .enumerate()
                 {
                     let q = block.delta_tt.nrows();
                     if row.htbeta.dim() != (q, border_dim) {
@@ -4140,8 +4019,7 @@ impl SaeManifoldTerm {
                     }
                     for a in 0..q {
                         for (beta_pos, channel) in border.iter().enumerate() {
-                            row.htbeta[[a, channel.index]] +=
-                                block.delta_tbeta[[a, beta_pos]];
+                            row.htbeta[[a, channel.index]] += block.delta_tbeta[[a, beta_pos]];
                         }
                     }
                 }
@@ -4215,12 +4093,11 @@ impl SaeManifoldTerm {
                 );
             }
         }
-        system.exact_a_classification = Some(
-            gam_solve::arrow_schur::ExactAClassificationGeometry {
+        system.exact_a_classification =
+            Some(gam_solve::arrow_schur::ExactAClassificationGeometry {
                 rows: classification_rows,
                 border_indices: classification_indices,
-            },
-        );
+            });
         system.refresh_row_hessian_fingerprint();
         Ok(system)
     }

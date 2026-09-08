@@ -7805,6 +7805,33 @@ impl SaeManifoldTerm {
                 moved_at.get_or_insert(StateMoveSite::ProximalCorrectionStep);
                 gauge_block_armed = true;
             }
+            // #2080/#2228 — the Newton solve deliberately quotients the
+            // reconstruction gauge to keep its Schur complement conditioned.
+            // Priors make that data-null orbit non-null for the FULL objective,
+            // however, so quotienting the step without minimizing its partner
+            // block deletes a real gradient component.  Compose both blocks at
+            // every accepted iterate; waiting for an objective-stall rescue left
+            // the orbit residual to become virtually the entire residual first.
+            if gauge_block_armed {
+                gauge_block_armed = false;
+                let orbit = self.descend_gauge_orbit(
+                    target,
+                    rho,
+                    analytic_penalties,
+                    &rho.lambda_smooth_vec()?,
+                    max_iter.saturating_sub(outer_iteration).max(1),
+                )?;
+                if orbit.moved() {
+                    state_moved = true;
+                    moved_at.get_or_insert(StateMoveSite::GaugeOrbitDescent);
+                    log::debug!(
+                        "run_joint_fit_arrow_schur: paired gauge block recovered {:.6e} over \
+                         {} round(s) after accepted iteration {outer_iteration}",
+                        orbit.objective_decrease,
+                        orbit.rounds,
+                    );
+                }
+            }
             // Affine gauge canonicalization is a representation change, but the
             // decoder smoothness term is part of the optimized objective — a
             // class-(c) objective-guarded transaction (kept move discarded: a

@@ -95,7 +95,6 @@ mod exact_hessian_fixture_tests {
         }
         (term, target, rho)
     }
-
 }
 
 #[cfg(test)]
@@ -426,10 +425,10 @@ mod amortized_encoder_tests {
                     .expect("sparse joint logdet trace");
                 let coord = t
                     .coordinate_block_assignment_log_strength_hessian_trace(
-                    &r,
-                    &cache,
-                    EvidenceOperator::Majorizer,
-                )
+                        &r,
+                        &cache,
+                        EvidenceOperator::Majorizer,
+                    )
                     .expect("sparse coordinate-block logdet trace");
                 v[si] = joint - coord;
             }
@@ -546,8 +545,7 @@ mod amortized_encoder_tests {
                     1.0e-6,
                 )
                 .expect("diagnostic cache");
-            let per_row: Vec<usize> =
-                cache.deflated_row_directions.iter().map(Vec::len).collect();
+            let per_row: Vec<usize> = cache.deflated_row_directions.iter().map(Vec::len).collect();
             let total: usize = per_row.iter().sum();
             let spectra: Vec<(usize, f64)> = cache
                 .deflation_row_spectra
@@ -634,7 +632,12 @@ mod amortized_encoder_tests {
             let gamma = match part {
                 0 => t.logdet_theta_adjoint(&r, &cache, &solver).unwrap(),
                 1 => t
-                    .coordinate_block_logdet_theta_adjoint(&r, &cache, EvidenceOperator::Majorizer, None)
+                    .coordinate_block_logdet_theta_adjoint(
+                        &r,
+                        &cache,
+                        EvidenceOperator::Majorizer,
+                        None,
+                    )
                     .unwrap(),
                 _ => {
                     let rc = t
@@ -687,9 +690,7 @@ mod amortized_encoder_tests {
     /// (`|H·x − g|` would then be the small one). Diagnostic: prints the norms.
     #[test]
     fn third_order_ift_deflation_residual_2330() {
-        use crate::manifold::arrow_solver::{
-            SaeArrowVector, apply_cached_arrow_hessian,
-        };
+        use crate::manifold::arrow_solver::{SaeArrowVector, apply_cached_arrow_hessian};
         use ndarray::array;
         let (mut term, target, rho, _stationary_cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
@@ -818,7 +819,12 @@ mod amortized_encoder_tests {
             .expect("gamma_joint");
         {
             let gtt = term
-                .coordinate_block_logdet_theta_adjoint(&rho, &cache, EvidenceOperator::Majorizer, None)
+                .coordinate_block_logdet_theta_adjoint(
+                    &rho,
+                    &cache,
+                    EvidenceOperator::Majorizer,
+                    None,
+                )
                 .expect("gamma_tt");
             gamma_eff.t -= &gtt.t;
             gamma_eff.beta -= &gtt.beta;
@@ -883,7 +889,12 @@ mod amortized_encoder_tests {
                     .logdet_theta_adjoint(&r, &cache, &solver)
                     .expect("gamma_joint");
                 let gtt = t
-                    .coordinate_block_logdet_theta_adjoint(&r, &cache, EvidenceOperator::Majorizer, None)
+                    .coordinate_block_logdet_theta_adjoint(
+                        &r,
+                        &cache,
+                        EvidenceOperator::Majorizer,
+                        None,
+                    )
                     .expect("gamma_tt");
                 g.t -= &gtt.t;
                 g.beta -= &gtt.beta;
@@ -1191,7 +1202,10 @@ mod amortized_encoder_tests {
             );
             let a_tt = sym.slice(s![..total_t, ..total_t]).to_owned();
             let (eigs_tt, vecs_tt) = a_tt.eigh(Side::Lower).expect("A_tt eigendecomposition");
-            let tt_norm = eigs_tt.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+            let tt_norm = eigs_tt
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f64, f64::max);
             let tt_metric = ArrowMetric::Coordinate(&cache);
             let kept_tt: f64 = eigs_tt
                 .iter()
@@ -1304,7 +1318,10 @@ mod amortized_encoder_tests {
         assert!(
             matches!(&result, Ok((value, _, _)) if value.is_finite()),
             "the E-attributable a_saddle specimen must PRICE FINITE under #2336, not refuse; got: {:?}",
-            result.as_ref().map(|(value, _, _)| *value).map_err(|e| format!("{e:?}"))
+            result
+                .as_ref()
+                .map(|(value, _, _)| *value)
+                .map_err(|e| format!("{e:?}"))
         );
     }
 
@@ -1482,7 +1499,6 @@ mod softmax_majorizer_active_entry_1410_tests {
             }
         }
     }
-
 }
 
 /// #1418: the implicit-function (IFT) back-substitution must invert the EXACT
@@ -1574,11 +1590,11 @@ mod exact_stationarity_solve_1418_tests {
     fn dense_exact_stationarity_pseudoinverse_keeps_signed_range_and_drops_null_2653() {
         let eigenvalues = Array1::from_vec(vec![4.0_f64, 1.0e-12, -2.0]);
         let geometry = spectral_block_with_uniform_floor(
-                Array2::from_diag(&eigenvalues),
-                eigenvalues,
-                Array2::from_diag(&Array1::ones(3)),
-                1.0e-9,
-            );
+            Array2::from_diag(&eigenvalues),
+            eigenvalues,
+            Array2::from_diag(&Array1::ones(3)),
+            1.0e-9,
+        );
         let rhs = SaeArrowVector {
             t: Array1::from_vec(vec![8.0, 3.0]),
             beta: Array1::from_vec(vec![6.0]),
@@ -1604,11 +1620,11 @@ mod exact_stationarity_solve_1418_tests {
     fn damped_residual_step_at_zero_damping_is_the_pseudoinverse_step_2762() {
         let eigenvalues = Array1::from_vec(vec![4.0_f64, 1.0e-12, -2.0]);
         let geometry = spectral_block_with_uniform_floor(
-                Array2::from_diag(&eigenvalues),
-                eigenvalues,
-                Array2::from_diag(&Array1::ones(3)),
-                1.0e-9,
-            );
+            Array2::from_diag(&eigenvalues),
+            eigenvalues,
+            Array2::from_diag(&Array1::ones(3)),
+            1.0e-9,
+        );
         // The damped path is stated in the RESIDUAL `g`; the pseudoinverse
         // route is stated in `rhs = −g`.
         let residual = SaeArrowVector {
@@ -1627,7 +1643,11 @@ mod exact_stationarity_solve_1418_tests {
             .expect("zero damping is the pseudoinverse point of the path");
         assert_abs_diff_eq!(damped.step.t[0], pseudoinverse.t[0], epsilon = 1.0e-15);
         assert_abs_diff_eq!(damped.step.t[1], pseudoinverse.t[1], epsilon = 1.0e-15);
-        assert_abs_diff_eq!(damped.step.beta[0], pseudoinverse.beta[0], epsilon = 1.0e-15);
+        assert_abs_diff_eq!(
+            damped.step.beta[0],
+            pseudoinverse.beta[0],
+            epsilon = 1.0e-15
+        );
         // The `1e-12` direction is inside the null band, so its whole
         // coefficient survives into the model residual and nothing else does:
         // `½·3² = 4.5`.
@@ -1659,20 +1679,14 @@ mod exact_stationarity_solve_1418_tests {
         }
         let eigenvalues = Array1::from_vec(vec![3.0_f64, -0.75, 1.0e-5, 0.25]);
         let operator = basis.dot(&Array2::from_diag(&eigenvalues)).dot(&basis.t());
-        let geometry = spectral_block_with_uniform_floor(
-                operator.clone(),
-                eigenvalues,
-                basis,
-                1.0e-12,
-            );
+        let geometry =
+            spectral_block_with_uniform_floor(operator.clone(), eigenvalues, basis, 1.0e-12);
         let residual = SaeArrowVector {
             t: Array1::from_vec(vec![0.7_f64, -1.3, 0.2]),
             beta: Array1::from_vec(vec![0.9]),
         };
         let mut flat_residual = Array1::<f64>::zeros(dim);
-        flat_residual
-            .slice_mut(s![..3])
-            .assign(&residual.t);
+        flat_residual.slice_mut(s![..3]).assign(&residual.t);
         flat_residual[3] = residual.beta[0];
         let mut previous_reduction = f64::INFINITY;
         for nu in [0.0_f64, 1.0e-10, 1.0e-6, 1.0e-2, 1.0, 1.0e3] {
@@ -1719,11 +1733,11 @@ mod exact_stationarity_solve_1418_tests {
     fn damping_separates_a_flat_direction_from_a_resolved_one_2762() {
         let eigenvalues = Array1::from_vec(vec![1.0_f64, 1.0e-6]);
         let geometry = spectral_block_with_uniform_floor(
-                Array2::from_diag(&eigenvalues),
-                eigenvalues,
-                Array2::from_diag(&Array1::ones(2)),
-                1.0e-14,
-            );
+            Array2::from_diag(&eigenvalues),
+            eigenvalues,
+            Array2::from_diag(&Array1::ones(2)),
+            1.0e-14,
+        );
         let residual = SaeArrowVector {
             t: Array1::from_vec(vec![1.0_f64]),
             beta: Array1::from_vec(vec![1.0]),
@@ -1762,23 +1776,51 @@ mod exact_stationarity_solve_1418_tests {
         assert!(resolved_leftover < 1.0e-5 && flat_leftover > 0.999);
     }
 
-    /// #2762 — the polish may not leave the state with a LARGER KKT residual
-    /// than it found. Ever, at any budget.
-    ///
-    /// This is the property the shipped acceptance test could not enforce and
-    /// measurably violated: on both #2762 witnesses EVERY step was accepted
-    /// while the raw KKT gradient rose 15x and 107x, because acceptance was
-    /// carried by a comparison between the trial state's decrement in the
-    /// MAJORIZER metric and the pre-state's decrement in the EXACT-Hessian
-    /// metric. This drives the phase directly with a tolerance no state can
-    /// meet, so it must step rather than return at its own gate, and asserts the
-    /// merit it now descends — `½‖g‖²` — is monotone across the whole budget.
-    ///
-    /// The end-to-end witnesses (`planted_1e4_column_spread…`,
-    /// `reactive_entry_reseeds…`) pin the CONVERGENCE this buys; this pins the
-    /// safety property, which holds on states where nothing converges at all.
+    /// #2080/#2228 — residual minimization and objective minimization point in
+    /// opposite directions on a negative-curvature mode.  The terminal polish
+    /// must use the latter: otherwise it rejects precisely the direction which
+    /// can leave the non-stationary inner saddle and every outer rho probe is
+    /// reported as infeasible.
     #[test]
-    fn terminal_polish_never_raises_the_kkt_residual_2762() {
+    fn terminal_objective_step_descends_resolved_negative_curvature_2080() {
+        let eigenvalues = Array1::from_vec(vec![-2.0_f64, 4.0]);
+        let geometry = spectral_block_with_uniform_floor(
+            Array2::from_diag(&eigenvalues),
+            eigenvalues,
+            Array2::from_diag(&Array1::ones(2)),
+            1.0e-12,
+        );
+        let gradient = SaeArrowVector {
+            t: Array1::from_vec(vec![3.0]),
+            beta: Array1::from_vec(vec![5.0]),
+        };
+        let residual_step = geometry
+            .damped_residual_step(&gradient, 0.0)
+            .expect("residual Gauss-Newton step");
+        let objective_step = geometry
+            .damped_objective_step(&gradient, 0.0)
+            .expect("objective trust-region step");
+        assert!(
+            gradient.t.dot(&residual_step.step.t) > 0.0,
+            "the negative-mode residual step must expose the old objective-ascent defect"
+        );
+        let directional_derivative =
+            gradient.t.dot(&objective_step.step.t) + gradient.beta.dot(&objective_step.step.beta);
+        assert!(
+            directional_derivative < 0.0,
+            "the objective step must be descent across both signs of curvature, got g dot d = {directional_derivative:.6e}"
+        );
+        assert_abs_diff_eq!(objective_step.step.t[0], -1.5, epsilon = 1.0e-14);
+        assert_abs_diff_eq!(objective_step.step.beta[0], -1.25, epsilon = 1.0e-14);
+    }
+
+    /// #2080/#2228 — the polish may not raise the penalized objective.  The
+    /// former residual-monotonicity assertion was itself wrong: objective descent
+    /// along resolved negative curvature necessarily increases `||g||`.  Driving
+    /// with an unreachable tolerance forces a real step and pins the scalar
+    /// currency on which terminal globalization is now accepted.
+    #[test]
+    fn terminal_polish_never_raises_the_penalized_objective_2080() {
         let (mut term, target, rho, _cache) =
             super::exact_hessian_fixture_tests::converged_state_with_residual();
         let lambda_smooth = rho.lambda_smooth_vec().expect("smoothness strengths");
@@ -1797,6 +1839,9 @@ mod exact_stationarity_solve_1418_tests {
             .abs()
             + 1.0;
         let before = residual_norm(&mut term);
+        let objective_before = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("objective before terminal polish");
         let mut best_seen = None;
         // Tolerance `0`: `quasi_laplace_kkt_stationary` cannot fire, so the
         // phase runs its budget instead of handing straight back.
@@ -1814,18 +1859,22 @@ mod exact_stationarity_solve_1418_tests {
             )
             .expect("the polish degrades every internal failure to Ok(false)");
         let after = residual_norm(&mut term);
+        let objective_after = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("objective after terminal polish");
         assert!(
-            after <= before,
-            "the polish raised the KKT residual it is judged on: {before:.6e} -> {after:.6e} \
-             (moved={moved})"
+            objective_after <= objective_before,
+            "the polish raised the scalar objective: {objective_before:.6e} -> \
+             {objective_after:.6e} (residual {before:.6e} -> {after:.6e}, moved={moved})"
         );
         // Non-vacuity: an unreachable tolerance on a state with a live residual
         // must make this phase actually step, or the assertion above is testing
         // an early return.
         assert!(
-            moved && after < before,
-            "the phase must commit at least one step at tolerance 0 on a state with a live \
-             residual: {before:.6e} -> {after:.6e} (moved={moved})"
+            moved && objective_after < objective_before,
+            "the phase must commit objective descent at tolerance 0: objective \
+             {objective_before:.6e} -> {objective_after:.6e}, residual \
+             {before:.6e} -> {after:.6e} (moved={moved})"
         );
     }
 
@@ -1835,11 +1884,11 @@ mod exact_stationarity_solve_1418_tests {
     fn retained_curvature_extremes_span_the_resolved_band_only_2762() {
         let eigenvalues = Array1::from_vec(vec![-7.0_f64, 1.0e-12, 0.5, 2.0]);
         let geometry = spectral_block_with_uniform_floor(
-                Array2::from_diag(&eigenvalues),
-                eigenvalues,
-                Array2::from_diag(&Array1::ones(4)),
-                1.0e-9,
-            );
+            Array2::from_diag(&eigenvalues),
+            eigenvalues,
+            Array2::from_diag(&Array1::ones(4)),
+            1.0e-9,
+        );
         let (smallest, largest) = geometry
             .retained_curvature_extremes()
             .expect("three directions clear the null band");
@@ -1850,11 +1899,11 @@ mod exact_stationarity_solve_1418_tests {
         // must say so rather than hand back a degenerate span.
         let null_eigenvalues = Array1::from_vec(vec![1.0e-12_f64, -2.0e-12]);
         let null_geometry = spectral_block_with_uniform_floor(
-                Array2::from_diag(&null_eigenvalues),
-                null_eigenvalues,
-                Array2::from_diag(&Array1::ones(2)),
-                1.0e-9,
-            );
+            Array2::from_diag(&null_eigenvalues),
+            null_eigenvalues,
+            Array2::from_diag(&Array1::ones(2)),
+            1.0e-9,
+        );
         assert!(null_geometry.retained_curvature_extremes().is_none());
     }
 
@@ -1920,7 +1969,6 @@ mod exact_stationarity_solve_1418_tests {
             "exact A-solve residual {exact_resid:.3e} must be far below surrogate {surrogate_resid:.3e}"
         );
     }
-
 }
 
 /// Validates the matrix-free Hutchinson stochastic-trace estimator that replaces

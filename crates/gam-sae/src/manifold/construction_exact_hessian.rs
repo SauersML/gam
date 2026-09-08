@@ -405,6 +405,58 @@ impl ExactHessianSpectralBlock {
         })
     }
 
+    /// A spectrally scaled descent step for the scalar objective whose gradient
+    /// is `residual`.  Unlike `damped_residual_step`, this uses `|A|` rather
+    /// than `A`: every retained component therefore has negative directional
+    /// derivative even when the stationarity operator is indefinite.  `nu`
+    /// has the same squared-curvature units as the residual damping ladder.
+    fn damped_objective_step(
+        &self,
+        residual: &SaeArrowVector,
+        nu: f64,
+    ) -> Result<DampedResidualStep, String> {
+        let total_t = residual.t.len();
+        let dim = total_t + residual.beta.len();
+        if self.eigenvectors.dim() != (dim, dim) || self.eigenvalues.len() != dim {
+            return Err("damped objective step: geometry and residual dimensions differ".into());
+        }
+        if !(nu.is_finite() && nu >= 0.0) {
+            return Err(format!(
+                "damped objective step: damping must be finite and >= 0; got {nu}"
+            ));
+        }
+        let mut flat = Array1::<f64>::zeros(dim);
+        flat.slice_mut(s![..total_t]).assign(&residual.t);
+        flat.slice_mut(s![total_t..]).assign(&residual.beta);
+        if !flat.iter().all(|value| value.is_finite()) {
+            return Err("damped objective step: residual contains a non-finite value".into());
+        }
+        let coefficients = self.eigenvectors.t().dot(&flat);
+        let mut step_coefficients = Array1::<f64>::zeros(dim);
+        let mut retained_rank = 0;
+        for index in 0..dim {
+            let magnitude = self.eigenvalues[index].abs();
+            if magnitude > self.rank_floor(index) {
+                step_coefficients[index] = -coefficients[index] / (magnitude + nu.sqrt());
+                retained_rank += 1;
+            }
+        }
+        let solution = self.eigenvectors.dot(&step_coefficients);
+        let model = &flat + &self.operator.dot(&solution);
+        Ok(DampedResidualStep {
+            step: SaeArrowVector {
+                t: solution.slice(s![..total_t]).to_owned(),
+                beta: solution.slice(s![total_t..]).to_owned(),
+            },
+            model_residual: SaeArrowVector {
+                t: model.slice(s![..total_t]).to_owned(),
+                beta: model.slice(s![total_t..]).to_owned(),
+            },
+            step_norm_sq: solution.dot(&solution),
+            retained_rank,
+        })
+    }
+
     /// Apply the symmetric Moore--Penrose inverse.  Resolved positive and
     /// negative modes are both retained; only the spectral null band
     /// `|λ| ≤ rank_floor` is removed, and that band is the ONLY null predicate
@@ -1624,15 +1676,19 @@ impl SaeManifoldTerm {
             let framed = self.last_frames_active && cache.k == self.factored_border_dim();
             if framed {
                 let lifted = projection.lift_border_vec(v.beta.view());
-                let delta = self
-                    .decoder_prior_exact_minus_majorizer_beta_hvp_prepared(prepared, lifted.view())?;
+                let delta = self.decoder_prior_exact_minus_majorizer_beta_hvp_prepared(
+                    prepared,
+                    lifted.view(),
+                )?;
                 let projected = projection.project_border_vec(delta.view());
                 for (index, &value) in projected.iter().enumerate() {
                     out.beta[index] += value;
                 }
             } else if cache.k == beta_dim {
-                let delta = self
-                    .decoder_prior_exact_minus_majorizer_beta_hvp_prepared(prepared, v.beta.view())?;
+                let delta = self.decoder_prior_exact_minus_majorizer_beta_hvp_prepared(
+                    prepared,
+                    v.beta.view(),
+                )?;
                 for (index, &value) in delta.iter().enumerate() {
                     out.beta[index] += value;
                 }
@@ -1980,13 +2036,9 @@ impl SaeManifoldTerm {
         vector: &SaeArrowVector,
         prepared: &PreparedDecoderPriorBetaCurvature,
     ) -> Result<SaeArrowVector, String> {
-        let (base_t, base_beta) = matrix_free_arrow_operator_apply(
-            system,
-            cache,
-            vector.t.view(),
-            vector.beta.view(),
-        )
-        .map_err(|error| format!("matrix-free evidence operator: {error}"))?;
+        let (base_t, base_beta) =
+            matrix_free_arrow_operator_apply(system, cache, vector.t.view(), vector.beta.view())
+                .map_err(|error| format!("matrix-free evidence operator: {error}"))?;
         let correction =
             self.apply_exact_hessian_minus_b_prepared(rho, target, cache, vector, prepared)?;
         let mut out = SaeArrowVector {
@@ -4842,7 +4894,11 @@ impl SaeManifoldTerm {
                 // (the induced ∞-norm), not a single entry: a cancellation in `C`
                 // can be as large as the whole row.
                 (0..gap.nrows())
-                    .map(|row| (0..gap.ncols()).map(|col| gap[[row, col]].abs()).sum::<f64>())
+                    .map(|row| {
+                        (0..gap.ncols())
+                            .map(|col| gap[[row, col]].abs())
+                            .sum::<f64>()
+                    })
                     .fold(0.0_f64, f64::max)
             });
         let mut inverse_values = Array1::<f64>::zeros(q);
@@ -7044,9 +7100,7 @@ mod tests_route_forced_classification_2673 {
                 .unwrap_or_else(|error| panic!("{label}: dense stationarity solve: {error}"));
             let free_solution = term
                 .solve_exact_stationarity_matrix_free(&rho, target.view(), &cache, &system, &rhs)
-                .unwrap_or_else(|error| {
-                    panic!("{label}: matrix-free stationarity solve: {error}")
-                });
+                .unwrap_or_else(|error| panic!("{label}: matrix-free stationarity solve: {error}"));
             let flatten = |x: &SaeArrowVector| -> Array1<f64> {
                 let mut out = Array1::<f64>::zeros(dim);
                 out.slice_mut(s![..total_t]).assign(&x.t);
