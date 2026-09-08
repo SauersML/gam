@@ -46,25 +46,27 @@ impl FixedRowSpaceProjector {
         let mut normalized = constraint.to_owned();
         let mut column_norms = vec![0.0_f64; q];
         for column in 0..q {
-            let norm = normalized.column(column).dot(&normalized.column(column)).sqrt();
+            let norm = normalized
+                .column(column)
+                .dot(&normalized.column(column))
+                .sqrt();
             column_norms[column] = norm;
             if norm > 0.0 && norm.is_finite() {
-                normalized.column_mut(column).mapv_inplace(|value| value / norm);
+                normalized
+                    .column_mut(column)
+                    .mapv_inplace(|value| value / norm);
             }
         }
         let (left, singular, right_t) =
             gam_linalg::faer_ndarray::FaerSvd::svd(&normalized, true, true)
                 .map_err(BasisError::LinalgError)?;
         let leading = singular.first().copied().unwrap_or(0.0);
-        let cutoff = default_rrqr_rank_alpha()
-            * f64::EPSILON
-            * n.max(q).max(1) as f64
-            * leading.max(1.0);
+        let cutoff =
+            default_rrqr_rank_alpha() * f64::EPSILON * n.max(q).max(1) as f64 * leading.max(1.0);
         let rank = singular.iter().filter(|&&value| value > cutoff).count();
         let left = left.ok_or_else(|| {
             BasisError::InvalidInput(
-                "fixed row-space projector SVD did not return its requested left frame"
-                    .to_string(),
+                "fixed row-space projector SVD did not return its requested left frame".to_string(),
             )
         })?;
         if left.nrows() != n || left.ncols() < rank {
@@ -95,8 +97,7 @@ impl FixedRowSpaceProjector {
             }
             for range_column in 0..rank {
                 constraint_coordinates[[constraint_column, range_column]] =
-                    right_t[[range_column, constraint_column]]
-                        / (norm * singular[range_column]);
+                    right_t[[range_column, constraint_column]] / (norm * singular[range_column]);
             }
         }
         Ok(Self {
@@ -178,10 +179,7 @@ impl FixedRowSpaceProjector {
             let design_chunk = design
                 .try_row_chunk(start..end)
                 .map_err(|error| BasisError::InvalidInput(error.to_string()))?;
-            range_cross += &fast_atb(
-                &self.range_basis.slice(s![start..end, ..]),
-                &design_chunk,
-            );
+            range_cross += &fast_atb(&self.range_basis.slice(s![start..end, ..]), &design_chunk);
         }
         let row_space_correction = fast_ab(&self.constraint_coordinates, &range_cross);
 
@@ -285,6 +283,7 @@ impl ImplicitRowProjection {
 /// crate-private `with_kernel_chart` builder installs those chart derivatives.
 #[derive(Debug, Clone)]
 pub struct ImplicitDesignPsiDerivative {
+    logarithmic_correction: Option<Arc<DuchonLogarithmicPsiCorrection>>,
     /// Pre-computed kernel values (materialized mode).
     /// Shape: (n * n_knots,). Empty in streaming mode.
     pub(crate) phi_values: Array1<f64>,
@@ -363,6 +362,8 @@ pub struct ImplicitDesignPsiDerivative {
     /// When present, axis `a` represents Σ_i coeff_i * raw_axis_i.
     pub(crate) axis_combinations: Option<Vec<Vec<(usize, f64)>>>,
 }
+
+include!("duchon_logarithmic_psi.rs");
 
 /// Streaming design derivative for one per-row latent coordinate `t[n, a]`.
 ///
@@ -640,11 +641,8 @@ impl LatentCoordDesignDerivative {
         // expansion in the standardized frame: `duchon_partial_fraction_coeffs`
         // is built at `kappa = 1/ell`, so an unconverted range builds the whole
         // expansion at the wrong kappa, not merely the kernel (#2643).
-        let length_scale = length_scale.map(|ell| {
-            input_scale
-                .to_standardized_units(ell)
-                .standardized_value()
-        });
+        let length_scale =
+            length_scale.map(|ell| input_scale.to_standardized_units(ell).standardized_value());
         // gam#979: the forward design ships `α·K` with `α = 1/max|K|` over
         // the center cloud (`duchon_kernel_chart`), so the coordinate Jacobian
         // must carry the same amplitude; it is computed from the same
@@ -677,8 +675,10 @@ impl LatentCoordDesignDerivative {
                 chart_scale,
             )
         } else {
-            let pure_poly_coeff =
-                PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, power), centers.ncols());
+            let pure_poly_coeff = PolyharmonicBlockCoeff::new(
+                pure_duchon_block_order(p_order, power),
+                centers.ncols(),
+            );
             let chart_scale = duchon_kernel_chart(
                 centers.view(),
                 None,
@@ -1155,6 +1155,7 @@ impl ImplicitDesignPsiDerivative {
             chart_second: Array2::<f64>::zeros((0, 0)),
             row_projection: None,
             axis_combinations: None,
+            logarithmic_correction: None,
         }
     }
 
@@ -1207,9 +1208,8 @@ impl ImplicitDesignPsiDerivative {
     /// exposed axis is a combination.
     #[inline]
     pub(crate) fn effective_share(&self, axis: usize) -> f64 {
-        let raw_share = |raw: usize| {
-            self.psi_scale_share + self.chart_first.get(raw).copied().unwrap_or(0.0)
-        };
+        let raw_share =
+            |raw: usize| self.psi_scale_share + self.chart_first.get(raw).copied().unwrap_or(0.0);
         match self.axis_combinations.as_ref() {
             Some(_) => self
                 .transformed_axis_combination(axis)
@@ -1297,6 +1297,7 @@ impl ImplicitDesignPsiDerivative {
             chart_second: Array2::<f64>::zeros((0, 0)),
             row_projection: None,
             axis_combinations: None,
+            logarithmic_correction: None,
         }
     }
 
@@ -1347,6 +1348,7 @@ impl ImplicitDesignPsiDerivative {
             chart_second: Array2::<f64>::zeros((0, 0)),
             row_projection: None,
             axis_combinations: None,
+            logarithmic_correction: None,
         }
     }
 
@@ -1485,17 +1487,12 @@ impl ImplicitDesignPsiDerivative {
 
         let width = match key {
             ProjectedJetKey::FirstRaw(_) => self.n_knots,
-            ProjectedJetKey::SecondDiagonal(_) | ProjectedJetKey::SecondCross(_, _) => {
-                self.p_out()
-            }
+            ProjectedJetKey::SecondDiagonal(_) | ProjectedJetKey::SecondCross(_, _) => self.p_out(),
         };
         let mut correction = Array2::<f64>::zeros((row_projection.projector.rank(), width));
         for basis_column in 0..row_projection.projector.rank() {
-            let row_direction = row_projection
-                .projector
-                .range_basis
-                .column(basis_column);
-            let values = match key {
+            let row_direction = row_projection.projector.range_basis.column(basis_column);
+            let mut values = match key {
                 ProjectedJetKey::FirstRaw(axis) => {
                     self.transpose_mul_first_raw_unprojected(axis, &row_direction)?
                 }
@@ -1506,6 +1503,16 @@ impl ImplicitDesignPsiDerivative {
                     self.transpose_mul_second_cross_unprojected(left, right, &row_direction)?
                 }
             };
+            if self.logarithmic_correction.is_some() {
+                for start in (0..self.n).step_by(IMPLICIT_MATVEC_CHUNK_SIZE) {
+                    let end = (start + IMPLICIT_MATVEC_CHUNK_SIZE).min(self.n);
+                    let mut polynomial = Array2::<f64>::zeros((end - start, width));
+                    self.add_logarithmic_correction(key, start..end, &mut polynomial);
+                    values += &polynomial
+                        .t()
+                        .dot(&row_direction.slice(ndarray::s![start..end]));
+                }
+            }
             correction.row_mut(basis_column).assign(&values);
         }
         let correction = Arc::new(correction);
@@ -1893,6 +1900,11 @@ impl ImplicitDesignPsiDerivative {
         axis: usize,
         v: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
+        if self.logarithmic_correction.is_some() {
+            return Ok(self.project_and_pad(
+                &self.logarithmic_transpose(ProjectedJetKey::FirstRaw(axis), v)?,
+            ));
+        }
         if let Some(row_projection) = self.row_projection.as_ref() {
             let projected = row_projection.projector.project_vector_owned(v.to_owned());
             return self.transpose_mul_unprojected(axis, &projected.view());
@@ -1942,15 +1954,22 @@ impl ImplicitDesignPsiDerivative {
             let g = self.effective_share(axis);
             let raw = self.accumulate_knot_vector(v, |idx| {
                 let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
-                Self::first_kernel_value(scale, self.phi_values[idx], self.q_values[idx], s_combo, g)
+                Self::first_kernel_value(
+                    scale,
+                    self.phi_values[idx],
+                    self.q_values[idx],
+                    s_combo,
+                    g,
+                )
             });
             return Ok(raw);
         }
         if self.is_streaming() {
             let scale = self.chart_scale;
             let g = self.effective_share(axis);
-            let raw =
-                self.streaming_accumulate_knot_vector(v, |phi, q, _, sb| Self::first_kernel_value(scale, phi, q, sb[axis], g))?;
+            let raw = self.streaming_accumulate_knot_vector(v, |phi, q, _, sb| {
+                Self::first_kernel_value(scale, phi, q, sb[axis], g)
+            })?;
             return Ok(raw);
         }
         let scale = self.chart_scale;
@@ -1958,7 +1977,9 @@ impl ImplicitDesignPsiDerivative {
         let af = &self.axis_components;
         let pv = &self.phi_values;
         let qv = &self.q_values;
-        let raw = self.accumulate_knot_vector(v, |idx| Self::first_kernel_value(scale, pv[idx], qv[idx], af[[idx, axis]], g));
+        let raw = self.accumulate_knot_vector(v, |idx| {
+            Self::first_kernel_value(scale, pv[idx], qv[idx], af[[idx, axis]], g)
+        });
         Ok(raw)
     }
 
@@ -1970,6 +1991,10 @@ impl ImplicitDesignPsiDerivative {
     ///   result_i = Σ_j q_{ij} · s_{d,ij} · u_knot_j
     /// where u_knot = Z · u_smooth (unprojected back to knot space).
     pub fn forward_mul(&self, axis: usize, u: &ArrayView1<f64>) -> Result<Array1<f64>, BasisError> {
+        if self.logarithmic_correction.is_some() {
+            return self
+                .logarithmic_forward(ProjectedJetKey::FirstRaw(axis), &self.unproject(u).view());
+        }
         let values = self.forward_mul_unprojected(axis, u)?;
         Ok(match self.row_projection.as_ref() {
             Some(row_projection) => row_projection.projector.project_vector_owned(values),
@@ -2026,7 +2051,13 @@ impl ImplicitDesignPsiDerivative {
                                 let idx = base + j;
                                 let s_combo =
                                     self.transformed_combo_axis_value_materialized(idx, combo);
-                                val += Self::first_kernel_value(scale, self.phi_values[idx], self.q_values[idx], s_combo, g) * u_knot[j];
+                                val += Self::first_kernel_value(
+                                    scale,
+                                    self.phi_values[idx],
+                                    self.q_values[idx],
+                                    s_combo,
+                                    g,
+                                ) * u_knot[j];
                             }
                             local[i - start] = val;
                         }
@@ -2047,7 +2078,13 @@ impl ImplicitDesignPsiDerivative {
                 for j in 0..k {
                     let idx = base + j;
                     let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
-                    val += Self::first_kernel_value(scale, self.phi_values[idx], self.q_values[idx], s_combo, g) * u_knot[j];
+                    val += Self::first_kernel_value(
+                        scale,
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        s_combo,
+                        g,
+                    ) * u_knot[j];
                 }
                 result[i] = val;
             }
@@ -2056,7 +2093,9 @@ impl ImplicitDesignPsiDerivative {
         if self.is_streaming() {
             let scale = self.chart_scale;
             let g = self.effective_share(axis);
-            return self.streaming_forward_mul(&u_knot, |phi, q, _, sb| Self::first_kernel_value(scale, phi, q, sb[axis], g));
+            return self.streaming_forward_mul(&u_knot, |phi, q, _, sb| {
+                Self::first_kernel_value(scale, phi, q, sb[axis], g)
+            });
         }
         let n = self.n;
         let k = self.n_knots;
@@ -2080,8 +2119,13 @@ impl ImplicitDesignPsiDerivative {
                         let base = i * k;
                         let mut val = 0.0;
                         for j in 0..k {
-                            val += Self::first_kernel_value(scale, pv[base + j], qv[base + j], af[[base + j, axis]], g)
-                                * u_knot[j];
+                            val += Self::first_kernel_value(
+                                scale,
+                                pv[base + j],
+                                qv[base + j],
+                                af[[base + j, axis]],
+                                g,
+                            ) * u_knot[j];
                         }
                         local[i - start] = val;
                     }
@@ -2100,7 +2144,13 @@ impl ImplicitDesignPsiDerivative {
                 let base = i * k;
                 let mut val = 0.0;
                 for j in 0..k {
-                    val += Self::first_kernel_value(scale, pv[base + j], qv[base + j], af[[base + j, axis]], g) * u_knot[j];
+                    val += Self::first_kernel_value(
+                        scale,
+                        pv[base + j],
+                        qv[base + j],
+                        af[[base + j, axis]],
+                        g,
+                    ) * u_knot[j];
                 }
                 result[i] = val;
             }
@@ -2117,6 +2167,9 @@ impl ImplicitDesignPsiDerivative {
         axis: usize,
         v: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
+        if self.logarithmic_correction.is_some() {
+            return self.logarithmic_transpose(ProjectedJetKey::SecondDiagonal(axis), v);
+        }
         if let Some(row_projection) = self.row_projection.as_ref() {
             let projected = row_projection.projector.project_vector_owned(v.to_owned());
             return self.transpose_mul_second_diag_unprojected(axis, &projected.view());
@@ -2151,7 +2204,9 @@ impl ImplicitDesignPsiDerivative {
                         .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
                         .sum();
                     let overlap_s = Self::transformed_combo_overlap_streaming(combo, combo, sb);
-                    Self::second_kernel_value(scale, phi, q, t, s_combo, s_combo, overlap_s, g, g, lam)
+                    Self::second_kernel_value(
+                        scale, phi, q, t, s_combo, s_combo, overlap_s, g, g, lam,
+                    )
                 })?;
                 return Ok(self.project_and_pad(&raw));
             }
@@ -2161,7 +2216,18 @@ impl ImplicitDesignPsiDerivative {
             let raw = self.accumulate_knot_vector(v, |idx| {
                 let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
                 let overlap_s = self.transformed_combo_overlap_materialized(idx, combo, combo);
-                Self::second_kernel_value(scale, self.phi_values[idx], self.q_values[idx], self.t_values[idx], s_combo, s_combo, overlap_s, g, g, lam)
+                Self::second_kernel_value(
+                    scale,
+                    self.phi_values[idx],
+                    self.q_values[idx],
+                    self.t_values[idx],
+                    s_combo,
+                    s_combo,
+                    overlap_s,
+                    g,
+                    g,
+                    lam,
+                )
             });
             return Ok(self.project_and_pad(&raw));
         }
@@ -2196,13 +2262,12 @@ impl ImplicitDesignPsiDerivative {
         axis_e: usize,
         v: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
+        if self.logarithmic_correction.is_some() {
+            return self.logarithmic_transpose(ProjectedJetKey::SecondCross(axis_d, axis_e), v);
+        }
         if let Some(row_projection) = self.row_projection.as_ref() {
             let projected = row_projection.projector.project_vector_owned(v.to_owned());
-            return self.transpose_mul_second_cross_unprojected(
-                axis_d,
-                axis_e,
-                &projected.view(),
-            );
+            return self.transpose_mul_second_cross_unprojected(axis_d, axis_e, &projected.view());
         }
         self.transpose_mul_second_cross_unprojected(axis_d, axis_e, v)
     }
@@ -2262,7 +2327,18 @@ impl ImplicitDesignPsiDerivative {
                 let s_d = self.transformed_combo_axis_value_materialized(idx, combo_d);
                 let s_e = self.transformed_combo_axis_value_materialized(idx, combo_e);
                 let overlap_s = self.transformed_combo_overlap_materialized(idx, combo_d, combo_e);
-                Self::second_kernel_value(scale, self.phi_values[idx], self.q_values[idx], self.t_values[idx], s_d, s_e, overlap_s, g_d, g_e, lam)
+                Self::second_kernel_value(
+                    scale,
+                    self.phi_values[idx],
+                    self.q_values[idx],
+                    self.t_values[idx],
+                    s_d,
+                    s_e,
+                    overlap_s,
+                    g_d,
+                    g_e,
+                    lam,
+                )
             });
             return Ok(self.project_and_pad(&raw));
         }
@@ -2272,7 +2348,9 @@ impl ImplicitDesignPsiDerivative {
             let g_e = self.effective_share(axis_e);
             let lam = self.chart_lambda(axis_d, axis_e);
             let raw = self.streaming_accumulate_knot_vector(v, |phi, q, t, sb| {
-                Self::second_kernel_value(scale, phi, q, t, sb[axis_d], sb[axis_e], 0.0, g_d, g_e, lam)
+                Self::second_kernel_value(
+                    scale, phi, q, t, sb[axis_d], sb[axis_e], 0.0, g_d, g_e, lam,
+                )
             })?;
             return Ok(self.project_and_pad(&raw));
         }
@@ -2285,7 +2363,18 @@ impl ImplicitDesignPsiDerivative {
         let qv = &self.q_values;
         let tv = &self.t_values;
         let raw = self.accumulate_knot_vector(v, |idx| {
-            Self::second_kernel_value(scale, pv[idx], qv[idx], tv[idx], af[[idx, axis_d]], af[[idx, axis_e]], 0.0, g_d, g_e, lam)
+            Self::second_kernel_value(
+                scale,
+                pv[idx],
+                qv[idx],
+                tv[idx],
+                af[[idx, axis_d]],
+                af[[idx, axis_e]],
+                0.0,
+                g_d,
+                g_e,
+                lam,
+            )
         });
         Ok(self.project_and_pad(&raw))
     }
@@ -2296,6 +2385,9 @@ impl ImplicitDesignPsiDerivative {
         axis: usize,
         u: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
+        if self.logarithmic_correction.is_some() {
+            return self.logarithmic_forward(ProjectedJetKey::SecondDiagonal(axis), u);
+        }
         let values = self.forward_mul_second_diag_unprojected(axis, u)?;
         Ok(match self.row_projection.as_ref() {
             Some(row_projection) => row_projection.projector.project_vector_owned(values),
@@ -2331,7 +2423,9 @@ impl ImplicitDesignPsiDerivative {
                         .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
                         .sum();
                     let overlap_s = Self::transformed_combo_overlap_streaming(combo, combo, sb);
-                    Self::second_kernel_value(scale, phi, q, t, s_combo, s_combo, overlap_s, g, g, lam)
+                    Self::second_kernel_value(
+                        scale, phi, q, t, s_combo, s_combo, overlap_s, g, g, lam,
+                    )
                 });
             }
             let n = self.n;
@@ -2346,7 +2440,18 @@ impl ImplicitDesignPsiDerivative {
                     let idx = base + j;
                     let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
                     let overlap_s = self.transformed_combo_overlap_materialized(idx, combo, combo);
-                    val += Self::second_kernel_value(scale, self.phi_values[idx], self.q_values[idx], self.t_values[idx], s_combo, s_combo, overlap_s, g, g, lam) * u_knot[j];
+                    val += Self::second_kernel_value(
+                        scale,
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        self.t_values[idx],
+                        s_combo,
+                        s_combo,
+                        overlap_s,
+                        g,
+                        g,
+                        lam,
+                    ) * u_knot[j];
                 }
                 val
             };
@@ -2394,8 +2499,18 @@ impl ImplicitDesignPsiDerivative {
             let mut val = 0.0;
             for j in 0..k {
                 let s = af[[base + j, axis]];
-                val += Self::second_kernel_value(scale, pv[base + j], qv[base + j], tv[base + j], s, s, s, g, g, lam)
-                    * u_knot[j];
+                val += Self::second_kernel_value(
+                    scale,
+                    pv[base + j],
+                    qv[base + j],
+                    tv[base + j],
+                    s,
+                    s,
+                    s,
+                    g,
+                    g,
+                    lam,
+                ) * u_knot[j];
             }
             val
         };
@@ -2430,6 +2545,9 @@ impl ImplicitDesignPsiDerivative {
         axis_e: usize,
         u: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
+        if self.logarithmic_correction.is_some() {
+            return self.logarithmic_forward(ProjectedJetKey::SecondCross(axis_d, axis_e), u);
+        }
         let values = self.forward_mul_second_cross_unprojected(axis_d, axis_e, u)?;
         Ok(match self.row_projection.as_ref() {
             Some(row_projection) => row_projection.projector.project_vector_owned(values),
@@ -2499,7 +2617,18 @@ impl ImplicitDesignPsiDerivative {
                     let s_e = self.transformed_combo_axis_value_materialized(idx, combo_e);
                     let overlap_s =
                         self.transformed_combo_overlap_materialized(idx, combo_d, combo_e);
-                    val += Self::second_kernel_value(scale, self.phi_values[idx], self.q_values[idx], self.t_values[idx], s_d, s_e, overlap_s, g_d, g_e, lam) * u_knot[j];
+                    val += Self::second_kernel_value(
+                        scale,
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        self.t_values[idx],
+                        s_d,
+                        s_e,
+                        overlap_s,
+                        g_d,
+                        g_e,
+                        lam,
+                    ) * u_knot[j];
                 }
                 val
             };
@@ -2530,7 +2659,9 @@ impl ImplicitDesignPsiDerivative {
             let g_e = self.effective_share(axis_e);
             let lam = self.chart_lambda(axis_d, axis_e);
             return self.streaming_forward_mul(&u_knot, |phi, q, t, sb| {
-                Self::second_kernel_value(scale, phi, q, t, sb[axis_d], sb[axis_e], 0.0, g_d, g_e, lam)
+                Self::second_kernel_value(
+                    scale, phi, q, t, sb[axis_d], sb[axis_e], 0.0, g_d, g_e, lam,
+                )
             });
         }
         let n = self.n;
@@ -2547,8 +2678,18 @@ impl ImplicitDesignPsiDerivative {
             let base = i * k;
             let mut val = 0.0;
             for j in 0..k {
-                val += Self::second_kernel_value(scale, pv[base + j], qv[base + j], tv[base + j], af[[base + j, axis_d]], af[[base + j, axis_e]], 0.0, g_d, g_e, lam)
-                    * u_knot[j];
+                val += Self::second_kernel_value(
+                    scale,
+                    pv[base + j],
+                    qv[base + j],
+                    tv[base + j],
+                    af[[base + j, axis_d]],
+                    af[[base + j, axis_e]],
+                    0.0,
+                    g_d,
+                    g_e,
+                    lam,
+                ) * u_knot[j];
             }
             val
         };
@@ -2583,6 +2724,12 @@ impl ImplicitDesignPsiDerivative {
     /// This is used when the dense matrix is needed temporarily (e.g., for
     /// HyperCoord construction) while avoiding simultaneous storage of all D axes.
     pub fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, BasisError> {
+        if self.logarithmic_correction.is_some() {
+            if self.enforces_dense_materialization_budget() {
+                assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
+            }
+            return self.row_chunk_first(axis, 0..self.n);
+        }
         assert!(
             axis < self.n_axes(),
             "implicit psi first materialization axis out of bounds: axis={axis}, n_axes={}",
@@ -2614,7 +2761,13 @@ impl ImplicitDesignPsiDerivative {
                 for j in 0..k {
                     let idx = base + j;
                     let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
-                    raw[[i, j]] = Self::first_kernel_value(scale, self.phi_values[idx], self.q_values[idx], s_combo, g);
+                    raw[[i, j]] = Self::first_kernel_value(
+                        scale,
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        s_combo,
+                        g,
+                    );
                 }
             }
             return Ok(self.project_matrix(raw));
@@ -2622,7 +2775,9 @@ impl ImplicitDesignPsiDerivative {
         if self.is_streaming() {
             let scale = self.chart_scale;
             let g = self.effective_share(axis);
-            return self.streaming_materialize(|phi, q, _, sb| Self::first_kernel_value(scale, phi, q, sb[axis], g));
+            return self.streaming_materialize(|phi, q, _, sb| {
+                Self::first_kernel_value(scale, phi, q, sb[axis], g)
+            });
         }
         let n = self.n;
         let k = self.n_knots;
@@ -2632,7 +2787,13 @@ impl ImplicitDesignPsiDerivative {
         for i in 0..n {
             let base = i * k;
             for j in 0..k {
-                raw[[i, j]] = Self::first_kernel_value(scale, self.phi_values[base + j], self.q_values[base + j], self.axis_components[[base + j, axis]], g);
+                raw[[i, j]] = Self::first_kernel_value(
+                    scale,
+                    self.phi_values[base + j],
+                    self.q_values[base + j],
+                    self.axis_components[[base + j, axis]],
+                    g,
+                );
             }
         }
         Ok(self.project_matrix(raw))
@@ -2640,6 +2801,12 @@ impl ImplicitDesignPsiDerivative {
 
     /// Materialize the full (n × p_out) second diagonal derivative matrix for axis d.
     pub fn materialize_second_diag(&self, axis: usize) -> Result<Array2<f64>, BasisError> {
+        if self.logarithmic_correction.is_some() {
+            if self.enforces_dense_materialization_budget() {
+                assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
+            }
+            return self.row_chunk_second_diag(axis, 0..self.n);
+        }
         assert!(
             axis < self.n_axes(),
             "implicit psi second diagonal materialization axis out of bounds: axis={axis}, n_axes={}",
@@ -2660,7 +2827,9 @@ impl ImplicitDesignPsiDerivative {
                         .map(|(raw_axis, coeff)| coeff * sb[*raw_axis])
                         .sum();
                     let overlap_s = Self::transformed_combo_overlap_streaming(combo, combo, sb);
-                    Self::second_kernel_value(scale, phi, q, t, s_combo, s_combo, overlap_s, g, g, lam)
+                    Self::second_kernel_value(
+                        scale, phi, q, t, s_combo, s_combo, overlap_s, g, g, lam,
+                    )
                 });
             }
             let n = self.n;
@@ -2675,7 +2844,18 @@ impl ImplicitDesignPsiDerivative {
                     let idx = base + j;
                     let s_combo = self.transformed_combo_axis_value_materialized(idx, combo);
                     let overlap_s = self.transformed_combo_overlap_materialized(idx, combo, combo);
-                    raw[[i, j]] = Self::second_kernel_value(scale, self.phi_values[idx], self.q_values[idx], self.t_values[idx], s_combo, s_combo, overlap_s, g, g, lam);
+                    raw[[i, j]] = Self::second_kernel_value(
+                        scale,
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        self.t_values[idx],
+                        s_combo,
+                        s_combo,
+                        overlap_s,
+                        g,
+                        g,
+                        lam,
+                    );
                 }
             }
             return Ok(self.project_matrix(raw));
@@ -2699,7 +2879,18 @@ impl ImplicitDesignPsiDerivative {
             let base = i * k;
             for j in 0..k {
                 let s = self.axis_components[[base + j, axis]];
-                raw[[i, j]] = Self::second_kernel_value(scale, self.phi_values[base + j], self.q_values[base + j], self.t_values[base + j], s, s, s, g, g, lam);
+                raw[[i, j]] = Self::second_kernel_value(
+                    scale,
+                    self.phi_values[base + j],
+                    self.q_values[base + j],
+                    self.t_values[base + j],
+                    s,
+                    s,
+                    s,
+                    g,
+                    g,
+                    lam,
+                );
             }
         }
         Ok(self.project_matrix(raw))
@@ -2713,6 +2904,12 @@ impl ImplicitDesignPsiDerivative {
         axis_d: usize,
         axis_e: usize,
     ) -> Result<Array2<f64>, BasisError> {
+        if self.logarithmic_correction.is_some() {
+            if self.enforces_dense_materialization_budget() {
+                assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
+            }
+            return self.row_chunk_second_cross(axis_d, axis_e, 0..self.n);
+        }
         assert!(
             axis_d < self.n_axes(),
             "implicit psi second cross materialization first axis out of bounds: axis_d={axis_d}, n_axes={}",
@@ -2766,7 +2963,18 @@ impl ImplicitDesignPsiDerivative {
                     let s_e = self.transformed_combo_axis_value_materialized(idx, combo_e);
                     let overlap_s =
                         self.transformed_combo_overlap_materialized(idx, combo_d, combo_e);
-                    raw[[i, j]] = Self::second_kernel_value(scale, self.phi_values[idx], self.q_values[idx], self.t_values[idx], s_d, s_e, overlap_s, g_d, g_e, lam);
+                    raw[[i, j]] = Self::second_kernel_value(
+                        scale,
+                        self.phi_values[idx],
+                        self.q_values[idx],
+                        self.t_values[idx],
+                        s_d,
+                        s_e,
+                        overlap_s,
+                        g_d,
+                        g_e,
+                        lam,
+                    );
                 }
             }
             return Ok(self.project_matrix(raw));
@@ -2777,7 +2985,9 @@ impl ImplicitDesignPsiDerivative {
             let g_e = self.effective_share(axis_e);
             let lam = self.chart_lambda(axis_d, axis_e);
             return self.streaming_materialize(|phi, q, t, sb| {
-                Self::second_kernel_value(scale, phi, q, t, sb[axis_d], sb[axis_e], 0.0, g_d, g_e, lam)
+                Self::second_kernel_value(
+                    scale, phi, q, t, sb[axis_d], sb[axis_e], 0.0, g_d, g_e, lam,
+                )
             });
         }
         let n = self.n;
@@ -2790,7 +3000,18 @@ impl ImplicitDesignPsiDerivative {
         for i in 0..n {
             let base = i * k;
             for j in 0..k {
-                raw[[i, j]] = Self::second_kernel_value(scale, self.phi_values[base + j], self.q_values[base + j], self.t_values[base + j], self.axis_components[[base + j, axis_d]], self.axis_components[[base + j, axis_e]], 0.0, g_d, g_e, lam);
+                raw[[i, j]] = Self::second_kernel_value(
+                    scale,
+                    self.phi_values[base + j],
+                    self.q_values[base + j],
+                    self.t_values[base + j],
+                    self.axis_components[[base + j, axis_d]],
+                    self.axis_components[[base + j, axis_e]],
+                    0.0,
+                    g_d,
+                    g_e,
+                    lam,
+                );
             }
         }
         Ok(self.project_matrix(raw))
@@ -2960,6 +3181,7 @@ impl ImplicitDesignPsiDerivative {
                 Self::first_kernel_value(scale, phi, q, s, g)
             })?
         };
+        self.add_logarithmic_correction(ProjectedJetKey::FirstRaw(axis), rows.clone(), &mut raw);
         self.subtract_projected_row_chunk_correction(
             ProjectedJetKey::FirstRaw(axis),
             rows,
@@ -3009,6 +3231,11 @@ impl ImplicitDesignPsiDerivative {
                 Self::second_kernel_value(scale, phi, q, t, s, s, s, g, g, lam)
             })?
         };
+        self.add_logarithmic_correction(
+            ProjectedJetKey::SecondDiagonal(axis),
+            rows.clone(),
+            &mut chunk,
+        );
         self.subtract_projected_row_chunk_correction(
             ProjectedJetKey::SecondDiagonal(axis),
             rows,
@@ -3083,6 +3310,11 @@ impl ImplicitDesignPsiDerivative {
                 Self::second_kernel_value(scale, phi, q, t, sd, se, 0.0, g_d, g_e, lam)
             })?
         };
+        self.add_logarithmic_correction(
+            ProjectedJetKey::SecondCross(axis_d, axis_e),
+            rows.clone(),
+            &mut chunk,
+        );
         self.subtract_projected_row_chunk_correction(
             ProjectedJetKey::SecondCross(axis_d, axis_e),
             rows,
@@ -3280,7 +3512,8 @@ pub(crate) fn design_chart_jets(
         )));
     };
     let dim = centers.ncols();
-    let metric = centered_aniso_metric_weights(&eta.map(<[f64]>::to_vec).unwrap_or_else(|| vec![0.0; dim]));
+    let metric =
+        centered_aniso_metric_weights(&eta.map(<[f64]>::to_vec).unwrap_or_else(|| vec![0.0; dim]));
     let mut components = vec![0.0_f64; dim];
     for a in 0..dim {
         let h = centers[[i, a]] - centers[[j, a]];
@@ -3306,9 +3539,17 @@ pub(crate) fn design_chart_jets(
         vec![scalar_component]
     };
     let n_axes = s_axes.len();
+    let (log_value, log_radial) = if per_axis {
+        DuchonLogarithmicPsiCorrection::coefficients(radial_kind)
+            .map(|coefficients| DuchonLogarithmicPsiCorrection::evaluate(&coefficients, r2))
+            .unwrap_or((0.0, 0.0))
+    } else {
+        (0.0, 0.0)
+    };
     let mut first = vec![0.0_f64; n_axes];
     for (a, &s_a) in s_axes.iter().enumerate() {
-        let k_a = ImplicitDesignPsiDerivative::first_kernel_value(1.0, phi, q, s_a, share_c);
+        let k_a = ImplicitDesignPsiDerivative::first_kernel_value(1.0, phi, q, s_a, share_c)
+            + log_value / dim as f64;
         first[a] = -k_a / phi;
     }
     let mut second = Array2::<f64>::zeros((n_axes, n_axes));
@@ -3317,7 +3558,7 @@ pub(crate) fn design_chart_jets(
             let overlap = if a == b { s_a } else { 0.0 };
             let k_ab = ImplicitDesignPsiDerivative::second_kernel_value(
                 1.0, phi, q, t, s_a, s_b, overlap, share_c, share_c, 0.0,
-            );
+            ) + (log_radial * (s_a + s_b) + 2.0 * share_c * log_value) / dim as f64;
             second[[a, b]] = -k_ab / phi + first[a] * first[b];
         }
     }
@@ -3367,6 +3608,8 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
         radial_kind.raw_psi_isotropic_share(),
     )?;
 
+    let logarithmic_correction =
+        DuchonLogarithmicPsiCorrection::new(data, centers, eta, &radial_kind);
     let policy = gam_runtime::resource::ResourcePolicy::default_library();
     let force_operator = radial_kind.is_duchon_family();
     let dense_derivatives_exceed_budget =
@@ -3402,7 +3645,8 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
             full_ident_transform,
             n_poly,
         );
-        let op = install_design_chart(op, &chart_jets);
+        let op = install_design_chart(op, &chart_jets)
+            .with_logarithmic_correction(logarithmic_correction);
         return Ok(AnisoBasisPsiDerivatives {
             design_first: Vec::new(),
             design_second_diag: Vec::new(),
@@ -3575,7 +3819,8 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
         n_poly,
         dim,
     )
-    .with_psi_scale_share(psi_scale_share);
+    .with_psi_scale_share(psi_scale_share)
+    .with_logarithmic_correction(logarithmic_correction);
     let op = install_design_chart(op, &chart_jets);
 
     // gam#1376 — the operator stays in the NATIVE per-axis ψ frame (no
@@ -3680,7 +3925,7 @@ pub(crate) fn build_scalar_design_psi_derivatives_shared(
             n_poly,
         )
         .with_psi_scale_share(psi_scale_share);
-    let op = install_design_chart(op, &chart_jets);
+        let op = install_design_chart(op, &chart_jets);
         return Ok(ScalarDesignPsiDerivatives {
             design_first: Array2::<f64>::zeros((0, 0)),
             design_second_diag: Array2::<f64>::zeros((0, 0)),
@@ -3865,8 +4110,7 @@ mod fixed_row_space_value_tests {
         let constraint = Array2::from_shape_vec(
             (5, 3),
             vec![
-                1.0, -2.0, 7.0, 1.0, -1.0, 7.0, 1.0, 0.0, 7.0, 1.0, 1.0, 7.0,
-                1.0, 2.0, 7.0,
+                1.0, -2.0, 7.0, 1.0, -1.0, 7.0, 1.0, 0.0, 7.0, 1.0, 1.0, 7.0, 1.0, 2.0, 7.0,
             ],
         )
         .expect("constraint shape");
@@ -3875,8 +4119,8 @@ mod fixed_row_space_value_tests {
             vec![0.3, -1.0, 2.0, 0.5, -0.7, 3.0, 1.4, -0.2, 4.0, 1.1],
         )
         .expect("value shape");
-        let projector = FixedRowSpaceProjector::from_constraint_block(constraint.view())
-            .expect("projector");
+        let projector =
+            FixedRowSpaceProjector::from_constraint_block(constraint.view()).expect("projector");
         assert_eq!(projector.rank(), 2);
 
         let mut expected = value.clone();

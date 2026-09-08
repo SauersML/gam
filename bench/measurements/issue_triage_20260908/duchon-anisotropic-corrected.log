@@ -1,0 +1,19 @@
+
+running 2 tests
+test amplified_raw_axis_design_derivatives_match_the_frozen_forward_basis ... axis=0 design_derivative_relative_gap=2.66479400e-12 centered_gap=2.62442023e-12
+axis=0 second_derivative_relative_gap=1.88559034e-9
+axis=1 design_derivative_relative_gap=2.62369835e-12 centered_gap=2.57813056e-12
+axis=1 second_derivative_relative_gap=1.88722219e-9
+cross_derivative_relative_gap=4.65177783e-10
+contrast_gap=2.63933633e-12 global_gap=2.05104487e-3
+ok
+test raw_axis_design_derivatives_match_the_frozen_forward_basis ... axis=0 design_derivative_relative_gap=1.23049721e-11 centered_gap=1.83374496e-10
+axis=0 second_derivative_relative_gap=1.66826310e-8
+axis=1 design_derivative_relative_gap=1.46033833e-11 centered_gap=1.83487047e-10
+axis=1 second_derivative_relative_gap=2.29538801e-8
+cross_derivative_relative_gap=2.61457245e-8
+contrast_gap=1.39456493e-11 global_gap=1.25492463e-11
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+
