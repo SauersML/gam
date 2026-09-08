@@ -251,6 +251,8 @@ def format_cuda_diagnostics() -> str:
 def _build_fit_payload(
     *,
     family: str,
+    negative_binomial_theta: float | None,
+    expectile_tau: float | None,
     offset: str | None,
     weights: str | None,
     persistent_warm_start_root: str | Path | None,
@@ -288,6 +290,8 @@ def _build_fit_payload(
     }
     ctn_stage1_recipe = normalize_ctn_stage1(transformation_normal_stage1)
     kwarg_items: dict[str, Any] = {
+        "negative_binomial_theta": negative_binomial_theta,
+        "expectile_tau": expectile_tau,
         "transformation_normal": transformation_normal,
         "ctn_stage1": ctn_stage1_recipe.to_rust_recipe() if ctn_stage1_recipe else None,
         "survival_likelihood": survival_likelihood,
@@ -712,6 +716,8 @@ def fit(
     formula: str,
     *,
     family: str = ...,
+    negative_binomial_theta: float | None = ...,
+    expectile_tau: float | None = ...,
     offset: str | None = ...,
     weights: str | None = ...,
     persistent_warm_start_root: str | Path | None = ...,
@@ -755,6 +761,8 @@ def fit(
     formula: str,
     *,
     family: str = ...,
+    negative_binomial_theta: float | None = ...,
+    expectile_tau: float | None = ...,
     offset: str | None = ...,
     weights: str | None = ...,
     persistent_warm_start_root: str | Path | None = ...,
@@ -797,6 +805,8 @@ def fit(
     formula: str,
     *,
     family: str = "auto",
+    negative_binomial_theta: float | None = None,
+    expectile_tau: float | None = None,
     offset: str | None = None,
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
@@ -865,6 +875,15 @@ def fit(
         inference — e.g. pass ``family="gaussian"`` to fit an integer rating
         column such as ``0..5`` (which matches the count signature) as a
         continuous response.
+    negative_binomial_theta:
+        Optional fixed positive size/overdispersion parameter for
+        ``family="negative-binomial"``. When omitted, Rust estimates theta.
+        This is the Python spelling of CLI ``--negative-binomial-theta`` and
+        the shared request field ``negative_binomial_theta``.
+    expectile_tau:
+        Optional target in the open interval ``(0, 1)`` for
+        ``family="expectile"``. This is the Python spelling of CLI
+        ``--expectile-tau`` and the shared request field ``expectile_tau``.
     offset:
         Name of the offset column. Corresponds to ``--offset-column``.
     weights:
@@ -1192,6 +1211,8 @@ def fit(
     )
     payload = _build_fit_payload(
         family=family,
+        negative_binomial_theta=negative_binomial_theta,
+        expectile_tau=expectile_tau,
         offset=offset,
         weights=weights,
         persistent_warm_start_root=persistent_warm_start_root,
@@ -1285,6 +1306,8 @@ def fit_array(
     formula: str,
     *,
     family: str = "auto",
+    negative_binomial_theta: float | None = None,
+    expectile_tau: float | None = None,
     offset: str | None = None,
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
@@ -1351,6 +1374,8 @@ def fit_array(
     )
     payload = _build_fit_payload(
         family=family,
+        negative_binomial_theta=negative_binomial_theta,
+        expectile_tau=expectile_tau,
         offset=offset,
         weights=weights,
         persistent_warm_start_root=persistent_warm_start_root,
@@ -1595,6 +1620,8 @@ def validate_formula(
     formula: str,
     *,
     family: str = "auto",
+    negative_binomial_theta: float | None = None,
+    expectile_tau: float | None = None,
     offset: str | None = None,
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
@@ -1644,6 +1671,8 @@ def validate_formula(
         rust_config.pop(key, None)
     payload = _build_fit_payload(
         family=family,
+        negative_binomial_theta=negative_binomial_theta,
+        expectile_tau=expectile_tau,
         offset=offset,
         weights=weights,
         persistent_warm_start_root=persistent_warm_start_root,
