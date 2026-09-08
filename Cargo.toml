@@ -247,10 +247,6 @@ name = "sae_decoder_refresh_scaling"
 path = "bench/cargo_benches/sae_decoder_refresh_scaling.rs"
 harness = false
 
-[[example]]
-name = "arrow_schur_hill_climb"
-path = "examples/perf/arrow_schur_hill_climb.rs"
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
