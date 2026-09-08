@@ -32,9 +32,11 @@ def main():
              if line.endswith(": test")]
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "inventory.txt").write_text(inventory)
+    scratch = args.output.resolve() / "scratch"
+    scratch.mkdir(exist_ok=True)
     with binary.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    environment = dict(os.environ, RAYON_NUM_THREADS="2",
+    environment = dict(os.environ, TMPDIR=str(scratch), RAYON_NUM_THREADS="2",
                        OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1")
 
     def run(entry):
@@ -77,8 +79,13 @@ def main():
             (args.output / "results.json").write_text(json.dumps(receipt, indent=2) + "\n")
     counts = {status: sum(r["status"] == status for r in records)
               for status in sorted({r["status"] for r in records})}
+    with binary.open("rb") as stream:
+        final_digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    receipt["binary_sha256_after"] = final_digest
+    receipt["binary_unchanged"] = final_digest == digest
+    (args.output / "results.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(counts, sort_keys=True), flush=True)
-    return 0 if len(records) == 30 and counts == {"passed": 30} else 1
+    return 0 if final_digest == digest and len(records) == 30 and counts == {"passed": 30} else 1
 
 
 if __name__ == "__main__":

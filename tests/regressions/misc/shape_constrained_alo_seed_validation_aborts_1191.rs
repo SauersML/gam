@@ -108,6 +108,7 @@ fn sqrt_dataset(n: usize) -> (Vec<f64>, Vec<f64>) {
 
 #[test]
 fn shape_constrained_smooths_fit_without_alo_seed_validation_abort() {
+    gam_runtime::test_support::install_diagnostic_logger();
     init_parallelism();
     let n = 400usize;
     let (x, y) = sqrt_dataset(n);

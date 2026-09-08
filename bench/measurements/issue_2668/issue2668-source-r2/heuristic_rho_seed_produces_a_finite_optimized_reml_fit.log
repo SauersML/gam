@@ -1,0 +1,15 @@
+
+running 1 test
+test families::estimate_external_family_and_links::heuristic_rho_seed_produces_a_finite_optimized_reml_fit ... 
+thread 'families::estimate_external_family_and_links::heuristic_rho_seed_produces_a_finite_optimized_reml_fit' (2030778) panicked at tests/regressions/families/estimate_external_family_and_links.rs:48:6:
+fit should succeed: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=7.035e-6 |Pg|=7.035e-6 bound=1.000e-6 (rung=solver-band derived_standard=false) hessian_psd=yes curvature_source=terminal-analytic railed=[] → NOT STATIONARY (|Pg|=7.035e-6 > bound=1.000e-6); tail-snap declined: no candidate passed the curvature tie (k=0: ρ=-3.53 more than 18 e-folds inside the box); solver provenance: origin=Solver, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=true, termination=gradient_tolerance(|g|=7.696227e-7 < 1.000000e-6) [measured=7.696227e-7 vs threshold=1.000000e-6, L2, Absolute], stop_reason=Converged after 34 outer iteration(s); final objective 2.498223e0, projected gradient norm 7.035e-6 against stationarity bound 1.000e-6 (rung=solver-band derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [-3.532956596104692].
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    families::estimate_external_family_and_links::heuristic_rho_seed_produces_a_finite_optimized_reml_fit
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 506 filtered out; finished in 0.31s
+

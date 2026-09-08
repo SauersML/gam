@@ -29,6 +29,7 @@ fn tiny_problem() -> (
 
 #[test]
 fn heuristic_rho_seed_produces_a_finite_optimized_reml_fit() {
+    gam_runtime::test_support::install_diagnostic_logger();
     let (x, y, w, offset, s) = tiny_problem();
     let opts = base_opts();
     let family = LikelihoodSpec::new(

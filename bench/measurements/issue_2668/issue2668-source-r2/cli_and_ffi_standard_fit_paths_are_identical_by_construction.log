@@ -1,0 +1,15 @@
+
+running 1 test
+test misc::cli_ffi_fit_parity_1196::cli_and_ffi_standard_fit_paths_are_identical_by_construction ... 
+thread 'misc::cli_ffi_fit_parity_1196::cli_and_ffi_standard_fit_paths_are_identical_by_construction' (2031742) panicked at tests/regressions/misc/cli_ffi_fit_parity_1196.rs:157:9:
+fit_model('y ~ s(x, shape=concave)') failed: Fatal outer-objective evaluation failure (outer ARC evaluation): fatal objective evaluation failure: outer eval failed: Parameter constraint violation: KKT residuals exceed tolerance: primal=0.000e0, dual=0.000e0, comp=6.765e-15, stat=5.636e2 (stat_rel=1.104e0 vs tol=5.000e-6; ‖grad‖∞=5.104e2); active=1/10; unreachable=5.636e2 blocked=1.776e-15
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    misc::cli_ffi_fit_parity_1196::cli_and_ffi_standard_fit_paths_are_identical_by_construction
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 506 filtered out; finished in 4.99s
+

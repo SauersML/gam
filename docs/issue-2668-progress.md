@@ -5,7 +5,9 @@ the two deleted contracts. Moving failures to another issue is not completion.
 The issue remains unresolved.
 
 `tests/data/issue_2668_regressions.json` records all 30 original identities. It
-explicitly maps the two previously documented replacements. The runner resolves
+explicitly maps the remaining renamed seed test. The original irrelevant-term
+shrinkage test has since been restored, so its mapping again uses its original
+identity. The runner resolves
 each identity against the executable's actual inventory, requires exactly one
 match, and requires a terminal verdict of one passed test. Missing, ambiguous,
 failed, and timed-out entries cannot contribute to the pass count.
@@ -104,3 +106,47 @@ Completion requires fixing the criterion and its derivatives together, replacing
 invalid fixture premises with independently derived contracts, resolving the
 inner-solver/performance failures, and rerunning every original contract on the
 repaired source. No closure claim has been made.
+
+## Current-source snapshot and gamma kernel measurement
+
+The scanner errors were resolved in the shared source, and Cargo successfully
+built `regressions-77fb4bb5c2a1941a`. Its archived 30-entry measurement is
+`bench/measurements/issue_2668/issue2668-source-r2/results.json`:
+22 passed, five failed, one missing mapping, and two diagnostic timeouts. The
+restored negative-binomial variance test passed in 40.68 seconds; Firth passed
+in 0.72 seconds. This supersedes the earlier existing-library observations for
+those tests. The missing mapping was the obsolete supported-linear replacement;
+the original irrelevant-covariate test is present and must be measured separately.
+
+The additional failures were the heuristic seed and the concave scenario shared
+by the CLI/FFI parity and shape tests. Diagnostics show that terminal REML
+certification reset the inner accuracy history and solved the mode more coarsely
+than the search. The shape fit instead enforced KKT on an unfinished inner solve,
+before its non-convergence status could update the iteration-cap feedback and
+reject the trial. Corrections are under verification; neither is counted fixed.
+
+A bounded 20-second profile of the old-library negative-binomial fit attributed
+13.53% of cycles to one factorial iterator symbol, plus additional factorial and
+polygamma work. Gamma derivative orders are compile-time constants; their
+Bernoulli/factorial coefficients now are too. The third-order dispersion path
+also requests exactly four scalar derivatives rather than computing five and
+discarding the last one. Series length, recurrence threshold, and arithmetic
+order are preserved.
+
+Fifteen gamma/jet correctness tests passed on MSI. The permanent
+`gamma_stack_bench.rs` evaluates 12 arguments from `1e-8` to `1e8`, 10,000 times
+each. Three interleaved pairs under the optimized test profile measured:
+
+| Arm | ns per full derivative stack |
+| --- | --- |
+| Before | 589.0, 582.2, 582.6 |
+| After | 255.3, 252.6, 311.9 |
+
+All six output fingerprints are `41fee25e33145465`. Median speedup is 2.28×.
+The before library is `gam-math-44e36aea55b719e1`, the after library is
+`gam-math-dc03c8141bcd374b`; both Cargo profile fingerprints are
+`16635960049555823289`. Dependency feature graphs differ between the root
+regression build and the standalone math build, so this is a kernel diagnostic,
+not a controlled end-to-end fit speedup. An older unoptimized library was also
+measured; its much larger ratio is deliberately excluded from this comparison.
+The timing receipt and textual perf report are retained beside the benchmark.

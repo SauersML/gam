@@ -1,0 +1,333 @@
+{
+  "binary": "/scratch.global/sauer354/m1-target/debug/deps/regressions-77fb4bb5c2a1941a",
+  "binary_sha256": "f1ee80d8ab01828b83395e6e062735802d27698c1b77ffe106bfc8ff1e3b009d",
+  "test_timeout_seconds": 60.0,
+  "workers": 2,
+  "results": [
+    {
+      "original": "families::estimate_external_family_and_links::heuristic_lambdas_are_used_as_initial_rho_for_reml",
+      "test": "heuristic_rho_seed_produces_a_finite_optimized_reml_fit",
+      "matches": [
+        "families::estimate_external_family_and_links::heuristic_rho_seed_produces_a_finite_optimized_reml_fit"
+      ],
+      "status": "failed",
+      "exit_code": 101,
+      "seconds": 0.36835690296720713,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/heuristic_rho_seed_produces_a_finite_optimized_reml_fit.log"
+    },
+    {
+      "original": "families::estimate_external_family_and_links::firth_accepted_for_binomial_loglog_and_cauchit_2158",
+      "test": "firth_accepted_for_binomial_loglog_and_cauchit_2158",
+      "matches": [
+        "families::estimate_external_family_and_links::firth_accepted_for_binomial_loglog_and_cauchit_2158"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.7199405540013686,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/firth_accepted_for_binomial_loglog_and_cauchit_2158.log"
+    },
+    {
+      "original": "families::flexible_link_linkwiggle_joint_solve_aborts::flexible_link_linkwiggle_smooth_mean_engages_or_fails_loud",
+      "test": "flexible_link_linkwiggle_smooth_mean_engages_or_fails_loud",
+      "matches": [
+        "families::flexible_link_linkwiggle_joint_solve_aborts::flexible_link_linkwiggle_smooth_mean_engages_or_fails_loud"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 8.545096973015461,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/flexible_link_linkwiggle_smooth_mean_engages_or_fails_loud.log"
+    },
+    {
+      "original": "families::flexible_link_linkwiggle_joint_solve_aborts::flexible_link_linkwiggle_parametric_mean_engages_or_fails_loud",
+      "test": "flexible_link_linkwiggle_parametric_mean_engages_or_fails_loud",
+      "matches": [
+        "families::flexible_link_linkwiggle_joint_solve_aborts::flexible_link_linkwiggle_parametric_mean_engages_or_fails_loud"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 12.054886860016268,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/flexible_link_linkwiggle_parametric_mean_engages_or_fails_loud.log"
+    },
+    {
+      "original": "families::multinomial_blocks_collapse_to_zero_width::multinomial_three_class_fit_keeps_all_blocks_full_width",
+      "test": "multinomial_three_class_fit_keeps_all_blocks_full_width",
+      "matches": [
+        "families::multinomial_blocks_collapse_to_zero_width::multinomial_three_class_fit_keeps_all_blocks_full_width"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.27147579699521884,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/multinomial_three_class_fit_keeps_all_blocks_full_width.log"
+    },
+    {
+      "original": "families::small_n_gaussian_double_penalty_terminates::wine_shaped_double_penalty_fit_converges_promptly",
+      "test": "wine_shaped_double_penalty_fit_converges_promptly",
+      "matches": [
+        "families::small_n_gaussian_double_penalty_terminates::wine_shaped_double_penalty_fit_converges_promptly"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.66971226898022,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/wine_shaped_double_penalty_fit_converges_promptly.log"
+    },
+    {
+      "original": "misc::cli_ffi_fit_parity_1196::cli_and_ffi_standard_fit_paths_are_identical_by_construction",
+      "test": "cli_and_ffi_standard_fit_paths_are_identical_by_construction",
+      "matches": [
+        "misc::cli_ffi_fit_parity_1196::cli_and_ffi_standard_fit_paths_are_identical_by_construction"
+      ],
+      "status": "failed",
+      "exit_code": 101,
+      "seconds": 5.029445803025737,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/cli_and_ffi_standard_fit_paths_are_identical_by_construction.log"
+    },
+    {
+      "original": "misc::linear_box_constraint_violated_by_internal_scaling::linear_box_constraint_holds_on_reported_scale",
+      "test": "linear_box_constraint_holds_on_reported_scale",
+      "matches": [
+        "misc::linear_box_constraint_violated_by_internal_scaling::linear_box_constraint_holds_on_reported_scale"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.11885457800235599,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/linear_box_constraint_holds_on_reported_scale.log"
+    },
+    {
+      "original": "misc::monotone_shape_binding_constraint::monotone_increasing_shape_binds_on_non_monotone_data",
+      "test": "monotone_increasing_shape_binds_on_non_monotone_data",
+      "matches": [
+        "misc::monotone_shape_binding_constraint::monotone_increasing_shape_binds_on_non_monotone_data"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 1.1718618919840083,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/monotone_increasing_shape_binds_on_non_monotone_data.log"
+    },
+    {
+      "original": "misc::regression_decoder_incoherence_majorizer_is_psd_gauss_newton::majorizer_equals_exact_hvp_minus_residual_term",
+      "test": "majorizer_equals_exact_hvp_minus_residual_term",
+      "matches": [
+        "misc::regression_decoder_incoherence_majorizer_is_psd_gauss_newton::majorizer_equals_exact_hvp_minus_residual_term"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.023771753010805696,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/majorizer_equals_exact_hvp_minus_residual_term.log"
+    },
+    {
+      "original": "misc::shape_constrained_alo_seed_validation_aborts_1191::shape_constrained_smooths_fit_without_alo_seed_validation_abort",
+      "test": "shape_constrained_smooths_fit_without_alo_seed_validation_abort",
+      "matches": [
+        "misc::shape_constrained_alo_seed_validation_aborts_1191::shape_constrained_smooths_fit_without_alo_seed_validation_abort"
+      ],
+      "status": "failed",
+      "exit_code": 101,
+      "seconds": 2.6755549499648623,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/shape_constrained_smooths_fit_without_alo_seed_validation_abort.log"
+    },
+    {
+      "original": "misc::wps_weighted_gram_invariants::penalized_hessian_times_influence_equals_weighted_gram",
+      "test": "penalized_hessian_times_influence_equals_weighted_gram",
+      "matches": [
+        "misc::wps_weighted_gram_invariants::penalized_hessian_times_influence_equals_weighted_gram"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.8893573270179331,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/penalized_hessian_times_influence_equals_weighted_gram.log"
+    },
+    {
+      "original": "optimization::beta_regression_reml_nonfinite::beta_regression_fits_clean_monotone_separation_prone",
+      "test": "beta_regression_fits_clean_monotone_separation_prone",
+      "matches": [
+        "optimization::beta_regression_reml_nonfinite::beta_regression_fits_clean_monotone_separation_prone"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 13.39949645701563,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/beta_regression_fits_clean_monotone_separation_prone.log"
+    },
+    {
+      "original": "optimization::beta_regression_reml_nonfinite::beta_regression_fits_with_positive_slope",
+      "test": "beta_regression_fits_with_positive_slope",
+      "matches": [
+        "optimization::beta_regression_reml_nonfinite::beta_regression_fits_with_positive_slope"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 4.837952085013967,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/beta_regression_fits_with_positive_slope.log"
+    },
+    {
+      "original": "optimization::nonnegative_constraint_kkt_abort_with_free_term::nonnegative_constraint_with_free_term_fits_to_the_constrained_optimum",
+      "test": "nonnegative_constraint_with_free_term_fits_to_the_constrained_optimum",
+      "matches": [
+        "optimization::nonnegative_constraint_kkt_abort_with_free_term::nonnegative_constraint_with_free_term_fits_to_the_constrained_optimum"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.2686997260316275,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/nonnegative_constraint_with_free_term_fits_to_the_constrained_optimum.log"
+    },
+    {
+      "original": "optimization::nonnegative_constraint_kkt_scale_invariant::nonnegative_constraint_kkt_gate_is_scale_invariant",
+      "test": "nonnegative_constraint_kkt_gate_is_scale_invariant",
+      "matches": [
+        "optimization::nonnegative_constraint_kkt_scale_invariant::nonnegative_constraint_kkt_gate_is_scale_invariant"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.21902549295919016,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/nonnegative_constraint_kkt_gate_is_scale_invariant.log"
+    },
+    {
+      "original": "families::gamma_dispersion_location_scale_predictable_1119::negbin_dispersion_location_scale_assembles_covariance_and_is_predictable",
+      "test": "negbin_dispersion_location_scale_assembles_covariance_and_is_predictable",
+      "matches": [
+        "families::gamma_dispersion_location_scale_predictable_1119::negbin_dispersion_location_scale_assembles_covariance_and_is_predictable"
+      ],
+      "status": "timeout",
+      "exit_code": -9,
+      "seconds": 60.010052744008135,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/negbin_dispersion_location_scale_assembles_covariance_and_is_predictable.log"
+    },
+    {
+      "original": "sae::latent_sae_gated::efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite",
+      "test": "efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite",
+      "matches": [
+        "sae::latent_sae_gated::efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite"
+      ],
+      "status": "failed",
+      "exit_code": 101,
+      "seconds": 3.086818884999957,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite.log"
+    },
+    {
+      "original": "sae::latent_sae_gated::penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth",
+      "test": "penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth",
+      "matches": [
+        "sae::latent_sae_gated::penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.06887202704092488,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth.log"
+    },
+    {
+      "original": "sae::latent_sae_gated::penalized_quasi_laplace_criterion_keeps_alpha_finite_on_collapsing_axis",
+      "test": "penalized_quasi_laplace_criterion_keeps_alpha_finite_on_collapsing_axis",
+      "matches": [
+        "sae::latent_sae_gated::penalized_quasi_laplace_criterion_keeps_alpha_finite_on_collapsing_axis"
+      ],
+      "status": "failed",
+      "exit_code": 101,
+      "seconds": 0.06646298599662259,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/penalized_quasi_laplace_criterion_keeps_alpha_finite_on_collapsing_axis.log"
+    },
+    {
+      "original": "smooths::convex_shape_smooth_parks_in_linear_corner_1654::convex_shape_smooth_does_not_park_in_linear_corner_at_collapsing_k",
+      "test": "convex_shape_smooth_does_not_park_in_linear_corner_at_collapsing_k",
+      "matches": [
+        "smooths::convex_shape_smooth_parks_in_linear_corner_1654::convex_shape_smooth_does_not_park_in_linear_corner_at_collapsing_k"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 6.333148774981964,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/convex_shape_smooth_does_not_park_in_linear_corner_at_collapsing_k.log"
+    },
+    {
+      "original": "smooths::double_penalty_shrinks_irrelevant_covariate_1266::default_double_penalty_shrinks_irrelevant_covariate_edf_below_one",
+      "test": "bspline_double_penalty_does_not_distort_a_supported_linear_fit",
+      "matches": [],
+      "status": "missing"
+    },
+    {
+      "original": "smooths::posterior_sampling_box_coefficient_constraint_1507::posterior_respects_nonnegative_coefficient_bound",
+      "test": "posterior_respects_nonnegative_coefficient_bound",
+      "matches": [
+        "smooths::posterior_sampling_box_coefficient_constraint_1507::posterior_respects_nonnegative_coefficient_bound"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.06852090603206307,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/posterior_respects_nonnegative_coefficient_bound.log"
+    },
+    {
+      "original": "smooths::posterior_sampling_box_coefficient_constraint_1507::posterior_respects_two_sided_linear_coefficient_bounds",
+      "test": "posterior_respects_two_sided_linear_coefficient_bounds",
+      "matches": [
+        "smooths::posterior_sampling_box_coefficient_constraint_1507::posterior_respects_two_sided_linear_coefficient_bounds"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.06947584199951962,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/posterior_respects_two_sided_linear_coefficient_bounds.log"
+    },
+    {
+      "original": "predict::dispersion_location_scale_generate_predict_variance_agreement::dispersion_location_scale_generate_matches_predict_variance_negbin",
+      "test": "dispersion_location_scale_generate_matches_predict_variance_negbin",
+      "matches": [
+        "predict::dispersion_location_scale_generate_predict_variance_agreement::dispersion_location_scale_generate_matches_predict_variance_negbin"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 40.67763551598182,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/dispersion_location_scale_generate_matches_predict_variance_negbin.log"
+    },
+    {
+      "original": "smooths::shape_constrained_fit_survives_its_own_inference_2601::every_shape_constraint_fits_clean_linear_data_2601",
+      "test": "every_shape_constraint_fits_clean_linear_data_2601",
+      "matches": [
+        "smooths::shape_constrained_fit_survives_its_own_inference_2601::every_shape_constraint_fits_clean_linear_data_2601"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 4.878043781034648,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/every_shape_constraint_fits_clean_linear_data_2601.log"
+    },
+    {
+      "original": "smooths::smooth_term_predict_flat_clamped_outside_training_range::smooth_term_predict_extrapolates_instead_of_flat_clamping_to_training_range",
+      "test": "smooth_term_predict_extrapolates_instead_of_flat_clamping_to_training_range",
+      "matches": [
+        "smooths::smooth_term_predict_flat_clamped_outside_training_range::smooth_term_predict_extrapolates_instead_of_flat_clamping_to_training_range"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.5348494069767185,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/smooth_term_predict_extrapolates_instead_of_flat_clamping_to_training_range.log"
+    },
+    {
+      "original": "smooths::smooth_extrapolation_axes_whole_class::radial_matern_reverts_to_mean_instead_of_freezing_at_the_boundary",
+      "test": "radial_matern_reverts_to_mean_instead_of_freezing_at_the_boundary",
+      "matches": [
+        "smooths::smooth_extrapolation_axes_whole_class::radial_matern_reverts_to_mean_instead_of_freezing_at_the_boundary"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 4.585245790949557,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/radial_matern_reverts_to_mean_instead_of_freezing_at_the_boundary.log"
+    },
+    {
+      "original": "survival::royston_parmar_predict_beyond_support_zero_hazard::royston_parmar_saved_predict_at_grid_top_does_not_fail",
+      "test": "royston_parmar_saved_predict_at_grid_top_does_not_fail",
+      "matches": [
+        "survival::royston_parmar_predict_beyond_support_zero_hazard::royston_parmar_saved_predict_at_grid_top_does_not_fail"
+      ],
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 17.313745933992323,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/royston_parmar_saved_predict_at_grid_top_does_not_fail.log"
+    },
+    {
+      "original": "survival::survival_location_scale_penalized_edf_below_ncoef_2106",
+      "test": "survival_location_scale_penalized_edf_below_ncoef_2106",
+      "matches": [
+        "survival::survival_location_scale_penalized_edf_below_ncoef_2106::survival_location_scale_penalized_edf_below_ncoef_2106"
+      ],
+      "status": "timeout",
+      "exit_code": -9,
+      "seconds": 60.008365436049644,
+      "log": "/projects/standard/hsiehph/sauer354/issue2668-source-r2/survival_location_scale_penalized_edf_below_ncoef_2106.log"
+    }
+  ]
+}

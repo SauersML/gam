@@ -46,6 +46,7 @@ impl Lcg {
 
 #[test]
 fn survival_location_scale_penalized_edf_below_ncoef_2106() {
+    gam_runtime::test_support::install_diagnostic_logger();
     init_parallelism();
 
     // Clean Gaussian AFT on log-time with a FLAT truth in x: log T = 0 + 1·ε.

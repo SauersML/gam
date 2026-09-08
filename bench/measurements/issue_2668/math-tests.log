@@ -1,0 +1,35 @@
+   Compiling bytemuck v1.25.2
+   Compiling matrixmultiply v0.3.11
+   Compiling approx v0.5.1
+   Compiling safe_arch v1.1.0
+   Compiling num-complex v0.4.6
+   Compiling wide v1.5.0
+   Compiling thiserror v2.0.19
+   Compiling rand v0.10.2
+   Compiling simba v0.10.0
+   Compiling typenum v1.20.1
+   Compiling nalgebra v0.35.0
+   Compiling statrs v0.19.0
+   Compiling gam-math v0.3.154 (/scratch.global/sauer354/n5/crates/gam-math)
+    Finished `test` profile [optimized + debuginfo] target(s) in 45.78s
+     Running unittests src/lib.rs (/scratch.global/sauer354/n5-target/debug/deps/gam_math-ef9f911ddb331793)
+
+running 15 tests
+test jet_poisson_oracle_tests::poisson_jet_tower_matches_hand_derived_closed_form ... ok
+test jet_tower::derivative_stack_tests::digamma_derivative_stack_overlaps_ln_gamma_stack ... ok
+test jet_tower::derivative_stack_tests::ln_gamma_derivative_stack_known_values_at_1 ... ok
+test jet_tower::derivative_stack_tests::ln_gamma_derivative_stack_known_values_at_2 ... ok
+test jet_tower::derivative_stack_tests::ln_gamma_derivative_stack_order2_is_prefix ... ok
+test jet_tower::tests::crossing_edge_constraint_frame_matches_bare_velocity_constants ... ok
+test jet_tower::tests::crossing_edge_tower_matches_handpath_velocity_formulas ... ok
+test jet_gamma_oracle_tests::gamma_dispersion_jet_tower_matches_independent_fd_oracle ... ok
+test jet_tower::tests::full_tower_accepts_largest_width_inside_storage_budget_932 ... ok
+test jet_tower::tests::full_tower_refuses_oversized_result_before_touching_program ... ok
+test jet_tower::tests::locscale_tower_matches_closed_forms_including_cross_blocks ... ok
+test jet_tower::tests::logit_tower_matches_closed_forms ... ok
+test jet_tower::tests::t3_t4_are_fully_index_symmetric ... ok
+test jet_tower::tests::tower3_matches_tower4_through_third_order ... ok
+test jet_tower::tests::gnarly_tower_is_fd_consistent_order_by_order ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 233 filtered out; finished in 0.01s
+

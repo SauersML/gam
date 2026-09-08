@@ -776,6 +776,7 @@ fn assert_orthogonal_dispersion_family_predictable(
 
 #[test]
 fn negbin_dispersion_location_scale_assembles_covariance_and_is_predictable() {
+    gam_runtime::test_support::install_diagnostic_logger();
     init_parallelism();
     // Heteroscedastic-dispersion NB2: mean exp(0.5 + 0.6 x), varying size θ(x).
     let n = 600usize;
