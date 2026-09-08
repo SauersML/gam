@@ -641,12 +641,12 @@ impl<'a> RemlState<'a> {
                 .for_each(|(coordinate, component)| *coordinate += step * component);
             point
         };
-        let centre_node = |_evaluations: usize| CalibratedSigmaNode { step: 0.0 };
+        let centre_node = CalibratedSigmaNode { step: 0.0 };
         if !wald_step.is_finite() || wald_step <= 0.0 || box_limit <= 0.0 {
             // Either the direction has no resolvable width, or ρ̂ already sits
             // on the box face along it. Both mean the node is the centre and
             // this side of the chord is zero-length.
-            return Ok(centre_node(0));
+            return Ok(centre_node);
         }
 
         let target = PROFILE_SIGMA_RISE;
