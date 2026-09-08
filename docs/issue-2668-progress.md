@@ -185,3 +185,32 @@ and Duchon atoms follow the same rule. The unreachable cubic-Duchon bound and
 its unused radial metadata were removed. This fixes setup classification, not
 the separate SAE criterion/ARD inconsistency; the original pair still needs
 remeasurement against the integrated build.
+
+## Integrated encode and proper smoothing posterior
+
+The r5 executable measured **24 passes, four failures, and two timeouts**.
+All 30 identities were present and the before/after binary hashes matched.
+Receipts are in `bench/measurements/issue_2668/issue2668-source-r5/`.
+
+The smoothing-posterior support/prior changes clear the cubature-domain error.
+The original irrelevant-covariate statistic is now measured: mean EDF 2.030541
+(1.119791, 3.320913, 1.967723, 2.554531, 1.189746 across the five seeds), above
+the required 1.0. Supported-signal EDF averages 8.636143. This is a real
+shrinkage failure, not an integration exception. The concave shape fit also
+fails during inference (P-IRLS nonconvergence after two iterations, reported
+gradient 2.293496e-7), so the r4 all-shapes pass does not carry forward to r5.
+
+Both SAE regressions pass atlas setup. The EFS test now exposes a one-row
+encode batch rejected by its row-indexed affine fixture. The collapsing-axis
+criterion refuses an unconverged mode, with raw KKT 1.391429e-2 versus tolerance
+7.044921e-4. NB covariance/prediction and survival location-scale EDF still
+exceed 60 seconds. No remaining contract is counted resolved.
+
+The next custom-family experiment uses one coefficient-accuracy policy for
+both value and derivative evaluations of the Laplace criterion. A nonlinear
+coefficient-dependent determinant has first-order sensitivity to coefficient
+error; coarse line-search modes therefore change the numerical objective
+relative to its gradient. The experiment also removes the residual-only
+override of the inner solver's convergence verdict, which ignored negative
+curvature. A quartic with an analytic mode, Laplace value, and rho derivative
+provides an independent focused accuracy check. Results are pending.
