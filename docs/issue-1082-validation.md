@@ -138,6 +138,23 @@ joint-penalty cancellation unit check passed in 0.02 seconds. Issue #1082 remain
 open: neither the outstanding quality gates nor all affected derivative checks
 have been satisfied.
 
+On the next availability check, the login node and primary Slurm controller
+responded, but `sinfo` reported 490 invalid, 11 unknown and one draining node;
+neither default compute host answered. No scheduler jobs remained for this user.
+No replacement validation job was submitted into that unavailable pool.
+
+Recovered multinomial logs narrow the remaining performance investigation:
+at `n=270, p=38, k=24`, a late armed-Jeffreys evaluation spent 1.802 seconds
+assembling its dense outer Hessian out of 1.975 seconds total. Adjacent inner
+solves certified in 0.034 and 0.047 seconds. Source inspection finds repeated
+first and all-axis second information derivatives for each pair in
+`custom_family_outer_jeffreys_hphi_drift_batched`; the mixed third derivative is
+pair-specific. This identifies work to measure, not proof of a derivative error
+or a validated optimization. The failed public joint-hyper probe must also be
+replaced by a check of the labeled joint-penalty evaluator actually used by the
+production fit. A local copy of the 5.2 MB failure log is preserved at
+`/Users/user/gam-validation-artifacts/issue1082-curvature-multinomial.log`.
+
 1. Run every selected test after the corrections, including both synthetic and real-data arms. Record
    actual durations and assertions; missing references remain failures.
 2. Diagnose and fix remaining solver/covariance failures without increasing
