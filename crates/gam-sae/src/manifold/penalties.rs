@@ -2159,16 +2159,8 @@ impl SaeManifoldTerm {
     /// reconstruction linearly, so Gauss–Newton IS exact there), and the ARD
     /// prior (a t-tier object) install no majorizer and appear in neither side.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn decoder_prior_beta_hvp_pair(
-        &self,
-        penalty_scale: f64,
-        v: ArrayView1<'_, f64>,
-    ) -> Result<(Array1<f64>, Array1<f64>), String> {
-        let prepared = self.prepare_decoder_prior_beta_curvature(penalty_scale);
-        self.decoder_prior_beta_hvp_pair_prepared(&prepared, v)
-    }
 
-    /// [`Self::decoder_prior_beta_hvp_pair`] against a plan prepared once for
+    /// `Self::decoder_prior_beta_hvp_pair` against a plan prepared once for
     /// this decoder state ([`Self::prepare_decoder_prior_beta_curvature`]).
     pub(crate) fn decoder_prior_beta_hvp_pair_prepared(
         &self,
@@ -3856,5 +3848,25 @@ mod tests_findings_234 {
             (gamma_w - gamma_none).abs() > 1e-4,
             "non-uniform weights must move γ off the unweighted value: w={gamma_w} none={gamma_none}"
         );
+    }
+}
+
+// The un-prepared wrappers below build a decoder-prior plan per call; production
+// callers all go through the `_prepared` forms with a plan built once per state
+// (#2828), so the wrappers are test-only conveniences and live here to keep the
+// workspace `warnings = "deny"` gate green (dead_code otherwise).
+#[cfg(test)]
+mod tests_decoder_prior_hvp_wrapper {
+    use super::*;
+
+    impl SaeManifoldTerm {
+        pub(crate) fn decoder_prior_beta_hvp_pair(
+            &self,
+            penalty_scale: f64,
+            v: ArrayView1<'_, f64>,
+        ) -> Result<(Array1<f64>, Array1<f64>), String> {
+            let prepared = self.prepare_decoder_prior_beta_curvature(penalty_scale);
+            self.decoder_prior_beta_hvp_pair_prepared(&prepared, v)
+        }
     }
 }

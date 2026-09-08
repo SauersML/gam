@@ -1251,18 +1251,8 @@ impl SaeManifoldTerm {
     /// deltas are logit/coord-space prior curvatures and carry no output metric,
     /// so they are path-independent.
     #[cfg_attr(not(test), expect(dead_code, reason = "exercised by the exact-Hessian test target"))]
-    pub(crate) fn apply_exact_hessian_minus_b(
-        &self,
-        rho: &SaeManifoldRho,
-        target: ArrayView2<'_, f64>,
-        cache: &ArrowFactorCache,
-        v: &SaeArrowVector,
-    ) -> Result<SaeArrowVector, String> {
-        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
-        self.apply_exact_hessian_minus_b_prepared(rho, target, cache, v, &prepared)
-    }
 
-    /// [`Self::apply_exact_hessian_minus_b`] against a β-tier decoder-prior plan
+    /// `Self::apply_exact_hessian_minus_b` against a β-tier decoder-prior plan
     /// prepared once for this state.
     ///
     /// #2828 — the β leg's plan is a property of the DECODER STATE, not of the
@@ -1710,7 +1700,7 @@ impl SaeManifoldTerm {
     /// #2828 — the border block of `E = B − A`, restricted to the β-tier decoder
     /// priors' MAJORIZATION artefact: `E_ββ = (installed PSD majorizer) − (exact
     /// prior Hessian)`, i.e. exactly the negation of the β leg
-    /// [`Self::apply_exact_hessian_minus_b`] now adds to `A`. Dense `k × k` in the
+    /// `Self::apply_exact_hessian_minus_b` now adds to `A`. Dense `k × k` in the
     /// cache's own border coordinates (factored when a frame is engaged), `None`
     /// when no β-tier prior is live and the block is identically zero.
     ///
@@ -1820,7 +1810,7 @@ impl SaeManifoldTerm {
 
     /// #2336 — the diagonal of `E = B − A` restricted to the ARD periodic
     /// prior's concave-half clamp (block (3) of
-    /// [`Self::apply_exact_hessian_minus_b`]), over the coordinate (t) block; zero
+    /// `Self::apply_exact_hessian_minus_b`), over the coordinate (t) block; zero
     /// on the β border and on logit rows.
     ///
     /// `E ⪰ 0` is diagonal in the t-block with entries `w_row·|min(V'',0)|`, the
@@ -1922,7 +1912,7 @@ impl SaeManifoldTerm {
     /// #1418: matrix-free apply of the EXACT stationarity Jacobian `A = ∇²_θθ L`:
     /// `A v = B_raw v + ΔC v`, the raw objective-majorizer apply
     /// ([`apply_raw_cached_arrow_hessian`]) plus the matrix-free dropped-curvature
-    /// correction `ΔC = A − B` ([`Self::apply_exact_hessian_minus_b`]).
+    /// correction `ΔC = A − B` (`Self::apply_exact_hessian_minus_b`).
     fn apply_exact_hessian(
         &self,
         rho: &SaeManifoldRho,
@@ -2014,19 +2004,8 @@ impl SaeManifoldTerm {
     /// Schur term and its `H_βt Φ(B_tt)⁻¹ H_tβ` restoration share one conditioned
     /// factor and cancel algebraically.
     #[cfg_attr(not(test), expect(dead_code, reason = "exercised by the matrix-free Hessian test target"))]
-    pub(crate) fn apply_exact_hessian_matrix_free(
-        &self,
-        rho: &SaeManifoldRho,
-        target: ArrayView2<'_, f64>,
-        cache: &ArrowFactorCache,
-        system: &ArrowSchurSystem,
-        vector: &SaeArrowVector,
-    ) -> Result<SaeArrowVector, String> {
-        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
-        self.apply_exact_hessian_matrix_free_prepared(rho, target, cache, system, vector, &prepared)
-    }
 
-    /// [`Self::apply_exact_hessian_matrix_free`] against a β-tier plan prepared
+    /// `Self::apply_exact_hessian_matrix_free` against a β-tier plan prepared
     /// once — the form the Krylov solve installs, so the plan is built once per
     /// solve rather than once per iteration.
     pub(crate) fn apply_exact_hessian_matrix_free_prepared(
@@ -2358,7 +2337,7 @@ impl SaeManifoldTerm {
 
     /// PATH C (#2253) CH5 — the ρ-derivative of the EXACT-minus-majorizer
     /// stationarity correction, `∂(ΔC)/∂ρ_i` where `ΔC = A − B`
-    /// ([`Self::apply_exact_hessian_minus_b`]), keyed by flat coordinate. The IFT
+    /// (`Self::apply_exact_hessian_minus_b`), keyed by flat coordinate. The IFT
     /// sensitivity `∂a/∂ρ_i = A⁺(∂Γ/∂ρ_i − (∂A/∂ρ_i)a)` differentiates the EXACT
     /// stationarity Hessian `A = B + ΔC`, not the majorized solver operator `B = H`
     /// (`penalty_curvature_operators_by_flat` = `∂B/∂ρ`). So the `M_i·a` term must
@@ -5926,7 +5905,7 @@ impl SaeManifoldTerm {
     /// Assemble `ΔC = A − B` per row, so the arrow evidence system can carry the
     /// EXACT observed information instead of the Newton/Schur majorizer.
     ///
-    /// [`Self::apply_exact_hessian_minus_b`] contracts these blocks against a
+    /// `Self::apply_exact_hessian_minus_b` contracts these blocks against a
     /// direction without ever forming them, which is all a matvec consumer needs.
     /// The streaming log-determinant is not a matvec consumer: it takes
     /// `log|H_tt^(i)|` off assembled per-row factors and reduces an assembled
@@ -7414,6 +7393,39 @@ mod column_loop_oracle_tests {
                 build_elapsed.as_secs_f64() * 1.0e3 / (dim.max(1) as f64),
             );
             Ok(a)
+        }
+    }
+}
+
+// The un-prepared wrappers below build a decoder-prior plan per call; production
+// callers all go through the `_prepared` forms with a plan built once per state
+// (#2828), so the wrappers are test-only conveniences and live here to keep the
+// workspace `warnings = "deny"` gate green (dead_code otherwise).
+#[cfg(test)]
+mod tests_exact_hessian_apply_wrappers {
+    use super::*;
+
+    impl SaeManifoldTerm {
+        pub(crate) fn apply_exact_hessian_minus_b(
+            &self,
+            rho: &SaeManifoldRho,
+            target: ArrayView2<'_, f64>,
+            cache: &ArrowFactorCache,
+            v: &SaeArrowVector,
+        ) -> Result<SaeArrowVector, String> {
+            let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
+            self.apply_exact_hessian_minus_b_prepared(rho, target, cache, v, &prepared)
+        }
+        pub(crate) fn apply_exact_hessian_matrix_free(
+            &self,
+            rho: &SaeManifoldRho,
+            target: ArrayView2<'_, f64>,
+            cache: &ArrowFactorCache,
+            system: &ArrowSchurSystem,
+            vector: &SaeArrowVector,
+        ) -> Result<SaeArrowVector, String> {
+            let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
+            self.apply_exact_hessian_matrix_free_prepared(rho, target, cache, system, vector, &prepared)
         }
     }
 }
