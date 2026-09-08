@@ -23,3 +23,4 @@ thiserror = "2.0.18"
 [dev-dependencies]
 # `test_support::fd_checker`'s self-tests compare stencils against closed forms.
 approx = "0.5.1"
+proptest = "1.11.0"

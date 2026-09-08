@@ -270,6 +270,24 @@ pub fn factorize_sparse_spd_strict(
         }
     })?;
     let simplicial = factorize_simplicial_canonical_upper(h_upper)?;
+    let largest_diagonal = (0..h_upper.ncols())
+        .filter_map(|column| {
+            (col_ptr[column]..col_ptr[column + 1])
+                .find(|&index| row_idx[index] == column)
+                .map(|index| values[index])
+        })
+        .fold(0.0_f64, f64::max);
+    // Each Schur-complement pivot forms a length-n dot product and subtracts
+    // it: at most 2n rounded operations, hence Wilkinson's gamma_(2n).
+    let pivot_band = crate::roundoff::accumulation_growth(2 * h_upper.ncols()) * largest_diagonal;
+    if (0..simplicial.n).any(|column| {
+        let diagonal = simplicial.l_values[simplicial.l_col_ptr[column]];
+        diagonal * diagonal <= pivot_band
+    }) {
+        return Err(LinalgError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
+    }
     let logdet = simplicial.logdet;
     Ok(SparseExactFactor {
         factor,
