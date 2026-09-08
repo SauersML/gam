@@ -1,4 +1,5 @@
 {
+  "source_hash_scope": "Snapshot at example link time. Dependency rlibs came from the contemporaneous warm extension build; their exact bytes are hashed below. Concurrent source edits after a dependency compiled are not attested by this snapshot.",
   "command": [
     "taskset",
     "-c",
