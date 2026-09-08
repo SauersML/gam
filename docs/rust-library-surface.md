@@ -68,7 +68,9 @@ let criterion = fitted
     .expect("this noisy Gaussian data has a finite REML criterion");
 let evidence = fitted.fit.convergence_evidence();
 assert!(criterion.is_finite());
-assert!(fitted.fit.outer_iterations <= config.outer_max_iter);
+if let Some(cap) = config.outer_max_iter {
+    assert!(fitted.fit.outer_iterations <= cap);
+}
 println!("REML={criterion:.3}; convergence={evidence:?}");
 # Ok(())
 # }

@@ -927,7 +927,7 @@ impl DecoderIncoherencePenalty {
     /// B_j[a,o]B_k[b,o]` depends on exactly row `a` of `B_j` and row `b` of
     /// `B_k`, so `∂C[a,b]/∂B` is two `p`-long runs and `JᵀJ = Σ_{a,b} v_{ab}
     /// v_{ab}ᵀ`. This is therefore the SAME operator as the
-    /// `include_residual = false` branch of [`Self::hvp_impl`] and as
+    /// `include_residual = false` branch of `Self::hvp_impl` and as
     /// [`Self::accumulate_psd_majorizer_dense`] — stated in the form a
     /// matrix-free solver can install without materializing `(ΣM_kp)²`.
     ///

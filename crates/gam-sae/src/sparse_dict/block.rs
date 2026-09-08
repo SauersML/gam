@@ -1564,7 +1564,7 @@ pub(super) fn seed_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize) -> 
 /// `K` regimes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockSeedPolicy {
-    /// Deterministic data-row seed ([`data_row_frames`]): distribute the `K`
+    /// Deterministic data-row seed (`data_row_frames`): distribute the `K`
     /// initial axes across the observed rows, centre them, and orthonormalize
     /// each block.  This costs `O(N·P + K·P)` and puts capacity in the data cloud
     /// before routing begins, rather than relying on later dead-block revival.
