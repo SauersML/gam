@@ -4445,6 +4445,9 @@ impl SaeManifoldTerm {
             self.beta_dim()
         };
         let mut schur_acc = Array2::<f64>::zeros((border_dim, border_dim));
+        let mut majorizer_acc = Array2::<f64>::zeros((border_dim, border_dim));
+        let mut clamp_acc = Array2::<f64>::zeros((border_dim, border_dim));
+        let mut exact_a_chunks = 0usize;
         let mut log_det_tt = 0.0_f64;
         // #2515 — same substitution as the matrix-free branch above, and for the
         // same reason: every factorization below is of `exact_a_evidence_system`'s
@@ -4503,19 +4506,44 @@ impl SaeManifoldTerm {
             // only β-side penalties, and `ΔC_ββ ≡ 0`.)
             let sys = chunk.exact_a_evidence_system(z_chunk, rho, &sys)?;
             let mut streaming = StreamingArrowSchur::from_system(&sys, sys.rows.len().max(1));
-            let (chunk_log_det_tt, chunk_schur) = streaming
-                .reduced_schur_and_log_det_tt(0.0, 0.0, &options)
+            let evidence = streaming
+                .evidence_schur_chunk(0.0, 0.0, &options)
                 .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
-            log_det_tt += chunk_log_det_tt;
+            log_det_tt += evidence.log_det_tt;
+            match (evidence.majorizer_metric, evidence.clamp_metric) {
+                (Some(majorizer), Some(clamp)) => {
+                    majorizer_acc += &majorizer;
+                    clamp_acc += &clamp;
+                    exact_a_chunks += 1;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err("SaeManifoldTerm::streaming_exact_arrow_log_det: partial exact-A \
+                                chunk carrier is not a classification"
+                        .to_string());
+                }
+            }
             for row in 0..border_dim {
                 for col in 0..border_dim {
-                    schur_acc[[row, col]] += chunk_schur[[row, col]];
+                    schur_acc[[row, col]] += evidence.schur[[row, col]];
                 }
             }
             start = end;
         }
-        let log_det_schur = StreamingArrowSchur::reduced_schur_log_det(&schur_acc, &options)
-            .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
+        let expected_chunks = n_total.div_ceil(chunk_size);
+        if exact_a_chunks != 0 && exact_a_chunks != expected_chunks {
+            return Err("SaeManifoldTerm::streaming_exact_arrow_log_det: partial exact-A \
+                        chunk carrier would classify a different operator"
+                .to_string());
+        }
+        let exact_a = (exact_a_chunks == expected_chunks).then_some((&majorizer_acc, &clamp_acc));
+        let log_det_schur = StreamingArrowSchur::reduced_schur_log_det(
+            &schur_acc,
+            &options,
+            exact_a.map(|metrics| metrics.0),
+            exact_a.map(|metrics| metrics.1),
+        )
+        .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
         if let Some(ri) = rank_inputs.as_deref_mut() {
             ri.log_det_tt = log_det_tt;
         }

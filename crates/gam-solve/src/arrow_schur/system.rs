@@ -1099,6 +1099,19 @@ pub struct StreamingArrowSchur {
     /// regression: #1273 wired the deflation into the dense path only). `None`
     /// for every non-evidence caller, which keeps the strict non-PD refusal.
     pub(crate) row_gauge_deflation: Option<ArrowRowGaugeDeflation>,
+    /// Raw exact-A operands used by the evidence classifier. The verdict and
+    /// operands form one contract; carrying only the refusing policy made the
+    /// streaming evidence route structurally unreachable (#2731).
+    pub(crate) exact_a_classification: Option<ExactAClassificationGeometry>,
+}
+
+/// One chunk's additive exact-evidence contribution, formed from one set of
+/// row factors so the Schur block cannot be separated from its classifier.
+pub struct StreamingEvidenceSchurChunk {
+    pub log_det_tt: f64,
+    pub schur: Array2<f64>,
+    pub majorizer_metric: Option<Array2<f64>>,
+    pub clamp_metric: Option<Array2<f64>>,
 }
 
 impl std::fmt::Debug for StreamingArrowSchur {
@@ -1145,6 +1158,7 @@ impl StreamingArrowSchur {
             evidence_factorization: false,
             refuse_resolved_indefinite: false,
             row_gauge_deflation: None,
+            exact_a_classification: None,
         }
     }
 
@@ -1208,6 +1222,7 @@ impl StreamingArrowSchur {
         // would deflate on the dense path but be refused / log-det-divergent on
         // the streaming path, breaking `streaming_logdet == full_logdet`.
         streaming.row_gauge_deflation = sys.row_gauge_deflation.clone();
+        streaming.exact_a_classification = sys.exact_a_classification.clone();
         streaming
     }
 
@@ -1226,27 +1241,34 @@ impl StreamingArrowSchur {
         di: usize,
         row_idx: usize,
     ) -> Result<Array2<f64>, ArrowSchurError> {
-        match self.row_gauge_deflation.as_ref() {
-            Some(deflation) => factor_one_row_result(
+        if self.row_gauge_deflation.is_some() || self.exact_a_classification.is_some() {
+            let gauge = self
+                .row_gauge_deflation
+                .as_ref()
+                .map(|deflation| deflation.row(row_idx))
+                .unwrap_or(&[]);
+            let exact_a = self
+                .exact_a_classification
+                .as_ref()
+                .and_then(|geometry| geometry.rows.get(row_idx));
+            factor_one_row_result(
                 row,
                 ridge_t,
                 di,
                 row_idx,
                 self.evidence_factorization,
-                deflation.row(row_idx),
+                gauge,
                 // Evidence path: opt into spectral discovery of an
                 // intrinsic-dimension-flat direction even when this row's
                 // supplied gauge list is empty/non-spanning — matching the
                 // `allow_spectral_deflation = true` the dense path passes.
                 true,
                 self.refuse_resolved_indefinite,
-                // The streaming system carries no exact-A classification
-                // geometry; the row is factored as it was before that
-                // classification existed.
-                None,
+                exact_a,
             )
-            .map(|result| result.factor),
-            None => factor_one_row(row, ridge_t, di, row_idx, self.evidence_factorization),
+            .map(|result| result.factor)
+        } else {
+            factor_one_row(row, ridge_t, di, row_idx, self.evidence_factorization)
         }
     }
 
@@ -1499,13 +1521,105 @@ impl StreamingArrowSchur {
         Ok((log_det_tt, schur))
     }
 
+    /// Form a complete chunk contribution for exact-A evidence classification.
+    pub fn evidence_schur_chunk(
+        &mut self,
+        ridge_t: f64,
+        ridge_beta: f64,
+        options: &ArrowSolveOptions,
+    ) -> Result<StreamingEvidenceSchurChunk, ArrowSchurError> {
+        if options.evidence_policy.refuses_resolved_indefinite()
+            && self.exact_a_classification.is_none()
+        {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "exact-A evidence classification requires the raw B/delta/clamp carrier"
+                    .to_string(),
+            });
+        }
+        let sys = self.as_classification_system()?;
+        let backend = CpuBatchedBlockSolver;
+        let factors = factor_blocks_for_system(
+            &sys,
+            ridge_t,
+            options.evidence_policy,
+            &backend,
+            options.gpu_policy,
+        )?;
+        let mut log_det_tt = 0.0;
+        for row_idx in 0..sys.rows.len() {
+            let factor = factors.factors.factor(row_idx);
+            for axis in 0..factor.nrows() {
+                log_det_tt += 2.0 * factor[[axis, axis]].ln();
+            }
+        }
+        let schur = build_dense_schur_direct(
+            &sys,
+            &factors.factors,
+            ridge_beta,
+            &backend,
+            options.gpu_policy,
+        )?;
+        let classification = exact_a_reduced_classification(&sys, &factors.factors)?;
+        let (majorizer_metric, clamp_metric) = classification.map_or(
+            (None, None),
+            |classification| {
+                (
+                    Some(classification.majorizer_metric),
+                    Some(classification.clamp_metric),
+                )
+            },
+        );
+        Ok(StreamingEvidenceSchurChunk {
+            log_det_tt,
+            schur,
+            majorizer_metric,
+            clamp_metric,
+        })
+    }
+
+    fn as_classification_system(&self) -> Result<ArrowSchurSystem, ArrowSchurError> {
+        let mut rows = Vec::with_capacity(self.n_rows);
+        for row_idx in 0..self.n_rows {
+            let mut row = (self.row_builder)(row_idx)?;
+            let di = row.htt.nrows();
+            row.htbeta = self.row_htbeta(row_idx, &row, di);
+            rows.push(row);
+        }
+        let mut sys = ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(
+            self.row_dims.to_vec(),
+            self.k,
+            self.k,
+        );
+        sys.rows = rows;
+        sys.hbb = self.hbb.clone();
+        sys.gb = self.gb.clone();
+        sys.row_gauge_deflation = self.row_gauge_deflation.clone();
+        sys.exact_a_classification = self.exact_a_classification.clone();
+        Ok(sys)
+    }
+
     pub fn reduced_schur_log_det(
         schur: &Array2<f64>,
         options: &ArrowSolveOptions,
+        majorizer_metric: Option<&Array2<f64>>,
+        clamp_metric: Option<&Array2<f64>>,
     ) -> Result<f64, ArrowSchurError> {
-        let schur_factor =
-            factor_dense_reduced_schur(schur, options.evidence_policy.reduced_schur_policy())?
-                .factor;
+        let exact_a = match (majorizer_metric, clamp_metric) {
+            (Some(majorizer_metric), Some(clamp_metric)) => Some(ExactAReducedClassification {
+                majorizer_metric: majorizer_metric.clone(),
+                clamp_metric: clamp_metric.clone(),
+            }),
+            (None, None) => None,
+            _ => return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "partial exact-A reduced-Schur carrier is not a classification".to_string(),
+            }),
+        };
+        let schur_factor = factor_dense_reduced_schur_with_exact_a(
+            schur,
+            options.evidence_policy.reduced_schur_policy(),
+            exact_a.as_ref(),
+        )?
+        .factor;
         let mut log_det_schur = 0.0_f64;
         for axis in 0..schur_factor.nrows() {
             log_det_schur += 2.0 * schur_factor[[axis, axis]].ln();
