@@ -22,6 +22,7 @@ fn cli_fit_reports_degenerate_inputs_at_the_shared_boundary() {
     for (csv, column, problem) in cases {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("data.csv");
+        let model = dir.path().join("model.gam");
         fs::write(&input, csv).unwrap();
         let output = Command::new(gam_test_support::gam_binary!())
             .args([
@@ -30,6 +31,8 @@ fn cli_fit_reports_degenerate_inputs_at_the_shared_boundary() {
                 "y ~ x",
                 "--family",
                 "gaussian",
+                "--out",
+                model.to_str().unwrap(),
             ])
             .output()
             .unwrap();
@@ -49,9 +52,18 @@ fn cli_fit_reports_degenerate_inputs_at_the_shared_boundary() {
 fn cli_fit_reports_empty_frame_without_panicking() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("data.csv");
+    let model = dir.path().join("model.gam");
     fs::write(&input, "y,x\n").unwrap();
     let output = Command::new(gam_test_support::gam_binary!())
-        .args(["fit", input.to_str().unwrap(), "y ~ x"])
+        .args([
+            "fit",
+            input.to_str().unwrap(),
+            "y ~ x",
+            "--family",
+            "gaussian",
+            "--out",
+            model.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     assert!(!output.status.success());

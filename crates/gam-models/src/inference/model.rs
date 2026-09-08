@@ -4058,7 +4058,7 @@ impl FittedModel {
         })?;
         let model: Self =
             serde_json::from_str(&payload).map_err(|e| FittedModelError::PayloadCorrupt {
-                reason: format!("failed to parse model json: {e}"),
+                reason: format!("failed to parse model '{}': {e}", path.display()),
             })?;
         let model = model.with_synchronized_stateful_link_metadata();
         model.validate_for_persistence()?;
