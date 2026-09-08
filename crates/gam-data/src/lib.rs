@@ -187,6 +187,10 @@ pub enum DataError {
     /// A cell value cannot be used as a feature: non-finite float, Arrow null,
     /// or an unsupported Arrow data type for the column.
     InvalidValue { reason: String },
+    /// A complete table reached the fitting boundary but one of its columns
+    /// cannot identify a model effect. Unlike `InvalidValue`, this retains
+    /// both pieces of machine-readable context for front ends.
+    DegenerateColumn { column: String, problem: String },
     /// A formula or call site references a column name that is not present in
     /// the input data. Structured so the FFI boundary can raise a typed
     /// Python exception (`gamfit.ColumnNotFoundError`) carrying the missing
@@ -252,6 +256,7 @@ impl DataError {
             | Self::EncodingFailure { .. }
             | Self::EmptyInput { .. }
             | Self::InvalidValue { .. }
+            | Self::DegenerateColumn { .. }
             | Self::ColumnNotFound { .. } => None,
         }
     }
@@ -299,6 +304,9 @@ impl fmt::Display for DataError {
             | DataError::EncodingFailure { reason }
             | DataError::EmptyInput { reason }
             | DataError::InvalidValue { reason } => f.write_str(reason),
+            DataError::DegenerateColumn { column, problem } => {
+                write!(f, "column '{column}' {problem}")
+            }
             DataError::ColumnNotFound {
                 name,
                 role,
@@ -402,6 +410,83 @@ pub struct EncodedDataset {
 }
 
 impl EncodedDataset {
+    /// Validate the table at the common formula-fit boundary.
+    ///
+    /// This deliberately lives below formula materialization: library, CLI,
+    /// and Python fits all carry an `EncodedDataset` through that seam, so a
+    /// degenerate design can never acquire frontend-specific behaviour.
+    pub fn validate_fit_boundary(&self) -> Result<(), DataError> {
+        if self.headers.is_empty() {
+            return Err(DataError::DegenerateColumn {
+                column: "<table>".to_string(),
+                problem: "has no columns".to_string(),
+            });
+        }
+        let mut seen = HashSet::with_capacity(self.headers.len());
+        for name in &self.headers {
+            if !seen.insert(name.as_str()) {
+                return Err(DataError::DegenerateColumn {
+                    column: name.clone(),
+                    problem: "has a duplicate name".to_string(),
+                });
+            }
+        }
+        if self.values.nrows() == 0 {
+            return Err(DataError::DegenerateColumn {
+                column: "<table>".to_string(),
+                problem: "has no observations".to_string(),
+            });
+        }
+        if self.values.ncols() != self.headers.len() {
+            return Err(DataError::SchemaMismatch {
+                reason: format!(
+                    "table has {} headers but {} value columns",
+                    self.headers.len(),
+                    self.values.ncols()
+                ),
+            });
+        }
+        for (index, name) in self.headers.iter().enumerate() {
+            if self.column_kinds.get(index) == Some(&ColumnKindTag::Categorical)
+                && self
+                    .schema
+                    .columns
+                    .get(index)
+                    .is_some_and(|column| column.levels.len() < 2)
+            {
+                return Err(DataError::DegenerateColumn {
+                    column: name.clone(),
+                    problem: "is a factor with fewer than two levels".to_string(),
+                });
+            }
+            let column = self.values.column(index);
+            let finite_count = column.iter().filter(|value| value.is_finite()).count();
+            if finite_count == 1 && column.len() > 1 {
+                return Err(DataError::DegenerateColumn {
+                    column: name.clone(),
+                    problem: "has only one non-missing value".to_string(),
+                });
+            }
+            if let Some((row, value)) = column
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(DataError::DegenerateColumn {
+                    column: name.clone(),
+                    problem: format!("has non-finite value {value} at row {}", row + 1),
+                });
+            }
+            if column.len() > 1 && column.iter().all(|value| *value == column[0]) {
+                return Err(DataError::DegenerateColumn {
+                    column: name.clone(),
+                    problem: "is constant".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn column_map(&self) -> HashMap<String, usize> {
         self.headers
             .iter()
@@ -3838,6 +3923,95 @@ mod tests {
             let once = canonical_level_bits(v);
             let twice = canonical_level_bits(f64::from_bits(once));
             assert_eq!(once, twice, "value {v}");
+        }
+    }
+    #[test]
+    fn fit_boundary_reports_each_degenerate_column_by_name() {
+        let cases = [
+            (
+                vec![0.0, f64::NAN, 1.0],
+                "has non-finite value NaN at row 2",
+            ),
+            (
+                vec![0.0, f64::INFINITY, 1.0],
+                "has non-finite value inf at row 2",
+            ),
+            (
+                vec![0.0, f64::NEG_INFINITY, 1.0],
+                "has non-finite value -inf at row 2",
+            ),
+            (vec![2.0, 2.0, 2.0], "is constant"),
+            (
+                vec![f64::NAN, 2.0, f64::NAN],
+                "has only one non-missing value",
+            ),
+        ];
+        for (values, expected) in cases {
+            let dataset = EncodedDataset {
+                headers: vec!["temperature".to_string()],
+                values: Array2::from_shape_vec((3, 1), values).unwrap(),
+                schema: DataSchema {
+                    columns: vec![SchemaColumn {
+                        name: "temperature".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: Vec::new(),
+                    }],
+                },
+                column_kinds: vec![ColumnKindTag::Continuous],
+            };
+            let error = dataset.validate_fit_boundary().unwrap_err();
+            assert!(matches!(error, DataError::DegenerateColumn { .. }));
+            assert_eq!(
+                error.to_string(),
+                format!("column 'temperature' {expected}")
+            );
+        }
+    }
+
+    #[test]
+    fn fit_boundary_rejects_empty_duplicate_and_one_level_factor() {
+        let cases = [
+            EncodedDataset {
+                headers: vec!["x".into()],
+                values: Array2::zeros((0, 1)),
+                schema: DataSchema {
+                    columns: vec![SchemaColumn {
+                        name: "x".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    }],
+                },
+                column_kinds: vec![ColumnKindTag::Continuous],
+            },
+            EncodedDataset {
+                headers: vec!["x".into(), "x".into()],
+                values: Array2::from_shape_vec((2, 2), vec![0.0, 1.0, 1.0, 0.0]).unwrap(),
+                schema: DataSchema { columns: vec![] },
+                column_kinds: vec![ColumnKindTag::Continuous; 2],
+            },
+            EncodedDataset {
+                headers: vec!["group".into()],
+                values: Array2::zeros((2, 1)),
+                schema: DataSchema {
+                    columns: vec![SchemaColumn {
+                        name: "group".into(),
+                        kind: ColumnKindTag::Categorical,
+                        levels: vec!["only".into()],
+                    }],
+                },
+                column_kinds: vec![ColumnKindTag::Categorical],
+            },
+        ];
+        let expected = [
+            "column '<table>' has no observations",
+            "column 'x' has a duplicate name",
+            "column 'group' is a factor with fewer than two levels",
+        ];
+        for (dataset, expected) in cases.into_iter().zip(expected) {
+            assert_eq!(
+                dataset.validate_fit_boundary().unwrap_err().to_string(),
+                expected
+            );
         }
     }
 }

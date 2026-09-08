@@ -910,11 +910,7 @@ fn encoded_table_from_columns(
         let column = numeric.column(matrix_column);
         let kind = infer_numeric_array_column_kind(column);
         for (row, value) in column.iter().enumerate() {
-            values[[row, table_column]] = if value.is_finite() {
-                *value
-            } else {
-                f64::NAN
-            };
+            values[[row, table_column]] = *value;
         }
         column_kinds[table_column] = kind;
         schema_columns[table_column] = Some(SchemaColumn {

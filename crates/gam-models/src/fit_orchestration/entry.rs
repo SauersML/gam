@@ -2409,6 +2409,7 @@ fn materialize_impl<'a>(
     config: &FitConfig,
     structural_only: bool,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
+    data.validate_fit_boundary()?;
     let config = config
         .clone()
         .resolve()
