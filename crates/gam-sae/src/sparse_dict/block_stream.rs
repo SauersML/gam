@@ -45,7 +45,7 @@
 use super::BlockSparseConfig;
 use super::block::{
     RowBlockCode, block_birth_evidence_margin, frame_fixed_point_residual, gram_schmidt_rows,
-    relative_scalar_change, route_and_code_all, seed_frames, stable_rank_symmetric,
+    relative_scalar_change, route_and_code_all, stable_rank_symmetric,
 };
 use super::block_frame::polar_tied_frame_step;
 use super::residual_reservoir::ResidualReservoir;
@@ -273,8 +273,8 @@ pub struct BlockRankCharges {
 impl BlockSparseStreamState {
     /// fit_begin: seed the block frames from `seed` (a representative sample) and
     /// prime the epoch accumulators. The seed fixes `P` and the initial
-    /// orthonormal frames (`seed_frames`); the corpus is streamed later through
-    /// [`Self::partial_fit`]. γ starts at 1.
+    /// orthonormal data-row frames (`data_row_frames`); the corpus is streamed
+    /// later through [`Self::partial_fit`]. γ starts at 1.
     pub fn new(seed: ArrayView2<'_, f32>, config: &BlockSparseConfig) -> Result<Self, String> {
         validate_config(config)?;
         if seed.nrows() == 0 || seed.ncols() == 0 {
@@ -299,7 +299,7 @@ impl BlockSparseStreamState {
         let b = config.block_size;
         let k = config.block_topk.min(g).max(1);
 
-        let decoder = seed_frames(seed, g, b);
+        let decoder = super::block::data_row_frames(seed, g, b);
 
         let cap = config.aux_k.saturating_mul(b).max(1);
         Ok(Self {

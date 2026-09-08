@@ -1025,7 +1025,7 @@ class BlockSparseDictStream:
     ----------
     seed:
         A representative ``N_seed x P`` sample fixing ``P`` and seeding the initial
-        block frames (deterministic farthest-point + orthonormalisation).
+        block frames (centred, evenly distributed data rows + orthonormalisation).
     n_blocks, block_size, block_topk, max_epochs, minibatch, block_tile, frame_ridge, aux_k, tolerance:
         Identical hyper-parameters to :func:`block_sparse_dictionary_fit`.
     """

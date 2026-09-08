@@ -122,9 +122,15 @@ fn a_non_descent_scale_keeps_the_support_definable_2825() {
             .collect()
     };
     // NON-VACUITY: at a descent scale this row takes both blocks.
-    assert_eq!(live(&code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist)).len(), 2);
+    assert_eq!(
+        live(&code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist)).len(),
+        2
+    );
     for gamma in [2.0_f32, 3.5] {
-        assert!(2.0 * gamma - gamma * gamma <= 0.0, "gamma {gamma} must be non-descent");
+        assert!(
+            2.0 * gamma - gamma * gamma <= 0.0,
+            "gamma {gamma} must be non-descent"
+        );
         let selected = code_row(x.view(), decoder.view(), gamma, 1, 2, &shortlist);
         assert_eq!(
             live(&selected),
@@ -1077,8 +1083,8 @@ fn coordinate_partition_frames_are_orthonormal_and_data_independent() {
 }
 
 #[test]
-fn farthest_point_seeded_entry_matches_default_byte_for_byte() {
-    // `fit_block_sparse_dictionary` must be exactly the FarthestPoint case of the
+fn data_row_seeded_entry_matches_default_byte_for_byte_2023() {
+    // `fit_block_sparse_dictionary` must be exactly the DataRows case of the
     // seeded entry — same seed, same alternation, same fixed point.
     let (p, b, n_blocks) = (8usize, 2usize, 3usize);
     let planted = planted_frames(p, n_blocks, b);
@@ -1097,17 +1103,47 @@ fn farthest_point_seeded_entry_matches_default_byte_for_byte() {
     };
     let default_fit = fit_block_sparse_dictionary(x.view(), &config).expect("default fit");
     let seeded_fit =
-        fit_block_sparse_dictionary_with_seed(x.view(), &config, BlockSeedPolicy::FarthestPoint)
-            .expect("FarthestPoint seeded fit");
+        fit_block_sparse_dictionary_with_seed(x.view(), &config, BlockSeedPolicy::DataRows)
+            .expect("data-row seeded fit");
     assert_eq!(
         default_fit.decoder, seeded_fit.decoder,
-        "the default entry must be byte-identical to the FarthestPoint seeded entry"
+        "the default entry must be byte-identical to the data-row seeded entry"
     );
     assert_eq!(
         default_fit.explained_variance,
         seeded_fit.explained_variance
     );
     assert_eq!(default_fit.epochs, seeded_fit.epochs);
+}
+
+#[test]
+fn data_row_seed_places_every_overcomplete_block_in_the_observed_cloud_2023() {
+    // A rotated rank-one cloud is adversarial to coordinate axes.  Even with
+    // K > P, the production seed must place every scalar block on the observed
+    // direction rather than create dead blocks and hope AuxK later revives them.
+    let direction = [1.0_f32, 2.0, 3.0, 4.0];
+    let x = Array2::from_shape_fn((32, direction.len()), |(row, column)| {
+        (row as f32 - 15.5) * direction[column]
+    });
+    let frames = data_row_frames(x.view(), 16, 1);
+    let direction_norm = direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    for block in 0..16 {
+        let alignment = frames
+            .row(block)
+            .iter()
+            .zip(direction.iter())
+            .map(|(&left, &right)| left * right / direction_norm)
+            .sum::<f32>()
+            .abs();
+        assert!(
+            (alignment - 1.0).abs() <= 8.0 * f32::EPSILON,
+            "block {block} was not seeded from the observed cloud: alignment={alignment}"
+        );
+    }
 }
 
 #[test]
@@ -1244,9 +1280,14 @@ fn tied_frame_stationarity_separates_normal_storage_error_from_tangent_signal_28
         action[[1, 0]] = 3.0 * current[[0, 1]] as f64;
         let scale = action.iter().map(|v| v * v).sum::<f64>().sqrt();
         let measured = super::super::block_frame::polar_tied_frame_step(
-            current.view(), action.view_mut(), second.view(), 0.0, 1.0e30,
+            current.view(),
+            action.view_mut(),
+            second.view(),
+            0.0,
+            1.0e30,
             proposal.view_mut(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!((measured - tangent / scale).abs() <= 16.0 * f64::EPSILON);
     }
 }

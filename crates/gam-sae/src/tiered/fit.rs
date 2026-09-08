@@ -49,10 +49,9 @@ use gam_solve::rho_optimizer::OuterCriterionCertificate;
 
 use crate::front_door::{SaeFitLane, admit_topk_manifold};
 use crate::manifold::{
-    SaeSupportFixedPointReport, SaeSupportOuterRequest, SaeSupportSeedRequest,
-    SaeSupportSparseTerm, SaeSupportTermSeedRequest, build_sae_support_seed,
-    SAE_SUPPORT_INNER_FIXED_POINT_MAX_ITER, build_sae_support_term_seed,
-    run_sae_support_outer, sae_support_effective_atom_dims,
+    SAE_SUPPORT_INNER_FIXED_POINT_MAX_ITER, SaeSupportFixedPointReport, SaeSupportOuterRequest,
+    SaeSupportSeedRequest, SaeSupportSparseTerm, SaeSupportTermSeedRequest, build_sae_support_seed,
+    build_sae_support_term_seed, run_sae_support_outer, sae_support_effective_atom_dims,
 };
 use crate::migration_ledger::{BirthSeed, MoveEvidence, MoveReason, MoveStage, SaeMigrationLedger};
 use crate::sparse_dict::{
@@ -64,24 +63,13 @@ use crate::tiered::code_space::{
     CodeSpacePromotionReport, harvest_code_space_promotions, linear_distortion_floor,
 };
 
-/// Serial farthest-point block seed budget in element-ops (`N·P·G·b`). Above this
-/// the `O(N·P·K)` corpus pass dominates the whole Tier-1 fit (measured to be the
-/// scaling wall at `K ≈ 1e4`, unrelated to routing), so [`TieredSeedPolicy::Auto`]
-/// switches to the `O(K·b)` coordinate-partition seed. Below it the data-aware
-/// farthest-point seed is affordable and gives the more coherent starting blocks.
-const FARTHEST_POINT_SEED_MAX_OPS: u128 = 1_000_000_000;
-
 /// How Tier-1 seeds its `K = G·b` block frames. The default [`Auto`] keeps the
-/// data-aware farthest-point seed at small/moderate `K` and switches to the cheap
-/// coordinate-partition seed once the serial farthest-point pass would dominate —
-/// the "Tier-1 K>small" entry that makes a `K ≈ 1e4` tiered fit tractable end to end
-/// without a caller flag (#2023).
+/// seed data-placed at every width using the linear-cost data-row construction.
 ///
 /// [`Auto`]: TieredSeedPolicy::Auto
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TieredSeedPolicy {
-    /// Pick by the farthest-point seed cost `N·P·G·b` against
-    /// `FARTHEST_POINT_SEED_MAX_OPS`.
+    /// Use the scalable data-row seed.
     #[default]
     Auto,
     /// Force the data-aware farthest-point seed regardless of `K`.
@@ -93,21 +81,11 @@ pub enum TieredSeedPolicy {
 impl TieredSeedPolicy {
     /// Resolve to a concrete [`BlockSeedPolicy`] for a corpus of `n` rows and the
     /// Tier-1 block geometry (`G` blocks of size `b` in `ℝ^P`).
-    fn resolve(self, n: usize, p: usize, config: &BlockSparseConfig) -> BlockSeedPolicy {
+    fn resolve(self, _n: usize, _p: usize, _config: &BlockSparseConfig) -> BlockSeedPolicy {
         match self {
+            TieredSeedPolicy::Auto => BlockSeedPolicy::DataRows,
             TieredSeedPolicy::FarthestPoint => BlockSeedPolicy::FarthestPoint,
             TieredSeedPolicy::CoordinatePartition => BlockSeedPolicy::CoordinatePartition,
-            TieredSeedPolicy::Auto => {
-                let ops = (n as u128)
-                    * (p as u128)
-                    * (config.n_blocks as u128)
-                    * (config.block_size as u128);
-                if ops > FARTHEST_POINT_SEED_MAX_OPS {
-                    BlockSeedPolicy::CoordinatePartition
-                } else {
-                    BlockSeedPolicy::FarthestPoint
-                }
-            }
         }
     }
 }
@@ -177,8 +155,8 @@ pub struct TieredFitConfig {
     /// block-gate lane when the mode admits it and a runtime is present.
     pub tier1: BlockSparseConfig,
     /// How Tier-1 seeds its `K` block frames. [`TieredSeedPolicy::Auto`] (default)
-    /// switches to the cheap coordinate-partition seed once the serial
-    /// farthest-point pass would dominate, so a `K ≈ 1e4` tiered fit runs end to end.
+    /// uses the data-row seed, so a `K ≈ 1e4` fit is both linear-cost and
+    /// data-placed from its first routing pass.
     pub tier1_seed: TieredSeedPolicy,
     /// Whether to run the Tier-2 curved refinement on the Tier-1 residual
     /// (`false` ⇒ Tier-0 + Tier-1 only, the linear-bulk baseline).
@@ -791,8 +769,14 @@ mod peel_tests {
         centered: ArrayView2<'_, f64>,
         n_atoms: usize,
         support_k: usize,
-    ) -> Result<(SaeSupportSparseTerm, SaeSupportFixedPointReport, OuterCriterionCertificate), String>
-    {
+    ) -> Result<
+        (
+            SaeSupportSparseTerm,
+            SaeSupportFixedPointReport,
+            OuterCriterionCertificate,
+        ),
+        String,
+    > {
         let (n_obs, output_dim) = centered.dim();
         let atom_basis = vec!["periodic".to_string(); n_atoms];
         let atom_dim = vec![1usize; n_atoms];
@@ -841,7 +825,11 @@ mod peel_tests {
         let config = LinearPeelConfig::derive(16, 2, 3).expect("derives");
         assert_eq!(config.tier1.block_size, 2, "b = d_max");
         assert_eq!(config.tier1.n_blocks, 8, "G = P / b");
-        assert_eq!(config.tier1.n_atoms(), 16, "K_lin = P, the identifiable width");
+        assert_eq!(
+            config.tier1.n_atoms(),
+            16,
+            "K_lin = P, the identifiable width"
+        );
         assert_eq!(config.tier1.block_topk, 3, "k = support_k");
         // support_k above the block count cannot fire more blocks than exist.
         let narrow = LinearPeelConfig::derive(4, 1, 9).expect("derives");
@@ -874,7 +862,10 @@ mod peel_tests {
             fixed_point.recurred,
             "the peeled inner fixed point must have RECURRED; got {fixed_point:?}"
         );
-        assert!(term.k_atoms() >= 1, "the peeled fit must retain a curved atom");
+        assert!(
+            term.k_atoms() >= 1,
+            "the peeled fit must retain a curved atom"
+        );
     }
 
     /// Arm (b): the composition is exact. The peel's additive offset `μ + L +
@@ -969,7 +960,8 @@ mod peel_tests {
         let mut max_delta = 0.0f64;
         for row in 0..z.nrows() {
             for column in 0..z.ncols() {
-                max_delta = max_delta.max((peel.residual[[row, column]] - unpeeled[[row, column]]).abs());
+                max_delta =
+                    max_delta.max((peel.residual[[row, column]] - unpeeled[[row, column]]).abs());
             }
         }
         assert!(
@@ -1343,26 +1335,22 @@ mod fit_tests {
         assert_eq!(report.ledger.pc_reseed_events, 0);
     }
 
-    /// `TieredSeedPolicy::Auto` keeps the data-aware farthest-point seed at small
-    /// `K` and switches to the cheap coordinate-partition seed once the serial
-    /// `N·P·G·b` pass would blow the budget — the "Tier-1 K>small" entry decision.
+    /// `TieredSeedPolicy::Auto` is data-placed without a serial farthest-point
+    /// search at both small and large `K`.
     #[test]
-    fn auto_seed_switches_at_the_farthest_point_budget() {
-        // Small geometry (well under the 1e9-op budget) → farthest-point.
+    fn auto_seed_is_scalable_and_data_placed_at_every_width_2023() {
         let small = TieredFitConfig::linear_bulk(8, 2);
         assert_eq!(
             small.tier1_seed.resolve(240, 16, &small.tier1),
-            BlockSeedPolicy::FarthestPoint,
-            "small-K tiered fit must keep the data-aware seed"
+            BlockSeedPolicy::DataRows
         );
-        // K≈1e4 at the #2023 target width (N=1e5, P=64) → N·P·G·b ≫ 1e9 → cheap seed.
         let large = TieredFitConfig::linear_bulk(2_500, 4);
         assert_eq!(
             large.tier1_seed.resolve(100_000, 64, &large.tier1),
-            BlockSeedPolicy::CoordinatePartition,
-            "large-K tiered fit must switch to the coordinate-partition seed"
+            BlockSeedPolicy::DataRows,
+            "large-K tiered fit must remain data-placed"
         );
-        // Explicit overrides ignore the budget.
+        // Explicit overrides remain available for controlled comparisons.
         let mut forced = TieredFitConfig::linear_bulk(2_500, 4);
         forced.tier1_seed = TieredSeedPolicy::FarthestPoint;
         assert_eq!(
