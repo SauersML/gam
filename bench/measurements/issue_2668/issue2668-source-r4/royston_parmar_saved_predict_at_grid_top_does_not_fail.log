@@ -1,0 +1,6 @@
+
+running 1 test
+test survival::royston_parmar_predict_beyond_support_zero_hazard::royston_parmar_saved_predict_at_grid_top_does_not_fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 18.33s
+

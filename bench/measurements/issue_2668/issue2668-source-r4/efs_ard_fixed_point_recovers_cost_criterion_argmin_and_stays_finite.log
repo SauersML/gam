@@ -1,0 +1,15 @@
+
+running 1 test
+test sae::latent_sae_gated::efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite ... 
+thread 'sae::latent_sae_gated::efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite' (2087983) panicked at tests/regressions/sae/latent_sae_gated.rs:466:43:
+EFS eval should succeed: REML smoothing optimization failed to converge: EncodeAtlas: precomputed basis 'dict' has no closed-form jet sup; route to exact encode
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    sae::latent_sae_gated::efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 506 filtered out; finished in 2.81s
+

@@ -1,0 +1,15 @@
+
+running 1 test
+test smooths::double_penalty_shrinks_irrelevant_covariate_1266::default_double_penalty_shrinks_irrelevant_covariate_edf_below_one ... 
+thread 'smooths::double_penalty_shrinks_irrelevant_covariate_1266::default_double_penalty_shrinks_irrelevant_covariate_edf_below_one' (2088087) panicked at tests/regressions/smooths/double_penalty_shrinks_irrelevant_covariate_1266.rs:105:68:
+fit ok: IntegrationFailed { reason: "positive smoothing cubature proposal extends beyond the resolved rho domain" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    smooths::double_penalty_shrinks_irrelevant_covariate_1266::default_double_penalty_shrinks_irrelevant_covariate_edf_below_one
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 506 filtered out; finished in 0.27s
+

@@ -150,3 +150,29 @@ regression build and the standalone math build, so this is a kernel diagnostic,
 not a controlled end-to-end fit speedup. An older unoptimized library was also
 measured; its much larger ratio is deliberately excluded from this comparison.
 The timing receipt and textual perf report are retained beside the benchmark.
+
+## Verified solver-contract corrections
+
+The next scanner-clean executable measured **25 passes, three failures, and two
+timeouts**, with all 30 entries present. The runner verified the binary hash
+again afterward; `binary_unchanged` is true. Full receipts are in
+`bench/measurements/issue_2668/issue2668-source-r4/`.
+
+The seeded REML, CLI/FFI parity, and all-shapes regressions now pass. Full-fidelity
+REML evaluations use the existing derivative-budget inner tolerance independently
+of adaptive history. KKT audits apply to claimed inner minima; unfinished solves
+reach the existing non-convergence handling, which rejects the trial and updates
+the cap feedback. No stationarity requirement was relaxed. The solver-only seed
+reproducer also passes, with terminal outer gradient norm approximately `1.68e-7`.
+
+The three remaining failures are the SAE ARD pair and the restored
+irrelevant-covariate shrinkage test. Shrinkage currently fails during smoothing
+uncertainty integration (`positive smoothing cubature proposal extends beyond the
+resolved rho domain`), before reaching its EDF assertion. The NB covariance fit
+and survival location-scale EDF fit still exceed 60 seconds. Their new logs
+capture inner/outer progress rather than merely a missing terminal line.
+
+The shared worktree now contains a separate correction distinguishing posterior
+support from the optimizer's numerical resolvability range, and using the
+declared proper smoothing prior for cubature weights. That newer change is not
+part of the r4 measurement and still needs integration into the verified snapshot.

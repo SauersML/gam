@@ -6773,6 +6773,18 @@ impl<'a> RemlState<'a> {
             if outer_cap > 0 {
                 pirls_config.max_iterations = pirls_config.max_iterations.min(outer_cap);
             }
+            if !in_screening && outer_cap == 0 {
+                // Full-fidelity samples must resolve the inner mode at the
+                // accuracy the outer derivative budget permits. Resetting the
+                // warm caches also resets the adaptive tolerance history;
+                // using the ordinary inner tolerance here would then make a
+                // terminal certificate LESS accurate than the search it
+                // audits (#2668). The existing derivative-budget floor is
+                // independent of that history and honors tighter caller input.
+                pirls_config.convergence_tolerance = pirls_config
+                    .convergence_tolerance
+                    .min(self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR);
+            }
             // Seed-screening prepass: rank candidate ρ by a CHEAP partial fit,
             // never a full PIRLS-to-production-tolerance solve. The iteration cap
             // above bounds the unconstrained case, but it is deliberately NOT
@@ -7405,19 +7417,17 @@ impl<'a> RemlState<'a> {
                  measured at the converged η); outer REML criterion now stationary in ρ"
             );
         }
-        // Under seed screening the inner solver is intentionally given a tiny
-        // iteration budget, so KKT stationarity will not be satisfied at the
-        // partial mode. Skip the certificate so the seed can still be ranked
-        // by an approximate cost; the actual fit (full inner budget) will
-        // certify KKT later.
-        if !in_screening {
-            self.enforce_constraint_kkt(pirls_result.as_ref())?;
-        }
-
         // Check the status returned by the P-IRLS routine.
         match pirls_result.status {
             pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
                 if !in_screening {
+                    // Audit a claimed minimum before caching or evaluating it.
+                    // An unfinished solve belongs to the non-convergence arm
+                    // below: that arm records cap feedback and refuses this
+                    // trial. Checking its KKT residual first instead turns
+                    // ordinary trial non-convergence into a fatal constraint
+                    // error and prevents the outer search from recovering.
+                    self.enforce_constraint_kkt(pirls_result.as_ref())?;
                     if let Some(predicted) = predicted_warm_start.as_ref() {
                         let converged_original = match pirls_result.coordinate_frame {
                             pirls::PirlsCoordinateFrame::OriginalSparseNative => {

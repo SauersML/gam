@@ -1,0 +1,998 @@
+
+running 1 test
+test families::estimate_external_family_and_links::heuristic_rho_seed_produces_a_finite_optimized_reml_fit ... [INFO] [GAM fit] n=4 p=2 k=1 fam=LikelihoodSpec { response: Binomial, link: Standard(Logit) } link=Logit X=dense reml_iter=40 firth=false
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [pirls-path] path=dense_transformed reason=design_not_sparse p=2 nnz_x=8 nnz_xtwx_symbolic=na nnz_s_lambda=2 nnz_h_est=na density_h_est=na
+[INFO] [GPU] CUDA acceleration disabled: could not load any of: /usr/local/nvidia/lib64/libcuda.so.1, /usr/local/nvidia/lib64/libcuda.so, /usr/local/nvidia/lib/libcuda.so.1, /usr/local/nvidia/lib/libcuda.so, /usr/local/cuda/compat/libcuda.so.1, /usr/local/cuda/compat/libcuda.so, /usr/lib/x86_64-linux-gnu/libcuda.so.1, /usr/lib/x86_64-linux-gnu/libcuda.so, /usr/lib64/libcuda.so.1, /usr/lib64/libcuda.so, /usr/lib/wsl/lib/libcuda.so.1, /usr/lib/wsl/lib/libcuda.so, libcuda.so.1, libcuda.so
+[INFO] [GPU] CUDA acceleration disabled: could not load any of: /usr/local/nvidia/lib64/libcuda.so.1, /usr/local/nvidia/lib64/libcuda.so, /usr/local/nvidia/lib/libcuda.so.1, /usr/local/nvidia/lib/libcuda.so, /usr/local/cuda/compat/libcuda.so.1, /usr/local/cuda/compat/libcuda.so, /usr/lib/x86_64-linux-gnu/libcuda.so.1, /usr/lib/x86_64-linux-gnu/libcuda.so, /usr/lib64/libcuda.so.1, /usr/lib64/libcuda.so, /usr/lib/wsl/lib/libcuda.so.1, /usr/lib/wsl/lib/libcuda.so, libcuda.so.1, libcuda.so
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0007s lm_lambda=3.33e-7 g_norm=3.508e-2 last_dev_change=5.997e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.013 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.11e-7 g_norm=6.632e-5 last_dev_change=3.951e-4 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.001 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=3 elapsed=0.0015s g_norm_initial=1.400e0 g_norm_final=2.642e-10 convergence_rate=5.736e-4 status=Converged
+[INFO] [STAGE] inner pirls solve iters=3 status=Converged max_eta=1.0 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.007s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=3.589142 pen=0.755913 Dp=4.345055 pirls_edf=0.8183 logS=0.000000 logH=1.065331 half_diff=0.532666 h_above1=2 h_min=1.520e0 h_max=1.909e0 rho=[0.0000] lambda=[1.000e0]
+  H_eig=[1.909e0,1.520e0]
+  Slam_eig=[1.000e0,1.000e0]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [HGB] small-sample fallback to defaults: pairs=0, threshold=3
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [pirls-path] repeated path=dense_transformed reason=design_not_sparse count=2 (suppressing identical decisions)
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0004s lm_lambda=3.33e-7 g_norm=5.632e-2 last_dev_change=3.703e0 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=0.996 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.11e-7 g_norm=4.609e-7 last_dev_change=1.233e-4 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=3 elapsed=0.0011s g_norm_initial=9.722e0 g_norm_final=5.107e-14 convergence_rate=1.738e-5 status=Converged
+[INFO] [STAGE] inner pirls solve iters=3 status=Converged max_eta=0.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=5.247728 pen=0.144818 Dp=5.392546 pirls_edf=0.1268 logS=5.000000 logH=5.131264 half_diff=0.065632 h_above1=2 h_min=1.281e1 h_max=1.321e1 rho=[2.5000] lambda=[1.218e1]
+  H_eig=[1.321e1,1.281e1]
+  Slam_eig=[1.218e1,1.218e1]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=2.135e-3 last_dev_change=1.176e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.001 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=2 elapsed=0.0007s g_norm_initial=9.663e-1 g_norm_final=2.219e-8 convergence_rate=1.515e-4 status=Converged
+[INFO] [STAGE] inner pirls solve iters=2 status=Converged max_eta=0.4 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=4.638849 pen=0.413098 Dp=5.051946 pirls_edf=0.3880 logS=2.399930 logH=2.833533 half_diff=0.216802 h_above1=2 h_min=3.932e0 h_max=4.325e0 rho=[1.2000] lambda=[3.320e0]
+  H_eig=[4.325e0,3.932e0]
+  Slam_eig=[3.320e0,3.320e0]
+[INFO] [OUTER] standard REML analytic-start ranking: [2.5] -> [1.1999647829283973] (scored: base=2.761905053e0 initial_sp=2.742774752e0 summed_diagonal=unavailable; bounds -12.000..30.000)
+[INFO] [OUTER] standard REML: n_params=1, gradient=Analytic, hessian=Either -> solver=Bfgs, search_hessian_source=BfgsApprox [solver=Bfgs;hessian=BfgsApprox;matrix-free=false] [no Hessian: BFGS approximation]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [pirls-path] repeated path=dense_transformed reason=design_not_sparse count=4 (suppressing identical decisions)
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=2.782e-3 last_dev_change=2.466e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.001 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.11e-7 g_norm=3.756e-8 last_dev_change=9.672e-7 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS exact-decrement] applicable=true decrement_sq=4.188351e-30 threshold=4.487030e-15 pass=true gradient_norm=4.131315e-15 relative_gradient=1.236104e-15 dimension_scale=2.828427e0 natural_scale=2.342207e0 objective=2.525973e0 actual_reduction=4.440892e-16 predicted_reduction=1.729368e-16 linear_model_term=-3.458736e-16 direction_norm=9.219501e-9 data_reduction=9.936726e-9 penalty_reduction=-9.936725e-9
+[INFO] [PIRLS solve-end] iters=3 elapsed=0.0012s g_norm_initial=1.400e0 g_norm_final=4.131e-15 convergence_rate=1.434e-5 status=Converged
+[INFO] [STAGE] inner pirls solve iters=3 status=Converged max_eta=0.4 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=4.638849 pen=0.413098 Dp=5.051946 pirls_edf=0.3880 logS=2.399930 logH=2.833533 half_diff=0.216802 h_above1=2 h_min=3.932e0 h_max=4.325e0 rho=[1.2000] lambda=[3.320e0]
+  H_eig=[4.325e0,3.932e0]
+  Slam_eig=[3.320e0,3.320e0]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [HGB] small-sample fallback to defaults: pairs=0, threshold=3
+[INFO] [OUTER] standard REML: BFGS seed 0 (slot 1) cost=2.742775e0 |g|=2.108387e-2 rho=[1.199965]
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=NaN (first-order bridge, eval=0)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=2.108e-2 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=1.316e-2 last_dev_change=1.497e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.011 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.11e-7 g_norm=6.569e-6 last_dev_change=4.806e-5 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=3 elapsed=0.0011s g_norm_initial=7.403e-1 g_norm_final=2.484e-12 convergence_rate=1.497e-4 status=Converged
+[INFO] [STAGE] inner pirls solve iters=3 status=Converged max_eta=0.9 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=3.785442 pen=0.705873 Dp=4.491315 pirls_edf=0.7413 logS=0.399930 logH=1.336058 half_diff=0.468064 h_above1=2 h_min=1.765e0 h_max=2.155e0 rho=[0.2000] lambda=[1.221e0]
+  H_eig=[2.155e0,1.765e0]
+  Slam_eig=[1.221e0,1.221e0]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.002s cost=2.713722e0 trial_rho_distance=NaN (first-order bridge, eval=0) theta=[+0.2000]
+[INFO] [OUTER schedule] inner-PIRLS cap transition accepted_iter=0 eval_count=0 g_ratio=n/a last_iters=3 converged=true ift_residual=n/a accept_rho=1.000 prev=0 new=5 (capped)
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=1 (first-order bridge, eval=0)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=2.108e-2 effective_tol=1.000e-6 floor=1.000e-8 ceiling=1.000e-6
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS exact-decrement] applicable=true decrement_sq=6.773015e-33 threshold=3.989089e-15 pass=true gradient_norm=1.104635e-16 relative_gradient=3.866397e-17 dimension_scale=2.828427e0 natural_scale=1.857013e0 objective=2.245657e0 actual_reduction=0.000000e0 predicted_reduction=1.639234e-24 linear_model_term=-3.278465e-24 direction_norm=1.325519e-12 data_reduction=1.153300e-12 penalty_reduction=-1.153300e-12
+[INFO] [PIRLS solve-end] iters=1 elapsed=0.0005s g_norm_initial=2.484e-12 g_norm_final=1.105e-16 convergence_rate=4.448e-5 status=Converged
+[INFO] [STAGE] inner pirls solve iters=1 status=Converged max_eta=0.9 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=3.785442 pen=0.705873 Dp=4.491315 pirls_edf=0.7413 logS=0.399930 logH=1.336058 half_diff=0.468064 h_above1=2 h_min=1.765e0 h_max=2.155e0 rho=[0.2000] lambda=[1.221e0]
+  H_eig=[2.155e0,1.765e0]
+  Slam_eig=[1.221e0,1.221e0]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [HGB] small-sample fallback to defaults: pairs=1, threshold=3
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.001s cost=2.713722e0 |g|=3.977e-2 (first-order bridge, eval=0) theta=[+0.2000] g=[+0.0398]
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=1.000e0 (first-order bridge, eval=1)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=3.977e-2 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0004s lm_lambda=1.11e-7 g_norm=4.180e-2 last_dev_change=1.799e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.046 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=3.70e-8 g_norm=3.062e-4 last_dev_change=1.016e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.005 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=3 elapsed=0.0012s g_norm_initial=5.869e-1 g_norm_final=1.713e-8 convergence_rate=3.079e-3 status=Converged
+[INFO] [STAGE] inner pirls solve iters=3 status=Converged max_eta=1.6 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=2.808610 pen=0.874641 Dp=3.683251 pirls_edf=1.1004 logS=-1.600070 logH=0.034086 half_diff=0.817078 h_above1=1 h_min=8.403e-1 h_max=1.231e0 rho=[-0.8000] lambda=[4.493e-1]
+  H_eig=[1.231e0,8.403e-1]
+  Slam_eig=[4.493e-1,4.493e-1]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.002s cost=2.658704e0 trial_rho_distance=1.000e0 (first-order bridge, eval=1) theta=[-0.8000]
+[INFO] [OUTER schedule] inner-PIRLS cap transition accepted_iter=0 eval_count=1 g_ratio=1.000e0 last_iters=3 converged=true ift_residual=n/a accept_rho=1.000 prev=0 new=5 (capped)
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=1 (first-order bridge, eval=1)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [pirls-path] repeated path=dense_transformed reason=design_not_sparse count=8 (suppressing identical decisions)
+[INFO] [ADAPTIVE-KKT] outer_g_norm=3.977e-2 effective_tol=1.000e-6 floor=1.000e-8 ceiling=1.000e-6
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS exact-decrement] applicable=true decrement_sq=3.254870e-28 threshold=3.271384e-15 pass=true gradient_norm=1.679833e-14 relative_gradient=7.453421e-15 dimension_scale=2.828427e0 natural_scale=1.253775e0 objective=1.841625e0 actual_reduction=-2.220446e-16 predicted_reduction=1.663702e-16 linear_model_term=-3.327400e-16 direction_norm=1.955861e-8 data_reduction=1.207997e-8 penalty_reduction=-1.207997e-8
+[INFO] [PIRLS solve-end] iters=1 elapsed=0.0005s g_norm_initial=1.713e-8 g_norm_final=1.680e-14 convergence_rate=9.805e-7 status=Converged
+[INFO] [STAGE] inner pirls solve iters=1 status=Converged max_eta=1.6 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=2.808610 pen=0.874641 Dp=3.683251 pirls_edf=1.1004 logS=-1.600070 logH=0.034086 half_diff=0.817078 h_above1=1 h_min=8.403e-1 h_max=1.231e0 rho=[-0.8000] lambda=[4.493e-1]
+  H_eig=[1.231e0,8.403e-1]
+  Slam_eig=[4.493e-1,4.493e-1]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [HGB] small-sample fallback to defaults: pairs=2, threshold=3
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.001s cost=2.658704e0 |g|=6.960e-2 (first-order bridge, eval=1) theta=[-0.8000] g=[+0.0696]
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=2.000e0 (first-order bridge, eval=2)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=6.960e-2 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=1.11e-7 g_norm=1.525e-1 last_dev_change=3.870e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.196 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=3.70e-8 g_norm=2.428e-2 last_dev_change=5.729e-2 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.111 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0002s lm_lambda=1.23e-8 g_norm=7.798e-4 last_dev_change=1.875e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=3.704e-8 final_lambda=1.235e-8 log10_ratio=-0.477 accept_rho=1.022 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  4 elapsed=0.0002s lm_lambda=4.12e-9 g_norm=8.335e-7 last_dev_change=2.008e-6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  4 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  4 start_lambda=1.235e-8 final_lambda=4.115e-9 log10_ratio=-0.477 accept_rho=1.001 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=5 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=5 elapsed=0.0018s g_norm_initial=5.420e-1 g_norm_final=9.549e-13 convergence_rate=4.458e-3 status=Converged
+[INFO] [STAGE] inner pirls solve iters=5 status=Converged max_eta=3.8 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.002s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=1.321934 pen=0.712750 Dp=2.034684 pirls_edf=1.4705 logS=-5.600070 logH=-2.597847 half_diff=1.501111 h_above1=0 h_min=1.492e-1 h_max=4.990e-1 rho=[-2.8000] lambda=[6.081e-2]
+  H_eig=[4.990e-1,1.492e-1]
+  Slam_eig=[6.081e-2,6.081e-2]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.002s cost=2.518453e0 trial_rho_distance=2.000e0 (first-order bridge, eval=2) theta=[-2.8000]
+[INFO] [OUTER schedule] inner-PIRLS cap transition accepted_iter=0 eval_count=2 g_ratio=1.750e0 last_iters=5 converged=true ift_residual=n/a accept_rho=1.000 prev=0 new=7 (capped)
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=1 (first-order bridge, eval=2)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=6.960e-2 effective_tol=1.000e-6 floor=1.000e-8 ceiling=1.000e-6
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS exact-decrement] applicable=true decrement_sq=5.925073e-32 threshold=1.807162e-15 pass=true gradient_norm=1.708724e-16 relative_gradient=1.206411e-16 dimension_scale=2.828427e0 natural_scale=4.163693e-1 objective=1.017342e0 actual_reduction=0.000000e0 predicted_reduction=2.956419e-24 linear_model_term=-5.912832e-24 direction_norm=6.264239e-12 data_reduction=1.302958e-12 penalty_reduction=-1.302958e-12
+[INFO] [PIRLS solve-end] iters=1 elapsed=0.0005s g_norm_initial=9.549e-13 g_norm_final=1.709e-16 convergence_rate=1.789e-4 status=Converged
+[INFO] [STAGE] inner pirls solve iters=1 status=Converged max_eta=3.8 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=1.321934 pen=0.712750 Dp=2.034684 pirls_edf=1.4705 logS=-5.600070 logH=-2.597847 half_diff=1.501111 h_above1=0 h_min=1.492e-1 h_max=4.990e-1 rho=[-2.8000] lambda=[6.081e-2]
+  H_eig=[4.990e-1,1.492e-1]
+  Slam_eig=[6.081e-2,6.081e-2]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [HGB] small-sample fallback to defaults: pairs=2, threshold=3
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.001s cost=2.518453e0 |g|=4.946e-2 (first-order bridge, eval=2) theta=[-2.8000] g=[+0.0495]
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=4.000e0 (first-order bridge, eval=3)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=4.946e-2 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=1.11e-7 g_norm=8.982e-2 last_dev_change=3.112e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.334 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=3.70e-8 g_norm=3.050e-2 last_dev_change=1.738e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.248 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0002s lm_lambda=1.23e-8 g_norm=7.513e-3 last_dev_change=4.371e-2 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=3.704e-8 final_lambda=1.235e-8 log10_ratio=-0.477 accept_rho=1.172 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  4 elapsed=0.0002s lm_lambda=4.12e-9 g_norm=8.780e-4 last_dev_change=4.393e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  4 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  4 start_lambda=1.235e-8 final_lambda=4.115e-9 log10_ratio=-0.477 accept_rho=1.079 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=5 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  5 elapsed=0.0002s lm_lambda=1.37e-9 g_norm=1.649e-5 last_dev_change=7.144e-5 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  5 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  5 start_lambda=4.115e-9 final_lambda=1.372e-9 log10_ratio=-0.477 accept_rho=1.012 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=6 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=6 elapsed=0.0021s g_norm_initial=2.044e-1 g_norm_final=6.875e-9 convergence_rate=5.682e-2 status=Converged
+[INFO] [STAGE] inner pirls solve iters=6 status=Converged max_eta=13.7 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.002s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.094433 pen=0.174260 Dp=0.268694 pirls_edf=1.7612 logS=-13.600052 logH=-8.318825 half_diff=2.640614 h_above1=0 h_min=5.177e-3 h_max=4.711e-2 rho=[-6.8000] lambda=[1.114e-3]
+  H_eig=[4.711e-2,5.177e-3]
+  Slam_eig=[1.114e-3,1.114e-3]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.003s cost=2.774961e0 trial_rho_distance=4.000e0 (first-order bridge, eval=3) theta=[-6.8000]
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=2.000e0 (first-order bridge, eval=3)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=4.946e-2 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=9.92e-7 g_norm=6.606e-2 last_dev_change=1.936e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=9.918e-7 log10_ratio=-0.004 accept_rho=0.601 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=3.31e-7 g_norm=1.249e-2 last_dev_change=6.028e-2 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=9.918e-7 final_lambda=3.306e-7 log10_ratio=-0.477 accept_rho=1.135 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0002s lm_lambda=1.10e-7 g_norm=5.472e-4 last_dev_change=2.908e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=3.306e-7 final_lambda=1.102e-7 log10_ratio=-0.477 accept_rho=1.029 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  4 elapsed=0.0002s lm_lambda=3.67e-8 g_norm=1.183e-6 last_dev_change=5.810e-6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  4 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  4 start_lambda=1.102e-7 final_lambda=3.673e-8 log10_ratio=-0.477 accept_rho=1.001 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=5 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=5 elapsed=0.0018s g_norm_initial=8.901e-2 g_norm_final=6.640e-12 convergence_rate=9.431e-3 status=Converged
+[INFO] [STAGE] inner pirls solve iters=5 status=Converged max_eta=8.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.002s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.423519 pen=0.444859 Dp=0.868378 pirls_edf=1.6284 logS=-9.600068 logH=-5.343016 half_diff=2.128526 h_above1=0 h_min=2.506e-2 h_max=1.908e-1 rho=[-4.8000] lambda=[8.229e-3]
+  H_eig=[1.908e-1,2.506e-2]
+  Slam_eig=[8.229e-3,8.229e-3]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.002s cost=2.562715e0 trial_rho_distance=2.000e0 (first-order bridge, eval=3) theta=[-4.8000]
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=1.000e0 (first-order bridge, eval=3)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=4.946e-2 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=6.34e-7 g_norm=2.531e-2 last_dev_change=1.183e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=6.337e-7 log10_ratio=-0.198 accept_rho=0.858 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=2.11e-7 g_norm=1.404e-3 last_dev_change=5.152e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=6.337e-7 final_lambda=2.112e-7 log10_ratio=-0.477 accept_rho=1.038 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0002s lm_lambda=7.04e-8 g_norm=4.417e-6 last_dev_change=1.697e-5 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=2.112e-7 final_lambda=7.041e-8 log10_ratio=-0.477 accept_rho=1.002 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=4 elapsed=0.0014s g_norm_initial=1.040e-1 g_norm_final=4.473e-11 convergence_rate=4.554e-3 status=Converged
+[INFO] [STAGE] inner pirls solve iters=4 status=Converged max_eta=5.6 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.002s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.800164 pen=0.585739 Dp=1.385903 pirls_edf=1.5404 logS=-7.600070 logH=-3.983073 half_diff=1.808498 h_above1=0 h_min=5.723e-2 h_max=3.255e-1 rho=[-3.8000] lambda=[2.237e-2]
+  H_eig=[3.255e-1,5.723e-2]
+  Slam_eig=[2.237e-2,2.237e-2]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.002s cost=2.501450e0 trial_rho_distance=1.000e0 (first-order bridge, eval=3) theta=[-3.8000]
+[INFO] [OUTER schedule] inner-PIRLS cap transition accepted_iter=0 eval_count=3 g_ratio=1.244e0 last_iters=4 converged=true ift_residual=n/a accept_rho=1.000 prev=0 new=6 (capped)
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=1 (first-order bridge, eval=3)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=4.946e-2 effective_tol=1.000e-6 floor=1.000e-8 ceiling=1.000e-6
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS exact-decrement] applicable=true decrement_sq=5.303251e-32 threshold=1.230929e-15 pass=true gradient_norm=8.581147e-17 relative_gradient=6.982580e-17 dimension_scale=2.828427e0 natural_scale=2.289364e-1 objective=6.929515e-1 actual_reduction=0.000000e0 predicted_reduction=1.587700e-20 linear_model_term=-3.175396e-20 direction_norm=7.382429e-10 data_reduction=8.439627e-11 penalty_reduction=-8.439627e-11
+[INFO] [PIRLS solve-end] iters=1 elapsed=0.0005s g_norm_initial=4.473e-11 g_norm_final=8.581e-17 convergence_rate=1.918e-6 status=Converged
+[INFO] [STAGE] inner pirls solve iters=1 status=Converged max_eta=5.6 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.800164 pen=0.585739 Dp=1.385903 pirls_edf=1.5404 logS=-7.600070 logH=-3.983073 half_diff=1.808498 h_above1=0 h_min=5.723e-2 h_max=3.255e-1 rho=[-3.8000] lambda=[2.237e-2]
+  H_eig=[3.255e-1,5.723e-2]
+  Slam_eig=[2.237e-2,2.237e-2]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.001s cost=2.501450e0 |g|=2.432e-2 (first-order bridge, eval=3) theta=[-3.8000] g=[-0.0243]
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=2.602e-1 (first-order bridge, eval=4)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=2.432e-2 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=1.11e-7 g_norm=2.369e-3 last_dev_change=8.655e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=0.955 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=3.70e-8 g_norm=1.138e-5 last_dev_change=3.823e-5 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.003 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=3 elapsed=0.0011s g_norm_initial=3.402e-2 g_norm_final=2.642e-10 convergence_rate=1.980e-3 status=Converged
+[INFO] [STAGE] inner pirls solve iters=3 status=Converged max_eta=5.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.924073 pen=0.618544 Dp=1.542617 pirls_edf=1.5217 logS=-7.079604 logH=-3.625785 half_diff=1.726910 h_above1=0 h_min=7.271e-2 h_max=3.662e-1 rho=[-3.5398] lambda=[2.902e-2]
+  H_eig=[3.662e-1,7.271e-2]
+  Slam_eig=[2.902e-2,2.902e-2]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.002s cost=2.498218e0 trial_rho_distance=2.602e-1 (first-order bridge, eval=4) theta=[-3.5398]
+[INFO] [OUTER schedule] inner-PIRLS cap transition accepted_iter=0 eval_count=4 g_ratio=6.114e-1 last_iters=3 converged=true ift_residual=n/a accept_rho=1.000 prev=0 new=5 (capped)
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=1 (first-order bridge, eval=4)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [pirls-path] repeated path=dense_transformed reason=design_not_sparse count=16 (suppressing identical decisions)
+[INFO] [ADAPTIVE-KKT] outer_g_norm=2.432e-2 effective_tol=1.000e-6 floor=1.000e-8 ceiling=1.000e-6
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS exact-decrement] applicable=true decrement_sq=1.406159e-30 threshold=1.370119e-15 pass=true gradient_norm=3.292364e-16 relative_gradient=2.596600e-16 dimension_scale=2.828427e0 natural_scale=2.679520e-1 objective=7.713083e-1 actual_reduction=2.220446e-16 predicted_reduction=4.657898e-19 linear_model_term=-9.315786e-19 direction_norm=3.568684e-9 data_reduction=4.779718e-10 penalty_reduction=-4.779717e-10
+[INFO] [PIRLS solve-end] iters=1 elapsed=0.0005s g_norm_initial=2.642e-10 g_norm_final=3.292e-16 convergence_rate=1.246e-6 status=Converged
+[INFO] [STAGE] inner pirls solve iters=1 status=Converged max_eta=5.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.924073 pen=0.618544 Dp=1.542617 pirls_edf=1.5217 logS=-7.079604 logH=-3.625785 half_diff=1.726910 h_above1=0 h_min=7.271e-2 h_max=3.662e-1 rho=[-3.5398] lambda=[2.902e-2]
+  H_eig=[3.662e-1,7.271e-2]
+  Slam_eig=[2.902e-2,2.902e-2]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.001s cost=2.498218e0 |g|=6.077e-4 (first-order bridge, eval=4) theta=[-3.5398] g=[-0.0006]
+[INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=1.328e-1 (first-order bridge, eval=5)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=6.077e-4 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=1.11e-7 g_norm=7.034e-4 last_dev_change=2.299e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=0.976 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=3.70e-8 g_norm=9.519e-7 last_dev_change=2.985e-6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.001 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=3 elapsed=0.0011s g_norm_initial=1.903e-2 g_norm_final=1.784e-12 convergence_rate=4.543e-4 status=Converged
+[INFO] [STAGE] inner pirls solve iters=3 status=Converged max_eta=4.8 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.990741 pen=0.635115 Dp=1.625856 pirls_edf=1.5128 logS=-6.814017 logH=-3.442058 half_diff=1.685979 h_above1=0 h_min=8.248e-2 h_max=3.880e-1 rho=[-3.4070] lambda=[3.314e-2]
+  H_eig=[3.880e-1,8.248e-2]
+  Slam_eig=[3.314e-2,3.314e-2]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.002s cost=2.498907e0 trial_rho_distance=1.328e-1 (first-order bridge, eval=5) theta=[-3.4070]
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=6.640e-2 (first-order bridge, eval=5)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=6.077e-4 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=1.701e-4 last_dev_change=5.470e-4 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.012 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.11e-7 g_norm=5.729e-8 last_dev_change=1.863e-7 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=3 elapsed=0.0010s g_norm_initial=9.320e-3 g_norm_final=1.324e-14 convergence_rate=1.124e-4 status=Converged
+[INFO] [STAGE] inner pirls solve iters=3 status=Converged max_eta=5.0 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.957131 pen=0.626830 Dp=1.583961 pirls_edf=1.5172 logS=-6.946810 logH=-3.534027 half_diff=1.706392 h_above1=0 h_min=7.742e-2 h_max=3.770e-1 rho=[-3.4734] lambda=[3.101e-2]
+  H_eig=[3.770e-1,7.742e-2]
+  Slam_eig=[3.101e-2,3.101e-2]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.002s cost=2.498372e0 trial_rho_distance=6.640e-2 (first-order bridge, eval=5) theta=[-3.4734]
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=3.320e-2 (first-order bridge, eval=5)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=6.077e-4 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=4.130e-5 last_dev_change=1.364e-4 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.006 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=2 elapsed=0.0007s g_norm_initial=4.553e-3 g_norm_final=3.432e-9 convergence_rate=8.683e-4 status=Converged
+[INFO] [STAGE] inner pirls solve iters=2 status=Converged max_eta=5.0 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.940532 pen=0.622688 Dp=1.563220 pirls_edf=1.5194 logS=-7.013207 logH=-3.579934 half_diff=1.716637 h_above1=0 h_min=7.502e-2 h_max=3.716e-1 rho=[-3.5066] lambda=[3.000e-2]
+  H_eig=[3.716e-1,7.502e-2]
+  Slam_eig=[3.000e-2,3.000e-2]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.001s cost=2.498247e0 trial_rho_distance=3.320e-2 (first-order bridge, eval=5) theta=[-3.5066]
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=1.660e-2 (first-order bridge, eval=5)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=6.077e-4 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.70e-8 g_norm=1.017e-5 last_dev_change=3.406e-5 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.003 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=2 elapsed=0.0007s g_norm_initial=2.250e-3 g_norm_final=2.089e-10 convergence_rate=3.047e-4 status=Converged
+[INFO] [STAGE] inner pirls solve iters=2 status=Converged max_eta=5.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.932285 pen=0.620617 Dp=1.552901 pirls_edf=1.5205 logS=-7.046406 logH=-3.602866 half_diff=1.721770 h_above1=0 h_min=7.386e-2 h_max=3.689e-1 rho=[-3.5232] lambda=[2.950e-2]
+  H_eig=[3.689e-1,7.386e-2]
+  Slam_eig=[2.950e-2,2.950e-2]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.001s cost=2.498220e0 trial_rho_distance=1.660e-2 (first-order bridge, eval=5) theta=[-3.5232]
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=8.300e-3 (first-order bridge, eval=5)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=6.077e-4 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=4.12e-9 g_norm=2.522e-6 last_dev_change=8.508e-6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.235e-8 final_lambda=4.115e-9 log10_ratio=-0.477 accept_rho=1.002 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=2 elapsed=0.0007s g_norm_initial=1.118e-3 g_norm_final=1.289e-11 convergence_rate=1.073e-4 status=Converged
+[INFO] [STAGE] inner pirls solve iters=2 status=Converged max_eta=5.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.928174 pen=0.619580 Dp=1.547755 pirls_edf=1.5211 logS=-7.063005 logH=-3.614327 half_diff=1.724339 h_above1=0 h_min=7.328e-2 h_max=3.676e-1 rho=[-3.5315] lambda=[2.926e-2]
+  H_eig=[3.676e-1,7.328e-2]
+  Slam_eig=[2.926e-2,2.926e-2]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.001s cost=2.498216e0 trial_rho_distance=8.300e-3 (first-order bridge, eval=5) theta=[-3.5315]
+[INFO] [OUTER schedule] inner-PIRLS cap transition accepted_iter=1 eval_count=5 g_ratio=1.528e-2 last_iters=2 converged=true ift_residual=n/a accept_rho=1.000 prev=0 new=4 (capped)
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=1 (first-order bridge, eval=5)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=6.077e-4 effective_tol=1.000e-6 floor=1.000e-8 ceiling=1.000e-6
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS exact-decrement] applicable=true decrement_sq=8.700314e-34 threshold=1.374682e-15 pass=true gradient_norm=1.050774e-17 relative_gradient=8.278426e-18 dimension_scale=2.828427e0 natural_scale=2.692916e-1 objective=7.738773e-1 actual_reduction=0.000000e0 predicted_reduction=1.121145e-21 linear_model_term=-2.242291e-21 direction_norm=1.747395e-10 data_reduction=2.352707e-11 penalty_reduction=-2.352701e-11
+[INFO] [PIRLS solve-end] iters=1 elapsed=0.0005s g_norm_initial=1.289e-11 g_norm_final=1.051e-17 convergence_rate=8.154e-7 status=Converged
+[INFO] [STAGE] inner pirls solve iters=1 status=Converged max_eta=5.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.928174 pen=0.619580 Dp=1.547755 pirls_edf=1.5211 logS=-7.063005 logH=-3.614327 half_diff=1.724339 h_above1=0 h_min=7.328e-2 h_max=3.676e-1 rho=[-3.5315] lambda=[2.926e-2]
+  H_eig=[3.676e-1,7.328e-2]
+  Slam_eig=[2.926e-2,2.926e-2]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.001s cost=2.498216e0 |g|=1.298e-4 (first-order bridge, eval=5) theta=[-3.5315] g=[+0.0001]
+[INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
+[INFO] [STAGE] outer eval start order=Value dim=1 trial_rho_distance=1.461e-3 (first-order bridge, eval=6)
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=1.298e-4 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=1.00e-9 g_norm=7.798e-8 last_dev_change=2.637e-7 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-9 final_lambda=1.000e-9 log10_ratio=0.000 accept_rho=1.000 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=2 elapsed=0.0007s g_norm_initial=1.965e-4 g_norm_final=1.239e-14 convergence_rate=7.940e-6 status=Converged
+[INFO] [STAGE] inner pirls solve iters=2 status=Converged max_eta=5.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.927452 pen=0.619398 Dp=1.546850 pirls_edf=1.5212 logS=-7.065926 logH=-3.616344 half_diff=1.724791 h_above1=0 h_min=7.318e-2 h_max=3.673e-1 rho=[-3.5330] lambda=[2.922e-2]
+  H_eig=[3.673e-1,7.318e-2]
+  Slam_eig=[2.922e-2,2.922e-2]
+[INFO] [STAGE] outer eval end order=Value elapsed=0.001s cost=2.498216e0 trial_rho_distance=1.461e-3 (first-order bridge, eval=6) theta=[-3.5330]
+[INFO] [STAGE] outer eval start order=ValueAndGradient dim=1 (first-order bridge, eval=6)
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.927452 pen=0.619398 Dp=1.546850 pirls_edf=1.5212 logS=-7.065926 logH=-3.616344 half_diff=1.724791 h_above1=0 h_min=7.318e-2 h_max=3.673e-1 rho=[-3.5330] lambda=[2.922e-2]
+  H_eig=[3.673e-1,7.318e-2]
+  Slam_eig=[2.922e-2,2.922e-2]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [STAGE] outer eval end order=ValueAndGradient elapsed=0.000s cost=2.498216e0 |g|=1.683e-7 (first-order bridge, eval=6) theta=[-3.5330] g=[+0.0000]
+[INFO] [BFGS] step accepted via StrongWolfe; inverse update applied
+[INFO] [BFGS] Converged by gradient: iters=3, f=2.498216e0, ||g||=1.683e-7, fe=20, ge=7, Δ=2.269e0
+[INFO] [OUTER summary] BFGS converged in 3 iters elapsed=0.031s final_value=2.498216e0
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=3.563e-1 last_dev_change=1.650e0 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.144 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.11e-7 g_norm=1.162e-1 last_dev_change=2.830e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.234 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0002s lm_lambda=3.70e-8 g_norm=2.255e-2 last_dev_change=6.247e-2 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.138 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  4 elapsed=0.0002s lm_lambda=1.23e-8 g_norm=1.011e-3 last_dev_change=3.206e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  4 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  4 start_lambda=3.704e-8 final_lambda=1.235e-8 log10_ratio=-0.477 accept_rho=1.030 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=5 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  5 elapsed=0.0002s lm_lambda=4.12e-9 g_norm=2.086e-6 last_dev_change=6.731e-6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  5 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  5 start_lambda=1.235e-8 final_lambda=4.115e-9 log10_ratio=-0.477 accept_rho=1.001 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=6 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=6 elapsed=0.0021s g_norm_initial=1.400e0 g_norm_final=8.918e-12 convergence_rate=1.362e-2 status=Converged
+[INFO] [STAGE] inner pirls solve iters=6 status=Converged max_eta=5.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.002s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.927452 pen=0.619398 Dp=1.546850 pirls_edf=1.5212 logS=-7.065926 logH=-3.616344 half_diff=1.724791 h_above1=0 h_min=7.318e-2 h_max=3.673e-1 rho=[-3.5330] lambda=[2.922e-2]
+  H_eig=[3.673e-1,7.318e-2]
+  Slam_eig=[2.922e-2,2.922e-2]
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.927452 pen=0.619398 Dp=1.546850 pirls_edf=1.5212 logS=-7.065926 logH=-3.616344 half_diff=1.724791 h_above1=0 h_min=7.318e-2 h_max=3.673e-1 rho=[-3.5330] lambda=[2.922e-2]
+  H_eig=[3.673e-1,7.318e-2]
+  Slam_eig=[2.922e-2,2.922e-2]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [HGB] small-sample fallback to defaults: pairs=0, threshold=3
+[INFO] [CERTIFICATE] standard REML: the objective published no criterion resolution; using the last-bit floor 7.768e-16 of the value alone (#2812)
+[INFO] [CERTIFICATE-BOUND] standard REML: fidelity=Screening, rho=[-3.5329633698043867], bound 1.000000e-6 set by solver-band (derived_standard=false, |Pg|=1.682783e-7, |g|=1.682783e-7, solver_band=1.000000e-6, cost=2.498216e0)
+[INFO] [CERTIFICATE] standard REML: gradient |g|=1.683e-7 |Pg|=1.683e-7 bound=1.000e-6 (rung=solver-band derived_standard=false) hessian_psd=not-spent curvature_source=screening-not-spent railed=[] → stationary
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=3.563e-1 last_dev_change=1.650e0 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.144 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.11e-7 g_norm=1.162e-1 last_dev_change=2.830e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.234 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0002s lm_lambda=3.70e-8 g_norm=2.255e-2 last_dev_change=6.247e-2 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.138 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  4 elapsed=0.0002s lm_lambda=1.23e-8 g_norm=1.011e-3 last_dev_change=3.206e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  4 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  4 start_lambda=3.704e-8 final_lambda=1.235e-8 log10_ratio=-0.477 accept_rho=1.030 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=5 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  5 elapsed=0.0002s lm_lambda=4.12e-9 g_norm=2.086e-6 last_dev_change=6.731e-6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  5 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  5 start_lambda=1.235e-8 final_lambda=4.115e-9 log10_ratio=-0.477 accept_rho=1.001 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=6 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=6 elapsed=0.0021s g_norm_initial=1.400e0 g_norm_final=8.918e-12 convergence_rate=1.362e-2 status=Converged
+[INFO] [STAGE] inner pirls solve iters=6 status=Converged max_eta=5.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.002s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.927452 pen=0.619398 Dp=1.546850 pirls_edf=1.5212 logS=-7.065926 logH=-3.616344 half_diff=1.724791 h_above1=0 h_min=7.318e-2 h_max=3.673e-1 rho=[-3.5330] lambda=[2.922e-2]
+  H_eig=[3.673e-1,7.318e-2]
+  Slam_eig=[2.922e-2,2.922e-2]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [HGB] small-sample fallback to defaults: pairs=0, threshold=3
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=3.563e-1 last_dev_change=1.650e0 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.144 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.11e-7 g_norm=1.162e-1 last_dev_change=2.830e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.234 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0002s lm_lambda=3.70e-8 g_norm=2.255e-2 last_dev_change=6.247e-2 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.138 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  4 elapsed=0.0002s lm_lambda=1.23e-8 g_norm=1.011e-3 last_dev_change=3.206e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  4 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  4 start_lambda=3.704e-8 final_lambda=1.235e-8 log10_ratio=-0.477 accept_rho=1.030 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=5 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  5 elapsed=0.0002s lm_lambda=4.12e-9 g_norm=2.086e-6 last_dev_change=6.731e-6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  5 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  5 start_lambda=1.235e-8 final_lambda=4.115e-9 log10_ratio=-0.477 accept_rho=1.001 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=6 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=6 elapsed=0.0021s g_norm_initial=1.400e0 g_norm_final=8.918e-12 convergence_rate=1.362e-2 status=Converged
+[INFO] [STAGE] inner pirls solve iters=6 status=Converged max_eta=5.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.002s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.927452 pen=0.619398 Dp=1.546850 pirls_edf=1.5212 logS=-7.065926 logH=-3.616344 half_diff=1.724791 h_above1=0 h_min=7.318e-2 h_max=3.673e-1 rho=[-3.5330] lambda=[2.922e-2]
+  H_eig=[3.673e-1,7.318e-2]
+  Slam_eig=[2.922e-2,2.922e-2]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [HGB] small-sample fallback to defaults: pairs=0, threshold=3
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=3.563e-1 last_dev_change=1.650e0 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.144 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.11e-7 g_norm=1.162e-1 last_dev_change=2.830e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.234 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0002s lm_lambda=3.70e-8 g_norm=2.255e-2 last_dev_change=6.247e-2 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.138 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  4 elapsed=0.0002s lm_lambda=1.23e-8 g_norm=1.011e-3 last_dev_change=3.206e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  4 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  4 start_lambda=3.704e-8 final_lambda=1.235e-8 log10_ratio=-0.477 accept_rho=1.030 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=5 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  5 elapsed=0.0002s lm_lambda=4.12e-9 g_norm=2.086e-6 last_dev_change=6.731e-6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  5 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  5 start_lambda=1.235e-8 final_lambda=4.115e-9 log10_ratio=-0.477 accept_rho=1.001 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=6 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=6 elapsed=0.0020s g_norm_initial=1.400e0 g_norm_final=8.918e-12 convergence_rate=1.362e-2 status=Converged
+[INFO] [STAGE] inner pirls solve iters=6 status=Converged max_eta=5.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.002s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.927452 pen=0.619398 Dp=1.546850 pirls_edf=1.5212 logS=-7.065926 logH=-3.616344 half_diff=1.724791 h_above1=0 h_min=7.318e-2 h_max=3.673e-1 rho=[-3.5330] lambda=[2.922e-2]
+  H_eig=[3.673e-1,7.318e-2]
+  Slam_eig=[2.922e-2,2.922e-2]
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.927452 pen=0.619398 Dp=1.546850 pirls_edf=1.5212 logS=-7.065926 logH=-3.616344 half_diff=1.724791 h_above1=0 h_min=7.318e-2 h_max=3.673e-1 rho=[-3.5330] lambda=[2.922e-2]
+  H_eig=[3.673e-1,7.318e-2]
+  Slam_eig=[2.922e-2,2.922e-2]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [OUTER hessian-route] choice=dense reason=below_crossover n=4 p=2 k=1 callback_kernel=false subspace_trace=true scale_prefers_operator=false dense_workspace_bytes=160
+[INFO] [OUTER hessian-elapsed] choice=dense reason=below_crossover n=4 p=2 k=1 elapsed=0.000s
+[INFO] [HGB] small-sample fallback to defaults: pairs=0, threshold=3
+[INFO] [CERTIFICATE] standard REML: the objective published no criterion resolution; using the last-bit floor 7.768e-16 of the value alone (#2812)
+[INFO] [CERTIFICATE-BOUND] standard REML: fidelity=Mint, rho=[-3.5329633698043867], bound 1.000000e-6 set by solver-band (derived_standard=false, |Pg|=1.682783e-7, |g|=1.682783e-7, solver_band=1.000000e-6, cost=2.498216e0)
+[INFO] [CERTIFICATE] standard REML: gradient |g|=1.683e-7 |Pg|=1.683e-7 bound=1.000e-6 (rung=solver-band derived_standard=false) hessian_psd=yes curvature_source=terminal-analytic railed=[] → stationary
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=3.563e-1 last_dev_change=1.650e0 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.144 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.11e-7 g_norm=1.162e-1 last_dev_change=2.830e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.234 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0002s lm_lambda=3.70e-8 g_norm=2.255e-2 last_dev_change=6.247e-2 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.138 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  4 elapsed=0.0002s lm_lambda=1.23e-8 g_norm=1.011e-3 last_dev_change=3.206e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  4 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  4 start_lambda=3.704e-8 final_lambda=1.235e-8 log10_ratio=-0.477 accept_rho=1.030 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=5 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=5 elapsed=0.0017s g_norm_initial=1.400e0 g_norm_final=2.086e-6 convergence_rate=6.833e-2 status=Converged
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.927452 pen=0.619398 Dp=1.546850 pirls_edf=1.5212 logS=-7.065926 logH=-3.616344 half_diff=1.724791 h_above1=0 h_min=7.318e-2 h_max=3.673e-1 rho=[-3.5330] lambda=[2.922e-2]
+  H_eig=[3.673e-1,7.318e-2]
+  Slam_eig=[2.922e-2,2.922e-2]
+[INFO] [STAGE] reml_laml cost_only_done k=1 ext_dim=0 dim=2 elapsed=0.000s
+[INFO] [OUTER hessian-route] choice=dense reason=below_crossover n=4 p=2 k=1 callback_kernel=false subspace_trace=true scale_prefers_operator=false dense_workspace_bytes=160
+[INFO] [OUTER hessian-elapsed] choice=dense reason=below_crossover n=4 p=2 k=1 elapsed=0.000s
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=1.683e-7 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=5.24e-7 g_norm=8.333e-1 last_dev_change=7.000e0 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=5.238e-7 log10_ratio=-0.281 accept_rho=0.890 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.75e-7 g_norm=2.995e-2 last_dev_change=2.421e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=5.238e-7 final_lambda=1.746e-7 log10_ratio=-0.477 accept_rho=1.022 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0002s lm_lambda=5.82e-8 g_norm=6.476e-5 last_dev_change=3.282e-4 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=1.746e-7 final_lambda=5.820e-8 log10_ratio=-0.477 accept_rho=1.001 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=4 elapsed=0.0014s g_norm_initial=3.724e0 g_norm_final=3.277e-10 convergence_rate=3.063e-3 status=Converged
+[INFO] [STAGE] inner pirls solve iters=4 status=Converged max_eta=1.1 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.002s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=3.413849 pen=0.794204 Dp=4.208052 pirls_edf=0.8851 logS=-0.353299 logH=0.831937 half_diff=0.592618 h_above1=2 h_min=1.333e0 h_max=1.723e0 rho=[-0.1766] lambda=[8.381e-1]
+  H_eig=[1.723e0,1.333e0]
+  Slam_eig=[8.381e-1,8.381e-1]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=1.683e-7 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=6.336e-2 last_dev_change=1.933e0 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=0.991 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.11e-7 g_norm=3.838e-6 last_dev_change=3.000e-4 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=3 elapsed=0.0010s g_norm_initial=5.043e0 g_norm_final=4.392e-13 convergence_rate=4.433e-5 status=Converged
+[INFO] [STAGE] inner pirls solve iters=3 status=Converged max_eta=0.2 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=4.986702 pen=0.264868 Dp=5.251569 pirls_edf=0.2389 logS=3.589636 logH=3.844923 half_diff=0.127643 h_above1=2 h_min=6.644e0 h_max=7.037e0 rho=[1.7948] lambda=[6.018e0]
+  H_eig=[7.037e0,6.644e0]
+  Slam_eig=[6.018e0,6.018e0]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=1.683e-7 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=9.522e-4 last_dev_change=8.537e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=2 elapsed=0.0007s g_norm_initial=9.357e0 g_norm_final=3.193e-10 convergence_rate=5.842e-6 status=Converged
+[INFO] [STAGE] inner pirls solve iters=2 status=Converged max_eta=0.0 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=5.469224 pen=0.037731 Dp=5.506955 pirls_edf=0.0322 logS=7.848654 logH=7.881162 half_diff=0.016254 h_above1=2 h_min=5.125e1 h_max=5.165e1 rho=[3.9243] lambda=[5.062e1]
+  H_eig=[5.165e1,5.125e1]
+  Slam_eig=[5.062e1,5.062e1]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [pirls-path] repeated path=dense_transformed reason=design_not_sparse count=32 (suppressing identical decisions)
+[INFO] [ADAPTIVE-KKT] outer_g_norm=1.683e-7 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.70e-8 g_norm=6.587e-7 last_dev_change=2.337e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS exact-decrement] applicable=true decrement_sq=8.036431e-31 threshold=4.922709e-15 pass=true gradient_norm=2.416190e-14 relative_gradient=6.362657e-15 dimension_scale=2.828427e0 natural_scale=2.797455e0 objective=2.771239e0 actual_reduction=4.440892e-16 predicted_reduction=2.986511e-16 linear_model_term=-5.973021e-16 direction_norm=9.067710e-10 data_reduction=5.773657e-10 penalty_reduction=-5.773650e-10
+[INFO] [PIRLS solve-end] iters=2 elapsed=0.0009s g_norm_initial=1.842e1 g_norm_final=2.416e-14 convergence_rate=3.621e-8 status=Converged
+[INFO] [STAGE] inner pirls solve iters=2 status=Converged max_eta=0.0 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=5.539781 pen=0.002697 Dp=5.542478 pirls_edf=0.0023 logS=13.173523 logH=13.175810 half_diff=0.001143 h_above1=2 h_min=7.261e2 h_max=7.265e2 rho=[6.5868] lambda=[7.254e2]
+  H_eig=[7.265e2,7.261e2]
+  Slam_eig=[7.254e2,7.254e2]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=1.683e-7 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 rows=8 route="Householder QR of PSD root" backward_error=2.414e-16 damped_decrement_sq=8.824e-2
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=4.12e-9 g_norm=5.809e-7 last_dev_change=4.412e-2 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.235e-8 final_lambda=4.115e-9 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 rows=8 route="Householder QR of PSD root" backward_error=1.486e-16 damped_decrement_sq=1.341e-17
+[INFO] [PIRLS exact-decrement] applicable=true decrement_sq=3.372587e-32 threshold=4.925038e-15 pass=true gradient_norm=2.913288e-14 relative_gradient=7.666696e-15 dimension_scale=2.828427e0 natural_scale=2.799927e0 objective=2.772550e0 actual_reduction=-4.440892e-16 predicted_reduction=6.703867e-18 linear_model_term=-1.340773e-17 direction_norm=2.308219e-11 data_reduction=-3.231460e-11 penalty_reduction=3.231422e-11
+[INFO] [PIRLS solve-end] iters=2 elapsed=0.0009s g_norm_initial=4.712e1 g_norm_final=2.913e-14 convergence_rate=2.486e-8 status=Converged
+[INFO] [STAGE] inner pirls solve iters=2 status=Converged max_eta=0.0 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=5.545022 pen=0.000078 Dp=5.545100 pirls_edf=0.0001 logS=20.266386 logH=20.266452 half_diff=0.000033 h_above1=2 h_min=2.517e4 h_max=2.517e4 rho=[10.1332] lambda=[2.516e4]
+  H_eig=[2.517e4,2.517e4]
+  Slam_eig=[2.516e4,2.516e4]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=1.683e-7 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 rows=8 route="Householder QR of PSD root" backward_error=1.003e-16 damped_decrement_sq=9.145e-3
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=1.00e-9 g_norm=2.274e-7 last_dev_change=4.572e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.372e-9 final_lambda=1.000e-9 log10_ratio=-0.137 accept_rho=1.000 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 rows=8 route="Householder QR of PSD root" backward_error=1.098e-16 damped_decrement_sq=1.721e-20
+[INFO] [PIRLS exact-decrement] applicable=true decrement_sq=1.261215e-32 threshold=4.925106e-15 pass=true gradient_norm=1.946706e-13 relative_gradient=5.122912e-14 dimension_scale=2.828427e0 natural_scale=2.799999e0 objective=2.772588e0 actual_reduction=0.000000e0 predicted_reduction=8.603484e-21 linear_model_term=-1.720698e-20 direction_norm=7.567399e-14 data_reduction=-1.061373e-13 penalty_reduction=1.059436e-13
+[INFO] [PIRLS solve-end] iters=2 elapsed=0.0009s g_norm_initial=1.658e2 g_norm_final=1.947e-13 convergence_rate=3.427e-8 status=Converged
+[INFO] [STAGE] inner pirls solve iters=2 status=Converged max_eta=0.0 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=5.545176 pen=0.000001 Dp=5.545177 pirls_edf=0.0000 logS=29.831425 logH=29.831426 half_diff=0.000000 h_above1=2 h_min=3.005e6 h_max=3.005e6 rho=[14.9157] lambda=[3.005e6]
+  H_eig=[3.005e6,3.005e6]
+  Slam_eig=[3.005e6,3.005e6]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=1.683e-7 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 rows=8 route="Householder QR of PSD root" backward_error=2.375e-16 damped_decrement_sq=4.138e-4
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=1.00e-9 g_norm=4.651e-8 last_dev_change=2.069e-4 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-9 final_lambda=1.000e-9 log10_ratio=0.000 accept_rho=1.000 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 rows=8 route="Householder QR of PSD root" backward_error=2.420e-16 damped_decrement_sq=1.132e-24
+[INFO] [PIRLS exact-decrement] applicable=true decrement_sq=1.167992e-31 threshold=4.925107e-15 pass=true gradient_norm=1.494525e-11 relative_gradient=3.932960e-12 dimension_scale=2.828427e0 natural_scale=2.800000e0 objective=2.772589e0 actual_reduction=0.000000e0 predicted_reduction=5.655569e-25 linear_model_term=-1.131371e-24 direction_norm=2.432587e-17 data_reduction=0.000000e0 penalty_reduction=3.405622e-17
+[INFO] [PIRLS solve-end] iters=2 elapsed=0.0009s g_norm_initial=8.896e2 g_norm_final=1.495e-11 convergence_rate=1.296e-7 status=Converged
+[INFO] [STAGE] inner pirls solve iters=2 status=Converged max_eta=0.0 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=5.545177 pen=0.000000 Dp=5.545177 pirls_edf=0.0000 logS=42.743193 logH=42.743193 half_diff=0.000000 h_above1=2 h_min=1.912e9 h_max=1.912e9 rho=[21.3716] lambda=[1.912e9]
+  H_eig=[1.912e9,1.912e9]
+  Slam_eig=[1.912e9,1.912e9]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=1.683e-7 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 rows=8 route="Householder QR of PSD root" backward_error=2.232e-16 damped_decrement_sq=5.725e-6
+[INFO] [PIRLS solve-end] iters=1 elapsed=0.0004s g_norm_initial=7.822e3 g_norm_final=9.746e-10 convergence_rate=1.246e-13 status=Converged
+[INFO] [STAGE] inner pirls solve iters=1 status=Converged max_eta=0.0 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.000s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=5.545177 pen=0.000000 Dp=5.545177 pirls_edf=0.0000 logS=60.000000 logH=60.000000 half_diff=0.000000 h_above1=2 h_min=1.069e13 h_max=1.069e13 rho=[30.0000] lambda=[1.069e13]
+  H_eig=[1.069e13,1.069e13]
+  Slam_eig=[1.069e13,1.069e13]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=1.683e-7 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=1.00e-9 g_norm=3.932e-1 last_dev_change=1.747e0 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-9 final_lambda=1.000e-9 log10_ratio=0.000 accept_rho=1.161 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.00e-9 g_norm=1.714e-1 last_dev_change=4.410e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=1.000e-9 final_lambda=1.000e-9 log10_ratio=0.000 accept_rho=1.321 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0002s lm_lambda=1.00e-9 g_norm=7.282e-2 last_dev_change=2.859e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=1.000e-9 final_lambda=1.000e-9 log10_ratio=0.000 accept_rho=1.323 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  4 elapsed=0.0002s lm_lambda=1.00e-9 g_norm=2.340e-2 last_dev_change=1.392e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  4 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  4 start_lambda=1.000e-9 final_lambda=1.000e-9 log10_ratio=0.000 accept_rho=1.231 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=5 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  5 elapsed=0.0002s lm_lambda=1.00e-9 g_norm=5.394e-3 last_dev_change=3.024e-2 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  5 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  5 start_lambda=1.000e-9 final_lambda=1.000e-9 log10_ratio=0.000 accept_rho=1.160 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=6 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  6 elapsed=0.0002s lm_lambda=1.00e-9 g_norm=5.373e-4 last_dev_change=2.501e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  6 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  6 start_lambda=1.000e-9 final_lambda=1.000e-9 log10_ratio=0.000 accept_rho=1.065 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=7 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  7 elapsed=0.0002s lm_lambda=1.00e-9 g_norm=7.660e-6 last_dev_change=2.689e-5 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  7 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  7 start_lambda=1.000e-9 final_lambda=1.000e-9 log10_ratio=0.000 accept_rho=1.008 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=8 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=8 elapsed=0.0028s g_norm_initial=1.400e0 g_norm_final=1.904e-9 convergence_rate=7.793e-2 status=Converged
+[INFO] [STAGE] inner pirls solve iters=8 status=Converged max_eta=14.0 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.003s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.087963 pen=0.165570 Dp=0.253533 pirls_edf=1.7652 logS=-13.778535 logH=-8.460927 half_diff=2.658804 h_above1=0 h_min=4.813e-3 h_max=4.396e-2 rho=[-6.8893] lambda=[1.019e-3]
+  H_eig=[4.396e-2,4.813e-3]
+  Slam_eig=[1.019e-3,1.019e-3]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=1.683e-7 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0003s lm_lambda=3.33e-7 g_norm=1.921e-3 last_dev_change=1.017e-2 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.157 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0002s lm_lambda=1.11e-7 g_norm=1.755e-4 last_dev_change=8.030e-4 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.062 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0002s lm_lambda=3.70e-8 g_norm=1.839e-6 last_dev_change=7.712e-6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.007 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=4 elapsed=0.0014s g_norm_initial=8.537e-3 g_norm_final=2.072e-10 convergence_rate=1.248e-2 status=Converged
+[INFO] [STAGE] inner pirls solve iters=4 status=Converged max_eta=17.2 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.002s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.036852 pen=0.085877 Dp=0.122729 pirls_edf=1.8040 logS=-15.920463 logH=-10.210324 half_diff=2.855070 h_above1=0 h_min=1.969e-3 h_max=1.869e-2 rho=[-7.9603] lambda=[3.491e-4]
+  H_eig=[1.869e-2,1.969e-3]
+  Slam_eig=[3.491e-4,3.491e-4]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=5.545177 pen=0.000000 Dp=5.545177 pirls_edf=0.0000 logS=60.000000 logH=60.000000 half_diff=0.000000 h_above1=2 h_min=1.069e13 h_max=1.069e13 rho=[30.0000] lambda=[1.069e13]
+  H_eig=[1.069e13,1.069e13]
+  Slam_eig=[1.069e13,1.069e13]
+[INFO] [reml-geometry] dense_spectral reason=design_not_sparse p=2 nnz_x=na nnz_h_est=na density_h_est=na threshold=0.1000
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [ADAPTIVE-KKT] outer_g_norm=1.683e-7 effective_tol=1.000e-8 floor=1.000e-8 ceiling=1.000e-8
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS exact-decrement] applicable=true decrement_sq=8.571910e-28 threshold=1.090049e-16 pass=true gradient_norm=1.307704e-15 relative_gradient=1.293540e-15 dimension_scale=2.828427e0 natural_scale=1.095028e-2 objective=6.136430e-2 actual_reduction=6.938894e-18 predicted_reduction=1.088885e-17 linear_model_term=-2.177767e-17 direction_norm=1.051726e-7 data_reduction=5.758336e-10 penalty_reduction=-5.758336e-10
+[INFO] [PIRLS solve-end] iters=1 elapsed=0.0005s g_norm_initial=2.072e-10 g_norm_final=1.308e-15 convergence_rate=6.311e-6 status=Converged
+[INFO] [STAGE] inner pirls solve iters=1 status=Converged max_eta=17.2 jeffreys_logdet=none rows=full(derivative-request) elapsed=0.001s
+[INFO] [STAGE] logdet S rho_dim=1 penalty_rank=2 elapsed=0.000s
+[INFO] [#1271-diag] path=orig p=2 penalty_rank=2 nullspace_dim=0 rss=0.036852 pen=0.085877 Dp=0.122729 pirls_edf=1.8040 logS=-15.920463 logH=-10.210324 half_diff=2.855070 h_above1=0 h_min=1.969e-3 h_max=1.869e-2 rho=[-7.9603] lambda=[3.491e-4]
+  H_eig=[1.869e-2,1.969e-3]
+  Slam_eig=[3.491e-4,3.491e-4]
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [STAGE] PIRLS row-chunk generation chunks=1 n=4 p=2 nnz=8 elapsed=0.000s
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 rows=8 route="Householder QR of PSD root" backward_error=1.454e-16 damped_decrement_sq=2.265e14
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0001s lm_lambda=3.33e-7 g_norm=5.379e-2 last_dev_change=2.603e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.306 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0002s lm_lambda=3.33e-7 g_norm=4.594e2 last_dev_change=1.133e14 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=2 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [PIRLS iter-end] iter=  2 elapsed=0.0001s lm_lambda=1.11e-7 g_norm=1.806e-2 last_dev_change=1.116e-1 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  2 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  2 start_lambda=3.333e-7 final_lambda=1.111e-7 log10_ratio=-0.477 accept_rho=1.239 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=3 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 rows=8 route="Householder QR of PSD root" backward_error=1.676e-16 damped_decrement_sq=1.975e-8
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=2 elapsed=0.0009s g_norm_initial=4.920e13 g_norm_final=1.491e-9 convergence_rate=5.505e-12 status=Converged
+[INFO] [PIRLS iter-end] iter=  3 elapsed=0.0001s lm_lambda=3.70e-8 g_norm=5.158e-3 last_dev_change=2.942e-2 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  3 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  3 start_lambda=1.111e-7 final_lambda=3.704e-8 log10_ratio=-0.477 accept_rho=1.201 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=4 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [STAGE] sigma-cubature pirls solve rho=[30.000] iters=2 status=Converged max_eta=0.0 elapsed=0.001s
+[INFO] [PIRLS iter-end] iter=  4 elapsed=0.0001s lm_lambda=1.23e-8 g_norm=9.123e-4 last_dev_change=4.566e-3 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  4 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  4 start_lambda=3.704e-8 final_lambda=1.235e-8 log10_ratio=-0.477 accept_rho=1.122 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=5 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  5 elapsed=0.0001s lm_lambda=4.12e-9 g_norm=4.520e-5 last_dev_change=1.954e-4 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  5 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  5 start_lambda=1.235e-8 final_lambda=4.115e-9 log10_ratio=-0.477 accept_rho=1.033 attempts=1
+[INFO] [STAGE] PIRLS update_with_curvature iter=6 curvature=Fisher elapsed=0.000s source=reused_prev_accept
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS solve-end] iters=6 elapsed=0.0018s g_norm_initial=1.329e-1 g_norm_final=1.295e-7 convergence_rate=9.956e-2 status=Converged
+[INFO] [STAGE] sigma-cubature pirls solve rho=[-7.960] iters=6 status=Converged max_eta=17.2 elapsed=0.002s
+[INFO] [sigma-cubature] node=0 step=1.8980e1 wald_step=3.3563e0 ΔV=2.743759e-1 posterior_weight=5.358987e-1 evals=11 box_limited=true tr(φ̂·H(ρ)⁻¹)=1.871525e-13 tr(φ̂·H(ρ̂)⁻¹)=1.638723e1
+[INFO] [sigma-cubature] node=1 step=1.8980e1 wald_step=3.3563e0 ΔV=4.182183e-1 posterior_weight=4.641013e-1 evals=11 box_limited=true tr(φ̂·H(ρ)⁻¹)=5.614967e2 tr(φ̂·H(ρ̂)⁻¹)=1.638723e1
+[INFO] [sigma-cubature] tr(correction)=3.053901e2 tr(φ̂·H(ρ̂)⁻¹)=1.638723e1
+[INFO] [smoothing-correction] branch=cubature rank=1 points=2 near_boundary=false grad_norm=1.683e-7 max_rho_var=1.126e1 max_node_criterion_rise=4.182e-1 (proposal calibration rise 0.5)
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 0.09s
+
