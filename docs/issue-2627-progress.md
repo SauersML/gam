@@ -113,3 +113,33 @@ gam-pyffi job **102173061164**: **124 run, 120 passed, 4 failed, 0 skipped,
 The workspace archive build succeeded and all ten Rust shards started. The
 shards and both Python jobs were still running at this update. These are
 additional measured failures, not a zero-failure result; #2627 remains open.
+
+## September 8: large-border fixture reaches device admission
+
+The same 16-test focused population now reports **16 passed, 0 failed,
+0 ignored, 1,252 filtered out, 2.69 seconds**. Output is in
+`bench/measurements/issue_triage_20260907/sae-2627-orthogonal.log`.
+
+Diagnostics resolved the remaining routing failure: dense decoder coefficient
+blocks acquired cross-subspace roundoff during SVD projection. The largest
+squared overlap was `5.49849782439841e-32`, which produced nonzero separation
+carriers. Refusing the scalar-smooth device operator in that case was correct;
+the earlier entry's description of a remaining device-admission defect was
+premature. The routing fixture now uses distinct singular values on disjoint
+coordinate axes, performs the real automatic frame activation, and explicitly
+asserts every pairwise overlap is exactly zero. Production curvature admission
+has not been relaxed or thresholded.
+
+The preserved assertions now measure full coefficient width 65,536, assembled
+border 2,048, 32 rows, local dimension 63, `InexactPCG`, framed operands, and
+successful offload admission. Operand storage is 32.5 MiB. This CPU test verifies
+assembly and dispatch policy; it does not claim physical GPU execution.
+
+The successful MSI rebuild took 95 seconds using the preceding warm-build
+configuration. Source checksum for `tests_device_engage_1783.rs` is
+`8eb7c00ed4f2df5fb75b0e1b870550261bb9b8138b4a0107bda8a8c0a951ad53`;
+test executable checksum is
+`964ca27851ae8c66b774dda012d36c22df7d0164405f5e492a6cfd715a87fd2f`.
+This remains a focused shared-development-tree receipt, not full-suite or
+exact-main certification. The gam-pyffi failures above and the outstanding
+complete Rust/Python populations still prevent closing #2627.
