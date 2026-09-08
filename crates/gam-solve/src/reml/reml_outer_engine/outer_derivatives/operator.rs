@@ -323,6 +323,10 @@ pub(crate) struct OuterHessianCoord {
 
 pub(crate) struct UnifiedHessianOperator {
     pub(crate) hop: Arc<dyn HessianFactorization>,
+    /// The stationarity Jacobian, distinct from the logdet matrix in `hop`.
+    pub(crate) mode_response_op: Arc<dyn HessianFactorization>,
+    pub(crate) active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
+    pub(crate) mode_rhs_correction: Option<ModeResponseRhsCorrectionFn>,
     pub(crate) coords: Vec<OuterHessianCoord>,
     pub(crate) pair_a: Array2<f64>,
     pub(crate) pair_ld_s: Array2<f64>,
@@ -446,14 +450,19 @@ impl UnifiedHessianOperator {
         }
     }
 
-    pub(crate) fn pair_rhs_combo(&self, idx: usize, alpha: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn pair_rhs_combo(&self, idx: usize, alpha: &Array1<f64>) -> Result<Array1<f64>, String> {
         let mut out = Array1::<f64>::zeros(self.hop.dim());
         for j in 0..alpha.len() {
             if alpha[j] != 0.0 {
                 self.scaled_add_pair_rhs(idx, j, alpha[j], &mut out);
+                if let Some(correction) = &self.mode_rhs_correction {
+                    let a = &self.coords[idx];
+                    let b = &self.coords[j];
+                    out.scaled_add(alpha[j], &correction(a.ext_index, b.ext_index, &a.v, &b.v)?);
+                }
             }
         }
-        out
+        Ok(out)
     }
 
     pub(crate) fn scalar_correction_trace(
@@ -499,6 +508,11 @@ impl UnifiedHessianOperator {
                 continue;
             }
             c_trace += alpha_j * self.pair_rhs_dot(idx, j, z_c.view());
+            if let Some(correction) = &self.mode_rhs_correction {
+                let a = &self.coords[idx];
+                let b = &self.coords[j];
+                c_trace += alpha_j * correction(a.ext_index, b.ext_index, &a.v, &b.v)?.dot(z_c);
+            }
         }
         // #740: `pair_rhs_dot` reads `pair_g[idx][j]` for the `−g_{ij}·z_c`
         // adjoint term, but the build SKIPPED the ψψ `pair_g` when the contracted
@@ -531,10 +545,11 @@ impl UnifiedHessianOperator {
     /// is the directional `β̇(α)` and `second_v` is the per-row `β̇_idx`. This
     /// mirrors the dense path's `compute_d2h(−v_l, −v_k)` exactly.
     ///
-    /// `u` is solved with the FULL inner inverse `hop.solve` even when the LAML
+    /// `u` is solved with the stationarity inverse even when the LAML
     /// logdet uses the projected penalty-subspace trace: `u = β̈` is a mode
     /// response (an IFT stationarity derivative living in the full β-space), so
-    /// the IFT identity demands the full inverse. The penalty-subspace
+    /// the IFT identity demands the stationarity inverse, restricted by active
+    /// constraints when present. The penalty-subspace
     /// projection acts only on the TRACE contraction (`trace_operator` below) —
     /// the same `ThetaModeResponseKernel` principle that the FIRST mode response
     /// and `dense.rs` follow (see `penalty_coordinate.rs` `respond_one`,
@@ -551,7 +566,11 @@ impl UnifiedHessianOperator {
             }
             .into());
         };
-        let u = self.hop.solve(rhs);
+        let u = ThetaModeResponseKernel::select(
+            self.subspace.as_deref(),
+            self.active_constraints.as_deref(),
+            self.mode_response_op.as_ref(),
+        ).respond_one(rhs);
         let Some(term1) = first(&u)? else {
             return Ok(0.0);
         };
@@ -688,7 +707,7 @@ impl UnifiedHessianOperator {
                         .callback_second_modes
                         .as_ref()
                         .expect("callback second modes")[idx];
-                    let mut rhs = self.pair_rhs_combo(idx, alpha);
+                    let mut rhs = self.pair_rhs_combo(idx, alpha)?;
                     // The build skipped the ψψ `pair_g`; the callback-correction
                     // second mode-response rhs needs `−Σ_j α_j g_{ψ_i ψ_j}`,
                     // which the hook supplies as `score.row(i)`. Inject it so the
@@ -1501,7 +1520,11 @@ pub(crate) fn build_outer_hessian_operator(
                     d_array: d_array.as_ref(),
                     x,
                 },
-                hop.as_ref(),
+                &ThetaModeResponseKernel::select(
+                    solution.penalty_subspace_trace.as_deref(),
+                    solution.active_constraints.as_deref(),
+                    solution.mode_response_operator(),
+                ),
                 h_g,
             )?),
             _ => None,
@@ -1549,6 +1572,9 @@ pub(crate) fn build_outer_hessian_operator(
     };
 
     Ok(UnifiedHessianOperator {
+        mode_rhs_correction: effective_deriv.mode_response_rhs_correction(),
+        mode_response_op: solution.mode_response_op.clone().unwrap_or_else(|| Arc::clone(&hop)),
+        active_constraints: solution.active_constraints.clone(),
         hop,
         coords,
         pair_a,

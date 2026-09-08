@@ -1220,6 +1220,9 @@ impl HessianFactorization for TangentProjectedHessianOperator {
 pub(crate) struct BorrowedDerivProvider<'a>(&'a dyn HessianDerivativeProvider);
 
 impl<'a> HessianDerivativeProvider for BorrowedDerivProvider<'a> {
+    fn mode_response_rhs_correction(&self) -> Option<ModeResponseRhsCorrectionFn> {
+        self.0.mode_response_rhs_correction()
+    }
     fn hessian_derivative_correction(
         &self,
         v: &Array1<f64>,

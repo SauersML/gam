@@ -1,5 +1,15 @@
 use super::*;
 
+/// Extra stationarity-Jacobian motion when its matrix differs from the
+/// logdet matrix. Inputs are extended-coordinate indices (None for rho)
+/// and positive-convention first responses v_i = -beta_i.
+/// The output adds D_j(C) v_i + partial_i(C) v_j to the second-response RHS,
+/// where C = M_stationarity - M_logdet and D_j includes beta motion.
+pub type ModeResponseRhsCorrectionFn = Arc<
+    dyn Fn(Option<usize>, Option<usize>, &Array1<f64>, &Array1<f64>)
+        -> Result<Array1<f64>, String> + Send + Sync,
+>;
+
 /// Provider of family-specific Hessian derivative information.
 ///
 /// The REML/LAML gradient requires ∂H/∂ρₖ. For Gaussian, this is just Aₖ = λₖSₖ.
@@ -10,6 +20,11 @@ use super::*;
 ///
 /// This trait abstracts over all three cases.
 pub trait HessianDerivativeProvider: Send + Sync {
+    /// None means the difference of the two matrices is constant.
+    fn mode_response_rhs_correction(&self) -> Option<ModeResponseRhsCorrectionFn> {
+        None
+    }
+
     /// Compute the third-derivative correction to Hₖ.
     ///
     /// Given the mode response vₖ = H⁻¹(Aₖβ̂), returns the correction matrix
@@ -880,6 +895,9 @@ impl<'a> BarrierDerivativeProvider<'a> {
 }
 
 impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
+    fn mode_response_rhs_correction(&self) -> Option<ModeResponseRhsCorrectionFn> {
+        self.inner.mode_response_rhs_correction()
+    }
     fn hessian_derivative_correction(
         &self,
         v_k: &Array1<f64>,

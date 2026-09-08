@@ -3027,7 +3027,11 @@ pub(crate) fn test_compute_adjoint_z_c_streaming_matches_dense_reference() {
         }
         h_dense[i] = acc;
     }
-    let streamed = compute_adjoint_z_c(&ing, &hop, &h_dense).expect("adjoint path");
+    let streamed = compute_adjoint_z_c(
+        &ing,
+        &ThetaModeResponseKernel::select(None, None, &hop),
+        &h_dense,
+    ).expect("adjoint path");
 
     let mut t = h_dense.clone();
     Zip::from(&mut t)
@@ -8980,6 +8984,38 @@ fn mode_response_operator_is_the_one_the_drift_trace_uses_2612() {
          below would hold vacuously"
     );
     assert_relative_eq!(drift_doubled, 0.5 * drift_inherited, max_relative = 1e-12);
+}
+
+#[test]
+fn second_mode_response_uses_stationarity_inverse_and_logdet_trace_979() {
+    struct Probe;
+    impl HessianDerivativeProvider for Probe {
+        fn hessian_derivative_correction(&self, v: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(Array2::zeros((v.len(), v.len()))))
+        }
+        fn hessian_second_derivative_correction(&self, _: &Array1<f64>, _: &Array1<f64>, u: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(Array2::from_diag(u)))
+        }
+        fn has_corrections(&self) -> bool { true }
+    }
+    let mut solution = mode_response_solution(Some(spd([6.0, 10.0])), Box::new(Probe));
+    solution.penalty_logdet.second = Some(Array2::zeros((1, 1)));
+    let rhs = array![2.0, 3.0];
+    let v = Array1::zeros(2);
+    // tr(diag(3,5)^-1 diag(diag(6,10)^-1 rhs)). Neither inverse
+    // can replace the other, even though the two matrices commute.
+    let expected = 2.0 / (6.0 * 3.0) + 3.0 / (10.0 * 5.0);
+    let response = ThetaModeResponseKernel::select(None, None, solution.mode_response_operator());
+    let dense = compute_ift_correction_trace(solution.hessian_op.as_ref(), &response,
+        &rhs, &v, &v, solution.deriv_provider.as_ref(), None, None, None, None, None).unwrap();
+    let kernel = OuterHessianDerivativeKernel::Callback {
+        first: Arc::new(|u| Ok(Some(DriftDerivResult::Dense(Array2::from_diag(u))))),
+        second: Arc::new(|u, _| Ok(Some(DriftDerivResult::Dense(Array2::zeros((u.len(), u.len())))))),
+    };
+    let operator = build_outer_hessian_operator(&solution, &[1.0], solution.deriv_provider.as_ref(), kernel, None, None).unwrap();
+    let implicit = operator.callback_correction_trace(&rhs, &v, &v).unwrap();
+    assert_relative_eq!(dense, expected, epsilon = 1e-13);
+    assert_relative_eq!(implicit, expected, epsilon = 1e-13);
 }
 
 /// gam#2765: **a constraint that holds with equality and carries a zero

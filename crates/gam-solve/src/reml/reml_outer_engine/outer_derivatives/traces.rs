@@ -12,7 +12,7 @@ use super::*;
 //   tr(G_ε C[u])    = uᵀ Xᵀ (c ⊙ h^G) = uᵀ v
 pub(crate) fn compute_adjoint_z_c(
     ing: &ScalarGlmIngredients<'_>,
-    hop: &dyn HessianFactorization,
+    mode_kernel: &ThetaModeResponseKernel<'_>,
     leverage: &Array1<f64>,
 ) -> Result<Array1<f64>, String> {
     let mut weighted = Array1::<f64>::zeros(ing.c_array.len());
@@ -23,39 +23,10 @@ pub(crate) fn compute_adjoint_z_c(
     // Matrix-free Xᵀ · weighted via DesignMatrix transpose-apply, so
     // operator-backed (Lazy) designs at large scale never densify.
     let v = ing.x.transpose_vector_multiply(&weighted);
-    // Adjoint shortcut for tr(Kernel · C[u]) where C[u] = Xᵀ diag(c ⊙ Xu) X
-    // and u = β̈ is the SECOND mode response. Expanding the trace,
-    //
-    //     tr(Kernel · C[u]) = Σ_r c_r (Xu)_r (X Kernel Xᵀ)_rr
-    //                       = uᵀ Xᵀ (c ⊙ h^G),   h^G = diag(X Kernel Xᵀ),
-    //
-    // and the mode response is `u = β̈ = H⁻¹ rhs` — solved with the FULL inner
-    // inverse `hop.solve` in EVERY regime (it is an IFT stationarity derivative
-    // living in full β-space; see `compute_ift_correction_trace`'s slow path and
-    // `penalty_coordinate.rs`). Substituting,
-    //
-    //     tr(Kernel · C[u]) = rhsᵀ H⁻¹ Xᵀ(c ⊙ h^G) = rhsᵀ · z_c,
-    //     z_c = H⁻¹ · Xᵀ(c ⊙ h^G).
-    //
-    // The PROJECTION enters ONLY through the leverage `h^G`, never through the
-    // solve:
-    //   * Full-Hessian regime: Kernel = G_ε(H), h^G = diag(X G_ε(H) Xᵀ).
-    //   * Projected-subspace regime (rank-deficient LAML fix): Kernel = K, the
-    //     caller passes h^{G,proj} = diag(X K Xᵀ); the solve stays `H⁻¹`.
-    //
-    // A previous version routed the projected regime through
-    // `K · Xᵀ(c⊙h^{G,proj})` (the projected pseudo-inverse) instead of
-    // `H⁻¹ · …`. That made `scalar_correction_trace` compute
-    // `rhsᵀ K Xᵀ(c⊙h^{G,proj})` while the dense path's
-    // `compute_ift_correction_trace` materialisation correctly traces
-    // `tr(K · C[H⁻¹ rhs]) = rhsᵀ H⁻¹ Xᵀ(c⊙h^{G,proj})`, so the operator-form
-    // Hessian disagreed with `compute_outer_hessian` on every non-trivial
-    // subspace direction (the
-    // `projected_operator_hessian_matches_dense_subspace_trace` /
-    // `outer_hessian_operator_matvec_matches_dense_subspace_with_null_alpha`
-    // regressions). The solve is `H⁻¹` regardless of regime; only the leverage
-    // is projected.
-    Ok(hop.solve(&v))
+    // tr(K_logdet C[u]) = u^T v with u = K_mode rhs. Thus the adjoint
+    // is K_mode v. The trace kernel enters through the leverage; the solve
+    // follows the stationarity Jacobian and its active-constraint geometry.
+    Ok(mode_kernel.respond_one(&v))
 }
 
 /// Compute the fourth-derivative trace: tr(G_ε(H) Xᵀ diag(d ⊙ (Xvₖ)(Xvₗ)) X).
@@ -171,6 +142,7 @@ pub(crate) fn compute_fourth_derivative_trace_matrix(
 ///   u = H⁻¹(rhs),  correction = hessian_second_derivative_correction(v_i, v_j, u)
 pub(crate) fn compute_ift_correction_trace(
     hop: &dyn HessianFactorization,
+    mode_kernel: &ThetaModeResponseKernel<'_>,
     rhs: &Array1<f64>,
     v_i: &Array1<f64>,
     v_j: &Array1<f64>,
@@ -211,7 +183,7 @@ pub(crate) fn compute_ift_correction_trace(
         // (`trace_projected_logdet`/`trace_operator`), never on the β̈ solve;
         // routing β̈ through the projected pseudo-inverse drops the `null(S₊)`
         // curvature component the projector discards.
-        let u = hop.solve(rhs);
+        let u = mode_kernel.respond_one(rhs);
         if let Some(correction) =
             effective_deriv.hessian_second_derivative_correction_result(v_i, v_j, &u)?
         {

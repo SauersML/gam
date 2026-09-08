@@ -224,7 +224,7 @@ pub(crate) fn compute_outer_hessian(
     };
     let adjoint_z_c = if incl_logdet_h {
         match (glm_ingredients.as_ref(), leverage.as_ref()) {
-            (Some(ing), Some(h_g)) => Some(compute_adjoint_z_c(ing, hop, h_g)?),
+            (Some(ing), Some(h_g)) => Some(compute_adjoint_z_c(ing, mode_kernel(), h_g)?),
             _ => None,
         }
     } else {
@@ -518,14 +518,19 @@ pub(crate) fn compute_outer_hessian(
         k,
     );
 
-    let build_rho_pair_rhs = |kk: usize, ll: usize| {
+    let mode_rhs_correction = effective_deriv.mode_response_rhs_correction();
+    let build_rho_pair_rhs = |kk: usize, ll: usize| -> Result<Array1<f64>, String> {
         let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
         rhs += &solution.penalty_coords[kk].scaled_matvec(&v_ks[ll], curvature_lambdas[kk]);
         if kk == ll {
             rhs -= &curvature_a_k_betas[kk];
         }
-        rhs
+        if let Some(correction) = &mode_rhs_correction {
+            rhs += &correction(None, None, &v_ks[kk], &v_ks[ll])?;
+        }
+        Ok(rhs)
     };
+    let second_mode_kernel = mode_kernel();
 
     let batched_rho_pair_corrections: Option<Vec<f64>> = if incl_logdet_h
         && subspace.is_some()
@@ -535,7 +540,7 @@ pub(crate) fn compute_outer_hessian(
         let mut rhs_matrix = Array2::<f64>::zeros((hop.dim(), rho_pair_count));
         for pair_idx in 0..rho_pair_count {
             let (kk, ll) = upper_triangle_pair_from_index(pair_idx, k);
-            let rhs = build_rho_pair_rhs(kk, ll);
+            let rhs = build_rho_pair_rhs(kk, ll)?;
             rhs_matrix.column_mut(pair_idx).assign(&rhs);
         }
         // The second mode response `β̈ = H⁻¹ · rhs` is an IFT stationarity
@@ -544,7 +549,7 @@ pub(crate) fn compute_outer_hessian(
         // penalty-subspace projection acts only on the trace contraction of the
         // resulting drift correction below — never on the β̈ solve — matching the
         // `ThetaModeResponseKernel` principle the first mode response follows.
-        let solved = hop.solve_multi(&rhs_matrix);
+        let solved = second_mode_kernel.respond_stack(&rhs_matrix);
         let triples: Vec<(Array1<f64>, Array1<f64>, Array1<f64>)> = (0..rho_pair_count)
             .map(|pair_idx| {
                 let (kk, ll) = upper_triangle_pair_from_index(pair_idx, k);
@@ -663,9 +668,10 @@ pub(crate) fn compute_outer_hessian(
                 let correction = if let Some(corrections) = batched_rho_pair_corrections.as_ref() {
                     corrections[pair_idx]
                 } else {
-                    let rhs = build_rho_pair_rhs(kk, ll);
+                    let rhs = build_rho_pair_rhs(kk, ll)?;
                     compute_ift_correction_trace(
                         hop,
+                        second_mode_kernel,
                         &rhs,
                         &v_ks[kk],
                         &v_ks[ll],
@@ -746,6 +752,9 @@ pub(crate) fn compute_outer_hessian(
                         .scaled_matvec(&ext_v[ext_idx], curvature_lambdas[rho_idx]);
                     let beta_rho = v_ks[rho_idx].mapv(|value| -value);
                     rhs += &ext_h_drifts[ext_idx].apply(&v_ks[rho_idx]);
+                    if let Some(correction) = &mode_rhs_correction {
+                        rhs += &correction(None, Some(ext_idx), &v_ks[rho_idx], &ext_v[ext_idx])?;
+                    }
 
                     let base = compute_base_h2_trace(
                         hop,
@@ -769,6 +778,7 @@ pub(crate) fn compute_outer_hessian(
 
                     let correction = compute_ift_correction_trace(
                         hop,
+                        second_mode_kernel,
                         &rhs,
                         &v_ks[rho_idx],
                         &ext_v[ext_idx],
@@ -864,6 +874,9 @@ pub(crate) fn compute_outer_hessian(
                         .drift
                         .scaled_add_apply(ext_v[jj].view(), 1.0, &mut rhs);
                     rhs += &ext_h_drifts[jj].apply(&ext_v[ii]);
+                    if let Some(correction) = &mode_rhs_correction {
+                        rhs += &correction(Some(ii), Some(jj), &ext_v[ii], &ext_v[jj])?;
+                    }
 
                     let base = compute_base_h2_trace(
                         hop,
@@ -888,6 +901,7 @@ pub(crate) fn compute_outer_hessian(
 
                     let correction = compute_ift_correction_trace(
                         hop,
+                        second_mode_kernel,
                         &rhs,
                         &ext_v[ii],
                         &ext_v[jj],
