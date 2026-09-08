@@ -309,3 +309,24 @@ dispersion determinant policy change is included: the inner cached determinant
 and outer derivative convention need to be examined together before changing
 either. No additional build or experiment is running from this task; the
 runner terminated its timed-out process groups. Issue #2668 remains open.
+
+## Refinement investigation and compute outage
+
+The r7 trace confirms that the concave failure hands off from LM to undamped
+refinement with decrement 2.931131e-12, then returns exactly the same residual
+and decrement. The Info logger does not show why refinement stopped. Inactive
+constraint crossing and rejection by the gradient-improvement guard are
+possibilities, not established causes. A debug diagnostic now reuses the
+original shape regression source and assertions directly:
+`bench/measurements/issue_2668/shape_refinement_diagnostic.rs`. Compile it with
+the warm probe compiler, exposing the anchor's `log`, `ndarray`, and
+`gam_runtime` dependencies, then run both tests serially without a name filter.
+It has not yet been compiled or run; no new solver change is claimed verified.
+
+MSI compute access is currently unavailable: default acn112/acn116 selection
+failed repeatedly, explicit acl42 SSH exited 255, and `sinfo` reports invalid,
+unknown, or drained node states across all partitions. The login node still
+serves read-only metadata and files; no build or test was moved there or run
+locally. No jobs were submitted during this outage. The previously rejected
+receipt commit 0b99a163d is now an ancestor of remote main following another
+session's merge.
