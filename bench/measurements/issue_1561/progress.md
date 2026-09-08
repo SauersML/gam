@@ -151,3 +151,43 @@ from inference rather than a different optimum. Its export is
 `gaussian-integration-corrected.json`. Raw oracle refinements and solver
 diagnostics accompany this report. The 0.145918% figure describes the tested
 shared-tree positive cubature implementation, not an isolated-main benchmark.
+
+## Fresh public-model reproductions
+
+Commit `30a462b62` carries the tested positive cubature proposal and stable
+accumulator. The proposal now uses the data-derived resolvability domain,
+averages feasible chord midpoints, and scales all its spherical nodes together
+to keep them inside that domain. Failed numerical integration reports its
+error rather than substituting a first-order covariance.
+
+After rebuilding the model library, the same 30 Gaussian replicates give
+conditional coverage **0.951889**, marginal coverage **0.954889**, and 9,000
+wider marginal intervals with width ratios **1.00167608–1.10764761**. These
+are the original data, seeds, nominal level, and coverage bar. The shared-tree
+prediction test also passes all four combinations of covariance mode and
+requested estimator transform; that test exercises machinery already removed
+from main and is not a new main-line test requirement.
+
+The current Poisson tensor model now returns successfully. Its RMSE is still
+**0.240018379199** against the original mgcv P-spline reference's
+**0.156515492583**. The Gaussian interaction RMSE remains
+**0.0346950027463**. Successful execution resolves the observed refusal on this
+integrated source, not these statistical quality gaps.
+
+`binomial_holdout_1561` replays the original five prostate folds, starting with
+the previously failing fold 3. All five fits succeed: fold times are 1.256,
+0.584, 0.538, 0.651, and 0.311 seconds (execution order 3, 0, 1, 2, 4).
+Predictions use the fitted frozen design. The independent Python audit checks
+that each of the 654 observations is held out exactly once, that fold IDs and
+labels match, and then runs the original additive reference models and bars.
+
+| Metric | GAM | EBM | pyGAM |
+| --- | ---: | ---: | ---: |
+| Mean five-fold AUC | 0.7072979814 | 0.6991852711 | 0.7064062130 |
+| Fold-0 held-out NLL | 0.6215316618 | 0.6210594769 | 0.6212567175 |
+
+Both absolute bars and both match-or-beat margins pass. Reference versions:
+interpret-core 0.7.8, pyGAM 0.12.0, scikit-learn 1.9.0, NumPy 2.2.6. EBM uses
+four workers to respect the shared node; its statistical settings and seed
+match the original fixture. These checks are still not a complete-suite
+significance result.

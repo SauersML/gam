@@ -1,0 +1,28 @@
+family=poisson GAM_rmse=0.240018379199
+family=poisson basis=ps select=FALSE rmse=0.156515492583 edf=10.827866656 sp= 18.1511599626,493.3267570793
+  max_abs_prediction_difference_from_GAM=0.409432343424
+family=poisson basis=ps select=TRUE rmse=0.237700958072 edf=8.64513260511 sp= 14.5055544169,461.3354716509,107.5107447402
+  max_abs_prediction_difference_from_GAM=0.196280027939
+family=poisson basis=cr select=FALSE rmse=0.167101388564 edf=11.9064858803 sp= 13.1416861753,298.2216673090
+  max_abs_prediction_difference_from_GAM=0.440454969416
+family=poisson basis=cr select=TRUE rmse=0.231753400302 edf=10.1650675702 sp= 11.4206097833,277.2236607475, 38.7977388545
+  max_abs_prediction_difference_from_GAM=0.035264257668
+family=gaussian GAM_rmse=0.0346950027463
+family=gaussian basis=ps select=FALSE rmse=0.028519483236 edf=3.95483764168 sp=2.51033284493e-01,4.69953536110e+05
+  max_abs_prediction_difference_from_GAM=0.081197749809
+family=gaussian basis=ps select=TRUE rmse=0.0291338029331 edf=3.46959472041 sp=3.08347811341e-01,2.21711497444e+05,2.06759376106e+04
+  max_abs_prediction_difference_from_GAM=0.054220092274
+family=gaussian basis=cr select=FALSE rmse=0.0290115398741 edf=4.48815169302 sp=9.53049172110e-01,1.30091294785e+06
+  max_abs_prediction_difference_from_GAM=0.0668207252755
+family=gaussian basis=cr select=TRUE rmse=0.0346949115607 edf=3.89512075372 sp=9.47322846167e-01,1.31358914202e+06,8.24710150022e+00
+  max_abs_prediction_difference_from_GAM=5.96233599381e-07
+Warning messages:
+1: In smooth.construct.tensor.smooth.spec(object, dk$data, dk$knots) :
+  reparameterization unstable for margin: not done
+2: In smooth.construct.tensor.smooth.spec(object, dk$data, dk$knots) :
+  reparameterization unstable for margin: not done
+3: In smooth.construct.tensor.smooth.spec(object, dk$data, dk$knots) :
+  reparameterization unstable for margin: not done
+4: In smooth.construct.tensor.smooth.spec(object, dk$data, dk$knots) :
+  reparameterization unstable for margin: not done
+R=R version 4.2.2 (2022-10-31) mgcv=1.9.1

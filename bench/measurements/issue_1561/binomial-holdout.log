@@ -1,0 +1,10 @@
+fold=3 start training_rows=523
+fold=3 elapsed=1.256s edf=Some(3.178728819097917) rho=[1.8201324613547987, -2.6014796555957047, 15.553191584580857, -3.6085059007535873], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+fold=0 start training_rows=523
+fold=0 elapsed=0.584s edf=Some(2.863967559117727) rho=[12.621620668886797, -3.0221571179821862, 17.393923084790316, -3.4540725296193973], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+fold=1 start training_rows=523
+fold=1 elapsed=0.538s edf=Some(2.8599954926881006) rho=[14.36322090527996, -2.6850635845618296, 16.468172678380842, -3.211342363041734], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+fold=2 start training_rows=523
+fold=2 elapsed=0.651s edf=Some(2.8763501891468177) rho=[11.907183667576076, -3.1848326231662436, 17.262238120331048, -3.2981443421200924], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1
+fold=4 start training_rows=524
+fold=4 elapsed=0.311s edf=Some(2.8755558648029504) rho=[14.183832662481953, -3.2940401333182305, 21.97914306188163, -3.335360338203176], shape=[4], strides=[1], layout=CFcf (0xf), const ndim=1

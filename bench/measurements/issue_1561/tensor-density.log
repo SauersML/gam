@@ -1,0 +1,2 @@
+family=poisson formula=y ~ te(x, z, k=[6,6]) edf=Some(10.07284364989549) rho=[4.696465795847629, 7.890668421900789, 4.459229369658264], shape=[3], strides=[1], layout=CFcf (0xf), const ndim=1 objective=Some(45.57804538675014)
+family=gaussian formula=y ~ ti(x, z, k=6) edf=Some(3.8950034272581497) rho=[3.5633338933725454, 20.642901790203535, 2.1098613099162535], shape=[3], strides=[1], layout=CFcf (0xf), const ndim=1 objective=Some(206.8624569170556)
