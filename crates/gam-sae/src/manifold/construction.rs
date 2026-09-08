@@ -1,4 +1,5 @@
 use super::*;
+use super::fit_drivers::GaugeOrbitDescent;
 // #2598 — `construction_quasi_laplace.rs` interpolates the refusal markers into
 // its ρ-local refusals instead of restating them, so the classifier and the
 // producer cannot disagree about the phrase again.
@@ -9,7 +10,7 @@ use crate::identifiability::{
 };
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_math::special::bessel_i0_centered_terms_from_log_abs;
-use super::fit_drivers::GaugeOrbitDescent;
+use opt::{BacktrackConfig, backtracking_line_search};
 
 // ── Theorem K: the rank charge is a RUNNING COMPLEXITY λ(n) ──────────────────
 //

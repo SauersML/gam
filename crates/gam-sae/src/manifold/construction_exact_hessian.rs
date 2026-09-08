@@ -405,6 +405,55 @@ impl ExactHessianSpectralBlock {
         })
     }
 
+    /// A descent step for the scalar objective whose gradient is `residual`.
+    ///
+    /// Unlike [`Self::damped_residual_step`], this solves a shifted *Hessian*
+    /// system rather than the normal equations for `‖g‖²`.  When `A` is
+    /// indefinite, a residual-minimising step can be an ascent direction for
+    /// the objective.  Reflecting the spectrum by the smallest shift which
+    /// makes every resolved eigenvalue positive gives an objective-descent
+    /// direction while retaining the exact Newton step for positive-definite
+    /// geometry.  The caller globalizes its length against the objective.
+    fn shifted_objective_descent_step(
+        &self,
+        residual: &SaeArrowVector,
+    ) -> Result<SaeArrowVector, String> {
+        let total_t = residual.t.len();
+        let dim = total_t + residual.beta.len();
+        if self.eigenvectors.dim() != (dim, dim) || self.eigenvalues.len() != dim {
+            return Err("shifted objective step: geometry/residual dimension mismatch".to_string());
+        }
+        let mut flat = Array1::<f64>::zeros(dim);
+        flat.slice_mut(s![..total_t]).assign(&residual.t);
+        flat.slice_mut(s![total_t..]).assign(&residual.beta);
+        let coefficients = self.eigenvectors.t().dot(&flat);
+        let minimum = self
+            .eigenvalues
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let shift = if minimum < 0.0 {
+            // Twice |lambda_min| reflects the left edge to +|lambda_min|;
+            // unlike adding exactly |lambda_min|, it does not manufacture a
+            // singular system at the most informative negative-curvature mode.
+            -2.0 * minimum
+        } else {
+            0.0
+        };
+        let mut step_coefficients = Array1::<f64>::zeros(dim);
+        for index in 0..dim {
+            let denominator = self.eigenvalues[index] + shift;
+            if denominator > self.rank_floor(index) {
+                step_coefficients[index] = -coefficients[index] / denominator;
+            }
+        }
+        let solution = self.eigenvectors.dot(&step_coefficients);
+        Ok(SaeArrowVector {
+            t: solution.slice(s![..total_t]).to_owned(),
+            beta: solution.slice(s![total_t..]).to_owned(),
+        })
+    }
+
     /// Apply the symmetric Moore--Penrose inverse.  Resolved positive and
     /// negative modes are both retained; only the spectral null band
     /// `|λ| ≤ rank_floor` is removed, and that band is the ONLY null predicate

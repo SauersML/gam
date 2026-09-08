@@ -1636,6 +1636,33 @@ mod exact_stationarity_solve_1418_tests {
         assert_eq!(damped.retained_rank, 2);
     }
 
+    /// #2267 — an indefinite exact stationarity operator must still produce a
+    /// descent direction for the penalized objective.  The old residual-normal
+    /// step reverses the negative mode and can therefore ascend the scalar it
+    /// is meant to optimize; the shifted Hessian step may not.
+    #[test]
+    fn indefinite_exact_hessian_step_is_objective_descent_2267() {
+        let eigenvalues = Array1::from_vec(vec![-2.0_f64, 4.0]);
+        let geometry = spectral_block_with_uniform_floor(
+            Array2::from_diag(&eigenvalues),
+            eigenvalues,
+            Array2::from_diag(&Array1::ones(2)),
+            1.0e-12,
+        );
+        let gradient = SaeArrowVector {
+            t: Array1::from_vec(vec![3.0]),
+            beta: Array1::from_vec(vec![5.0]),
+        };
+        let step = geometry
+            .shifted_objective_descent_step(&gradient)
+            .expect("indefinite geometry has an objective step");
+        let slope = gradient.t.dot(&step.t) + gradient.beta.dot(&step.beta);
+        assert!(
+            slope < 0.0,
+            "shifted exact-Hessian step must descend the objective; gᵀΔ={slope}"
+        );
+    }
+
     /// #2762 — the modeled residual the damped path reports is the EXACT linear
     /// residual `g + AΔ(ν)`, on a non-diagonal operator, at every damping.
     ///

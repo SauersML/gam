@@ -2858,6 +2858,56 @@ impl SaeManifoldTerm {
                         break;
                     }
                 };
+            // #2267: globalize the exact-Hessian step in the objective's own
+            // currency before considering residual-norm minimization.  At an
+            // indefinite stationarity operator those are different problems:
+            // reducing ‖g‖² can reject every direction which follows negative
+            // curvature even though the penalized objective has ordinary
+            // descent.  This was the refine/polish limit cycle in the shipped
+            // 635-row example.  The residual remains the convergence gate; it
+            // is no longer (incorrectly) the step-acceptance objective.
+            let objective_before =
+                self.penalized_objective_total(target, rho_fixed, registry, 1.0)?;
+            let objective_step = geometry.shifted_objective_descent_step(&residual)?;
+            let directional =
+                -(residual.t.dot(&objective_step.t) + residual.beta.dot(&objective_step.beta));
+            if directional.is_finite() && directional > 0.0 {
+                let objective_snapshot = self.snapshot_mutable_state();
+                let accepted = backtracking_line_search::<_, String>(
+                    BacktrackConfig {
+                        initial_step: 1.0,
+                        max_steps: SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS + 1,
+                        ..BacktrackConfig::default()
+                    },
+                    |alpha| {
+                        self.restore_mutable_state(&objective_snapshot)?;
+                        Ok(self
+                            .apply_newton_step(
+                                objective_step.t.view(),
+                                objective_step.beta.view(),
+                                alpha,
+                            )
+                            .and_then(|()| {
+                                self.penalized_objective_total(target, rho_fixed, registry, 1.0)
+                            })
+                            .ok()
+                            .map(|value| (value, ())))
+                    },
+                    |alpha, value| {
+                        value.is_finite()
+                            && value
+                                <= objective_before - SAE_MANIFOLD_ARMIJO_C1 * alpha * directional
+                                    + opt::armijo_roundoff_cushion(objective_before)
+                    },
+                )?;
+                if accepted.is_some() {
+                    made_progress = true;
+                    // Reassemble at the objective-descended state on the next
+                    // iteration.  Only that assembly may certify stationarity.
+                    continue;
+                }
+                self.restore_mutable_state(&objective_snapshot)?;
+            }
             let Some((curvature_min, curvature_max)) = geometry.retained_curvature_extremes()
             else {
                 log::debug!(
