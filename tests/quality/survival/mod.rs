@@ -3,8 +3,6 @@ mod quality_vs_flexsurv_weibull_aft;
 mod quality_vs_gam_competing_risks_integral_identity;
 mod quality_vs_gamlss_gaussian_survival_ls;
 mod quality_vs_inla_survival_random_intercept_baseline;
-mod quality_vs_lifelines_competing_risks_cif;
-mod quality_vs_lifelines_cox_like_marginal;
 mod quality_vs_lifelines_crps_lognormal_aft;
 mod quality_vs_lifelines_loglogistic_aft;
 mod quality_vs_lifelines_lognormal_aft;

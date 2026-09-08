@@ -51,5 +51,4 @@ mod quality_vs_simplex_dirichlet_regression;
 mod quality_vs_statsmodels_gam_additive;
 mod quality_vs_statsmodels_negbin;
 mod quality_vs_statsmodels_negbin_coefficient_se;
-mod quality_vs_synthetic_frailty_hazard_multiplier_likelihood;
 mod ws4a_end_to_end;

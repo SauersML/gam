@@ -122,8 +122,9 @@ jobs:
           # `precondition_check`) that the optimizer elides, not by real FLOPs. This
           # makes the quality measurements reflect production-representative code
           # rather than a debug build no user experiences. Convergence and the
-          # quality assertions gate the run; elapsed time does not.
-          cargo build --keep-going --profile release-dev --test quality \
+          # quality assertions gate the run; quality_1082 also retains its
+          # original per-test 360-second runtime requirement.
+          cargo build --keep-going --profile release-dev --test quality --test quality_1082 \
             || echo "build reported errors; missing quality binary is flagged BUILDFAIL in the run step"
           # A handful of quality tests (RMST, competing risks) shell out to the
           # real `gam` CLI to exercise the end-to-end formula fit path. The CLI
@@ -170,23 +171,30 @@ jobs:
           measured=1
           # gam#1082: the quality target is built under the `release-dev` profile
           # (see the build step), so its binary lands in target/release-dev/deps.
-          bin=$(find target/release-dev/deps -maxdepth 1 -type f -perm -u+x -name "quality-*" ! -name '*.*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
-          if [ -n "$bin" ] && [ -x "$bin" ]; then
-            tests=()
-            if "$bin" --list > "$OUT/quality-list.txt" 2> "$OUT/quality-list.stderr"; then
-              mapfile -t tests < <(sed -n 's/: test$//p' "$OUT/quality-list.txt")
+          tests=()
+          declare -A test_binary test_discovery_errors
+          for target in quality quality_1082; do
+            bin=$(find target/release-dev/deps -maxdepth 1 -type f -perm -u+x -name "$target-*" ! -name '*.*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+            target_tests=()
+            if [ -n "$bin" ] && [ -x "$bin" ]; then
+              if "$bin" --list > "$OUT/$target-list.txt" 2> "$OUT/$target-list.stderr"; then
+                mapfile -t target_tests < <(sed -n 's/: test$//p' "$OUT/$target-list.txt")
+              fi
+              if [ "${#target_tests[@]}" -eq 0 ]; then
+                discovery_error=1
+                measured=0
+                target_tests=("${target}_discovery")
+                test_discovery_errors["${target}_discovery"]=1
+              fi
             else
-              discovery_error=1
-            fi
-            if [ "$discovery_error" -eq 1 ] || [ "${#tests[@]}" -eq 0 ]; then
-              discovery_error=1
               measured=0
-              tests=(quality_discovery)
+              target_tests=("$target")
             fi
-          else
-            measured=0
-            tests=(quality)
-          fi
+            for t in "${target_tests[@]}"; do
+              tests+=("$t")
+              test_binary["$t"]="$bin"
+            done
+          done
           if [ "$measured" -eq 1 ]; then
             printf '%s\n' "${tests[@]}" > "$OUT/quality_cases.txt"
           fi
@@ -198,7 +206,7 @@ jobs:
           {
             echo "## Reference quality suite"
             echo ""
-            echo "Each row is one exact libtest case from the grouped \`quality\`"
+            echo "Each row is one exact libtest case from the \`quality\` or \`quality_1082\`"
             echo "integration binary. Synthetic and \`_on_real_data\` arms are timed"
             echo "and classified independently, so grouping does not hide an individual"
             echo "test inside one aggregate invocation. The \`outcome\` says exactly WHAT happened — it never collapses"
@@ -221,6 +229,7 @@ jobs:
             echo "|---|---|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
           for t in "${tests[@]}"; do
+            bin="${test_binary[$t]}"
             i=$((i+1))
             outcome=""; cause=""; reason=""; rc=0
             echo "::group::[$i/$N] $t"
@@ -230,7 +239,7 @@ jobs:
             tsafe="${t//:/_}"
             log="$OUT/logs/$tsafe.log"
             start=$SECONDS
-            if [ "$discovery_error" -eq 1 ]; then
+            if [ "${test_discovery_errors[$t]:-0}" -eq 1 ]; then
               outcome=TEST_ERROR; cause=test_discovery; rc=-1
               reason="quality binary listed zero libtest cases"
               echo "$reason" > "$log"
@@ -240,11 +249,15 @@ jobs:
               echo "no executable binary found for grouped quality target — the build step could not compile it" > "$log"
             else
               # Execute the pre-built binary directly — no cargo, no rebuild.
-              # SPEC forbids wall-clock budgets: a fit either converges, returns
-              # a typed non-convergence error with resumable work, or keeps
-              # progressing. The harness must not substitute elapsed time for a
-              # mathematical convergence verdict.
-              "$bin" --exact "$t" --nocapture --test-threads=1 > "$log" 2>&1
+              # Production convergence remains a mathematical certificate;
+              # the test harness also measures the issue's runtime contract.
+              run_prefix=()
+              if [[ "$bin" == */quality_1082-* ]]; then
+                # SPEC permits test deadlines. This population retains #1082's
+                # original 360-second acceptance budget.
+                run_prefix=(timeout 360s)
+              fi
+              "${run_prefix[@]}" "$bin" --exact "$t" --nocapture --test-threads=1 > "$log" 2>&1
               rc=$?
             fi
             dur=$((SECONDS-start))

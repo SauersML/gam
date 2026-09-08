@@ -13,7 +13,7 @@ pools to the allocated CPU capacity when invoking it:
 
 ```sh
 cargo nextest run --profile issue-1082 --build-jobs 4 --test-threads 1 \
-  -p gam --test quality --test regressions \
+  -p gam --test quality_1082 \
   -p gam-models --test quality_multinomial_penguins_2612
 ```
 
@@ -74,6 +74,29 @@ cargo nextest run --profile issue-1082 --build-jobs 4 --test-threads 1 \
   unit-level evidence; the end-to-end rebuild is still in progress.
 
 ## Completion evidence still required
+
+Latest focused census on MSI acn112: **24 passed, 2 failed, 1 timed out**
+across 27 cases, one test process at a time with four Rayon workers. The separate
+penguin follow-up is still outstanding. Synthetic Poisson tensor comparisons
+passed in 5 seconds each; restored beta-logistic recovery passed in 6 seconds.
+The corrected R-free Poisson fixture passed in 10 seconds and the negative-binomial
+outer-loop reproduction in 2 seconds. Gaussian/logistic coverage passed in 8/12
+seconds. All original recovery assertions and the 360-second deadline remain.
+
+Remaining failures: multinomial smooth-by-factor timed out at 360 seconds;
+the real spatial INLA comparison took 26 seconds but GAM's RMSE .79904 exceeded
+1.10 times INLA's .70544; survival reached an inner-convergence refusal in 60
+seconds. INLA now executes using its official Rocky Linux 8 binary and a real
+libatomic file inside its library directory, accessible from MSI's R container.
+The new survival fifth derivative passed its independent finite-difference check
+against the fourth derivative, covering events, censoring, and three slope values.
+
+The `quality_1082` target owns the selected source modules exactly once; the large
+`quality` and `regressions` binaries no longer register them. Reference-quality CI
+discovers and runs both quality binaries and times out focused cases at 360 seconds.
+The census logs are at
+`/projects/standard/hsiehph/sauer354/issue1082-focused-results/` on MSI, with the
+result ledger at `/Users/user/gam-validation-artifacts/issue1082-focused-results.tsv`.
 
 1. Run every selected test after the corrections, including both synthetic and real-data arms. Record
    actual durations and assertions; missing references remain failures.
