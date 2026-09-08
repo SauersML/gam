@@ -2968,7 +2968,7 @@ mod standard_payload_penalty_topology_tests {
         assert_eq!(payload.family, "binomial-logit");
         assert_eq!(
             payload.family_state.likelihood(),
-            LikelihoodSpec::binomial_logit(),
+            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)),
         );
         let serialized = serde_json::to_vec(&payload).expect("serialize flexible-link payload");
         let payload: FittedModelPayload =
@@ -2976,7 +2976,7 @@ mod standard_payload_penalty_topology_tests {
         assert_eq!(payload.family, "binomial-logit");
         assert_eq!(
             payload.family_state.likelihood(),
-            LikelihoodSpec::binomial_logit(),
+            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)),
         );
         let fit = payload
             .fit_result
