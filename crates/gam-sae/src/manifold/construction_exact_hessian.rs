@@ -239,25 +239,12 @@ impl ArrowMetric<'_> {
 /// in hand, the WHOLE path costs one diagonal pass per point — no
 /// refactorization, no second operator apply.
 ///
-/// With `rhs = −g` the linear model of the stationarity residual at the trial
-/// point is exactly
-///
-/// ```text
-///   g + A Δ(ν) = Σ_i u_i c_i ν/(λ_i² + ν),      c_i = u_iᵀ g
-/// ```
-///
-/// so `model_residual` below is CLOSED FORM, not an estimate. The caller prices
-/// that residual in the currency its convergence gate owns; this lower-level
-/// spectral object deliberately does not attach an ambient or quotient scalar
-/// merit to it.
+/// The caller prices the trial point in the currency its convergence gate
+/// owns (#2080: the penalized objective); this lower-level spectral object
+/// deliberately does not attach an ambient or quotient scalar merit to it.
 pub(crate) struct DampedResidualStep {
     /// `Δ(ν)`.
     pub(crate) step: SaeArrowVector,
-    /// `g + AΔ(ν)` — the linear model's residual AT the trial point, in the
-    /// same arrow layout as the residual handed in. The caller measures it in
-    /// whatever currency its gate is denominated in; this type stays ignorant of
-    /// which one that is.
-    pub(crate) model_residual: SaeArrowVector,
     /// `‖Δ(ν)‖²`.
     pub(crate) step_norm_sq: f64,
     /// Directions whose damped denominator cleared the null band.
@@ -333,83 +320,11 @@ impl ExactHessianSpectralBlock {
         (largest > 0.0 && smallest.is_finite()).then_some((smallest, largest))
     }
 
-    /// One point of the damped residual path — see [`DampedResidualStep`].
-    ///
-    /// `residual` is the stationarity residual `g`; the step returned solves the
-    /// damped system against `−g`, i.e. it is a descent step, and the modeled
-    /// residual is reported for `g` itself so the caller can price it in the
-    /// same merit as its convergence gate.
-    /// A direction whose damped denominator `λ² + ν` is inside the null band
-    /// (`≤ rank_floor²`) contributes nothing to the step and its whole
-    /// coefficient to the model residual: at `ν = 0` that is exactly the
-    /// pseudoinverse's own classification.
-    fn damped_residual_step(
-        &self,
-        residual: &SaeArrowVector,
-        nu: f64,
-    ) -> Result<DampedResidualStep, String> {
-        let total_t = residual.t.len();
-        let dim = total_t + residual.beta.len();
-        let spectral_dim = self.eigenvalues.len();
-        if self.eigenvectors.dim() != (dim, spectral_dim) || spectral_dim != dim {
-            return Err(format!(
-                "damped residual step: eigenvectors {:?} and spectrum {spectral_dim} do not \
-                 match residual dimension {dim}",
-                self.eigenvectors.dim(),
-            ));
-        }
-        if !(nu.is_finite() && nu >= 0.0) {
-            return Err(format!(
-                "damped residual step: damping must be finite and ≥ 0; got {nu}"
-            ));
-        }
-        let mut flat = Array1::<f64>::zeros(dim);
-        flat.slice_mut(s![..total_t]).assign(&residual.t);
-        flat.slice_mut(s![total_t..]).assign(&residual.beta);
-        if !flat.iter().all(|value| value.is_finite()) {
-            return Err("damped residual step: residual contains a non-finite value".to_string());
-        }
-        let coefficients = self.eigenvectors.t().dot(&flat);
-        let mut step_coefficients = Array1::<f64>::zeros(spectral_dim);
-        let mut model_coefficients = Array1::<f64>::zeros(spectral_dim);
-        let mut retained_rank = 0usize;
-        for index in 0..spectral_dim {
-            let lambda = self.eigenvalues[index];
-            let floor = self.rank_floor(index);
-            let null_band = floor * floor;
-            let denominator = lambda * lambda + nu;
-            let coefficient = coefficients[index];
-            let surviving = if denominator > null_band {
-                // Δ solves `(A² + ν) Δ = −A g` in this direction.
-                step_coefficients[index] = -lambda * coefficient / denominator;
-                retained_rank += 1;
-                coefficient * nu / denominator
-            } else {
-                coefficient
-            };
-            model_coefficients[index] = surviving;
-        }
-        let solution = self.eigenvectors.dot(&step_coefficients);
-        let model = self.eigenvectors.dot(&model_coefficients);
-        Ok(DampedResidualStep {
-            step: SaeArrowVector {
-                t: solution.slice(s![..total_t]).to_owned(),
-                beta: solution.slice(s![total_t..]).to_owned(),
-            },
-            model_residual: SaeArrowVector {
-                t: model.slice(s![..total_t]).to_owned(),
-                beta: model.slice(s![total_t..]).to_owned(),
-            },
-            step_norm_sq: solution.dot(&solution),
-            retained_rank,
-        })
-    }
-
     /// A spectrally scaled descent step for the scalar objective whose gradient
-    /// is `residual`.  Unlike `damped_residual_step`, this uses `|A|` rather
-    /// than `A`: every retained component therefore has negative directional
-    /// derivative even when the stationarity operator is indefinite.  `nu`
-    /// has the same squared-curvature units as the residual damping ladder.
+    /// is `residual`.  This uses `|A|` rather than `A`: every retained
+    /// component therefore has negative directional derivative even when the
+    /// stationarity operator is indefinite.  `nu` has the same
+    /// squared-curvature units as the damping ladder.
     fn damped_objective_step(
         &self,
         residual: &SaeArrowVector,
@@ -442,15 +357,10 @@ impl ExactHessianSpectralBlock {
             }
         }
         let solution = self.eigenvectors.dot(&step_coefficients);
-        let model = &flat + &self.operator.dot(&solution);
         Ok(DampedResidualStep {
             step: SaeArrowVector {
                 t: solution.slice(s![..total_t]).to_owned(),
                 beta: solution.slice(s![total_t..]).to_owned(),
-            },
-            model_residual: SaeArrowVector {
-                t: model.slice(s![..total_t]).to_owned(),
-                beta: model.slice(s![total_t..]).to_owned(),
             },
             step_norm_sq: solution.dot(&solution),
             retained_rank,
@@ -1220,38 +1130,6 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    /// #1418: apply the EXACT stationarity-Jacobian correction `ΔC·v = (A − B)·v`
-    /// to a joint `(t, β)` vector, matrix-free via row-local work and ordered
-    /// prior column reductions.
-    ///
-    /// `A = ∇²_θθ L` is the true inner-fit Hessian; `B` is the assembled
-    /// evidence/Newton operator the solver factors. They differ only by the four
-    /// curvature substitutions the assembly makes for stability:
-    ///   1. data: `B` uses Gauss-Newton `J̃J̃ᵀ`, dropping the residual curvature
-    ///      `R[a,b] = Σ_out r_out·∂²f_out/∂θ_a∂θ_b` (t–t via `jets.second`, t–β via
-    ///      `jets.beta_deriv`; the decoder is linear in β so the β–β block is 0);
-    ///   2. softmax: `B` uses the Gershgorin majorizer `D = diag(Σ_j|H_kj|)`,
-    ///      dropping `H_entropy − D` (#1419);
-    ///   3. periodic ARD: `B` uses `max(V'',0)`, dropping the negative part
-    ///      `min(V'',0)` (the indefinite tail past a quarter period).
-    ///   4. ordered Beta--Bernoulli: `B` uses the positive row-local diagonal
-    ///      majorizer and drops both the exact negative active-mass rank-one term
-    ///      and every nonpositive row-local diagonal contribution.
-    /// `ΔC` is the sum of exactly these four deltas, each built from the same
-    /// jets / penalty curvatures the assembly and the θ-adjoint use, so
-    /// `A = B + ΔC` is the one true Hessian. Exact on BOTH the isotropic and the
-    /// whitened-metric paths: the data fit is `½ r_nᵀ M_n r_n`, so the residual
-    /// curvature is `Σ_out (M_n r_n)_out·∂²f_out/∂θ_a∂θ_b` — contract the
-    /// metric-applied √w-scaled residual `error_metric = √w·M_n r_n` (the SAME
-    /// quantity the assembly's β-tier gradient uses) against the RAW second jets
-    /// `jets.second`/`jets.beta_deriv` (the same raw-jet convention the whole
-    /// θ-adjoint and the Gauss-Newton `htt = J̃J̃ᵀ = J M Jᵀ` assembly use). On the
-    /// isotropic path `M_n = I` so `error_metric = √w·r` and `J M Jᵀ = JJᵀ`,
-    /// recovering the plain case. The softmax, ordered Beta--Bernoulli, and ARD
-    /// deltas are logit/coord-space prior curvatures and carry no output metric,
-    /// so they are path-independent.
-    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by the exact-Hessian test target"))]
-
     /// `Self::apply_exact_hessian_minus_b` against a β-tier decoder-prior plan
     /// prepared once for this state.
     ///
@@ -1968,42 +1846,6 @@ impl SaeManifoldTerm {
         self.materialize_exact_stationarity_geometry(rho, target, cache)?
             .solve_stationarity(rhs)
     }
-
-    /// #2828 item 2 / #2515 — the matrix-free apply of the SAME exact
-    /// stationarity Hessian `A = B_raw + ΔC` the dense route materializes.
-    ///
-    /// The wide-border path reaches its majorizer through
-    /// [`matrix_free_arrow_operator_apply`], which applies the CONDITIONED row
-    /// factor — `Φ(B_raw)`, in which every spectrally deflated per-row direction
-    /// is pinned to UNIT curvature so its `log 1 = 0` is ρ-independent. That
-    /// pinning is a solve / log-determinant policy, not part of the objective
-    /// Hessian, and adding `ΔC` on top of it builds `Φ(B_raw) + ΔC` — the
-    /// operator [`apply_raw_cached_arrow_hessian`]'s own doc names as the
-    /// mistake, and precisely what this seam built until #2828.
-    ///
-    /// The difference is not a tolerance. Measured at the #2330 Patch-D
-    /// converged mode, where the exact `A` carries six eigenvalues near `2.7e-8`
-    /// against a spectral norm of `3.0e1`:
-    ///
-    /// * the two operators differed by `1.0` in ABSOLUTE terms on the pinned
-    ///   columns (`Φ(B_raw)` reads 1 where `B_raw` reads `1.7e-7`);
-    /// * on a right-hand side aligned with the smallest eigendirection the dense
-    ///   route returned the true `A⁻¹` response (`‖x‖ = 3.69e7`, relative
-    ///   residual `4.6e-9`) while this route returned `‖x‖ = 8.9e2` whose
-    ///   residual was `‖Ax − rhs‖ = ‖rhs‖` — no residual reduction at all;
-    /// * and it was SILENT, because the `μ` deflation detector inspects the
-    ///   SOLUTION, and a solution that never acquired the near-null component
-    ///   has none to detect: it read `μ = 0.99` and accepted.
-    ///
-    /// [`Self::solve_exact_stationarity`] cannot be reused here, and neither can
-    /// `apply_raw_cached_arrow_hessian`: both need `cache.schur_factor`, the
-    /// dense `K × K` Cholesky the wide-border path does not build. What CAN be
-    /// reused is the row-local `Φ(B_raw) → B_raw` correction
-    /// ([`add_raw_row_deflation_correction`]), and that is the entire
-    /// difference — the border half of both applies is already raw, because its
-    /// Schur term and its `H_βt Φ(B_tt)⁻¹ H_tβ` restoration share one conditioned
-    /// factor and cancel algebraically.
-    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by the matrix-free Hessian test target"))]
 
     /// `Self::apply_exact_hessian_matrix_free` against a β-tier plan prepared
     /// once — the form the Krylov solve installs, so the plan is built once per
