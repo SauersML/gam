@@ -2310,9 +2310,14 @@ mod tests {
         // The token is memoized, and the fix depends on it: an identity that
         // moved between two reads in one process would downgrade the process's
         // own terminus and silently disable resume everywhere.
-        assert_eq!(producer_identity(), producer_identity());
+        let first = producer_identity();
+        let second = producer_identity();
         assert!(
-            !producer_identity().is_empty(),
+            std::ptr::eq(first, second),
+            "the OnceLock must return the same allocation, not merely equal text"
+        );
+        assert!(
+            !first.is_empty(),
             "an empty token would collide with the legacy serde default"
         );
     }

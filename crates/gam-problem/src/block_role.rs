@@ -66,8 +66,7 @@ mod tests {
     }
 
     #[test]
-    fn eq_reflexive() {
-        assert_eq!(BlockRole::Mean, BlockRole::Mean);
+    fn distinct_roles_are_not_equal() {
         assert_ne!(BlockRole::Mean, BlockRole::Scale);
     }
 }
