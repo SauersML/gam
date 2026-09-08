@@ -46,3 +46,37 @@ their scores do not establish completion of the current public API run.
 No original quality threshold, model specification, fold assignment, or
 convergence tolerance was changed. No global significance claim follows from
 this partial diagnostic.
+
+## Follow-up source audit
+
+The later issue update reports all five native fits in 3.340 seconds. Its raw
+MSI log, `/projects/standard/hsiehph/sauer354/issue1561-binomial-holdout.log`,
+records each fold's successful fit, EDF, and rho. This does not supersede the
+partial Python run or establish a measured Python-overhead ratio: an exact
+native executable hash and its complete dependency/source provenance were not
+present in the retained seven-file `source-sha256.txt` receipt.
+
+The configuration review found no different statistical option to explain the
+gap. Python's omitted link resolves to binomial logit, matching the native
+example's explicit `link="logit"`. Both leave Firth, flexible links, dimension
+scaling, and adaptive regularization at their common defaults. JSON parsing
+starts from `FitConfig::default()`. Python's table-kind field changes saved
+metadata only. `fit_formula_to_payload` and `fit_from_formula` share the standard
+fit driver.
+
+The reviewed family resolution, configuration resolution, and payload service
+files match the actual 7112 build manifest exactly:
+
+| File under `crates/gam-models/src/` | SHA-256 |
+| --- | --- |
+| `fit_orchestration/materialize/family.rs` | `e8a126f9d40c53b932a4393085700766a5ea2e7f1a41828f5d0964def885c059` |
+| `fit_orchestration/fit_config.rs` | `a3bc5b691e02e1b714c46af72fc0590ce7a29621b13e831e4f1743248a94fe6b` |
+| `inference/model_payload_builders.rs` | `43dbce57c689ad733efcaa2adf63491cf323d5186c75f2f43b6cb4e1e6bb2f9a` |
+
+The Python log shows repeated BFGS seed searches and stationarity refusals;
+the elapsed time cannot be assigned to table conversion or serialization from
+these observations. A useful next comparison must run both entry points
+against the same compiled dependency graph, identical encoded rows and thread
+allocation, and retain terminal rho/EDF and source provenance. No speculative
+configuration change was made. MSI compute nodes were unavailable during this
+follow-up; no builds or test computations ran on the login node.
