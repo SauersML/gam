@@ -1337,9 +1337,10 @@ fn frame_landed_norm(frame: &Array2<f64>, delta: ArrayView1<'_, f64>) -> f64 {
 /// latent `axis` over `doses`, comparing the on-manifold group action against a
 /// matched-per-row-norm flat-direction control (gam#2234 E2).
 ///
-/// For each dose `δ` the on-manifold ambient move is the fitted group-action
-/// delta [`SaeManifoldTerm::steer_rows`] (chart step `δ` on `axis`, gate held
-/// fixed). The flat control replays the SAME per-row move NORM along one fixed
+/// For each dose `δ` the on-manifold ambient move advances the atom's
+/// canonical, unit-speed chart coordinate by `δ` (gate held fixed). The raw
+/// fitted parameter is gauge-arbitrary and is deliberately not exposed as the
+/// dose axis. The flat control replays the SAME per-row move NORM along one fixed
 /// ambient direction `w` — the atom's mean decode-tangent direction along `axis`,
 /// the manifold analog of a flat SAE's single decoder column. Each move is
 /// decomposed against every atom's local decode-tangent frame at its fitted
@@ -1371,6 +1372,12 @@ pub fn collateral_curve(
     if axis >= d_k {
         return Err(format!(
             "collateral_curve: axis {axis} out of range for atom {atom_k} latent_dim {d_k}"
+        ));
+    }
+    if d_k != 1 || axis != 0 {
+        return Err(format!(
+            "collateral_curve: intrinsic doses require a one-dimensional canonical chart; \
+             atom {atom_k} has latent_dim {d_k} and axis {axis}"
         ));
     }
     if doses.is_empty() {
@@ -1486,9 +1493,7 @@ pub fn collateral_curve(
     let mut manifold_pts = Vec::with_capacity(doses.len());
     let mut flat_pts = Vec::with_capacity(doses.len());
     for &dose in doses {
-        let mut step = Array1::<f64>::zeros(d_k);
-        step[axis] = dose;
-        let on_field = model.steer_rows(atom_k, &rows, step.view())?;
+        let on_field = steer_rows_unit_speed(model, atom_k, &rows, dose)?.delta;
 
         // Matched control: same per-row move NORM, along the fixed direction w.
         let mut flat_field = Array2::<f64>::zeros((n, p));
