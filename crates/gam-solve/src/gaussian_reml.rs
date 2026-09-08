@@ -926,6 +926,13 @@ pub struct GaussianRemlEigenCache {
     pub nullity: usize,
 }
 
+impl GaussianRemlEigenCache {
+    /// Return the eigenvalue under the same range classification used by REML.
+    pub(crate) fn classified_penalty_eigenvalue(&self, index: usize) -> f64 {
+        PenaltyRangeSpectrum::of(self).get(index)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct GaussianRemlWarmStart {
     pub lambda: Option<f64>,
@@ -4271,7 +4278,7 @@ fn gaussian_reml_eigen_cache_from_xtwx(
 /// chol(X'WX, lower)`. Used by the batched K-way fit path so a single
 /// `cusolverDnDpotrfBatched` call factors all K matrices, then each cache
 /// finishes per-fit without re-doing the Cholesky.
-fn gaussian_reml_eigen_cache_from_lower(
+pub(crate) fn gaussian_reml_eigen_cache_from_lower(
     lower: Array2<f64>,
     penalty: ArrayView2<'_, f64>,
     nullspace_dim: Option<usize>,

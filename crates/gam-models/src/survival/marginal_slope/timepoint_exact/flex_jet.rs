@@ -2032,10 +2032,9 @@ fn base_moment_jets<J: FlexJet>(
 ///        + 4G_2^[1] d_1³ + G_3 d_1⁴`. So a 4th-ORDER-only crossing-edge mismatch
 /// is NOT uniquely the `g_zzz δ⁴` term — it can equally be a wrong `z_4` (edge
 /// 4th deriv) or a coefficient-edge CROSS channel (`G_1^[2] d_1²`, `G_2^[1] d_1³`,
-/// `G_1 d_2²`). NOTE: the `n/z` `g`-stack form has a removable singularity at
-/// `z_E0=0` (special-cased); the singularity-free polynomial form
+/// `G_1 d_2²`). Differentiate the polynomial without dividing by the edge:
 /// `g_z = e^{−q}(n z^{n−1} − q_z z^n)`, `g_zz = e^{−q}(n(n−1)z^{n−2} − 2n q_z z^{n−1}
-/// + (q_z²−q_zz)z^n)`, … is preferable when `z_E0` may be near 0.
+/// + (q_z²−q_zz)z^n)`, … remain regular at and near `z_E0=0`.
 fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> Option<J> {
     if !finite {
         return None;
@@ -2052,16 +2051,20 @@ fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> O
         .mul(&zc)
         .add(&c[0]);
     // g = zⁿ e^{−q}.
-    let z_pow = {
-        let mut zk = const_jet_like(z_e, 1.0);
-        for _ in 0..n {
-            zk = zk.mul(&zc);
+    // Differentiate the polynomial itself. Dividing by z and then multiplying
+    // by z^n loses the nonzero derivatives at z=0 and overflows near zero.
+    let polynomial_derivative = |order: usize| -> f64 {
+        if n < order {
+            0.0
+        } else {
+            let falling = (0..order).fold(1.0, |product, k| product * (n - k) as f64);
+            falling * z0.powi((n - order) as i32)
         }
-        zk
     };
+    let p0 = polynomial_derivative(0);
     let q = zc.mul(&zc).add(&eta.mul(&eta)).scale(0.5);
     let w = exp_jet(&q.scale(-1.0));
-    let g = z_pow.mul(&w);
+    let g = w.scale(p0);
     let delta = tangent_jet(z_e);
     let mut sliver = g.mul(&delta);
     if J::ORDER == 1 {
@@ -2075,30 +2078,20 @@ fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> O
         .mul(&zc)
         .add(&c[1]); // c1 + 2c2 z + 3c3 z²
     let q_z = zc.add(&eta.mul(&eta_z));
-    // n/z^k constants (z held at the fixed edge); 0 when n=0 or z0=0.
-    let nz = |power: i32| -> J {
-        if n == 0 || z0 == 0.0 {
-            const_jet_like(z_e, 0.0)
-        } else {
-            const_jet_like(z_e, n as f64 / z0.powi(power))
-        }
-    };
-    // g_z/g = a1 = n/z − q_z.
-    let a1 = nz(1).sub(&q_z);
-    let g_z = a1.mul(&g);
+    let p1 = polynomial_derivative(1);
+    let g_z = add_const(&q_z.scale(-p0), p1).mul(&w);
     let d2 = delta.mul(&delta);
     sliver = sliver.add(&g_z.mul(&d2).scale(0.5));
     if J::ORDER == 2 {
         return Some(sliver);
     }
 
-    // η_zz, q_zz and a1' first contribute through the δ³ term.
+    // η_zz and q_zz first contribute through the δ³ term.
     let eta_zz = c[2].scale(2.0).add(&c[3].scale(6.0).mul(&zc)); // 2c2 + 6c3 z
     let q_zz = add_const(&eta_z.mul(&eta_z).add(&eta.mul(&eta_zz)), 1.0);
-    let a1p = nz(2).scale(-1.0).sub(&q_zz);
-    // g_zz/g = b2 = a1' + a1².
-    let b2 = a1p.add(&a1.mul(&a1));
-    let g_zz = b2.mul(&g);
+    let p2 = polynomial_derivative(2);
+    let weight_second = q_z.mul(&q_z).sub(&q_zz);
+    let g_zz = add_const(&weight_second.scale(p0).sub(&q_z.scale(2.0 * p1)), p2).mul(&w);
     let d3 = d2.mul(&delta);
     sliver = sliver.add(&g_zz.mul(&d3).scale(1.0 / 6.0));
     if J::ORDER == 3 {
@@ -2113,10 +2106,16 @@ fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> O
     );
     let eta_zzz = c[3].scale(6.0); // 6c3
     let q_zzz = eta_z.scale(3.0).mul(&eta_zz).add(&eta.mul(&eta_zzz));
-    let a1pp = nz(3).scale(2.0).sub(&q_zzz);
-    // g_zzz/g = b2' + a1 b2, b2' = a1'' + 2 a1 a1'.
-    let b2p = a1pp.add(&a1.mul(&a1p).scale(2.0));
-    let g_zzz = b2p.add(&a1.mul(&b2)).mul(&g);
+    let p3 = polynomial_derivative(3);
+    let weight_third = q_z.mul(&q_zz.scale(3.0).sub(&q_z.mul(&q_z))).sub(&q_zzz);
+    let g_zzz = add_const(
+        &weight_third
+            .scale(p0)
+            .add(&weight_second.scale(3.0 * p1))
+            .sub(&q_z.scale(3.0 * p2)),
+        p3,
+    )
+    .mul(&w);
     let d4 = d3.mul(&delta);
     Some(sliver.add(&g_zzz.mul(&d4).scale(1.0 / 24.0)))
 }
@@ -3830,8 +3829,62 @@ use gam_math::nested_dual::{Dual2, JetField};
 #[cfg(test)]
 mod moment_engine_tests {
     use super::*;
-    use crate::cubic_cell_kernel::{DenestedCubicCell};
+    use crate::cubic_cell_kernel::DenestedCubicCell;
     use crate::marginal_slope_shared::eval_coeff4_at;
+
+    #[test]
+    fn moving_edge_monomial_flux_is_regular_at_zero_all_orders_932() {
+        // With eta=0 the integrand is z^n exp(-z²/2). Its first three
+        // derivatives are independent Hermite-polynomial witnesses for the
+        // sliver's derivatives through fourth order. Two nested second-order
+        // axes also check every mixed channel, not only the top derivative.
+        for z in [0.0_f64, 1e-120, -1e-120, 0.25, -0.7] {
+            let zero = Jet2::from_parts(0.0, &[0.0], &[0.0]);
+            let edge = Dual2 {
+                v: Jet2::primary(z, 0, 1),
+                g: Jet2::from_parts(1.0, &[0.0], &[0.0]),
+                h: zero,
+            };
+            let coefficients = std::array::from_fn(|_| const_jet_like(&edge, 0.0));
+            for n in 0..=4_i32 {
+                let flux = edge_sliver_jet(n as usize, &coefficients, &edge, true)
+                    .expect("finite moving boundary");
+                let weight = (-0.5 * z * z).exp();
+                let leading = |order: i32| {
+                    if n < order {
+                        0.0
+                    } else {
+                        (0..order).fold(1.0, |value, k| value * (n - k) as f64) * z.powi(n - order)
+                    }
+                };
+                let expected = [
+                    z.powi(n) * weight,
+                    (leading(1) - z.powi(n + 1)) * weight,
+                    (leading(2) - (2 * n + 1) as f64 * z.powi(n) + z.powi(n + 2)) * weight,
+                    (leading(3) - 3.0 * n as f64 * leading(1) + (3 * n + 3) as f64 * z.powi(n + 1)
+                        - z.powi(n + 3))
+                        * weight,
+                ];
+                for (actual, wanted) in [
+                    (flux.v.v, 0.0),
+                    (flux.v.g[0], expected[0]),
+                    (flux.v.h[0], expected[1]),
+                    (flux.g.v, expected[0]),
+                    (flux.g.g[0], expected[1]),
+                    (flux.g.h[0], expected[2]),
+                    (flux.h.v, expected[1]),
+                    (flux.h.g[0], expected[2]),
+                    (flux.h.h[0], expected[3]),
+                ] {
+                    let tolerance = 128.0 * f64::EPSILON * (1.0 + wanted.abs());
+                    assert!(
+                        actual.is_finite() && (actual - wanted).abs() <= tolerance,
+                        "n={n}, z={z}: actual={actual}, expected={wanted}, bound={tolerance}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn dual2_flexjet_scales_runtime_channels_by_total_homogeneous_order() {

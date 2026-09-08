@@ -89,8 +89,9 @@ all five derived gates passed. Full-third measured **1.060940**, wins **1.00**,
 resolution **0.0047**, against the strengthened hand opponent. The other rigid
 cells measured 1.024296 / 1.145698 / 1.178569 / 1.343110 for order two,
 contracted third, contracted fourth, and full fourth. SLS macro V/G/H measured
-1.024316. The remaining package jobs are not yet a completed whole-population
-verdict. Attempts to connect to acn116 returned SSH status
+1.024316. All package jobs in that run have now completed successfully. This
+whole-run verdict predates the newly enforced BMS flex gate and moving-edge
+repair. Attempts to connect to acn116 returned SSH status
 255 before starting the test; there is no second-host measurement to report.
 
 The BMS flex candidate is being validated on MSI in the existing
@@ -152,3 +153,22 @@ coarse/fine FD estimates were -0.16359 and +12.167. The test printed a skip and
 passed. This remains a counterexample to complete fourth-order verification;
 changing the test name and removing the old hand producer did not resolve it.
 Log: `.buildd/issue932-block10-before.log`.
+
+The moving-edge primitive had a separate concrete defect: it formed derivatives
+of `z^n exp(-q)` with `n/z`, replacing that ratio by zero at `z=0`. For example,
+at `n=1`, `eta=0`, the second derivative of the sliver at zero is 1, whereas
+that implementation returned 0. Near zero, the inverse powers also overflow.
+The repaired primitive differentiates the monomial without division and uses
+the product rule with the exponential derivative stack. The new independent
+Hermite-polynomial witness checks every nested derivative channel through
+fourth order for n=0..4, at zero, ±1e-120, and ordinary positive/negative edges.
+It passed on MSI, along with four existing moment FD witnesses and all **71**
+issue-932 model correctness tests. Logs: `.buildd/issue932-edge-polynomial.log`,
+`.buildd/issue932-edge-moment-witnesses.log`, and
+`.buildd/issue932-edge-model-witnesses.log`. The model package was unoptimized;
+release performance evidence for this repair is still pending.
+
+The Block10 discrepancy remains after the edge repair, with the same skipped
+entries (`.buildd/issue932-block10-edge-polynomial.log`). The local candidate
+turns those omissions into assertions and checks zero-direction outputs
+against exact zero; resolving its numerical counterexample is still required.

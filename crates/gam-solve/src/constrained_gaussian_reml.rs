@@ -20,7 +20,8 @@ use crate::active_set::{
 };
 use crate::estimate::EstimationError;
 use crate::gaussian_reml::{
-    GaussianRemlBackwardResult, gaussian_reml_multi_closed_form_with_cache,
+    GaussianRemlBackwardResult, GaussianRemlEigenCache,
+    gaussian_reml_multi_closed_form_with_cache,
 };
 use faer::Side;
 use gam_linalg::faer_ndarray::{
@@ -221,10 +222,11 @@ pub fn constrained_gaussian_reml_forward(
     loop {
         let lambda = gam_problem::checked_exp_log_strength(rho)
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-        let hessian = &gram + &(penalty.clone() * lambda);
-        let (qp_beta, qp_active) = solve_quadratic_with_linear_constraints(
-            &hessian,
+        let (qp_beta, qp_active) = solve_spectral_constrained_quadratic(
+            &unconstrained.cache,
+            &gram,
             &rhs,
+            lambda,
             &beta_start,
             constraints,
             Some(&active_hint),
@@ -255,11 +257,12 @@ pub fn constrained_gaussian_reml_forward(
         )?;
         let accepted = optimize_affine_face(&profile, rho)?;
 
-        let accepted_hessian = &gram + &(penalty.clone() * accepted.lambda);
         let accepted_beta = accepted.beta.column(0).to_owned();
-        let (qp_check, next_hint) = solve_quadratic_with_linear_constraints(
-            &accepted_hessian,
+        let (qp_check, next_hint) = solve_spectral_constrained_quadratic(
+            &unconstrained.cache,
+            &gram,
             &rhs,
+            accepted.lambda,
             &accepted_beta,
             constraints,
             Some(&qp_active),
@@ -297,6 +300,46 @@ pub fn constrained_gaussian_reml_forward(
         rho = accepted.rho;
         active_hint = next_hint;
     }
+}
+
+/// Solve the KKT problem in the same data-whitened penalty modes as REML.
+/// With `BᵀGB = I` and `BᵀSB = diag(δ)`, the map
+/// `β = B diag((1 + λδ)^(-1/2)) u` gives an identity Hessian. This keeps the
+/// active-face search and its terminal audit resolved even when the penalty
+/// dominates the data by more than the natural coordinates can represent.
+fn solve_spectral_constrained_quadratic(
+    cache: &GaussianRemlEigenCache,
+    gram: &Array2<f64>,
+    rhs: &Array1<f64>,
+    lambda: f64,
+    beta_start: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    warm_active_set: Option<&[usize]>,
+) -> Result<(Array1<f64>, Vec<usize>), EstimationError> {
+    let p = rhs.len();
+    let mut coefficient_map = cache.coefficient_basis.clone();
+    // B⁻¹ = BᵀG: no inverse of the ill-conditioned penalized Hessian is formed.
+    let mut transformed_start = cache.coefficient_basis.t().dot(&gram.dot(beta_start));
+    for index in 0..p {
+        let scale = (1.0 + lambda * cache.classified_penalty_eigenvalue(index)).sqrt();
+        coefficient_map
+            .column_mut(index)
+            .mapv_inplace(|value| value / scale);
+        transformed_start[index] *= scale;
+    }
+    let transformed_constraints = LinearInequalityConstraints::new(
+        constraints.a.dot(&coefficient_map),
+        constraints.b.clone(),
+    )
+    .map_err(EstimationError::ParameterConstraintViolation)?;
+    let (transformed_beta, active) = solve_quadratic_with_linear_constraints(
+        &Array2::eye(p),
+        &coefficient_map.t().dot(rhs),
+        &transformed_start,
+        &transformed_constraints,
+        warm_active_set,
+    )?;
+    Ok((coefficient_map.dot(&transformed_beta), active))
 }
 
 fn validate_forward_problem(
@@ -1426,6 +1469,46 @@ mod tests {
             (analytic - numerical).abs() <= tolerance,
             "{label}: analytic={analytic:.12e}, numerical={numerical:.12e}, tolerance={tolerance:.3e}"
         );
+    }
+
+    #[test]
+    fn constrained_kkt_solve_preserves_data_curvature_below_a_large_rotated_penalty() {
+        let gram = Array2::eye(3);
+        let root = array![[1.0, -1.0, 0.5]];
+        let penalty = root.t().dot(&root);
+        // G = I is already its own Cholesky factor. Construct the production
+        // cache directly so this oracle also covers classification of its raw
+        // penalty spectrum, independently of the affine-profile machinery.
+        let cache = crate::gaussian_reml::gaussian_reml_eigen_cache_from_lower(
+            gram.clone(), penalty.view(), None, 0,
+        )
+        .unwrap();
+        let constraints =
+            LinearInequalityConstraints::new(array![[0.0, 0.0, 1.0]], array![0.1]).unwrap();
+        for rho in [0.0_f64, 30.0, 45.0] {
+            let lambda = rho.exp();
+            let (beta, active) = solve_spectral_constrained_quadratic(
+                &cache,
+                &gram,
+                &array![0.0, 0.0, -1.0],
+                lambda,
+                &array![0.0, 0.0, 0.1],
+                &constraints,
+                Some(&[0]),
+            )
+            .unwrap();
+            // On β₂ = 0.1, the exact normal equations give β₀ = -β₁
+            // and (1 + 2λ) β₀ = -0.05λ. No spectral solver is used by
+            // this oracle, and the natural Hessian loses its null curvature
+            // entirely at the final strength.
+            let first = -0.05 / (2.0 + 1.0 / lambda);
+            let expected = array![first, -first, 0.1];
+            assert_eq!(active, vec![0]);
+            assert!(
+                (&beta - &expected).iter().all(|error| error.abs() < 1e-10),
+                "rho={rho}: beta={beta:?}, expected={expected:?}",
+            );
+        }
     }
 
     #[test]

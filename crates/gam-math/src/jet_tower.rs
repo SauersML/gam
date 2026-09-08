@@ -1059,9 +1059,9 @@ pub fn ln_gamma_derivative_stack(x: f64) -> [f64; 5] {
     [
         statrs::function::gamma::ln_gamma(x),
         digamma_positive(x),
-        polygamma_positive(1, x),
-        polygamma_positive(2, x),
-        polygamma_positive(3, x),
+        polygamma_positive::<1>(x),
+        polygamma_positive::<2>(x),
+        polygamma_positive::<3>(x),
     ]
 }
 
@@ -1069,17 +1069,26 @@ pub fn ln_gamma_derivative_stack_order2(x: f64) -> [f64; 3] {
     [
         statrs::function::gamma::ln_gamma(x),
         digamma_positive(x),
-        polygamma_positive(1, x),
+        polygamma_positive::<1>(x),
+    ]
+}
+
+pub fn ln_gamma_derivative_stack_order3(x: f64) -> [f64; 4] {
+    [
+        statrs::function::gamma::ln_gamma(x),
+        digamma_positive(x),
+        polygamma_positive::<1>(x),
+        polygamma_positive::<2>(x),
     ]
 }
 
 pub fn digamma_derivative_stack(x: f64) -> [f64; 5] {
     [
         digamma_positive(x),
-        polygamma_positive(1, x),
-        polygamma_positive(2, x),
-        polygamma_positive(3, x),
-        polygamma_positive(4, x),
+        polygamma_positive::<1>(x),
+        polygamma_positive::<2>(x),
+        polygamma_positive::<3>(x),
+        polygamma_positive::<4>(x),
     ]
 }
 
@@ -1095,14 +1104,14 @@ pub fn digamma(x: f64) -> f64 {
 }
 
 /// Scalar trigamma ψ′(x) for x>0. Bit-identical to
-/// `trigamma_derivative_stack(x)[0]` (both bottom out in `polygamma_positive(1,
-/// x)`), but evaluates ONLY ψ′ — the four higher polygammas (orders 2–5) the
+/// `trigamma_derivative_stack(x)[0]` (both use `polygamma_positive::<1>(x)`),
+/// but evaluates ONLY ψ′ — the four higher polygammas (orders 2–5) the
 /// `[f64; 5]` stack builds are discarded at a `[0]` consumer. Used by the
 /// dispersion-channel Fisher-information row kernels (NB2 `ψ′(θ)−ψ′(θ+μ)`, Beta
 /// `μψ′(μφ)−(1−μ)ψ′((1−μ)φ)`) which read the trigamma value alone.
 #[inline]
 pub fn trigamma(x: f64) -> f64 {
-    polygamma_positive(1, x)
+    polygamma_positive::<1>(x)
 }
 
 fn digamma_positive(mut x: f64) -> f64 {
@@ -1117,16 +1126,16 @@ fn digamma_positive(mut x: f64) -> f64 {
     acc + digamma_asymptotic(x)
 }
 
-fn polygamma_positive(order: usize, mut x: f64) -> f64 {
+fn polygamma_positive<const ORDER: usize>(mut x: f64) -> f64 {
     if !(x.is_finite() && x > 0.0) {
         return f64::NAN;
     }
     let mut acc = 0.0;
     while x < POLYGAMMA_ASYMPTOTIC_MIN_X {
-        acc += polygamma_recurrence_term(order, x);
+        acc += polygamma_recurrence_term::<ORDER>(x);
         x += 1.0;
     }
-    acc + polygamma_asymptotic(order, x)
+    acc + polygamma_asymptotic::<ORDER>(x)
 }
 
 const POLYGAMMA_ASYMPTOTIC_MIN_X: f64 = 20.0;
@@ -1143,53 +1152,68 @@ const BERNOULLI_EVEN: [(usize, f64); 10] = [
     (20, -174611.0 / 330.0),
 ];
 
-fn polygamma_recurrence_term(order: usize, x: f64) -> f64 {
-    let sign = if order % 2 == 1 { 1.0 } else { -1.0 };
-    sign * factorial(order)
-        / x.powi(i32::try_from(order + 1).expect("supported derivative order fits i32"))
+fn polygamma_recurrence_term<const ORDER: usize>(x: f64) -> f64 {
+    let coefficient = const {
+        let sign = if ORDER % 2 == 1 { 1.0 } else { -1.0 };
+        sign * factorial(ORDER)
+    };
+    coefficient / x.powi((ORDER + 1) as i32)
 }
 
 fn digamma_asymptotic(x: f64) -> f64 {
     let mut out = x.ln() - 0.5 / x;
     for (bernoulli_order, bernoulli) in BERNOULLI_EVEN {
-        out -= bernoulli
-            / (bernoulli_order as f64
-                * x.powi(i32::try_from(bernoulli_order).expect("Bernoulli order fits i32")));
+        out -= bernoulli / (bernoulli_order as f64 * x.powi(bernoulli_order as i32));
     }
     out
 }
 
-fn polygamma_asymptotic(order: usize, x: f64) -> f64 {
-    if !(1..=5).contains(&order) {
-        return f64::NAN;
-    }
+fn polygamma_asymptotic<const ORDER: usize>(x: f64) -> f64 {
+    const { assert!(ORDER >= 1 && ORDER <= 5) };
+    let (leading, half_term) = const {
+        let sign = if ORDER % 2 == 1 { 1.0 } else { -1.0 };
+        (sign * factorial(ORDER - 1), sign * factorial(ORDER))
+    };
+    let mut out =
+        leading / x.powi(ORDER as i32) + half_term / (2.0 * x.powi((ORDER + 1) as i32));
 
-    let order_factorial = factorial(order);
-    let leading_sign = if order % 2 == 1 { 1.0 } else { -1.0 };
-    let mut out = leading_sign * factorial(order - 1)
-        / x.powi(i32::try_from(order).expect("supported derivative order fits i32"))
-        + leading_sign * order_factorial
-            / (2.0
-                * x.powi(i32::try_from(order + 1).expect("supported derivative order fits i32")));
-
-    let bernoulli_sign = if order % 2 == 1 { 1.0 } else { -1.0 };
-    for (bernoulli_order, bernoulli) in BERNOULLI_EVEN {
-        let rising = rising_factorial(bernoulli_order, order);
-        out += bernoulli_sign * bernoulli * rising
-            / bernoulli_order as f64
-            / x.powi(
-                i32::try_from(bernoulli_order + order).expect("combined derivative order fits i32"),
-            );
+    // Derivative order and Bernoulli coefficients are fixed by the series.
+    // Build their factorial products once at compile time, including in dev
+    // builds: #2668's NB profile spent 13.53% of cycles in factorial alone.
+    let coefficients = const { polygamma_asymptotic_coefficients::<ORDER>() };
+    for (power, coefficient) in coefficients {
+        out += coefficient / x.powi(power);
     }
     out
 }
 
-fn factorial(n: usize) -> f64 {
-    (1..=n).fold(1.0, |acc, k| acc * k as f64)
+const fn polygamma_asymptotic_coefficients<const ORDER: usize>() -> [(i32, f64); 10] {
+    let sign = if ORDER % 2 == 1 { 1.0 } else { -1.0 };
+    let mut coefficients = [(0, 0.0); BERNOULLI_EVEN.len()];
+    let mut index = 0;
+    while index < BERNOULLI_EVEN.len() {
+        let (power, bernoulli) = BERNOULLI_EVEN[index];
+        coefficients[index] = (
+            (power + ORDER) as i32,
+            sign * bernoulli * rising_factorial(power, ORDER) / power as f64,
+        );
+        index += 1;
+    }
+    coefficients
 }
 
-fn rising_factorial(start: usize, len: usize) -> f64 {
-    (start..start + len).fold(1.0, |acc, k| acc * k as f64)
+const fn factorial(n: usize) -> f64 {
+    rising_factorial(1, n)
+}
+
+const fn rising_factorial(start: usize, len: usize) -> f64 {
+    let mut product = 1.0;
+    let mut offset = 0;
+    while offset < len {
+        product *= (start + offset) as f64;
+        offset += 1;
+    }
+    product
 }
 
 impl<const K: usize> std::ops::Add for Tower4<K> {
@@ -2185,12 +2209,14 @@ mod derivative_stack_tests {
 
     #[test]
     fn ln_gamma_derivative_stack_order2_is_prefix() {
-        for &x in &[0.5_f64, 1.0, 2.0, 5.0] {
+        for &x in &[1.0e-8_f64, 0.5, 1.0, 2.0, 5.0, 20.0, 1.0e8] {
             let full = ln_gamma_derivative_stack(x);
             let ord2 = ln_gamma_derivative_stack_order2(x);
+            let ord3 = ln_gamma_derivative_stack_order3(x);
             assert_eq!(ord2[0], full[0], "order2[0] != full[0] at x={x}");
             assert_eq!(ord2[1], full[1], "order2[1] != full[1] at x={x}");
             assert_eq!(ord2[2], full[2], "order2[2] != full[2] at x={x}");
+            assert_eq!(&ord3, &full[..4], "order3 prefix differs at x={x}");
         }
     }
 
