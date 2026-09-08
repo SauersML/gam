@@ -2524,6 +2524,12 @@ pub(crate) fn fit_binomial_mean_wiggle(
     let wiggle_log_lambdas = spec.wiggle_block.initial_log_lambdas.clone();
     let wiggle_beta_initial = spec.wiggle_block.initial_beta.clone();
     let eta_block_input = spec.eta_block.clone();
+    // The custom-family solver is family-agnostic, but the returned standard
+    // fit is still binomial with this resolved inverse link. Persist that
+    // authority at the producer so every caller retains the response scale
+    // after the joint mean/warp refit (issue #2748).
+    let likelihood_family = gam_spec::inverse_link_to_binomial_spec(&spec.link_kind)
+        .map_err(|err| err.to_string())?;
 
     let family = BinomialMeanWiggleFamily {
         y: spec.y,
@@ -2869,6 +2875,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
         .to_string()
     })?;
     let (mut fit, last_alias, frozen_source_beta, frozen_warp_design) = converged;
+    fit.likelihood_family = Some(likelihood_family);
     // Capture the mean coefficients whose linear predictor is the *frozen index*
     // `η̂` the warp basis `B(η̂)` was pinned at (#2141). The reported deviance is
     // evaluated with `q = X·β_saved + B(η̂)·β_w`, so `predict` must re-evaluate the
