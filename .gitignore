@@ -8,7 +8,6 @@ libbuild.rmeta
 /apply_*.py
 /scratch_*.log
 /error.log
-/build.sh
 /*.png
 __pycache__/
 bench/**/__pycache__/

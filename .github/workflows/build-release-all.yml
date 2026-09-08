@@ -19,7 +19,7 @@ env:
   # Content-addressed compiler cache shared across CI runs (GitHub Actions
   # backend). These release builds are the heaviest dep-graph compiles in the
   # repo, so warming sccache here is what makes every later run — and, via a
-  # shared SCCACHE_BUCKET and local Cargo caches — start warm instead of cold. sccache
+  # shared SCCACHE_BUCKET, local build.sh — start warm instead of cold. sccache
   # keys on flags too, so each matrix target keeps its own entries.
   # RUSTC_WRAPPER is set after the shared backend is reachable. Every target
   # measures compiler requests and cache health; cold misses seed future runs.
