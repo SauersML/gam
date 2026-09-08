@@ -38,7 +38,10 @@
 //! uses sequential block updates; the streaming trajectory is different.
 //!
 //! EV describes the pass's measured frames with their profiled γ. Proposed frames
-//! remain an uncertified checkpoint until another pass measures them. Finalize
+//! remain an uncertified checkpoint until a paired pass reroutes both proposal
+//! and baseline and profiles a gamma for each. Only a strict full-objective
+//! improvement commits; rejection retracts halfway along the same frame direction
+//! and cannot certify stationarity. Finalize
 //! requires EV, γ, projector closure and tangent stationarity and returns the exact measured frames,
 //! γ and EV; an EV coincidence alone never certifies an unmeasured proposal.
 
@@ -126,6 +129,31 @@ fn block_row_postings(codes: &[RowBlockCode], blocks: usize) -> Vec<Vec<(usize, 
     postings
 }
 
+fn profiled_scalar(old_gamma: f32, rss: f64, numerator: f64, denominator: f64) -> (f32, f64) {
+    let gamma = if denominator == 0.0 {
+        0.0
+    } else {
+        (numerator / denominator) as f32
+    };
+    let old = old_gamma as f64;
+    let new = gamma as f64;
+    let correction = (new - old) * ((new + old) * denominator - 2.0 * numerator);
+    (gamma, (rss + correction).max(0.0))
+}
+
+/// Grassmann retraction halfway between a rejected proposal and its baseline.
+/// Repeated rejection therefore backtracks on the same proposed direction;
+/// there is no user-selected damping constant or search box.
+fn bisect_frame_trial(baseline: &Array2<f32>, proposal: &Array2<f32>, b: usize) -> Array2<f32> {
+    let mut midpoint = (baseline + proposal) * 0.5;
+    for mut block in midpoint.axis_chunks_iter_mut(Axis(0), b) {
+        let mut owned = block.to_owned();
+        gram_schmidt_rows(&mut owned);
+        block.assign(&owned);
+    }
+    midpoint
+}
+
 /// Per-shard summary returned by [`BlockSparseStreamState::partial_fit`].
 #[derive(Clone, Copy, Debug)]
 pub struct BlockShardStats {
@@ -188,6 +216,22 @@ struct PendingBlockBirth {
     baseline_second: Vec<Array2<f64>>,
 }
 
+/// A frame refresh is not committed until a second, paired streaming pass has
+/// priced both the proposal and the frame set which produced it.  Routing is
+/// repeated for both dictionaries: fixed-support descent is not evidence of
+/// descent after the top-k map changes (#2825).
+struct PendingFrameTrial {
+    baseline_decoder: Array2<f32>,
+    baseline_gamma: f32,
+    proposed_decoder: Array2<f32>,
+    baseline_rss: f64,
+    baseline_gamma_num: f64,
+    baseline_gamma_den: f64,
+    baseline_rows: usize,
+    baseline_usage: Vec<usize>,
+    baseline_second: Vec<Array2<f64>>,
+}
+
 /// Resumable state for a streaming block-sparse fit. Construct with [`Self::new`]
 /// (fit_begin), feed shards with [`Self::partial_fit`], close each epoch with
 /// [`Self::end_epoch`], and read the frames out with [`Self::finalize`]. The block
@@ -238,6 +282,7 @@ pub struct BlockSparseStreamState {
     last_rss: f64,
     last_rows: usize,
     pending_birth: Option<PendingBlockBirth>,
+    pending_frame: Option<PendingFrameTrial>,
 }
 
 /// Per-block honest-charge ledger over the last closed epoch, as parallel
@@ -340,6 +385,7 @@ impl BlockSparseStreamState {
             last_rss: 0.0,
             last_rows: 0,
             pending_birth: None,
+            pending_frame: None,
         })
     }
 
@@ -416,6 +462,7 @@ impl BlockSparseStreamState {
             last_rss: 0.0,
             last_rows: 0,
             pending_birth: None,
+            pending_frame: None,
         })
     }
 
@@ -476,6 +523,22 @@ impl BlockSparseStreamState {
             // mutating moments. Birth evidence uses a true paired full pass.
             let baseline_codes = self
                 .pending_birth
+                .as_ref()
+                .map(|pending| {
+                    route_and_code_all(
+                        rows,
+                        pending.baseline_decoder.view(),
+                        pending.baseline_gamma,
+                        self.g,
+                        b,
+                        self.k,
+                        self.config.minibatch,
+                        self.config.block_tile,
+                    )
+                })
+                .transpose()?;
+            let frame_baseline_codes = self
+                .pending_frame
                 .as_ref()
                 .map(|pending| {
                     route_and_code_all(
@@ -618,6 +681,40 @@ impl BlockSparseStreamState {
                     });
                 pending.baseline_rows += rows.nrows();
             }
+            if let (Some(pending), Some(baseline_codes)) =
+                (self.pending_frame.as_mut(), frame_baseline_codes.as_ref())
+            {
+                let baseline = project_coded_rows(
+                    rows,
+                    pending.baseline_decoder.view(),
+                    baseline_codes,
+                    b,
+                    pending.baseline_gamma,
+                );
+                for projection in &baseline {
+                    pending.baseline_rss += projection.rss;
+                    pending.baseline_gamma_num += projection.gamma_num;
+                    pending.baseline_gamma_den += projection.gamma_den;
+                }
+                let postings = block_row_postings(baseline_codes, self.g);
+                pending
+                    .baseline_second
+                    .par_iter_mut()
+                    .zip(pending.baseline_usage.par_iter_mut())
+                    .zip(postings.par_iter())
+                    .for_each(|((second, usage), entries)| {
+                        for &(row, slot) in entries {
+                            let w = &baseline_codes[row].projections[slot * b..(slot + 1) * b];
+                            for left in 0..b {
+                                for right in 0..b {
+                                    second[[left, right]] += w[left] * w[right];
+                                }
+                            }
+                        }
+                        *usage += entries.len();
+                    });
+                pending.baseline_rows += rows.nrows();
+            }
             self.row_count += rows.nrows();
             // Every completed minibatch leaves coherent accumulated state,
             // including when a later minibatch's router returns an error.
@@ -666,6 +763,54 @@ impl BlockSparseStreamState {
         for c in 0..p {
             tss += self.col_sumsq[c] - self.col_sum[c] * self.col_sum[c] / n;
         }
+        let mut rejected_frame = false;
+        if let Some(mut trial) = self.pending_frame.take() {
+            if trial.baseline_rows != self.row_count {
+                return Err(format!(
+                    "BlockSparseStream frame trial saw {} candidate rows but {} baseline rows",
+                    self.row_count, trial.baseline_rows,
+                ));
+            }
+            let (_, candidate_rss) =
+                profiled_scalar(self.gamma, self.rss, self.gamma_num, self.gamma_den);
+            let (baseline_gamma, baseline_rss) = profiled_scalar(
+                trial.baseline_gamma,
+                trial.baseline_rss,
+                trial.baseline_gamma_num,
+                trial.baseline_gamma_den,
+            );
+            // The two objectives were accumulated on identical rows.  Only a
+            // strict decrease may commit a rerouted proposal; equality has no
+            // directional information and is handled by backtracking.
+            if !(candidate_rss < baseline_rss) {
+                let midpoint =
+                    bisect_frame_trial(&trial.baseline_decoder, &trial.proposed_decoder, b);
+                self.decoder = trial.baseline_decoder.clone();
+                self.gamma = baseline_gamma;
+                self.rss = baseline_rss;
+                self.usage = std::mem::take(&mut trial.baseline_usage);
+                self.second = std::mem::take(&mut trial.baseline_second);
+                self.alive_count = self.usage.iter().filter(|&&count| count > 0).count();
+                if midpoint != self.decoder {
+                    let baseline_decoder = self.decoder.clone();
+                    self.decoder = midpoint.clone();
+                    self.pending_frame = Some(PendingFrameTrial {
+                        baseline_decoder,
+                        baseline_gamma,
+                        proposed_decoder: midpoint,
+                        baseline_rss: 0.0,
+                        baseline_gamma_num: 0.0,
+                        baseline_gamma_den: 0.0,
+                        baseline_rows: 0,
+                        baseline_usage: vec![0; self.g],
+                        baseline_second: (0..self.g)
+                            .map(|_| Array2::<f64>::zeros((b, b)))
+                            .collect(),
+                    });
+                }
+                rejected_frame = true;
+            }
+        }
         // Resolve a staged residual-row birth against the exact full-pass
         // criterion BEFORE any ordinary frame refresh consumes the candidate's
         // accumulators. A rejected proposal restores the complete baseline
@@ -711,7 +856,7 @@ impl BlockSparseStreamState {
         let mut candidate_decoder = self.decoder.clone();
         let mut gamma_residual = f64::INFINITY;
         let mut frame_residual = f64::INFINITY;
-        if !rejected_birth {
+        if !rejected_birth && !rejected_frame {
             // (γ) closed-form shared scalar from the accumulated least-squares.
             self.gamma = if self.gamma_den == 0.0 {
                 0.0
@@ -823,6 +968,7 @@ impl BlockSparseStreamState {
 
         let improve = ev - self.prev_ev;
         let stationary = !rejected_birth
+            && !rejected_frame
             && accepted_births == 0
             && improve.abs() <= self.config.tolerance
             && gamma_residual <= self.config.tolerance
@@ -835,10 +981,27 @@ impl BlockSparseStreamState {
         // Certify the frames actually measured in this pass, together with
         // their profiled gamma. A frame proposal needs the next pass before
         // it has either an EV or a gamma certificate of its own.
-        if !stationary && !rejected_birth {
-            self.decoder = candidate_decoder;
+        if !stationary && !rejected_birth && !rejected_frame {
+            let baseline_decoder = self.decoder.clone();
+            self.decoder = candidate_decoder.clone();
+            if self.decoder != baseline_decoder {
+                self.pending_frame = Some(PendingFrameTrial {
+                    baseline_decoder,
+                    baseline_gamma: self.gamma,
+                    proposed_decoder: candidate_decoder,
+                    baseline_rss: 0.0,
+                    baseline_gamma_num: 0.0,
+                    baseline_gamma_den: 0.0,
+                    baseline_rows: 0,
+                    baseline_usage: vec![0; self.g],
+                    baseline_second: (0..self.g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
+                });
+            }
         }
-        let birth_pending = !rejected_birth && self.stage_birth_proposal();
+        let birth_pending = self.pending_frame.is_none()
+            && !rejected_birth
+            && !rejected_frame
+            && self.stage_birth_proposal();
         let converged = stationary && !birth_pending;
 
         self.prev_ev = ev;
@@ -963,12 +1126,12 @@ impl BlockSparseStreamState {
     /// error and the state itself remains the resumable checkpoint — stream more
     /// epochs and finalize again.
     pub fn finalize(&self) -> Result<BlockSparseStreamArtifact, String> {
-        if !self.converged || self.pending_birth.is_some() {
+        if !self.converged || self.pending_birth.is_some() || self.pending_frame.is_some() {
             return Err(format!(
                 "BlockSparseStream.finalize: streaming fit has not converged after {} epoch(s) \
                  (last EV {:.6e}, EV residual {:.3e}, gamma residual {:.3e}, frame residual {:.3e} \
                  vs tolerance {:.3e}, {} accepted block \
-                 birth(s) in the last epoch, birth pending={}); the stream state is a resumable \
+                 birth(s) in the last epoch, birth pending={}, frame trial pending={}); the stream state is a resumable \
                  checkpoint, not a model — run more epochs until end_epoch reports convergence",
                 self.epochs_run,
                 self.last_ev,
@@ -978,6 +1141,7 @@ impl BlockSparseStreamState {
                 self.config.tolerance,
                 self.last_accepted_births,
                 self.pending_birth.is_some(),
+                self.pending_frame.is_some(),
             ));
         }
         Ok(BlockSparseStreamArtifact {
