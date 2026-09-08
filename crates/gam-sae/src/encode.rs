@@ -66,7 +66,7 @@ use opt::constants::{ARMIJO_C1, BACKTRACK_CONTRACTION};
 use opt::{AcceptedStep, BacktrackConfig, backtracking_line_search};
 
 use crate::chart_coordinate_solve::PeriodicCurveExtrema;
-use crate::manifold::{AffineCoordinateEvaluator, AmbientSphereHarmonicEvaluator, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator, SaeBasisEvaluator, SaeManifoldAtom, TorusHarmonicEvaluator};
+use crate::manifold::{AffineCoordinateEvaluator, AmbientSphereHarmonicEvaluator, CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator, SaeBasisEvaluator, SaeManifoldAtom, TorusHarmonicEvaluator};
 use gam_linalg::faer_ndarray::FaerEigh;
 
 use faer::Side;
@@ -99,38 +99,17 @@ pub(crate) const CERTIFIED_GLOBAL_MIN_RECON_FLOOR: f64 = 1.0e-11;
 /// certified in-chart radius. Over the ball `‖t − t_c‖ ≤ radius` the jet sup
 /// bounds returned by [`BasisHessianLipschitz`] hold, so the Kantorovich
 /// constant `L` computed from them is valid for any start in the ball.
-///
-/// For radial (Duchon) families the chart also carries the minimum kernel-center
-/// distance `exclusion_r_min` (a lower bound on `‖t − c_k‖` over the chart) that
-/// bounds the otherwise-singular `1/r` radial tails (issue #1010).
 #[derive(Debug, Clone)]
 pub struct ChartRegion {
     /// Chart center coordinate `t_c` (length = latent_dim).
     pub center: Array1<f64>,
     /// In-chart radius in the coordinate metric.
     pub radius: f64,
-    /// For radial (Duchon) families: a lower bound on `‖t − c_k‖` over the
-    /// chart, across every kernel center `c_k`. `None` for non-radial families.
-    pub exclusion_r_min: Option<f64>,
-    /// For radial (Duchon) families: an upper bound on `‖t − c_k‖` over the
-    /// chart, across every kernel center `c_k`. `None` for non-radial families.
-    pub radial_r_max: Option<f64>,
 }
 
 impl ChartRegion {
     pub fn new(center: Array1<f64>, radius: f64) -> Self {
-        Self {
-            center,
-            radius,
-            exclusion_r_min: None,
-            radial_r_max: None,
-        }
-    }
-
-    pub fn with_radial_bounds(mut self, r_min: f64, r_max: f64) -> Self {
-        self.exclusion_r_min = Some(r_min);
-        self.radial_r_max = Some(r_max);
-        self
+        Self { center, radius }
     }
 
     /// A jet-sup certificate is only meaningful over a genuine region. Even
@@ -395,90 +374,6 @@ pub(crate) fn patch_jet_sup(
     d.powi(order as i32) * big_d.powi(order as i32) * rho.powi(residual_degree).max(1.0)
 }
 
-impl BasisHessianLipschitz for DuchonCoordinateEvaluator {
-    /// Radial-kernel basis `Φ_m(t) = φ(r_m)`, `r_m = ‖t − c_m‖`, plus a
-    /// polynomial nullspace block. For the cubic Duchon kernel `φ(r) = r³` the
-    /// radial derivatives are `φ' = 3r²`, `φ'' = 6r`, `φ''' = 6`. The chain rule
-    /// to coordinate jets introduces `1/r` factors through the unit radial
-    /// direction `u = (t − c)/r` and the projector `(I − uuᵀ)/r`, so over a
-    /// chart the jets are bounded by combining the radial-derivative magnitudes
-    /// at the worst-case radius with the inverse-radius tail at the chart's
-    /// EXCLUSION radius `r_min` (the closest a chart point gets to any center):
-    ///
-    /// ```text
-    /// ‖∇φ‖    ≤ |φ'|                              ≤ 3 r_max²
-    /// ‖∇²φ‖   ≤ |φ''| + |φ'|/r                    ≤ 6 r_max + 3 r_max²/r_min
-    /// ‖∇³φ‖   ≤ |φ'''| + 3|φ''|/r + 3|φ'|/r²      ≤ 6 + 18 r_max/r_min + 9 r_max²/r_min²
-    /// ```
-    ///
-    /// (the `1/r`, `1/r²` tails are bounded by `1/r_min`, `1/r_min²`). The
-    /// polynomial nullspace block is degree ≤ `order`; its jets are bounded like
-    /// the monomial patch with `D = order`. The per-column sup is the max of the
-    /// kernel and polynomial bounds. The `r³` kernel is itself `C²` (no
-    /// singularity) so these tails are conservative but finite for any
-    /// `r_min > 0`; the atlas refines charts to keep `r_min` bounded away from 0.
-    fn value_sup(&self, chart: &ChartRegion) -> f64 {
-        let r_max = chart.radial_r_max.unwrap_or(chart.radius);
-        let poly = duchon_poly_jet_sup(self.centers.ncols(), self.order_degree(), chart, 0);
-        (r_max.powi(3)).max(poly)
-    }
-    fn jacobian_sup(&self, chart: &ChartRegion) -> f64 {
-        let r_max = chart.radial_r_max.unwrap_or(chart.radius);
-        let kernel = 3.0 * r_max * r_max;
-        let poly = duchon_poly_jet_sup(self.centers.ncols(), self.order_degree(), chart, 1);
-        kernel.max(poly)
-    }
-    fn hessian_sup(&self, chart: &ChartRegion) -> f64 {
-        let r_max = chart.radial_r_max.unwrap_or(chart.radius);
-        let r_min = chart
-            .exclusion_r_min
-            .unwrap_or(chart.radius)
-            .max(f64::MIN_POSITIVE);
-        let kernel = 6.0 * r_max + 3.0 * r_max * r_max / r_min;
-        let poly = duchon_poly_jet_sup(self.centers.ncols(), self.order_degree(), chart, 2);
-        kernel.max(poly)
-    }
-    fn third_sup(&self, chart: &ChartRegion) -> f64 {
-        let r_max = chart.radial_r_max.unwrap_or(chart.radius);
-        let r_min = chart
-            .exclusion_r_min
-            .unwrap_or(chart.radius)
-            .max(f64::MIN_POSITIVE);
-        let kernel = 6.0 + 18.0 * r_max / r_min + 9.0 * r_max * r_max / (r_min * r_min);
-        let poly = duchon_poly_jet_sup(self.centers.ncols(), self.order_degree(), chart, 3);
-        kernel.max(poly)
-    }
-}
-
-/// Polynomial-block degree of a Duchon nullspace order, used to bound the
-/// nullspace columns like a monomial patch.
-trait DuchonOrderDegree {
-    fn order_degree(&self) -> usize;
-}
-
-impl DuchonOrderDegree for DuchonCoordinateEvaluator {
-    fn order_degree(&self) -> usize {
-        match self.order {
-            gam_terms::basis::DuchonNullspaceOrder::Zero => 0,
-            gam_terms::basis::DuchonNullspaceOrder::Linear => 1,
-            gam_terms::basis::DuchonNullspaceOrder::Degree(d) => d,
-        }
-    }
-}
-
-/// Per-column `g`-th jet sup of the Duchon polynomial nullspace block, treated
-/// as a monomial patch of degree `order_degree`.
-pub(crate) fn duchon_poly_jet_sup(
-    latent_dim: usize,
-    order_degree: usize,
-    chart: &ChartRegion,
-    order: u32,
-) -> f64 {
-    if order_degree == 0 {
-        return if order == 0 { 1.0 } else { 0.0 };
-    }
-    patch_jet_sup(latent_dim, order_degree, chart, order)
-}
 
 /// Decoder magnitude `Σ_m ‖B_{m,:}‖₂` of an atom's frozen decoder block: the
 /// factor that converts a per-column `Φ`-jet sup `B_g` into a reconstruction
@@ -842,10 +737,13 @@ pub(crate) const SAE_CYLINDER_LINE_DEGREE: usize = 2;
 /// pairs them with the full-width decoder pre-image `B = Q B̃`, against which the
 /// reconstruction is IDENTICAL (`Φ̃ B̃ = Φ (Q B̃)`), so the certificate frame never
 /// sees the reduction and stays sound.
+/// `None` means the atom lacks an analytic bound over a whole chart. Its exact
+/// pointwise evaluator can still encode it; absence of an amortization
+/// certificate is not an invalid model or a failed inner solve.
 pub(crate) fn family_jet_sups(
     atom: &SaeManifoldAtom,
     chart: &ChartRegion,
-) -> Result<JetSups, String> {
+) -> Result<Option<JetSups>, String> {
     use crate::manifold::SaeAtomBasisKind::*;
     let m = atom.full_basis_size();
     let d = atom.latent_dim();
@@ -868,11 +766,12 @@ pub(crate) fn family_jet_sups(
             )?;
             JetSups::from_family(&ev, chart)
         }
-        ProjectivePlane | KleinBottle => {
-            return Err(
-                "EncodeAtlas: quotient spectral jet sup requires a plan-native bound; route this atom through exact analytic encode"
-                    .to_string(),
-            );
+        ProjectivePlane | KleinBottle | Mobius | Precomputed(_) | FiniteSet | Duchon => {
+            // These families need evaluator-native interval bounds that the
+            // atom does not currently expose. In particular, replacing a
+            // Duchon kernel and its data-placed centers with cubic r³ about
+            // the origin can underestimate curvature and falsely certify it.
+            return Ok(None);
         }
         Cylinder => {
             // Cylinder width is `(2H+1)·(D+1)` with the canonical flat-axis
@@ -890,13 +789,6 @@ pub(crate) fn family_jet_sups(
             let ev = CylinderHarmonicEvaluator::new(h.max(1), SAE_CYLINDER_LINE_DEGREE)?;
             JetSups::from_family(&ev, chart)
         }
-        Mobius => {
-            return Err(
-                "EncodeAtlas: Mobius jet bounds require its persisted harmonic and width \
-                 degrees; use the atom's exact analytic jets"
-                    .to_string(),
-            );
-        }
         Linear | EuclideanPatch | Poincare => {
             // The patch width fixes max_degree implicitly; bound by a degree that
             // covers the column count (conservative). Degree d-patch column count
@@ -907,41 +799,8 @@ pub(crate) fn family_jet_sups(
             let ev = EuclideanPatchEvaluator::new(d, degree)?;
             JetSups::from_family(&ev, chart)
         }
-        Duchon => {
-            // UNSOUND — DO NOT TRUST for a certificate (F2/F3). This bound
-            // hard-codes cubic `φ(r) = r³` radial jets and a single origin center
-            // (`duchon_centers_from_atom`), but the real Duchon kernel is the
-            // polyharmonic `c·r^(2m−d)` (with log variants) over the atom's
-            // data-placed centers — so it can UNDER-estimate L and issue a FALSE
-            // certificate (the module's own warning). The atom does not expose its
-            // real order / center matrix / scaling to this crate, so no sound bound
-            // is available. `build_atom_atlas_from_centers` therefore REFUSES to
-            // certify Duchon atoms (emits uncertified charts → exact-encode
-            // fallback) and never reaches this arm; it is retained only so the
-            // family dispatch is total. If a future change threads the real
-            // order/centers here, replace this with the true `φ_{m,d}` jet bounds.
-            let centers = duchon_centers_from_atom(atom);
-            let conservative_m = m.max(1);
-            let ev = DuchonCoordinateEvaluator::new(centers, conservative_m)?;
-            JetSups::from_family(&ev, chart)
-        }
-        Precomputed(name) => {
-            return Err(format!(
-                "EncodeAtlas: precomputed basis '{name}' has no closed-form jet sup; route to exact encode"
-            ));
-        }
-        // A finite-set (indicator) atom is piecewise constant — it has no
-        // continuous jet to bound, so there is no Kantorovich chart; route to the
-        // exact encode like any other non-differentiable basis.
-        FiniteSet => {
-            return Err(
-                "EncodeAtlas: finite-set (indicator) basis has no closed-form jet sup; \
-                 route to exact encode"
-                    .to_string(),
-            );
-        }
     };
-    Ok(sups)
+    Ok(Some(sups))
 }
 
 /// Smallest monomial-patch degree whose column count covers `m` basis columns.
@@ -993,15 +852,6 @@ pub(crate) fn patch_column_count(latent_dim: usize, degree: usize) -> usize {
         den *= i as u128;
     }
     (num / den) as usize
-}
-
-/// Recover Duchon centers from an atom: when the evaluator is unavailable the
-/// atlas falls back to the atom's own latent-coordinate hull as the center set,
-/// which only affects the radial-tail bound conservatively.
-pub(crate) fn duchon_centers_from_atom(atom: &SaeManifoldAtom) -> Array2<f64> {
-    // One center at the origin in latent_dim space is a sound conservative
-    // default: the chart's own r_min / r_max bracket the true radial range.
-    Array2::<f64>::zeros((1, atom.latent_dim().max(1)))
 }
 
 /// The four per-column jet sups of a basis family over a chart.
@@ -2303,23 +2153,14 @@ impl EncodeAtlas {
         // reduced-row sum. Identical for an un-reduced atom.
         let decoder_norm_sum = decoder_row_norm_sum(atom.full_width_decoder().view());
         let mut charts = Vec::with_capacity(centers.nrows());
-        // HONEST REFUSAL for Duchon atoms (F2/F3): the closed-form Hessian-Lipschitz
-        // bound available here (`family_jet_sups` Duchon arm) hard-codes cubic-r³
-        // jets and a single origin center, but the real Duchon kernel is the
-        // polyharmonic `c·r^(2m−d)` (with log variants) over data-placed centers.
-        // That bound can UNDER-estimate L → a FALSE certificate (the module's own
-        // warning; underestimating L is the dangerous direction). The atom does not
-        // expose its real order/centers/scaling to this crate, so no sound bound is
-        // available — refuse rather than fabricate. Every Duchon chart is emitted
-        // UNCERTIFIED (`certified_radius = 0`, no amortized predictor), so routing
-        // skips it and every Duchon row flags for the exact multi-start encode.
-        let duchon_uncertifiable =
-            matches!(atom.basis_kind(), crate::manifold::SaeAtomBasisKind::Duchon);
         for c in 0..centers.nrows() {
             let center = centers.row(c).to_owned();
             let nominal_radius = radii[c];
-            let region = chart_region(atom, center.clone(), nominal_radius);
-            if duchon_uncertifiable {
+            let region = ChartRegion::new(center.clone(), nominal_radius);
+            let Some(sups) = family_jet_sups(atom, &region)? else {
+                // Select exact encoding when this family cannot bound an
+                // amortized chart. Keep the center as an exact-solve seed,
+                // and publish no certificate or approximate predictor.
                 charts.push(CertifiedChart {
                     region,
                     lipschitz: f64::INFINITY,
@@ -2331,8 +2172,7 @@ impl EncodeAtlas {
                     jacobian_sup: f64::INFINITY,
                 });
                 continue;
-            }
-            let sups = family_jet_sups(atom, &region)?;
+            };
             let recon_sups = reconstruction_jet_sups(atom, sups);
             let lipschitz =
                 hessian_lipschitz_constant(recon_sups, amplitude_bound, target_norm_bound, 0.0);
@@ -3397,41 +3237,6 @@ pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) ->
     }
 }
 
-/// Build the [`ChartRegion`] for a center, attaching the radial r_min / r_max
-/// bracket for Duchon atoms (the chart's distance range to the kernel centers).
-pub(crate) fn chart_region(
-    atom: &SaeManifoldAtom,
-    center: Array1<f64>,
-    radius: f64,
-) -> ChartRegion {
-    use crate::manifold::SaeAtomBasisKind::*;
-    let region = ChartRegion::new(center.clone(), radius);
-    match atom.basis_kind() {
-        Duchon => {
-            // r ranges over [‖t_c‖ − radius, ‖t_c‖ + radius] about the single
-            // origin-anchored center used by the conservative radial bound.
-            //
-            // The lower bound must be `max(0, center_norm − radius)` — NOT floored
-            // at `radius`. When the chart contains the kernel center
-            // (`center_norm < radius`, true r_min = 0), flooring at `radius`
-            // would give a finite, NON-CONSERVATIVE `r_min`, causing the
-            // hessian_sup / third_sup formulas (which divide by r_min) to
-            // underestimate the Lipschitz constant and potentially grant a false
-            // Kantorovich certificate. Flooring at `f64::MIN_POSITIVE` instead
-            // correctly drives the formulas toward ∞, producing a very large L
-            // that will NEVER certify (rows route to the exact multi-start
-            // fallback) — conservative and sound.
-            let center_norm = center.dot(&center).sqrt();
-            let r_min = (center_norm - radius).max(f64::MIN_POSITIVE);
-            let r_max = center_norm + radius;
-            region.with_radial_bounds(r_min, r_max)
-        }
-        // Cylinder has no radial kernel block (it is a harmonic × polynomial
-        // tensor, not a Duchon radial basis), so it needs no radial r_min/r_max.
-        Periodic | Sphere | Torus | ProjectivePlane | KleinBottle | Cylinder | Mobius | Linear
-        | EuclideanPatch | Poincare | Precomputed(_) | FiniteSet => region,
-    }
-}
 
 #[cfg(test)]
 mod encode_fix_tests {
@@ -3906,31 +3711,41 @@ mod encode_fix_tests {
     }
 
     #[test]
-    fn f3_duchon_atoms_are_uncertifiable() {
-        let atom = tiny_atom(SaeAtomBasisKind::Duchon, 1);
-        let centers = ndarray::array![[0.0_f64], [0.3], [0.7]];
-        let radii = vec![0.1_f64, 0.1, 0.1];
-        let atlas = EncodeAtlas::build_atom_atlas_from_centers(
-            0,
-            &atom,
-            centers.view(),
-            &radii,
-            1.0,
-            1.0,
-            &AtlasConfig::default(),
-        )
-        .expect("duchon atlas builds (uncertified)");
-        assert_eq!(atlas.charts.len(), 3, "one chart per center");
-        for (i, chart) in atlas.charts.iter().enumerate() {
-            assert_eq!(
-                chart.certified_radius, 0.0,
-                "duchon chart {i} must be uncertified (refused), got r={}",
-                chart.certified_radius
-            );
-            assert!(
-                chart.amortized_jacobian.is_none(),
-                "duchon chart {i} must carry no amortized predictor"
-            );
+    fn families_without_chart_bounds_keep_exact_encode_seeds() {
+        for kind in [
+            SaeAtomBasisKind::Duchon,
+            SaeAtomBasisKind::Precomputed("analytic-custom-basis".into()),
+            SaeAtomBasisKind::ProjectivePlane,
+            SaeAtomBasisKind::KleinBottle,
+            SaeAtomBasisKind::Mobius,
+            SaeAtomBasisKind::FiniteSet,
+        ] {
+            let atom = tiny_atom(kind, 1);
+            let centers = ndarray::array![[0.0_f64], [0.3], [0.7]];
+            let radii = vec![0.1_f64, 0.1, 0.1];
+            let atlas = EncodeAtlas::build_atom_atlas_from_centers(
+                0,
+                &atom,
+                centers.view(),
+                &radii,
+                1.0,
+                1.0,
+                &AtlasConfig::default(),
+            )
+            .expect("missing chart bounds must select exact encoding");
+            assert_eq!(atlas.charts.len(), 3, "one chart per center");
+            for (i, chart) in atlas.charts.iter().enumerate() {
+                assert_eq!(
+                    chart.certified_radius, 0.0,
+                    "chart {i} must be uncertified, got r={}",
+                    chart.certified_radius
+                );
+                assert!(
+                    chart.amortized_jacobian.is_none(),
+                    "chart {i} must carry no amortized predictor"
+                );
+                assert_eq!(chart.region.center, centers.row(i));
+            }
         }
     }
 
@@ -4030,4 +3845,3 @@ mod encode_fix_tests {
         assert!((eta - delta.dot(&delta).sqrt()).abs() < 1e-12);
     }
 }
-

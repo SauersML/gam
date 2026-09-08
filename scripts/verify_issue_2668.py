@@ -32,7 +32,7 @@ def main():
              if line.endswith(": test")]
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "inventory.txt").write_text(inventory)
-    scratch = args.output.resolve() / "scratch"
+    scratch = args.output.resolve().with_name(args.output.name + "-scratch")
     scratch.mkdir(exist_ok=True)
     with binary.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()

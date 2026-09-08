@@ -1,0 +1,37 @@
+   Compiling gam-runtime v0.3.154 (/scratch.global/sauer354/n5/crates/gam-runtime)
+   Compiling gam-math v0.3.154 (/scratch.global/sauer354/n5/crates/gam-math)
+   Compiling opt v0.8.1 (https://github.com/SauersML/opt.git?rev=706f0c4c23a21c2e4e205358229fe061717b6410#706f0c4c)
+   Compiling gam-data v0.3.154 (/scratch.global/sauer354/n5/crates/gam-data)
+   Compiling gam-linalg v0.3.154 (/scratch.global/sauer354/n5/crates/gam-linalg)
+   Compiling gam-geometry v0.3.154 (/scratch.global/sauer354/n5/crates/gam-geometry)
+   Compiling gam-gpu v0.3.154 (/scratch.global/sauer354/n5/crates/gam-gpu)
+   Compiling gam-problem v0.3.154 (/scratch.global/sauer354/n5/crates/gam-problem)
+   Compiling gam-terms v0.3.154 (/scratch.global/sauer354/n5/crates/gam-terms)
+   Compiling gam-model-api v0.3.154 (/scratch.global/sauer354/n5/crates/gam-model-api)
+   Compiling gam-identifiability v0.3.154 (/scratch.global/sauer354/n5/crates/gam-identifiability)
+   Compiling gam-solve v0.3.154 (/scratch.global/sauer354/n5/crates/gam-solve)
+   Compiling gam-sae v0.3.154 (/scratch.global/sauer354/n5/crates/gam-sae)
+    Finished `test` profile [optimized + debuginfo] target(s) in 4m 14s
+     Running unittests src/lib.rs (/scratch.global/sauer354/m1-target/debug/deps/gam_sae-fb94dd1dff4b5790)
+
+running 17 tests
+test encode::encode_fix_tests::beta_eta_newton_refuses_genuine_negative_curvature_2x2 ... ok
+test encode::encode_fix_tests::beta_eta_newton_healthy_pd_unchanged ... ok
+test encode::encode_fix_tests::beta_eta_newton_refuses_null_with_projected_gradient ... ok
+test encode::encode_fix_tests::beta_eta_newton_refuses_rank1_null_2x2 ... ok
+test encode::encode_fix_tests::chart_nominal_radius_sphere_covers_capped_grid_spacing ... ok
+test encode::encode_fix_tests::beta_eta_newton_refuses_rank_deficient_3x3 ... ok
+test encode::encode_fix_tests::converging_h_sequence_is_never_flagged ... ok
+test encode::encode_fix_tests::f2_certificate_uses_true_hessian_refuses_singular_field ... ok
+test encode::encode_fix_tests::f6_certified_step_not_rejected_by_progress_rule ... ok
+test encode::encode_fix_tests::f1_routing_scores_amplitude_scaled_reconstruction ... ok
+test encode::encode_fix_tests::families_without_chart_bounds_keep_exact_encode_seeds ... ok
+test encode::encode_fix_tests::non_finite_h_flags ... ok
+test encode::encode_fix_tests::joint_normal_equations_use_the_shared_multi_atom_residual ... ok
+test encode::encode_fix_tests::plateau_h_sequence_terminates_bounded ... ok
+test encode::encode_fix_tests::wrap_aware_containment_accepts_seam_point ... ok
+test encode::encode_fix_tests::wrap_aware_containment_does_not_wrap_flat_axis ... ok
+test encode::encode_fix_tests::the_d1_periodic_fiber_enumerator_minimises_the_encode_objective_2518 ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 1250 filtered out; finished in 1.11s
+

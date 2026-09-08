@@ -176,3 +176,12 @@ The shared worktree now contains a separate correction distinguishing posterior
 support from the optimizer's numerical resolvability range, and using the
 declared proper smoothing prior for cubature weights. That newer change is not
 part of the r4 measurement and still needs integration into the verified snapshot.
+
+The encode setup correction passes all 17 focused encode tests (1.11 seconds
+runtime on MSI). An unavailable whole-chart derivative bound is now an explicit
+capability absence: the atlas retains exact-solve centers and publishes no
+amortized predictor or certificate. Precomputed, quotient, Möbius, finite-set,
+and Duchon atoms follow the same rule. The unreachable cubic-Duchon bound and
+its unused radial metadata were removed. This fixes setup classification, not
+the separate SAE criterion/ARD inconsistency; the original pair still needs
+remeasurement against the integrated build.
