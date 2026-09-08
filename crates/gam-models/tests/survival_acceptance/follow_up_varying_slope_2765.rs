@@ -23,9 +23,8 @@
 //! by luck.
 
 use csv::StringRecord;
-use gam::{
-    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
-};
+use gam_data::encode_recordswith_inferred_schema;
+use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 
 const N: usize = 2_400;
 /// Polynomial degree of the slope's follow-up margin. Bound to a constant so
@@ -46,7 +45,7 @@ const LOCATION_LEVEL: f64 = -1.15;
 /// and the marginal survival curve is decreasing, as the family requires.
 const LOCATION_TREND: f64 = 0.95;
 
-use gam::utils::splitmix64;
+use gam_linalg::utils::splitmix64;
 
 fn next_unit(state: &mut u64) -> f64 {
     (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
@@ -103,30 +102,30 @@ fn planted_event_time(u: f64, z: f64) -> f64 {
     (0.5 * (low + high)).exp()
 }
 
-fn build_dataset() -> (gam::inference::data::EncodedDataset, Vec<f64>, Vec<f64>) {
+pub(super) fn build_dataset(n: usize) -> (gam_data::EncodedDataset, Vec<f64>, Vec<f64>) {
     let headers = ["time", "event", "z"]
         .iter()
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
     let mut state: u64 = 0x2765_2767_5CA1_AB1E_u64;
 
-    let mut raw_scores: Vec<f64> = Vec::with_capacity(N);
-    let mut draws: Vec<f64> = Vec::with_capacity(N);
-    let mut censor: Vec<f64> = Vec::with_capacity(N);
-    for _ in 0..N {
+    let mut raw_scores: Vec<f64> = Vec::with_capacity(n);
+    let mut draws: Vec<f64> = Vec::with_capacity(n);
+    let mut censor: Vec<f64> = Vec::with_capacity(n);
+    for _ in 0..n {
         raw_scores.push(next_gauss(&mut state));
         draws.push(next_unit(&mut state).clamp(1e-6, 1.0 - 1e-6));
         censor.push(next_unit(&mut state));
     }
     // The latent score is standardized by construction, as the family expects.
-    let mean = raw_scores.iter().sum::<f64>() / N as f64;
-    let variance = raw_scores.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / N as f64;
+    let mean = raw_scores.iter().sum::<f64>() / n as f64;
+    let variance = raw_scores.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
     let sd = variance.sqrt().max(1e-12);
     let scores: Vec<f64> = raw_scores.iter().map(|v| (v - mean) / sd).collect();
 
-    let mut rows: Vec<StringRecord> = Vec::with_capacity(N);
-    let mut observed_times: Vec<f64> = Vec::with_capacity(N);
-    for index in 0..N {
+    let mut rows: Vec<StringRecord> = Vec::with_capacity(n);
+    let mut observed_times: Vec<f64> = Vec::with_capacity(n);
+    for index in 0..n {
         let z = scores[index];
         let event_time = planted_event_time(draws[index], z);
         // Administrative censoring spread over the fixture's support, giving a
@@ -170,12 +169,12 @@ fn pearson(left: &[f64], right: &[f64]) -> f64 {
 
 #[test]
 fn survival_marginal_slope_recovers_a_follow_up_varying_slope_2765() {
-    init_parallelism();
+    super::initialize_cpu_fitting();
     gam_runtime::test_support::install_diagnostic_logger();
     #[cfg(target_os = "macos")]
-    gam::gpu::configure_global_policy(gam::gpu::GpuPolicy::Off);
+    gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Off);
 
-    let (data, times, _scores) = build_dataset();
+    let (data, times, _scores) = build_dataset(N);
 
     let cfg = FitConfig {
         survival_likelihood: Some("marginal-slope".to_string()),
@@ -245,7 +244,10 @@ fn survival_marginal_slope_recovers_a_follow_up_varying_slope_2765() {
     let truth: Vec<f64> = times.iter().map(|t| planted_slope(*t)).collect();
 
     for value in &fitted {
-        assert!(value.is_finite(), "fitted slope must be finite; got {value}");
+        assert!(
+            value.is_finite(),
+            "fitted slope must be finite; got {value}"
+        );
     }
 
     let correlation = pearson(&fitted, &truth);

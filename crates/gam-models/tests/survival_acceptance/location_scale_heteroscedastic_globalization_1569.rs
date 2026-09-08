@@ -8,11 +8,10 @@
 //! The data is a clean Gaussian AFT on log-time:  log T = μ(x) + σ(x)·ε.
 //! Truth is known analytically in the mean-centered gauge; no reference tool needed.
 
-use gam::matrix::LinearOperator;
-use gam::smooth::build_term_collection_design;
-use gam::{
-    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
-};
+use gam_data::encode_recordswith_inferred_schema;
+use gam_linalg::matrix::LinearOperator;
+use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
+use gam_terms::smooth::build_term_collection_design;
 use ndarray::Array2;
 
 /// Numerical-Recipes 64-bit LCG → deterministic uniforms in [0,1).
@@ -163,7 +162,7 @@ fn fit_heteroscedastic(
 
 #[test]
 fn survival_location_scale_heteroscedastic_sweep_diagnostic() {
-    init_parallelism();
+    super::initialize_cpu_fitting();
     gam_runtime::test_support::install_diagnostic_logger();
     let configs = [
         (200usize, 0.3f64, 0.4f64, 6usize, 4usize, 1234u64), // mild control
@@ -192,7 +191,7 @@ fn survival_location_scale_heteroscedastic_sweep_diagnostic() {
 /// Asserting regression guard for #1569.
 #[test]
 fn survival_location_scale_heteroscedastic_globalization_converges_1569() {
-    init_parallelism();
+    super::initialize_cpu_fitting();
     gam_runtime::test_support::install_diagnostic_logger();
     let r = fit_heteroscedastic(180, 1.0, 1.2, 8, 8, 7);
     // Convergence is certified by construction: fit_heteroscedastic returning

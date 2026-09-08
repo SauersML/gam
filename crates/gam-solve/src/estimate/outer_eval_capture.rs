@@ -315,6 +315,14 @@ pub fn enable_outer_gradient_fd_capture_over_theta(min_psi_dim: usize) {
     arm_outer_gradient_fd_capture(min_psi_dim, true);
 }
 
+/// Request the extended-coordinate audit without differencing smoothing
+/// parameters. Use this when the acceptance gate grades only the ψ block;
+/// each omitted ρ ladder would otherwise repeat full coefficient fits whose
+/// derivatives the gate does not inspect.
+pub fn enable_outer_gradient_fd_capture_for_psi(min_psi_dim: usize) {
+    arm_outer_gradient_fd_capture(min_psi_dim, false);
+}
+
 fn arm_outer_gradient_fd_capture(min_psi_dim: usize, grade_rho: bool) {
     FD_CAPTURE.with(|capture| {
         *capture.borrow_mut() = Some(OuterGradientFdCapture {

@@ -5,7 +5,7 @@
 //! lot of memory — run under `--release` if iteration time matters:
 //!
 //! ```text
-//! cargo test --release large_scale_reml_stress
+//! cargo test --release -p gam-models --test large_scale_reml_stress
 //! ```
 //!
 //! It exercises the full Duchon-on-PC GAM pipeline end-to-end:
@@ -17,7 +17,8 @@
 //!     `aniso_log_scales = Some(zeros)`) with `K` farthest-point centers.
 //!   * REML/LAML outer loop must converge.
 //!   * Held-out-grid relative L2 reconstruction error must be < 0.10.
-//!   * The held-out posterior-mean prediction must be finite.
+//!   * Bias-corrected predictions must be available on `FitInference`
+//!     and finite.
 //!   * 95% prediction-interval coverage on held-out samples must
 //!     exceed 0.85 across `N_COVERAGE_SIMS` independent simulations.
 //!   * Each fit must terminate on convergence, strictly inside the outer
@@ -25,18 +26,23 @@
 //!
 //! All randomness is seeded; failures are reproducible.
 
-use gam::basis::{
+use gam_models::fit_orchestration::drivers::{
+    fit_term_collection_forspec, fit_term_collectionwith_spatial_length_scale_optimization,
+};
+use gam_predict::{
+    InferenceCovarianceMode, PosteriorMeanOptions, PredictInput, PredictPosteriorMeanResult,
+    PredictableModel, StandardPredictor,
+};
+use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use gam_solve::estimate::{FitOptions, UnifiedFitResult};
+use gam_terms::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     duchon_max_active_operator_derivative_order, resolve_duchon_orders,
 };
-use gam::estimate::{FitOptions, UnifiedFitResult};
-use gam::smooth::{
+use gam_terms::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
-    TermCollectionSpec, build_term_collection_design, fit_term_collection_forspec,
-    fit_term_collectionwith_spatial_length_scale_optimization,
-    freeze_term_collection_from_design,
+    TermCollectionSpec, build_term_collection_design, freeze_term_collection_from_design,
 };
-use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -270,12 +276,12 @@ fn duchon_aniso_pc_spec(name: &str, pc_dim: usize, k_centers: usize) -> TermColl
                     length_scale: Some(HYBRID_LENGTH_SCALE),
                     power: power as f64,
                     nullspace_order,
-                    identifiability: gam::basis::SpatialIdentifiability::default(),
+                    identifiability: gam_terms::basis::SpatialIdentifiability::default(),
                     aniso_log_scales: Some(vec![0.0; pc_dim]),
                     operator_penalties,
 
                     periodic: None,
-                    boundary: gam::basis::OneDimensionalBoundary::Open,
+                    boundary: gam_terms::basis::OneDimensionalBoundary::Open,
                 },
                 input_scale: None,
             },
@@ -300,6 +306,7 @@ fn fit_options(max_iter: usize) -> FitOptions {
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: false,
+        adaptive_regularization: None,
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
@@ -404,37 +411,59 @@ fn relative_l2(pred: &Array1<f64>, truth: &Array1<f64>) -> f64 {
     (num / den.max(1e-30)).sqrt()
 }
 
-fn gaussian_identity_mean(
+fn gaussian_identity_posterior(
     design: ArrayView2<'_, f64>,
-    beta: ArrayView1<'_, f64>,
+    fit: &UnifiedFitResult,
     offset: ArrayView1<'_, f64>,
-) -> Array1<f64> {
-    let mut mean = design.dot(&beta);
-    mean += &offset;
-    mean
+    confidence_level: Option<f64>,
+) -> PredictPosteriorMeanResult {
+    let predictor = StandardPredictor {
+        beta: fit.beta.clone(),
+        family: gaussian_identity_likelihood(),
+        link_kind: None,
+        covariance: fit.covariance_conditional.clone(),
+        link_wiggle: None,
+    };
+    let input = PredictInput {
+        design: design.to_owned().into(),
+        offset: offset.to_owned(),
+        design_noise: None,
+        offset_noise: None,
+        auxiliary_scalar: None,
+        auxiliary_matrix: None,
+    };
+    predictor
+        .predict_posterior_mean(
+            &input,
+            fit,
+            &PosteriorMeanOptions {
+                confidence_level,
+                covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
+                include_observation_interval: false,
+            },
+        )
+        .expect("production Gaussian posterior prediction")
 }
 
-fn gaussian_identity_mean_interval(
+fn gaussian_identity_posterior_mean_interval(
     design: ArrayView2<'_, f64>,
     fit: &UnifiedFitResult,
     offset: ArrayView1<'_, f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    let mean = gaussian_identity_mean(design, fit.beta.view(), offset);
-    let covariance = fit
-        .beta_covariance_corrected()
-        .expect("Gaussian identity coverage requires smoothing-corrected covariance");
-    assert_eq!(covariance.nrows(), fit.beta.len());
-    assert_eq!(covariance.ncols(), fit.beta.len());
-
-    let mut eta_se = Array1::<f64>::zeros(design.nrows());
-    for (i, row) in design.outer_iter().enumerate() {
-        let cov_row = covariance.dot(&row);
-        eta_se[i] = row.dot(&cov_row).max(0.0).sqrt();
-    }
-    let z_se = eta_se.mapv(|se| NORMAL_95_TWO_SIDED_Z * se);
-    let lower = &mean - &z_se;
-    let upper = &mean + &z_se;
-    (mean, lower, upper)
+    let prediction = gaussian_identity_posterior(design, fit, offset, Some(NOMINAL_COVERAGE));
+    assert_eq!(
+        prediction.uncertainty_covariance_source,
+        Some(InferenceCovarianceMode::SmoothingCorrected)
+    );
+    (
+        prediction.mean,
+        prediction
+            .mean_lower
+            .expect("posterior credible lower bound"),
+        prediction
+            .mean_upper
+            .expect("posterior credible upper bound"),
+    )
 }
 
 // ─── Main stress test ───────────────────────────────────────────────────
@@ -507,11 +536,13 @@ fn large_scale_reml_stress_main() {
     let holdout_dense = holdout_design.design.to_dense();
     let holdout_offset = Array1::<f64>::zeros(N_HOLDOUT);
 
-    let pred_mean = gaussian_identity_mean(
+    let pred_mean = gaussian_identity_posterior(
         holdout_dense.view(),
-        fitted.fit.beta.view(),
+        &fitted.fit,
         holdout_offset.view(),
-    );
+        None,
+    )
+    .mean;
     assert!(pred_mean.iter().all(|v| v.is_finite()));
     let rel_l2 = relative_l2(&pred_mean, &y_true_holdout);
 
@@ -544,7 +575,7 @@ fn large_scale_reml_stress_main() {
     //
     // All-zero means the scales never moved off their seed and the smooth is
     // still isotropic in six dimensions whatever the spec asked for.
-    let aniso_report = match gam::smooth::get_spatial_aniso_log_scales(&frozenspec, 0) {
+    let aniso_report = match gam_terms::smooth::get_spatial_aniso_log_scales(&frozenspec, 0) {
         Some(eta) if !eta.is_empty() => {
             let moved = eta.iter().any(|v| v.abs() > 1e-8);
             let parts: Vec<String> = eta.iter().map(|v| format!("{v:+.4}")).collect();
@@ -590,11 +621,20 @@ fn large_scale_reml_stress_main() {
          which this bar is out of reach.",
     );
 
-    // (3) The held-out Gaussian identity prediction must stay finite after a
-    //     successful REML fit.
-    let pred_unc_mean =
-        gaussian_identity_mean(holdout_dense.view(), fitted.fit.beta.view(), holdout_offset.view());
+    // (3) The production posterior mean stays unchanged when credible
+    //     intervals are requested, and smoothing-corrected bounds are finite.
+    let (pred_unc_mean, lower, upper) = gaussian_identity_posterior_mean_interval(
+        holdout_dense.view(),
+        &fitted.fit,
+        holdout_offset.view(),
+    );
     assert!(pred_unc_mean.iter().all(|v| v.is_finite()));
+    assert!(lower.iter().chain(upper.iter()).all(|v| v.is_finite()));
+    assert!(
+        (&pred_unc_mean - &pred_mean)
+            .iter()
+            .all(|v| v.abs() < f64::EPSILON.sqrt())
+    );
 
     // (4) The outer loop converged inside its configured budget rather than
     //     stopping because it ran out of iterations.
@@ -876,7 +916,7 @@ fn large_scale_reml_stress_coverage() {
             .expect("Gaussian identity coverage requires the conditional covariance")
             .clone();
         let offset_te = Array1::<f64>::zeros(N_COVERAGE_HOLDOUT);
-        let (pred_mean, pred_lower, pred_upper) = gaussian_identity_mean_interval(
+        let (pred_mean, pred_lower, pred_upper) = gaussian_identity_posterior_mean_interval(
             holdout_dense.view(),
             &fitted.fit,
             offset_te.view(),
