@@ -103,7 +103,7 @@ class Smooth(_BasisDescriptor):
         ``"monotone_increasing"`` (f'(x) ≥ 0 everywhere on the data range),
         ``"monotone_decreasing"`` (f'(x) ≤ 0), ``"convex"`` (f''(x) ≥ 0),
         or ``"concave"`` (f''(x) ≤ 0). Shape constraints are enforced by
-        the inner solver as joint linear inequalities ``A·β ≤ b`` on the
+        the inner solver as joint linear inequalities ``A·β ≥ b`` on the
         coefficient vector (the constraint matrix ``A`` is generated from
         the basis on a dense 1D grid spanning the data range, so the
         inequality at the grid points implies the constraint on the
