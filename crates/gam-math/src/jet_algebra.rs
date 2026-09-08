@@ -375,7 +375,8 @@ fn build_partitions(
     if elem == m {
         let mut packed = PackedPartition {
             blocks: [0u8; MAX_SLOTS],
-            n_blocks: n_blocks as u8,
+            n_blocks: u8::try_from(n_blocks)
+                .expect("partition block count must fit the fixed-width representation"),
         };
         packed.blocks[..n_blocks].copy_from_slice(&blocks[..n_blocks]);
         out.push(packed);

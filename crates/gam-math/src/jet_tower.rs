@@ -434,7 +434,6 @@ impl<const K: usize> Tower4<K> {
         self.compose_unary(ln_gamma_derivative_stack(self.v))
     }
 
-
     /// Contract `t3` with one primary-space direction:
     /// `out[a][b] = Σ_c t3[a][b][c] · dir[c]` — exactly the
     /// `row_third_contracted` shape.
@@ -486,7 +485,6 @@ impl<const K: usize> Tower4<K> {
         }
         out
     }
-
 }
 
 impl<const K: usize> jet_algebra::JetAlgebra<5> for Tower4<K> {
@@ -1147,13 +1145,16 @@ const BERNOULLI_EVEN: [(usize, f64); 10] = [
 
 fn polygamma_recurrence_term(order: usize, x: f64) -> f64 {
     let sign = if order % 2 == 1 { 1.0 } else { -1.0 };
-    sign * factorial(order) / x.powi((order + 1) as i32)
+    sign * factorial(order)
+        / x.powi(i32::try_from(order + 1).expect("supported derivative order fits i32"))
 }
 
 fn digamma_asymptotic(x: f64) -> f64 {
     let mut out = x.ln() - 0.5 / x;
     for (bernoulli_order, bernoulli) in BERNOULLI_EVEN {
-        out -= bernoulli / (bernoulli_order as f64 * x.powi(bernoulli_order as i32));
+        out -= bernoulli
+            / (bernoulli_order as f64
+                * x.powi(i32::try_from(bernoulli_order).expect("Bernoulli order fits i32")));
     }
     out
 }
@@ -1165,15 +1166,20 @@ fn polygamma_asymptotic(order: usize, x: f64) -> f64 {
 
     let order_factorial = factorial(order);
     let leading_sign = if order % 2 == 1 { 1.0 } else { -1.0 };
-    let mut out = leading_sign * factorial(order - 1) / x.powi(order as i32)
-        + leading_sign * order_factorial / (2.0 * x.powi((order + 1) as i32));
+    let mut out = leading_sign * factorial(order - 1)
+        / x.powi(i32::try_from(order).expect("supported derivative order fits i32"))
+        + leading_sign * order_factorial
+            / (2.0
+                * x.powi(i32::try_from(order + 1).expect("supported derivative order fits i32")));
 
     let bernoulli_sign = if order % 2 == 1 { 1.0 } else { -1.0 };
     for (bernoulli_order, bernoulli) in BERNOULLI_EVEN {
         let rising = rising_factorial(bernoulli_order, order);
         out += bernoulli_sign * bernoulli * rising
             / bernoulli_order as f64
-            / x.powi((bernoulli_order + order) as i32);
+            / x.powi(
+                i32::try_from(bernoulli_order + order).expect("combined derivative order fits i32"),
+            );
     }
     out
 }
@@ -1306,7 +1312,7 @@ pub trait RowProgram<const K: usize>: Send + Sync {
     /// uses ONLY [`crate::jet_scalar::JetScalar`] ops and per-row data (response,
     /// censoring, offsets) entering as constants.
     fn eval<S: crate::jet_scalar::JetScalar<K>>(&self, row: usize, p: &[S; K])
-    -> Result<S, String>;
+        -> Result<S, String>;
 }
 
 /// Maximum size of one canonical dense-jet storage object kept on the call
@@ -1950,9 +1956,9 @@ mod tests {
         const TAU: f64 = 1.3; // the link-knot crossing threshold τ
         let g_idx = 1usize;
         let g0 = 0.85_f64; // the slope value b (the g-primary IS the slope)
-        // Stand-in intercept tower a(θ): nonzero value, gradient, Hessian in the
-        // two live axes so a_u and a_uv are both exercised. (In production this
-        // comes from implicit_solve; here we plant known derivatives.)
+                           // Stand-in intercept tower a(θ): nonzero value, gradient, Hessian in the
+                           // two live axes so a_u and a_uv are both exercised. (In production this
+                           // comes from implicit_solve; here we plant known derivatives.)
         let mut a = Tower4::<3>::constant(0.45);
         a.g[0] = 0.7;
         a.g[1] = -0.3;
@@ -2206,7 +2212,6 @@ mod derivative_stack_tests {
             }
         }
     }
-
 }
 
 // ── Contraction-symmetry optimization gate ────────────────────────────────────
@@ -2398,7 +2403,7 @@ mod contraction_symmetry_tests {
     /// randomised order, and reports its own resolution).
     #[test]
     fn contraction_symmetry_speedup_is_reported() {
-        use crate::paired_timing::{SpeedGate, paired_interleaved};
+        use crate::paired_timing::{paired_interleaved, SpeedGate};
 
         const K: usize = 9;
         let mut r = Rng(0xC0FF_EE99_1234_5678);
