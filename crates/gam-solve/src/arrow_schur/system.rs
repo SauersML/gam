@@ -940,16 +940,19 @@ impl ArrowSchurSystem {
         assert_eq!(latent.latent_dim(), self.d);
         for (i, row) in self.rows.iter_mut().enumerate() {
             let t_i = ArrayView1::from(latent.row(i));
-            let gt_e = row.gt.clone();
-            let htt_e = row.htt.clone();
-            let htbeta_e = row.htbeta.clone();
-            row.gt = manifold.project_gradient_to_tangent(t_i, gt_e.view());
-            row.htt = manifold.riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
-            row.htbeta = manifold.project_matrix_columns_to_gradient_tangent(
+            let gt = manifold.project_gradient_to_tangent(t_i, row.gt.view());
+            let htt = manifold.riemannian_hessian_matrix(t_i, row.gt.view(), row.htt.view());
+            let htbeta = manifold.project_matrix_columns_to_gradient_tangent(
                 t_i,
-                gt_e.view(),
-                htbeta_e.view(),
+                row.gt.view(),
+                row.htbeta.view(),
             );
+            // Assembly recycles these row buffers across accepted iterates.
+            // Project from the original Euclidean blocks before overwriting
+            // their contents, preserving both the geometry and the allocations.
+            row.gt.assign(&gt);
+            row.htt.assign(&htt);
+            row.htbeta.assign(&htbeta);
         }
     }
 

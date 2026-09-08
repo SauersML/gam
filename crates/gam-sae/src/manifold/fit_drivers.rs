@@ -9159,14 +9159,14 @@ mod projection_policy_tests {
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             Array2::<f64>::zeros((1, 1)),
             vec![coordinates.clone()],
-            vec![SaeAtomBasisKind::Sphere.latent_manifold(2)],
+            vec![SaeAtomBasisKind::Sphere.latent_manifold(3)],
             AssignmentMode::softmax(1.0),
         )
         .unwrap();
         let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
 
         let before = term.assignment.coords[0].as_matrix();
-        term.seed_coords_by_decoder_projection(Array2::<f64>::zeros((1, 2)).view())
+        term.seed_coords_by_decoder_projection(Array2::<f64>::zeros((1, 3)).view())
             .expect("compact multivariate chart is skipped, not an error");
         assert_eq!(term.assignment.coords[0].as_matrix(), before);
     }

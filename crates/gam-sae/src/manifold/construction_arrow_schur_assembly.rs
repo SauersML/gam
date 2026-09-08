@@ -527,7 +527,13 @@ impl SaeManifoldTerm {
             self.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
             Array2::<f64>::zeros((0, 0))
         };
-        let (rows_workspace, gb_workspace) = self.take_arrow_assembly_buffers();
+        let (rows_workspace, mut gb_workspace) = self.take_arrow_assembly_buffers();
+        // The framed output gradient has a different width from the full-beta
+        // accumulation below. Retain its buffer until the projection is ready.
+        let mut framed_gb_workspace = Array1::<f64>::zeros(0);
+        if frames_engaged {
+            std::mem::swap(&mut framed_gb_workspace, &mut gb_workspace);
+        }
         let mut sys = ArrowSchurSystem::new_with_assembly_buffers(
             per_row_dims,
             beta_dim,
@@ -614,7 +620,6 @@ impl SaeManifoldTerm {
             .collect();
         struct SaeAssemblyRow {
             pub(crate) row: usize,
-            pub(crate) block: ArrowRowBlock,
             pub(crate) gb_delta: Vec<(usize, f64)>,
             pub(crate) g_blocks: SaeGBlocks,
             pub(crate) kron_a_phi: Option<Vec<(usize, f64)>>,
@@ -678,7 +683,7 @@ impl SaeManifoldTerm {
             }
             None => (k_atoms, q),
         };
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
         // #1033 large-n: fold the per-row assembly results in row-ordered CHUNKS
         // rather than collecting all `n` `SaeAssemblyRow`s at once. The previous
         // path materialized the FULL `Vec<SaeAssemblyRow>` (every row's htt/gt
@@ -715,8 +720,9 @@ impl SaeManifoldTerm {
         while chunk_start < n {
             let chunk_end = (chunk_start + assembly_chunk_rows).min(n);
             let mut fold_offset_in_chunk = 0usize;
-            let row_results: Vec<SaeAssemblyRow> = (chunk_start..chunk_end)
-                .into_par_iter()
+            let row_results: Vec<SaeAssemblyRow> = sys.rows[chunk_start..chunk_end]
+                .par_iter_mut()
+                .enumerate()
                 .map_init(
                     || RowScratch {
                         decoded: Array2::<f64>::zeros((decoded_rows, p)),
@@ -729,7 +735,8 @@ impl SaeManifoldTerm {
                         decoded_scratch: vec![0.0_f64; p],
                         assignments: Array1::<f64>::zeros(k_atoms),
                     },
-                    |scratch, row| -> Result<SaeAssemblyRow, String> {
+                    |scratch, (row_in_chunk, block)| -> Result<SaeAssemblyRow, String> {
+                        let row = chunk_start + row_in_chunk;
                         // #1557 — mark this rayon row worker as a nested data-parallel
                         // region so any faer GEMM reached transitively from the per-row
                         // assembly (frame `Uᵀ` products, the per-row cross-block /
@@ -953,8 +960,8 @@ impl SaeManifoldTerm {
                             }
                         }
 
-                        // Build the per-row Arrow-Schur block at the row's active dim.
-                        let mut block = ArrowRowBlock::new(q_row, row_htbeta_dim);
+                        // Fill the zeroed row buffer admitted by the system
+                        // constructor; each worker owns a disjoint row.
                         for a in 0..q_row {
                             let jac_a = &jac_white[a * w_dim..(a + 1) * w_dim];
                             let g = jac_a
@@ -1363,7 +1370,6 @@ impl SaeManifoldTerm {
                         };
                         Ok(SaeAssemblyRow {
                             row,
-                            block,
                             gb_delta,
                             g_blocks,
                             kron_a_phi,
@@ -1424,7 +1430,6 @@ impl SaeManifoldTerm {
                     // Ascending row arrival ⇒ `frame_support[row]` aligns to `row`.
                     frame_support_rows.push(sup);
                 }
-                sys.rows[row] = row_result.block;
             }
             chunk_start = chunk_end;
         }
@@ -1455,13 +1460,14 @@ impl SaeManifoldTerm {
                                 this.compact_row_ext_manifold_and_point(row_idx, layout);
                             let t_i = point_i.view();
                             let gt_e = row.gt.clone();
-                            let htt_e = row.htt.clone();
-                            row.gt = manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
-                            row.htt = manifold_i.riemannian_hessian_matrix(
+                            let gt = manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
+                            let htt = manifold_i.riemannian_hessian_matrix(
                                 t_i,
                                 gt_e.view(),
-                                htt_e.view(),
+                                row.htt.view(),
                             );
+                            row.gt.assign(&gt);
+                            row.htt.assign(&htt);
                         };
                         let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN
                             && rayon::current_thread_index().is_none();
@@ -1625,13 +1631,14 @@ impl SaeManifoldTerm {
                                 this.compact_row_ext_manifold_and_point(row_idx, layout);
                             let t_i = point_i.view();
                             let gt_e = row.gt.clone();
-                            let htt_e = row.htt.clone();
-                            row.gt = manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
-                            row.htt = manifold_i.riemannian_hessian_matrix(
+                            let gt = manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
+                            let htt = manifold_i.riemannian_hessian_matrix(
                                 t_i,
                                 gt_e.view(),
-                                htt_e.view(),
+                                row.htt.view(),
                             );
+                            row.gt.assign(&gt);
+                            row.htt.assign(&htt);
                             (manifold_i, point_i, gt_e)
                         };
                     // Frames arm: `htbeta` column projection with the SAME pre-projection
@@ -1639,12 +1646,12 @@ impl SaeManifoldTerm {
                     let frames_row = |row_idx: usize, row: &mut ArrowRowBlock| {
                         let (manifold_i, point_i, gt_e) = project_gt_htt(row_idx, row);
                         let t_i = point_i.view();
-                        let htbeta_e = row.htbeta.clone();
-                        row.htbeta = manifold_i.project_matrix_columns_to_gradient_tangent(
+                        let htbeta = manifold_i.project_matrix_columns_to_gradient_tangent(
                             t_i,
                             gt_e.view(),
-                            htbeta_e.view(),
+                            row.htbeta.view(),
                         );
+                        row.htbeta.assign(&htbeta);
                     };
                     // Matrix-free arm: Kronecker local-Jacobian column projection with the
                     // SAME pre-projection gradient `gt_e` so the cross-block geometry
@@ -1883,13 +1890,13 @@ impl SaeManifoldTerm {
         // that expansion is `ne²·2Mp` to build and `ne·sMp` to store and apply,
         // and it was 86% of the curved tier at `p=2048, charts=32` (#2731).
         let mut sep_curvature: Vec<SeparationBarrierCurvature> = Vec::new();
-        // #2343 — amplitude barrier FIRST: its radial ridge lands in the SAME
-        // shared `sep_atom_curv` the separation barrier's `lev` uses, folded once
-        // below regardless of which barrier(s) engaged.
-        let amplitude_wrote = self.add_sae_amplitude_barrier(
+        // The amplitude majorizer is a per-atom scalar ridge on every layout.
+        // Keep it in the structured smooth blocks even when other penalties
+        // use dense storage. Marking this ridge as dense disables framed device
+        // data although the device operator represents it exactly (#2627).
+        self.add_sae_amplitude_barrier(
             &mut sys,
             penalty_scale,
-            dense_beta_curvature,
             &mut sep_atom_curv,
         );
         let separation_wrote = self.add_sae_separation_barrier(
@@ -1899,32 +1906,25 @@ impl SaeManifoldTerm {
             &mut sep_atom_curv,
             &mut sep_curvature,
         );
-        if amplitude_wrote || separation_wrote {
-            if dense_beta_curvature {
-                beta_penalty_assembly.record_curvature(true);
-            } else {
-                // Fold the per-atom majorizer `lev_k·I_{M_k}` (from BOTH barriers)
-                // into the smooth penalty factor `λ S_k`. With `⊗ I_p` (full-`B`) or
-                // `⊗ I_{r_k}` (factored, `U_kᵀU_k = I`) this is exactly the `lev_k·I`
-                // block diagonal the dense path writes — and it now flows through the
-                // structured penalty op and the device smooth blocks. No
-                // `deferred_factored` mark: the curvature is in the smooth op, not
-                // a deferred dense block, so the device path stays engaged.
-                for atom_idx in 0..self.atoms.len() {
-                    let c = sep_atom_curv[atom_idx];
-                    if c > 0.0 {
-                        let m = smooth_scaled_s[atom_idx].nrows();
-                        for i in 0..m {
-                            smooth_scaled_s[atom_idx][[i, i]] += c;
-                        }
-                        smooth_ops[atom_idx] = Arc::new(IdentityRightKroneckerPenaltyOp {
-                            factor_a: smooth_scaled_s[atom_idx].clone(),
-                            p,
-                            global_offset: beta_offsets[atom_idx],
-                            k: beta_dim,
-                        });
-                    }
+        if separation_wrote && dense_beta_curvature {
+            beta_penalty_assembly.record_curvature(true);
+        }
+        // Fold scalar majorizers into λ S_k on every layout. With ⊗ I_p
+        // (full decoder) or ⊗ I_r (orthonormal frame), this is the same ridge
+        // as a dense diagonal and also reaches the device smooth blocks.
+        for atom_idx in 0..self.atoms.len() {
+            let c = sep_atom_curv[atom_idx];
+            if c > 0.0 {
+                let m = smooth_scaled_s[atom_idx].nrows();
+                for i in 0..m {
+                    smooth_scaled_s[atom_idx][[i, i]] += c;
                 }
+                smooth_ops[atom_idx] = Arc::new(IdentityRightKroneckerPenaltyOp {
+                    factor_a: smooth_scaled_s[atom_idx].clone(),
+                    p,
+                    global_offset: beta_offsets[atom_idx],
+                    k: beta_dim,
+                });
             }
         }
         if frames_engaged {
@@ -2064,7 +2064,12 @@ impl SaeManifoldTerm {
             // factored coordinates, so analytic row supplements and data-fit
             // cross terms already share shape `(q_i × factored_border_dim)`.
             sys.k = border_dim;
-            sys.gb = gb_c;
+            if framed_gb_workspace.len() == border_dim {
+                framed_gb_workspace.assign(&gb_c);
+            } else {
+                framed_gb_workspace = gb_c;
+            }
+            sys.gb = framed_gb_workspace;
             self.reclaim_border_hbb_workspace(&mut sys);
             // Factored per-atom block ranges for the block-Jacobi Schur
             // preconditioner: `[off_C[k] .. off_C[k] + M_k·r_k]`.

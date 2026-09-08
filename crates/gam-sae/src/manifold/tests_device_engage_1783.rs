@@ -223,6 +223,67 @@ fn framed_circle_isometry_fit_builds_device_sae_pcg_data_1783() {
     );
 }
 
+/// A scalar amplitude ridge must reach both the CPU and device operators on
+/// either side of the dense-penalty threshold. Scale the decoder so this ridge
+/// is numerically visible beside the data Gram, then use its analytic radial
+/// second derivative as an independent reference.
+#[test]
+fn framed_amplitude_ridge_preserves_device_data_and_curvature_2627() {
+    let (mut term, mut target, rho) = framed_circle_term();
+    term.atoms[0]
+        .decoder_coefficients_mut()
+        .mapv_inplace(|value| value * 1.0e-6);
+    target.mapv_inplace(|value| value * 1.0e-6);
+    assert_eq!(term.auto_activate_decoder_frames().unwrap(), 1);
+
+    for threshold in [usize::MAX, 1] {
+        let sys = term
+            .assemble_arrow_schur_scaled_with_beta_penalty_probe_threshold(
+                target.view(),
+                &rho,
+                None,
+                1.0,
+                threshold,
+            )
+            .unwrap();
+        let atom = &term.atoms[0];
+        let u = atom
+            .decoder_coefficients()
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>();
+        let f = term
+            .amplitude_barrier_gate
+            .expect("nonzero decoder activates the amplitude barrier");
+        let ridge =
+            2.0 * SAE_AMPLITUDE_BARRIER_STRENGTH * f * (3.0 * u + f) / (u * (u + f).powi(2));
+        let lambda = rho.lambda_smooth_vec().unwrap()[0];
+        let data_gram = atom.basis_values.t().dot(&atom.basis_values);
+        let device = sys
+            .device_sae_pcg
+            .as_ref()
+            .expect("a scalar ridge admits framed device data");
+        assert!(device.frame.is_some());
+        let smooth = &device.smooth_blocks[0].factor_a;
+        let mut diagonal = vec![0.0; sys.k];
+        sys.effective_penalty_op().diagonal(&mut diagonal);
+        let rank = atom.border_frame_rank();
+        for basis in 0..atom.basis_size() {
+            let expected_smooth = lambda * atom.smooth_penalty()[[basis, basis]] + ridge;
+            let expected = data_gram[[basis, basis]] + expected_smooth;
+            let tolerance = 1.0e-11 * expected.abs().max(1.0);
+            assert!(
+                ridge > 100.0 * tolerance,
+                "the reference must detect a dropped ridge"
+            );
+            assert!((smooth[[basis, basis]] - expected_smooth).abs() < tolerance);
+            for frame_axis in 0..rank {
+                assert!((diagonal[basis * rank + frame_axis] - expected).abs() < tolerance);
+            }
+        }
+    }
+}
+
 /// #1783 SCALE HONESTY (pure policy, CPU-observable): the reporter's exact
 /// realistic `d_atom = 1` shape must clear the reduced-Schur offload gate, so on a
 /// CUDA host the device WOULD be selected. The gate was never the blocker for
@@ -274,8 +335,11 @@ fn offload_gate_admits_d_atom_1_at_token_scale_1783() {
 fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
     const K_ATOMS: usize = 32;
     const M: usize = 8;
-    const P: usize = 64;
     const FRAME_RANK: usize = 8;
+    // Distinct output subspaces keep this a device-routing witness. Reusing
+    // the same subspace for several atoms activates the cross-atom separation
+    // curvature, which the scalar-smooth device operator does not represent.
+    const P: usize = K_ATOMS * FRAME_RANK;
     const LATENT_DIM: usize = 1;
     const N_OBS: usize = 32;
 
