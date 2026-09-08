@@ -1,0 +1,6 @@
+
+running 2 tests
+test probability::tests::normal_logcdf_fifth_matches_fourth_derivative ... ok
+test probability::tests::normal_logcdf_fifth_matches_high_precision_reference_979 ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 246 filtered out; finished in 0.00s

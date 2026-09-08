@@ -1,0 +1,25 @@
+
+running 21 tests
+test survival::marginal_slope::psi_terms_fd_tests::a_constant_follow_up_margin_reproduces_the_static_beta_drift_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::a_constant_follow_up_margin_reproduces_the_static_frame_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::a_slope_design_psi_on_a_follow_up_varying_slope_is_refused_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::a_zero_psi_design_derivative_publishes_zero_terms_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::baseline_psi_terms_match_finite_difference_follow_up_axis0_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::baseline_psi_terms_match_finite_difference_follow_up_axis1_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::baseline_psi_terms_match_finite_difference_follow_up_axis2_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::baseline_psi_terms_match_finite_difference_static_axis0_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::baseline_psi_terms_match_finite_difference_static_axis1_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::baseline_psi_terms_match_finite_difference_static_axis2_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::beta_hessian_drift_matches_finite_difference_follow_up_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::beta_hessian_drift_matches_finite_difference_marginal_direction_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::beta_hessian_drift_matches_finite_difference_slope_direction_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::beta_hessian_drift_matches_finite_difference_static_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::beta_hessian_drift_matches_finite_difference_time_direction_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::beta_hessian_second_drift_matches_finite_difference_follow_up_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::beta_hessian_second_drift_matches_finite_difference_slope_pair_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::beta_hessian_second_drift_matches_finite_difference_static_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::marginal_design_psi_terms_match_finite_difference_follow_up_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::marginal_design_psi_terms_match_finite_difference_static_2765 ... ok
+test survival::marginal_slope::psi_terms_fd_tests::slope_design_psi_terms_match_finite_difference_static_2765 ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 1542 filtered out; finished in 0.31s

@@ -1,0 +1,14 @@
+
+running 9 tests
+test survival::marginal_slope::follow_up_domain_tests::a_time_constant_slope_declines_the_joint_step_limit_2765 ... ok
+test survival::marginal_slope::follow_up_domain_tests::a_time_constant_warm_start_is_never_retreated_2765 ... ok
+test survival::marginal_slope::follow_up_domain_tests::an_exterior_warm_start_is_retreated_into_the_domain_2765 ... ok
+test survival::marginal_slope::follow_up_domain_tests::an_interior_step_is_not_limited_2765 ... ok
+test survival::marginal_slope::follow_up_domain_tests::an_interior_warm_start_is_left_alone_2765 ... ok
+test survival::marginal_slope::follow_up_domain_tests::follow_up_value_program_preserves_the_newton_value_without_derivative_work_2765 ... [2765-VALUE] rows=16384 Newton=58.043392ms scalar=13.979897ms speedup=4.152
+ok
+test survival::marginal_slope::follow_up_domain_tests::the_fixture_step_really_leaves_the_domain_2765 ... ok
+test survival::marginal_slope::follow_up_domain_tests::the_joint_step_limit_lands_on_a_point_the_row_program_admits_2765 ... ok
+test survival::marginal_slope::follow_up_domain_tests::the_value_only_likelihood_is_the_frame_kernels_likelihood_2765 ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 1554 filtered out; finished in 0.28s

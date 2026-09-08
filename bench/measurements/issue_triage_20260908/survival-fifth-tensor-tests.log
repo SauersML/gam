@@ -1,0 +1,6 @@
+
+running 2 tests
+test survival::marginal_slope::information_third::tests::static_fifth_matches_differentiated_fourth_for_events_and_censoring ... ok
+test survival::marginal_slope::information_third_dynamic::tests::follow_up_fifth_matches_differentiated_fourth_for_events_and_censoring_2765 ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1561 filtered out; finished in 0.33s
