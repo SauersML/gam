@@ -44,6 +44,8 @@ pub enum WorkflowError {
     /// optimizer / profile-cost evaluation) failed to converge or
     /// produced a non-finite value that downstream code cannot consume.
     IntegrationFailed { reason: String },
+    /// Training data failed the shared fit-boundary contract.
+    InvalidData { column: String, problem: String },
     /// A spatial basis could not be certified at its current resolution and
     /// the next information-bearing expansion could not be fitted. Carries the
     /// attempted resolution and underlying evidence instead of returning the
@@ -82,6 +84,9 @@ impl std::fmt::Display for WorkflowError {
             | WorkflowError::SchemaMismatch { reason }
             | WorkflowError::MissingDependency { reason }
             | WorkflowError::IntegrationFailed { reason } => f.write_str(reason),
+            WorkflowError::InvalidData { column, problem } => {
+                write!(f, "column '{column}' {problem}")
+            }
             WorkflowError::SpatialUnderresolved {
                 term,
                 current_centers,
@@ -141,6 +146,7 @@ impl std::error::Error for WorkflowError {
             | WorkflowError::SchemaMismatch { .. }
             | WorkflowError::MissingDependency { .. }
             | WorkflowError::IntegrationFailed { .. }
+            | WorkflowError::InvalidData { .. }
             | WorkflowError::SpatialUnderresolved { .. }
             | WorkflowError::ColumnNotFound { .. } => None,
         }
@@ -278,6 +284,9 @@ impl From<gam_data::DataError> for WorkflowError {
             | DataError::EncodingFailure { reason }
             | DataError::EmptyInput { reason }
             | DataError::InvalidValue { reason } => Self::InvalidConfig { reason },
+            DataError::DegenerateColumn { column, problem } => {
+                Self::InvalidData { column, problem }
+            }
         }
     }
 }
