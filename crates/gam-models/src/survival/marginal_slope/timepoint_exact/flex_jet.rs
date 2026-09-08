@@ -3084,14 +3084,12 @@ fn add_coefficient_row(
     Ok(())
 }
 
-fn lifted_coefficient_affine<J: FlexCoefficientJet>(
+fn coefficient_affine<J: FlexCoefficientJet>(
     value: f64,
     gradient: Vec<f64>,
     coefficient_direction: Option<&FlexCoefficientRowDirection<'_>>,
     design_affected: bool,
-    family_first: f64,
-    family_second: f64,
-) -> Dual2<J> {
+) -> J {
     let dimension = gradient.len();
     let mut directional_gradient = vec![0.0; dimension];
     let directional_value = match coefficient_direction {
@@ -3117,8 +3115,20 @@ fn lifted_coefficient_affine<J: FlexCoefficientJet>(
         }
         Some(FlexCoefficientRowDirection::Design { .. }) => 0.0,
     };
+    J::affine(value, gradient, directional_value, directional_gradient)
+}
+
+fn lifted_coefficient_affine<J: FlexCoefficientJet>(
+    value: f64,
+    gradient: Vec<f64>,
+    coefficient_direction: Option<&FlexCoefficientRowDirection<'_>>,
+    design_affected: bool,
+    family_first: f64,
+    family_second: f64,
+) -> Dual2<J> {
+    let dimension = gradient.len();
     Dual2 {
-        v: J::affine(value, gradient, directional_value, directional_gradient),
+        v: coefficient_affine(value, gradient, coefficient_direction, design_affected),
         g: J::constant(family_first, dimension),
         h: J::constant(family_second, dimension),
     }
@@ -3388,16 +3398,14 @@ impl SurvivalMarginalSlopeFamily {
                 first.derivative_exit,
                 second.derivative_exit,
             );
-            let beta_wiggle_jets: Vec<Dual2<J>> = time_tail
+            let beta_wiggle_jets: Vec<J> = time_tail
                 .clone()
                 .map(|local_axis| {
-                    lifted_coefficient_affine::<J>(
+                    coefficient_affine::<J>(
                         beta_time[local_axis],
                         one_hot_coefficient_gradient(dimension, slices.time.start + local_axis),
                         coefficient_direction,
                         false,
-                        0.0,
-                        0.0,
                     )
                 })
                 .collect();

@@ -10,7 +10,12 @@ Sources: [issue and original deployment plan](https://github.com/SauersML/gam/is
 
 ## Current counterexamples
 
-1. [Release run 34250437216](https://github.com/SauersML/gam/actions/runs/34250437216)
+1. The newer [release run 34262907256](https://github.com/SauersML/gam/actions/runs/34262907256)
+   at `9cda85f8a01565e4cbc1de4ed9c32007f58a0072` still fails rigid BMS
+   contracted third (**0.991894**, wins 0.07, resolution 0.0064) and full
+   third (**0.996361**, wins 0.13, resolution 0.0141). Earlier green evidence
+   therefore does not establish a durable strict speed advantage.
+   [Release run 34250437216](https://github.com/SauersML/gam/actions/runs/34250437216)
    at `d82efb558d2119c784a867ecd9378062e8ff83ae` failed two macro speed cells:
    rigid BMS `third_full`, hand/generated median ratio **0.932480**, wins
    **0.00**, resolution **0.0057**; SLS V/G/H **0.992762**, wins **0.07**,
@@ -47,7 +52,7 @@ Sources: [issue and original deployment plan](https://github.com/SauersML/gam/is
 | Implicit roots and moving cell boundaries | One implemented value/derivative expression, differentiated maps, and independent boundary/implicit witnesses | Current source and runtime audit pending |
 | Strongest-hand speed evidence for every shipped lowering | Same-contract, same-input, same-output, paired release measurements; full matrices consumed | Incomplete: runtime SLS and BMS flex proxy opponents remain; macro failures above |
 | Continuous release enforcement | Derived tests resolve and execute; no unasserted timer or skipped cell counted as acceptance | BMS flex enforcement repair under validation; runner coverage audit pending |
-| Timewiggle-q compose layer faster than optimized analytic reference | Current full-output hand parity and release measurement of the disputed compose layer | Pending; primitive or arena timing is not sufficient |
+| Timewiggle-q compose layer faster than optimized analytic reference | Current full-output hand parity and release measurement of the disputed compose layer | Original analytic-basis opponent now beaten in isolated MSI measurements, with an enforced source gate; integrated release and strongest-hand schedule still pending |
 | GPU end-to-end regression (reported 0.69x at n=32768/r=20) | Transfer-inclusive current CPU/GPU comparison at that shape and relevant dispatch behavior, with utilization | Pending; CUDA compilation alone is insufficient |
 | SAE non-softmax/IBP/JumpReLU strongest-hand comparison | Equivalent live prior and reconstruction semantics, all-channel parity and optimized hand timing | Current independent-gate hand test exists; opponent and mode coverage audit pending |
 | Runtime-width SLS wiggle, orders two through four | Runtime-sized analytic hand opponent and complete channel parity/timing | Incomplete: current test measures allocation policy |
@@ -224,3 +229,46 @@ MSI after the repair. The warm direct-rustc build took 9.64 seconds at opt-level
 2 with four pinned CPUs; tests took 0.15 seconds on one CPU. Logs:
 `.buildd/issue932-ladder-before.log` and `.buildd/issue932-ladder-after.log`.
 These are correctness results; no speed conclusion is drawn from this build.
+
+The timewiggle coefficient map now expresses a production invariant in its
+scalar interface: coefficients are fixed in the outer family direction, while
+their inner coefficient jets remain live. This removes construction and
+multiplication of zero family-derivative jets without dropping mixed
+coefficient/family channels. Exit value and slope are evaluated together, with
+identical supplied polynomial stacks sharing their complete weighted term.
+The existing family-geometry body is unchanged; the scalar program and its
+tests moved to `timewiggle_geometry/scalar_q.rs`. A small MSI harness includes
+that production source directly instead of copying its implementation.
+
+The new paired gate first failed on the original arithmetic: analytic/production
+ratios **0.846274 / 0.864490** for `Dual2<Order2<5>>` and
+`Dual2<OneSeed<5>>`, both wins 0.00. The final candidate passes at
+**1.111911 / 1.211732**, both wins 1.00, resolutions 0.0047 / 0.0117. Each
+measurement uses 15 interleaved repetitions and consumes every channel from 64
+varied rows per arm call. The opponent is the historical polynomial/exp scalar
+program, **not** a fully hand-expanded runtime-width spline schedule. This does
+not discharge that separate requirement. The benchmark uses opt-level 3, one
+codegen unit and LTO off; integrated release CI remains required. Logs:
+`.buildd/issue932-timewiggle-baseline.log` and
+`.buildd/issue932-timewiggle-final.log`.
+
+All five isolated tests pass, including a new direct-polynomial witness at
+widths 0, 1, 2, 7 and 32 with nonzero coefficient Hessians and mixed family
+channels. The MSI model integration build completed in **129.40 seconds** with
+the existing warm dependencies, optimization disabled, four pinned CPUs and a
+150-second cap. It passed all **72** issue-932 correctness witnesses (8.25 s)
+and all **28** timewiggle integration tests (31.92 s). The latter include the
+public family/design workspace, joint-Hessian FD, operator/dense agreement,
+and baseline-family derivative consumers. Logs:
+`.buildd/issue932-timewiggle-model-build.log`,
+`.buildd/issue932-timewiggle-model-witnesses.log`, and
+`.buildd/issue932-timewiggle-integration.log`. CI's marker parser finds
+`release_timewiggle_q_vs_analytic_basis_program_932`, and the integrated binary
+lists exactly that new test.
+
+The completed model job `102185652642` in release run **34262907256** also
+validates the shortened BMS flex gate: all four cells pass, with dynamic/fixed
+ratios **1.049541 / 2.866422** for score-warp orders 3/4 and
+**1.021672 / 4.639822** for link-dev orders 3/4; all wins are 1.00. Its opponent
+remains a dynamic jet. The run as a whole fails the two rigid macro cells
+listed above, so it is not a whole-population acceptance result.
