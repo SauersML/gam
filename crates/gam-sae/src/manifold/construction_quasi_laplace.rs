@@ -839,7 +839,6 @@ impl SaeManifoldTerm {
             base_refine_iter
         };
         let mut previous_refine_grad_norm: Option<f64> = None;
-        let mut saw_refine_progress = false;
         // #2234 — one progress-gated extra refinement window (see the budget
         // escalation at the non-convergence refusal below). 0 until granted.
         let mut budget_escalation_extra = 0usize;
@@ -1165,7 +1164,6 @@ impl SaeManifoldTerm {
                             progress_refine_iter,
                             previous_refine_grad_norm,
                             grad_norm,
-                            saw_refine_progress,
                         );
                         if total_inner_iter >= refine_limit {
                             // #1117/#1118 — pre-stationarity genuinely-indefinite
@@ -1208,8 +1206,6 @@ impl SaeManifoldTerm {
                         }
                         let remaining = refine_limit - total_inner_iter;
                         let refine_iter = inner_max_iter.max(1).min(remaining);
-                        saw_refine_progress |=
-                            Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
                         previous_refine_grad_norm = Some(grad_norm);
                         let refine = self.run_joint_fit_arrow_schur_for_quasi_laplace(
                             target,
@@ -1238,7 +1234,6 @@ impl SaeManifoldTerm {
                 progress_refine_iter,
                 previous_refine_grad_norm,
                 grad_norm,
-                saw_refine_progress,
             );
             let effective_refine_limit = refine_limit
                 .checked_add(budget_escalation_extra)
@@ -1255,8 +1250,8 @@ impl SaeManifoldTerm {
                 // line search sees cliffs in all directions, and the outer fit
                 // freezes at a live gradient and refuses to mint (measured
                 // fleet-wide 2026-07-10: gam-sae 126 test failures, ten-orders
-                // cost-lane disagreement at one ρ). A solve that is MEASURABLY
-                // DESCENDING (`saw_refine_progress`) is an unfinished
+                // cost-lane disagreement at one ρ). A solve whose latest KKT residual is
+                // MEASURABLY DESCENDING is an unfinished
                 // computation, not an infeasibility: grant it one additional
                 // window of the same size and keep refining. The ordinary
                 // nonstationary lane retains that single-window hang bound.
@@ -1343,7 +1338,9 @@ impl SaeManifoldTerm {
                     }
                     last_limit_certificate = Some(predicted_relative_decrease);
                 }
-                if (saw_refine_progress || gradient_stationary) && budget_escalation_extra == 0 {
+                if (refine_limit > base_refine_iter || gradient_stationary)
+                    && budget_escalation_extra == 0
+                {
                     let escalation_window = refine_limit.max(1);
                     // `refine_iteration_limit` is dynamic and may return a
                     // ceiling below the iterations already consumed.  Carry
@@ -1409,7 +1406,6 @@ impl SaeManifoldTerm {
                             polish_escalations += 1;
                             *criterion_fixed_point = false;
                             consecutive_objective_stalls = 0;
-                            saw_refine_progress = true;
                             budget_escalation_extra = total_inner_iter
                                 .saturating_sub(refine_limit)
                                 .saturating_add(refine_limit.max(1));
@@ -1603,8 +1599,6 @@ impl SaeManifoldTerm {
                 )
             })?;
             let refine_iter = inner_max_iter.max(1).min(remaining);
-            saw_refine_progress |=
-                Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
             previous_refine_grad_norm = Some(grad_norm);
             let refine = self.run_joint_fit_arrow_schur_for_quasi_laplace(
                 target,
@@ -1870,7 +1864,6 @@ impl SaeManifoldTerm {
                     )? {
                         *criterion_fixed_point = false;
                         consecutive_objective_stalls = 0;
-                        saw_refine_progress = true;
                         continue;
                     }
                 }
@@ -1913,7 +1906,6 @@ impl SaeManifoldTerm {
                     if orbit.moved() {
                         *criterion_fixed_point = false;
                         consecutive_objective_stalls = 0;
-                        saw_refine_progress = true;
                         log::debug!(
                             "SAE inner refine loop: gauge-orbit descent recovered {:.6e} over \
                              {} round(s) at the objective-stall fixed point (span dim {}, \
@@ -2535,7 +2527,6 @@ impl SaeManifoldTerm {
         progress_refine_iter: usize,
         previous_grad_norm: Option<f64>,
         grad_norm: f64,
-        saw_refine_progress: bool,
     ) -> usize {
         // Flat affine-gauge valleys can keep crawling productively after the
         // historical base budget. Extend only when the measured KKT residual has
@@ -2543,13 +2534,12 @@ impl SaeManifoldTerm {
         // work budget (#968/#1029). Value-order probes pass the base budget as
         // their progress budget, so this branch cannot make probes expensive.
         //
-        // #2230 COST-PROPORTIONAL EXTENSION: `saw_refine_progress` is the
-        // LATEST-round verdict, not a sticky historical OR. The historical
-        // `|=` accumulation meant ONE gradient drop anywhere granted the
-        // 16×/64× extended budget for the rest of the evaluation — an
+        // #2230 COST-PROPORTIONAL EXTENSION: the latest pair of KKT residuals is
+        // the progress verdict. A historical `|=` latch meant ONE gradient drop
+        // anywhere granted the 16×/64× extended budget for the rest of the evaluation — an
         // oscillating or stalled tail then ground the full extended budget on
-        // every criterion eval (the #1094 "kept extending via
-        // saw_refine_progress from earlier rounds" pathology, and the
+        // every criterion eval (the #1094 “kept extending via progress from
+        // earlier rounds” pathology, and the
         // dominant per-eval cost of the measured multi-hour outer churn).
         // Under the per-round contract each extension round must PAY for
         // itself with a monotone KKT-residual decrease; the first
@@ -2560,7 +2550,7 @@ impl SaeManifoldTerm {
             return base_refine_iter;
         }
         let making_progress =
-            saw_refine_progress && Self::refine_round_made_progress(previous_grad_norm, grad_norm);
+            Self::refine_round_made_progress(previous_grad_norm, grad_norm);
         if making_progress && grad_norm.is_finite() {
             progress_refine_iter
         } else {
