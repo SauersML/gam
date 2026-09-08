@@ -5745,7 +5745,7 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
     };
     use crate::row_kernel::RowSet;
 
-    // Event rows (d=1); moderate-tail primaries clear of the monotonicity guard,
+    // Event and mixed censoring rows; moderate-tail primaries clear of the monotonicity guard,
     // matching the joint-Hessian oracle's regime so the ±h·dir stencils stay in
     // the smooth interior of the warp basis and the residual link.
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
@@ -5775,7 +5775,14 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
     // Coefficient layout: [time(1), threshold(1), log_sigma(1), wiggle(pw)].
     let ncoef = 3 + pw;
 
-    for distribution in [ResidualDistribution::Gaussian, ResidualDistribution::Gumbel] {
+    for (distribution, event) in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ]
+    .into_iter()
+    .flat_map(|distribution| [event, [0.0, 1.0, 0.0, 1.0]].map(|event| (distribution, event)))
+    {
         let inverse_link = residual_distribution_inverse_link(distribution);
         let mut family =
             survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
@@ -5843,6 +5850,13 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
                           fmh: &Array2<f64>,
                           fm2h: &Array2<f64>,
                           h: f64| {
+            for matrix in [fph, fp2h, fmh, fm2h] {
+                assert_eq!(matrix.dim(), (ncoef, ncoef));
+                assert!(
+                    matrix.iter().all(|value| value.is_finite()),
+                    "{distribution:?} event={event:?}: non-finite stencil input"
+                );
+            }
             (fp2h.mapv(|x| -x) + fph.mapv(|x| 8.0 * x) - fmh.mapv(|x| 8.0 * x) + fm2h) / (12.0 * h)
         };
 
@@ -5903,6 +5917,12 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
             let mut third_coarse_change = 0.0_f64;
             let mut third_fine_change = 0.0_f64;
             for ((a, b), &analytic) in d_dir_analytic.indexed_iter() {
+                assert!(
+                    [analytic, fd_third[[a, b]], coarse_extrap_third[[a, b]]]
+                        .iter()
+                        .all(|value| value.is_finite()),
+                    "{distribution:?} event={event:?} {label}: non-finite third[{a},{b}]"
+                );
                 let e = (analytic - fd_third[[a, b]]).abs() / (1.0 + analytic.abs());
                 if e > third_max {
                     third_max = e;
@@ -5958,6 +5978,12 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
             let mut fourth_coarse_change = 0.0_f64;
             let mut fourth_fine_change = 0.0_f64;
             for ((a, b), &analytic) in d2_analytic.indexed_iter() {
+                assert!(
+                    [analytic, fd_fourth[[a, b]], coarse_extrap_fourth[[a, b]]]
+                        .iter()
+                        .all(|value| value.is_finite()),
+                    "{distribution:?} event={event:?} {label}: non-finite fourth[{a},{b}]"
+                );
                 let e = (analytic - fd_fourth[[a, b]]).abs() / (1.0 + analytic.abs());
                 if e > fourth_max {
                     fourth_max = e;
@@ -5977,7 +6003,7 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
             let fourth_order_observed =
                 fourth_fine_change < 1.0e-4 || (8.0..=32.0).contains(&fourth_ratio);
             eprintln!(
-                "ZZ932 {distribution:?} {label}: third_max={third_max:.3e} at {third_at:?} \
+                "ZZ932 {distribution:?} event={event:?} {label}: third_max={third_max:.3e} at {third_at:?} \
                  (analytic={:+.9e}, fd={:+.9e}, remainder={third_remainder:.3e}, \
                  raw_ratio={third_ratio:.3}), \
                  fourth_max={fourth_max:.3e} at {fourth_at:?} \

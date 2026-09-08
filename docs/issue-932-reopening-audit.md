@@ -57,7 +57,7 @@ Sources: [issue and original deployment plan](https://github.com/SauersML/gam/is
 | Block10 fourth-order FD convergence omissions | Every required entry covered by a converged independent witness or exact oracle | Pending; skipping unresolved entries cannot prove all-channel correctness |
 | Loosened oracle tolerances and narrowed fixtures | Justified numerical error bounds, wider relevant fixtures, corruption sensitivity | Pending; inspect each affected oracle, not only the repaired rigid test |
 | Removed hand-oracle coverage | Independent replacement for each still-live channel, not a comparison of one lowering with itself | Pending |
-| M=32 complete canonical fourth-order coverage without stack overflow | Executed bounded-stack live-route/canonical test, explicit matrix coverage, no width refusal | Current source and runtime audit pending |
+| M=32 complete canonical fourth-order coverage without stack overflow | Executed bounded-stack live-route/canonical test, explicit matrix coverage, no width refusal | Passed on MSI: four fixtures, every 32×32 third/fourth entry, canonical evaluation on an explicit 1 MiB stack |
 | Moment-order, implicit-lift, heap and CUDA tile costs | Measurements covering the live changes, including common widths at and below 32 | Pending; isolated primitive wins cannot establish total path speed |
 | GPU initialization error distinguishes memory headroom from missing runtime | Current typed failure propagation and behavior tests | Verified at the runtime policy boundary on MSI: zero-memory present runtime survives Auto/Required resolution; allocation fault retains its typed diagnosis |
 
@@ -123,3 +123,32 @@ that `CUDA_ERROR_OUT_OF_MEMORY` remains a `DriverCallFailed` diagnosis. This
 tests the actual policy resolver; it does not claim a physical GPU allocation
 or end-to-end throughput measurement. Log:
 `.buildd/issue932-gpu-memory-contract.log`.
+
+The existing MSI model test binary passed **70 issue-932 correctness witnesses**
+in 4.52 seconds, with serial execution and measurement tests excluded. This
+includes the M=32 bounded-stack test, rigid independent full-tensor algebra and
+corruption controls, Gaussian coefficient-map witnesses, survival joint and
+wiggle Hessians, implicit lifts, moving boundaries, and selected-GPU error
+propagation. The rigid tensor's worst scaled error was **7.694e-16** against
+its **7.105e-15** bound. Log: `.buildd/issue932-current-model-witnesses.log`.
+These are the sources compiled for the model diagnostic above, not a claim
+that all concurrent working-tree edits have been built. A source review also
+found that the SLS higher-order FD oracle's maximum-error accumulation could
+hide NaNs. Its next revision rejects non-finite analytic and stencil entries
+and extends the original Gaussian/Gumbel event fixture to Logistic and mixed
+censoring, while retaining the existing numerical bounds.
+That expanded oracle passed on MSI: 18 distribution/censoring/direction cases,
+all matrix entries checked; the largest scaled fourth error stayed below
+7.3e-6 against the unchanged 1e-4 bound. This correctness-only build disabled
+optimization for the model package while retaining the warmed release
+dependencies; no speed conclusion is drawn from it. Log:
+`.buildd/issue932-sls-fd-expanded.log`.
+
+The historical Block10 test now lives under
+`flex_production_fourth_contraction_matches_scalar_fd_witness`. Running the
+current optimized binary confirmed that its skip is still active: for example,
+`zero_warp_edge/alternating->mixed` entry `[3,3]` produced -0.16347 while the
+coarse/fine FD estimates were -0.16359 and +12.167. The test printed a skip and
+passed. This remains a counterexample to complete fourth-order verification;
+changing the test name and removing the old hand producer did not resolve it.
+Log: `.buildd/issue932-block10-before.log`.
