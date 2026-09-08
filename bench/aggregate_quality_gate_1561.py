@@ -12,11 +12,13 @@ It reads the canonical `[QUALITY_PAIR] ...` telemetry emitted by
 NOT the heterogeneous human `eprintln!` tokens (`gam_test_rmse` vs `gam:{}` vs
 `gam_rmse_truth` ...) that make the scrape unreliable. One row per test.
 
-Per-test signed effect (negative == GAM better, uniformly across metric kinds):
+Per-metric signed effect (negative == GAM better, uniformly across metric kinds):
     lower_is_better : effect = log(gam / reference)
     higher_is_better: effect = log(reference / gam)
 
-Acceptance (matches the issue): one-sided Wilcoxon signed-rank on the effects,
+The experimental unit is the actual libtest `case`, emitted by the test thread,
+not a channel label or metric. Its signed effect is the median of its metric
+effects. Acceptance: one-sided Wilcoxon signed-rank on those per-case medians,
 H1 = median effect < 0 (GAM better), reported overall and per category with a
 Benjamini-Hochberg-adjusted per-category view.
 
@@ -43,6 +45,7 @@ import os
 import re
 import sys
 from collections import defaultdict
+from statistics import median
 
 _LINE = re.compile(
     r"\[QUALITY_PAIR\]\s+"
@@ -52,11 +55,11 @@ _LINE = re.compile(
     r"gam=(?P<gam>\S+)\s+"
     r"reference=(?P<reference>\S+)\s+"
     r"reference_value=(?P<reference_value>\S+)\s+"
-    r"lower_is_better=(?P<lower>true|false)"
+    r"lower_is_better=(?P<lower>true|false)\s+"
+    r"case=(?P<case>\S+)"
 )
 
-# #2395 paired-panel columns, appended after `lower_is_better` so the historical
-# prefix stays byte-identical. Absent on single-shot (unpaired) pairs.
+# #2395 paired-panel columns. Absent on single-shot (unpaired) pairs.
 _PAIRED = re.compile(
     r"folds=(?P<folds>\d+)\s+"
     r"effect_mean=(?P<effect_mean>\S+)\s+"
@@ -70,13 +73,19 @@ _PAIRED = re.compile(
 
 
 def _parse(stream) -> list[dict]:
-    rows: dict[tuple[str, str, str], dict] = {}
+    rows: dict[tuple[str, str, str, str, str], dict] = {}
+    categories = {}
     for raw in stream:
         m = _LINE.search(raw)
         if m is None:
+            if "[QUALITY_PAIR]" in raw:
+                raise ValueError("malformed quality telemetry or missing libtest case; rerun the suite")
             continue
         gam = float(m["gam"])
         ref = float(m["reference_value"])
+        category = categories.setdefault(m["case"], m["category"])
+        if category != m["category"]:
+            raise ValueError(f"one experimental case reported multiple categories: {m['case']}")
         lower = m["lower"] == "true"
         pm = _PAIRED.search(raw, m.end())
         paired = None
@@ -91,10 +100,10 @@ def _parse(stream) -> list[dict]:
                 "gam_wins": int(pm["gam_wins"]),
                 "verdict": pm["verdict"],
             }
-        # de-dup: a retried/parametrized test may emit the same key twice; last wins.
-        key = (m["category"], m["test"], m["metric"])
-        rows[key] = {
+        key = (m["category"], m["case"], m["test"], m["metric"], m["reference"])
+        row = {
             "category": m["category"],
+            "case": m["case"],
             "test": m["test"],
             "metric": m["metric"],
             "gam": gam,
@@ -103,6 +112,9 @@ def _parse(stream) -> list[dict]:
             "lower_is_better": lower,
             "paired": paired,
         }
+        if key in rows and rows[key] != row:
+            raise ValueError(f"conflicting repeated quality observation: {key}")
+        rows[key] = row
     return list(rows.values())
 
 
@@ -138,7 +150,7 @@ def _parse_outcome_tsv(path: str) -> dict[str, dict]:
     and the report distinguishes the causes by name.
     """
     by_cat: dict[str, dict] = defaultdict(
-        lambda: {"executed": 0, "failed": 0, "failed_paths": []}
+        lambda: {"executed": 0, "failed": 0, "failed_paths": [], "cases": set()}
     )
     with open(path, newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
@@ -150,6 +162,7 @@ def _parse_outcome_tsv(path: str) -> dict[str, dict]:
             category = test.split("::", 1)[0]
             rec = by_cat[category]
             rec["executed"] += 1
+            rec["cases"].add(test)
             if outcome not in _TSV_PASS:
                 rec["failed"] += 1
                 cause = (row.get("cause") or "").strip()
@@ -178,7 +191,7 @@ def _parse_nextest(lines: list[str]) -> dict[str, dict]:
     the significance set.
     """
     by_cat: dict[str, dict] = defaultdict(
-        lambda: {"executed": 0, "failed": 0, "failed_paths": []}
+        lambda: {"executed": 0, "failed": 0, "failed_paths": [], "cases": set()}
     )
     for raw in lines:
         m = _NEXTEST.match(_ANSI.sub("", raw))
@@ -188,6 +201,7 @@ def _parse_nextest(lines: list[str]) -> dict[str, dict]:
         category = path.split("::", 1)[0]
         rec = by_cat[category]
         rec["executed"] += 1
+        rec["cases"].add(path)
         if m["status"] not in _NEXTEST_PASS:
             rec["failed"] += 1
             rec["failed_paths"].append(f"{m['status']} {path}")
@@ -198,11 +212,11 @@ def _effect(row: dict) -> float | None:
     gam, ref = row["gam"], row["reference_value"]
     if not (math.isfinite(gam) and math.isfinite(ref)) or gam <= 0.0 or ref <= 0.0:
         return None
-    ratio = gam / ref if row["lower_is_better"] else ref / gam
-    return math.log(ratio)
+    effect = math.log(gam) - math.log(ref)
+    return effect if row["lower_is_better"] else -effect
 
 
-def _wilcoxon_less(effects: list[float]) -> tuple[float, float, int]:
+def _wilcoxon_less(effects: list[float]) -> tuple[float, float, float]:
     """One-sided Wilcoxon signed-rank, H1: median < 0. Returns (W+, z, p).
 
     Normal approximation with continuity + tie correction (adequate for the
@@ -211,7 +225,7 @@ def _wilcoxon_less(effects: list[float]) -> tuple[float, float, int]:
     nz = [e for e in effects if e != 0.0]
     n = len(nz)
     if n == 0:
-        return (0.0, float("nan"), float("nan"))
+        return (0.0, 0.0, 1.0)
     order = sorted(range(n), key=lambda i: abs(nz[i]))
     ranks = [0.0] * n
     i = 0
@@ -224,13 +238,12 @@ def _wilcoxon_less(effects: list[float]) -> tuple[float, float, int]:
             ranks[order[k]] = avg
         i = j + 1
     w_plus = sum(r for e, r in zip(nz, ranks) if e > 0.0)
-    w_minus = sum(r for e, r in zip(nz, ranks) if e < 0.0)
     mean = n * (n + 1) / 4.0
     # tie correction
     tie_term = 0.0
     from collections import Counter
 
-    for c in Counter(round(abs(e), 12) for e in nz).values():
+    for c in Counter(abs(e) for e in nz).values():
         tie_term += c**3 - c
     var = n * (n + 1) * (2 * n + 1) / 24.0 - tie_term / 48.0
     if var <= 0.0:
@@ -242,14 +255,20 @@ def _wilcoxon_less(effects: list[float]) -> tuple[float, float, int]:
 
 
 def _summarize(label: str, rows: list[dict]) -> dict:
-    effects, dropped = [], 0
-    wins = losses = ties = 0
+    by_case = defaultdict(list)
+    invalid_cases = set()
     for row in rows:
+        key = (row["category"], row["case"])
         e = _effect(row)
         if e is None:
-            dropped += 1
-            continue
-        effects.append(e)
+            invalid_cases.add(key)
+        else:
+            by_case[key].append(e)
+    # One independent experimental unit per libtest case. A case with an
+    # invalid metric cannot silently contribute only its surviving metrics.
+    effects = [median(es) for case, es in by_case.items() if case not in invalid_cases]
+    wins = losses = ties = 0
+    for e in effects:
         if e < 0.0:
             wins += 1
         elif e > 0.0:
@@ -257,16 +276,16 @@ def _summarize(label: str, rows: list[dict]) -> dict:
         else:
             ties += 1
     w_plus, z, p = _wilcoxon_less(effects) if effects else (0.0, float("nan"), float("nan"))
-    median = sorted(effects)[len(effects) // 2] if effects else float("nan")
     return {
         "label": label,
-        "n": len(rows),
+        "n": len(set(by_case) | invalid_cases),
+        "pairs": len(rows),
         "scored": len(effects),
-        "dropped_nonfinite": dropped,
+        "dropped_nonfinite": len(invalid_cases),
         "gam_wins": wins,
         "reference_wins": losses,
         "ties": ties,
-        "median_log_ratio": median,
+        "median_log_ratio": median(effects) if effects else float("nan"),
         "wilcoxon_z": z,
         "p_one_sided_gam_better": p,
     }
@@ -331,26 +350,40 @@ def main() -> None:
     print("-" * 72)
     print(_fmt(overall))
     print()
+    recorded_cases = {case for record in nextest.values() for case in record["cases"]}
+    unrecorded_cases = {row["case"] for row in rows} - recorded_cases
+    execution_valid = (
+        bool(nextest)
+        and not unrecorded_cases
+        and all(record["failed"] == 0 for record in nextest.values())
+    )
     verdict = (
         overall["p_one_sided_gam_better"] < 0.05
         and overall["median_log_ratio"] < 0.0
+        and overall["dropped_nonfinite"] == 0
+        and execution_valid
     )
     print(
-        f"CLOSURE (one-sided p<0.05 AND GAM better on median): "
+        f"CLOSURE (per-case p<0.05, negative median, valid metrics, successful recorded execution): "
         f"{'PASS' if verdict else 'FAIL'} "
         f"(p={overall['p_one_sided_gam_better']:.4f}, "
         f"median log(gam/ref)={overall['median_log_ratio']:.4f}, "
         f"wins {overall['gam_wins']} / losses {overall['reference_wins']})"
     )
     if overall["dropped_nonfinite"]:
-        print(f"NOTE: {overall['dropped_nonfinite']} pair(s) dropped (nonfinite/nonpositive).")
+        print(f"INVALID: {overall['dropped_nonfinite']} case(s) have nonfinite/nonpositive metrics; closure blocked.")
+    print(f"Experimental units: {overall['scored']} cases from {len(rows)} metric pairs.")
+    if not execution_valid:
+        print("INCOMPLETE: absent execution record or failed cases; closure blocked.")
+        for case in sorted(unrecorded_cases):
+            print(f"  unrecorded emitting case: {case}")
 
     # Attrition: cross-reference emitted pairs against nextest execution so a
     # test that crashed/refused BEFORE its emit line is visible, not absorbed.
     if nextest:
         emitters = defaultdict(set)
         for row in rows:
-            emitters[row["category"]].add(row["test"].split("::", 1)[0])
+            emitters[row["category"]].add(row["case"])
         print("\n--- execution vs emission (silent-attrition guard) ---")
         print(f"{'category':<12} {'executed':>8} {'failed':>7} {'emitting':>9}")
         total_failed_no_pair = []
@@ -360,8 +393,8 @@ def main() -> None:
                 f"{c:<12} {nx['executed']:>8} {nx['failed']:>7} {len(emitters.get(c, set())):>9}"
             )
             for fp in nx["failed_paths"]:
-                stem = fp.split("::", 1)[-1].split("::")[0] if "::" in fp else fp
-                if stem not in emitters.get(c, set()):
+                case = fp.split(" ", 1)[-1]
+                if case not in emitters.get(c, set()):
                     total_failed_no_pair.append(fp)
         if total_failed_no_pair:
             print(

@@ -626,12 +626,14 @@ impl QualityPair {
     /// The single stable line the aggregator consumes. Values use full `f64`
     /// precision so the log-ratio the Wilcoxon test needs is exact.
     ///
-    /// A paired panel appends its power columns AFTER `lower_is_better`, which
-    /// keeps the historical prefix byte-identical: an aggregator that predates
-    /// #2395 still parses the line, and a newer one reads the extra fields.
+    /// The libtest thread name identifies the experimental unit. Labels and
+    /// metrics can describe several outputs of that one test; they must not
+    /// become independent observations in the whole-suite significance test.
     pub fn line(&self) -> String {
+        let thread = std::thread::current();
+        let case = thread.name().expect("quality telemetry requires a named test thread");
         let head = format!(
-            "[QUALITY_PAIR] category={} test={} metric={} gam={:.12e} reference={} reference_value={:.12e} lower_is_better={}",
+            "[QUALITY_PAIR] category={} test={} metric={} gam={:.17e} reference={} reference_value={:.17e} lower_is_better={} case={}",
             self.category,
             self.test,
             self.metric,
@@ -639,6 +641,7 @@ impl QualityPair {
             self.reference,
             self.reference_value,
             self.lower_is_better,
+            case,
         );
         match &self.folds {
             None => head,
@@ -1102,6 +1105,30 @@ pub fn pearson(a: &[f64], b: &[f64]) -> f64 {
         sbb += db * db;
     }
     sab / (saa.sqrt() * sbb.sqrt()).max(1e-300)
+}
+
+#[cfg(test)]
+mod quality_pair_identity_tests {
+    use super::QualityPair;
+
+    #[test]
+    fn metric_labels_preserve_the_executing_case_and_full_precision_1561() {
+        let value = f64::from_bits(0x3fd5555555555556);
+        let emit = |label| QualityPair::error("families", label, "rmse", value, "mgcv", 1.0).line();
+        let thread = std::thread::current();
+        let expected_case = format!("case={}", thread.name().unwrap());
+        for label in ["mean", "scale"] {
+            let line = emit(label);
+            assert!(line.split_whitespace().any(|field| field == expected_case));
+            let reported: f64 = line
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("gam="))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(reported.to_bits(), value.to_bits());
+        }
+    }
 }
 
 #[cfg(test)]
