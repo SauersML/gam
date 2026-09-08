@@ -1446,6 +1446,73 @@ fn build_duchon_probit_setup() -> DuchonProbitSetup {
     }
 }
 
+/// Value probes must preserve the exact objective without doing derivative work.
+#[test]
+fn spatial_value_trials_do_not_compute_or_cache_a_gradient_2735() {
+    use gam_solve::rho_optimizer::OuterEvalOrder;
+
+    let setup = build_duchon_probit_setup();
+    let options = external_opts_for_design(
+        &LikelihoodSpec::binomial_probit(),
+        &setup.frozen_design,
+        &FitOptions { compute_inference: false, tol: 1e-12, ..FitOptions::default() },
+    );
+    let mut context = SpatialJointContext {
+        data: setup.data.view(),
+        rho_dim: setup.rho_dim,
+        kind: SpatialHyperKind::Isotropic,
+        cache: SingleBlockExactJointDesignCache::new(
+            setup.data.view(), setup.frozen.clone(), setup.frozen_design.clone(),
+            setup.spatial_terms.clone(), setup.rho_dim, setup.dims_per_term.clone(),
+        ).expect("spatial cache"),
+        evaluator: gam_solve::estimate::ExternalJointHyperEvaluator::new(
+            setup.y.view(), setup.weights.view(), &setup.frozen_design.design,
+            setup.offset.view(), &setup.frozen_design.penalties, &options,
+            "spatial value-only acceptance #2735",
+        ).expect("joint evaluator"),
+        frozen_glm_inputs: None,
+        frozen_glm_psi_bounds: None,
+        frozen_glm_tensor: None,
+        frozen_glm_tensor_attempted: false,
+        frozen_glm_weight_memo: None,
+        value_realization_failures: 0,
+        value_evaluation_failures: 0,
+        nfree_polish_boundary: None,
+    };
+    let mut theta = Array1::zeros(setup.rho_dim + setup.psi_dim);
+    theta[setup.rho_dim] = 0.4;
+    let value = context.eval_full(&theta, OuterEvalOrder::Value, false)
+        .expect("value-only trial").0;
+    assert!(value.is_finite());
+    assert!(context.cache.memoized_eval(&theta).is_none(),
+        "a value trial must not populate the derivative cache");
+    let full = context.eval_full(&theta, OuterEvalOrder::ValueAndGradient, false)
+        .expect("accepted-point gradient");
+    assert!((value - full.0).abs() < 1e-8 * (1.0 + value.abs()));
+    assert!(full.1.iter().any(|g| g.abs() > 1e-6));
+
+    // Differentiate the actual value-only objective, and ensure that probing
+    // another theta does not leave a fictitious gradient in the shared cache.
+    let h = 1e-4;
+    let mut plus = theta.clone();
+    let mut minus = theta.clone();
+    plus[setup.rho_dim] += h;
+    minus[setup.rho_dim] -= h;
+    let vp = context.eval_full(&plus, OuterEvalOrder::Value, false)
+        .expect("positive value probe").0;
+    let vm = context.eval_full(&minus, OuterEvalOrder::Value, false)
+        .expect("negative value probe").0;
+    assert!(context.cache.memoized_eval(&minus).is_none());
+    let fd = (vp - vm) / (2.0 * h);
+    let analytic = full.1[setup.rho_dim];
+    assert!((fd - analytic).abs() < 1e-4 * (1.0 + analytic.abs()),
+        "value/gradient disagreement: fd={fd}, analytic={analytic}");
+    let repeated = context.eval_full(&theta, OuterEvalOrder::ValueAndGradient, false)
+        .expect("gradient after value probes");
+    assert!((repeated.0 - full.0).abs() < 1e-8 * (1.0 + full.0.abs()));
+    assert!((&repeated.1 - &full.1).iter().all(|gap| gap.abs() < 1e-6));
+}
+
 /// #2425 MEASUREMENT (reports, never fails): is the marginal `psi_only` ρ₁
 /// analytic-vs-FD gap central-difference TRUNCATION or a noise floor?
 #[test]

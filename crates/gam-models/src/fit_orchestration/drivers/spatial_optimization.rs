@@ -3167,6 +3167,14 @@ impl<'d> SpatialJointContext<'d> {
         analytic_outer_hessian_available: bool,
     ) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), EstimationError> {
         use gam_solve::rho_optimizer::OuterEvalOrder;
+        // A rejected value trial never needs spatial derivative slabs. Keep
+        // its cache entry value-only so a later accepted-point request still
+        // computes the gradient rather than reading a placeholder (#2735).
+        if matches!(order, OuterEvalOrder::Value) {
+            return self.eval_cost(theta).map(|cost| {
+                (cost, Array1::zeros(theta.len()), gam_problem::HessianValue::Unavailable)
+            });
+        }
         let allow_second_order = matches!(order, OuterEvalOrder::ValueGradientHessian)
             && analytic_outer_hessian_available;
         if let Some(eval) = self.cache.memoized_eval(theta) {
@@ -4282,7 +4290,8 @@ fn run_exact_joint_spatial_optimization(
         let t0 = std::time::Instant::now();
         let allow_second_order_for_call = matches!(order, OuterEvalOrder::ValueGradientHessian)
             && analytic_outer_hessian_available;
-        let gate = ctx.nfree_skip_gate_status(theta, allow_second_order_for_call, true);
+        let requires_gradient = !matches!(order, OuterEvalOrder::Value);
+        let gate = ctx.nfree_skip_gate_status(theta, allow_second_order_for_call, requires_gradient);
         let resets_before = ctx.evaluator.slow_path_reset_count();
         let raw = ctx.eval_full(theta, order, analytic_outer_hessian_available);
         let reset_delta = ctx
@@ -4315,7 +4324,7 @@ fn run_exact_joint_spatial_optimization(
                 kphase_nfree_miss_second_order
                     .set(kphase_nfree_miss_second_order.get() + reset_delta);
             }
-            if gate.would_skip(true) {
+            if gate.would_skip(requires_gradient) {
                 kphase_nfree_miss_other.set(kphase_nfree_miss_other.get() + reset_delta);
             }
         }
