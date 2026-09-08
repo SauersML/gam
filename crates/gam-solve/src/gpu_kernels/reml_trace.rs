@@ -1303,9 +1303,12 @@ mod tests {
 
     #[test]
     fn splitmix_is_deterministic_and_disperses() {
-        // Self-consistency: same input → same output, and a few near-by
-        // inputs land in distinct buckets (no trivial collisions).
-        assert_eq!(splitmix64_mix(42), splitmix64_mix(42));
+        // Fixed known-answer vectors provide an oracle rather than comparing
+        // the implementation with itself.
+        assert_eq!(splitmix64_mix(0), 0);
+        assert_eq!(splitmix64_mix(1), 0x5692_161d_100b_05e5);
+        assert_eq!(splitmix64_mix(42), 0xa759_ea27_d472_7622);
+        assert_eq!(splitmix64_mix(u64::MAX), 0xb4d0_55fc_f2cb_bd7b);
         let mut bits_seen = 0u64;
         for x in 0u64..64 {
             bits_seen |= splitmix64_mix(x);
