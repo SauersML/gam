@@ -18,7 +18,7 @@ pub(crate) use gam::solver::estimate::{
 };
 
 pub(crate) use gam::linalg::faer_ndarray::{
-    array2_to_matmut, factorize_symmetricwith_fallback, fast_xt_diag_x,
+    array2_to_matmut, factorize_symmetricwith_fallback,
 };
 
 pub(crate) use gam::families::inverse_link::{apply_inverse_link_spec_vec, apply_inverse_link_vec};

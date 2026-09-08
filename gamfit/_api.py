@@ -3107,7 +3107,6 @@ def gaussian_reml_fit_latent_backward(
     aux_strength: float | str | None = None,
     dim_selection_log_precision: Any | None = None,
     basis_kind: str = "duchon",
-    sigma_eff_mode: str = "profiled",
     tensor_knots_concat: Any | None = None,
     tensor_knot_offsets: Sequence[int] | None = None,
     tensor_degrees: Sequence[int] | None = None,
@@ -3117,11 +3116,6 @@ def gaussian_reml_fit_latent_backward(
     Returns the standard REML adjoint gradients (``grad_y``,
     ``grad_penalty``, ``grad_weights``) plus the latent gradient
     ``grad_t`` with shape ``(n_obs, latent_dim)``.
-
-    ``sigma_eff_mode`` selects the dispersion convention for the analytic
-    outer REML latent gradient. The default ``"profiled"`` matches the
-    existing REML objective; ``"fixed"`` is accepted for the fixed-dispersion
-    call shape.
 
     ``grad_t`` includes the additive identifiability-mode contributions
     (auxiliary-prior pullback and/or ARD per-axis ridge); the outer
@@ -3163,7 +3157,6 @@ def gaussian_reml_fit_latent_backward(
             if dim_selection_log_precision is None
             else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
             str(basis_kind),
-            str(sigma_eff_mode),
             None
             if tensor_knots_concat is None
             else _numeric_vector(tensor_knots_concat, "tensor_knots_concat"),
@@ -3208,7 +3201,6 @@ def gaussian_reml_optimize_latent(
     tensor_knot_offsets: Sequence[int] | None = None,
     tensor_degrees: Sequence[int] | None = None,
     manifold: str = "euclidean",
-    sigma_eff_mode: str = "profiled",
     max_iter: int = 200,
     grad_tol: float = 1.0e-8,
     stationarity_reference: float | None = None,
@@ -3310,7 +3302,6 @@ def gaussian_reml_optimize_latent(
             None if tensor_knot_offsets is None else [int(v) for v in tensor_knot_offsets],
             None if tensor_degrees is None else [int(v) for v in tensor_degrees],
             str(manifold),
-            str(sigma_eff_mode),
             int(max_iter),
             float(grad_tol),
             None if stationarity_reference is None else float(stationarity_reference),
