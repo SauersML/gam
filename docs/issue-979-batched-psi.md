@@ -56,3 +56,23 @@ at that point converge in two cycles, with residual `6.538e-11`.
 
 Log: `codex979-batched-binary1500-c12.log` in the same MSI log directory.
 The diagnostic process terminated and no owned build or fit remains running.
+
+## Next Hessian change: validation pending
+
+The third-information producer in `bms/information_third.rs` still updated all
+equal coefficient permutations through multidimensional indexing on every row.
+The working implementation now accumulates its ordered triples in flat buffers
+and expands the equal entries after summation, using the same algebraic symmetry
+as the verified mixed-derivative batch.
+
+New checks differentiate the mixed information drift along a coefficient
+direction and along the other spatial design block, for both normal and
+empirical latent distributions. The wide timing fixture also measures this
+third-information calculation. These edits are **not yet compiled or tested**.
+
+MSI validation is currently unavailable: direct compute access failed for
+acn112, acn116, and the newly listed Sioux node acl42. The login node is
+reachable, but `sinfo` reports invalid/unknown compute states and a read-only
+`sbatch --test-only` request for four CPUs and 16 GiB on Sioux reports
+`Requested node configuration is not available`. No job was submitted, and no
+build or numerical test was run locally or on the login node.
