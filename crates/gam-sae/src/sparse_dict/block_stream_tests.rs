@@ -5,6 +5,32 @@ use super::BlockSparseStreamState;
 use crate::sparse_dict::BlockSparseConfig;
 use ndarray::{Array2, array};
 
+#[test]
+fn streaming_seed_is_data_placed_when_dictionary_is_overcomplete_2023() {
+    let direction = [1.0_f32, 2.0, 3.0, 4.0];
+    let seed = Array2::from_shape_fn((32, direction.len()), |(row, column)| {
+        (row as f32 - 15.5) * direction[column]
+    });
+    let config = BlockSparseConfig::new(16, 1);
+    let state = BlockSparseStreamState::new(seed.view(), &config).expect("valid streaming seed");
+    let direction_norm = direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    for block in 0..config.n_blocks {
+        let alignment = state
+            .decoder
+            .row(block)
+            .iter()
+            .zip(direction.iter())
+            .map(|(&left, &right)| left * right / direction_norm)
+            .sum::<f32>()
+            .abs();
+        assert!((alignment - 1.0).abs() <= 8.0 * f32::EPSILON);
+    }
+}
+
 fn coupled_fixture() -> (Array2<f32>, Array2<f32>, BlockSparseConfig) {
     let x = array![[1.0_f32, 2.0], [-2.0, 1.0], [0.5, 0.2], [-0.7, -0.4]];
     let decoder = array![[1.0_f32, 0.0], [0.6, 0.8]];
