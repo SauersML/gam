@@ -344,6 +344,27 @@ fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
     const N_OBS: usize = 32;
 
     let mut term = low_rank_factored_htbeta_term(K_ATOMS, M, P, FRAME_RANK, LATENT_DIM, N_OBS);
+    // Use distinct singular values on disjoint coordinate axes. A dense
+    // coefficient block has the same mathematical span, but its SVD can
+    // introduce roundoff outside that span and activate separation curvature.
+    // This witness requires exactly orthogonal decoders so every installed
+    // curvature term is representable by the scalar-smooth device operator.
+    for (atom_idx, atom) in term.atoms.iter_mut().enumerate() {
+        atom.decoder_coefficients_mut().fill(0.0);
+        for col in 0..FRAME_RANK {
+            atom.decoder_coefficients_mut()[[col, atom_idx * FRAME_RANK + col]] =
+                0.2 * (col + 1) as f64;
+        }
+        assert_eq!(
+            atom.maybe_activate_decoder_frame().expect("coordinate frame activation"),
+            Some(FRAME_RANK),
+        );
+    }
+    for j in 0..K_ATOMS {
+        for k in 0..j {
+            assert_eq!(term.decoder_gram_cosine_sq(j, k), 0.0);
+        }
+    }
     let rho = factored_htbeta_rho(K_ATOMS, LATENT_DIM);
     let target = Array2::<f64>::from_shape_fn((N_OBS, P), |(row, col)| {
         1.0e-3 * ((row + 1) as f64 * (col + 3) as f64).sin()
