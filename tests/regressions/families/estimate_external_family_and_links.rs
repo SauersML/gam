@@ -5,23 +5,10 @@ use ndarray::{Array1, Array2, array};
 
 fn base_opts() -> FitOptions {
     FitOptions {
-        resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
-        latent_cloglog: None,
-        mixture_link: None,
-        optimize_mixture: false,
-        sas_link: None,
-        optimize_sas: false,
         compute_inference: true,
-        skip_rho_posterior_inference: false,
         max_iter: 40,
-        tol: 1e-6,
         nullspace_dims: vec![0],
-        linear_constraints: None,
-        firth_bias_reduction: false,
-        rho_prior: Default::default(),
-        kronecker_penalty_system: None,
-        kronecker_factored: None,
-        persistent_warm_start_store: None,
+        ..FitOptions::default()
     }
 }
 
@@ -82,3 +69,33 @@ fn heuristic_rho_seed_produces_a_finite_optimized_reml_fit() {
     );
 }
 
+#[test]
+fn firth_accepted_for_binomial_loglog_and_cauchit_2158() {
+    let (x, y, w, offset, penalties) = tiny_problem();
+    let mut opts = base_opts();
+    opts.firth_bias_reduction = true;
+    for link in [StandardLink::LogLog, StandardLink::Cauchit] {
+        let fit = fit_gamwith_heuristic_lambdas(
+            x.view(),
+            y.view(),
+            w.view(),
+            offset.view(),
+            &penalties,
+            Some(&[2.5]),
+            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(link)),
+            &opts,
+        )
+        .unwrap_or_else(|error| panic!("Firth {link:?} must fit with inference enabled: {error}"));
+        assert!(fit.deviance.is_finite(), "{link:?}: non-finite deviance");
+        assert!(
+            fit.beta_flat().iter().all(|value| value.is_finite()),
+            "{link:?}: non-finite coefficient"
+        );
+        let covariance = fit
+            .beta_covariance()
+            .expect("Firth fit must carry covariance");
+        assert_eq!(covariance.dim(), (x.ncols(), x.ncols()));
+        assert!(covariance.iter().all(|value| value.is_finite()));
+        assert!(covariance.diag().iter().all(|value| *value > 0.0));
+    }
+}

@@ -8,25 +8,14 @@ use gam::terms::sae::manifold::{
 use ndarray::{Array2, Array3, Array4, Array5, ArrayView2, array};
 use std::sync::Arc;
 
-/// A precomputed basis that is AFFINE in the latent coordinates: its Jacobian is
-/// the same at every observation, so all higher jets vanish identically.
-///
-/// #2330 — the fixtures below supply `basis_values` and `basis_jacobian` directly
-/// through a `Precomputed` basis kind, which attaches no evaluator. The
-/// quasi-Laplace criterion needs a SECOND jet, and `atom_second_jets` refuses when
-/// an atom has neither a second-jet source nor an evaluator, so the criterion
-/// failed with `atom 'a' has no basis evaluator for second jets`.
-///
-/// The refusal is right in general — a precomputed table carries no derivative
-/// information, so a second jet cannot be inferred from a supplied Jacobian. It is
-/// wrong for the two fixtures below, whose Jacobians do not vary across
-/// observations taken at DISTINCT coordinates (one is the identity everywhere, the
-/// other is zero everywhere). A Jacobian constant across distinct coordinates
-/// forces the map to be affine, so both the second and third jets are exactly zero
-/// rather than unknown. Supply those zeros explicitly instead of asking the product
-/// to guess them.
+/// An explicitly affine basis: phi(t) = phi(t0) + J (t - t0).
+/// Its higher derivatives vanish by construction, not by inference from a
+/// finite table of Jacobians. The values must move with trial coordinates;
+/// returning the original table with a nonzero Jacobian makes the solver's
+/// objective and gradient describe different functions (#2668).
 #[derive(Debug)]
 struct PrecomputedAffineBasis {
+    origin_coords: Array2<f64>,
     phi: Array2<f64>,
     jacobian: Array3<f64>,
 }
@@ -43,23 +32,26 @@ impl PrecomputedAffineBasis {
 
 impl gam::terms::sae::basis::SaeBasisEvaluator for PrecomputedAffineBasis {
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
-        // The stored tensors were built for the fixture's own coordinate block, so
-        // a caller evaluating at a different number of rows would silently receive
-        // the wrong shape. Check rather than discard the argument.
-        if coords.nrows() != self.phi.nrows() {
+        if coords.dim() != self.origin_coords.dim() {
             return Err(format!(
-                "PrecomputedAffineBasis: evaluated at {} rows, tabulated for {}",
-                coords.nrows(),
-                self.phi.nrows()
+                "PrecomputedAffineBasis: coordinate shape {:?}, expected {:?}",
+                coords.dim(),
+                self.origin_coords.dim()
             ));
         }
-        Ok((self.phi.clone(), self.jacobian.clone()))
+        let mut phi = self.phi.clone();
+        for row in 0..coords.nrows() {
+            for basis in 0..self.n_basis() {
+                for axis in 0..self.latent_dim() {
+                    phi[[row, basis]] += self.jacobian[[row, basis, axis]]
+                        * (coords[[row, axis]] - self.origin_coords[[row, axis]]);
+                }
+            }
+        }
+        Ok((phi, self.jacobian.clone()))
     }
 
-    fn second_jet_dyn(
-        &self,
-        coords: ArrayView2<'_, f64>,
-    ) -> Option<Result<Array4<f64>, String>> {
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as gam::terms::sae::basis::SaeBasisSecondJet>::second_jet(self, coords))
     }
 
@@ -79,12 +71,7 @@ impl gam::terms::sae::basis::SaeBasisEvaluator for PrecomputedAffineBasis {
 impl gam::terms::sae::basis::SaeBasisSecondJet for PrecomputedAffineBasis {
     fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
         let d = self.latent_dim();
-        Ok(Array4::<f64>::zeros((
-            coords.nrows(),
-            self.n_basis(),
-            d,
-            d,
-        )))
+        Ok(Array4::<f64>::zeros((coords.nrows(), self.n_basis(), d, d)))
     }
 }
 
@@ -273,6 +260,7 @@ fn build_collapse_probe_term(coords: Array2<f64>) -> SaeManifoldTerm {
     )
     .expect("atom should build")
     .with_basis_second_jet(Arc::new(PrecomputedAffineBasis {
+        origin_coords: coords,
         phi: basis_values,
         jacobian: basis_jacobian,
     }));
@@ -337,7 +325,7 @@ fn penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth()
     let coords = array![[0.2], [0.8], [-0.5], [1.3], [-1.1], [0.4]];
     let assignment = SaeAssignment::from_blocks_with_mode(
         Array2::<f64>::zeros((n, 1)),
-        vec![coords],
+        vec![coords.clone()],
         AssignmentMode::softmax(1.0),
     )
     .expect("assignment should build");
@@ -351,6 +339,7 @@ fn penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth()
         [1.0, -1.1],
         [1.0, 0.4]
     ];
+    let gram = phi.t().dot(&phi);
     let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "a",
         gam::terms::sae::manifold::SaeAtomBasisKind::Precomputed("dict".into()),
@@ -362,6 +351,7 @@ fn penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth()
     )
     .expect("atom should build")
     .with_basis_second_jet(Arc::new(PrecomputedAffineBasis {
+        origin_coords: coords,
         phi,
         jacobian: Array3::zeros((n, 2, 1)),
     }));
@@ -376,44 +366,44 @@ fn penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth()
     // near the penalty null space would leave it monotone/endpoint-pinned).
     let target = array![[8.0], [2.0], [15.0], [-3.0], [21.0], [6.0]];
 
-    // The minimum sits near log λ ≈ −6 (measured 2026-09-04 on this fixture:
-    // V = 11.35, 10.35, 9.35, 8.36, 7.42, 6.85, 8.98, 29.6 at log λ = −16, −14,
-    // −12, −10, −8, −6, −4, −2). A grid whose first two points straddle it
-    // reports the LEFT ENDPOINT as the argmin and reads a working Occam term as
-    // a missing one; the grid must extend past the minimum on both sides at a
-    // spacing finer than the basin.
-    let log_lambda_grid = [
-        -16.0_f64, -12.0, -10.0, -8.0, -6.0, -4.0, -2.0, 0.0, 4.0, 8.0, 12.0, 16.0,
-    ];
-    let mut best = (f64::INFINITY, f64::NAN);
-    for &ll in &log_lambda_grid {
-        // Fresh term per grid point — penalized_quasi_laplace_criterion fits (t,β) in place, so a
-        // shared term would carry the previous λ's fit forward and make the
-        // sweep path-dependent (monotone), masking the true interior optimum.
-        // Run the inner fit to convergence (50 iters) so loss.total() and
-        // ½log|H| reflect the genuine λ-conditioned penalised optimum the REML
-        // criterion is defined at.
+    // Residualize the unpenalized coefficient direction. The only penalized
+    // scalar is delta = beta_0 - beta_1, with data precision
+    // h = 1 / ([1,-1] G^-1 [1,-1]'). Here delta_hat = 20 exactly.
+    // The current rank-adjusted criterion, up to a lambda-independent constant,
+    // is .5*lambda*h*delta_hat^2/(h+lambda) + .5*log(1+h/lambda)
+    //    + .5*log(n)*h/(h+lambda).
+    // Its derivative vanishes at the following closed-form interior root.
+    // Deriving the bracket avoids interpreting a grid that misses the basin as
+    // evidence that the Occam normalizer is absent (#2668).
+    let determinant = gram[[0, 0]] * gram[[1, 1]] - gram[[0, 1]].powi(2);
+    let h = determinant / (gram[[0, 0]] + gram[[1, 1]] + 2.0 * gram[[0, 1]]);
+    let delta_squared = 400.0;
+    let lambda_star = h / (h * delta_squared - 1.0 - (n as f64).ln());
+    assert!(lambda_star.is_finite() && lambda_star > 0.0);
+    let cost_at = |lambda: f64| {
         let mut term = base_term.clone();
-        let rho = SaeManifoldRho::new(0.0, ll, vec![array![0.0]]);
-        let (v, _loss) = term
-            .penalized_quasi_laplace_criterion(target.view(), &rho, None, 50, 1.0, 1.0e-6, 1.0e-6)
-            .expect("criterion should evaluate");
+        let rho = SaeManifoldRho::new(0.0, lambda.ln(), vec![array![0.0]]);
+        term.penalized_quasi_laplace_criterion(target.view(), &rho, None, 50, 1.0, 1.0e-6, 1.0e-6)
+            .expect("criterion should evaluate")
+            .0
+    };
+    let oracle = |lambda: f64| {
+        0.5 * lambda * h * delta_squared / (h + lambda)
+            + 0.5 * (h / lambda).ln_1p()
+            + 0.5 * (n as f64).ln() * h / (h + lambda)
+    };
+    let minimum = cost_at(lambda_star);
+    assert!(minimum.is_finite());
+    for factor in [0.25, 0.5, 2.0, 4.0] {
+        let lambda = factor * lambda_star;
+        let gap = cost_at(lambda) - minimum;
+        let expected = oracle(lambda) - oracle(lambda_star);
         assert!(
-            v.is_finite(),
-            "criterion must be finite at log λ={ll}; got {v}"
+            gap > 0.0 && (gap - expected).abs() < 1.0e-6,
+            "profiled criterion must agree with its scalar closed form: \
+             lambda={lambda}, measured gap={gap}, expected gap={expected}"
         );
-        if v < best.0 {
-            best = (v, ll);
-        }
     }
-    let argmin = best.1;
-    assert!(
-        argmin > log_lambda_grid[0] && argmin < *log_lambda_grid.last().unwrap(),
-        "quasi-Laplace criterion over log λ_smooth must have a finite INTERIOR argmin \
-         (validating the −½·rank·logλ Occam term's presence and sign); got \
-         argmin={argmin} (monotone to an endpoint means the term is missing or \
-         wrong-signed)"
-    );
 }
 
 #[test]

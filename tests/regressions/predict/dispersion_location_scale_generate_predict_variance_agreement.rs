@@ -49,6 +49,20 @@ use ndarray::{Array1, Array2};
 /// without depending on the platform RNG.
 struct Lcg(u64);
 impl Lcg {
+    fn poisson(&mut self, rate: f64) -> f64 {
+        // Exponential waiting times give an exact Poisson draw without a
+        // product of uniforms underflowing for a large gamma-mixture rate.
+        let mut elapsed = 0.0;
+        let mut count = 0;
+        loop {
+            elapsed -= (1.0 - self.unit()).ln();
+            if elapsed > rate {
+                return count as f64;
+            }
+            count += 1;
+        }
+    }
+
     fn unit(&mut self) -> f64 {
         self.0 = self
             .0
@@ -85,6 +99,7 @@ impl Lcg {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fam {
     Gamma,
+    NegativeBinomial,
 }
 
 /// One dispersion-LS scenario: family config + truth surfaces + a draw.
@@ -105,6 +120,10 @@ fn kind_matches(kind: &DispersionFamilyKind, fam: Fam) -> bool {
     matches!(
         (kind, fam),
         (DispersionFamilyKind::Gamma, Fam::Gamma)
+            | (
+                DispersionFamilyKind::NegativeBinomial,
+                Fam::NegativeBinomial
+            )
     )
 }
 
@@ -143,6 +162,12 @@ fn run_scenario(s: &Scenario) {
     let y: Vec<f64> = x
         .iter()
         .map(|&xi| match s.fam {
+            Fam::NegativeBinomial => {
+                let mu = (1.0 + 0.4 * xi).exp();
+                let theta = (1.0 - 0.8 * xi).exp();
+                let rate = rng.gamma(theta, mu / theta);
+                rng.poisson(rate)
+            }
             Fam::Gamma => {
                 let mu = (0.6 + 0.4 * xi).exp();
                 let shape = (1.0 - 0.8 * xi).exp(); // precision falls with x
@@ -295,5 +320,15 @@ fn dispersion_location_scale_generate_matches_predict_variance_gamma() {
         family: "gamma",
         fam: Fam::Gamma,
         likelihood: LikelihoodSpec::gamma_log(),
+    });
+}
+
+#[test]
+fn dispersion_location_scale_generate_matches_predict_variance_negbin() {
+    run_scenario(&Scenario {
+        name: "negbin-LS",
+        family: "negbin",
+        fam: Fam::NegativeBinomial,
+        likelihood: DispersionFamilyKind::NegativeBinomial.likelihood_spec(),
     });
 }
