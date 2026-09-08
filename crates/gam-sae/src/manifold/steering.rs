@@ -208,12 +208,16 @@ impl SaeManifoldTerm {
     /// The ambient steering DELTA `a_{ik}·(Φ_k(t_i ⊕ δ) − Φ_k(t_i))·B_k` for atom
     /// `k` on the selected `rows`, shape `(rows.len(), p)`. The caller adds this
     /// to the ambient activation `x` to move token `i` along atom `k`'s chart by
-    /// the intrinsic coordinate step `δ` (radians / fraction-of-period, per the
-    /// atom's manifold), staying on the decoded feature image by construction.
+    /// the intrinsic coordinate step `δ`, staying on the decoded feature image
+    /// by construction. For a one-dimensional periodic or interval chart, `δ`
+    /// is measured in the canonical arc-length coordinate (rescaled to the
+    /// chart's span), not in the gauge-arbitrary fitted parameter. Higher
+    /// dimensional charts retain their manifold-coordinate group action.
     ///
-    /// `δ` is a length-`d_k` chart step (the SAME `δ` applied to every selected
-    /// row). The gate `a_{ik}` is held fixed, so the delta changes content at
-    /// fixed strength. Circle closure is
+    /// `δ` is a length-`d_k` intrinsic step (the SAME intrinsic displacement
+    /// is applied to every selected row; its fitted-coordinate representation
+    /// varies with local chart speed). The gate `a_{ik}` is held fixed, so the
+    /// delta changes content at fixed strength. Circle closure is
     /// exact up to floating-point wrap: `δ = 0` is an exactly-zero delta and
     /// `δ = period` returns to the start (`|Δ| ≈ 0`).
     ///
@@ -224,6 +228,24 @@ impl SaeManifoldTerm {
     /// deltas. Use [`Self::steer_layer_delta`] / [`Self::steer_layer_decode`],
     /// which select one layer's column block and return HONEST activation units.
     pub fn steer_rows(
+        &self,
+        atom: usize,
+        rows: &[usize],
+        delta: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        if delta.len() == 1 {
+            return crate::inference::steering::steer_rows_unit_speed(
+                self, atom, rows, delta[0],
+            )
+            .map(|field| field.delta);
+        }
+        self.steer_rows_raw(atom, rows, delta)
+    }
+
+    /// Apply the fitted-coordinate group action without assigning physical units
+    /// to that coordinate. This is crate-private so all user-facing one-dimensional
+    /// steering goes through the canonical arc-length map.
+    pub(crate) fn steer_rows_raw(
         &self,
         atom: usize,
         rows: &[usize],

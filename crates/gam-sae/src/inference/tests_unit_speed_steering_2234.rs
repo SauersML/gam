@@ -1,9 +1,9 @@
 //! #2234 / #2263 item 3 — **is a requested chart displacement realized as the
 //! INTRINSIC displacement it is documented to be?**
 //!
-//! [`crate::manifold::SaeManifoldTerm::steer_rows`] documents its `δ` as
-//! "radians / fraction-of-period, per the atom's manifold" and implements it as
-//! `LatentManifold::retract(t, δ)` — a raw offset of the FITTED chart parameter.
+//! The historical [`crate::manifold::SaeManifoldTerm::steer_rows`] implementation
+//! sent `δ` directly to `LatentManifold::retract(t, δ)` — a raw offset of the
+//! FITTED chart parameter.
 //! Those are the same object only when the fitted parameter is arc length. The
 //! chart parameterization is a gauge freedom (#2022 / #1019 / #2081): the fit
 //! lands on one point of the `Diff(S¹)` orbit, and
@@ -561,9 +561,18 @@ fn sweep(
             // The canonical surface picks the STEP; the ambient move is still
             // produced by the same group action, so the two arms differ in
             // nothing but the step.
-            crate::inference::steering::steer_rows_unit_speed(term, 0, &rows_idx, fraction)
-                .expect("canonical steer")
-                .raw_steps
+            let canonical = crate::inference::steering::steer_rows_unit_speed(
+                term, 0, &rows_idx, fraction,
+            )
+            .expect("canonical steer");
+            let public = term
+                .steer_rows(0, &rows_idx, array![fraction].view())
+                .expect("public steer");
+            assert_eq!(
+                public, canonical.delta,
+                "the public steer_rows surface bypassed canonical arc-length steering"
+            );
+            canonical.raw_steps
         } else {
             // What a caller passes today: the requested fraction of the period,
             // straight into the raw chart parameter.
