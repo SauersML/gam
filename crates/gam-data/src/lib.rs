@@ -214,6 +214,30 @@ pub enum DataError {
 }
 
 impl DataError {
+    /// Attach the source file to errors produced while loading a table.
+    ///
+    /// Column lookup errors already identify the offending column and expose
+    /// structured fields to the Python boundary, so they deliberately remain
+    /// unchanged. All other ingest failures need the file identity as well.
+    #[must_use]
+    fn with_source_path(self, path: &Path) -> Self {
+        let qualify = |reason: String| {
+            if reason.contains(&path.display().to_string()) {
+                reason
+            } else {
+                format!("data file '{}': {reason}", path.display())
+            }
+        };
+        match self {
+            Self::SchemaMismatch { reason } => Self::SchemaMismatch { reason: qualify(reason) },
+            Self::ParseError { reason } => Self::ParseError { reason: qualify(reason) },
+            Self::EncodingFailure { reason } => Self::EncodingFailure { reason: qualify(reason) },
+            Self::EmptyInput { reason } => Self::EmptyInput { reason: qualify(reason) },
+            Self::InvalidValue { reason } => Self::InvalidValue { reason: qualify(reason) },
+            column @ Self::ColumnNotFound { .. } => column,
+        }
+    }
+
     /// The remediation a user can act on, when the failure has one; the single
     /// source of the advice every front end prints beside the error.
     #[must_use]
@@ -495,7 +519,7 @@ pub fn load_dataset_projected_with_categorical_roles(
     requested_columns: &[String],
     categorical_roles: &HashSet<&str>,
 ) -> Result<EncodedDataset, DataError> {
-    match detect_format(path)? {
+    (match detect_format(path)? {
         DataFormat::Csv => {
             load_delimited_inferred(path, b',', requested_columns, categorical_roles)
         }
@@ -503,7 +527,8 @@ pub fn load_dataset_projected_with_categorical_roles(
             load_delimited_inferred(path, b'\t', requested_columns, categorical_roles)
         }
         DataFormat::Parquet => load_parquet_inferred(path, requested_columns, categorical_roles),
-    }
+    })
+    .map_err(|error| error.with_source_path(path))
 }
 
 pub fn load_datasetwith_schema_projected(
@@ -512,7 +537,7 @@ pub fn load_datasetwith_schema_projected(
     unseen_policy: UnseenCategoryPolicy,
     requested_columns: &[String],
 ) -> Result<EncodedDataset, DataError> {
-    match detect_format(path)? {
+    (match detect_format(path)? {
         DataFormat::Csv => {
             load_delimited_with_schema(path, b',', schema, unseen_policy, requested_columns)
         }
@@ -522,7 +547,8 @@ pub fn load_datasetwith_schema_projected(
         DataFormat::Parquet => {
             load_parquet_with_schema(path, schema, unseen_policy, requested_columns)
         }
-    }
+    })
+    .map_err(|error| error.with_source_path(path))
 }
 
 // ---------------------------------------------------------------------------
@@ -531,6 +557,7 @@ pub fn load_datasetwith_schema_projected(
 
 pub fn load_csvwith_inferred_schema(path: &Path) -> Result<EncodedDataset, DataError> {
     load_delimited_inferred(path, b',', &[], &HashSet::new())
+        .map_err(|error| error.with_source_path(path))
 }
 
 // ---------------------------------------------------------------------------
