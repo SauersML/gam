@@ -418,11 +418,12 @@ impl EncodedDataset {
     /// and Python fits all carry an `EncodedDataset` through that seam, so a
     /// degenerate design can never acquire frontend-specific behaviour.
     ///
-    /// `response_columns` are exempt from the constancy rule only: a constant
-    /// response is a question for the response family (an all-zero count
-    /// response is refused by the family with its own message, #2255), not a
-    /// design degeneracy. Every other rule still applies to them.
-    pub fn validate_fit_boundary(&self, response_columns: &[&str]) -> Result<(), DataError> {
+    /// Constancy is NOT a boundary rule: a constant column is legitimate input
+    /// for many designs (an all-zero left-truncation entry time, an event
+    /// indicator, a scalar term the model prunes) and the layers that judge it
+    /// carry the specific message (an all-zero count response, #2255; a
+    /// constant calibrated score column in a marginal-slope fit).
+    pub fn validate_fit_boundary(&self) -> Result<(), DataError> {
         if self.headers.is_empty() {
             return Err(DataError::DegenerateColumn {
                 column: "<table>".to_string(),
@@ -482,15 +483,6 @@ impl EncodedDataset {
                 return Err(DataError::DegenerateColumn {
                     column: name.clone(),
                     problem: format!("has non-finite value {value} at row {}", row + 1),
-                });
-            }
-            if column.len() > 1
-                && !response_columns.contains(&name.as_str())
-                && column.iter().all(|value| *value == column[0])
-            {
-                return Err(DataError::DegenerateColumn {
-                    column: name.clone(),
-                    problem: "is constant".to_string(),
                 });
             }
         }
@@ -3950,7 +3942,6 @@ mod tests {
                 vec![0.0, f64::NEG_INFINITY, 1.0],
                 "has non-finite value -inf at row 2",
             ),
-            (vec![2.0, 2.0, 2.0], "is constant"),
             (
                 vec![f64::NAN, 2.0, f64::NAN],
                 "has only one non-missing value",
@@ -3969,7 +3960,7 @@ mod tests {
                 },
                 column_kinds: vec![ColumnKindTag::Continuous],
             };
-            let error = dataset.validate_fit_boundary(&[]).unwrap_err();
+            let error = dataset.validate_fit_boundary().unwrap_err();
             assert!(matches!(error, DataError::DegenerateColumn { .. }));
             assert_eq!(
                 error.to_string(),
@@ -4019,7 +4010,7 @@ mod tests {
         ];
         for (dataset, expected) in cases.into_iter().zip(expected) {
             assert_eq!(
-                dataset.validate_fit_boundary(&[]).unwrap_err().to_string(),
+                dataset.validate_fit_boundary().unwrap_err().to_string(),
                 expected
             );
         }

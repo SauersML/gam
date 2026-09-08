@@ -2409,6 +2409,7 @@ fn materialize_impl<'a>(
     config: &FitConfig,
     structural_only: bool,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
+    data.validate_fit_boundary()?;
     let config = config
         .clone()
         .resolve()
@@ -2416,15 +2417,6 @@ fn materialize_impl<'a>(
     let config = &config;
     gam_gpu::configure_global_policy(config.gpu_policy);
     let parsed = parse_formula(formula)?;
-    // The response identifiers (`y`, or the columns inside `Surv(...)` /
-    // `cbind(...)`) are exempt from the shared constancy rule: a constant
-    // response is judged by its family, which owns the message (#2255).
-    let response_columns: Vec<&str> = parsed
-        .response
-        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
-        .filter(|token| !token.is_empty())
-        .collect();
-    data.validate_fit_boundary(&response_columns)?;
     let col_map = data.column_map();
     let family_transformation_normal =
         family_requests_transformation_normal(config.family.as_deref());

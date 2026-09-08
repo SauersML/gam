@@ -848,9 +848,11 @@ where
     let engine_context = context.to_string();
     let objective = std::rc::Rc::new(std::cell::RefCell::new(objective));
     // The outer engine asks for the scalar cost and then for derivatives at
-    // the same accepted point. A baseline evaluation can be a complete nested
-    // latent-survival REML fit, so retain the full result from the cost call.
-    // Taking rather than cloning also supports operator-valued Hessians.
+    // the same accepted point, and may ask for either again at that point
+    // (a BFGS line search re-reads the accepted iterate). A baseline
+    // evaluation can be a complete nested latent-survival REML fit, so the
+    // most recent evaluation is retained and served, cloned, for every
+    // request at exactly that theta (#2714).
     let cost_eval_cache = std::rc::Rc::new(std::cell::RefCell::new(
         None::<(Array1<f64>, gam_problem::OuterEval)>,
     ));
@@ -885,21 +887,25 @@ where
     let cost_cache = std::rc::Rc::clone(&cost_eval_cache);
     let cost_eval = eval_at.clone();
     let cost_fn = move |_: &mut (), theta: &Array1<f64>| {
+        if let Some((cached_theta, eval)) = cost_cache.borrow().as_ref()
+            && cached_theta == theta
+        {
+            return Ok(eval.cost);
+        }
         let eval = cost_eval(&cost_objective, theta)?;
         let cost = eval.cost;
         *cost_cache.borrow_mut() = Some((theta.clone(), eval));
         Ok(cost)
     };
     let eval_fn = move |_: &mut (), theta: &Array1<f64>| {
-        let cached = {
-            let mut cache = cost_eval_cache.borrow_mut();
-            if cache.as_ref().is_some_and(|(cached_theta, _)| cached_theta == theta) {
-                cache.take().map(|(_, eval)| eval)
-            } else {
-                None
-            }
-        };
-        cached.map_or_else(|| eval_at(&objective, theta), Ok)
+        if let Some((cached_theta, eval)) = cost_eval_cache.borrow().as_ref()
+            && cached_theta == theta
+        {
+            return Ok(eval.clone());
+        }
+        let eval = eval_at(&objective, theta)?;
+        *cost_eval_cache.borrow_mut() = Some((theta.clone(), eval.clone()));
+        Ok(eval)
     };
     run_baseline_theta_optimizer(initial, context, contract, cost_fn, eval_fn)
 }

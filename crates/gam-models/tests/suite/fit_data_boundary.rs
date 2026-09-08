@@ -17,29 +17,6 @@ fn dataset(values: Vec<f64>, kind: ColumnKindTag, levels: Vec<&str>) -> EncodedD
     }
 }
 
-/// A two-column table whose response `y` is well-behaved and whose covariate
-/// `offender` carries the degeneracy: the shared boundary judges covariates,
-/// while a constant RESPONSE is the response family's question (#2255).
-fn dataset_with_covariate(offender: Vec<f64>) -> EncodedDataset {
-    let n = offender.len();
-    let mut values = Array2::zeros((n, 2));
-    for (row, value) in offender.into_iter().enumerate() {
-        values[[row, 0]] = row as f64;
-        values[[row, 1]] = value;
-    }
-    EncodedDataset {
-        headers: vec!["y".into(), "offender".into()],
-        values,
-        schema: DataSchema {
-            columns: vec![
-                SchemaColumn { name: "y".into(), kind: ColumnKindTag::Continuous, levels: vec![] },
-                SchemaColumn { name: "offender".into(), kind: ColumnKindTag::Continuous, levels: vec![] },
-            ],
-        },
-        column_kinds: vec![ColumnKindTag::Continuous, ColumnKindTag::Continuous],
-    }
-}
-
 #[test]
 fn public_materializer_returns_typed_data_errors_before_design_construction() {
     let cases = [
@@ -90,16 +67,6 @@ fn public_materializer_returns_typed_data_errors_before_design_construction() {
         );
         assert!(error.to_string().contains(problem), "{error}");
     }
-    // A constant covariate is a design degeneracy the shared boundary owns; a
-    // constant response is not (the response family refuses an all-zero count
-    // response with its own message, #2255), so it is asserted on a covariate.
-    let constant = dataset_with_covariate(vec![4.0, 4.0, 4.0]);
-    let error = match materialize("y ~ offender", &constant, &FitConfig::default()) {
-        Err(error) => error,
-        Ok(_) => panic!("a constant covariate must not materialize a fit request"),
-    };
-    assert!(matches!(&error, WorkflowError::InvalidData { column, .. } if column == "offender"));
-    assert!(error.to_string().contains("is constant"), "{error}");
 }
 
 #[test]

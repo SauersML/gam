@@ -11,7 +11,6 @@ import gamfit
         ([0.0, np.nan, 1.0], "non-finite value NaN"),
         ([0.0, np.inf, 1.0], "non-finite value inf"),
         ([0.0, -np.inf, 1.0], "non-finite value -inf"),
-        ([4.0, 4.0, 4.0], "is constant"),
         ([np.nan, 4.0, np.nan], "only one non-missing value"),
     ],
 )

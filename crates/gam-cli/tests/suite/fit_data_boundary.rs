@@ -6,7 +6,6 @@ fn cli_fit_reports_degenerate_inputs_at_the_shared_boundary() {
         ("y,x\n0,0\n1,NaN\n2,1\n", "y ~ x", "column 'x'", "non-finite"),
         ("y,x\n0,0\n1,inf\n2,1\n", "y ~ x", "column 'x'", "non-finite"),
         ("y,x\n0,0\n1,-inf\n2,1\n", "y ~ x", "column 'x'", "non-finite"),
-        ("y,x\n0,4\n1,4\n2,4\n", "y ~ x", "column 'x'", "constant"),
         (
             "y,x\n0,NA\n1,4\n2,NA\n",
             "y ~ x",
