@@ -5896,6 +5896,28 @@ fn run_nonconverged_arc_returns_typed_checkpoint_after_budget_retry_ladder() {
     );
 }
 
+#[test]
+fn arc_budget_retry_continues_only_the_exhausted_checkpoint() {
+    let mut config = OuterConfig::default();
+    config.heuristic_lambdas = Some(vec![0.5, 2.0, 8.0]);
+    config.seed_config.max_seeds = 7;
+    config.seed_config.seed_budget = 3;
+    config.screen_initial_rho = true;
+
+    super::super::run::restrict_arc_retry_to_checkpoint(&mut config);
+
+    assert!(
+        config.heuristic_lambdas.is_none(),
+        "a checkpoint continuation must not regenerate heuristic starts"
+    );
+    assert_eq!(config.seed_config.max_seeds, 1);
+    assert_eq!(config.seed_config.seed_budget, 1);
+    assert!(
+        !config.screen_initial_rho,
+        "the already-evaluated terminal checkpoint must be continued directly"
+    );
+}
+
 // The seed cascade: keep-best / parsimony ranking, Gaussian multistart,
 // expensive-seed screening and its cap ladder, the seed budget, and seed
 // projection before validation. Split out for the source-file length budget.
