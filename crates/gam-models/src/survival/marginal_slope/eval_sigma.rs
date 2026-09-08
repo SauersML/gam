@@ -269,7 +269,7 @@ impl SurvivalMarginalSlopeFamily {
                             DYNAMIC_SLOPE_PRIMARIES,
                             DynamicSlopeGeometry,
                         >(self, block_states, i)?;
-                        let (nll, _, _) = rigid_row_order2::<
+                        let nll = rigid_row_value::<
                             DYNAMIC_SLOPE_PRIMARIES,
                             DynamicSlopeGeometry,
                         >(&primaries, &inputs)?;

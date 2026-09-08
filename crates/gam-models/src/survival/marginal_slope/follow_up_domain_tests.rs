@@ -304,6 +304,60 @@ fn the_fixture_step_really_leaves_the_domain_2765() {
     );
 }
 
+#[test]
+fn follow_up_value_program_preserves_the_newton_value_without_derivative_work_2765() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let family = family(true);
+    let state = states(&family, interior_slope_beta());
+    let rows: Vec<_> = (0..N_ROWS)
+        .map(|row| {
+            let inputs = rigid_row_inputs(&family, &state, row, "value program regression")
+                .expect("row inputs");
+            let primaries = rigid_row_kernel_primaries::<
+                DYNAMIC_SLOPE_PRIMARIES, DynamicSlopeGeometry,
+            >(&family, &state, row).expect("dynamic primaries");
+            (primaries, inputs)
+        })
+        .collect();
+    for (primaries, inputs) in &rows {
+        let scalar = rigid_row_value::<DYNAMIC_SLOPE_PRIMARIES, DynamicSlopeGeometry>(
+            primaries, inputs,
+        ).expect("scalar row");
+        let (newton, _, _) = rigid_row_order2::<DYNAMIC_SLOPE_PRIMARIES, DynamicSlopeGeometry>(
+            primaries, inputs,
+        ).expect("Newton row");
+        assert!((scalar - newton).abs() <= 16.0 * f64::EPSILON * newton.abs().max(1.0),
+            "the value carrier must evaluate the Newton objective: {scalar:e} versus {newton:e}");
+    }
+
+    // Report both implementations in one binary on identical inputs. Timing is
+    // evidence for iteration cost, while the assertions above grade correctness
+    // independently of host load and compiler profile.
+    let start = Instant::now();
+    for _ in 0..1024 {
+        for (primaries, inputs) in &rows {
+            let (value, _, _) = rigid_row_order2::<DYNAMIC_SLOPE_PRIMARIES, DynamicSlopeGeometry>(
+                black_box(primaries), black_box(inputs),
+            ).expect("Newton row");
+            black_box(value);
+        }
+    }
+    let newton_elapsed = start.elapsed();
+    let start = Instant::now();
+    for _ in 0..1024 {
+        for (primaries, inputs) in &rows {
+            black_box(rigid_row_value::<DYNAMIC_SLOPE_PRIMARIES, DynamicSlopeGeometry>(
+                black_box(primaries), black_box(inputs),
+            ).expect("scalar row"));
+        }
+    }
+    let scalar_elapsed = start.elapsed();
+    eprintln!("[2765-VALUE] rows={} Newton={newton_elapsed:?} scalar={scalar_elapsed:?} speedup={:.3}",
+        1024 * N_ROWS, newton_elapsed.as_secs_f64() / scalar_elapsed.as_secs_f64());
+}
+
 /// The limiter returns a point the ROW PROGRAM admits, and it goes to the
 /// boundary rather than stopping short of it.
 ///

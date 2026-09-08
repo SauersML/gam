@@ -582,7 +582,9 @@ pub fn survival_marginal_slope_vector_neglog(
     let variance = validated_vector_variance(workspace.quadratic_value(row, slopes), probit_scale)?;
     let features = static_slope_feature_frame(q0, q1, qd1, linear, variance, 0.0)
         .map(|value| RuntimeValue::constant(value, RIGID_FEATURE_DIMENSION, &()));
-    Ok(rigid_feature_runtime_nll(&features, &inputs, RIGID_FEATURE_DIMENSION, &())?.value())
+    Ok(rigid_feature_runtime_nll::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry, _>(
+        &features, &inputs, RIGID_FEATURE_DIMENSION, &(),
+    )?.value())
 }
 
 #[cfg(test)]
@@ -1255,7 +1257,7 @@ fn validated_vector_variance(raw_variance: f64, probit_scale: f64) -> Result<f64
 }
 
 #[inline(always)]
-fn rigid_feature_runtime_nll<'arena, S>(
+fn rigid_feature_runtime_nll<'arena, const P: usize, G: SlopeRowGeometry<P>, S>(
     features: &[S; RIGID_FEATURE_DIMENSION],
     inputs: &RigidRowInputs,
     dimension: usize,
@@ -1278,11 +1280,11 @@ where
         inputs.wi,
         inputs.di,
         inputs.probit_scale,
-        follow_up_varying_flag::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>(),
+        follow_up_varying_flag::<P, G>(),
         dimension,
         workspace,
     );
-    validate_rigid_row_admission::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>(
+    validate_rigid_row_admission::<P, G>(
         features[FEATURE_QD1].value(),
         inputs,
         neg_eta0,
@@ -1290,6 +1292,22 @@ where
         adjusted_derivative,
     )?;
     Ok(nll)
+}
+
+/// Evaluate the canonical row expression without constructing the feature
+/// gradient, its 9-by-9 Hessian, or the pullback to the primary frame. Trial
+/// points in the coefficient line search need only this scalar and its domain
+/// witnesses; the frame and probability expression remain the same ones used
+/// to construct the step.
+pub(crate) fn rigid_row_value<const P: usize, G: SlopeRowGeometry<P>>(
+    primaries: &[f64; P],
+    inputs: &RigidRowInputs,
+) -> Result<f64, String> {
+    let features = G::feature_frame(primaries, inputs)
+        .map(|value| RuntimeValue::constant(value, RIGID_FEATURE_DIMENSION, &()));
+    Ok(rigid_feature_runtime_nll::<P, G, _>(
+        &features, inputs, RIGID_FEATURE_DIMENSION, &(),
+    )?.value())
 }
 
 #[inline]
